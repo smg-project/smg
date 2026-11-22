@@ -912,6 +912,11 @@ also where those bytes are a routing key's (`model_gateway/src/policies/prefix_h
 place from the wrong text sends routing keys to other workers than classic does, and no test in
 the crate sees it.
 
+A caller of the one call states the ring alone (`PlaceRequest::ring`). The engine reads where the
+routing value stands on it with the request's keys, under a profile whose ring stage places a value
+by its own text. Under `prefix_hash` such a request is lent no ring yet: the stage's own ring
+places it.
+
 ### 8.2 The contract as designed **[partly]**
 
 Everything in the list above that is the same for every host moves into the crate. A host does
@@ -964,6 +969,7 @@ pub struct PlaceRequest<'a> {
     pub tried: &'a [WorkerId],        // workers earlier attempts used
     pub budget_micros: u32,           // time left for the decision
     pub decode_again: bool,           // the caller asks a pair's decode again behind its prefill
+    pub ring: Option<&'a dyn LentRing>, // the hash ring the caller keeps of the model's workers
     // planned: `admits`, the route's own rule, asked of the pick
 }
 

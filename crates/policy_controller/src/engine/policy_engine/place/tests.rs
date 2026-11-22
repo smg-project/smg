@@ -25,6 +25,7 @@ use crate::{
         view::{fingerprint, Candidate, FixedFacts, HashKind},
         PairAdmission, PairLists, PartnerClasses,
     },
+    policies::consistent_hashing::InOrder as Lent,
     stages::{pickers::push_drawn, registry::StageRegistry, Lifecycle},
     tracking::lease::{EventSet, Lease, Outcome, Side},
 };
@@ -905,6 +906,156 @@ fn a_placement_names_the_routing_value_its_document_derived() {
     assert_eq!(placement.routing_key, None);
     let kept: Placement<'static> = placement.kept();
     assert!(kept.routing_key.is_none());
+}
+
+/// A request whose caller lends its ring goes to the worker that ring's
+/// walk reaches from the place of the value its document's sources derive:
+/// the routing key, and with none the client's address. The gateway's own
+/// policy takes the two in that order and places each by its own text
+/// (`model_gateway/src/policies/consistent_hashing.rs`, lines 189 to 241 at
+/// 882be6f4f). The caller states the ring and nothing else: the one call
+/// reads the value's place with the request's keys. A request with neither
+/// value states no place, and one that lends no ring is placed by the
+/// stage's own ring.
+#[test]
+fn a_request_that_lends_its_ring_goes_where_that_rings_walk_reaches() {
+    let engine = hosted(preset("consistent_hashing"));
+    let list = pool(8);
+    let members = engine.pool_members(&list);
+    let order = [6, 1, 4, 0, 7, 2, 5, 3];
+    let ring = Lent(order.iter().map(|&at| list[at].url().to_owned()).collect());
+    // The worker the ring's walk reaches first from where `text` stands.
+    let reached = |text: &str| order[(ring.position(text) % 8) as usize];
+    let placed = |headers: &dyn HeaderRead, ring: Option<&dyn LentRing>| {
+        let request = PlaceRequest {
+            headers,
+            ring,
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        };
+        let placement = engine.place(&request).expect("a placement");
+        let worker = |held: &Arc<dyn Worker>| Arc::ptr_eq(held, &placement.worker);
+        list.iter().position(worker).expect("a worker of the list")
+    };
+    // What the request's facts state: whether a ring, and the places.
+    let stated = |headers: &dyn HeaderRead, ring: Option<&dyn LentRing>| {
+        let request = PlaceRequest {
+            headers,
+            ring,
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        };
+        let made = Made::new(engine, &request, &[]);
+        let facts = made.make(engine.spec()).facts;
+        (facts.ring.is_some(), facts.ring_positions.to_vec())
+    };
+    let keyed = [
+        ("x-forwarded-for", "10.0.0.1"),
+        ("x-smg-routing-key", "conv-1"),
+    ];
+    let client = [("x-forwarded-for", "10.0.0.1")];
+    assert_eq!(placed(&keyed, Some(&ring)), reached("conv-1"));
+    assert_eq!(placed(&client, Some(&ring)), reached("10.0.0.1"));
+    assert_eq!(
+        stated(&keyed, Some(&ring)),
+        (true, vec![ring.position("conv-1")])
+    );
+    assert_eq!(stated(&(), Some(&ring)), (true, Vec::new()));
+    let _ = placed(&(), Some(&ring));
+    // No ring lent: the stage's own ring keeps the value on one worker.
+    assert_eq!(stated(&keyed, None), (false, Vec::new()));
+    assert_eq!(placed(&keyed, None), placed(&keyed, None));
+}
+
+/// A ring no decision may ask.
+#[derive(Debug)]
+struct Unasked;
+
+impl LentRing for Unasked {
+    fn position(&self, key: &str) -> u64 {
+        panic!("the ring was asked where {key} stands");
+    }
+
+    fn walk(&self, position: u64, _: &mut dyn FnMut(&str) -> bool) {
+        panic!("the ring was walked from {position}");
+    }
+}
+
+/// Under `prefix_hash` a request through the one call is lent no ring. The
+/// classic policy asks its ring for another text than the routing value's
+/// own (`model_gateway/src/policies/prefix_hash.rs`, lines 223 to 229 and
+/// 291 to 293 at 882be6f4f), and no place is read here by that rule. So
+/// the stage's own ring places the request on the worker it has with no
+/// ring lent, and the caller's ring is asked nothing. A document with no
+/// ring stage asks it nothing either.
+#[test]
+fn a_request_under_the_prefix_form_is_lent_no_ring() {
+    let tokens: Vec<u32> = (0..64).collect();
+    let headers = [("x-smg-routing-key", "conv-1")];
+    for name in ["prefix_hash", "random"] {
+        let engine = hosted(preset(name));
+        let list = pool(8);
+        let members = engine.pool_members(&list);
+        let request = |ring: Option<&'static dyn LentRing>| PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(&tokens),
+                ..Prompt::NONE
+            },
+            headers: &headers,
+            ring,
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        };
+        let placed = |request: &PlaceRequest<'_>| {
+            let placement = engine.place(request).expect("a placement");
+            let worker = |held: &Arc<dyn Worker>| Arc::ptr_eq(held, &placement.worker);
+            list.iter().position(worker).expect("a worker of the list")
+        };
+        let lent = request(Some(&Unasked));
+        let made = Made::new(engine, &lent, &[]);
+        let facts = made.make(engine.spec()).facts;
+        assert!(facts.ring.is_none(), "{name}");
+        assert!(facts.ring_positions.is_empty(), "{name}");
+        let with = placed(&lent);
+        if name == "prefix_hash" {
+            assert_eq!(with, placed(&request(None)), "the stage's own ring");
+        }
+    }
+}
+
+/// A pair's request is lent the ring where a side's ring stage places a
+/// routing value by its own text, the prefill's or the decode's: both
+/// sides are handed the one ring, and each takes it by its own stage
+/// ([`RequestFacts::ring`]). A pair with no such stage is lent none, and
+/// neither is a pair with a side of the prefix form, which would take the
+/// one place stated for its own: the caller's ring is asked nothing.
+#[test]
+fn a_pairs_request_is_lent_the_ring_a_side_of_it_places_by() {
+    let list = pool(2);
+    let headers = [("x-smg-routing-key", "conv-1")];
+    let ring = Lent(vec![list[1].url().to_owned(), list[0].url().to_owned()]);
+    let stated = |prefill: &str, decode: &str, ring: &dyn LentRing| {
+        let document = PolicySpec::pair_presets(prefill, decode);
+        let engine = engine_of(&document.expect("the pair presets"));
+        let members = engine.pool_members(&list);
+        let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
+        let pair = pair_of(&members, &classes);
+        let request = PlaceRequest {
+            headers: &headers,
+            ring: Some(ring),
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+        };
+        let made = Made::new(&engine, &request, &[]);
+        let facts = made.make(engine.spec()).facts;
+        (facts.ring.is_some(), facts.ring_positions.to_vec())
+    };
+    let lent = (true, vec![ring.position("conv-1")]);
+    let ringed = "consistent_hashing";
+    assert_eq!(stated(ringed, ringed, &ring), lent);
+    assert_eq!(stated("round_robin", ringed, &ring), lent);
+    assert_eq!(stated(ringed, "round_robin", &ring), lent);
+    let none = (false, Vec::new());
+    assert_eq!(stated("round_robin", "round_robin", &Unasked), none);
+    assert_eq!(stated("prefix_hash", "prefix_hash", &Unasked), none);
+    assert_eq!(stated("prefix_hash", ringed, &Unasked), none);
+    assert_eq!(stated(ringed, "prefix_hash", &Unasked), none);
 }
 
 /// A filter of the host's own. It keeps a worker for a request that is

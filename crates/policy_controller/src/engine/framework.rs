@@ -396,6 +396,18 @@ pub trait Scorer: Lifecycle + Debug {
         true
     }
 
+    /// Whether the stage places a request at the place its caller states
+    /// for the routing value's own text on a ring the caller lends
+    /// ([`RequestFacts::ring`]): the hash ring that is keyed by no prefix.
+    /// What makes a request for its caller states that place under such a
+    /// stage and lends the ring to no other
+    /// ([`Engine::states_key_place`]): another form of the ring is asked for
+    /// another text. A stage that reads a ring ([`Scorer::needs`]) and
+    /// answers `false` here is taken for such a form.
+    fn places_by_key_text(&self) -> bool {
+        false
+    }
+
     /// The warm-up ruling this stage applies, where it applies one: what a
     /// host that names a pool's warming rows enters
     /// ([`WarmUpRule::list_warming_rows`]). No other stage holds one.
@@ -3622,6 +3634,15 @@ impl Marks {
     /// it: the decision's host does, by its one lookup
     /// ([`Engine::reads_for`]).
     const BY_REPORTS: u16 = 1 << 9;
+    /// A scorer places a request at the place stated for its routing
+    /// value's own text on a lent ring ([`Scorer::places_by_key_text`]).
+    /// The engine's run reads nothing of it: what makes the request does,
+    /// by its one lookup ([`Engine::states_key_place`]).
+    const KEY_PLACE: u16 = 1 << 10;
+    /// A scorer reads a ring ([`Needs::ring`](crate::document::spec::Needs::ring))
+    /// and places by another text than the routing value's own: the place
+    /// stated for that text is not its place. Read by the same lookup.
+    const OTHER_PLACE: u16 = 1 << 11;
 
     fn of(profile: &Profile, order: Order) -> Self {
         let scoped = if profile.scoped() { Self::SCOPED } else { 0 };
@@ -3672,7 +3693,23 @@ impl Marks {
         } else {
             0
         };
-        Self(scoped | by_assignment | draws_first | joined | ranked | engines | owns | by_reports)
+        let by_key_text = |stage: &WeightedScorer| stage.scorer.places_by_key_text();
+        let key_place = if profile.scorers.iter().any(by_key_text) {
+            Self::KEY_PLACE
+        } else {
+            0
+        };
+        let by_other_text = |stage: &WeightedScorer| {
+            stage.scorer.needs().ring && !stage.scorer.places_by_key_text()
+        };
+        let other_place = if profile.scorers.iter().any(by_other_text) {
+            Self::OTHER_PLACE
+        } else {
+            0
+        };
+        // The three marks no run of the engine reads.
+        let for_hosts = by_reports | key_place | other_place;
+        Self(scoped | by_assignment | draws_first | joined | ranked | engines | owns | for_hosts)
     }
 
     /// Whether no stage asks anything before the profile's run: no scope
@@ -3689,6 +3726,16 @@ impl Marks {
     /// A stage that may refuse by a report of leases.
     const fn by_reports(self) -> bool {
         self.0 & Self::BY_REPORTS != 0
+    }
+
+    /// A scorer that places by the place stated for a key's own text.
+    const fn key_place(self) -> bool {
+        self.0 & Self::KEY_PLACE != 0
+    }
+
+    /// A ring scorer that places by another text than the key's own.
+    const fn other_place(self) -> bool {
+        self.0 & Self::OTHER_PLACE != 0
     }
 
     /// A scope to open and no key's mark: the opening's first arm.
@@ -4841,6 +4888,31 @@ impl Engine {
         self.resolve(model, phase).map_or(0, |(_, index, _)| {
             self.profile_needs[usize::from(index)].sample
         })
+    }
+
+    /// Whether what makes a request of `phase` for `model` states where
+    /// the routing value's own text stands on a ring its caller lends: a
+    /// scorer of the profile that decides it places by that
+    /// ([`Scorer::places_by_key_text`]), or, for a pair asked at its
+    /// prefill, a scorer of its decode profile does. And no scorer of
+    /// either reads a ring by another text: a pair's two sides are handed
+    /// one ring and one place, so a side of another ring form would take
+    /// that place for its own. `false` where no binding matches. One
+    /// lookup, which only a request that lends a ring pays. A caller that
+    /// writes a request's facts itself asks it before it takes the place
+    /// with the request's keys
+    /// ([`KeySources::derive_keys`](crate::document::KeySources::derive_keys)).
+    #[must_use]
+    pub fn states_key_place(&self, model: &str, phase: Phase) -> bool {
+        let own = self.resolve(model, phase);
+        let own = own.map(|(_, index, _)| self.marks[usize::from(index)]);
+        let own = own.unwrap_or_default();
+        let decode = if phase == Phase::Prefill {
+            self.pair_decode_marks(model)
+        } else {
+            Marks::default()
+        };
+        (own.key_place() || decode.key_place()) && !(own.other_place() || decode.other_place())
     }
 
     /// The marks of the decode profile of `model`'s pair binding, none

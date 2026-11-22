@@ -2,6 +2,7 @@
 //! asked through the engine's own entry, over a list of worker objects.
 
 use std::{
+    cell::OnceCell,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
@@ -16,9 +17,9 @@ use crate::{
         policy_engine::{PolicyEngine, PoolMembers},
         records,
         sticky_sessions::{shards_for_this_host, SessionVerdict},
-        view::{Constraints, Identity, PinSource, RequestFacts, Session, WorkerId},
+        view::{Constraints, Identity, Phase, PinSource, RequestFacts, Session, WorkerId},
     },
-    policies::consistent_hashing::InOrder,
+    policies::consistent_hashing::{InOrder, LentRing},
     store::GatewayId,
     tracking::{
         lease::{Outcome, Side, TransportClass},
@@ -156,6 +157,105 @@ fn a_key_an_empty_lent_ring_places_goes_to_the_ready_worker_at_its_position() {
     // Seven are ready, and the seventh of them stands at place 7.
     list[2].set_status(WorkerStatus::NotReady);
     assert_eq!(first(&asks), 7);
+}
+
+/// A request as a caller that keeps a ring makes it: its keys read from
+/// its headers by the document's sources, with where the key stands on the
+/// ring the caller lends.
+struct Derives<'a> {
+    headers: &'a [(&'a str, &'a [u8])],
+    ring: &'a InOrder,
+    members: &'a PoolMembers,
+    /// Where the key stands, found while the request is made and kept
+    /// here: the request's facts borrow it for as long as it stands.
+    position: OnceCell<u64>,
+}
+
+impl RequestMaker for Derives<'_> {
+    fn model(&self) -> &str {
+        MODEL
+    }
+
+    fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+        let sources = spec.key_sources_for(MODEL, Phase::Single);
+        let header = |name: &str| {
+            let named = self.headers.iter().find(|(listed, _)| *listed == name);
+            named.map(|(_, value)| *value)
+        };
+        let keys = sources
+            .expect("the ring's sources")
+            .derive_keys(header, None, Some(self.ring));
+        let position = keys
+            .ring_position
+            .map(|at| self.position.get_or_init(|| at));
+        Request {
+            id: b"request",
+            facts: RequestFacts {
+                model: MODEL,
+                session_key: keys.session.map_or(Identity::NONE, |key| key.key),
+                client_key: keys.client_key,
+                ring: Some(self.ring),
+                ring_positions: position.map_or(&[], std::slice::from_ref),
+                ..RequestFacts::default()
+            },
+            constraints: Constraints::default(),
+        }
+    }
+
+    fn workers(&self) -> WorkerLists<'_> {
+        WorkerLists::Single(self.members)
+    }
+}
+
+/// A request's headers place it on the ring its caller lends: under the
+/// stock ring its routing key, and with none its client's address, is read
+/// by the document's sources with where its text stands on that ring, and
+/// the request goes to the workers the ring reaches from there. A request
+/// that carries neither states no place, and is placed all the same.
+///
+/// The gateway's own policy takes the two in that order, behind a worker
+/// the request names, and draws for a request with neither
+/// (`model_gateway/src/policies/consistent_hashing.rs`, lines 189 to 241 at
+/// 882be6f4f).
+#[test]
+fn a_requests_headers_place_it_on_the_ring_its_caller_lends() {
+    let engine = preset("consistent_hashing");
+    let list = pool(8);
+    let members = engine.pool_members(&list);
+    let order = [6, 1, 4, 0, 7, 2, 5, 3];
+    let ring = InOrder(order.iter().map(|&at| list[at].url().to_owned()).collect());
+    // The four workers the ring reaches from where `text` stands on it.
+    let reached = |text: &str| -> Vec<u32> {
+        let from = (ring.position(text) % 8) as usize;
+        let around = order.iter().cycle().skip(from).take(4);
+        around.map(|&at| at as u32).collect()
+    };
+    let placed = |headers: &[(&str, &[u8])]| -> Vec<u32> {
+        let asks = Derives {
+            headers,
+            ring: &ring,
+            members: &members,
+            position: OnceCell::new(),
+        };
+        let decided = engine.decide_under(GatewayId::LOCAL, &asks, Instant::now());
+        let decision = decided
+            .expect("an answer")
+            .whole()
+            .expect("whole")
+            .0
+            .decision;
+        targets(&decision).iter().map(|&(place, _)| place).collect()
+    };
+    let keyed: [(&str, &[u8]); 2] = [
+        ("x-forwarded-for", b"10.0.0.1"),
+        ("x-smg-routing-key", b"conv-1"),
+    ];
+    assert_eq!(placed(&keyed), reached("conv-1"));
+    assert_eq!(placed(&keyed[..1]), reached("10.0.0.1"));
+    assert!(
+        !placed(&[]).is_empty(),
+        "no key: placed over the whole list"
+    );
 }
 
 /// Under either stock ring document a keyed request over a list of worker

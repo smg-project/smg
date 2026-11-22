@@ -8,7 +8,7 @@ pub(crate) mod routing_key;
 pub(crate) mod routing_settings;
 pub(crate) mod spec;
 
-pub use routing_key::{strip_lineage, DerivedKey, KeySource, KeySources};
+pub use routing_key::{strip_lineage, DerivedKey, DerivedKeys, KeySource, KeySources};
 pub use routing_settings::{
     LoadMetricSetting, ModeSettings, PolicySettings, RoutingKeyOverrideSettings, RoutingSettings,
     RoutingSettingsError,
