@@ -1678,14 +1678,14 @@
           }
         },
         "ttl_s": {
-          "description": "How long an idle key stays pinned, in seconds; above zero (default\n14400), `4294967295` for ever.",
+          "description": "How long an idle key stays pinned, in seconds, before the rule's\nnext sweep forgets it; above zero (default 14400), `4294967295` for\never.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
           "default": 14400
         },
         "sweep_s": {
-          "description": "The sweep cadence of idle keys, in seconds; above zero (default 120),\n`4294967295` for never, allowed under a `ttl_s` for ever alone.",
+          "description": "The sweep cadence of idle keys, in seconds: a key idle for `ttl_s`\nis forgotten at the next sweep, and one used again ahead of it stays\npinned. Above zero (default 120), `4294967295` for never, allowed\nunder a `ttl_s` for ever alone.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,

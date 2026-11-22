@@ -279,7 +279,8 @@ fn the_engines_pass_drops_the_session_keys_past_their_end() {
     drop(first);
     let sessions = engine.spec().engine().sessions();
     assert_eq!(sessions.len(), 1);
-    // The stock rule forgets a key four hours after its last request.
+    // The stock rule forgets a key at its first sweep, one a minute, four
+    // hours after its last request.
     engine.sweep(now + Duration::from_secs(14_000));
     assert_eq!(sessions.len(), 1, "inside the idle time");
     engine.sweep(now + Duration::from_secs(14_500));

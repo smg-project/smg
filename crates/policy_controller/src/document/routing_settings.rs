@@ -1426,7 +1426,14 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::document::spec::{AppliedSpec, PRESETS};
+    use crate::{
+        document::spec::{AppliedSpec, PRESETS},
+        engine::{
+            Candidate, Constraints, Health, Identity, PoolFacts, RequestFacts, Scratch, WorkerId,
+        },
+        stages::Lifecycle,
+        tracking::{Lease, Side},
+    };
 
     /// The settings of a gateway that sets none, as its configuration
     /// defaults them. The document they mean is the `random` preset.
@@ -2033,6 +2040,73 @@ mod tests {
             ("policy", "manual".to_string()),
             "one session rule serves the whole binding, so a manual side beside another policy is refused"
         );
+    }
+
+    /// The workers two requests of one key are placed on under `config`'s
+    /// document, over two workers. The second request comes `later_secs`
+    /// after the first with the loads turned, so a key placed anew takes
+    /// the other worker.
+    fn two_requests_of_a_key(config: &RoutingSettings, later_secs: u64) -> (u32, u32) {
+        let document = config.policy_document().expect("a document");
+        let applied = validated(&document).expect("the controller takes the document");
+        let engine = applied.engine();
+        let mut scratch = Scratch::new();
+        let mut place = |now_micros: u64, loads: [u32; 2]| {
+            let pool = [0, 1].map(|position: u32| Candidate {
+                position,
+                id: WorkerId(1_000 + u64::from(position)),
+                key: 1_000 + position,
+                health: Health {
+                    healthy: true,
+                    ..Health::default()
+                },
+                in_flight: loads[position as usize],
+                ..Candidate::default()
+            });
+            let facts = RequestFacts {
+                model: "m",
+                session_key: Identity::plain("k1"),
+                now_micros,
+                ..RequestFacts::default()
+            };
+            let pool_facts = PoolFacts {
+                pool_size: 2,
+                generation: 1,
+                ..PoolFacts::default()
+            };
+            let cx = Constraints::default();
+            let decision = engine.decide(&facts, &pool_facts, &pool, &cx, &mut scratch);
+            let pick = decision.pick().expect("a pick");
+            let target = *pick.targets.first().expect("a target");
+            let lease = Lease {
+                issued_micros: now_micros,
+                session: facts.session(),
+                session_verdict: pick.session_verdict,
+                ..Lease::default()
+            };
+            engine.on_dispatched(&lease, &target, Side::Single, 0);
+            target.position
+        };
+        let first = place(1_000_000, [1, 5]);
+        (first, place((1 + later_secs) * 1_000_000, [9, 0]))
+    }
+
+    /// A key used again after its idle time and ahead of its rule's next
+    /// sweep keeps its worker, and one used at that sweep or later is
+    /// placed anew. The gateway's sticky map ends an idle entry at an
+    /// eviction tick alone, and every use renews the entry
+    /// (`model_gateway/src/policies/manual.rs`: `evict_idle`, `peek_pin`).
+    /// No recorded row moves time, so this case states the rule.
+    #[test]
+    fn a_key_idle_past_its_time_keeps_its_worker_until_the_sweep() {
+        // Idle after a minute, swept every hour.
+        let manual = config(PolicySettings::Manual {
+            eviction_interval_secs: 3_600,
+            max_idle_secs: 60,
+            assignment_mode: Assignment::MinLoad,
+        });
+        assert_eq!(two_requests_of_a_key(&manual, 61), (0, 0));
+        assert_eq!(two_requests_of_a_key(&manual, 3_600), (0, 1));
     }
 
     #[test]

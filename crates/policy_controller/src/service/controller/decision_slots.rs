@@ -6969,9 +6969,9 @@ pub(crate) mod tests {
     }
 
     /// The store's pin is the key's worker before its own end and for less
-    /// than the rule's TTL since its last use: the engine's table forgets
-    /// a key at its TTL to the microsecond, and the pin of record is no
-    /// older a pin.
+    /// than the rule's TTL since its last use, to the microsecond: a pin of
+    /// record ends with its idle time, where the engine's table keeps a
+    /// key on to its rule's sweep.
     #[test]
     fn a_stored_pin_as_old_as_the_rules_ttl_is_no_pin() {
         use super::StorePins;

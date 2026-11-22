@@ -264,18 +264,18 @@ impl StorePins<'_> {
     /// `ttl_micros`.
     fn standing(&self, pin: Pin, ttl_micros: Option<u64>) -> Option<WorkerId> {
         // A pin at or past its own end is no pin, whether or not the sweep
-        // has run: its end is the instant the engine's table forgot the
-        // key, or the latest a lease's own rule counted where no table
-        // held it. A TTL counted from the dispatch ends later than that,
-        // and so may the TTL of a rule applied since. The end stands on
-        // the decision clock: the ask's instant is turned into it here, at
-        // a miss that finds a pin with an end and nowhere else.
+        // has run: its end is the instant the engine's table forgets the
+        // key, its rule's sweep, or the latest a lease's own rule counted
+        // where no table held it. The TTL of a rule applied since may end
+        // later than that. The end stands on the decision clock: the ask's
+        // instant is turned into it here, at a miss that finds a pin with
+        // an end and nowhere else.
         let ended = |ends: u64| ends <= self.store.micros(self.now);
         if pin.ends.is_some_and(ended) {
             return None;
         }
-        // The asking rule's TTL holds as well, against the pin's last use:
-        // a pin as old as that TTL is no pin, to the microsecond.
+        // The asking rule's TTL holds as well, against the pin's last use: a
+        // pin that old is no pin, though the table keeps its key to a sweep.
         let age = self.now.saturating_duration_since(pin.last_used);
         ttl_micros
             .is_none_or(|ttl| age < Duration::from_micros(ttl))
@@ -2580,7 +2580,7 @@ fn chosen_dispatched(
 /// a rule without a TTL. Where the table holds no such key, or no engine
 /// was told, the lease's own rule ends it: the TTL its decision was made
 /// under, as its issued state carries it, counted from the lease's
-/// issue as the table counted it then. So it does where the dispatch
+/// issue, where the table counts on to a sweep. So it does where the dispatch
 /// itself made the table's entry anew and no decision has read it: that
 /// entry holds no instant yet. An end the lease's rule counts never moves
 /// the pin's end earlier: a lease dispatched behind a newer one of its

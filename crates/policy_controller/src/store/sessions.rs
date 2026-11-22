@@ -18,7 +18,7 @@ pub struct Pin {
     /// The last decision that used it, on the host's clock: a merge reads
     /// it.
     pub last_used: Instant,
-    /// The instant the pin ends, by the TTL of the rule that placed its
+    /// The instant the pin ends, set under the rule that placed its
     /// key: at or past it the sweep drops the pin and a decision's read
     /// takes none. It stands on the decision clock, in microseconds since
     /// the store's origin, as the engine's table holds the instant it

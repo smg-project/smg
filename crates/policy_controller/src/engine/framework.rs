@@ -8525,7 +8525,8 @@ mod tests {
         );
         assert_eq!(engine.sessions().held(key), pinned);
 
-        facts.now_micros += 31;
+        // Idle until 112: the rule's next sweep is at 121.
+        facts.now_micros += 33;
         let expired = engine
             .shadow(&facts, &pool, &rows, &cx, &mut scratch)
             .expect("an expired pin leaves a fresh placement");
