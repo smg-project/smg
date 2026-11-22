@@ -102,6 +102,11 @@ pub trait PairAdmission: fmt::Debug {
 /// and the host's reads of its own admission. A decision names a prefill by
 /// its place in the prefill list and a decode by its place in the decode
 /// list, so the host finds both workers with no lookup by id.
+///
+/// A host that holds the request to a part of a pool states the places of
+/// that side's list it may take ([`Self::prefill_places`],
+/// [`Self::decode_places`]). The lists stay the pools' own, with their
+/// records and their pair classes: nothing is made for a part of a list.
 #[derive(Clone, Copy, Debug)]
 pub struct PairLists<'a> {
     /// The prefills.
@@ -113,6 +118,16 @@ pub struct PairLists<'a> {
     pub classes: &'a PartnerClasses,
     /// The host's reads of its prefill limit and of its decode rooms.
     pub admission: &'a dyn PairAdmission,
+    /// The places of the prefill list the request may take, ascending,
+    /// each once; `None` for every place. The request's own fact and no
+    /// veto of a worker: the prefill side's set opens with them under any
+    /// document ([`Constraints::places`]).
+    pub prefill_places: Option<&'a [u32]>,
+    /// The places of the decode list the request may take, stated as the
+    /// prefills' are. The two stand apart: a host may hold one side alone.
+    /// The decode asked again behind a held prefill is held to them too,
+    /// and its held prefill is found wherever it stands in its list.
+    pub decode_places: Option<&'a [u32]>,
 }
 
 impl PairLists<'_> {
@@ -148,6 +163,7 @@ impl PairLists<'_> {
         let live = Live::at(spec.engine(), clock, now, loads, None);
         request.facts.now_micros = live.now_micros();
         let (facts, cx) = (&request.facts, &request.constraints);
+        let places = [self.prefill_places, self.decode_places];
         let decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;
             let (workers, records) = (self.prefill.workers(), self.prefill.records(spec, clock));
@@ -163,9 +179,13 @@ impl PairLists<'_> {
             };
             let (engine, scratch) = (spec.engine(), &mut buffers.scratch);
             match held {
-                None => decide_records(engine, facts, cx, &prefill_facts, pools, scratch),
+                None => {
+                    let sides = (cx, places);
+                    decide_records(engine, facts, sides, &prefill_facts, pools, scratch)
+                }
                 Some(held) => {
-                    decide_decode_records(engine, facts, cx, &decode_facts, pools, held, scratch)
+                    let side = (cx, places[1]);
+                    decide_decode_records(engine, facts, side, &decode_facts, pools, held, scratch)
                 }
             }
         };
@@ -221,7 +241,9 @@ pub(super) fn stamp(
 /// demand, or places of its list. A pair's records keep no demand fact, so
 /// such a request is shed and never placed past its demand. A hint of some
 /// records is declined: no stage here takes a part of a list. So are
-/// places ([`single::PLACES`]): a pair's sides do not read them.
+/// places the request states itself ([`single::PLACES`]): one set cannot
+/// hold two lists, and each side's places are its lists' to state
+/// ([`PairLists::prefill_places`], [`PairLists::decode_places`]).
 pub(super) fn not_narrowed_by(cx: &Constraints<'_>) -> Option<(ShedReason, &'static str)> {
     match cx.subset_hint {
         Some(0) => Some((ShedReason::NoEndpoints, SUBSET_HINT)),
@@ -244,7 +266,8 @@ fn decode_session(facts: &RequestFacts<'_>) -> Session {
 
 /// A pair's decision over the records of its two lists, stamped
 /// ([`stamp`]): the engine's pair entry. `pool` holds the prefill list's
-/// facts. The request's constraints are read by both sides.
+/// facts. The request's constraints are read by both sides, each with
+/// the places its list states (`places`: the prefills', the decodes').
 ///
 /// One side alone is no pair: where either list holds no record the engine
 /// answers over no candidate. A request that states a hard demand or a
@@ -253,7 +276,7 @@ fn decode_session(facts: &RequestFacts<'_>) -> Session {
 fn decide_records(
     engine: &Engine,
     facts: &RequestFacts<'_>,
-    cx: &Constraints<'_>,
+    (cx, places): (&Constraints<'_>, [Option<&[u32]>; 2]),
     pool: &PoolFacts<'_>,
     pools: PairPools<'_>,
     scratch: &mut Scratch,
@@ -268,7 +291,21 @@ fn decide_records(
     if let Some((reason, stage)) = not_narrowed_by(cx) {
         return shed(reason, stage, facts.seed, pool.generation);
     }
-    engine.decide_pair(facts, pool, pools, cx, cx, scratch)
+    match places {
+        [None, None] => engine.decide_pair(facts, pool, pools, cx, cx, scratch),
+        // Each side's set opens with its own places.
+        [prefills, decodes] => {
+            let prefill_cx = Constraints {
+                places: prefills,
+                ..*cx
+            };
+            let decode_cx = Constraints {
+                places: decodes,
+                ..*cx
+            };
+            engine.decide_pair(facts, pool, pools, &prefill_cx, &decode_cx, scratch)
+        }
+    }
 }
 
 /// What a pair's first pick ([`PairLists::decide`]) issues: the prefill
@@ -313,17 +350,22 @@ pub(super) fn issue(
 /// The decode asked again over the records of the two lists, stamped
 /// ([`stamp`]): the engine's decode entry over the partners of the prefill
 /// of `held`, the target the pair holds, handed the decode that target
-/// names. `pool` holds the decode list's facts.
+/// names. `pool` holds the decode list's facts. The decodes are held to
+/// `places`, the decode list's.
 ///
 /// A prefill list with no record holds no held prefill: the entry answers
 /// over no list, is handed no decode and names the prefill that left,
 /// whatever the request states. A decode list with no record is read as
 /// it stands. The entry finds the held prefill in its list and refuses
 /// the call for the partners it lacks.
+///
+/// The held prefill is looked for before what the request states is
+/// judged: a call whose prefill is in no list of records reads
+/// `prefill-gone` from the engine's entry too, whatever it states.
 fn decide_decode_records(
     engine: &Engine,
     facts: &RequestFacts<'_>,
-    cx: &Constraints<'_>,
+    (cx, places): (&Constraints<'_>, Option<&[u32]>),
     pool: &PoolFacts<'_>,
     pools: PairPools<'_>,
     held: &Target,
@@ -342,11 +384,18 @@ fn decide_decode_records(
         let no_lists = PairPools::default();
         return engine.decide_decode(&facts, &none, no_lists, prefill, None, cx, scratch);
     }
-    if let Some((reason, stage)) = not_narrowed_by(cx) {
+    let listed = |_: &_| pools.prefills.iter().any(|row| row.id == prefill);
+    if let Some((reason, stage)) = not_narrowed_by(cx).filter(listed) {
         return shed(reason, stage, facts.seed, pool.generation);
     }
     let first = held.pair.map(|pair| (pair.decode_id, pair.decode_dp_rank));
-    engine.decide_decode(&facts, pool, pools, prefill, first, cx, scratch)
+    match places {
+        None => engine.decide_decode(&facts, pool, pools, prefill, first, cx, scratch),
+        Some(_) => {
+            let decode_cx = Constraints { places, ..*cx };
+            engine.decide_decode(&facts, pool, pools, prefill, first, &decode_cx, scratch)
+        }
+    }
 }
 
 /// What a pick of the decode decided again ([`PairLists::decide`] behind a
@@ -687,10 +736,11 @@ mod tests {
         decodes: &[Candidate],
         classes: &PartnerClasses,
     ) -> Decision {
+        let free = Constraints::default();
         decide_records(
             spec.engine(),
             facts,
-            &Constraints::default(),
+            (&free, [None, None]),
             &pool(prefills),
             pools(prefills, decodes, classes),
             &mut Scratch::default(),
@@ -807,7 +857,7 @@ mod tests {
             let decision = decide_records(
                 spec.engine(),
                 &facts(),
-                cx,
+                (cx, [None, None]),
                 &pool(&prefills),
                 pools(&prefills, &decodes, &classes),
                 &mut Scratch::default(),
@@ -966,7 +1016,7 @@ mod tests {
         let again = decide_decode_records(
             pair.spec.engine(),
             &facts,
-            &Constraints::default(),
+            (&Constraints::default(), None),
             &pool(&decodes),
             pools(&prefills, &decodes, &classes),
             &prefill_alone(WorkerId(1)),
@@ -998,7 +1048,7 @@ mod tests {
         let again = decide_decode_records(
             pair.spec.engine(),
             &facts(),
-            &Constraints::default(),
+            (&Constraints::default(), None),
             &pool(&decodes),
             pools(&prefills, &decodes, &classes),
             &prefill_alone(WorkerId(5)),
@@ -1106,6 +1156,25 @@ mod tests {
             }
         }
 
+        /// [`Self::of`] under a document whose profiles list no filter: a
+        /// valid document that weighs no worker's health.
+        fn unfiltered(prefills: usize, decodes: usize) -> Self {
+            let mut host = Self::of(prefills, decodes);
+            let mut document =
+                PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets");
+            document.generation = 3;
+            for profile in document.profiles.values_mut() {
+                profile.filter.clear();
+            }
+            let spec = AppliedSpec::validate(&document).expect("a valid document");
+            host.engine = PolicyEngine::new(spec);
+            host.members = [
+                host.engine.pool_members(&host.prefills),
+                host.engine.pool_members(&host.decodes),
+            ];
+            host
+        }
+
         /// The host's keyed request for a pair over its lists, every pair
         /// open, its decode sent `later` or with its prefill.
         fn asks<'a>(&'a self, classes: &'a PartnerClasses, later: bool) -> Asks<'a> {
@@ -1115,6 +1184,8 @@ mod tests {
                 decode,
                 classes,
                 admission: &OPEN,
+                prefill_places: None,
+                decode_places: None,
             };
             let constraints = Constraints {
                 decode_later: later,
@@ -1169,6 +1240,24 @@ mod tests {
             held: Option<&Target>,
             excluded: &[WorkerId],
         ) -> Decision {
+            let constraints = Constraints {
+                excluded,
+                ..Constraints::default()
+            };
+            self.decide_among(admission, seed, held, constraints, [None, None])
+        }
+
+        /// [`Self::decide_held`] for a request that states `constraints`
+        /// and that its host holds to `places`: those of the prefill list
+        /// and those of the decode list it may take.
+        fn decide_among(
+            &self,
+            admission: &dyn PairAdmission,
+            seed: u64,
+            held: Option<&Target>,
+            constraints: Constraints<'_>,
+            places: [Option<&[u32]>; 2],
+        ) -> Decision {
             let [prefill, decode] = &self.members;
             let classes = every(self.prefills.len(), self.decodes.len() as u32);
             let lists = PairLists {
@@ -1176,10 +1265,8 @@ mod tests {
                 decode,
                 classes: &classes,
                 admission,
-            };
-            let constraints = Constraints {
-                excluded,
-                ..Constraints::default()
+                prefill_places: places[0],
+                decode_places: places[1],
             };
             let mut request = Request {
                 id: b"",
@@ -1359,6 +1446,69 @@ mod tests {
         assert!(prefills_full(&host.decide(&full, 1, None)));
     }
 
+    /// A pair its host holds to places is decided over the pools' own lists,
+    /// and each side opens with its own places: no prefill and no decode
+    /// outside them is picked, under the stock document and under one whose
+    /// profiles list no filter. One side may be held alone. A side with no
+    /// place kept picks no pair. The decode asked again is held to the
+    /// decodes' places of its own call.
+    #[test]
+    fn a_pair_held_to_places_is_handed_no_other_place_on_either_side() {
+        for host in [Host::of(3, 4), Host::unfiltered(3, 4)] {
+            // Both sides held: every pick is of the places, and the turns
+            // reach each of them.
+            let mut seen = ([false; 3], [false; 4]);
+            for seed in 0..64 {
+                let both = [Some(&[1][..]), Some(&[0, 3][..])];
+                let picked = host.picked(&host.decide_among(
+                    &OPEN,
+                    seed,
+                    None,
+                    Constraints::default(),
+                    both,
+                ));
+                seen.0[picked.0] = true;
+                seen.1[picked.1] = true;
+            }
+            assert_eq!(seen, ([false, true, false], [true, false, false, true]));
+            for seed in 0..32 {
+                let prefills = [Some(&[0, 2][..]), None];
+                let picked = host.picked(&host.decide_among(
+                    &OPEN,
+                    seed,
+                    None,
+                    Constraints::default(),
+                    prefills,
+                ));
+                assert_ne!(picked.0, 1, "seed {seed}");
+                let decodes = [None, Some(&[2][..])];
+                let picked = host.picked(&host.decide_among(
+                    &OPEN,
+                    seed,
+                    None,
+                    Constraints::default(),
+                    decodes,
+                ));
+                assert_eq!(picked.1, 2, "seed {seed}");
+            }
+            // No decode kept: no pair is picked, whatever is ready.
+            let none = [None, Some(&[][..])];
+            assert!(host
+                .decide_among(&OPEN, 1, None, Constraints::default(), none)
+                .pick()
+                .is_none());
+            // The decode asked again behind a sent prefill.
+            let (sent, _) = host.picked(&host.decide(&OPEN, 3, None));
+            let held = prefill_alone(worker_id(host.prefills[sent].as_ref()));
+            for seed in 0..16 {
+                let decodes = [None, Some(&[1][..])];
+                let again =
+                    host.decide_among(&OPEN, seed, Some(&held), Constraints::default(), decodes);
+                assert_eq!(host.picked(&again), (sent, 1), "seed {seed}");
+            }
+        }
+    }
+
     /// The decode asked again reads both lists at its own call, and keeps
     /// the prefill that was sent.
     #[test]
@@ -1426,7 +1576,7 @@ mod tests {
             let again = decide_decode_records(
                 pair.spec.engine(),
                 &facts(),
-                &demanded,
+                (&demanded, None),
                 &pool(&decodes),
                 pools(&prefills, &decodes, &classes),
                 &prefill_alone(WorkerId(1)),
@@ -1615,6 +1765,8 @@ mod tests {
                 decode,
                 classes: &classes,
                 admission: &OPEN,
+                prefill_places: None,
+                decode_places: None,
             };
             let positions = [position];
             let facts = RequestFacts {
@@ -2629,6 +2781,262 @@ mod tests {
             let again = host.engine.decide_decode_without_lease(&call, &held, now);
             let again = again.expect("a decision");
             assert_eq!(host.picked(&again), (2, 3), "seed {seed}");
+        }
+    }
+
+    /// A pair that exists among the places is found. Six prefills, each
+    /// with its own decode, and the decode list held to the sixth decode's
+    /// place: the sixth prefill is picked at every turn. A pick among all
+    /// six names four of them a turn and would miss it on some. The
+    /// gateway's classic router does the same by the request's own rule: a
+    /// prefill is a candidate only where one of its partners is open for
+    /// the request (`model_gateway/src/routers/common/placement.rs:1301-1306`,
+    /// `:1389-1394`, `:1423-1437`, at main `c738c8d3b`).
+    #[test]
+    fn a_prefill_whose_partners_stand_outside_the_decode_places_is_no_candidate() {
+        let (spec, _) = hearing();
+        let (mut prefills, mut decodes) = lists(6, 6);
+        let own: Vec<[u32; 1]> = (0..6).map(|at| [at]).collect();
+        let classes = PartnerClasses::number(6, own.iter().map(|one| one.as_slice()));
+        stamp(&mut prefills, &mut decodes, &classes, &OPEN);
+        let free = Constraints::default();
+        for seed in 0..24 {
+            let facts = RequestFacts { seed, ..facts() };
+            let decision = decide_records(
+                spec.engine(),
+                &facts,
+                (&free, [None, Some(&[5])]),
+                &pool(&prefills),
+                pools(&prefills, &decodes, &classes),
+                &mut Scratch::default(),
+            );
+            assert_eq!(picked(&decision), (6, 106), "seed {seed}");
+        }
+    }
+
+    /// What a pair's shed says is said of the prefills the request may take.
+    /// The one prefill place holds a worker that is not ready, the prefills
+    /// outside the places are ready, and every decode is over its
+    /// thresholds: the shed names the prefill side's stage, not the decodes'
+    /// veto, which stands against prefills the request may not take. The
+    /// gateway's classic router names the prefill role there: no prefill
+    /// its request's rule admits is available
+    /// (`model_gateway/src/routers/common/placement.rs:1301-1306`,
+    /// `:1342-1346`, `:1395-1413`, at main `c738c8d3b`).
+    #[test]
+    fn a_pair_with_no_ready_prefill_among_its_places_is_shed_at_the_prefill_stage() {
+        let (spec, _) = hearing();
+        let (mut prefills, mut decodes) = lists(3, 2);
+        let classes = every(3, 2);
+        stamp(&mut prefills, &mut decodes, &classes, &OPEN);
+        prefills[0].health.healthy = false;
+        for decode in &mut decodes {
+            decode.health.overloaded = true;
+        }
+        let free = Constraints::default();
+        let decision = decide_records(
+            spec.engine(),
+            &facts(),
+            (&free, [Some(&[0]), None]),
+            &pool(&prefills),
+            pools(&prefills, &decodes, &classes),
+            &mut Scratch::default(),
+        );
+        match decision {
+            Decision::Shed(shed) => assert_eq!(
+                (shed.reason, shed.emptied_by),
+                (ShedReason::NoEndpoints, "healthy")
+            ),
+            other => panic!("not shed: {other:?}"),
+        }
+    }
+
+    /// The decode asked again looks its held prefill up before it judges
+    /// what the call states. A prefill that is in no list reads
+    /// `prefill-gone` under a demand, a subset hint, places of the request's
+    /// own, and decode places of the list. With the prefill listed, the
+    /// first three read their own stage and the fourth is decided among its
+    /// places. The gateway's classic router asks no decode again: it selects
+    /// a request's pair whole, once
+    /// (`model_gateway/src/routers/common/placement.rs:1227-1275`, at main
+    /// `c738c8d3b`).
+    #[test]
+    fn a_decode_asked_for_a_prefill_that_left_reads_prefill_gone_whatever_it_states() {
+        let pair = decided(2);
+        let (mut prefills, mut decodes) = lists(1, 2);
+        let classes = every(1, 2);
+        stamp(&mut prefills, &mut decodes, &classes, &OPEN);
+        let again = |held: u64, cx: &Constraints<'_>, places: Option<&[u32]>| {
+            decide_decode_records(
+                pair.spec.engine(),
+                &facts(),
+                (cx, places),
+                &pool(&decodes),
+                pools(&prefills, &decodes, &classes),
+                &prefill_alone(WorkerId(held)),
+                &mut Scratch::default(),
+            )
+        };
+        let shed_of = |decision: Decision| match decision {
+            Decision::Shed(shed) => (shed.reason, shed.emptied_by),
+            other => panic!("not shed: {other:?}"),
+        };
+        let free = Constraints::default();
+        let demanded = Constraints {
+            demands: Demands {
+                vision: true,
+                ..Demands::default()
+            },
+            ..free
+        };
+        let hinted = Constraints {
+            subset_hint: Some(2),
+            ..free
+        };
+        let held_to = Constraints {
+            places: Some(&[0]),
+            ..free
+        };
+        let gone = (ShedReason::NoEndpoints, "prefill-gone");
+        for (cx, own) in [
+            (&demanded, (ShedReason::NoEndpoints, WIRES)),
+            (&hinted, (ShedReason::PolicyDeclined, SUBSET_HINT)),
+            (&held_to, (ShedReason::PolicyDeclined, single::PLACES)),
+        ] {
+            assert_eq!(shed_of(again(5, cx, None)), gone);
+            assert_eq!(shed_of(again(1, cx, None)), own);
+        }
+        assert_eq!(shed_of(again(5, &free, Some(&[1]))), gone);
+        assert_eq!(picked(&again(1, &free, Some(&[1]))), (1, 102));
+    }
+
+    /// The all-vetoed rule keeps to a side's places. Two prefills, each
+    /// with its own decode, and the decode list held to the second decode's
+    /// place, which is over its thresholds. Under a binding that steers the
+    /// pair is the second prefill with that decode, whatever stands outside
+    /// the places: a first decode over its thresholds too opens no prefill,
+    /// and a free one does not keep the pool from the rule. Under a binding
+    /// that sheds both are refused as saturated. Where the one place holds
+    /// a decode that is not ready, a decode outside it that is over its
+    /// thresholds or doubted takes nothing: the rule looks at every row of
+    /// the side and the pair is refused at the place's own stage, under
+    /// either word. The gateway's classic router counts only the decodes
+    /// its request's rule admits when it lifts a decode pool, and pairs
+    /// among those
+    /// (`model_gateway/src/routers/common/placement.rs:1301-1306`,
+    /// `:1315-1321`, `:1341`, `:1389-1394`, `:1575-1578`, at main
+    /// `ebbcd9c6d`).
+    #[test]
+    fn the_all_vetoed_rule_keeps_to_a_sides_places() {
+        use crate::{document::spec::OverloadSpec, engine::decision::LiftedVeto};
+        let spec_of = |shed: bool| {
+            let presets = PolicySpec::pair_presets("passthrough", "passthrough");
+            let mut document = presets.expect("the pair presets");
+            document.generation = 3;
+            document.bindings[0].overload = Some(OverloadSpec {
+                shed_when_all_vetoed: shed,
+                ..OverloadSpec::default()
+            });
+            AppliedSpec::validate(&document).expect("a valid document")
+        };
+        let (steers, sheds) = (spec_of(false), spec_of(true));
+        let own: Vec<[u32; 1]> = (0..2).map(|at| [at]).collect();
+        let classes = PartnerClasses::number(2, own.iter().map(|one| one.as_slice()));
+        let free = Constraints::default();
+        // The two lists as `health` leaves the decodes, decided with the
+        // decode list held to its second place.
+        let decide = |spec: &AppliedSpec, health: &dyn Fn(&mut [Candidate])| {
+            let (mut prefills, mut decodes) = lists(2, 2);
+            stamp(&mut prefills, &mut decodes, &classes, &OPEN);
+            health(&mut decodes);
+            decide_records(
+                spec.engine(),
+                &facts(),
+                (&free, [None, Some(&[1])]),
+                &pool(&prefills),
+                pools(&prefills, &decodes, &classes),
+                &mut Scratch::default(),
+            )
+        };
+        let shed_of = |decision: Decision| match decision {
+            Decision::Shed(shed) => (shed.reason, shed.emptied_by),
+            other => panic!("not shed: {other:?}"),
+        };
+        for first_over in [true, false] {
+            let over = |decodes: &mut [Candidate]| {
+                decodes[0].health.overloaded = first_over;
+                decodes[1].health.overloaded = true;
+            };
+            let steered = decide(&steers, &over);
+            assert_eq!(picked(&steered), (2, 102), "first over {first_over}");
+            assert_eq!(steered.trace().lifted, LiftedVeto::Overload);
+            assert_eq!(
+                shed_of(decide(&sheds, &over)),
+                (ShedReason::Saturated, "not-overloaded"),
+                "first over {first_over}"
+            );
+        }
+        for doubted in [false, true] {
+            let outside = |decodes: &mut [Candidate]| {
+                decodes[0].health.overloaded = !doubted;
+                decodes[0].health.stalled = doubted;
+                decodes[1].health.healthy = false;
+            };
+            for spec in [&steers, &sheds] {
+                assert_eq!(
+                    shed_of(decide(spec, &outside)),
+                    (ShedReason::NoEndpoints, "healthy"),
+                    "doubted {doubted}"
+                );
+            }
+        }
+    }
+
+    /// The lifted rule opens no prefill for a decode outside the decode
+    /// places. Six prefills, each with its own decode, every decode over
+    /// its thresholds, and the decode list held to the sixth decode's
+    /// place. Under a binding that steers the pair is the sixth prefill
+    /// with that decode at every turn, the overload veto lifted. Were the
+    /// other five decodes to open their prefills too, the prefills' pick,
+    /// which names four of the six a turn, would miss the sixth on some
+    /// turns and no pair would be found. The gateway's classic router lifts
+    /// a decode pool over the workers its request's rule admits, and takes
+    /// a prefill as a candidate only where one of its partners is open
+    /// among those
+    /// (`model_gateway/src/routers/common/placement.rs:1301-1306`,
+    /// `:1315-1321`, `:1341-1345`, `:1389-1394`, `:1423-1437`, at main
+    /// `9f303447f`).
+    #[test]
+    fn the_lifted_rule_opens_no_prefill_for_a_decode_outside_the_decode_places() {
+        use crate::{document::spec::OverloadSpec, engine::decision::LiftedVeto};
+        let presets = PolicySpec::pair_presets("round_robin", "round_robin");
+        let mut document = presets.expect("the pair presets");
+        document.generation = 3;
+        document.bindings[0].overload = Some(OverloadSpec {
+            shed_when_all_vetoed: false,
+            ..OverloadSpec::default()
+        });
+        let steers = AppliedSpec::validate(&document).expect("a valid document");
+        let (mut prefills, mut decodes) = lists(6, 6);
+        let own: Vec<[u32; 1]> = (0..6).map(|at| [at]).collect();
+        let classes = PartnerClasses::number(6, own.iter().map(|one| one.as_slice()));
+        stamp(&mut prefills, &mut decodes, &classes, &OPEN);
+        for decode in &mut decodes {
+            decode.health.overloaded = true;
+        }
+        let free = Constraints::default();
+        for seed in 0..24 {
+            let facts = RequestFacts { seed, ..facts() };
+            let decision = decide_records(
+                steers.engine(),
+                &facts,
+                (&free, [None, Some(&[5])]),
+                &pool(&prefills),
+                pools(&prefills, &decodes, &classes),
+                &mut Scratch::default(),
+            );
+            assert_eq!(picked(&decision), (6, 106), "seed {seed}");
+            assert_eq!(decision.trace().lifted, LiftedVeto::Overload, "seed {seed}");
         }
     }
 }

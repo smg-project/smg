@@ -44,7 +44,7 @@
 //! ([`Constraints::places`](crate::engine::view::Constraints::places)) is
 //! made and decided over the list's own records: it is not plain, the
 //! keyed decision leaves it to the whole pass, and that pass opens with
-//! the places. A pair that states places is declined ([`PLACES`]).
+//! the places. A pair whose request states places is declined ([`PLACES`]).
 
 use std::{
     cell::Cell,
@@ -76,9 +76,10 @@ thread_local! {
     static MEETING: Cell<Vec<u32>> = const { Cell::new(Vec::new()) };
 }
 
-/// The stage a pair held to places is declined under
+/// The stage a pair whose request states places is declined under
 /// ([`Constraints::places`](crate::engine::view::Constraints::places)):
-/// one set of places cannot hold a pair's two lists.
+/// one set of places cannot hold a pair's two lists. An encode request's
+/// lists whose pair is held to places are declined under it too.
 pub(super) const PLACES: &str = "places";
 
 /// The crate's word, in a shed's `emptied_by`, for a pool no stage emptied.

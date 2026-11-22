@@ -13,12 +13,13 @@ use smg_worker::load::state::LoadSnapshot;
 
 use super::{
     pair::{not_narrowed_by, stamp, Buffers, PairLists, BUFFERS},
+    single::PLACES,
     PoolMembers,
 };
 use crate::{
     document::spec::AppliedSpec,
     engine::{
-        decision::Decision,
+        decision::{shed, Decision, ShedReason},
         decision_engine::Request,
         framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools},
         records::{DecisionClock, Live},
@@ -72,6 +73,12 @@ impl EncodeLists<'_> {
     /// than their list are declined by the engine under the column's name:
     /// a request with none reads neither.
     ///
+    /// Lists whose pair is held to places ([`PairLists::prefill_places`],
+    /// [`PairLists::decode_places`]) are declined under the places' name,
+    /// and no key is placed: the engine decides an encode request's pair
+    /// over the workers it admits for the items and reads no place of the
+    /// lists.
+    ///
     /// Nothing is issued for the decision and no stage hears of it.
     #[expect(
         clippy::too_many_arguments,
@@ -96,6 +103,15 @@ impl EncodeLists<'_> {
         // takes one for its two.
         let live = Live::at(spec.engine(), clock, now, loads, None);
         request.facts.now_micros = live.now_micros();
+        // The engine's pass decides the pair over the prefills and the
+        // decodes it admits for the items: a place of the lists as their
+        // host holds them names no row there. The call's instant is
+        // written first, as every answer of this entry leaves it.
+        if pair.prefill_places.is_some() || pair.decode_places.is_some() {
+            placed.clear();
+            let (seed, generation) = (request.facts.seed, spec.generation());
+            return shed(ShedReason::PolicyDeclined, PLACES, seed, generation);
+        }
         let (facts, cx) = (&request.facts, &request.constraints);
         let mut decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;

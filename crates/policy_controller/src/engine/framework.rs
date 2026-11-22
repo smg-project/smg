@@ -1771,9 +1771,9 @@ fn only(classes: &[u32]) -> Option<u32> {
 /// 4.2: a shed names it): a pool with no candidate was emptied by no stage,
 /// a prefill whose classes hold no decode by the partners.
 ///
-/// A set no class narrows opens with the places the request is held to,
-/// where its host holds it to any, and with no other row ([`places`]):
-/// what a filter then keeps is among them, under any profile.
+/// A set opens with the places the request is held to, where its host holds
+/// it to any, and with no other row ([`places`]): what a class or a filter
+/// then keeps is among them, under any profile.
 ///
 /// A pool a hard filter empties is put to the set's all-vetoed rule before
 /// its stage is returned ([`vetoed::emptied`]). Where the rule steers, the
@@ -1797,6 +1797,15 @@ fn filter(
     let kept = &mut buf.kept;
     kept.clear();
     match class {
+        // A side held to places opens with those of them its classes keep:
+        // a class opens no row outside them.
+        Some(classes) if places::stated(cx) => {
+            places::open(kept, candidates.len(), cx);
+            kept.retain(|&i| classed(classes, candidates[i as usize].pair_class));
+            if kept.is_empty() {
+                return Some("partners");
+            }
+        }
         Some(classes) => {
             let rows = 0..candidates.len() as u32;
             match only(classes) {
@@ -6671,8 +6680,8 @@ impl Engine {
                 .validate()
                 .map_or_else(|clause| clause.to_string(), |()| String::new())
         );
-        let open = decodes
-            .iter()
+        // A decode outside its side's places partners nobody.
+        let open = places::rows(decodes, decode_cx)
             .filter(|d| {
                 d.pair_class != 0
                     && decode_profile
@@ -6710,8 +6719,9 @@ impl Engine {
                     ..*decode_cx
                 };
                 let hard = || decode_profile.filters.iter().filter(|f| !f.soft());
-                let kept = decodes
-                    .iter()
+                // Here too a decode outside its side's places partners
+                // nobody: the rule's pass above opened with those places.
+                let kept = places::rows(decodes, decode_cx)
                     .filter(|d| hard().all(|f| f.keep(&all, d, &pass)));
                 pools.table.partnered(
                     kept.map(|d| d.pair_class),
@@ -6744,7 +6754,9 @@ impl Engine {
                 if prefill_shed.reason != ShedReason::PolicyDeclined {
                     let mut routable = 0usize;
                     scratch.classes.clear();
-                    for c in prefills.iter().filter(|c| {
+                    // Of the prefills the request may take: one outside
+                    // its side's places is no routable prefill of it.
+                    for c in places::rows(prefills, cx).filter(|c| {
                         prefill_profile
                             .filters
                             .iter()
@@ -6996,16 +7008,19 @@ impl Engine {
     /// Decides the decode side for a held prefill. The model's pair binding
     /// runs its decode profile over that prefill's partners in `pools`.
     /// Each picked target names the held prefill and one of those decodes.
-    /// A missing prefill is shed under `prefill-gone`. A shed made once the
-    /// decode profile resolves names that profile. `pool` holds the facts
-    /// of the decode pool, where the profile places. Partners that are all
-    /// over their thresholds, or doubted, are put to the binding's all-vetoed
-    /// rule, both its tiers: the rule picks afresh among them, whatever
-    /// decode the first decision named. Over partners all over their
-    /// thresholds it keeps to the ones the request has not tried while one
-    /// is left, as a first decision does. A pair's first decision lifts the
-    /// overload veto alone ([`Self::decide_pair`]). Here the prefill has
-    /// run, and a refusal fails its request.
+    /// A missing prefill is shed under `prefill-gone`, whatever the call's
+    /// constraints state: it is looked for before they are read. A shed
+    /// made once the decode profile resolves names that profile. `pool`
+    /// holds the facts of the decode pool, where the profile places. The
+    /// decodes are held to the places `decode_cx` states. The held
+    /// prefill is found by its id, in or outside any places. Partners that
+    /// are all over their thresholds, or doubted, are put to the binding's
+    /// all-vetoed rule, both its tiers: the rule picks afresh among them,
+    /// whatever decode the first decision named. Over partners all over
+    /// their thresholds it keeps to the ones the request has not tried
+    /// while one is left, as a first decision does. A pair's first decision
+    /// lifts the overload veto alone ([`Self::decide_pair`]). Here the
+    /// prefill has run, and a refusal fails its request.
     ///
     /// `first_decode` is the worker and the rank of the decode the pair's
     /// first decision named, where the caller holds them. Under a decode
@@ -7050,10 +7065,8 @@ impl Engine {
         let Some(profile) = self.profiles.get(usize::from(index)) else {
             return shed(ShedReason::PolicyDeclined, "binding", bare);
         };
-        let shown = self.marks[usize::from(index)].scoped();
-        if shown && !decode_cx.stalled.is_empty() {
-            return rows_not_written(bare, index);
-        }
+        // The held prefill is looked for before any constraint is read: a
+        // call whose prefill left the lists says so, whatever it states.
         let Some(prefill) = pools.prefills.iter().find(|row| row.id == prefill) else {
             // The decode profile is resolved, so the shed names it.
             let under = Trace {
@@ -7062,6 +7075,10 @@ impl Engine {
             };
             return shed(ShedReason::NoEndpoints, "prefill-gone", under);
         };
+        let shown = self.marks[usize::from(index)].scoped();
+        if shown && !decode_cx.stalled.is_empty() {
+            return rows_not_written(bare, index);
+        }
         // This call has one draw sequence, seeded by its own request.
         decode_facts.seed = facts.seed;
         let _opened = shown.then(|| profile.open(&decode_facts, decodes, pool));
@@ -12690,6 +12707,24 @@ mod tests {
             let under = (stage == "written-rows").then_some(0);
             assert_eq!(decision.trace().made_under(), under, "{stage}");
         }
+        // A call whose prefill left the lists says so ahead of its mask: the
+        // prefill is looked for before a constraint is read. The gateway's
+        // classic router asks no decode again
+        // (`model_gateway/src/routers/common/placement.rs:1227-1275`, at
+        // main `c738c8d3b`).
+        let left = engine.decide_decode(
+            &facts,
+            &PoolFacts::default(),
+            pools,
+            WorkerId(u64::MAX),
+            None,
+            &mask,
+            &mut Scratch::new(),
+        );
+        assert_eq!(
+            shed_of(&left),
+            Some((ShedReason::NoEndpoints, "prefill-gone"))
+        );
         assert!(phases.lock().expect("the phases shown").is_empty());
         assert!(decide(&engine, &facts, pools, &cx).pick().is_some());
         assert_eq!(*phases.lock().expect("the phases shown"), [Phase::Decode]);
