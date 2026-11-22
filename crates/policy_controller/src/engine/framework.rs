@@ -4669,9 +4669,14 @@ impl Engine {
     /// documents. The table takes this document's two times
     /// ([`SessionTable::set_times`]) and keeps its keys, its shards and the
     /// workers it holds as absent. The table this engine was made with is
-    /// let go: its host calls this before the engine takes a decision.
+    /// let go, and a pin it held would go with it: its host calls this
+    /// before the engine takes a decision, which a debug build checks.
     #[cfg(feature = "in-process")]
     pub(crate) fn share_sessions(&mut self, table: Arc<SessionTable>) {
+        debug_assert!(
+            self.sessions.is_empty(),
+            "the engine placed a key ahead of the hand-over of its session table"
+        );
         table.set_times(self.sessions.sweep_micros(), self.sessions.absence_micros());
         self.sessions = table;
     }
