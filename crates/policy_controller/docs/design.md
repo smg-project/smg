@@ -894,7 +894,7 @@ pub enum Decided {
 
 Then the host itself has to: derive the routing key by the document's rule and hash the prompt
 into blocks, inside `make`; try the targets in order, checking each worker's health again; keep
-the decision's lease and report each event; turn a refusal into a status. For a single request
+the decision's lease and report each event; turn a refusal into a status. For a single request and for a pair
 `place` of section 8.2 now derives the key, hashes the prompt and tries the targets, and its
 `Placement` keeps the lease. The host still says the two events and turns a refusal into a
 status.
@@ -946,7 +946,7 @@ host's `Generation` type. The engine fills the cell at the list's first decision
 **2. For each request, one call.**
 
 ```rust
-// engine/policy_engine/place.rs, behind the feature `in-process`: built for a single request
+// engine/policy_engine/place.rs, behind the feature `in-process`: built for a single request and a pair
 pub struct PlaceRequest<'a> {
     pub model: &'a str,
     pub lists: WorkerLists<'a>,       // one list, or a pair's two lists with their pair classes
@@ -982,6 +982,7 @@ pub struct Placement<'a> {               // built, see part 3
 pub enum Unplaced {
     Shed { reason: ShedReason, emptied_by: &'static str, retry_after_secs: u16 },
     Queued,
+    PrefillsFull, // the host's admission holds back every prefill of a pair: the host waits for room
     NoWorkers,
     Refused(DecisionRefused),
 }
@@ -992,11 +993,13 @@ targets best first: health and circuit breaker are read again, and the route's r
 the picked worker. If none holds, it decides again over what is left. The host sees a worker or a
 reason.
 
-Built so far, for a single request: the key, the hashes, one decision, and its targets tried
+Built so far, for a single request and for a pair over its two lists: the key, the hashes, one decision, and its targets tried
 best first by health and circuit breaker. Where none holds the request has no worker
 (`NoWorkers`), and a lease the pick was issued is given up at once. Planned: the route's rule,
-the decision made again over what is left, a pair's two lists and an encode request. `place`
-declines the last two by name until then.
+the decision made again over what is left and an encode request. `place`
+declines the last by name until then.
+
+A pair's target holds where both its workers can be sent to.
 
 A retry stays on its wire by its demand alone. The host gives one number to each runtime and
 transport it dials. It writes that number as each worker's fact and as the retry's demand, and
@@ -1028,7 +1031,7 @@ impl Placement<'_> {
 
 Where the document's stages want no events, a single request's placement holds nothing and
 these calls do nothing. A pair's placement always holds a lease (section 6). `place` answers
-a single request with a placement, and no host makes one itself.
+a single request and a pair with a placement, and no host makes one itself.
 
 Nothing else is asked of a host that makes this call. In particular it never names a policy,
 never looks inside a decision, never keeps a lease and never runs a timer for the engine.
@@ -1472,7 +1475,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) is replayed by nothing |
 | Encode-prefill-decode on that engine | **[partly]** | `EncodeLists::decide` decides it over a host's three lists; the engine's entry refuses it and nothing is issued for it |
 | The lease and its events; the guard | **[built]** | |
-| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, and `place` for a single request with one decision; `place` for a pair and for an encode request, the decision made again and the start call are not |
+| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, and `place` for a single request and for a pair with one decision; `place` for an encode request, the decision made again and the start call are not |
 | The crate's bench of the kept engine | **[planned]** | |
 | The gateway as a host | **[planned]** | section 9; the earlier integration, still on main, is taken out first (stage 0) |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |

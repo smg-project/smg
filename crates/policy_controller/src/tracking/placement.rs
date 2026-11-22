@@ -14,7 +14,8 @@
 //!
 //! **Who makes one.** The host contract has one call for a request, which
 //! answers a placement ([`PolicyEngine::place`], the design's section 8.2).
-//! No host makes one itself. The call places a single request today.
+//! No host makes one itself. The call places a single request and a pair
+//! over its two lists today.
 //!
 //! **The instants.** A host reads no clock for the engine: the call that
 //! says a word reads it.
