@@ -2591,6 +2591,41 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
     }
 }
 
+/// Unit k of a long text is pool thread k's own: a thread takes its own unit
+/// before a free one. Thread 0 of a pool of two is held while thread 1 reads
+/// both units of a text whose second unit alone is not ASCII: the unit thread
+/// 1 read last is the first.
+#[test]
+fn a_pool_thread_takes_its_own_unit_of_a_long_text_first() {
+    use std::sync::{Barrier, Mutex};
+    let tokenizer = tokenizer_of(&shapes()[0], &mut 0x5A5A_1234_5678_9ABC);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let model = tokenizer.get_model();
+    let text = "xy ".repeat(24 << 10) + "я";
+    assert_eq!(native.units(&text, true, true).as_slice().len(), 2);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .expect("pool");
+    // Thread 1 holds `reading` from before the two meet until it returns or
+    // unwinds, and thread 0 waits for it inside its own callback: it can
+    // neither take a unit nor outlast a panic of thread 1.
+    let (met, reading) = (Barrier::new(2), Mutex::new(()));
+    let last_was_ascii = pool.broadcast(|context| {
+        if context.index() == 0 {
+            met.wait();
+            drop(reading.lock());
+            return false;
+        }
+        let _held = reading.lock();
+        met.wait();
+        let ids = native.encode_with(Some(model), &text, true, false);
+        ids.expect("pooled");
+        native.thread_piece_cache().borrow().unit_ascii
+    });
+    assert!(last_was_ascii[1], "thread 1 read the second unit first");
+}
+
 /// The added-token search through the tokens' prefixes finds what the
 /// automaton's unanchored leftmost-longest search finds: the same ranges and
 /// the same tokens, on texts made of the tokens, their prefixes, other text
