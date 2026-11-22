@@ -259,28 +259,39 @@ impl PoolMembers {
     /// pick. Found once a list, for the model of its first request: a
     /// gateway's list is one model's. Another model's request is answered
     /// by the document at its call.
+    ///
+    /// The read of what the list keeps stands in the caller's own code
+    /// ([`single::alone`]): a request whose place asks more than one pick
+    /// pays no call for the answer.
+    #[inline(always)]
     fn alone(&self, spec: &AppliedSpec, model: &str) -> Option<AloneProfile> {
-        let find = || {
-            let engine = spec.engine();
-            let Place::Alone(profile) = engine.place_for(model, Phase::Single) else {
-                return None;
-            };
-            // A sessions rule pins a keyed request ahead of the profile.
-            let ruled = engine.binding(model, Phase::Single)?.sessions.is_some();
-            (!ruled).then_some(profile)
-        };
         // A part is one ask's: its answer is kept nowhere, so nothing is
         // allocated for it.
         if self.part {
-            return find();
+            return alone_under(spec, model);
         }
-        let (named, alone) = self.alone.get_or_init(|| (model.into(), find()));
+        let (named, alone) = self
+            .alone
+            .get_or_init(|| (model.into(), alone_under(spec, model)));
         if **named == *model {
             *alone
         } else {
-            find()
+            alone_under(spec, model)
         }
     }
+}
+
+/// The profile the document of `spec` picks alone for a single request of
+/// `model`, under a binding that states no sessions rule
+/// ([`PoolMembers::alone`]).
+fn alone_under(spec: &AppliedSpec, model: &str) -> Option<AloneProfile> {
+    let engine = spec.engine();
+    let Place::Alone(profile) = engine.place_for(model, Phase::Single) else {
+        return None;
+    };
+    // A sessions rule pins a keyed request ahead of the profile.
+    let ruled = engine.binding(model, Phase::Single)?.sessions.is_some();
+    (!ruled).then_some(profile)
 }
 
 impl PolicyEngine {
@@ -458,7 +469,7 @@ impl PolicyEngine {
     /// `seed` is the request's seed, read where the profile's pick draws
     /// ([`AloneProfile::draws`]) and by no other: under one seed such a
     /// pick names one worker of an unchanged pool, so its caller draws a
-    /// seed a request.
+    /// seed a request ([`AloneProfile::seed`]).
     #[must_use]
     pub fn pick(
         &self,
@@ -1031,7 +1042,11 @@ mod tests {
             seen[at.expect("a worker that passes")] += 1;
         }
         for (at, &picks) in seen.iter().enumerate() {
-            assert_eq!(picks > 64, at % 2 == 1, "worker {at}: {seen:?}");
+            if at % 2 == 0 {
+                assert_eq!(picks, 0, "refused worker {at}: {seen:?}");
+            } else {
+                assert!(picks > 64, "worker {at}: {seen:?}");
+            }
         }
 
         // One worker in 64 passes: the draws' bound runs out for most

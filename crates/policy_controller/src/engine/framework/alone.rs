@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use super::{profile_index, Binding, Engine, Marks, Plan, Profile};
+use super::{profile_index, Binding, Engine, Marks, PicksAlone, Plan, Profile};
 use crate::{document::spec::Needs, engine::view::Phase, stages::filters::RowTests};
 
 /// A profile whose whole decision is one pick of its picker
@@ -16,19 +16,30 @@ use crate::{document::spec::Needs, engine::view::Phase, stages::filters::RowTest
 pub struct AloneProfile {
     /// The profile's place in the document.
     pub(crate) index: u16,
-    /// Whether the picker's pick reads its draw
-    /// ([`Picker::draws_alone`](super::Picker::draws_alone)).
+    /// Whether the picker's pick reads its draw ([`PicksAlone::ByDraw`]).
     pub(crate) draws: bool,
 }
 
 impl AloneProfile {
     /// Whether the profile's pick reads the request's seed
-    /// ([`Picker::draws_alone`](super::Picker::draws_alone)). A caller that
-    /// asks the pick states a seed drawn for the request under such a
-    /// profile, and draws none under any other: a rotation reads no draw.
+    /// ([`PicksAlone::ByDraw`]). A caller that asks the pick states a seed
+    /// drawn for the request under such a profile, and draws none under
+    /// any other: a rotation reads no draw.
     #[must_use]
     pub const fn draws(self) -> bool {
         self.draws
+    }
+
+    /// The seed a caller asks the profile's pick with: `drawn`'s, a seed
+    /// drawn for the request, where the pick reads one, and zero with
+    /// nothing drawn under any other profile.
+    #[must_use]
+    pub fn seed(self, drawn: impl FnOnce() -> u64) -> u64 {
+        if self.draws {
+            drawn()
+        } else {
+            0
+        }
     }
 }
 
@@ -132,7 +143,7 @@ impl Engine {
         match self.in_the_way(index, profile, phase) {
             None => Place::Alone(AloneProfile {
                 index,
-                draws: profile.picker.draws_alone(),
+                draws: profile.picker.picks_alone() == PicksAlone::ByDraw,
             }),
             Some(stage) => Place::NotAlone {
                 profile: &profile.name,
@@ -229,7 +240,7 @@ impl Engine {
             .marks
             .get(usize::from(index))
             .is_none_or(|marks| marks.0 & !Marks::DRAWS_FIRST != 0);
-        if asks_more || !profile.picker.picks_alone() {
+        if asks_more || profile.picker.picks_alone() == PicksAlone::No {
             return Some(InTheWay::Picker(profile.picker.name()));
         }
         None

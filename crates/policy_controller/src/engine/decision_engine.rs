@@ -91,9 +91,9 @@ pub trait RequestMaker {
     /// ([`RequestFacts::seed`](super::view::RequestFacts::seed)), for a
     /// pick that reads nothing else of the request. An engine that decides
     /// over its host's lists asks it ahead of [`RequestMaker::make`], where
-    /// the place's picker draws alone
-    /// ([`Picker::draws_alone`](super::framework::Picker::draws_alone)),
-    /// and at no other pick: a rotation's request draws none.
+    /// the place's picker picks by a draw
+    /// ([`PicksAlone::ByDraw`](super::framework::PicksAlone::ByDraw)), and
+    /// at no other pick: a rotation's request draws none.
     ///
     /// A maker that says it states a seed drawn for the request, as the
     /// request it makes states one: under a constant seed a picker that

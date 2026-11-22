@@ -669,25 +669,15 @@ pub trait Picker: Lifecycle + Debug {
     }
 
     /// Whether the picker places a request over a pool's workers by itself
-    /// ([`Picker::pick_alone`]): its own rule is its whole pick, and it
-    /// reads no row, no score and no count. A caller that keeps a worker's
-    /// health on the worker and holds every other rule of a placement
-    /// itself asks such a picker for one pick and nothing else of a
-    /// decision ([`Engine::place_for`]). The default is no. The engine reads
-    /// it where such a caller asks for a place's profile, not at a
-    /// decision.
-    fn picks_alone(&self) -> bool {
-        false
-    }
-
-    /// Whether the picker's pick alone reads its draw
-    /// ([`Picker::pick_alone`], [`Picker::pick_among`]): the caller then
-    /// states the request's seed, and the pick is the one the whole
-    /// decision would draw first by that seed. The default is no: a
-    /// rotation reads no draw, and no seed is drawn for its pick. The
-    /// engine reads it where it finds a place's profile, not at a decision.
-    fn draws_alone(&self) -> bool {
-        false
+    /// ([`Picker::pick_alone`]), and whether that pick reads a draw
+    /// ([`PicksAlone`]): its own rule is its whole pick, and it reads no
+    /// row, no score and no count. A caller that keeps a worker's health
+    /// on the worker and holds every other rule of a placement itself asks
+    /// such a picker for one pick and nothing else of a decision
+    /// ([`Engine::place_for`]). The default is no. The engine reads it
+    /// where such a caller asks for a place's profile, not at a decision.
+    fn picks_alone(&self) -> PicksAlone {
+        PicksAlone::No
     }
 
     /// One pick over `pool` by the picker's own rule alone
@@ -697,10 +687,11 @@ pub trait Picker: Lifecycle + Debug {
     /// own bound ran out before a worker was kept, as a rotation's turns
     /// past a refused worker do: the caller then reads the pool whole and
     /// asks [`Picker::pick_among`] of the workers that pass. `draw` is the
-    /// stream of the request's seed, for a picker that draws alone
-    /// ([`Picker::draws_alone`]): it takes its values from it and from
+    /// stream of the request's seed, for a picker that picks by a draw
+    /// ([`PicksAlone::ByDraw`]): it takes its values from it and from
     /// nowhere else, and [`Picker::pick_among`] reads the stream past
-    /// them. The default picks nobody.
+    /// them. Any other picker leaves the stream as it stands: no seed was
+    /// drawn for it. The default picks nobody.
     fn pick_alone(
         &self,
         pool: &PoolWord<'_>,
@@ -721,6 +712,25 @@ pub trait Picker: Lifecycle + Debug {
         let _ = (set, passed, draw);
         0
     }
+}
+
+/// Whether a picker places a request over a pool's workers by itself, and
+/// what that pick reads ([`Picker::picks_alone`]). One answer says both, so
+/// a picker that picks by a draw cannot leave its caller without the word
+/// that a seed is owed: under a seed that never changes such a picker
+/// names one worker for every request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PicksAlone {
+    /// It does not: its pick reads a row, a score or a count.
+    #[default]
+    No,
+    /// By the pool's order: a rotation's turn over it, or its first worker.
+    /// The pick reads no draw, so no seed is drawn for it, and it leaves
+    /// the stream it is handed as it stands.
+    ByOrder,
+    /// By a draw: the caller states the request's seed, and the pick is
+    /// the one the whole decision would draw first by that seed.
+    ByDraw,
 }
 
 /// A pool as a picker that places over its workers by itself is handed it

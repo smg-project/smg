@@ -41,7 +41,7 @@ use crate::{
     engine::{
         decision::{Decision, Shed, ShedReason, Target, Trace},
         decision_engine::{AlonePick, HeldDecision, Plain, RequestMaker},
-        framework::Engine,
+        framework::{AloneProfile, Engine},
         records,
         sticky_sessions::SessionVerdict,
         store_backed_engine::{DecideOutcome, Leased, Request, SUBSET_HINT, WIRES},
@@ -72,6 +72,13 @@ const NO_STAGE: &str = "none";
 /// ahead of it, and nothing a host is handed of a pick is built here.
 /// Under a document that takes no word on a lease the place is the whole
 /// answer. Under any other the pick is noted ([`noted`]).
+///
+/// What it asks of the request stands in its caller's own code, for every
+/// maker: the tests of what the request states plain, the list's profile
+/// for its model, and its seed where that profile draws. A request that
+/// takes the whole pass pays no call for that answer. The pick behind
+/// them ([`picked`]) is compiled once, here.
+#[inline(always)]
 pub(super) fn alone(
     own: &PolicyEngine,
     maker: &impl RequestMaker,
@@ -86,9 +93,21 @@ pub(super) fn alone(
         return None;
     }
     let profile = members.alone(&own.spec, maker.model())?;
-    // A rotation reads no draw: no seed is asked for its pick. A maker
-    // that says none for a draw has its request made.
+    // A pick that reads no draw asks no seed. A maker that says none for a
+    // draw has its request made.
     let seed = if profile.draws() { maker.seed()? } else { 0 };
+    picked(own, profile, seed, members)
+}
+
+/// [`alone`] behind what it asks of a request: one pick under `profile`,
+/// the list's own for the request's model, by `seed`, of an eligible worker
+/// of `members`.
+fn picked(
+    own: &PolicyEngine,
+    profile: AloneProfile,
+    seed: u64,
+    members: &PoolMembers,
+) -> Option<AlonePick> {
     let admits = |state: RoutingState| state.eligible();
     let position = own.pick(profile, members, seed, admits)?;
     Some(AlonePick {
@@ -331,7 +350,7 @@ mod tests {
         engine::{
             decision::{LiftedVeto, Targets},
             decision_engine::{Decided, DecisionEngine, RequestMaker, WorkerLists},
-            framework::{Picker, Place, PoolWord, TieBand},
+            framework::{Picker, PicksAlone, Place, PoolWord, TieBand},
             prompt_hashes::HashSeeds,
             records::worker_id,
             store_backed_engine::DecisionRefused,
@@ -488,11 +507,26 @@ mod tests {
     /// place states the seed. The place is the worker the whole decision
     /// names first by the same seed, at every pool size: a maker that says
     /// no seed ahead has its request made, and is answered that decision.
+    /// So it is over a pool with workers refused, where the draw is made
+    /// again, and where the draws run out and the pool is read whole.
     #[test]
     fn random_is_one_draw_of_the_seed_answered_as_a_place() {
         let engine = preset("random");
-        for workers in [1, 2, 3, 8, 16, 64] {
+        for (workers, passing) in [
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (8, 8),
+            (16, 16),
+            (64, 64),
+            (16, 8),
+            (64, 4),
+        ] {
             let list = pool(workers);
+            // The workers refused stand between the ones that pass.
+            for (at, worker) in list.iter().enumerate() {
+                worker.set_overloaded(at % (workers / passing) != 0);
+            }
             let members = engine.pool_members(&list);
             let mut seen = vec![false; workers];
             for seed in 0..16 * workers as u64 {
@@ -502,6 +536,7 @@ mod tests {
                 let pick = placed(&engine, &asks);
                 assert_eq!((pick.seed, pick.generation), (seed, 1));
                 assert_eq!((asks.made.get(), asks.seeds.get()), (0, 1));
+                assert!(list[pick.place as usize].routing_state().eligible());
                 seen[pick.place as usize] = true;
                 let id = worker_id(list[pick.place as usize].as_ref());
                 let decision = pick.decision(id, 0);
@@ -524,7 +559,8 @@ mod tests {
                     "{workers} workers, seed {seed}"
                 );
             }
-            assert!(seen.iter().all(|&picked| picked), "{workers}: {seen:?}");
+            let picked = seen.iter().filter(|&&picked| picked).count();
+            assert_eq!(picked, passing, "{workers}: {seen:?}");
         }
         assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
     }
@@ -913,8 +949,12 @@ mod tests {
             !self.alone
         }
 
-        fn picks_alone(&self) -> bool {
-            self.alone
+        fn picks_alone(&self) -> PicksAlone {
+            if self.alone {
+                PicksAlone::ByOrder
+            } else {
+                PicksAlone::No
+            }
         }
 
         fn pick_alone(

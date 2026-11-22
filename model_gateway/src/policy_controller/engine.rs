@@ -388,8 +388,8 @@ impl RequestMaker for Made<'_, '_> {
         })
     }
 
-    // Drawn anew for the ask, as the request made states one
-    // ([`Ask::request`]).
+    // Drawn anew at each call. A request made behind a pick that found no
+    // worker states a seed of its own ([`Ask::request`]).
     fn seed(&self) -> Option<u64> {
         Some(rand::rng().random())
     }

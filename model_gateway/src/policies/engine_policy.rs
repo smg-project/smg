@@ -67,18 +67,11 @@ impl EnginePolicy {
 
 impl LoadBalancingPolicy for EnginePolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
-        // A profile that draws is handed a seed drawn for this pick, as a
-        // classic policy that draws reads its thread's generator. A
-        // rotation reads none, and none is drawn for it.
-        let seed = if self.profile.draws() {
-            rand::rng().random()
-        } else {
-            0
-        };
+        // A seed drawn for this pick, where the profile's pick draws.
+        let seed = self.profile.seed(|| rand::rng().random());
         // A snapshot's list named whole: what the engine keeps of it is in
         // the cell beside it, built by the list's first pick. The pick is
-        // one turn of the list's own rotation, or one draw, and one read of
-        // that worker.
+        // one turn of the list's rotation or one draw, and one worker read.
         if let Some(named) = info.named {
             if let (None, Some(cell)) = (named.positions, named.members) {
                 debug_assert!(
@@ -366,7 +359,11 @@ mod tests {
             times[pick(&random)] += 1;
         }
         for (at, &times) in times.iter().enumerate() {
-            assert_eq!(times > 40, at != 3, "worker {at} took {times} of 800");
+            if at == 3 {
+                assert_eq!(times, 0, "the worker that is not ready was picked");
+            } else {
+                assert!(times > 40, "worker {at} took {times} of 800");
+            }
         }
         let passthrough = asking("passthrough");
         for _ in 0..4 {

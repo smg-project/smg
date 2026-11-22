@@ -5,13 +5,13 @@ use crate::{
     document::spec::ProfileSpec,
     engine::{
         decision::{Targets, MAX_TARGETS},
-        framework::{Picker, PoolWord, TieBand, DRAW_BOUND},
+        framework::{Picker, PicksAlone, PoolWord, TieBand},
         view::{Candidate, PoolFacts, RequestFacts},
     },
     policies::standard_filters,
     stages::{
         lifecycle::Lifecycle,
-        pickers::{draw_kept, push_drawn, target_of},
+        pickers::{draw_kept, draw_place, push_drawn, target_of},
     },
     Draw,
 };
@@ -49,34 +49,21 @@ impl Picker for Random {
     }
 
     // Its draw is its whole rule, and the request's seed is all it reads.
-    fn picks_alone(&self) -> bool {
-        true
-    }
-
-    fn draws_alone(&self) -> bool {
-        true
+    fn picks_alone(&self) -> PicksAlone {
+        PicksAlone::ByDraw
     }
 
     /// A uniform draw over the pool, drawn again while its worker is
-    /// refused: the values [`Picker::draw_first`] reads of the same seed,
-    /// so the pick is the whole decision's first target. Past
-    /// [`DRAW_BOUND`] refused workers the caller reads the pool whole.
+    /// refused: the draw [`Picker::draw_first`] makes, by the same seed, so
+    /// the pick is the whole decision's first target. Past the draw's
+    /// bound of refused workers the caller reads the pool whole.
     fn pick_alone(
         &self,
         pool: &PoolWord<'_>,
         draw: &mut Draw,
         keep: &mut dyn FnMut(usize) -> bool,
     ) -> Option<usize> {
-        if pool.rows == 0 {
-            return None;
-        }
-        for _ in 0..DRAW_BOUND {
-            let at = draw.below(pool.rows);
-            if keep(at) {
-                return Some(at);
-            }
-        }
-        None
+        draw_place(draw, pool.rows, None, keep, &mut 0)
     }
 
     /// A uniform draw among the workers that pass, by the stream past the

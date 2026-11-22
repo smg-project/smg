@@ -403,7 +403,22 @@ pub(crate) fn draw_kept(
     keep: &mut dyn FnMut(&Candidate) -> bool,
     refused: &mut u32,
 ) -> Option<usize> {
-    let rows = candidates.len() - usize::from(except.is_some());
+    let keep = |row: usize| keep(&candidates[row]);
+    draw_place(draw, candidates.len(), except, keep, refused)
+}
+
+/// [`draw_kept`] over the places of a pool of `rows`, with `keep` asked of
+/// a place: the one draw of a decision's rows and of a pool's workers
+/// where a picker picks them alone, so one seed names one place by both.
+#[inline]
+pub(crate) fn draw_place(
+    draw: &mut Draw,
+    rows: usize,
+    except: Option<usize>,
+    mut keep: impl FnMut(usize) -> bool,
+    refused: &mut u32,
+) -> Option<usize> {
+    let rows = rows - usize::from(except.is_some());
     if rows == 0 {
         return None;
     }
@@ -412,7 +427,7 @@ pub(crate) fn draw_kept(
         if except.is_some_and(|taken| row >= taken) {
             row += 1;
         }
-        if keep(&candidates[row]) {
+        if keep(row) {
             return Some(row);
         }
         *refused += 1;

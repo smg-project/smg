@@ -11,7 +11,7 @@ use crate::{
     document::spec::ProfileSpec,
     engine::{
         decision::{Targets, MAX_TARGETS},
-        framework::{Picker, PoolWord, TieBand, DRAW_BOUND},
+        framework::{Picker, PicksAlone, PoolWord, TieBand, DRAW_BOUND},
         view::{Candidate, ModelFingerprint, PoolFacts, RequestFacts},
     },
     policies::standard_filters,
@@ -228,8 +228,8 @@ impl Picker for RoundRobin {
     }
 
     // Its rotation is its whole rule, and a pool's own word counts it.
-    fn picks_alone(&self) -> bool {
-        true
+    fn picks_alone(&self) -> PicksAlone {
+        PicksAlone::ByOrder
     }
 
     /// The pool's own turn by the pool's own word: one step of the word and
