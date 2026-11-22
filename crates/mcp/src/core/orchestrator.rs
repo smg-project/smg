@@ -1849,7 +1849,7 @@ impl McpOrchestrator {
                 Ok(entries) => (entries, None),
                 Err(message) => (Vec::new(), Some(message)),
             };
-        self.connection_pool.set_listing(
+        let still_pooled = self.connection_pool.set_listing(
             &pool_key,
             &client,
             match &list_error {
@@ -1862,6 +1862,13 @@ impl McpOrchestrator {
                 }
             },
         );
+        if !still_pooled {
+            debug!(
+                "Dynamic server '{}' (tenant: {:?}) left the pool during its listing - its \
+                 tools stay out of the inventory",
+                pool_key.url, pool_key.tenant_id
+            );
+        }
 
         if opened {
             self.metrics.record_connection_opened();
