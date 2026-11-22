@@ -45,8 +45,9 @@ pub(crate) const PAD: &str = "<pad>";
 /// `tiktoken.rs`).
 pub(crate) const PATTERN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-/// The most special ids a configuration may name. The files in use name
-/// 1,000.
+/// The most special ids a configuration may name: a bound of this reader,
+/// beyond the checks of the reference reader. A load keeps a slot for every
+/// special id the configuration names. The files in use name 1,000.
 const MAX_SPECIAL_TOKENS: usize = 1 << 16;
 
 /// The special tokens of a file that lists none: the reference reader's
