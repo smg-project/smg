@@ -27,7 +27,11 @@
 //! publishes once. `--overloaded 1` puts every worker over its
 //! overload threshold, so the list admits no worker, and gives each worker
 //! requests in flight: its place plus one, the middle worker none, so the
-//! rule for such a list has loads to steer by. `--callers` threads each
+//! rule for such a list has loads to steer by. `--shadow twin` names a copy
+//! of the cell's profile as its binding's shadow, so each decision is
+//! followed by its shadow profile's. `--shadow other` names that shadow at
+//! a binding of another model: the cell's decisions then have no shadow,
+//! under a document that names one. `--callers` threads each
 //! make `--decisions` timed decisions behind untimed first ones. The result
 //! is one line.
 //!
@@ -65,7 +69,7 @@ use std::{
 use counting_alloc::{calls, Counting};
 use parking_lot::{Condvar, Mutex};
 use smg_policy_controller::{
-    document::{AppliedSpec, PolicySpec},
+    document::{AppliedSpec, PolicySpec, ShadowSpec},
     engine::{
         Constraints, Decided, Identity, Phase, Plain, PolicyEngine, PoolMembers, Request,
         RequestFacts, RequestMaker, WorkerId, WorkerLists,
@@ -219,6 +223,18 @@ fn mix(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+/// Which binding of a run's document names a copy of the cell's profile as
+/// its shadow.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shadowed {
+    /// None: the document is the cell's preset as it stands.
+    No,
+    /// The cell's own binding: each decision has a shadow.
+    Twin,
+    /// A binding of another model: the cell's decisions have none.
+    Other,
+}
+
 /// One run, as the switches state it.
 struct Run {
     cell: Cell,
@@ -227,6 +243,7 @@ struct Run {
     decisions: u64,
     publish_ms: u64,
     overloaded: bool,
+    shadow: Shadowed,
 }
 
 fn run() -> Run {
@@ -237,6 +254,7 @@ fn run() -> Run {
         decisions: 1_000_000,
         publish_ms: 0,
         overloaded: false,
+        shadow: Shadowed::No,
     };
     let mut switches = env::args().skip(1);
     while let Some(switch) = switches.next() {
@@ -256,6 +274,13 @@ fn run() -> Run {
             "--decisions" => run.decisions = number(),
             "--publish-ms" => run.publish_ms = number(),
             "--overloaded" => run.overloaded = number() != 0,
+            "--shadow" => {
+                run.shadow = match value.as_str() {
+                    "twin" => Shadowed::Twin,
+                    "other" => Shadowed::Other,
+                    other => panic!("no shadow {other}"),
+                };
+            }
             other => panic!("no switch {other}"),
         }
     }
@@ -374,7 +399,22 @@ fn main() {
             }
         }
     }
-    let document = document();
+    let mut document = document();
+    if run.shadow != Shadowed::No {
+        // A copy of the profile the cell's binding names.
+        let live = document.bindings[0].profile.clone();
+        let twin = document.profiles[&live.expect("a binding of one profile")].clone();
+        document.profiles.insert("twin".to_owned(), twin);
+        let named = Some(ShadowSpec::Profile("twin".to_owned()));
+        if run.shadow == Shadowed::Other {
+            let mut other = document.bindings[0].clone();
+            "another-model".clone_into(&mut other.matcher.model);
+            other.shadow = named;
+            document.bindings.insert(0, other);
+        } else {
+            document.bindings[0].shadow = named;
+        }
+    }
     let spec = AppliedSpec::validate(&document).expect("a valid document");
     let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(spec)));
     behind(engine);

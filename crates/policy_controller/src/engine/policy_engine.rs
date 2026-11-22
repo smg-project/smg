@@ -34,7 +34,9 @@
 //! request's guard holds to its end. The engine files no lease and keeps no
 //! note of a request: the guard lends back what a later word needs
 //! ([`HeldDecision`]). A single request is decided in [`single`], and a pair
-//! in [`pair`], with its decode asked again behind its prefill.
+//! in [`pair`], with its decode asked again behind its prefill. Where a
+//! single's binding names a shadow, that profile decides after the whole
+//! decision and its decision is counted ([`with_shadow`]).
 //!
 //! The engine keeps no worker list, no health and no count of requests in
 //! flight. What it keeps is its stages' own: a rotation, and for the stages
@@ -47,6 +49,7 @@ pub mod overlap;
 pub(super) mod pair;
 mod single;
 mod task;
+mod with_shadow;
 
 use std::{
     cell::RefCell,
@@ -71,10 +74,12 @@ use super::{
     },
     framework::{
         release, AloneProfile, EncodeItems, EncodePlaced, NotAlone, Picker, Place, PoolWord,
+        ShadowRows, SHADOWS,
     },
     lease_events,
     prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
+    shadow::{Counted, ShadowCounts, Shadowed},
     sticky_sessions::{shards_for_this_host, SessionTable},
     view::{fingerprint, FixedFacts, Phase, WireModes, WorkerId},
 };
@@ -112,7 +117,8 @@ pub struct PolicyEngine {
     /// The one clock of the engine's decisions: a decision's instant and a
     /// load report's sample instant are counted from its origin.
     clock: DecisionClock,
-    /// How many whole decisions panicked ([`DecisionEngine::faults`]).
+    /// How many whole decisions panicked, and how many shadow profiles did
+    /// after a live decision that stood ([`DecisionEngine::faults`]).
     faults: AtomicU64,
     /// How many words of a lease and changes of membership panicked in a
     /// stage that heard them.
@@ -142,7 +148,19 @@ pub struct PolicyEngine {
     /// and the newest snapshot the engine's own task keeps at hand
     /// ([`Self::run`]).
     loads: task::Loads,
+    /// Whether a binding of the document names a shadow profile
+    /// ([`SHADOWS`]), read once, here. A whole decision of a single request
+    /// pays one test of it, and a place picked alone pays none.
+    any_shadow: bool,
+    /// The shadow decisions counted so far ([`DecisionEngine::shadowed`]),
+    /// by binding and kind. The table is allocated at the first of them: a
+    /// document that names no shadow keeps none.
+    shadow_counts: OnceLock<Box<ShadowCounts>>,
 }
+
+/// The document's word of a binding's shadow: the binding's position, and
+/// how its shadow profile reads the live decision's affinity rows.
+type ShadowWord = (u32, ShadowRows);
 
 /// One pool of one model as the engine keeps it: the gateway's shared list
 /// of worker objects and the pool's own word.
@@ -172,6 +190,10 @@ pub struct PoolMembers {
     /// engine picks alone for it, where the document holds one
     /// ([`Self::alone`]).
     alone: OnceLock<(Box<str>, Option<AloneProfile>)>,
+    /// The model of the list's first whole decision under a document that
+    /// names a shadow, and the document's word of that model's shadow
+    /// ([`Self::shadow`]).
+    shadow: OnceLock<(Box<str>, Option<ShadowWord>)>,
     /// What a decision whose stages read affinity keeps of the list
     /// ([`Self::affinity`]): read at the list's first such decision, and by
     /// no other.
@@ -242,10 +264,10 @@ impl PoolMembers {
 
     /// The profile the engine picks alone for a single request of `model`
     /// over this list ([`Place::Alone`]), under a binding that states no
-    /// sessions rule: `None` where the place's decision asks more than one
-    /// pick. Found once a list, for the model of its first request: a
-    /// gateway's list is one model's. Another model's request is answered
-    /// by the document at its call.
+    /// sessions rule and names no shadow: `None` where the place's decision
+    /// asks more than one pick. Found once a list, for the model of its
+    /// first request: a gateway's list is one model's. Another model's
+    /// request is answered by the document at its call.
     fn alone(&self, spec: &AppliedSpec, model: &str) -> Option<AloneProfile> {
         let find = || {
             let engine = spec.engine();
@@ -254,11 +276,29 @@ impl PoolMembers {
             };
             // A sessions rule pins a keyed request ahead of the profile.
             let ruled = engine.binding(model, Phase::Single)?.sessions.is_some();
-            (!ruled).then_some(profile)
+            // A shadow profile runs with a whole decision, over its
+            // records: one test under a document that names none.
+            let any_shadow = engine.seat_flags() & SHADOWS != 0;
+            let has_shadow = any_shadow && engine.shadow_for(model, Phase::Single).is_some();
+            (!ruled && !has_shadow).then_some(profile)
         };
         let (named, alone) = self.alone.get_or_init(|| (model.into(), find()));
         if **named == *model {
             *alone
+        } else {
+            find()
+        }
+    }
+
+    /// What the document says of the shadow of a single request of `model`
+    /// ([`ShadowWord`]): `None` under a binding that names no shadow. Found
+    /// once a list, as [`Self::alone`] is: a request of the list's model
+    /// pays no second read of its binding.
+    fn shadow(&self, spec: &AppliedSpec, model: &str) -> Option<ShadowWord> {
+        let find = || spec.engine().shadow_for(model, Phase::Single);
+        let (named, shadow) = self.shadow.get_or_init(|| (model.into(), find()));
+        if **named == *model {
+            *shadow
         } else {
             find()
         }
@@ -270,12 +310,14 @@ impl PolicyEngine {
     #[must_use]
     pub fn new(mut spec: AppliedSpec) -> Self {
         let hears = spec.engine().hears();
+        let any_shadow = spec.engine().seat_flags() & SHADOWS != 0;
         // The table takes the document's two times where the document's
         // engine takes the pointer.
         let sessions = Arc::new(SessionTable::new(0).with_shards(shards_for_this_host()));
         spec.share_sessions(Arc::clone(&sessions));
         Self {
             hears,
+            any_shadow,
             spec,
             applied: next_applied(),
             epochs: AtomicU64::new(0),
@@ -287,6 +329,7 @@ impl PolicyEngine {
             sessions,
             affinity: Affinity::default(),
             loads: task::Loads::default(),
+            shadow_counts: OnceLock::new(),
         }
     }
 
@@ -408,6 +451,7 @@ impl PolicyEngine {
             records: OnceLock::new(),
             wires: OnceLock::new(),
             alone: OnceLock::new(),
+            shadow: OnceLock::new(),
             affinity: PoolAffinity::default(),
         }
     }
@@ -601,6 +645,10 @@ impl PolicyEngine {
     /// a pick names its alternates: a host that hands a decision's targets
     /// to another process cannot ask again cheaply.
     ///
+    /// A binding's shadow decides behind the live decision, as under the
+    /// leasing entry. What it said is dropped here: the entry's caller
+    /// does not count it yet.
+    ///
     /// # Errors
     ///
     /// [`DecisionRefused::PairSide`] for a request of any phase but
@@ -623,7 +671,7 @@ impl PolicyEngine {
             let mut request = self.made(maker);
             match (request.facts.phase, maker.workers()) {
                 (Phase::Single, WorkerLists::Single(members)) => {
-                    Ok(self.decide_made(maker, &mut request, members, now))
+                    Ok(self.decide_made(maker, &mut request, members, now, &mut None))
                 }
                 (Phase::Single, _) => Ok(single::over_none(self, &request)),
                 (Phase::Prefill | Phase::Decode | Phase::Encode, _) => {
@@ -637,6 +685,12 @@ impl PolicyEngine {
     /// every entry that decides one. It reads the snapshot the request
     /// gives where it gives one, and the newest the engine's own task
     /// keeps at hand otherwise.
+    ///
+    /// Under a binding that names a shadow, the shadow profile decides
+    /// behind the live one ([`with_shadow::decide`]). What it said is
+    /// written into `said`, for the caller to count behind its issue. A
+    /// document that names no shadow pays one test: its path holds nothing
+    /// else of a shadow.
     #[inline]
     fn decide_made<'a>(
         &self,
@@ -644,6 +698,7 @@ impl PolicyEngine {
         request: &mut Request<'a>,
         members: &'a PoolMembers,
         now: Instant,
+        said: &mut Option<Shadowed>,
     ) -> super::decision::Decision {
         let kept;
         let loads = match maker.loads() {
@@ -653,7 +708,17 @@ impl PolicyEngine {
                 kept.as_ref().and_then(|newest| newest.as_ref())
             }
         };
-        single::decide(self, request, members, loads, now)
+        // Under a document that names a shadow the list's word says
+        // whether this binding does.
+        if self.any_shadow {
+            if let Some(binding) = members.shadow(&self.spec, request.facts.model) {
+                let (decision, shadow) =
+                    with_shadow::decide(self, request, members, loads, now, binding);
+                *said = shadow;
+                return decision;
+            }
+        }
+        single::decide(self, request, members, loads, now, single::WithoutShadow)
     }
 
     /// The decision's pass: the place it answers, or its whole decision
@@ -689,7 +754,15 @@ impl PolicyEngine {
         let later = request.constraints.decode_later;
         let decided = match (request.facts.phase, maker.workers()) {
             (Phase::Single, WorkerLists::Single(members)) => {
-                self.decide_made(maker, &mut request, members, now)
+                let mut said = None;
+                let decision = self.decide_made(maker, &mut request, members, now, &mut said);
+                // What a shadow said is counted behind the lease's issue.
+                if let Some(said) = said {
+                    let decided = with_shadow::issued(self, decision, &request, now, said);
+                    *whole = Some((decided, later));
+                    return Ok(None);
+                }
+                decision
             }
             // A pair is decided at its prefill, over its host's two
             // lists.
@@ -723,9 +796,9 @@ impl PolicyEngine {
 /// of a list's records, wires or one-pick profile: a stage's lock is its own.
 ///
 /// A panic in a decision costs that request its decision and is counted
-/// ([`DecisionEngine::faults`]). A panic in a stage that hears a word is
-/// held here too and counted ([`PolicyEngine::unheard`]): the request goes
-/// on.
+/// ([`DecisionEngine::faults`]). A shadow's panic costs its request nothing
+/// and is counted with them. A panic in a stage that hears a word is held
+/// here too and counted ([`PolicyEngine::unheard`]): the request goes on.
 impl DecisionEngine for PolicyEngine {
     fn decide_under(
         &self,
@@ -828,9 +901,15 @@ impl DecisionEngine for PolicyEngine {
         self.faults.load(Ordering::Relaxed)
     }
 
-    // No shadow is asked here: a document that states one does not start.
-    fn shadowed(&self, _: u32, _: ShadowKind) -> u64 {
-        0
+    // The shadow decisions counted for single requests. No shadow profile
+    // runs on a pair's side here.
+    fn shadowed(&self, binding: u32, kind: ShadowKind) -> u64 {
+        let counts = self.shadow_counts.get();
+        counts.map_or(0, |counts| {
+            counts
+                .of(binding, Counted::Single, kind)
+                .load(Ordering::Relaxed)
+        })
     }
 }
 

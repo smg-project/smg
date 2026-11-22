@@ -39,12 +39,16 @@
 //! [`decide`] is one single decision over such records, in the calling
 //! thread's own buffer. It writes the records the decision reads: every
 //! worker's where the profile's stages read the pool, and where the
-//! profile's picker draws first, the drawn workers' alone.
+//! profile's picker draws first, the drawn workers' alone. Under a binding
+//! that names a shadow profile, [`with_shadow::decide`] is that decision
+//! followed by the shadow profile's, over every worker's record.
 //!
 //! One clock dates both sides ([`DecisionClock`]): a decision's instant and
 //! a report's sample instant are microseconds since one origin, so a load
 //! stage's credit of dispatches is released by a report sampled after them
 //! and by no other.
+
+pub(crate) mod with_shadow;
 
 use std::{
     cell::{Cell, RefCell},
@@ -1016,6 +1020,14 @@ pub fn decide(
         let (rows, pool_facts) = pool.write(workers, live, rows);
         engine.decide(facts, &pool_facts, rows, cx, scratch)
     };
+    with_buffers(decide)
+}
+
+/// Runs one decision over the calling thread's own buffers: the one borrow
+/// of them, for a decision without a shadow ([`decide`]) and for one
+/// followed by its binding's shadow profile ([`with_shadow::decide`]).
+#[inline]
+fn with_buffers<T>(decide: impl FnOnce(&mut Buffers) -> T) -> T {
     BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
         Ok(mut buffers) => decide(&mut buffers),
         // A stage asked for a decision from inside its own, on this

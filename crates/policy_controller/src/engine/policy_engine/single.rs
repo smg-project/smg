@@ -40,16 +40,17 @@ use std::{
     time::Instant,
 };
 
-use smg_worker::{load::state::LoadSnapshot, runtime::RoutingState};
+use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, runtime::RoutingState};
 
 use super::{keys, overlap, PolicyEngine, PoolMembers};
 use crate::{
     engine::{
         decision::{Decision, Shed, ShedReason, Trace, SUBSET_HINT, WIRES},
         decision_engine::{AlonePick, DecideOutcome, Leased, Plain, Request},
+        framework::Engine,
         records,
         sticky_sessions::SessionVerdict,
-        view::{Phase, Session},
+        view::{Constraints, Phase, RequestFacts, Session},
     },
     stages::Lifecycle,
     tracking::lease::{EventKind, EventSet, Lease, LeaseId, LeaseKind, Side, DISPATCH_TTL},
@@ -148,19 +149,58 @@ pub(super) fn noted(
     Some(decided)
 }
 
+/// How a made request's whole decision runs over its pool's records. The
+/// caller of [`decide`] states the form where it is written, so [`decide`]
+/// holds no test of it. One form runs the binding's live profile alone
+/// ([`WithoutShadow`]): one call of [`records::decide`] and nothing else.
+/// The other runs the binding's shadow profile behind it
+/// ([`super::with_shadow`]).
+pub(super) trait WholeDecision {
+    /// The engine's whole decision over `records`, the records of
+    /// `workers`, for the request `facts` state.
+    fn decide(
+        self,
+        engine: &Engine,
+        records: &records::PoolRecords,
+        workers: &[Arc<dyn Worker>],
+        live: &records::Live<'_>,
+        facts: &mut RequestFacts<'_>,
+        cx: &Constraints<'_>,
+    ) -> Decision;
+}
+
+/// The whole decision by the live profile alone.
+pub(super) struct WithoutShadow;
+
+impl WholeDecision for WithoutShadow {
+    #[inline(always)]
+    fn decide(
+        self,
+        engine: &Engine,
+        records: &records::PoolRecords,
+        workers: &[Arc<dyn Worker>],
+        live: &records::Live<'_>,
+        facts: &mut RequestFacts<'_>,
+        cx: &Constraints<'_>,
+    ) -> Decision {
+        records::decide(engine, records, workers, live, facts, cx)
+    }
+}
+
 /// One made request's decision over `members`, the list its host handed,
 /// at `now`: by the rows its key names where they answer
 /// ([`keys::decide`]), and else the engine's whole decision over records
-/// written for the request from the list's workers. Each worker's report
-/// is read from `loads`, the host's load snapshot for this decision. A
-/// request that states what no stage here runs is declined under that
-/// stage's name.
+/// written for the request from the list's workers, run as `whole` states
+/// ([`WholeDecision`]). Each worker's report is read from `loads`, the
+/// host's load snapshot for this decision. A request that states what no
+/// stage here runs is declined under that stage's name.
 pub(super) fn decide(
     own: &PolicyEngine,
     request: &mut Request<'_>,
     members: &PoolMembers,
     loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
+    whole: impl WholeDecision,
 ) -> Decision {
     let spec = &own.spec;
     let cx = request.constraints;
@@ -197,7 +237,7 @@ pub(super) fn decide(
         workers,
         records.ids(),
         facts,
-        |facts| records::decide(engine, records, workers, &live, facts, &cx),
+        |facts| whole.decide(engine, records, workers, &live, facts, &cx),
     )
 }
 
@@ -284,7 +324,7 @@ pub(super) fn issued(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{cell::Cell, sync::Arc, time::Duration};
 
     use parking_lot::Mutex;
@@ -315,7 +355,7 @@ mod tests {
         },
     };
 
-    const MODEL: &str = "model-a";
+    pub(crate) const MODEL: &str = "model-a";
 
     fn preset(name: &str) -> PolicyEngine {
         let mut document = PolicySpec::preset(name).expect("a built-in preset");
@@ -334,13 +374,13 @@ mod tests {
         PolicyEngine::new(AppliedSpec::validate(&document).expect("the document validates"))
     }
 
-    fn pool(workers: usize) -> Arc<[Arc<dyn Worker>]> {
+    pub(crate) fn pool(workers: usize) -> Arc<[Arc<dyn Worker>]> {
         (0..workers)
             .map(|at| ready_worker(&format!("http://worker-{at}:8000"), MODEL))
             .collect()
     }
 
-    fn request<'a>() -> Request<'a> {
+    pub(crate) fn request<'a>() -> Request<'a> {
         Request {
             id: b"request",
             facts: RequestFacts {
@@ -354,15 +394,15 @@ mod tests {
 
     /// A request stated ahead, with the list its host hands for it, and how
     /// many times the engine made it.
-    struct Asks<'a> {
-        request: Request<'a>,
-        members: Option<&'a PoolMembers>,
-        loads: Option<Arc<LoadSnapshot>>,
-        made: Cell<u32>,
+    pub(crate) struct Asks<'a> {
+        pub(crate) request: Request<'a>,
+        pub(crate) members: Option<&'a PoolMembers>,
+        pub(crate) loads: Option<Arc<LoadSnapshot>>,
+        pub(crate) made: Cell<u32>,
     }
 
     impl<'a> Asks<'a> {
-        fn of(request: Request<'a>, members: Option<&'a PoolMembers>) -> Self {
+        pub(crate) fn of(request: Request<'a>, members: Option<&'a PoolMembers>) -> Self {
             Self {
                 request,
                 members,
@@ -396,13 +436,13 @@ mod tests {
     }
 
     /// What the one entry answers a request stated ahead.
-    fn answered(engine: &PolicyEngine, asks: &Asks<'_>) -> Decided {
+    pub(crate) fn answered(engine: &PolicyEngine, asks: &Asks<'_>) -> Decided {
         let decided = engine.decide_under(GatewayId::LOCAL, asks, Instant::now());
         decided.expect("an answer")
     }
 
     /// The whole decision the entry answers: no place.
-    fn decided(engine: &PolicyEngine, asks: &Asks<'_>) -> DecideOutcome {
+    pub(crate) fn decided(engine: &PolicyEngine, asks: &Asks<'_>) -> DecideOutcome {
         answered(engine, asks).whole().expect("a whole decision").0
     }
 
