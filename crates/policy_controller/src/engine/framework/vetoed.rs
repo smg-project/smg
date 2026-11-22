@@ -599,7 +599,7 @@ mod tests {
         },
         policies::{consistent_hashing::ConsistentHash, manual::Manual},
         stages::{
-            filters::{Healthy, NotOverloaded},
+            filters::{HasCapacity, HasRoom, Healthy, NotOverloaded},
             lifecycle::Lifecycle,
             pickers::Best,
         },
@@ -1280,14 +1280,29 @@ mod tests {
     /// decide. `shed` makes its binding shed a pool the veto empties. The
     /// decode side's shadow is a twin of its profile.
     fn pair_engine(shed: bool) -> Engine {
-        let side = |name: &str| Profile {
+        pair_engine_of(shed, [vetoes(), vetoes()])
+    }
+
+    /// The health stage and the overload veto: a side's filters.
+    fn vetoes() -> Vec<Box<dyn Filter>> {
+        vec![Box::new(Healthy), Box::new(NotOverloaded)]
+    }
+
+    /// [`pair_engine`], its live sides filtering by `live` instead: the
+    /// prefill side's filters, then the decode side's.
+    fn pair_engine_of(shed: bool, [prefill, decode]: [Vec<Box<dyn Filter>>; 2]) -> Engine {
+        let side = |name: &str, filters| Profile {
             name: name.into(),
-            filters: vec![Box::new(Healthy), Box::new(NotOverloaded)],
+            filters,
             scorers: vec![],
             picker: Box::new(Best),
         };
         let mut engine = Engine::new(
-            vec![side("prefill"), side("decode"), side("twin")],
+            vec![
+                side("prefill", prefill),
+                side("decode", decode),
+                side("twin", vetoes()),
+            ],
             vec![Binding {
                 model: "*".into(),
                 phases: vec![],
@@ -1344,7 +1359,10 @@ mod tests {
     /// among the chosen prefill's partners. No decode is open, so the rule
     /// first says which decodes it keeps and the prefill is chosen for
     /// them: a prefill whose class holds no decode is passed over. A doubted
-    /// decode among them is not kept, however few requests it holds.
+    /// decode among them is not kept, however few requests it holds. The
+    /// gateway's own pair selection answers so
+    /// (`model_gateway/src/routers/common/placement.rs:1315-1321`,
+    /// `:1338-1341`, `:1571-1578`).
     #[test]
     fn a_pairs_decode_side_over_on_every_worker_goes_to_the_fewest_in_flight() {
         let engine = pair_engine(false);
@@ -1360,10 +1378,29 @@ mod tests {
     }
 
     /// Under a binding that sheds, a pair's decode side over its thresholds
-    /// on every worker is shed as saturated.
+    /// on every worker is shed as saturated, as the gateway's own selection
+    /// lifts nothing where it sheds (`placement.rs:1314-1321` there).
     #[test]
     fn a_binding_that_sheds_sheds_a_pairs_decode_side_over_on_every_worker() {
         let (prefills, decodes) = ([classed(free(0, 1), 1)], [classed(over(0, 1), 1)]);
+        let decision = decide_pair(&pair_engine(true), &prefills, &decodes);
+        assert_eq!(
+            shed_of(&decision),
+            (ShedReason::Saturated, "not-overloaded")
+        );
+    }
+
+    /// A pair's first decision crosses no doubt. Under a binding that sheds,
+    /// the rule keeps a doubted decode under its thresholds beside a busy
+    /// one, and a decode kept past a doubt opens no prefill: the pool is
+    /// shed as saturated, as it was. The gateway's own pair selection places
+    /// that pair by its fallback
+    /// (`model_gateway/src/routers/common/placement.rs:1443-1458`,
+    /// `:1138-1147`).
+    #[test]
+    fn a_pairs_first_decision_crosses_no_doubt_under_a_binding_that_sheds() {
+        let prefills = [classed(free(0, 0), 1)];
+        let decodes = [classed(over(0, 1), 1), classed(doubted(1, 0), 1)];
         let decision = decide_pair(&pair_engine(true), &prefills, &decodes);
         assert_eq!(
             shed_of(&decision),
@@ -1395,11 +1432,102 @@ mod tests {
         assert_eq!(shed_of(&refused), (ShedReason::Saturated, "not-overloaded"));
     }
 
+    /// A free decode keeps its pool from the rule, whoever it pairs with: a
+    /// decode outside any pairing, or one whose own prefill is not ready.
+    /// The gateway's own pair selection lifts the veto for the decode side
+    /// only where no decode of the whole pool is available
+    /// (`model_gateway/src/routers/common/placement.rs:1315-1321`, `:1341`),
+    /// and refuses these pairs.
+    #[test]
+    fn a_free_decode_keeps_its_pool_from_the_rule() {
+        let engine = pair_engine(false);
+        let refused = |prefills: &[Candidate], decodes: &[Candidate]| {
+            shed_of(&decide_pair(&engine, prefills, decodes))
+        };
+        let saturated = (ShedReason::Saturated, "not-overloaded");
+        let outside = [classed(over(0, 0), 1), free(1, 0)];
+        assert_eq!(refused(&[classed(free(0, 0), 1)], &outside), saturated);
+        let mut prefills = [classed(free(0, 0), 1), classed(free(1, 0), 2)];
+        prefills[1].health.healthy = false;
+        let decodes = [classed(over(0, 0), 1), classed(free(1, 0), 2)];
+        assert_eq!(refused(&prefills, &decodes), saturated);
+    }
+
+    /// A room narrows a prefill's partners, and hides no prefill. Both
+    /// decodes are over their thresholds alone: one is full and its prefill
+    /// free, the other has room and its prefill is at its limit. The pair is
+    /// the free prefill with its full decode, whichever of the two classes
+    /// stands first among the decodes. The gateway's own pair
+    /// selection makes it so: a prefill at its limit leaves before the
+    /// policy picks, and the rooms are asked among the picked prefill's
+    /// partners (`model_gateway/src/routers/common/placement.rs:1467-1480`,
+    /// `:1520-1521`, `:1551-1578`).
+    #[test]
+    fn a_room_narrows_a_prefills_partners_and_hides_no_prefill() {
+        let (mut limit, mut room) = (vetoes(), vetoes());
+        limit.push(Box::new(HasCapacity));
+        room.push(Box::new(HasRoom));
+        let engine = pair_engine_of(false, [limit, room]);
+        // The pair where the prefill at `under` is under its limit and the
+        // other prefill's decode has the room.
+        let placed = |under: usize| {
+            let mut prefills = [classed(free(0, 0), 1), classed(free(1, 0), 2)];
+            prefills[under].has_capacity = true;
+            let mut decodes = [classed(over(0, 0), 1), classed(over(1, 0), 2)];
+            decodes[1 - under].has_room = true;
+            let decision = decide_pair(&engine, &prefills, &decodes);
+            (pair_of(&decision), decision.trace().lifted)
+        };
+        assert_eq!(placed(0), ((0, 0), LiftedVeto::Overload));
+        assert_eq!(placed(1), ((1, 1), LiftedVeto::Overload));
+    }
+
+    /// The pass that opens the prefills sets the retry's tried list aside,
+    /// as the rule's own pass does: a hard filter that reads the list hides
+    /// no prefill whose decode the rule then takes. The gateway's own pair
+    /// selection steps aside from a tried decode only while another partner
+    /// is left (`model_gateway/src/routers/common/placement.rs:1562-1570`),
+    /// and places this pair.
+    #[test]
+    fn a_tried_decode_still_opens_its_prefill() {
+        /// Refuses a worker an earlier attempt tried: a hard filter.
+        #[derive(Debug)]
+        struct Untried;
+        impl Filter for Untried {
+            fn name(&self) -> &'static str {
+                "untried"
+            }
+            fn keep(&self, req: &RequestFacts<'_>, row: &Candidate, _: &Constraints<'_>) -> bool {
+                !req.tried.contains(&row.id)
+            }
+        }
+        let mut reads_tried = vetoes();
+        reads_tried.push(Box::new(Untried));
+        let engine = pair_engine_of(false, [vetoes(), reads_tried]);
+        let (prefills, decodes) = ([classed(free(0, 0), 1)], [classed(over(0, 1), 1)]);
+        let pools = PairPools {
+            prefills: &prefills,
+            decodes: &decodes,
+            ..PairPools::default()
+        };
+        let tried = [decodes[0].id];
+        let req = RequestFacts {
+            tried: &tried,
+            ..facts(1)
+        };
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let decision = engine.decide_pair(&req, &pool, pools, &cx, &cx, &mut Scratch::new());
+        assert_eq!(pair_of(&decision), (0, 0));
+        assert_eq!(decision.trace().lifted, LiftedVeto::Overload);
+    }
+
     /// A decode asked for a held prefill is put to the rule, both its tiers.
     /// Partners over their thresholds on every worker go to the one that
     /// holds the fewest requests, and under a binding that sheds they are
     /// shed as saturated. Partners doubted on every worker go to the fewest
-    /// requests under either word, and never to one a hold stands on.
+    /// requests under either word, and never to one a hold stands on. The
+    /// gateway's own selection asks no decode again, so these answers are
+    /// the engine's own.
     #[test]
     fn a_decode_asked_for_a_held_prefill_is_put_to_the_rule() {
         let prefills = [classed(free(0, 0), 1)];
