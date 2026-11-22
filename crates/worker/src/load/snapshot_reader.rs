@@ -37,9 +37,8 @@ use std::{
 use crate::load::state::{LoadReceiver, LoadSnapshot};
 
 /// The monitor's feed for the asks a policy engine of this process
-/// decides. Empty until its host hands it the monitor's channel
-/// ([`Self::read`]): an ask is then lent no snapshot, and its records
-/// carry no report.
+/// decides. Until its host hands it the monitor's channel
+/// ([`Self::read`]) it is empty, and an ask is lent no snapshot.
 #[derive(Debug, Default)]
 pub struct LoadSnapshotReader {
     feed: OnceLock<LoadReceiver>,
