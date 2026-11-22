@@ -914,9 +914,13 @@ impl Format {
     /// arguments state or a calls wrapper, and the message frame's are the terminals with a row
     /// into or out of the frame (`Self::message_framing`): a table whose thought is framed by
     /// them alone (Inkling's, whose kind markers also move between the bodies) shows none, and
-    /// neither does the variant [`Self::without_calls`] made of it. A state's own text rows
-    /// stay with it: a trimmed stay is still trimmed, a framing state's text still dropped; and a
-    /// tag the end cut short is still dropped, as the legacy parsers drop it on both their paths.
+    /// neither does the variant [`Self::without_calls`] made of it. Where the turn starts in its
+    /// own wrapper (Kimi K3's message), the markers on a row between that wrapper and the answer
+    /// (the response tags, the message close) frame the answer, not the thought, and stay
+    /// dropped: the thought keeps its two tags and the answer comes back bare. A state's own
+    /// text rows stay with it: a trimmed stay is still trimmed, a framing state's text still
+    /// dropped; and a tag the end cut short is still dropped, as the legacy parsers drop it on
+    /// both their paths.
     /// A table without a thought changes only in what it shows; the thought-first mark and the
     /// layout, which serve the tags alone, go. A marker with no row out of the thought's state is
     /// its text and counts no malformed run, as in the table (`Self::is_remade`), so an output
@@ -925,10 +929,24 @@ impl Format {
     pub fn without_reasoning(mut self) -> Self {
         let calls = self.terminals_of_calls();
         let framing = self.message_framing();
+        let wrapped = self
+            .states
+            .first()
+            .is_some_and(|state| state.emits == Emits::Wrapper);
+        let answers: Vec<usize> = self
+            .transitions
+            .iter()
+            .filter(|row| {
+                let answer = |state: usize| self.emits(state) == Emits::Content;
+                wrapped && ((row.from == 0 && answer(row.to)) || (row.to == 0 && answer(row.from)))
+            })
+            .map(|row| row.on)
+            .collect();
         for (index, terminal) in self.terminals.iter_mut().enumerate() {
             if !terminal.ignored
                 && !calls.contains(&index)
                 && !framing.contains(&index)
+                && !answers.contains(&index)
                 && !terminal.frames_messages
             {
                 terminal.shown = true;
@@ -2245,16 +2263,15 @@ mod tests {
     const KIMI_OPENER: &str = "<|open|>message role=\"assistant\"<|sep|>";
 
     #[test]
-    fn without_reasoning_shows_kimi_k3s_frame_and_still_reads_its_call() {
-        // The legacy reasoning parser removes the think, response and message tags and leaves the
-        // tools channel to the tool parser; without it those tags are text, and the call reads.
+    fn without_reasoning_shows_kimi_k3s_think_tags_alone_and_still_reads_its_call() {
+        // The think tags are the thought's and stay as text; the response tags and the message
+        // close frame the answer, which the legacy tool parser unwraps too, and the call reads.
         let format = crate::formats::kimi_k3().without_reasoning();
         assert!(format.validate().is_ok());
         let (content, reasoning, calls) = said(&events(format, KIMI_OPENER, KIMI_TURN));
         assert_eq!(
             content,
-            "<|open|>think<|sep|>a thought<|close|>think<|sep|><|open|>response<|sep|>an answer\
-             <|close|>response<|sep|><|close|>message<|sep|>"
+            "<|open|>think<|sep|>a thought<|close|>think<|sep|>an answer"
         );
         assert_eq!(reasoning, "");
         assert_eq!(calls, 1);
@@ -2266,7 +2283,7 @@ mod tests {
             KIMI_OPENER,
             cut,
         );
-        assert_eq!(said(&out).0, "<|open|>response<|sep|>an answer");
+        assert_eq!(said(&out).0, "an answer");
         let dropped = out.iter().rev().nth(1);
         assert!(
             matches!(dropped, Some(crate::event::Event::Dropped { text, .. })
