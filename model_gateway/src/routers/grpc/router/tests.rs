@@ -139,13 +139,18 @@ async fn the_attempt_deadline_is_armed_only_by_grpc_request_timeout_secs() {
 }
 
 /// A store has one policy engine, the context's. The router's stages ask that
-/// one, and the router builds none of its own.
+/// one, and the router builds none of its own. Every pipeline the router
+/// builds is handed it, whichever bundle of dependencies builds the
+/// pipeline: where the engine decides a policy, the policy registry may hold
+/// no classic policy for a pipeline built without the engine. Over a context
+/// with no engine, no pipeline asks one.
 #[tokio::test]
 async fn a_router_asks_the_policy_engine_of_its_context() {
     use crate::policy_controller::engine::testing::bed;
 
     let config = grpc_config(regular_routing_mode()).build_unchecked();
-    let mut ctx = grpc_ctx_from(&config, mcp_orchestrator().await);
+    let mcp_orchestrator = mcp_orchestrator().await;
+    let mut ctx = grpc_ctx_from(&config, Arc::clone(&mcp_orchestrator));
     let (policy_engine, _store, _workers) = bed(&[]);
     let policy_engine = Arc::new(policy_engine);
     Arc::get_mut(&mut ctx)
@@ -158,7 +163,22 @@ async fn a_router_asks_the_policy_engine_of_its_context() {
         Arc::strong_count(&policy_engine) > 2,
         "the router's stages hold the context's policy engine"
     );
+    for pipeline in pipelines_of(&router) {
+        assert!(
+            pipeline.asks_policy_engine(),
+            "a pipeline was built without the context's policy engine"
+        );
+    }
     drop(router);
+
+    let bare = grpc_ctx_from(&config, mcp_orchestrator);
+    let router = GrpcRouter::new(&bare, Mode::Regular).expect("regular router");
+    for pipeline in pipelines_of(&router) {
+        assert!(
+            !pipeline.asks_policy_engine(),
+            "a pipeline asks a policy engine its context does not hold"
+        );
+    }
 }
 
 /// `--grouped-dp-sticky` reaches every pipeline a regular or PD router
