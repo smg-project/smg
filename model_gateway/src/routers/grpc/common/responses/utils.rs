@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::response::Response;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use openai_protocol::{
-    common::{Tool, Usage},
+    common::{to_value_exact, Tool, Usage},
     responses::{
         CustomTool, IncompleteDetails, IncompleteReason, InputTokensDetails, NamespaceTool,
         OutputTokensDetails, ResponseStatus, ResponseTool, ResponseUsage, ResponsesRequest,
@@ -660,7 +660,10 @@ pub(crate) async fn persist_response_if_needed(
         "foreground"
     };
     let response_json = match to_value(response) {
-        Ok(json) => json,
+        Ok(mut json) => {
+            exact_sampling_numbers(&mut json, response);
+            json
+        }
         Err(e) => {
             warn!(response_id = %response.id, error = %e, "Failed to serialize the response for storage");
             Metrics::record_response_not_stored(mode, "record");
@@ -775,6 +778,22 @@ pub(crate) async fn persist_response_if_needed(
 fn not_stored(error: &PersistError) -> NotStored {
     NotStored::new(error.retryable, error)
 }
+
+/// Writes `temperature` and `top_p` into the JSON tree of a response as
+/// the response holds them: the plain conversion widens the two 32-bit
+/// numbers to 64 bits.
+pub(crate) fn exact_sampling_numbers(raw: &mut Value, response: &ResponsesResponse) {
+    for (key, value) in [
+        ("temperature", response.temperature),
+        ("top_p", response.top_p),
+    ] {
+        let Some(value) = value else { continue };
+        if let (Some(slot), Ok(exact)) = (raw.get_mut(key), to_value_exact(&value)) {
+            *slot = exact;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1041,6 +1060,41 @@ mod tests {
         )
         .await
         .expect("nothing to store, nothing to report");
+    }
+
+    /// A stored response gives its `temperature` and `top_p` to a `GET` of
+    /// its id as the answer itself gave them, not widened to 64 bits.
+    #[tokio::test]
+    async fn a_get_of_a_stored_response_reads_the_sampling_numbers_unwidened() {
+        use crate::endpoints::responses::get_response;
+
+        let storage: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hi",
+            "temperature": 0.7,
+            "top_p": 0.9
+        }))
+        .unwrap();
+        persist_response_if_needed(
+            Arc::new(MemoryConversationStorage::new()),
+            Arc::new(MemoryConversationItemStorage::new()),
+            storage.clone(),
+            &completed_response("resp_g", &request),
+            &request,
+            None,
+            None,
+        )
+        .await
+        .expect("the record is written");
+
+        let answer = get_response(&storage, None, "resp_g", None).await;
+        let body = axum::body::to_bytes(answer.into_body(), 1 << 20).await;
+        let read: Value = serde_json::from_slice(&body.unwrap()).unwrap();
+        assert_eq!(
+            (&read["temperature"], &read["top_p"]),
+            (&json!(0.7), &json!(0.9))
+        );
     }
 
     /// A background response deleted while its work ran (its record is gone

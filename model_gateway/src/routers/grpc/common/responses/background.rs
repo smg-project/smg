@@ -256,7 +256,8 @@ pub(crate) async fn store_record(
     tenant: Option<&str>,
     request_context: Option<StorageRequestContext>,
 ) -> Result<(), ResponseStorageError> {
-    let raw = serde_json::to_value(response)?;
+    let mut raw = serde_json::to_value(response)?;
+    super::utils::exact_sampling_numbers(&mut raw, response);
     let mut stored = build_stored_response(raw, request);
     stored.input = Value::Array(
         extract_input_items(&request.input).map_err(ResponseStorageError::StorageError)?,
@@ -326,7 +327,10 @@ pub(crate) async fn finish_unstored(
     request_context: Option<StorageRequestContext>,
 ) {
     let mut raw = match serde_json::to_value(response) {
-        Ok(raw) => raw,
+        Ok(mut raw) => {
+            super::utils::exact_sampling_numbers(&mut raw, response);
+            raw
+        }
         Err(e) => {
             warn!(response_id = %response.id, error = %e, "Failed to serialize the background response");
             return;
