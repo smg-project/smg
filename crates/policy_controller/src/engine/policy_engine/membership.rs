@@ -24,8 +24,9 @@
 //! registration or its replacement. Last the stages are told the ids that
 //! stand: a worker whose whole life the channel dropped is in neither
 //! list, and a stage drops there what requests left under it. The records
-//! of sent prefixes hear no such list: they forget an id at its join, so
-//! a worker inherits nothing of a life the channel dropped.
+//! of sent prefixes forget there every id that is not among them, and an
+//! id at its join, so a worker inherits nothing of a life the channel
+//! dropped.
 //!
 //! The events the channel kept come behind that read and may be older than
 //! it, and a registry can say a registration ahead of the removal it
@@ -83,9 +84,13 @@ use crate::{
 /// ([`Worker::runtime_state`]). A host that wraps a worker in another
 /// object before it hands it on must hand on that state: else a removal
 /// is read as an earlier life's and tells no leave, and each whole read
-/// tells every worker a leave and a join. A registry registers a new
-/// object at each registration: an object it removed and registers again
-/// is read as the life that was removed.
+/// tells every worker a leave and a join. A replacement is read by its
+/// object alone: it tells something only where its `old` is the object
+/// the follow was handed of the worker. A host that wraps each event
+/// anew so has every replacement tell nothing, and an id a replacement
+/// changes is told at the next whole read alone. A registry registers a
+/// new object at each registration: an object it removed and registers
+/// again is read as the life that was removed.
 pub trait Members: Send + Sync {
     /// A subscription to the registry's events from this call on.
     fn events(&self) -> Receiver<WorkerEvent>;
@@ -102,7 +107,8 @@ pub trait Members: Send + Sync {
     /// nothing: the id is the fingerprint of the worker's address. An id
     /// the host's lists name that this states of no standing worker is in
     /// no whole read's snapshot: the stages drop what they keep under it,
-    /// and a ring or a bucket fences it for a while.
+    /// a ring or a bucket fences it for a while, and the records of sent
+    /// prefixes forget it.
     ///
     /// Asked on the engine's task, some time behind the registry's write:
     /// the host may have replaced the object since. A host that keeps a
@@ -110,9 +116,9 @@ pub trait Members: Send + Sync {
     /// and each replacement is then told under its own id. A host that
     /// keeps the id by the worker's address answers of the worker that
     /// stands there. An id that stood only between two replacements heard
-    /// together is then told to no stage. A replacement that changes the
-    /// id told owes a whole read at the task's next upkeep, and its
-    /// snapshot drops what requests left under such an id
+    /// together is then told to no stage. So a replacement of a worker
+    /// whose id this states owes a whole read at the task's next upkeep,
+    /// and its snapshot drops what requests left under such an id
     /// ([`PolicyEngine::set_registry`]).
     fn facts_of(&self, _worker: &Arc<dyn Worker>) -> FixedFacts {
         FixedFacts::default()
@@ -202,16 +208,17 @@ pub(super) struct Follow {
     /// Whether the follow owes a whole read of the registry at the task's
     /// next upkeep: at its start, behind a channel that closed, behind a
     /// word lost to a panic of the host's own code, and behind a
-    /// replacement that changed the id told.
+    /// replacement of a worker whose id its host states.
     unread: bool,
 }
 
 impl Follow {
     /// The id the stages are told `worker` under: the one its host states,
-    /// or the fingerprint of its address.
-    fn id_of(&self, worker: &Arc<dyn Worker>) -> WorkerId {
+    /// or the fingerprint of its address. And whether its host states one.
+    fn id_of(&self, worker: &Arc<dyn Worker>) -> (WorkerId, bool) {
         let facts = self.registry.facts_of(worker);
-        facts.id_or(worker_id(worker.as_ref()))
+        let stated = facts.id.is_some();
+        (facts.id_or(worker_id(worker.as_ref())), stated)
     }
 }
 
@@ -243,9 +250,9 @@ impl PolicyEngine {
     ///
     /// A worker removed and another registered at its address come as a
     /// `Removed` and a `Registered`: a leave, then a join. The records of
-    /// sent prefixes forget the worker's id at a leave, and at a join no
-    /// leave came ahead of. The session table is told nothing, as at the
-    /// two calls.
+    /// sent prefixes forget the worker's id at a leave, at a join no leave
+    /// came ahead of, and behind a whole read where it stands no more. The
+    /// session table is told nothing, as at the two calls.
     ///
     /// An id names one worker. A worker registered under an id that
     /// another worker is held under is read as the id's next life: a leave
@@ -263,8 +270,11 @@ impl PolicyEngine {
     /// so a stage keeps nothing of a worker whose whole life the channel
     /// dropped. A worker that keeps no state and was replaced inside the
     /// dropped events is told there as its next life. It reads whole
-    /// behind a replacement that changed the id told too, at its next
-    /// upkeep. It does the same behind a channel that closed, on another
+    /// behind a replacement of a worker whose id the host states too, at
+    /// its next upkeep: a host that keeps ids by address may have stated
+    /// another id between two replacements heard together, and the read
+    /// drops what requests left under it. It does the same behind a
+    /// channel that closed, on another
     /// subscription, once a second for as long as the host hands a closed
     /// one. The engine keeps the registry for as long as it stands, and
     /// reads it off a request's path alone.
@@ -332,7 +342,7 @@ impl PolicyEngine {
     fn tells(&self, follow: &mut Follow, word: Result<WorkerEvent, RecvError>) -> bool {
         match word {
             Ok(WorkerEvent::Registered { worker_id, worker }) => {
-                let id = follow.id_of(&worker);
+                let (id, _) = follow.id_of(&worker);
                 self.stands(follow, worker_id, &worker, id, false);
             }
             Ok(WorkerEvent::Replaced {
@@ -345,7 +355,11 @@ impl PolicyEngine {
                 // removal was heard ahead: it tells nothing.
                 let held = follow.told.get(&worker_id);
                 if held.is_some_and(|held| held.holds(&old)) {
-                    let id = follow.id_of(&new);
+                    let (id, stated) = follow.id_of(&new);
+                    // The id may stand while another stood between two
+                    // replacements heard together: the read ends with
+                    // the ids that stand.
+                    follow.unread |= stated;
                     self.stands(follow, worker_id, &new, id, true);
                 }
             }
@@ -376,10 +390,7 @@ impl PolicyEngine {
     ///
     /// A join no leave comes ahead of starts with no sent prefixes all the
     /// same: the records forget the id first, so the worker inherits
-    /// nothing of a life the channel dropped whole. A replacement that
-    /// changes the id told owes a whole read: the host may have stated an
-    /// id between two replacements heard together, and the read's snapshot
-    /// drops what requests left under it.
+    /// nothing of a life the channel dropped whole.
     fn stands(
         &self,
         follow: &mut Follow,
@@ -392,7 +403,6 @@ impl PolicyEngine {
             if was.id == id && (replaced || was.is(worker)) {
                 return;
             }
-            follow.unread |= replaced;
             self.unnamed(follow, was.id);
         }
         let held = follow.under.entry(id).or_insert(0);
@@ -438,8 +448,9 @@ impl PolicyEngine {
     /// then each worker that stands. Last it tells them the ids that stand
     /// ([`Membership::Snapshot`]): a worker whose whole life the channel
     /// dropped is in neither list, and a stage drops there what requests
-    /// left under it. The records of sent prefixes are told the single
-    /// leaves alone, and forget an id at its join. A worker found under a
+    /// left under it. The records of sent prefixes forget every id that
+    /// is not among them ([`super::overlap::Affinity::keep`]). A worker
+    /// found under a
     /// registry id the follow holds is the worker held where it is the
     /// object held or keeps its state, and the worker's next life
     /// otherwise: a worker that keeps no state and was replaced inside the
@@ -448,7 +459,7 @@ impl PolicyEngine {
     fn read_whole(&self, follow: &mut Follow) {
         let standing = follow.registry.standing().into_iter();
         let stands: FxHashMap<ObjectId, (WorkerId, Arc<dyn Worker>)> = standing
-            .map(|(object, worker)| (object, (follow.id_of(&worker), worker)))
+            .map(|(object, worker)| (object, (follow.id_of(&worker).0, worker)))
             .collect();
         let held = follow.told.keys();
         let gone: Vec<ObjectId> = held
@@ -462,6 +473,7 @@ impl PolicyEngine {
             self.stands(follow, object, &worker, id, false);
         }
         let standing: Vec<WorkerId> = follow.under.keys().copied().collect();
+        self.affinity.keep(&standing);
         self.told(&Membership::Snapshot(&standing));
     }
 }

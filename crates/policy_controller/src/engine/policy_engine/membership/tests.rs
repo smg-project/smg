@@ -334,6 +334,10 @@ fn a_replaced_object_and_a_status_change_tell_the_stages_nothing() {
     drain(&engine, &mut follow);
     assert_eq!(told(&heard), []);
     assert_eq!(held(&follow), sorted(vec![id(0), id(1)]));
+    assert!(
+        !follow.unread,
+        "a replacement of a worker whose host states no id owes no read"
+    );
 
     // The worker is still followed: its removal is told.
     remove(&registry, 0);
@@ -630,11 +634,35 @@ fn a_replacement_that_changes_the_id_told_owes_a_whole_read() {
     engine.follow_registry(&mut members);
     assert_eq!(told_and_standing(&heard), (vec![], vec![WorkerId(9)]));
 
-    // No read is owed behind it, and none behind a replacement under which the id stands.
-    replace(&registry, 0);
-    drain(&engine, members.as_mut().expect("the follow"));
+    // No read is owed behind it.
     engine.follow_registry(&mut members);
     assert_eq!(told_and_standing(&heard), (vec![], vec![]));
+}
+
+/// A host that keeps ids by address can state another id of a worker and
+/// the first again between two replacements heard together: both words
+/// name the id told, so the stages are told nothing, and what requests
+/// left under the id between would stay. A replacement of a worker whose
+/// id its host states owes a whole read at the next upkeep, with no lag:
+/// its snapshot names the ids that stand.
+#[test]
+fn a_replacement_under_a_stated_id_that_stands_owes_a_whole_read() {
+    let registry = registry(1);
+    let host = Stating::over(&registry);
+    host.state(0, 7);
+    let (engine, heard, follow) = following(&host);
+    let mut members = Some(follow);
+    let _ = told(&heard);
+
+    // The host stated 8 and then 7 again of the worker ahead of the first
+    // word.
+    replace(&registry, 0);
+    replace(&registry, 0);
+    drain(&engine, members.as_mut().expect("the follow"));
+    assert_eq!(told_and_standing(&heard), (vec![], vec![]));
+
+    engine.follow_registry(&mut members);
+    assert_eq!(told_and_standing(&heard), (vec![], vec![WorkerId(7)]));
 }
 
 /// Two workers stand under one stated id, and the host gives one of them
@@ -717,6 +745,59 @@ fn a_join_and_a_leave_of_the_follow_forget_the_ids_sent_prefixes() {
     }
     drain(&engine, &mut follow);
     assert_ne!(places(400), second, "a leave forgets the sent prefixes");
+}
+
+/// A whole read tells the records of sent prefixes the ids that stand. A
+/// worker that was sent prefixes and stands no more is forgotten there,
+/// though the follow never told its leave: a prompt the records name it
+/// for is placed by its request's seed again. A worker that stands keeps
+/// what it was sent.
+#[test]
+fn a_whole_read_forgets_the_sent_prefixes_of_an_id_that_stands_no_more() {
+    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let engine = PolicyEngine::new(spec);
+    let registry = registry(0);
+    engine.set_registry(handed(&registry));
+    let mut follow = started(&engine).expect("a registry was handed");
+    let list = pool(8);
+    let members = engine.pool_members(&list);
+    let sent = |prompt: u32, seed: u64| {
+        let tokens: Vec<u32> = (prompt * 100_000..prompt * 100_000 + 1_024).collect();
+        let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+        let mut asked = request();
+        asked.facts.seed = seed;
+        hashes.write_to(&mut asked.facts);
+        let asks = Asks::of(asked, Some(&members));
+        let decided = decided(&engine, &asks);
+        let pick = decided.decision.pick().expect("a pick");
+        pick.targets.first().expect("a target").position
+    };
+    let places = |seeds: u64| -> Vec<u32> {
+        (0..16)
+            .map(|prompt| sent(prompt, seeds + u64::from(prompt)))
+            .collect()
+    };
+    let first = places(0);
+    assert_eq!(places(100), first, "a prompt stays where it was sent");
+
+    // None of the eight stands in the registry.
+    engine.heard(Some(&mut follow), Err(RecvError::Lagged(1)));
+    let second = places(200);
+    assert_ne!(
+        second, first,
+        "the read forgets a worker that stands no more"
+    );
+
+    // All eight stand: the read forgets none.
+    for at in 0..8 {
+        register(&registry, at);
+    }
+    drain(&engine, &mut follow);
+    let third = places(300);
+    engine.heard(Some(&mut follow), Err(RecvError::Lagged(1)));
+    assert_eq!(places(400), third, "the read keeps a worker that stands");
 }
 
 /// The engine's own task follows the registry its host handed: the workers

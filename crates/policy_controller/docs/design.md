@@ -910,13 +910,13 @@ worker whose host states none is named by the fingerprint of its address.
 |---|---|
 | `Registered` | a join |
 | `Removed` | a leave, under the id told at the worker's join |
-| `Replaced` | nothing where the host states the same id of the new object; a leave of the old id and a join of the new one where it states another |
+| `Replaced` | nothing where the host states the same id of the new object; a leave of the old id and a join of the new one where it states another; nothing of an object the task does not hold |
 | `StatusChanged` | nothing: a decision reads a worker's status on its object |
 
 A worker removed and another registered at its address come as a `Removed` and a `Registered`,
 so a leave and then a join. Where the registration is heard first, the worker is read as its
 id's next life: a leave and a join of the id, and the removal then tells nothing. That holds
-under the registry's own id of a worker too: a removal tells a leave only of the object the
+under the registry's own id of a worker too: a removal tells a leave only of the worker the
 task holds. The events
 are a broadcast that drops its oldest for a reader that falls behind: the task then reads the
 registry whole, tells what changed, and last tells the ids that stand, so a stage keeps

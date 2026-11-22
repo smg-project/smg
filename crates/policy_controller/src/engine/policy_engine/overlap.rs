@@ -27,7 +27,7 @@
 //!   already holds, sixteen blocks a turn, and takes each turn by a try: a
 //!   turn that meets a held lock ends the write there, so a pick waits for
 //!   nobody. The map of the records is behind a mutex that only the read of
-//!   a list's table, a removed worker and the timer's sweep take.
+//!   a list's table, a change of membership and the timer's sweep take.
 //! - **Once a thread**: the buffers a naming writes into. A decision
 //!   allocates nothing once they have grown.
 //!
@@ -49,7 +49,7 @@ use std::{
 use arc_swap::ArcSwapOption;
 use kv_index::ChainIndex;
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smg_worker::identity::basic::Worker;
 
 use crate::{
@@ -160,8 +160,8 @@ pub trait CacheIndexes: Send + Sync {
 pub struct Affinity {
     indexes: OnceLock<Arc<dyn CacheIndexes>>,
     /// The record of sent prefixes of each model, by the model id its
-    /// workers registered under. Locked where a list's table is read, where
-    /// a worker left and at the timer's sweep: never by a decision's naming
+    /// workers registered under. Locked where a list's table is read, at a
+    /// change of membership and at the timer's sweep: never by a decision's naming
     /// or its write, which hold their record by the list's table.
     records: Mutex<FxHashMap<Box<str>, Arc<PrefixRecord>>>,
 }
@@ -191,12 +191,24 @@ impl Affinity {
         self.indexes.get()?.block_size(model)
     }
 
-    /// A worker left the pool or was replaced: every record of sent
-    /// prefixes forgets it. Takes the records' map and, for a record that
-    /// holds the worker, that record's lock as a writer.
+    /// A worker left the pool, was replaced, or joins with no leave told
+    /// ahead: every record of sent prefixes forgets it. Takes the records'
+    /// map and, for a record that holds the worker, that record's lock as
+    /// a writer.
     pub fn forget(&self, worker: WorkerId) {
         for record in self.records.lock().values() {
             record.forget(worker);
+        }
+    }
+
+    /// The workers that stand, said whole behind a read of the host's
+    /// registry: every record forgets each worker it holds a place for
+    /// that is not among them, so a worker whose leave was never told
+    /// keeps no place. Takes what [`Self::forget`] takes.
+    pub(super) fn keep(&self, standing: &[WorkerId]) {
+        let standing: FxHashSet<WorkerId> = standing.iter().copied().collect();
+        for record in self.records.lock().values() {
+            record.keep(&standing);
         }
     }
 
@@ -332,6 +344,20 @@ impl PrefixRecord {
         self.left.fetch_add(1, Ordering::Relaxed);
         predictor.forget(worker);
         self.sweeping.store(true, Ordering::Relaxed);
+    }
+
+    /// Forgets every worker the record holds a place for that is not in
+    /// `standing` ([`Self::forget`]).
+    fn keep(&self, standing: &FxHashSet<WorkerId>) {
+        let held = self.predictor.read();
+        let gone: Vec<WorkerId> = held
+            .held()
+            .filter(|worker| !standing.contains(worker))
+            .collect();
+        drop(held);
+        for worker in gone {
+            self.forget(worker);
+        }
     }
 
     /// One step of the work that waits, under the writer's guard.
