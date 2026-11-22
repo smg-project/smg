@@ -1213,8 +1213,8 @@ On main: 18 sheets, 482 lines.
 
 | | Sheets | Lines |
 |---|---|---|
-| replayed and passing | 15 | 426 |
-| recorded, replayed by nothing (`pair_select`, `rank_pin`, `constraint_decider`) | 3 | 56 |
+| replayed and passing | 16 | 437 |
+| recorded, replayed by nothing (`pair_select`, `constraint_decider`) | 2 | 45 |
 | replayed through the engine that stays (`PolicyEngine`) | **0** | **0** |
 | replayed lines held to an answer of the crate's own, not classic's | | 23 |
 

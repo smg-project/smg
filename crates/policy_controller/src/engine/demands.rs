@@ -24,6 +24,10 @@
 //! alone ([`DemandFacts::window`]), and the two are not added. A worker
 //! that states no window holds a request of any size.
 //!
+//! A request whose route can pin no data-parallel rank says so
+//! ([`Demands::no_rank`]), and a worker that registered a rank does not
+//! take it ([`DemandFacts::ranked`]).
+//!
 //! A pool the demands leave nobody is shed with no endpoint, under the
 //! stage of one demand ([`UnmetDemand::stage`]). A row is judged by the demand
 //! it fails first, in the order a host answers for them ([`UnmetDemand`]), and
@@ -77,6 +81,10 @@ pub struct Demands {
     /// is. A prefill worker is not held to it ([`Self::held_by`]): a host
     /// states it whatever the request's phase. `0` demands none.
     pub output_window: u32,
+    /// Whether no data-parallel rank can be pinned for the request: its
+    /// route names no rank to the worker it sends to. Only a worker that
+    /// registered none ([`DemandFacts::ranked`]) takes the request.
+    pub no_rank: bool,
 }
 
 impl Demands {
@@ -88,6 +96,7 @@ impl Demands {
             && matches!(self.references, References::None)
             && self.input_window == 0
             && self.output_window == 0
+            && !self.no_rank
     }
 
     /// The demand a worker fails first, in the order of [`UnmetDemand`]:
@@ -96,6 +105,9 @@ impl Demands {
     /// demand.
     #[must_use]
     pub const fn unmet_by(self, vision: bool, facts: DemandFacts) -> Option<UnmetDemand> {
+        if self.no_rank && facts.ranked {
+            return Some(UnmetDemand::Rank);
+        }
         if self.runtime != 0 && self.runtime != facts.runtime {
             return Some(UnmetDemand::Runtime);
         }
@@ -152,7 +164,8 @@ impl Demands {
 /// What a worker states for the hard demands of a request beside its row,
 /// by its registration: one entry a row, in a column beside the rows. The
 /// default states nothing: it meets no demand for a runtime or for media by
-/// reference, and it holds a request of any size. Whether the worker takes
+/// reference, it holds a request of any size, and it registered no rank.
+/// Whether the worker takes
 /// images is no entry of the column: its row carries that bit
 /// ([`WorkerFacts::vision`](crate::store::WorkerFacts::vision)). Further
 /// demands add their fields: a host writes the rest of the type as
@@ -173,6 +186,10 @@ pub struct DemandFacts {
     /// holds a request to it. `0` states none, and the worker takes a
     /// request of any size.
     pub window: u32,
+    /// Whether the worker registered a data-parallel rank, a group of one
+    /// included: a request no rank can be pinned for
+    /// ([`Demands::no_rank`]) is left to the workers that registered none.
+    pub ranked: bool,
 }
 
 /// The stage a pool is shed under when none of its rows processes media by
@@ -188,15 +205,24 @@ pub(crate) const PIPELINE: &str = "pipeline";
 /// window that holds less than the request needs ([`UnmetDemand::Window`]).
 pub(crate) const CONTEXT_WINDOW: &str = "context-window";
 
+/// The stage a pool is shed under when each of its rows registered a
+/// data-parallel rank and none can be pinned for the request
+/// ([`UnmetDemand::Rank`]).
+pub(crate) const RANK: &str = "rank";
+
 /// The demand a worker fails first. The order is the order a host answers
-/// for them: a pool is cut to its request's runtime, then to the workers
-/// that take images, then to those that process media by reference, then
-/// to the pipeline the request names, then to the windows that hold the
-/// request. Further demands add their cases: a host's match keeps an arm
-/// for the rest.
+/// for them: a pool is cut to the workers that registered no rank where
+/// none can be pinned for its request, then to its request's runtime, then
+/// to the workers that take images, then to those that process media by
+/// reference, then to the pipeline the request names, then to the windows
+/// that hold the request. Further demands add their cases: a host's match
+/// keeps an arm for the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum UnmetDemand {
+    /// The worker registered a data-parallel rank, and none can be pinned
+    /// for the request.
+    Rank,
     /// Another runtime than the request stays on, or none stated.
     Runtime,
     /// The worker takes no images.
@@ -219,6 +245,7 @@ impl UnmetDemand {
     #[must_use]
     pub const fn stage(self) -> &'static str {
         match self {
+            Self::Rank => RANK,
             Self::Runtime => decision::WIRES,
             Self::Vision => framework::VISION,
             Self::References => REFERENCES,
@@ -391,6 +418,49 @@ mod tests {
         assert_eq!(both.unmet_by(false, host), Some(UnmetDemand::Window));
     }
 
+    /// A request no rank can be pinned for is met by the workers that
+    /// registered none, and a request that says nothing of ranks by every
+    /// worker. The rank is judged first, so a pool is shed under it only
+    /// where every worker registered one. That is the gateway's classic
+    /// rule: it filters its pool to the workers with no rank before it
+    /// selects one (`model_gateway/src/routers/http/router.rs:1237-1247`
+    /// at main `ddd8a44cb`).
+    #[test]
+    fn a_request_no_rank_can_be_pinned_for_leaves_the_workers_that_registered_one() {
+        let ranked = DemandFacts {
+            ranked: true,
+            ..DemandFacts::default()
+        };
+        let plain = DemandFacts::default();
+        let unpinned = Demands {
+            no_rank: true,
+            ..Demands::default()
+        };
+        assert!(!unpinned.is_none());
+        assert_eq!(unpinned.unmet_by(false, plain), None);
+        assert_eq!(unpinned.unmet_by(false, ranked), Some(UnmetDemand::Rank));
+        assert!(Demands::default().met_by(false, ranked));
+        let long = Demands {
+            input_window: 101,
+            ..unpinned
+        };
+        let narrow = DemandFacts {
+            window: 100,
+            ..plain
+        };
+        let both = DemandFacts {
+            ranked: true,
+            ..narrow
+        };
+        assert_eq!(long.unmet_by(false, both), Some(UnmetDemand::Rank));
+        // A worker that registered a rank and holds the request, beside one
+        // that registered none and does not: a pool is shed under the
+        // largest, the window.
+        let mix = [long.unmet_by(false, ranked), long.unmet_by(false, narrow)];
+        assert_eq!(mix, [Some(UnmetDemand::Rank), Some(UnmetDemand::Window)]);
+        assert_eq!(mix.into_iter().max(), Some(Some(UnmetDemand::Window)));
+    }
+
     /// A prefill worker is held to the input alone: the completion's
     /// bound is its decode's to hold. Every other role is held to both,
     /// and no other demand moves with the role.
@@ -402,6 +472,7 @@ mod tests {
             references: References::Caller,
             input_window: 40,
             output_window: 400,
+            no_rank: true,
         };
         let input_alone = Demands {
             output_window: 0,
@@ -423,6 +494,7 @@ mod tests {
     #[test]
     fn the_demands_stand_in_a_hosts_order_each_with_its_stage() {
         let order = [
+            UnmetDemand::Rank,
             UnmetDemand::Runtime,
             UnmetDemand::Vision,
             UnmetDemand::References,
@@ -433,6 +505,7 @@ mod tests {
         assert_eq!(
             order.map(UnmetDemand::stage),
             [
+                "rank",
                 "wires",
                 "vision",
                 "references",
