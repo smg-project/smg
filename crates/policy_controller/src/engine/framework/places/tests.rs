@@ -64,7 +64,7 @@ fn of(rows: &[Candidate]) -> PoolFacts<'static> {
 }
 
 /// A request held to `places`.
-fn held(places: &[u32]) -> Constraints<'_> {
+fn stating(places: &[u32]) -> Constraints<'_> {
     Constraints {
         places: Some(places),
         ..Constraints::default()
@@ -103,7 +103,7 @@ fn no_preset_hands_a_target_outside_the_places_under_the_draws_floor() {
         for bare in [false, true] {
             let engine = stock(name, bare);
             for seed in 0..24 {
-                let (cx, mut scratch) = (held(&places), Scratch::new());
+                let (cx, mut scratch) = (stating(&places), Scratch::new());
                 let decision = engine.decide(&facts(seed), &of(&rows), &rows, &cx, &mut scratch);
                 let named = named(&decision);
                 let what = format!("{name}, bare {bare}, seed {seed}");
@@ -145,7 +145,7 @@ fn the_filter_half_opens_with_the_places_under_a_profile_of_no_filter() {
     let rows = pool(8);
     let mut first = [0_u32; 8];
     for seed in 0..64 {
-        let (cx, mut scratch) = (held(&[1, 6, 99]), Scratch::new());
+        let (cx, mut scratch) = (stating(&[1, 6, 99]), Scratch::new());
         let decision = engine.decide(&facts(seed), &of(&rows), &rows, &cx, &mut scratch);
         // The whole pass counts the survivors of its filters: the two
         // places of the pool, and not the one past its end.
@@ -160,7 +160,7 @@ fn the_filter_half_opens_with_the_places_under_a_profile_of_no_filter() {
     }
     assert!(first[1] > 0 && first[6] > 0, "{first:?}");
     // Held to no place of the pool, the request has no candidate.
-    let (cx, mut scratch) = (held(&[]), Scratch::new());
+    let (cx, mut scratch) = (stating(&[]), Scratch::new());
     let none = engine.decide(&facts(1), &of(&rows), &rows, &cx, &mut scratch);
     assert!(none.pick().is_none());
 }
@@ -179,10 +179,34 @@ fn a_pool_over_its_thresholds_is_steered_among_the_places() {
         rows[place].in_flight = in_flight;
     }
     for seed in 1..=8 {
-        let (cx, mut scratch) = (held(&[1, 4, 6]), Scratch::new());
+        let (cx, mut scratch) = (stating(&[1, 4, 6]), Scratch::new());
         let decision = engine.decide(&facts(seed), &of(&rows), &rows, &cx, &mut scratch);
         assert_eq!(named(&decision), [4, 6, 1], "seed {seed}");
         let pick = decision.pick().expect("a pick");
         assert_eq!(pick.trace.lifted, LiftedVeto::Overload);
+    }
+}
+
+/// A request held to the one place it already tried is handed that place
+/// again, not refused, as over a list of that worker alone: the filter of
+/// tried workers is soft, and steps aside where it would leave nobody.
+#[test]
+fn a_request_held_to_the_one_place_it_tried_is_handed_it_again() {
+    let rows = pool(8);
+    let gone = [rows[5].id];
+    for name in ["round_robin", "least_load"] {
+        let engine = stock(name, false);
+        let request = RequestFacts {
+            attempt: 1,
+            tried: &gone,
+            ..facts(3)
+        };
+        let cx = Constraints {
+            excluded: &gone,
+            ..stating(&[5])
+        };
+        let mut scratch = Scratch::new();
+        let decision = engine.decide(&request, &of(&rows), &rows, &cx, &mut scratch);
+        assert_eq!(named(&decision), [5], "{name}");
     }
 }

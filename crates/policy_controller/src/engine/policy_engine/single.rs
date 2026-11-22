@@ -26,7 +26,9 @@
 //! **What is refused by name.** The list a host hands is its request's own:
 //! every worker of it is dialed on a wire the request states. A list that is
 //! not, a subset hint and a hard demand are declined under the stage that
-//! would have run them.
+//! would have run them. So is a request held to places of its list
+//! ([`PLACES`]): the engine's draws and its keyed reads do not ask the
+//! places yet.
 
 use std::{
     sync::{atomic::Ordering, Arc},
@@ -54,6 +56,13 @@ use crate::{
 /// The stage a request that states a hard demand is declined under: no
 /// stage of this engine reads a worker's facts for one.
 const DEMANDS: &str = "demands";
+
+/// The stage a request held to places of its list is declined under
+/// ([`Constraints::places`](crate::engine::view::Constraints::places)),
+/// single or pair. The staged pass holds a request to its places. The
+/// engine's draws and its keyed reads do not ask them yet, so no caller
+/// is answered a worker outside them.
+pub(super) const PLACES: &str = "places";
 
 /// The crate's word, in a shed's `emptied_by`, for a pool no stage emptied.
 const NO_STAGE: &str = "none";
@@ -161,6 +170,9 @@ pub(super) fn decide<'r>(
     }
     if !cx.demands.is_none() {
         return declined(own, request, DEMANDS);
+    }
+    if cx.places.is_some() {
+        return declined(own, request, PLACES);
     }
     if !cx.wire_modes.is_empty() && !cx.wire_modes.contains(members.wires()) {
         return declined(own, request, WIRES);
@@ -653,7 +665,9 @@ mod tests {
         later.constraints.decode_later = true;
         let mut masked = request();
         masked.constraints.stalled = &rows;
-        for request in [retried, missed, hinted, lifted, later, masked] {
+        let mut held = request();
+        held.constraints.places = Some(&rows);
+        for request in [retried, missed, hinted, lifted, later, masked, held] {
             assert_eq!(request.plain(), None);
         }
     }
@@ -708,6 +722,14 @@ mod tests {
         assert_eq!(
             shed(hinted, Some(&members)),
             (ShedReason::PolicyDeclined, SUBSET_HINT)
+        );
+        // Held to a place of the list: the one turn does not answer it, and
+        // no pass that does not ask the places yet is run for it.
+        let mut held = request();
+        held.constraints.places = Some(&[1]);
+        assert_eq!(
+            shed(held, Some(&members)),
+            (ShedReason::PolicyDeclined, PLACES)
         );
         // The list's workers are dialed over HTTP.
         let mut dialed = request();

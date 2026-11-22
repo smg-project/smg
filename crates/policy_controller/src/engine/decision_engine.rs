@@ -82,6 +82,11 @@ pub trait RequestMaker {
     /// no fact of a request, so a plain request of such a place is decided
     /// with none made: its routing key is not derived and no seed is drawn
     /// for it. The answer is cheap: it reads the document nowhere.
+    ///
+    /// A request held to places of its list
+    /// ([`Constraints::places`](super::view::Constraints::places)) is not
+    /// plain: that pick reads no constraint. A maker that states places
+    /// answers `None` here.
     fn plain(&self) -> Option<Plain> {
         None
     }
@@ -127,7 +132,8 @@ impl RequestMaker for Request<'_> {
             && cx.demands.is_none()
             && !cx.overload_lifted
             && !cx.decode_later
-            && cx.stalled.is_empty();
+            && cx.stalled.is_empty()
+            && cx.places.is_none();
         plain.then_some(Plain {
             phase: facts.phase,
             wires: cx.wire_modes,
@@ -141,8 +147,8 @@ impl RequestMaker for Request<'_> {
 ///
 /// A request is plain where it is a first attempt that asks nothing beyond
 /// a worker of its list: it names no worker tried or just missed, states no
-/// subset hint, no hard demand and no later decode, lifts no veto, and no
-/// standing veto of its host masks a row.
+/// subset hint, no hard demand, no later decode and no places of its list,
+/// lifts no veto, and no standing veto of its host masks a row.
 ///
 /// A lease issued for a plain request that was never made states no
 /// session: no rule of a place picked by its picker alone reads one.

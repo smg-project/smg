@@ -1758,9 +1758,9 @@ fn only(classes: &[u32]) -> Option<u32> {
 /// 4.2: a shed names it): a pool with no candidate was emptied by no stage,
 /// a prefill whose classes hold no decode by the partners.
 ///
-/// The set opens with the places the request is held to, where its host
-/// holds it to any, and with no other row ([`places`]): what a filter then
-/// keeps is among them, under any profile.
+/// A set no class narrows opens with the places the request is held to,
+/// where its host holds it to any, and with no other row ([`places`]):
+/// what a filter then keeps is among them, under any profile.
 ///
 /// A pool a hard filter empties is put to the set's all-vetoed rule before
 /// its stage is returned ([`vetoed::emptied`]). Where the rule steers, the
@@ -1793,7 +1793,6 @@ fn filter(
                 None => kept
                     .extend(rows.filter(|&i| classed(classes, candidates[i as usize].pair_class))),
             }
-            places::hold(kept, cx);
             if kept.is_empty() {
                 return Some("partners");
             }
@@ -2363,7 +2362,7 @@ fn keep_folded(
     kept: &mut Vec<u32>,
 ) -> bool {
     kept.clear();
-    if places::held(cx) {
+    if places::stated(cx) {
         return false;
     }
     if tests.masked(cx) {

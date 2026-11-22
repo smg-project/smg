@@ -204,15 +204,17 @@ pub(super) fn stamp(
 }
 
 /// How a pair's request is shed where it states what a pair's lists are not
-/// narrowed by, and the stage it is shed under: a subset hint, or a hard
-/// demand. A pair's records keep no demand fact, so such a request is shed
-/// and never placed past its demand. A hint of some records is declined: no
-/// stage here takes a part of a list.
+/// narrowed by, and the stage it is shed under: a subset hint, a hard
+/// demand, or places of its list. A pair's records keep no demand fact, so
+/// such a request is shed and never placed past its demand. A hint of some
+/// records is declined: no stage here takes a part of a list. So are
+/// places ([`single::PLACES`]): a pair's sides do not read them.
 fn not_narrowed_by(cx: &Constraints<'_>) -> Option<(ShedReason, &'static str)> {
     match cx.subset_hint {
         Some(0) => Some((ShedReason::NoEndpoints, SUBSET_HINT)),
         Some(_) => Some((ShedReason::PolicyDeclined, SUBSET_HINT)),
         None if !cx.demands.is_none() => Some((ShedReason::NoEndpoints, WIRES)),
+        None if cx.places.is_some() => Some((ShedReason::PolicyDeclined, single::PLACES)),
         None => None,
     }
 }
@@ -894,6 +896,12 @@ mod tests {
         };
         let declined = (ShedReason::PolicyDeclined, SUBSET_HINT);
         assert_eq!(shed_under(&some), declined);
+        let held = Constraints {
+            places: Some(&[0]),
+            ..Constraints::default()
+        };
+        let declined = (ShedReason::PolicyDeclined, single::PLACES);
+        assert_eq!(shed_under(&held), declined);
     }
 
     #[test]
