@@ -330,6 +330,24 @@ class ShardTableTests(unittest.TestCase):
             for need in target.get("required-features", []):
                 self.assertIn(need, on, f"the kv shard would skip tests/{target['name']}.rs")
 
+    def test_the_kv_shard_runs_the_policy_crates_library_as_the_gateway_builds_it(self):
+        # The gateway is the one build that turns the policy crate's `in-process` feature on,
+        # and its shards run the gateway's own cases. The kv shard runs the crate's library
+        # under the gateway's feature set, or no line runs the cases behind that feature.
+        gateway = tomllib.loads((REPO / "model_gateway" / "Cargo.toml").read_text())
+        asked = gateway["dependencies"]["smg-policy-controller"]
+        root = tomllib.loads((REPO / "Cargo.toml").read_text())
+        self.assertTrue(asked["workspace"])
+        self.assertIs(
+            root["workspace"]["dependencies"]["smg-policy-controller"]["default-features"], False
+        )
+        self.assertIn("in-process", asked["features"])
+        features = ",".join(sorted(asked["features"]))
+        self.assertIn(
+            f'echo "-p smg-policy-controller --lib --no-default-features --features {features}"',
+            SCRIPT.read_text(),
+        )
+
     def test_the_kv_shard_builds_the_example_controller_outside_the_workspace(self):
         # The example controller is also built where a user stands: its own
         # script writes it outside the workspace with the crate named by
@@ -659,7 +677,11 @@ class PolicyControllerRunTests(unittest.TestCase):
     )
 
     def run_shard(
-        self, scenario: dict | None = None, listed: str | None = None, shard: str = "gateway-1"
+        self,
+        scenario: dict | None = None,
+        listed: str | None = None,
+        shard: str = "gateway-1",
+        hosted: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], list[dict]]:
         with tempfile.TemporaryDirectory() as tmp:
             stubs = Path(tmp) / "bin"
@@ -683,6 +705,7 @@ class PolicyControllerRunTests(unittest.TestCase):
                     "CARGO_STUB_CALLS": str(calls),
                     "CARGO_STUB_SCENARIO": str(scenario_file),
                     "POLICY_CONTROLLER_KNOWN": str(known),
+                    **({"GITHUB_ACTIONS": "true"} if hosted else {}),
                 },
             )
             return done, [json.loads(line) for line in calls.read_text().splitlines()]
@@ -790,6 +813,19 @@ class PolicyControllerRunTests(unittest.TestCase):
         self.assert_red(
             done,
             "line 5 of the list is not <binary> <case> <fails|classic> <why>, tab separated",
+        )
+
+    def test_a_hosted_run_folds_the_expected_failures_and_annotates_a_problem(self):
+        done, _ = self.run_shard(hosted=True)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        folded = done.stdout.split("::group::", 1)[1].split("::endgroup::", 1)[0]
+        self.assertIn("test one::refused ... FAILED", folded)
+        self.assertNotIn("::error::", done.stdout)
+        done, _ = self.run_shard(self.changed("gamma_tests", "plain", result="FAILED"), hosted=True)
+        self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn(
+            "::error::The tests of gateway-1 with the policy controller on: gamma_tests plain: fails",
+            done.stdout,
         )
 
     def test_only_a_gateway_integration_shard_runs_with_the_policy_controller_on(self):

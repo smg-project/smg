@@ -201,6 +201,11 @@ commands_of() {
             # The policy crate's library as a host in process builds it: `worker-host` without the
             # controller. The shard's first line turns the controller on, so that build would never be made.
             echo "-p smg-policy-controller --lib --no-default-features --features worker-host"
+            # The policy crate's library as the gateway builds it: the engine a gateway keeps in its own
+            # process (`in-process`) beside `operator` and `worker-host`, without the controller. The gateway
+            # alone asks for `in-process`, and its shards run the gateway's cases, so no other line runs the
+            # cases behind that feature.
+            echo "-p smg-policy-controller --lib --no-default-features --features in-process,operator,worker-host"
             # The radix tree without its fuzz binary (the radix-fuzz shard); --doc cannot share an invocation with --test.
             selectors=$(test_selectors_except smg-radix-tree fuzz_differential)
             echo "-p smg-radix-tree --lib$selectors"
@@ -298,6 +303,8 @@ policy_controller_run() {
         (set -x; SMG_TEST_CLASSIC_PICKS="$work/picks" cargo test --no-fail-fast -p smg$plain) 2>&1 | tee -a "$work/part1" || status=$?
     fi
 
+    # The failures of this part are the expected ones: a hosted log folds them into one group.
+    [ -z "${GITHUB_ACTIONS:-}" ] || echo "::group::The policy controller on, part 2 of 3: expected failures"
     echo "== The policy controller on, part 2 of 3: the cases the list names as failing, alone (each is expected to FAIL) =="
     for target in $targets; do
         names=$(known_cases fails "$target")
@@ -306,10 +313,12 @@ policy_controller_run() {
         (set -x; cargo test --no-fail-fast -p smg --test "$target" -- --exact $names) > "$work/fails.$target" 2>&1 || true
         cat "$work/fails.$target"
     done
+    [ -z "${GITHUB_ACTIONS:-}" ] || echo "::endgroup::"
 
     echo "== The policy controller on, part 3 of 3: the run of $shard against $POLICY_CONTROLLER_KNOWN =="
     # shellcheck disable=SC2086
     python3 -c '
+import os
 import re
 import sys
 from pathlib import Path
@@ -393,6 +402,9 @@ failing, classic = kinds.count("fails"), kinds.count("classic")
 print(f"policy controller on, {shard}: {len(targets)} test binaries, {len(part1)} cases run in part 1; the list names {failing} of their cases as failing and {classic} as placed by a classic policy")
 for problem in problems:
     print(f"policy controller on, {shard}: PROBLEM: {problem}")
+    if os.environ.get("GITHUB_ACTIONS"):
+        # An annotation of the hosted run: the problem shows on the pull request.
+        print(f"::error::The tests of {shard} with the policy controller on: {problem}")
 print(f"policy controller on, {shard}: " + ("OK" if not problems else f"FAILED, {len(problems)} problem(s)"))
 sys.exit(1 if problems else 0)
 ' "$POLICY_CONTROLLER_KNOWN" "$work" "$shard" "$status" "$every" $targets || status=1
