@@ -8,12 +8,31 @@
 //! headers) are the same positions here.
 
 use super::demands::DemandFacts;
-use crate::{load::signals, tracking::in_flight};
+use crate::{load::signals, policies::consistent_hashing::LentRing, tracking::in_flight};
 
-/// The stable identity of a candidate: a hash of the registration key and the
-/// incarnation, never a URL. A same-URL replacement is a new id.
+/// The identity of a candidate, as its host states it. A controller's
+/// membership states a hash of the registration key and the incarnation
+/// ([`identity`](crate::store::identity)): a same-URL replacement is a new
+/// id. A gateway's worker list states the fingerprint of the worker's
+/// address ([`WorkerId::from_address`]), one id for a worker and the one
+/// that replaces it there, unless its program states ids of its own
+/// ([`FixedFacts::id`]). A hash ring a caller lends finds a worker's row
+/// by the address's fingerprint alone.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WorkerId(pub u64);
+
+impl WorkerId {
+    /// The id a gateway's worker list states for the worker registered at
+    /// `address`: the address's fingerprint, the same for every worker
+    /// object registered there. A hash ring a caller lends names its
+    /// workers by address ([`LentRing`]), and a decision finds a named
+    /// worker's row by this: the ring serves rows whose ids are stated
+    /// this way.
+    #[must_use]
+    pub fn from_address(address: &str) -> Self {
+        Self(fingerprint(address.as_bytes()))
+    }
+}
 
 /// A worker's role in the fleet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -836,7 +855,10 @@ pub struct FixedFacts {
     /// by. A program states an id for every worker of its lists or for
     /// none: one id space a program. A stated id is never `WorkerId(0)`:
     /// zero reads as absent wherever an id travels (a lease, a trace, a
-    /// session's pins), so a zero stated here states none.
+    /// session's pins), so a zero stated here states none. A program that
+    /// states ids lends no hash ring ([`RequestFacts::ring`]): a lent ring
+    /// finds a worker's row by the fingerprint of its address, so it would
+    /// find none and every key would go by its position alone.
     pub id: Option<WorkerId>,
     /// What the worker states for a request's hard demands: its entry of
     /// the column beside the records. Whether the worker registered a
@@ -1120,6 +1142,34 @@ pub struct RequestFacts<'a> {
     /// The wire's request facts carry it to a controller, and a plugin's
     /// frame keeps `0` under every exposure.
     pub client_key: u64,
+    /// The hash ring the request's caller keeps of the model's workers,
+    /// lent to this decision ([`LentRing`]): the plain ring stage with no
+    /// bounded-load rule places the request's key where this ring's walk
+    /// reaches, and its own ring learns nothing of the decision. The rows
+    /// of such a decision carry the ids of their workers' addresses
+    /// ([`WorkerId::from_address`]): a program that states ids of its own
+    /// lends none ([`FixedFacts::id`]). A caller that keeps rings lends one
+    /// with every such request, an empty one for a model whose ring it
+    /// has not built: a key its walk hands to no kept worker goes to the
+    /// kept worker at the key's position modulo their count. `None` from a
+    /// caller that keeps no ring, as a controller: the stage places by its
+    /// own. Both sides of a pair take the one ring, each over its own
+    /// list: a side takes a worker of the ring only where its list keeps
+    /// that worker, and a key no kept worker of the side takes goes to the
+    /// side's kept worker at the key's position modulo their count. An
+    /// encode request's items take none: the place stated is the request's
+    /// routing value's, and an item is placed by its own key on the stage's
+    /// ring. In-process only.
+    pub ring: Option<&'a dyn LentRing>,
+    /// Where the request stands on the lent ring, as its caller states it:
+    /// the position of the value it is placed by ([`LentRing::position`]).
+    /// A routing value gives one entry. Empty where the request states
+    /// nothing to place by, and the lent ring is then not asked. A caller
+    /// states a key's position with every ring it lends, an empty ring
+    /// too. The list stands as long as the request does: a caller that
+    /// finds a position while it makes the request keeps it beside the
+    /// request. In-process only: no frame carries it.
+    pub ring_positions: &'a [u64],
 }
 
 /// The multiplier that spreads a session's model and phase over its key.
@@ -1582,12 +1632,13 @@ mod tests {
     /// A request's facts are copied where a decision narrows or resumes
     /// them, so their size is a cost of those decisions: the pin is exact.
     /// The signal cells are one word, for every signal, and the client's
-    /// key is one word more: a field the facts gain moves this number and
-    /// carries the decision bench's cells that copy the facts
-    /// (`benches/decision.rs`).
+    /// key is one word more. The ring a caller lends is two words, and
+    /// where the request stands on it two more. A field the facts gain
+    /// moves this number and carries the decision bench's cells that copy
+    /// the facts (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
-        assert_eq!(size_of::<RequestFacts<'_>>(), 296);
+        assert_eq!(size_of::<RequestFacts<'_>>(), 328);
     }
 
     #[test]

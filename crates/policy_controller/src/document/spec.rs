@@ -238,7 +238,8 @@ pub struct Needs {
     /// The stage reads the prefixes sent to each worker.
     #[serde(default)]
     pub sent_prefixes: bool,
-    /// A consistent-hash ring per model.
+    /// A consistent-hash ring per model. A host that keeps one lends it with
+    /// a request ([`RequestFacts::ring`](crate::engine::RequestFacts::ring)).
     pub ring: bool,
     /// Allow-listed headers in the view.
     pub headers: bool,

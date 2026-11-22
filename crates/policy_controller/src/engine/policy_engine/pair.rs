@@ -465,6 +465,7 @@ mod tests {
             },
             view::{Health, Identity, Role, WireModes, WorkerId},
         },
+        policies::consistent_hashing::InOrder,
         stages::{Best, HasCapacity, StageRegistry},
         store::GatewayId,
         tracking::{
@@ -1539,6 +1540,67 @@ mod tests {
         assert_eq!(host.picked(&again).1, 0);
         let alone = host.decide(&OPEN, 0, Some(held.id));
         assert_eq!(host.picked(&alone).1, 0, "no decode handed");
+    }
+
+    /// Both sides of a pair take the hash ring their caller lends, each
+    /// over its own list. The gateway hands a pair its model's one ring
+    /// where either side's policy reads it
+    /// (`model_gateway/src/routers/common/placement.rs`, lines 1574 to 1585
+    /// at 882be6f4f), and each side's policy places by its two rules
+    /// (`model_gateway/src/policies/consistent_hashing.rs`, lines 99 to
+    /// 140). A side takes the ring's worker only where its own list holds
+    /// an eligible one: the walk passes the other side's workers, and a
+    /// worker of its own that is not ready. A value no worker of the side
+    /// takes goes by its position over that side's eligible workers.
+    #[test]
+    fn each_side_of_a_pair_places_on_the_ring_its_caller_lends() {
+        let document = PolicySpec::pair_presets("consistent_hashing", "consistent_hashing");
+        let spec = AppliedSpec::validate(&document.expect("the pair presets"));
+        let host = Host::under((spec.expect("a valid document"), Arc::default()), 3, 3);
+        let lent = |workers: &str| {
+            let address = |at: &str| format!("grpc://{at}:9000");
+            InOrder(workers.split(' ').map(address).collect())
+        };
+        // The pair a keyed request is placed on where it stands at
+        // `position` of the ring lent.
+        let placed = |ring: &InOrder, position: u64| {
+            let [prefill, decode] = &host.members;
+            let classes = every(3, 3);
+            let lists = PairLists {
+                prefill,
+                decode,
+                classes: &classes,
+                admission: &OPEN,
+            };
+            let positions = [position];
+            let facts = RequestFacts {
+                ring: Some(ring),
+                ring_positions: &positions,
+                ..keyed()
+            };
+            let mut request = Request {
+                id: b"",
+                facts,
+                constraints: Constraints::default(),
+            };
+            let (spec, now) = (host.engine.spec(), Instant::now());
+            host.picked(&lists.decide(spec, None, &host.clock, now, &mut request, None))
+        };
+        // The model's one ring holds both lists' workers: each side takes
+        // the first worker of its own list that the walk reaches.
+        let model = lent("decode-1 prefill-2 decode-0 prefill-0 prefill-1 decode-2");
+        assert_eq!(placed(&model, 0), (2, 1));
+        assert_eq!(placed(&model, 3), (0, 2));
+        // A worker that is not ready is passed over on its side.
+        host.prefills[2].set_status(WorkerStatus::NotReady);
+        host.decodes[1].set_status(WorkerStatus::NotReady);
+        assert_eq!(placed(&model, 0), (0, 0));
+        // A ring that reaches no eligible worker of a side: the value goes
+        // by its position over that side's eligible workers, two here.
+        let no_prefill = lent("decode-2 decode-0 prefill-2");
+        assert_eq!(placed(&no_prefill, 3), (1, 2));
+        let no_decode = lent("prefill-1 decode-1");
+        assert_eq!(placed(&no_decode, 4), (1, 0));
     }
 
     /// The stock presets of a pair as a document in force, round robin for

@@ -424,6 +424,10 @@ impl Checked {
             // candidates of the program that decides.
             signal_cells: None,
             client_key: facts.client_key,
+            // No frame carries a ring: the ring stage places by its own,
+            // as it learns it from the rows.
+            ring: None,
+            ring_positions: &[],
         }
     }
 

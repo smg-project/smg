@@ -18,6 +18,7 @@ use crate::{
         sticky_sessions::{shards_for_this_host, SessionVerdict},
         view::{Constraints, Identity, PinSource, RequestFacts, Session, WorkerId},
     },
+    policies::consistent_hashing::InOrder,
     store::GatewayId,
     tracking::{
         lease::{Outcome, Side, TransportClass},
@@ -106,6 +107,57 @@ fn served(worker: WorkerId) -> Outcome {
     }
 }
 
+/// Under the stock ring a keyed request over a list of worker objects goes
+/// to the workers its caller's ring reaches from where the caller says the
+/// key stands, in the ring's order: each worker the ring names by address
+/// is found in the list. A worker that is not ready passes the key on.
+///
+/// The gateway's own policy takes the first eligible worker its ring
+/// reaches from the key (`model_gateway/src/policies/consistent_hashing.rs`,
+/// lines 99 to 115 at 882be6f4f): where that ring is the one lent, the
+/// first worker named here.
+#[test]
+fn a_rings_keyed_request_goes_to_the_workers_its_callers_ring_reaches() {
+    let engine = preset("consistent_hashing");
+    let list = pool(8);
+    let members = engine.pool_members(&list);
+    let order = [5, 2, 7, 0, 3, 6, 1, 4];
+    let ring = InOrder(order.iter().map(|&at| list[at].url().to_owned()).collect());
+    let places = |asks: &Asks<'_>| -> Vec<u32> {
+        let decision = decided(&engine, asks).decision;
+        targets(&decision).iter().map(|&(place, _)| place).collect()
+    };
+    let mut asks = keyed(9, &members);
+    asks.request.facts.ring = Some(&ring);
+    // Two workers along the ring's order.
+    asks.request.facts.ring_positions = &[10];
+    assert_eq!(places(&asks), [7, 0, 3, 6]);
+    list[7].set_status(WorkerStatus::NotReady);
+    list[3].set_status(WorkerStatus::NotReady);
+    assert_eq!(places(&asks), [0, 6, 1, 4]);
+}
+
+/// A caller with no ring of the model's workers yet lends an empty one, and
+/// the key goes to the ready worker at its position modulo their count, in
+/// the list's order: what that caller's own policy answers with no ring
+/// (`model_gateway/src/policies/consistent_hashing.rs`, lines 124 to 140 at
+/// 882be6f4f).
+#[test]
+fn a_key_an_empty_lent_ring_places_goes_to_the_ready_worker_at_its_position() {
+    let engine = preset("consistent_hashing");
+    let list = pool(8);
+    let members = engine.pool_members(&list);
+    let ring = InOrder(Vec::new());
+    let mut asks = keyed(9, &members);
+    asks.request.facts.ring = Some(&ring);
+    asks.request.facts.ring_positions = &[13];
+    let first = |asks: &Asks<'_>| targets(&decided(&engine, asks).decision)[0].0;
+    assert_eq!(first(&asks), 5);
+    // Seven are ready, and the seventh of them stands at place 7.
+    list[2].set_status(WorkerStatus::NotReady);
+    assert_eq!(first(&asks), 7);
+}
+
 /// Under either stock ring document a keyed request over a list of worker
 /// objects is placed by the ring stage's own ring, and its host builds
 /// nothing for it: a key names the same workers in the same order whatever
@@ -153,7 +205,7 @@ fn a_rings_keyed_request_keeps_its_keys_workers_whatever_its_seed() {
 /// (`model_gateway/src/policies/consistent_hashing.rs`, lines 99 to 121 at
 /// 882be6f4f): no other key moves there either.
 #[test]
-fn a_worker_that_left_its_list_stays_in_the_stages_ring_and_moves_no_other_key() {
+fn a_worker_that_left_its_list_moves_no_other_key() {
     for ring in ["consistent_hashing", "prefix_hash"] {
         let (seen, fresh) = (preset(ring), preset(ring));
         let named = |engine: &PolicyEngine, list: &Arc<[Arc<dyn Worker>]>, key: u64| {

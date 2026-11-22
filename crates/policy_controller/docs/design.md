@@ -576,7 +576,7 @@ pub struct Request<'a> {
     pub constraints: Constraints<'a>, // what only the deciding host knows
 }
 
-// engine/view.rs (the fields a stage reads; 28 in all)
+// engine/view.rs (the fields a stage reads; 30 in all)
 pub struct RequestFacts<'a> {
     pub model: &'a str,            // the resolved model id
     pub phase: Phase,              // Single, Prefill, Decode or Encode
@@ -598,6 +598,8 @@ pub struct RequestFacts<'a> {
     pub seed: u64,                 // the only randomness a stage gets; kept in the trace
     pub budget_micros: u32,        // time left for the decision
     pub now_micros: u64,           // the host's clock at the decision
+    pub ring: Option<&'a dyn LentRing>, // the hash ring the host keeps, lent to this decision
+    pub ring_positions: &'a [u64], // where the request stands on that ring, as the host states it
     // eight more fields: `affinity` and `named`, and the six that 5.8 removes
 }
 
@@ -830,7 +832,7 @@ the decode side adds `has-room`.
 | `round_robin` | none | `round-robin` | one counter for each worker list; for the full pass, one rotation for each set of surviving workers, in a fixed table |
 | `power_of_two` | `least-load` | `power-of-two` | what was dispatched to each worker since its last load report |
 | `least_load` | `least-load` | `best` | the same |
-| `consistent_hashing` | `consistent-hash` | `best` | one hash ring, of the workers its decisions have read |
+| `consistent_hashing` | `consistent-hash` | `best` | nothing where the host lends its ring and states the request's place, under no bounded-load rule; else one hash ring, of the workers its decisions have read |
 | `prefix_hash` | `consistent-hash` by the routing key, else by the prompt's first 256 tokens, with a bounded-load rule; `least-requests` | `best` | the same ring |
 | `manual` | none | `manual`, with a sessions rule | routing key to pinned worker, with an expiry |
 | `cache_aware` | `warmup-slice`, `prefix-affinity`, `kv-pressure`, `least-load` | `best` over a sample of 16 | the record of sent prefixes; the warm-up counters; the dispatch count of `least-load` |
@@ -888,6 +890,16 @@ the decision's lease and report each event; turn a refusal into a status.
 
 That is too much. The gateway's earlier integration needs a module of its own of 19 files and
 13,856 lines (tests included) for it, and a branch in every route.
+
+A host that keeps a hash ring of a model's workers can lend it with a request: the request's facts
+carry the ring, behind a trait of two methods (`LentRing`), and where the request stands on it
+(`RequestFacts::ring`, `RequestFacts::ring_positions`). A trap for the lender. Under `prefix_hash`
+classic asks its ring for the sixteen hex digits of the hash of the bytes a request is placed by,
+also where those bytes are a routing key's (`model_gateway/src/policies/prefix_hash.rs:223`,
+`:292`, `:300`). Under `consistent_hashing` it asks for the routing key's own text
+(`model_gateway/src/policies/consistent_hashing.rs:84`, `:109`). A lender that states a request's
+place from the wrong text sends routing keys to other workers than classic does, and no test in
+the crate sees it.
 
 ### 8.2 The contract as designed **[partly]**
 
@@ -1347,7 +1359,10 @@ Five things follow, and they are the first work of section 16.
    answer, so the pair sheet's refusals are compared by their reason alone, where classic names
    the side. A change of stage 1 makes a pair's refusal name its side. The 12 ring lines of
    `all_vetoed` name their workers by the key's order on the engine's own ring: they prove the
-   walk past a vetoed worker, not that a key lands on classic's worker (decision 3).
+   walk past a vetoed worker, not that a key lands on classic's worker (decision 3). With a ring
+   its caller lends, the 12 answer as recorded over hand-built candidates
+   (`the_classic_ring_rows_replay_on_a_ring_their_caller_lends`). That the lent ring is classic's
+   own is proven at stage 3.
 5. **Decision 3 (a) parts the `prefix_hash` sheet in two.** 31 of its 47 lines say where their
    requests stand on a ring: 30 list their workers in a request's ring order and one has
    nothing to hash. They replay on a ring their caller lends and hold their recorded answers,
@@ -1511,12 +1526,12 @@ different modes would disagree.
 
 | Option | Cost |
 |---|---|
-| (a) The host lends the ring it keeps; the engine asks it which workers a routing key reaches. | Crate only, written locally and not opened: one deletion and five changes. The crate's ring beside a worker list is deleted (1,650 lines removed, 145 added, 14 files). The five changes are 409, 84, 468, 252 and 428 changed lines, 727 of product and 914 of proof, and three of them pass 400 lines. The host lends its ring through a trait of two methods and states where a request stands on it. The crate then writes no hash and no ring for such a host, so a request is placed on classic's own ring. The price in proof: 16 of the 47 recorded `prefix_hash` lines test which tokens are in a key. In the crate they keep replaying on the crate's own ring, share for share as on main. A gateway then never runs that ring, so for a gateway they are proven at stage 3 (section 13.1), where the change also cuts classic's key recipe and classic's ring lookup into functions that classic and the lender both call. A controller has no classic ring to be lent: until (b) it keeps its own ring and places a routing key on another worker than a gateway would. |
+| (a) The host lends the ring it keeps; the engine asks it which workers a routing key reaches. | Crate only: one deletion and four changes. The crate's ring beside a worker list is deleted (1,728 lines removed, 230 added, 17 files). The four changes are about 580, 270, 450 and 550 changed lines, about 370 of them product code and 1,050 proof. The host lends its ring through a trait of two methods and states where a request stands on it. The crate then writes no hash and no ring for such a host, so a request is placed on classic's own ring. The price in proof: 16 of the 47 recorded `prefix_hash` lines test which tokens are in a key. In the crate they keep replaying on the crate's own ring, share for share as on main. A gateway then never runs that ring, so for a gateway they are proven at stage 3 (section 13.1), where the change also cuts classic's key recipe and classic's ring lookup into functions that classic and the lender both call. A controller has no classic ring to be lent: until (b) it keeps its own ring and places a routing key on another worker than a gateway would. |
 | (b) Classic's ring (one file, 508 lines) moves to a crate both sides use. | A pure move, about 15 lines changed beside it. The gateway, the engine and the controller then build one ring type. |
 | (c) The crate's ring is changed to classic's hashes. | About 125 lines. Classic's recipe written twice; a gateway would keep two rings for a model. |
 
-**Recommendation: (a) now, (b) with the controller's switch.** Not (c). No ring work opens before
-this decision.
+**Recommendation: (a) now, (b) with the controller's switch.** Not (c). Work on (a) has started,
+inside the crate only.
 
 ### Decision 4: where a placement stays during a request
 
@@ -1619,7 +1634,7 @@ The crate first (rule 7). Each stage ends with a test, and the next does not sta
 | 0 | The earlier gateway integration is taken out. | The gateway routes by classic alone; every classic test and bench cell is as before. |
 | 1 | **The policies, proven in the crate.** Each classic policy decided by `PolicyEngine` over worker objects: its sheet replays through that engine, and its bench cell meets classic's count. | Every line of the 14 sheets that record a decision (408 of section 13.1's 482) replays through the kept engine over worker objects. Each difference from classic is fixed or accepted as a named difference. Under decision 3 (a) the 16 `prefix_hash` lines that test a key's tokens replay there with no ring lent, and their proof for a gateway is stage 3's. |
 | 2 | **The host contract.** `place`, `Placement`, the engine's own upkeep and membership events (section 8.2). | A test host in the crate serves every plan through `place` alone. |
-| 3 | **The gateway, one change** (section 9), off by default. | The four points of section 9.2's bar; under decision 3 (a), the 47 `prefix_hash` lines of section 13.1 read as recorded through the gateway's own entry with the engine on; a cluster run beside classic. |
+| 3 | **The gateway, one change** (section 9), off by default. | The four points of section 9.2's bar; under decision 3 (a), the 47 `prefix_hash` lines and the 12 ring lines of `all_vetoed` read as recorded, count for count, through the gateway's own entry with the engine on and the recorder's own workers and prompts; a cluster run beside classic. |
 | 4 | **The controller on the one engine** (section 10.2); the old engine is deleted. | The controller's own tests pass on `PolicyEngine`; the store-backed engine is gone; each of the 74 lines of the four host sheets (section 13.1) is answered by the host's code that the controller takes from the worker crate, or by a rule of the crate's with its differences named. |
 | 5 | **A gateway under a controller** (section 11). | A cluster run: gateways under a controller beside classic, with the controller stopped and started under load. |
 
@@ -1641,7 +1656,7 @@ behind the one before.
 | 8 | The encode facts of a host's lists, written by one function | its case |
 | 9 | A pair's side wholly over its thresholds follows its binding's rule | classic's pair sheet |
 | 10 | A sampling pick steps aside for a request held to some workers | its cases |
-| 11 | A session's pin and a ring's walk honour a request held to some workers | its cases |
+| 11 | A row the keyed decision reads by its place honours a request held to some workers | its cases |
 | 12 | A sampling pick converts a list's load reports once | the bench's cell before and after |
 | 13 | A request with no routing key under a sessions rule is decided by one pick | a case that counts the records read, failing before; the bench's cell; the `manual` and sticky lines unmoved |
 | 14 | A pair is decided with the host's load reports, as a single request is | a case that fails before; the bench's pair cell |
@@ -1650,6 +1665,6 @@ One more change ran beside them: the types both engines share moved out of the o
 and the store's lease file into the kept engine's modules, with no behaviour change (section 5.7).
 
 Behind them, in the crate: `random` and `round_robin` details of the short path; pairs and encode
-requests over worker lists. Waiting for a decision:
-the hash ring (3), new recorders (2), the controller's parts (5, 10), shadow and explain on the
+requests over worker lists; the hash ring a host lends (decision 3). Waiting for a decision:
+new recorders (2), the controller's parts (5, 10), shadow and explain on the
 kept engine (7), CI's run of the kept engine's tests and the published set (11).

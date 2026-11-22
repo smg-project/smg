@@ -16,7 +16,7 @@ use crate::{
     engine::{
         decision::Decision,
         framework::DRAW_FROM,
-        view::{AffinityHolder, AffinityRows, Phase},
+        view::{fingerprint, AffinityHolder, AffinityRows, Phase},
     },
 };
 
@@ -95,6 +95,11 @@ fn a_workers_id_is_the_fingerprint_of_its_address_whichever_object_stands_there(
     assert_eq!(
         worker_id(first.as_ref()),
         WorkerId(fingerprint(b"http://worker-a:8000"))
+    );
+    // A removal names a worker by its address alone: the same id.
+    assert_eq!(
+        WorkerId::from_address("http://worker-a:8000"),
+        worker_id(first.as_ref())
     );
 }
 
