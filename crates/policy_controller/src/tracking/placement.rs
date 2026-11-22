@@ -13,10 +13,8 @@
 //! and read no clock.
 //!
 //! **Who makes one.** The host contract has one call for a request, which
-//! answers a placement (the design's section 8.2). That call is not built.
-//! Until it is, a host makes a placement of the answer it holds, by
-//! [`Placement::alone`] or [`Placement::taken`]: the two are no part of the
-//! contract.
+//! answers a placement ([`PolicyEngine::place`], the design's section 8.2).
+//! No host makes one itself. The call places a single request today.
 //!
 //! **The instants.** A host reads no clock for the engine: the call that
 //! says a word reads it.
@@ -77,9 +75,10 @@ pub struct Placement<'a> {
 impl Placement<'_> {
     /// The placement of a place ([`AlonePick`]): `worker` is the worker at
     /// the pick's place in the list its host handed. Nothing is owed of
-    /// it, so it holds no lease, takes no id and reads no clock.
+    /// it, so it holds no lease, takes no id and reads no clock. The one
+    /// call for a request makes it ([`PolicyEngine::place`]).
     #[must_use]
-    pub fn alone(worker: Arc<dyn Worker>, pick: AlonePick) -> Self {
+    pub(crate) fn alone(worker: Arc<dyn Worker>, pick: AlonePick) -> Self {
         Self {
             worker,
             decode: None,
@@ -102,11 +101,12 @@ impl Placement<'_> {
     ///
     /// `None` where the decision picked no target at `index`. A lease the
     /// answer carried is then given up as a guard gives one up at its
-    /// drop. A host none of whose targets can be sent to holds the answer
-    /// in a guard itself and releases it under its reason
-    /// ([`DecisionGuard::released`]).
+    /// drop. The call that places a request makes it
+    /// ([`PolicyEngine::place`]). Where none of the targets can be sent
+    /// to, that call holds the answer in a guard itself and releases it
+    /// under its reason ([`DecisionGuard::released`]).
     #[must_use]
-    pub fn taken(
+    pub(crate) fn taken(
         engine: &'static PolicyEngine,
         decided: DecideOutcome,
         later: bool,

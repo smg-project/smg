@@ -623,7 +623,7 @@ pub(crate) mod tests {
     #[test]
     fn a_place_picked_under_a_document_that_takes_a_word_is_noted() {
         let (engine, heard) = hearing_as(false, true, EventSet::LEASE);
-        let place = engine.place(MODEL, Phase::Single);
+        let place = engine.place_for(MODEL, Phase::Single);
         assert!(matches!(place, Place::Alone(_)), "{place:?}");
         let list = pool(4);
         let members = engine.pool_members(&list);
@@ -990,7 +990,7 @@ pub(crate) mod tests {
         for workers in [DRAW_FROM, 64] {
             let spec = AppliedSpec::validate(&document).expect("the document validates");
             let engine = PolicyEngine::new(spec);
-            let Place::Alone(profile) = engine.place(MODEL, Phase::Single) else {
+            let Place::Alone(profile) = engine.place_for(MODEL, Phase::Single) else {
                 panic!("one pick of round robin decides the place");
             };
             let (one, other) = (pool(workers), pool(workers));
@@ -1384,7 +1384,7 @@ pub(crate) mod tests {
     #[test]
     fn a_decision_without_a_lease_takes_no_id_and_tells_no_stage() {
         let (engine, heard) = hearing_as(false, true, EventSet::LEASE);
-        let place = engine.place(MODEL, Phase::Single);
+        let place = engine.place_for(MODEL, Phase::Single);
         assert!(matches!(place, Place::Alone(_)), "{place:?}");
         let list = pool(4);
         let members = engine.pool_members(&list);

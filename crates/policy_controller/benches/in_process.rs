@@ -51,6 +51,8 @@
 mod counting_alloc;
 #[path = "in_process/pair.rs"]
 mod pair;
+#[path = "in_process/place.rs"]
+mod place;
 
 #[cfg(any(target_env = "msvc", target_env = "musl"))]
 use std::alloc::System as Allocator;
@@ -309,6 +311,8 @@ struct Run {
     workers: usize,
     callers: usize,
     decisions: u64,
+    /// The entry asked for a request: the bench's `place` file reads it.
+    entry: String,
     publish_ms: u64,
     overloaded: bool,
     shadow: Shadowed,
@@ -320,6 +324,7 @@ fn run() -> Run {
         workers: 64,
         callers: 1,
         decisions: 1_000_000,
+        entry: "decide_at".to_owned(),
         publish_ms: 0,
         overloaded: false,
         shadow: Shadowed::No,
@@ -340,6 +345,7 @@ fn run() -> Run {
             "--workers" => run.workers = number() as usize,
             "--callers" => run.callers = number() as usize,
             "--decisions" => run.decisions = number(),
+            "--entry" => run.entry = place::named(&value),
             "--publish-ms" => run.publish_ms = number(),
             "--overloaded" => run.overloaded = number() != 0,
             "--shadow" => {
@@ -509,6 +515,13 @@ fn main() {
         plain: request(0).plain(),
     };
     let (publish, converted) = (|| feed.publish(&loads), || host.members.conversions());
+    // The one call a host makes for a request, where the run asks it.
+    if place::asked(&run, &host) {
+        measure(&run, engine, upkeep, publish, converted, |_| {
+            place::one(&host)
+        });
+        return;
+    }
     measure(&run, engine, upkeep, publish, converted, |seed| {
         host.place(seed)
     });
@@ -595,7 +608,7 @@ fn measure(
     });
     let total = run.decisions * run.callers as u64;
     assert_eq!(placed.into_inner(), total, "a worker takes it");
-    println!(
+    print!(
         "cell={} workers={} callers={} overloaded={} publish_ms={} publications={} conversions={} allocations_per_decision={:.4} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
         run.cell.0,
         run.workers,
@@ -610,4 +623,6 @@ fn measure(
         total as f64 / wall.as_secs_f64(),
         busy_nanos.into_inner() as f64 / total as f64,
     );
+    // The words a file of its own adds, and the line's end.
+    println!("{}", place::word());
 }

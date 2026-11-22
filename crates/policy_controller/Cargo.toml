@@ -72,6 +72,8 @@ smg-grpc-client = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 smg-worker = { workspace = true, optional = true }
 wfaas = { workspace = true, optional = true }
+# The header map a request's headers are read from (the `in-process` feature).
+http = { workspace = true, optional = true }
 # Worker discovery (the `discovery` feature): the discovery crate with its
 # four providers, each of which the controller's flags can select.
 smg-service-discovery = { workspace = true, features = ["consul", "file", "kubernetes", "slurm"], optional = true }
@@ -225,6 +227,7 @@ discovery = ["controller", "worker-host", "dep:smg-service-discovery"]
 # runtime. The engine's own task takes Tokio's timer, which that runtime
 # builds already.
 in-process = [
+    "dep:http",
     "dep:smg-worker",
     "dep:tokio",
     "smg-worker/runtime",
