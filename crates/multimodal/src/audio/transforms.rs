@@ -203,6 +203,43 @@ pub(super) fn bandlimited_resample(
         TransformError::ShapeError(format!("failed to allocate resampled audio: {error}"))
     })?;
 
+    #[cfg(target_arch = "x86_64")]
+    if convolve_rows(
+        &mut output,
+        samples,
+        &kernels,
+        orig_freq,
+        new_freq,
+        width,
+        target_len,
+    )? {
+        return Ok(output);
+    }
+    convolve_blocks(
+        &mut output,
+        samples,
+        &kernels,
+        orig_freq,
+        new_freq,
+        width,
+        target_len,
+    )?;
+    Ok(output)
+}
+
+/// [`bandlimited_resample`]'s convolution one output sample after the other,
+/// appended to `output`: the loop of a processor without AVX2 and FMA, and
+/// the bits [`convolve_rows`] must give.
+fn convolve_blocks(
+    output: &mut Vec<f32>,
+    samples: &[f32],
+    kernels: &[f32],
+    orig_freq: usize,
+    new_freq: usize,
+    width: usize,
+    target_len: usize,
+) -> Result<(), TransformError> {
+    let kernel_len = kernels.len() / new_freq;
     // The convolution reads `width` samples before the signal and up to a
     // kernel beyond its end, where it previously contributed nothing: a tap
     // whose index fell outside the input was skipped. Materialising those
@@ -241,7 +278,85 @@ pub(super) fn bandlimited_resample(
         }
     }
 
-    Ok(output)
+    Ok(())
+}
+
+/// Blocks of output whose chains [`convolve_rows`] steps together.
+#[cfg(target_arch = "x86_64")]
+const RESAMPLE_ROW_BLOCKS: usize = 128;
+
+/// [`bandlimited_resample`]'s convolution on a processor with AVX2 and FMA:
+/// fills `output` and returns `true`. On any other processor it returns
+/// `false` and [`convolve_blocks`] runs.
+///
+/// Every output sample stays the chain `value = sample.mul_add(coefficient,
+/// value)` over its taps in order from `+0.0`, as [`convolve_blocks`] runs it;
+/// only which chain steps next differs, so no bit does. The chains of one
+/// phase over a row of blocks take each tap together, eight to an
+/// instruction. Their samples lie `orig_freq` apart, so the row's input is
+/// laid out by input phase first: `strands[strand * strand_len + position]`
+/// is sample `(first_block + position) * orig_freq + strand` of the input
+/// with `width` zeros in front and zeros behind.
+#[cfg(target_arch = "x86_64")]
+#[multiversion::multiversion(targets("x86_64+avx2+fma"))]
+fn convolve_rows(
+    output: &mut Vec<f32>,
+    samples: &[f32],
+    kernels: &[f32],
+    orig_freq: usize,
+    new_freq: usize,
+    width: usize,
+    target_len: usize,
+) -> Result<bool, TransformError> {
+    let fused = multiversion::target::match_target! { "x86_64+avx2+fma" => true, _ => false };
+    if !fused {
+        return Ok(false);
+    }
+    let kernel_len = kernels.len() / new_freq;
+    let blocks = samples.len().div_ceil(orig_freq);
+    let strand_len = blocks.min(RESAMPLE_ROW_BLOCKS) + (kernel_len - 1) / orig_freq;
+    let mut strands: Vec<f32> = Vec::new();
+    strands
+        .try_reserve_exact(orig_freq * strand_len)
+        .map_err(|error| {
+            TransformError::ShapeError(format!("failed to allocate resample input rows: {error}"))
+        })?;
+    strands.resize(orig_freq * strand_len, 0.0);
+    output.resize(target_len, 0.0);
+    let mut values = [0.0_f32; RESAMPLE_ROW_BLOCKS];
+    for first_block in (0..blocks).step_by(RESAMPLE_ROW_BLOCKS) {
+        let values = &mut values[..(blocks - first_block).min(RESAMPLE_ROW_BLOCKS)];
+        strands.fill(0.0);
+        for (strand, positions) in strands.chunks_exact_mut(strand_len).enumerate() {
+            let start = first_block * orig_freq + strand;
+            let lead = width.saturating_sub(start).div_ceil(orig_freq);
+            let source = samples
+                .iter()
+                .skip(start + lead * orig_freq - width)
+                .step_by(orig_freq);
+            for (position, &sample) in positions.iter_mut().skip(lead).zip(source) {
+                *position = sample;
+            }
+        }
+        for (phase, kernel) in kernels.chunks_exact(kernel_len).enumerate() {
+            values.fill(0.0);
+            for (shift, coefficients) in kernel.chunks(orig_freq).enumerate() {
+                for (strand, &coefficient) in strands.chunks_exact(strand_len).zip(coefficients) {
+                    for (value, &sample) in values.iter_mut().zip(&strand[shift..]) {
+                        *value = sample.mul_add(coefficient, *value);
+                    }
+                }
+            }
+            let slots = output
+                .iter_mut()
+                .skip(first_block * new_freq + phase)
+                .step_by(new_freq);
+            for (slot, &value) in slots.zip(values.iter()) {
+                *slot = value;
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Fractional bits of the sample grid: samples are placed on a grid of
@@ -593,5 +708,47 @@ mod tests {
         assert_eq!(frexp_exponent(0.75), 0);
         assert_eq!(frexp_exponent(3.0), 2);
         assert_eq!(frexp_exponent(0.0), 0);
+    }
+
+    /// The rows of [`convolve_rows`] against the plain loop over one table:
+    /// the same bits, for the ratios and half widths of 44.1, 48 and 8 kHz to
+    /// 16 kHz and of 16 to 24 kHz, at lengths around one block and one row,
+    /// each with a cut last block. A processor without AVX2 and FMA runs the
+    /// plain loop alone and has nothing to compare.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_rows_convolve_like_the_plain_loop() {
+        use super::{convolve_blocks, convolve_rows, RESAMPLE_ROW_BLOCKS};
+
+        for (orig_freq, new_freq, width) in [(441, 160, 17), (3, 1, 19), (1, 2, 7), (2, 3, 7)] {
+            let kernels: Vec<f32> = (0..new_freq * (2 * width + orig_freq))
+                .map(|i| ((i * 37 + 11) % 251) as f32 / 251.0 - 0.5)
+                .collect();
+            let row = RESAMPLE_ROW_BLOCKS * orig_freq;
+            for len in [1, orig_freq + 1, row - 1, row + 1] {
+                let samples: Vec<f32> = (0..len)
+                    .map(|i| ((i * 73 + 977) % 65_536) as f32 / 32_768.0 - 1.0)
+                    .collect();
+                let target_len = (len * new_freq).div_ceil(orig_freq);
+                let (mut rows, mut plain) = (Vec::new(), Vec::new());
+                let by_rows = convolve_rows(
+                    &mut rows, &samples, &kernels, orig_freq, new_freq, width, target_len,
+                )
+                .unwrap();
+                if !by_rows {
+                    return;
+                }
+                convolve_blocks(
+                    &mut plain, &samples, &kernels, orig_freq, new_freq, width, target_len,
+                )
+                .unwrap();
+                assert!(
+                    rows.iter()
+                        .map(|value| value.to_bits())
+                        .eq(plain.iter().map(|value| value.to_bits())),
+                    "{orig_freq}:{new_freq}, {len} samples"
+                );
+            }
+        }
     }
 }
