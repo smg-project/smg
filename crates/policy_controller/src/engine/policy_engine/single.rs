@@ -11,11 +11,10 @@
 //! request: the engine asks it before the request is made, so such a
 //! request is never made.
 //!
-//! **A key's rows, between** ([`keys::decide`]). A request that is made,
-//! under a sessions rule or a ring, is decided by the rows its key names:
-//! its key's pin, which is one worker's record, or its key's owner on the
-//! list's ring and the members behind it. It answers where those rows say
-//! what the whole pass would, and nothing where they do not.
+//! **A key's rows, between** ([`keys::decide`]). A request that is made
+//! under a sessions rule is decided by the row its key names: its key's
+//! pin, which is one worker's record. It answers where that row says what
+//! the whole pass would, and nothing where it does not.
 //!
 //! **The whole pass, behind them** ([`decide`]). Every other request is made
 //! and put to the engine's whole decision over records written for it from
@@ -153,12 +152,11 @@ pub(super) fn noted(
 /// written for the request from the list's workers. Each worker's report
 /// is read from `loads`, the host's load snapshot for this decision. A
 /// request that states what no stage here runs is declined under that
-/// stage's name. The list is borrowed as long as the request: its ring is
-/// lent into the request's facts.
-pub(super) fn decide<'r>(
+/// stage's name.
+pub(super) fn decide(
     own: &PolicyEngine,
-    request: &mut Request<'r>,
-    members: &'r PoolMembers,
+    request: &mut Request<'_>,
+    members: &PoolMembers,
     loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
 ) -> Decision {
@@ -185,9 +183,8 @@ pub(super) fn decide<'r>(
     let live = records::Live::at(spec.engine(), &own.clock, now, loads, key);
     let (engine, workers) = (spec.engine(), members.workers());
     // A keyed request is decided by the rows its key names, where they say
-    // what the whole pass would: its key's pin, or its key's owner on the
-    // list's ring and the members behind it.
-    if let Some(keyed) = keys::decide(engine, members.ring(), records, workers, &live, facts, &cx) {
+    // what the whole pass would: its key's pin.
+    if let Some(keyed) = keys::decide(engine, records, workers, &live, facts, &cx) {
         return keyed;
     }
     // A profile whose stages read who holds the prompt is named its rows

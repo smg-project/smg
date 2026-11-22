@@ -78,7 +78,6 @@ use super::{
 use crate::{
     document::spec::AppliedSpec,
     names::intern,
-    policies::consistent_hashing::PoolRing,
     stages::Lifecycle,
     store::{pairing::Refusal, GatewayId},
     tracking::lease::{EventKind, EventSet, Membership, Said, Side},
@@ -145,9 +144,6 @@ pub struct PoolMembers {
     /// engine picks alone for it, where the document holds one
     /// ([`Self::alone`]).
     alone: OnceLock<(Box<str>, Option<AloneProfile>)>,
-    /// The list's hash ring ([`Self::ring`]): built off the path of a
-    /// request, and by no decision ([`PolicyEngine::fill_ring`]).
-    ring: OnceLock<PoolRing>,
     /// What a decision whose stages read affinity keeps of the list
     /// ([`Self::affinity`]): read at the list's first such decision, and by
     /// no other.
@@ -203,18 +199,6 @@ impl PoolMembers {
                 wires.union(WireModes::from(*worker.connection_mode()))
             })
         })
-    }
-
-    /// The cell of the list's hash ring: each worker of the list at its
-    /// positions, by its id and its stable key. Empty until the gateway
-    /// fills it, off the path of a request ([`PolicyEngine::fill_ring`]):
-    /// a decision reads the cell, lends the ring where it stands, and
-    /// neither builds one nor waits for one. A list no ring policy decides
-    /// builds none. The ring is never changed: a membership change
-    /// publishes another list, which takes a ring of its own.
-    #[must_use]
-    pub fn ring(&self) -> &OnceLock<PoolRing> {
-        &self.ring
     }
 
     /// What a decision whose stages read affinity keeps of the list: each
@@ -371,7 +355,6 @@ impl PolicyEngine {
             records: OnceLock::new(),
             wires: OnceLock::new(),
             alone: OnceLock::new(),
-            ring: OnceLock::new(),
             affinity: PoolAffinity::default(),
         }
     }
@@ -384,10 +367,9 @@ impl PolicyEngine {
     ///
     /// The list's records are made of the answers at this call, and not at
     /// the list's first whole decision: a list's records are also made
-    /// with no request at hand, by its ring's fill and by a pick that is
-    /// noted. So the cost grows with the list, once a list, off the path
-    /// of a request: a wave of registrations pays it once for each list
-    /// published.
+    /// with no request at hand, by a pick that is noted. So the cost grows
+    /// with the list, once a list, off the path of a request: a wave of
+    /// registrations pays it once for each list published.
     #[must_use]
     pub fn pool_members_with_fixed_facts(
         &self,
@@ -399,35 +381,6 @@ impl PolicyEngine {
             records: OnceLock::from(records),
             ..self.pool_members(pool)
         }
-    }
-
-    /// Whether the document places a single request of `model` by a hash
-    /// ring: a stage that may decide such a request reads one. The gateway
-    /// keeps a ring for each list of such a model's workers
-    /// ([`Self::fill_ring`]), and none for another model's.
-    #[must_use]
-    pub fn reads_ring(&self, model: &str) -> bool {
-        let engine = self.spec.engine();
-        engine.needs_for(model, Phase::Single).ring
-    }
-
-    /// Builds the hash ring of `members`, a list of `model`'s workers,
-    /// where the document places a single request of the model by a ring
-    /// ([`Self::reads_ring`]), and says whether the list's ring stands.
-    /// `false` where it places such a request by none: the list takes none.
-    ///
-    /// For the gateway, off the path of a request, where it hears of a list:
-    /// the build hashes every worker's positions and sorts them, and no
-    /// decision does it ([`PoolMembers::ring`]). It makes the list's
-    /// records where no decision has yet. A second call is one read.
-    pub fn fill_ring(&self, model: &str, members: &PoolMembers) -> bool {
-        if !self.reads_ring(model) {
-            return false;
-        }
-        members
-            .ring
-            .get_or_init(|| keys::ring_of(members.records(&self.spec, &self.clock)));
-        true
     }
 
     /// What the document holds for one place the gateway builds a policy

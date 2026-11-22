@@ -7,7 +7,7 @@
 //! into the spec's declared lists (zones, engine kinds, connectors, labels,
 //! headers) are the same positions here.
 
-use crate::{load::signals, policies::consistent_hashing::PoolRing, tracking::in_flight};
+use crate::{load::signals, tracking::in_flight};
 
 /// The stable identity of a candidate: a hash of the registration key and the
 /// incarnation, never a URL. A same-URL replacement is a new id.
@@ -1083,25 +1083,6 @@ pub struct RequestFacts<'a> {
     /// The wire's request facts carry it to a controller, and a plugin's
     /// frame keeps `0` under every exposure.
     pub client_key: u64,
-    /// The hash ring of the list the candidates are, where the host keeps
-    /// one a list ([`PoolRing`]): a stage that places by a ring reads this
-    /// one, with no lock, and its own ring learns nothing of the decision.
-    /// `None` where the host keeps none: such a stage then places by its
-    /// own ring, which learns its members from the candidates. A host
-    /// lends the ring of the list it hands as the candidates and never the
-    /// ring of another list: a ring of another length than the candidates
-    /// is its caller's error, which a debug build stops at and any other
-    /// build passes over, placing by the stage's own ring. A pair takes
-    /// none: each side is a list of its own. In-process only.
-    pub ring: Option<&'a PoolRing>,
-    /// The host keeps a ring for the candidates' list and that ring is not
-    /// built yet, so [`Self::ring`] is `None`. Such a host builds a list's
-    /// ring off the path of a request, and a request that comes first
-    /// neither builds it nor waits for it. A stage that places by a ring
-    /// places such a request as one that carries no key, by its profile's
-    /// draw, and neither reads its own ring nor teaches it. In-process
-    /// only.
-    pub ring_awaited: bool,
 }
 
 /// The multiplier that spreads a session's model and phase over its key.
@@ -1564,13 +1545,13 @@ mod tests {
 
     /// A request's facts are copied where a decision narrows or resumes
     /// them, so their size is a cost of those decisions: the pin is exact.
-    /// The signal cells are one word, for every signal, the client's key
-    /// is one word more and the lent ring another: a field the facts gain
-    /// moves this number and carries the decision bench's cells that copy
-    /// the facts (`benches/decision.rs`).
+    /// The signal cells are one word, for every signal, and the client's
+    /// key is one word more: a field the facts gain moves this number and
+    /// carries the decision bench's cells that copy the facts
+    /// (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
-        assert_eq!(size_of::<RequestFacts<'_>>(), 304);
+        assert_eq!(size_of::<RequestFacts<'_>>(), 296);
     }
 
     #[test]

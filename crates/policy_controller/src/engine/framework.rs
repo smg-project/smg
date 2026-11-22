@@ -310,29 +310,6 @@ pub trait Scorer: Lifecycle + Debug {
         false
     }
 
-    /// [`Self::own`] for a host that reads a row when it is asked about
-    /// one, and writes none ahead of the decision: the scorer names the
-    /// rows it meets by their places in the pool, which holds `rows` of
-    /// them, asks `keep` about each, once, and writes to `out` the places
-    /// of the rows it hands out, the pick first and its alternates behind
-    /// it, each one kept by `keep` and none twice. Returns how many it
-    /// wrote. They are the rows [`Self::own`] hands out over the same
-    /// pool, in its order. `0` where it places nothing by itself, as
-    /// [`Self::own`] says `false`: the profile's run over the whole pool
-    /// decides. A scorer that places by a ring walks the ring its host
-    /// lent ([`RequestFacts::ring`]) and places nothing where none is
-    /// lent. It reads no value of the seed's stream. The default places
-    /// nothing.
-    fn own_by_place(
-        &self,
-        _facts: &RequestFacts<'_>,
-        _rows: usize,
-        _keep: &mut dyn FnMut(u32) -> bool,
-        _out: &mut [u32; MAX_TARGETS],
-    ) -> usize {
-        0
-    }
-
     /// How this scorer's values lie ([`ScoreSpread`]), asked once when the
     /// engine is built. A scorer that writes levels is a rank where its weight
     /// outweighs every stage behind it: a plain decision then asks those stages
@@ -3357,10 +3334,10 @@ pub struct Engine {
     /// indexed by [`slot`].
     phase_needs: [Needs; PHASES.len()],
     /// Per phase, whether a binding that covers it under the single plan
-    /// pins a key or reads a ring: the phases whose requests the keyed
-    /// decision over rows read one at a time answers or lends a ring
-    /// ([`Self::decide_keyed`]), indexed by [`slot`]. Every other phase's
-    /// request is turned away there by this one read.
+    /// pins a key: the phases whose requests the keyed decision over rows
+    /// read one at a time answers ([`Self::decide_keyed`]), indexed by
+    /// [`slot`]. Every other phase's request is turned away there by this
+    /// one read.
     keyed: [bool; PHASES.len()],
     sessions: SessionTable,
     assignment: AssignmentStages,
@@ -4447,12 +4424,10 @@ impl Engine {
                         .and_then(|i| profile_needs.get(usize::from(i)))
                         .copied()
                         .unwrap_or_default();
-                    // A rule that pins a key, or a stage that places by a
-                    // ring, the profile's or its shadow's: what a keyed
-                    // decision answers for, or lends a ring for.
-                    let reads_ring = own.ring || shadow.ring;
+                    // A rule that pins a key: what a keyed decision
+                    // answers for.
                     keyed[slot(phase)] |=
-                        binding.plan == Plan::Single && (binding.sessions.is_some() || reads_ring);
+                        binding.plan == Plan::Single && binding.sessions.is_some();
                     phase_needs[slot(phase)] = phase_needs[slot(phase)]
                         .or(own)
                         .or(shadow)

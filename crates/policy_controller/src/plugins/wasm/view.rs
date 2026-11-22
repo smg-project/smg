@@ -1568,8 +1568,6 @@ mod tests {
             named: None,
             signal_cells: None,
             client_key: 0,
-            ring: None,
-            ring_awaited: false,
         };
         let exposure = Exposure {
             tenant: Reveal::Plain,
