@@ -1328,13 +1328,12 @@ pub struct Constraints<'a> {
     /// The request's own fact and no veto of a worker: no stage reads it,
     /// and a profile that lists no filter is held to it like any other. A
     /// decision's staged pass opens its set with these places and hands no
-    /// target outside them, and a pass that draws from the pool leaves
-    /// such a request to it. A keyed request's reads by place do not ask
-    /// them yet: until they do, the engine over worker lists declines a
-    /// request that states places, by name. They are places of the one
-    /// list a single request is decided over, and one set of places
-    /// cannot hold a pair's two lists: a pair that states any is declined
-    /// the same way, and the served controller states none.
+    /// target outside them. A pass that draws from the pool leaves such a
+    /// request to it, and so does a keyed request's read of a row by its
+    /// place. They are places of the one list a single request is decided
+    /// over, and one set of places cannot hold a pair's two lists: the
+    /// engine over worker lists declines a pair that states any, by name,
+    /// and the served controller states none.
     ///
     /// A request held to places whose every worker it already tried is
     /// handed one of them again, not refused: the filter of tried
