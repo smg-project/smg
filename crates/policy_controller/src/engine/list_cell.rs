@@ -96,8 +96,7 @@ pub trait ModelLists: fmt::Debug + Send + Sync + 'static {
     ///
     /// It runs inside the fill of the list's cell, so it asks the engine
     /// nothing of that list: a call of [`PolicyEngine::members_of`] for the
-    /// same list from here waits for the fill it stands in, and does not
-    /// return.
+    /// same list from here is an error, and may deadlock or panic.
     fn fixed_facts(&self, worker: &Arc<dyn Worker>) -> FixedFacts;
 }
 
@@ -137,9 +136,10 @@ impl PolicyEngine {
 #[cfg(test)]
 mod tests {
     use std::{
+        panic::{catch_unwind, AssertUnwindSafe},
         ptr,
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Barrier,
         },
         thread,
@@ -209,11 +209,13 @@ mod tests {
     }
 
     /// A program whose lists live in the worker crate's registry. It says
-    /// of one worker that it takes images, and counts what it is asked.
+    /// of one worker that it takes images, and counts what it is asked. A
+    /// case can have its next answer panic.
     #[derive(Debug)]
     struct Program {
         registry: WorkerRegistry<Lists>,
         asked: AtomicUsize,
+        panics_next: AtomicBool,
     }
 
     impl Program {
@@ -226,6 +228,7 @@ mod tests {
             Self {
                 registry,
                 asked: AtomicUsize::new(0),
+                panics_next: AtomicBool::new(false),
             }
         }
 
@@ -253,8 +256,11 @@ mod tests {
 
         fn fixed_facts(&self, worker: &Arc<dyn Worker>) -> FixedFacts {
             self.asked.fetch_add(1, Ordering::Relaxed);
+            let panics = self.panics_next.swap(false, Ordering::Relaxed);
+            assert!(!panics, "the program panics");
             FixedFacts {
                 vision: worker.url() == TAKES_IMAGES,
+                ..FixedFacts::default()
             }
         }
     }
@@ -390,5 +396,26 @@ mod tests {
         assert_eq!(named.iter().filter(|named| **named).count(), 1);
         assert!(ptr::eq(engine.members_of(lists.all(), &program), members));
         assert_eq!(program.asked(), 4, "and not again at a read");
+    }
+
+    /// A fill whose program panics leaves the cell empty, and the panic
+    /// goes to the asker. The next ask fills the cell: the program is asked
+    /// again, once a worker.
+    #[test]
+    fn a_fill_whose_program_panics_leaves_the_cell_empty() {
+        let (engine, program) = (engine(), Program::of(&[regular(0), regular(1)]));
+        let lists = program.published();
+        program.panics_next.store(true, Ordering::Relaxed);
+
+        let asked = catch_unwind(AssertUnwindSafe(|| {
+            let _ = engine.members_of(lists.all(), &program);
+        }));
+        assert!(asked.is_err(), "the panic goes to the asker");
+        assert!(lists.all_cell.0.get().is_none(), "the cell stays empty");
+        assert_eq!(program.asked(), 1, "it panicked at its first answer");
+
+        let members = engine.members_of(lists.all(), &program);
+        assert!(Arc::ptr_eq(members.workers(), &lists.all));
+        assert_eq!(program.asked(), 3, "the next ask fills, once a worker");
     }
 }
