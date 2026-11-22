@@ -439,6 +439,23 @@ const READ_AT_ONCE_BYTES: usize = PARALLEL_MIN_BYTES;
 /// weight in between, the load of another tokenizer for one, is past it
 /// and reads the table itself.
 const LOAD_READ_HOLDS: Duration = Duration::from_millis(10);
+/// A text at least this long may have the thread's packed table read back
+/// before it (`PieceCache::reads_back`).
+const READ_BACK_MIN_BYTES: usize = 4096;
+/// The time a long text is given to encode, this and `READ_BACK_PER_BYTE`
+/// for each of its bytes: a thread whose next long text starts later than
+/// that is taken to have lost its processor in between.
+const READ_BACK_BASE: Duration = Duration::from_micros(20);
+const READ_BACK_PER_BYTE: Duration = Duration::from_nanos(32);
+/// The longest gap the read answers: a wait for a processor lasts a few
+/// slices of the scheduler, a longer one is a thread at rest.
+const READ_BACK_WITHIN: Duration = Duration::from_millis(20);
+
+/// The processors this process may run on, or `usize::MAX` where the
+/// system does not say, so that no encoder has more callers than that.
+fn processors() -> usize {
+    std::thread::available_parallelism().map_or(usize::MAX, usize::from)
+}
 /// The size a long text unit is cut into for the pool, at the first stable
 /// boundary past each multiple of it.
 const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
@@ -651,6 +668,9 @@ struct PieceCache {
     /// The vocabulary's form of a waiting piece being merged on the
     /// sentencepiece path: a scratch string of the thread.
     mapped: String,
+    /// When the thread's last long text started, and its bytes
+    /// (`Self::reads_back`).
+    last_long: Option<(Instant, usize)>,
 }
 
 impl PieceCache {
@@ -678,7 +698,26 @@ impl PieceCache {
             of_use: 0,
             asks_from: 0,
             mapped: String::new(),
+            last_long: None,
         }
+    }
+
+    /// Whether a long text of `bytes` bytes that starts at `now` has the
+    /// packed table read back before it, and notes the text. It has when
+    /// the long text before it started longer ago than that one is given
+    /// to encode and within [`READ_BACK_WITHIN`]: the thread is taken to
+    /// have lost its processor to another caller, and the table's lines
+    /// to have left the near caches with it; read as a stream they cost
+    /// less than fetched one probe at a time. A thread that did other
+    /// work in between reads as well.
+    fn reads_back(&mut self, now: Instant, bytes: usize) -> bool {
+        let last = self.last_long.replace((now, bytes));
+        last.is_some_and(|(then, bytes)| {
+            let gap = now.saturating_duration_since(then);
+            let bytes = u32::try_from(bytes).unwrap_or(u32::MAX);
+            gap > READ_BACK_BASE + READ_BACK_PER_BYTE.saturating_mul(bytes)
+                && gap < READ_BACK_WITHIN
+        })
     }
 
     /// Bytes the long tier holds, used or not: its entries' pieces, ids and
@@ -1560,6 +1599,10 @@ pub(crate) struct NativeEncoder {
     /// The thread that loaded this encoder, and when its rehearsal had read
     /// the merge table through ([`Self::rehearse`]).
     load_read: OnceLock<(ThreadId, Instant)>,
+    /// [`processors`] when the encoder was made: once more threads than
+    /// this have called, a thread reads its table back
+    /// (`PieceCache::reads_back`).
+    processors: usize,
 }
 
 impl std::fmt::Debug for NativeEncoder {
@@ -1682,6 +1725,7 @@ impl NativeEncoder {
             threads: AtomicUsize::new(0),
             callers: AtomicUsize::new(0),
             load_read: OnceLock::new(),
+            processors: processors(),
         })
     }
 
@@ -1768,6 +1812,7 @@ impl NativeEncoder {
             threads: AtomicUsize::new(0),
             callers: AtomicUsize::new(0),
             load_read: OnceLock::new(),
+            processors: processors(),
         })
     }
 
@@ -2469,6 +2514,7 @@ impl NativeEncoder {
             threads: AtomicUsize::new(0),
             callers: AtomicUsize::new(0),
             load_read: OnceLock::new(),
+            processors: processors(),
         })
     }
 
@@ -2894,6 +2940,14 @@ impl NativeEncoder {
         let mut ids = Vec::with_capacity(before.len() + text.len() / 3 + 8 + after.len());
         ids.extend_from_slice(before);
         let mut cache = self.piece_cache_for_text(text.len());
+        // The count of callers never falls, and the clock is read only
+        // past it. Not for a unit on the pool: it is no text of its thread.
+        if text.len() >= READ_BACK_MIN_BYTES
+            && self.callers.load(Ordering::Relaxed) > self.processors
+            && cache.reads_back(Instant::now(), text.len())
+        {
+            cache.packed.read_through();
+        }
         self.encode_serial(model, units, words, at_start, &mut ids, &mut cache)?;
         ids.extend_from_slice(after);
         Ok(ids)

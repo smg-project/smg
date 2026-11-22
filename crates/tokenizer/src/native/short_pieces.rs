@@ -314,6 +314,24 @@ impl ShortPieceTable {
         self.entries.len()
     }
 
+    /// Reads one tag in 64 and one id word of every second entry, a load
+    /// a cache line, and keeps nothing, so that the lines come in as two
+    /// streams rather than one dependent probe at a time
+    /// (`PieceCache::reads_back` says when).
+    #[inline(never)]
+    pub(super) fn read_through(&self) {
+        const LINE_STEP: usize = 64 / size_of::<Entry>();
+        let mut sum = 0u64;
+        for tag in self.tags.iter().step_by(64) {
+            sum = sum.wrapping_add(u64::from(*tag));
+        }
+        for entry in self.entries.iter().step_by(LINE_STEP) {
+            sum = sum.wrapping_add(u64::from(entry.ids[0]));
+        }
+        // The loads stay: the sum is observed.
+        std::hint::black_box(sum);
+    }
+
     /// Entries the table takes before [`Self::insert`] refuses: three
     /// quarters of the slots, so a probe always ends on an empty slot.
     pub(super) fn fill_bound(&self) -> usize {

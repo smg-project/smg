@@ -4569,6 +4569,24 @@ fn a_thread_keeps_its_whole_share_where_no_miss_asks_the_learned_table() {
     }
 }
 
+/// A long text has the thread's table read back only when the one before
+/// it started longer ago than that one is given to encode, and within the
+/// band: not the first, not one that follows at once, not one after a rest.
+#[test]
+fn a_long_text_reads_the_table_back_after_a_lost_processor() {
+    let mut cache = PieceCache::with_share(1);
+    let bytes = 8192;
+    let given = READ_BACK_BASE + READ_BACK_PER_BYTE * 8192;
+    let first = Instant::now();
+    assert!(!cache.reads_back(first, bytes), "none before it");
+    let at_once = first + given;
+    assert!(!cache.reads_back(at_once, bytes), "it follows at once");
+    let waited = at_once + given + Duration::from_micros(1);
+    assert!(cache.reads_back(waited, bytes), "the thread waited");
+    let rested = waited + READ_BACK_WITHIN;
+    assert!(!cache.reads_back(rested, bytes), "the thread rested");
+}
+
 /// Threads that share at one time encode as a young thread does: sixteen
 /// threads encode the same texts of many distinct pieces through a learned
 /// table small enough that every part of it fills and is set down while
