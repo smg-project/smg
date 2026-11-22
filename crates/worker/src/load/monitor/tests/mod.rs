@@ -698,6 +698,94 @@ async fn a_stopped_monitor_ends_its_tasks_and_starts_again_over_the_registry() {
     assert!(monitor.event_task.lock().is_some());
 }
 
+/// A ready HTTP worker at one URL that serves `models`.
+fn serving(models: &[&str]) -> Arc<dyn Worker> {
+    let cards: Vec<ModelCard> = models.iter().copied().map(ModelCard::new).collect();
+    let worker = BasicWorkerBuilder::new("http://w:1")
+        .worker_type(WorkerType::Regular)
+        .connection_mode(ConnectionMode::Http)
+        .models(cards)
+        .health_config(crate::test_support::no_health_check())
+        .build();
+    worker.set_status(WorkerStatus::Ready);
+    Arc::new(worker)
+}
+
+/// Poll a stop once: whether it ended.
+async fn polled_once(stop: std::pin::Pin<&mut impl std::future::Future<Output = ()>>) -> bool {
+    tokio::select! {
+        biased;
+        () = stop => true,
+        () = std::future::ready(()) => false,
+    }
+}
+
+/// A stop dropped at its first wait keeps the event task's handle, so the
+/// stop behind it waits for that task's end too. The event task's poll of
+/// a replacement is held inside the sink while both stops are polled:
+/// neither takes a group's loop while that poll runs. The poll then starts
+/// the loop of the group the replacement adds, and the second stop ends it
+/// with every other task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_behind_one_dropped_at_its_first_wait_waits_for_the_event_task() {
+    let (entered, in_forget) = mpsc::channel();
+    let (resume, at_resume) = mpsc::channel();
+    let registry = Arc::new(WorkerRegistry::new());
+    let sink = Arc::new(StoppedAtForget {
+        classic: ClassicLoadSink::new(
+            Arc::clone(&registry),
+            Arc::new(LoadReaders::Blind),
+            Arc::new(WorkerLoadManager::new()),
+        ),
+        entered,
+        resume: Mutex::new(at_resume),
+    });
+    let monitor = Arc::new(WorkerMonitor::with_sink(
+        Arc::clone(&registry),
+        sink,
+        5,
+        false,
+        false,
+    ));
+    let id = registry.register(serving(&["a"])).unwrap();
+    monitor.start_event_loop();
+    let groups = || monitor.group_handles.lock().len();
+    assert_eq!(groups(), 1);
+
+    // The event task's poll of the replacement stands inside the sink.
+    assert!(registry.replace(&id, serving(&["a", "b"])));
+    assert!(within_two_seconds(|| in_forget.try_recv().is_ok()).await);
+
+    {
+        let stop = monitor.stop();
+        tokio::pin!(stop);
+        assert!(!polled_once(stop.as_mut()).await, "the stop ended");
+    }
+    assert_eq!(groups(), 1, "a stop at its first wait took a group's loop");
+
+    let stop = monitor.stop();
+    tokio::pin!(stop);
+    assert!(!polled_once(stop.as_mut()).await, "the stop ended");
+    assert_eq!(
+        groups(),
+        1,
+        "the stop took a group's loop ahead of the event task's end"
+    );
+
+    // The poll goes on, and starts the loop of the group the replacement
+    // adds.
+    resume.send(()).unwrap();
+    assert!(within_two_seconds(|| groups() == 2).await);
+
+    stop.await;
+    assert_eq!(groups(), 0, "a group's loop outlived the stop");
+    assert_eq!(
+        Arc::weak_count(&monitor),
+        0,
+        "a task of the stopped monitor still holds it"
+    );
+}
+
 fn pushed(running: i32) -> PushedRecord {
     PushedRecord {
         snapshot: SchedulerLoadSnapshot {

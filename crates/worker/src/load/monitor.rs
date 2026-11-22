@@ -1396,14 +1396,15 @@ impl<G: Generation> WorkerMonitor<G> {
     /// poll behind it, until the next start: its rebuild from the registry
     /// tells the sink the reset.
     ///
-    /// A stop dropped at a wait leaves no task running with no handle: the
-    /// event task was told to end ahead of the first wait, and every other
-    /// task ahead of the next. It has reset nothing: a later stop does.
+    /// A stop dropped at its first wait puts the event task's handle back.
+    /// That task was told to end, and a poll of it that still runs can
+    /// start a group: the next stop waits for the task's end ahead of the
+    /// groups it takes. A stop dropped at a later wait has told every other
+    /// task to end. It has reset nothing: a later stop does.
     ///
     /// Called by no task of the monitor: the call waits for each of them.
     pub async fn stop(&self) {
-        let events = self.event_task.lock().take();
-        ended(events).await;
+        Awaited::out_of(&self.event_task).ended().await;
         // No group starts behind the event task's end, so the tasks taken
         // here are every task that stands.
         let mut ending: Vec<JoinHandle<()>> = Vec::new();
@@ -1423,8 +1424,8 @@ impl<G: Generation> WorkerMonitor<G> {
         for task in &ending {
             task.abort();
         }
-        for task in ending {
-            ended(Some(task)).await;
+        for mut task in ending {
+            ended(&mut task).await;
         }
         self.stop_all_groups();
     }
@@ -2191,13 +2192,42 @@ impl<G> Drop for WorkerMonitor<G> {
     }
 }
 
+/// A task's handle, out of its slot while [`WorkerMonitor::stop`] waits for
+/// the task's end. Dropped ahead of that end, it puts the handle back: the
+/// stop behind a dropped one waits for the task too.
+struct Awaited<'a> {
+    slot: &'a Mutex<Option<JoinHandle<()>>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl<'a> Awaited<'a> {
+    fn out_of(slot: &'a Mutex<Option<JoinHandle<()>>>) -> Self {
+        let handle = slot.lock().take();
+        Self { slot, handle }
+    }
+
+    /// Tell the task to end and wait for its end ([`ended`]).
+    async fn ended(mut self) {
+        if let Some(handle) = &mut self.handle {
+            ended(handle).await;
+        }
+        self.handle = None;
+    }
+}
+
+impl Drop for Awaited<'_> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            *self.slot.lock() = Some(handle);
+        }
+    }
+}
+
 /// Abort a task of the monitor and wait for its end ([`WorkerMonitor::stop`]).
 /// An aborted task ends at its next wait, and a cancelled join is its end.
-async fn ended(handle: Option<JoinHandle<()>>) {
-    if let Some(handle) = handle {
-        handle.abort();
-        let _ = handle.await;
-    }
+async fn ended(handle: &mut JoinHandle<()>) {
+    handle.abort();
+    let _ = handle.await;
 }
 
 /// Debounced eviction flusher: waits for the first queued eviction, lets a
