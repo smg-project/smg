@@ -28,6 +28,12 @@
 //! ([`Demands::no_rank`]), and a worker that registered a rank does not
 //! take it ([`DemandFacts::ranked`]).
 //!
+//! A retry whose constraint was decided for its first worker says how that
+//! worker decides one, as a number ([`Demands::decoding`]), and only a
+//! worker that states the same number takes it
+//! ([`DemandFacts::decoding`]). The numbers are the registering host's:
+//! the crate holds no rule for them.
+//!
 //! A pool the demands leave nobody is shed with no endpoint, under the
 //! stage of one demand ([`UnmetDemand::stage`]). A row is judged by the demand
 //! it fails first, in the order a host answers for them ([`UnmetDemand`]), and
@@ -85,18 +91,32 @@ pub struct Demands {
     /// route names no rank to the worker it sends to. Only a worker that
     /// registered none ([`DemandFacts::ranked`]) takes the request.
     pub no_rank: bool,
+    /// How the request's constraint was decided: a retry states the number
+    /// of its first attempt's worker ([`DemandFacts::decoding`]), and only
+    /// a worker that states the same number takes it. A prefill worker is
+    /// not held to it ([`Self::held_by`]). `0` demands none.
+    pub decoding: u8,
 }
 
 impl Demands {
     /// Whether the request demands nothing: its door reads no fact then.
     #[must_use]
     pub const fn is_none(self) -> bool {
-        self.runtime == 0
-            && !self.vision
-            && matches!(self.references, References::None)
-            && self.input_window == 0
-            && self.output_window == 0
-            && !self.no_rank
+        // Every field by its name and no rest: a demand added later does
+        // not build until this test reads it.
+        let Self {
+            runtime,
+            vision,
+            references,
+            input_window,
+            output_window,
+            no_rank,
+            decoding,
+        } = self;
+        // One compare for the numbers, one for the bits and the byte.
+        (runtime | input_window | output_window) == 0
+            && (vision as u8 | no_rank as u8 | decoding) == 0
+            && matches!(references, References::None)
     }
 
     /// The demand a worker fails first, in the order of [`UnmetDemand`]:
@@ -131,23 +151,27 @@ impl Demands {
         // A window that is stated holds each bound alone.
         let held = facts.window == 0
             || (self.input_window <= facts.window && self.output_window <= facts.window);
-        if held {
-            None
-        } else {
-            Some(UnmetDemand::Window)
+        if !held {
+            return Some(UnmetDemand::Window);
         }
+        if self.decoding != 0 && self.decoding != facts.decoding {
+            return Some(UnmetDemand::Decoding);
+        }
+        None
     }
 
     /// What a worker of `role`'s pool is held to: the request's demands,
-    /// less its completion's bound for a prefill worker. A prefill runs
-    /// the input, and the decode beside it holds the budget. The door
-    /// reads a request's demands through this where it judges rows: the
-    /// role is the door's to know.
+    /// less its completion's bound and the way its constraint was decided
+    /// for a prefill worker. A prefill runs the input: the decode beside it
+    /// holds the budget and generates the tokens a constraint holds. The
+    /// door reads a request's demands through this where it judges rows:
+    /// the role is the door's to know.
     #[must_use]
     pub const fn held_by(self, role: Role) -> Self {
         match role {
             Role::Prefill => Self {
                 output_window: 0,
+                decoding: 0,
                 ..self
             },
             Role::Single | Role::Decode | Role::Encode => self,
@@ -163,8 +187,9 @@ impl Demands {
 
 /// What a worker states for the hard demands of a request beside its row,
 /// by its registration: one entry a row, in a column beside the rows. The
-/// default states nothing: it meets no demand for a runtime or for media by
-/// reference, it holds a request of any size, and it registered no rank.
+/// default states nothing: it meets no demand for a runtime, for media by
+/// reference or for a way to decide a constraint, it holds a request of any
+/// size, and it registered no rank.
 /// Whether the worker takes
 /// images is no entry of the column: its row carries that bit
 /// ([`WorkerFacts::vision`](crate::store::WorkerFacts::vision)). Further
@@ -190,6 +215,11 @@ pub struct DemandFacts {
     /// included: a request no rank can be pinned for
     /// ([`Demands::no_rank`]) is left to the workers that registered none.
     pub ranked: bool,
+    /// How the worker decides a request's constraint, as a number its
+    /// registering host names: equal numbers decide a constraint alike,
+    /// and the crate reads no more of it. `0` states none, and meets no
+    /// demand for one.
+    pub decoding: u8,
 }
 
 /// The stage a pool is shed under when none of its rows processes media by
@@ -210,12 +240,17 @@ pub(crate) const CONTEXT_WINDOW: &str = "context-window";
 /// ([`UnmetDemand::Rank`]).
 pub(crate) const RANK: &str = "rank";
 
+/// The stage a pool is shed under when none of its rows decides a
+/// constraint as the request's was decided ([`UnmetDemand::Decoding`]).
+pub(crate) const DECODING: &str = "decoding";
+
 /// The demand a worker fails first. The order is the order a host answers
 /// for them: a pool is cut to the workers that registered no rank where
 /// none can be pinned for its request, then to its request's runtime, then
 /// to the workers that take images, then to those that process media by
 /// reference, then to the pipeline the request names, then to the windows
-/// that hold the request. Further demands add their cases: a host's match
+/// that hold the request, then to the workers that decide its constraint
+/// as it was decided. Further demands add their cases: a host's match
 /// keeps an arm for the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
@@ -234,6 +269,9 @@ pub enum UnmetDemand {
     /// The worker's context window holds less than the request's input or
     /// its completion needs.
     Window,
+    /// The worker decides a constraint another way than the request's was
+    /// decided, or states no way.
+    Decoding,
 }
 
 impl UnmetDemand {
@@ -251,6 +289,7 @@ impl UnmetDemand {
             Self::References => REFERENCES,
             Self::Pipeline => PIPELINE,
             Self::Window => CONTEXT_WINDOW,
+            Self::Decoding => DECODING,
         }
     }
 }
@@ -461,9 +500,66 @@ mod tests {
         assert_eq!(mix.into_iter().max(), Some(Some(UnmetDemand::Window)));
     }
 
+    /// A retry's constraint is met by the workers that state its number
+    /// alone: a worker that states another way, or none, meets no demand
+    /// for one. It is judged last, behind the window.
+    #[test]
+    fn a_decided_constraint_is_met_by_the_same_number_alone() {
+        let decides = |decoding: u8| DemandFacts {
+            decoding,
+            ..DemandFacts::default()
+        };
+        let retry = Demands {
+            decoding: 5,
+            ..Demands::default()
+        };
+        assert!(!retry.is_none());
+        assert_eq!(
+            [decides(5), decides(7), decides(0)].map(|facts| retry.unmet_by(false, facts)),
+            [
+                None,
+                Some(UnmetDemand::Decoding),
+                Some(UnmetDemand::Decoding)
+            ]
+        );
+        assert!(Demands::default().met_by(false, decides(7)));
+        let long = Demands {
+            input_window: 101,
+            ..retry
+        };
+        let narrow = DemandFacts {
+            window: 100,
+            ..decides(7)
+        };
+        assert_eq!(long.unmet_by(false, narrow), Some(UnmetDemand::Window));
+    }
+
+    /// The test of a request that demands nothing reads every field: the
+    /// default demands nothing, and a request that states one demand alone
+    /// demands something, whichever it is.
+    #[test]
+    fn a_request_that_states_one_demand_alone_demands_something() {
+        let nothing = Demands::default();
+        assert!(nothing.is_none());
+        let mut alone = [nothing; 9];
+        alone[0].runtime = 1;
+        alone[1].vision = true;
+        alone[2].references = References::Any;
+        alone[3].references = References::Caller;
+        alone[4].references = References::Worker;
+        alone[5].input_window = 1;
+        alone[6].output_window = 1;
+        alone[7].no_rank = true;
+        alone[8].decoding = 1;
+        for demands in alone {
+            assert!(!demands.is_none(), "{demands:?}");
+        }
+    }
+
     /// A prefill worker is held to the input alone: the completion's
-    /// bound is its decode's to hold. Every other role is held to both,
-    /// and no other demand moves with the role.
+    /// bound is its decode's to hold, and so is the way a constraint is
+    /// decided. Every other role is held to all of it, and no other demand
+    /// moves with the role.
     #[test]
     fn a_prefill_is_held_to_the_input_alone() {
         let asked = Demands {
@@ -473,9 +569,11 @@ mod tests {
             input_window: 40,
             output_window: 400,
             no_rank: true,
+            decoding: 5,
         };
         let input_alone = Demands {
             output_window: 0,
+            decoding: 0,
             ..asked
         };
         assert_eq!(asked.held_by(Role::Prefill), input_alone);
@@ -500,6 +598,7 @@ mod tests {
             UnmetDemand::References,
             UnmetDemand::Pipeline,
             UnmetDemand::Window,
+            UnmetDemand::Decoding,
         ];
         assert!(order.is_sorted());
         assert_eq!(
@@ -510,7 +609,8 @@ mod tests {
                 "vision",
                 "references",
                 "pipeline",
-                "context-window"
+                "context-window",
+                "decoding"
             ]
         );
     }
