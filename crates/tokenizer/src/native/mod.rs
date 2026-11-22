@@ -630,7 +630,8 @@ struct PieceCache {
     shares: bool,
     /// The calls up to the one that reads the merge table through
     /// (`NativeEncoder::piece_cache_for_text`): two in a new cache, zero
-    /// once the table is read.
+    /// once the table is read, or once the load's read stood in for it
+    /// (`NativeEncoder::load_read_holds`).
     calls_to_read: u8,
     /// The asks of the learned table since the thread last judged them
     /// (`Self::judge_asks`), and those of them the table answered.

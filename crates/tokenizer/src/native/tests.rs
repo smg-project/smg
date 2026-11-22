@@ -5081,19 +5081,28 @@ fn a_thread_reads_the_merge_table_at_its_second_call_or_before_a_long_first_text
 fn a_rehearsal_reads_for_the_loading_thread_and_makes_no_cache_of_it() {
     let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
     let tokenizer = tokenizer_of(&shapes()[0], &mut state);
-    let native = seeded(&tokenizer);
-    native.rehearse(Some(tokenizer.get_model()));
+    let model = tokenizer.get_model();
+    let mut native = seeded(&tokenizer);
+    native.rehearse(Some(model));
     assert_eq!(native.threads.load(Ordering::Relaxed), 0);
-    let &(_, read_at) = native.load_read.get().expect("the load's stamp");
-    assert!(native.load_read_holds(read_at), "right after the load");
-    assert!(!native.load_read_holds(read_at + LOAD_READ_HOLDS), "later");
-    let elsewhere = std::thread::scope(|scope| {
-        scope
-            .spawn(|| native.load_read_holds(read_at))
-            .join()
-            .expect("a thread")
-    });
-    assert!(!elsewhere, "another thread reads the table itself");
+    // The load's stamp an hour ahead: fresh whatever the pace of the test.
+    let (loader, read_at) = native.load_read.take().expect("the load's stamp");
+    let fresh = read_at + Duration::from_secs(3600);
+    native.load_read = OnceLock::from((loader, fresh));
+    assert!(!native.load_read_holds(fresh + LOAD_READ_HOLDS), "later");
+    let reads_after_two_calls = || {
+        for _ in 0..2 {
+            native
+                .encode_with(Some(model), " one more piece", false, false)
+                .expect("ids");
+        }
+        let merges = native.merges.as_ref().expect("a merge table");
+        merges.reads.load(Ordering::Relaxed)
+    };
+    assert_eq!(reads_after_two_calls(), 1, "the load's read stands in");
+    let elsewhere =
+        std::thread::scope(|scope| scope.spawn(reads_after_two_calls).join().expect("a thread"));
+    assert_eq!(elsewhere, 2, "another thread reads the table itself");
 }
 
 /// A thread whose share fell (threads joined) since it last read it is

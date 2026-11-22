@@ -46,6 +46,8 @@
 //! the leftmost of equal ranks: equal ranks are one token, formed at two
 //! positions by the same or by different splits).
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{borrow::Cow, cmp::Reverse, collections::BinaryHeap};
 
 use rustc_hash::FxHashMap;
@@ -281,6 +283,9 @@ pub(super) struct MergeTable {
     /// The model's `ignore_merges`: a piece that is a token is that token,
     /// looked up before any merge (by the caller, in the model's vocabulary).
     pub(super) ignore_merges: bool,
+    /// The calls of [`Self::read_through`], for the test of who reads.
+    #[cfg(test)]
+    pub(super) reads: AtomicUsize,
 }
 
 /// The model's `merges` field read back: `[[a, b], ...]` in rank order.
@@ -660,6 +665,8 @@ impl MergeTable {
             merges,
             preformed: Box::new(Preformed::empty()),
             ignore_merges,
+            #[cfg(test)]
+            reads: Default::default(),
         }
     }
 
@@ -806,8 +813,9 @@ impl MergeTable {
 
     /// Reads one word of every line of the table, the buckets first, then
     /// the grid and the filter (the small, hot tables last, so they stay in
-    /// the nearer caches), and keeps nothing: an early encode of a thread with
-    /// the encoder calls it so that the table's lines come in as one stream
+    /// the nearer caches), and keeps nothing: the end of a load
+    /// (`NativeEncoder::rehearse`) and an early encode of a thread with
+    /// the encoder call it so that the table's lines come in as one stream
     /// then rather than one dependent probe at a time during the first-sight
     /// pieces of the texts after it. In a fresh process the table was built
     /// at load and the rest of the load pushed it out; measured on the
@@ -815,11 +823,13 @@ impl MergeTable {
     /// memory per token against 0.16 from the last-level cache, and this read
     /// takes 10-20 % off those cells (16 % by median) and 8 % by median off
     /// the 2 KB ones, nothing measurable from 32 KB up, against a parent that
-    /// has the pair filter, for 0.3-0.5 ms once per thread per encoder on a
-    /// 128-151k-merge table.
+    /// has the pair filter, for 0.3-0.5 ms at the load and at most once per
+    /// thread per encoder on a 128-151k-merge table.
     #[inline(never)]
     pub(super) fn read_through(&self) {
         const GRID_STEP: usize = 64 / size_of::<Merge>();
+        #[cfg(test)]
+        self.reads.fetch_add(1, Ordering::Relaxed);
         let mut sum = 0u64;
         for bucket in &self.buckets {
             sum = sum.wrapping_add(bucket.0[0].key);
