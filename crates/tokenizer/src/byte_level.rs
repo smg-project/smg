@@ -112,6 +112,7 @@ impl Piece<'_> {
 /// in a text store, so the decoder reads each as `&str` with no validation
 /// per token; the others live in a byte store. About 9 bytes per id plus the
 /// token bytes themselves.
+#[derive(Default)]
 pub(crate) struct ByteLevelTable {
     /// `spans[id]` indexes the store `kind[id]` names for token `id`.
     spans: Vec<(u32, u32)>,

@@ -62,8 +62,9 @@
 //! encoder.
 
 use std::{
-    borrow::Cow,
+    borrow::{Borrow, Cow},
     cell::{RefCell, RefMut},
+    hash::Hash,
     ops::Range,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -2324,8 +2325,8 @@ impl NativeEncoder {
     /// encodes each match: no normalizer, one stage whose matches alone are
     /// pieces, no frame. The seed is ready at once: every token of a
     /// complete table is its own id.
-    pub(crate) fn from_ranks(
-        ranks: &FxHashMap<Vec<u8>, u32>,
+    pub(crate) fn from_ranks<K: Borrow<[u8]> + Eq + Hash>(
+        ranks: &FxHashMap<K, u32>,
         pattern: &str,
         specials: &[(String, u32)],
     ) -> Result<Self, Declined> {
@@ -2446,10 +2447,10 @@ impl NativeEncoder {
 
     /// The seed of a tiktoken vocabulary: every token the key holds, with
     /// its own id (what a miss on it merges to, the table being complete).
-    fn ranks_seed(ranks: &FxHashMap<Vec<u8>, u32>) -> ShortPieceTable {
+    fn ranks_seed<K: Borrow<[u8]>>(ranks: &FxHashMap<K, u32>) -> ShortPieceTable {
         let mut table = ShortPieceTable::for_entries(ranks.len());
         for (token, &rank) in ranks {
-            if let Some(key) = ShortPieceKey::of(token) {
+            if let Some(key) = ShortPieceKey::of(token.borrow()) {
                 table.insert(key, &[rank], ranks.len());
             }
         }

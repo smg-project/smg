@@ -46,7 +46,12 @@
 //! the leftmost of equal ranks: equal ranks are one token, formed at two
 //! positions by the same or by different splits).
 
-use std::{borrow::Cow, cmp::Reverse, collections::BinaryHeap};
+use std::{
+    borrow::{Borrow, Cow},
+    cmp::Reverse,
+    collections::BinaryHeap,
+    hash::Hash,
+};
 
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
@@ -458,7 +463,9 @@ impl MergeTable {
     /// The table pre-forms characters as a model's does (see `preformed`):
     /// the tokens are raw bytes already, and an id's least operand rank is
     /// the least rank of a split that takes it as either half.
-    pub(super) fn from_ranks(ranks: &FxHashMap<Vec<u8>, u32>) -> Result<Self, Declined> {
+    pub(super) fn from_ranks<K: Borrow<[u8]> + Eq + Hash>(
+        ranks: &FxHashMap<K, u32>,
+    ) -> Result<Self, Declined> {
         let mut byte_ids = [0u32; 256];
         for (byte, id) in byte_ids.iter_mut().enumerate() {
             *id = ranks
@@ -486,6 +493,7 @@ impl MergeTable {
         let mut root = vec![UNSET; ranks_end];
         let mut splits = Vec::with_capacity(ranks.len() * 2);
         for (token, &rank) in ranks {
+            let token: &[u8] = token.borrow();
             if token.len() < 2 {
                 continue;
             }
@@ -577,6 +585,7 @@ impl MergeTable {
         }
         let mut ids = Vec::new();
         for (token, &rank) in ranks {
+            let token: &[u8] = token.borrow();
             if token.len() < 2 {
                 continue;
             }
@@ -612,7 +621,7 @@ impl MergeTable {
         // The tokens in rank order, placed and not sorted: the analysis
         // orders them by id, one pass where they come in order. A token
         // another of its rank displaces goes after the placed ones.
-        let mut by_rank: Vec<Option<&Vec<u8>>> = vec![None; ranks_end];
+        let mut by_rank: Vec<Option<&K>> = vec![None; ranks_end];
         let mut twice = Vec::new();
         for (token, &rank) in ranks {
             if let Some(first) = by_rank[rank as usize].replace(token) {
@@ -623,9 +632,12 @@ impl MergeTable {
             .iter()
             .enumerate()
             .filter_map(|(rank, token)| token.map(|token| (rank as u32, token)));
-        let mut raws = Raws::for_tokens(ranks.len(), ranks.keys().map(Vec::len).sum());
+        let mut raws = Raws::for_tokens(
+            ranks.len(),
+            ranks.keys().map(|token| token.borrow().len()).sum(),
+        );
         for (rank, token) in placed.chain(twice) {
-            raws.push(rank, token.iter().copied().map(Some), |_| true);
+            raws.push(rank, token.borrow().iter().copied().map(Some), |_| true);
         }
         table.preformed = Box::new(Preformed::analyse(&table, raws, &min_operand));
         Ok(table)
