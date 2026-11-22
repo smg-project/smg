@@ -40,7 +40,7 @@ use openai_protocol::{
     UNKNOWN_MODEL_ID,
 };
 use reqwest::multipart::{Form, Part};
-use smg_policy_controller::engine::WorkerId;
+use smg_policy_controller::engine::{WireModes, WorkerId};
 use smg_worker::{
     identity::{
         basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
@@ -83,7 +83,9 @@ use crate::{
             },
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload, placement,
-            placement::{CandidateFilter, PlacementFailure, PlacementInputs, RefusalSite},
+            placement::{
+                CandidateFilter, Missed, PlacementFailure, PlacementInputs, Placer, RefusalSite,
+            },
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
@@ -126,6 +128,8 @@ const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
 const TRANSCRIPTION_REFUSAL_SITE: &str = "Router::route_multipart_transcription";
 
+const TYPED_REFUSAL_SITE: &str = "Router::route_typed_request";
+
 /// Error code of a streamed body that broke off before it was forwarded.
 /// With the middleware's `REQUEST_BODY_STALLED` and `REQUEST_BODY_TOO_LARGE`
 /// it names an abort the client caused; the three carry no worker verdict:
@@ -164,12 +168,14 @@ struct TypedAttempt<'a, T> {
     /// The engines a failed attempt of this request dispatched to; a retry
     /// re-selects away from them while another available worker is left.
     tried: &'a parking_lot::Mutex<Vec<String>>,
-    /// The store rows the request's failed attempts were sent to, one an
-    /// attempt. A retry names them in its ask, and their count is the ask's
-    /// retry number. Classic policies leave it empty.
+    /// The rows a followed controller's placements named for the request's
+    /// failed attempts, one an attempt: the placement that waits names them
+    /// in its ask, and their count is the ask's retry number. Empty where
+    /// the placement does not wait.
     tried_rows: &'a parking_lot::Mutex<Vec<WorkerId>>,
-    /// The request's own id, kept where the router's policy engine asks: a
-    /// source of the request's routing key.
+    /// The request's own id, copied where the placement waits: its ask
+    /// stands behind the lease's view. A placement that does not wait reads
+    /// the id in the view.
     rid: Option<&'a str>,
 }
 
@@ -184,6 +190,9 @@ pub struct Router {
     policy_registry: Arc<PolicyRegistry>,
     /// The policy engine, when it places this router's requests.
     policy_engine: Option<Arc<PolicyEngine>>,
+    /// Who places a typed request: the classic policies, or the policy
+    /// engine where it places this router's requests.
+    placer: Placer,
     retry_config: RetryConfig,
     /// Cap on buffered worker response bodies, mirroring the ingress limit.
     max_payload_size: usize,
@@ -259,6 +268,7 @@ impl Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
             policy_engine: ctx.policy_engine.clone(),
+            placer: Placer::of(&ctx.policy_registry, ctx.policy_engine.as_ref()),
             retry_config: ctx.router_config.effective_retry_config(),
             max_payload_size: ctx.router_config.max_payload_size,
             stream_stall_timeout: match ctx.router_config.stream_body_stall_timeout_secs {
@@ -377,6 +387,7 @@ impl Router {
                 cache_namespace,
                 candidate_filter,
                 tried,
+                ..Default::default()
             },
         )
     }
@@ -496,12 +507,13 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let routing = self.routing_derivatives(headers, &typed_req);
-        // The lease frees the parsed request at its dispatch, so the policy
-        // engine's asks read the request's own id from here.
+        // A placement that waits asks behind the lease's view, so its ask
+        // reads the request's own id from here.
         let rid = self
-            .policy_engine
-            .as_ref()
-            .and_then(|_| typed_req.rid().map(str::to_owned));
+            .placer
+            .waits()
+            .then(|| typed_req.rid().map(str::to_owned))
+            .flatten();
         // Resolve once, here, so every registry, policy and metrics lookup
         // below is keyed by the canonical model ID. Only `get_by_model`
         // understands aliases; retry configs, hash rings and policies do not,
@@ -538,7 +550,7 @@ impl Router {
             // The state the attempts share; `TypedAttempt` names each piece.
             let tried = parking_lot::Mutex::new(Vec::new());
             let tried_rows = parking_lot::Mutex::new(Vec::new());
-            let ledger = AttemptLedger::of(self.policy_engine.is_some());
+            let ledger = AttemptLedger::of(self.placer.waits());
             let attempt = TypedAttempt {
                 headers,
                 lease: &lease,
@@ -642,7 +654,7 @@ impl Router {
         attempt: &TypedAttempt<'_, T>,
         endpoint: &'static str,
     ) -> Response {
-        let res = self.route_typed_request_once(attempt).await;
+        let res = self.route_typed_request_once(attempt, 0).await;
         Metrics::record_router_upstream_response(
             metrics_labels::ROUTER_HTTP,
             res.status().as_u16(),
@@ -671,8 +683,8 @@ impl Router {
             // operation per attempt; the lease keeps the request alive
             // for replay until the retry window closes (first
             // non-retryable response).
-            |_: u32| async {
-                let res = self.route_typed_request_once(attempt).await;
+            |retry: u32| async move {
+                let res = self.route_typed_request_once(attempt, retry).await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
                 Metrics::record_router_upstream_response(
@@ -720,38 +732,40 @@ impl Router {
     }
 
     /// One attempt of a typed request as a sequence of named stages: the
-    /// placement or classic selection with its overload re-check, the adapter,
-    /// the dispatch, the adapter's verdict and the accounting. A successful
-    /// stream carries its placement to the body's end. Other attempts report
-    /// their status before returning.
+    /// placement with its overload re-check, the adapter, the dispatch, the
+    /// adapter's verdict and the accounting. A successful stream carries its
+    /// placement to the body's end. Other attempts report their status
+    /// before returning. `retry` is the attempt's number, `0` for the first.
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize>(
         &self,
         attempt: &TypedAttempt<'_, T>,
+        retry: u32,
     ) -> Response {
-        let (worker, mut placed) = match &self.policy_engine {
-            None => {
-                let worker = match self.select_worker_for_attempt(attempt) {
-                    Ok(worker) => worker,
-                    Err(refusal) => return refusal,
-                };
-
-                // Dispatch-time re-check of the one chosen worker: O(1), and the only
-                // thing that closes the window between selection and dispatch in which
-                // a load report can flip the veto.
-                if let Some(shed) = overload::shed_if_worker_overloaded(
-                    worker.as_ref(),
-                    attempt.model_id,
-                    self.worker_registry.overload_shed_enabled(),
-                ) {
-                    return shed;
-                }
-                (worker, None)
-            }
-            Some(policy_engine) => match self.place_attempt(policy_engine, attempt).await {
-                Ok(placed) => Sent::of(placed),
+        let placed = if self.placer.waits() {
+            match self.place_typed_waiting(attempt).await {
+                Ok(placed) => placed,
                 Err(refusal) => return refusal,
-            },
+            }
+        } else {
+            let placed = match self.place_typed(attempt, retry) {
+                Ok(placed) => placed,
+                Err(refusal) => return refusal,
+            };
+            // Dispatch-time re-check of the one chosen worker: O(1), and the only
+            // thing that closes the window between selection and dispatch in which
+            // a load report can flip the veto.
+            if let Some(shed) = overload::shed_if_worker_overloaded(
+                placed.worker().as_ref(),
+                attempt.model_id,
+                self.worker_registry.overload_shed_enabled(),
+            ) {
+                return shed;
+            }
+            placed
         };
+        // The route keeps the placement where a word of the request is owed
+        // to its engine, and the worker alone where none is.
+        let (worker, mut placed) = Sent::of(placed);
 
         let mut decision_adapter =
             match Self::decision_adapter_for_attempt(attempt, worker.as_ref()) {
@@ -782,7 +796,10 @@ impl Router {
 
         let response =
             self.account_attempt_outcome(attempt, &worker, response, head_success_recorded, || {
-                self.tried_row(&worker, placed.as_ref())
+                // The row a followed controller's placement named: the next
+                // placement that waits names it as tried.
+                let placed = placed.as_ref().filter(|_| self.placer.waits())?;
+                Some(placed.id())
             });
 
         match placed {
@@ -792,17 +809,6 @@ impl Router {
                 placed.ended_by(&response, Instant::now());
                 response
             }
-        }
-    }
-
-    /// The row a retry names an attempt's worker by, as tried. A placement
-    /// the route kept names it. One that owed its engine nothing was not
-    /// kept ([`Sent::of`]): the policy engine names its worker
-    /// ([`PolicyEngine::row_of`]). The classic line names no row.
-    fn tried_row(&self, worker: &Arc<dyn Worker>, placed: Option<&Sent>) -> Option<WorkerId> {
-        match placed {
-            Some(sent) => Some(sent.id()),
-            None => self.policy_engine.as_ref()?.row_of(worker.as_ref()),
         }
     }
 
@@ -838,23 +844,104 @@ impl Router {
             .then(|| crate::policy_controller::refused("an explicit target worker"))
     }
 
-    /// The attempt's placement by the policy controller, or the answer of a
-    /// request it did not place. The commit keeps to this router's own pool
+    /// The worker of one attempt, by whoever places this router's requests
+    /// ([`Placer::place`]), or the refusal the router answers where nobody
+    /// was placed. One call, made while the lease lends the request: the
+    /// prompt, the request's id and its session key are read in the view.
+    ///
+    /// A retry is placed away from the engines the request already tried,
+    /// while another available worker is left to take it, and never on a
+    /// worker whose answer was definitive: both narrow the candidates ahead
+    /// of the decision, whoever decides.
+    ///
+    /// A miss is judged from exactly the pool the placement drew from, the
+    /// no-model id's included: that is what makes the shed fire for a
+    /// request that names no model and for a model that is also served over
+    /// gRPC. A verdict only the policy engine has keeps its own answer.
+    fn place_typed<T: GenerationRequest>(
+        &self,
+        attempt: &TypedAttempt<'_, T>,
+        retry: u32,
+    ) -> Result<Placed, Response> {
+        let model_id = attempt.model_id;
+        let placed = attempt.lease.with_view(|view| {
+            // A retry re-selects away from the engines this request already
+            // tried, while another available worker is left to take it.
+            let tried = attempt.tried.lock();
+            // A retry never goes back to a worker whose answer was
+            // definitive. Until a worker gave one the ledger hands no
+            // filter, and a first attempt asks nothing of each candidate.
+            attempt.ledger.with_candidate_filter(|candidate_filter| {
+                // This router proxies plain HTTP to the worker's URL, so
+                // only HTTP workers are candidates; nothing pins a wire on
+                // this path.
+                self.placer.place(
+                    &self.worker_registry,
+                    model_id,
+                    RoutingPool::HttpRegular,
+                    None,
+                    &PlacementInputs {
+                        text: view.text,
+                        tokens: view.tokens,
+                        headers: attempt.headers,
+                        rid_key: view.rid_key,
+                        cache_namespace: view.cache_namespace,
+                        candidate_filter,
+                        tried: &tried,
+                        rid: view.request.rid(),
+                        streaming: attempt.is_stream,
+                        attempt: u8::try_from(retry).unwrap_or(u8::MAX),
+                        ..Default::default()
+                    },
+                )
+            })
+        });
+        placed.map_err(|missed| {
+            let refusal = match missed {
+                Missed::Nobody => match placement::single_failure(
+                    &self.worker_registry,
+                    model_id,
+                    RoutingPool::HttpRegular,
+                    None,
+                ) {
+                    PlacementFailure::NoCandidates => error::model_not_found(model_id),
+                    PlacementFailure::AllOverloaded(shed) => shed,
+                    PlacementFailure::Unavailable
+                    | PlacementFailure::PolicyDeclined(_)
+                    | PlacementFailure::NoCompatiblePair { .. }
+                    | PlacementFailure::PrefillAtCapacity => placement::no_available_workers(
+                        "All workers are unavailable (circuit breaker open or unhealthy)",
+                    ),
+                },
+                Missed::Engine(verdict) => verdict.answer(model_id),
+            };
+            self.report_refusal(TYPED_REFUSAL_SITE, model_id, refusal)
+        })
+    }
+
+    /// The attempt's placement where the placement waits, under a
+    /// controller's address ([`Placer::waits`]), or the answer of a request
+    /// it did not place. A request that names no model is placed under the
+    /// one model the workers share, and one for a model no worker serves is
+    /// not found.
+    ///
+    /// The commit keeps to this router's own pool
     /// ([`RoutingPool::HttpRegular`]): the router sends plain HTTP to a
     /// regular worker's URL, so a target of another wire or role is passed
     /// over. It also keeps to the workers the request's ledger admits: a
-    /// worker that answered the request definitively takes no later attempt,
-    /// as on the classic arm. The controller reads the tried rows softly, so
-    /// the rule is held here.
-    async fn place_attempt<T>(
+    /// worker that answered the request definitively takes no later attempt.
+    /// The controller reads the tried rows softly, so the rule is held here.
+    ///
+    /// The prompt's hashes are made while the lease lends the prompt. The
+    /// ask waits behind the view and reads the hashes alone.
+    async fn place_typed_waiting<T>(
         &self,
-        policy_engine: &PolicyEngine,
         attempt: &TypedAttempt<'_, T>,
     ) -> Result<Placed, Response> {
         let model = if attempt.model_id == UNKNOWN_MODEL_ID {
             let Some(model) = self.model_of_an_unnamed_request() else {
                 return Err(self.report_refusal(
-                    "Router::route_typed_request",
+                    TYPED_REFUSAL_SITE,
                     attempt.model_id,
                     error::model_not_found(UNKNOWN_MODEL_ID),
                 ));
@@ -869,118 +956,77 @@ impl Router {
             .is_empty()
         {
             return Err(self.report_refusal(
-                "Router::route_typed_request",
+                TYPED_REFUSAL_SITE,
                 attempt.model_id,
                 error::model_not_found(&model),
             ));
         }
-        if let Some(refusal) = self.explicit_target_refusal(&model, attempt.headers) {
-            return Err(refusal);
-        }
-        let id = engine::mark();
         let tried = attempt.tried_rows.lock().clone();
-        let stated = Ask {
-            streaming: attempt.is_stream,
-            headers: attempt.headers,
-            rid: attempt.rid,
-            tried: &tried,
-            pool: Some(RoutingPool::HttpRegular),
-            ..Ask::of(&id, &model)
-        };
         let ledger = attempt.ledger;
         let rule =
             |worker: &dyn Worker| RoutingPool::HttpRegular.matches(worker) && ledger.admits(worker);
-        // The prompt the classic arm routes by: the request's token ids
-        // where it has them, else its text. The lease lends it for as long
-        // as its view stands, so the engine of this process is asked inside
-        // the view, on this thread, and reads the prompt for its record of
-        // sent prefixes. A followed controller's engine reads the hashes
-        // alone, and its ask waits behind the view.
-        let here = attempt.lease.with_view(|view| {
-            let prompt = Prompt {
-                text: view.text,
-                ..Prompt::of(view.tokens, view.cache_namespace)
-            };
-            let hashes = policy_engine.hashes(&model, &prompt);
-            let ask = Ask {
-                hashes: Some(&hashes),
-                prompt: Some(&prompt),
-                ..stated
-            };
-            let placed = policy_engine.place_here(&ask, rule, Instant::now);
-            placed.ok_or(hashes)
+        let hashes = attempt.lease.with_view(|view| {
+            self.placer
+                .hashes(&model, view.text, view.tokens, view.cache_namespace)
         });
-        let placed = match here {
-            Ok(placed) => placed,
-            Err(hashes) => {
-                let ask = Ask {
-                    hashes: Some(&hashes),
-                    ..stated
-                };
-                policy_engine.place_at(&ask, rule, Instant::now).await
-            }
+        let inputs = PlacementInputs {
+            headers: attempt.headers,
+            rid: attempt.rid,
+            streaming: attempt.is_stream,
+            hashes: hashes.as_ref(),
+            ..Default::default()
         };
-        placed.map_err(|unplaced| {
-            self.report_refusal(
-                "Router::route_typed_request",
-                attempt.model_id,
-                unplaced.answer(&model),
-            )
-        })
+        self.place_waiting(
+            TYPED_REFUSAL_SITE,
+            attempt.model_id,
+            &model,
+            &inputs,
+            rule,
+            &tried,
+        )
+        .await
     }
 
-    /// The worker of one attempt: selected away from the engines the request
-    /// already tried and from those whose answer was definitive, or the
-    /// refusal this router answers when the pool has none to give.
-    fn select_worker_for_attempt<T>(
+    /// The end of a placement that waits, for a route of this router: the
+    /// refusal of a request that names its worker
+    /// ([`Self::explicit_target_refusal`]), the placement over the router's
+    /// pool ([`Placer::place_waiting`]), and the answer of a request it did
+    /// not place, reported at `site` under the model the client `asked`
+    /// for. `model` is the model the request is placed under.
+    async fn place_waiting(
         &self,
-        attempt: &TypedAttempt<'_, T>,
-    ) -> Result<Arc<dyn Worker>, Response> {
-        let model_id = attempt.model_id;
-        match attempt.lease.with_view(|view| {
-            // A retry re-selects away from the engines this request already
-            // tried, while another available worker is left to take it.
-            let tried = attempt.tried.lock();
-            // A retry never goes back to a worker whose answer was
-            // definitive. Until a worker gave one the ledger hands no
-            // filter, and a first attempt asks nothing of each candidate.
-            attempt.ledger.with_candidate_filter(|candidate_filter| {
-                self.select_worker_for_model(
-                    model_id,
-                    view.text,
-                    view.tokens,
-                    attempt.headers,
-                    view.rid_key,
-                    view.cache_namespace,
-                    candidate_filter,
-                    &tried,
-                )
-            })
-        }) {
-            Some(worker) => Ok(worker),
-            None => {
-                // The verdict is judged from exactly the pool selection drew
-                // from, wildcard model included: that is what makes the shed
-                // fire for a model-less `/generate` and for a model that is
-                // also served over gRPC.
-                let refusal = match placement::single_failure(
-                    &self.worker_registry,
-                    model_id,
-                    RoutingPool::HttpRegular,
-                    None,
-                ) {
-                    PlacementFailure::NoCandidates => error::model_not_found(model_id),
-                    PlacementFailure::AllOverloaded(shed) => shed,
-                    PlacementFailure::Unavailable
-                    | PlacementFailure::PolicyDeclined(_)
-                    | PlacementFailure::NoCompatiblePair { .. }
-                    | PlacementFailure::PrefillAtCapacity => placement::no_available_workers(
-                        "All workers are unavailable (circuit breaker open or unhealthy)",
-                    ),
-                };
-                Err(self.report_refusal("Router::route_typed_request", model_id, refusal))
-            }
+        site: &'static str,
+        asked: &str,
+        model: &str,
+        inputs: &PlacementInputs<'_>,
+        rule: impl Fn(&dyn Worker) -> bool + Send + Sync,
+        tried_rows: &[WorkerId],
+    ) -> Result<Placed, Response> {
+        if let Some(refusal) = self.explicit_target_refusal(model, inputs.headers) {
+            return Err(refusal);
         }
+        let placed = self
+            .placer
+            .place_waiting(
+                model,
+                RoutingPool::HttpRegular,
+                // The router dials plain HTTP and states no wire.
+                WireModes::NONE,
+                inputs,
+                rule,
+                tried_rows,
+            )
+            .await;
+        placed.map_err(|missed| {
+            let refusal = match missed {
+                Missed::Engine(verdict) => verdict.answer(model),
+                // The miss of a placer that never waits.
+                Missed::Nobody => placement::no_available_workers(format!(
+                    "No available workers for model '{model}'"
+                )),
+            };
+            self.report_refusal(site, asked, refusal)
+        })
     }
 
     /// The adapter of a `/v1/decisions` request bound for a worker that does
@@ -1035,7 +1081,7 @@ impl Router {
         let load_guard = lease.with_view(|view| {
             WorkerLoadGuard::with_key(
                 worker.clone(),
-                self.policy_registry.sticky_key(headers, view.rid_key),
+                self.placer.session_key(headers, view.rid_key),
             )
         });
 
@@ -1545,6 +1591,7 @@ impl Router {
                 cache_namespace: routing.cache_namespace,
                 candidate_filter: None,
                 tried: &[],
+                ..Default::default()
             },
         ) else {
             // Judged from the same candidates whether the pre-filter emptied
@@ -2762,7 +2809,7 @@ impl Router {
 
     /// The placement of a request whose body is not read, by the policy
     /// engine of this process: the ask of an attempt on the buffered path
-    /// ([`Self::place_attempt`]) with what the headers alone state. The
+    /// ([`Self::place_typed`]) with what the headers alone state. The
     /// request names no model here, so it is asked under the one model the
     /// workers serve. A valid tokens hint is the prompt the buffered path
     /// would hash. The request is sent once, so no ledger narrows the
@@ -3461,6 +3508,7 @@ mod tests {
 
         Router {
             worker_registry,
+            placer: Placer::of(&policy_registry, None),
             policy_registry,
             policy_engine: None,
             retry_config: RetryConfig::default(),
@@ -3878,9 +3926,11 @@ mod tests {
             }
             worker_registry.register_or_replace(Arc::new(builder.build()));
         }
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
         Router {
             worker_registry,
-            policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            placer: Placer::of(&policy_registry, None),
+            policy_registry,
             policy_engine: None,
             retry_config: retry,
             max_payload_size: 536_870_912,
@@ -4022,10 +4072,10 @@ mod tests {
             rid: None,
         };
         let select = || {
-            let worker = router
-                .select_worker_for_attempt(&attempt)
+            let placed = router
+                .place_typed(&attempt, 0)
                 .expect("the pool has a worker to give");
-            worker.url().to_string()
+            placed.worker().url().to_string()
         };
 
         // Round robin walks the pool it is handed.
@@ -4653,6 +4703,7 @@ mod tests {
         }
         Router {
             worker_registry,
+            placer: Placer::of(&policy_registry, None),
             policy_registry,
             policy_engine: None,
             retry_config: RetryConfig::default(),

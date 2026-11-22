@@ -125,6 +125,7 @@ impl Sent {
     /// ([`Placed::owes`]). A placement that owes none is its worker and
     /// nothing else: its send is told to nobody, no clock is read at its
     /// dispatch or its end, and its answer's body is not held to its end.
+    #[inline]
     pub(crate) fn of(placed: Placed) -> (Arc<dyn Worker>, Option<Self>) {
         if placed.owes() {
             (Arc::clone(placed.worker()), Some(Self::from(placed)))

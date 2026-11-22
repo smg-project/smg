@@ -1031,6 +1031,7 @@ impl PDRouter {
                             cache_namespace,
                             candidate_filter,
                             tried: &tried,
+                            ..Default::default()
                         },
                         sticky_key,
                     )
@@ -3651,6 +3652,7 @@ impl RouterTrait for PDRouter {
                     cache_namespace: None,
                     candidate_filter: None,
                     tried: &[],
+                    ..Default::default()
                 },
             ) else {
                 return error::service_unavailable(

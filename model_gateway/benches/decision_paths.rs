@@ -125,9 +125,9 @@ use smg::{
     routers::{
         common::{
             bench_support::{
-                attach_loads, policies_asking_the_engine, route_classic, route_engine, route_pair,
-                route_records, set_pair_sides, thread_allocated_bytes, EngineObject,
-                EngineOverRecords, Route,
+                attach_loads, policies_asking_the_engine, route_classic, route_engine, route_http,
+                route_pair, route_records, set_pair_sides, thread_allocated_bytes, CellPlacer,
+                EngineObject, EngineOverRecords, Route,
             },
             snapshot::WorkerRegistry,
         },
@@ -616,6 +616,16 @@ fn build(cell: &Cell) -> Built {
         !(pair && cell.keys != 0),
         "a pair cell sends no routing key"
     );
+    // A single request on the regular HTTP route goes through the one
+    // placing call, by whoever the cell's path says places: chosen once
+    // here, as the router chooses where it is built.
+    let placer = match &*decider {
+        Decider::Policies(policies) if route == Route::Http && !pair => {
+            Some(CellPlacer::classic(policies))
+        }
+        Decider::Engine(object) if route == Route::Http => Some(CellPlacer::engine(object)),
+        Decider::Policies(_) | Decider::Engine(_) | Decider::Records(_) => None,
+    };
     assert!(
         !(cell.grow > 0 && cell.models > 1),
         "a growing conversation is one model's"
@@ -627,6 +637,9 @@ fn build(cell: &Cell) -> Built {
             0 => None,
             count => keys.get((turn % count as u64) as usize),
         };
+        if let Some(placer) = &placer {
+            return route_http(&registry, placer, model, Some(tokens), headers);
+        }
         match &*decider {
             Decider::Policies(policies) if pair => {
                 route_pair(&registry, policies, model, Some(tokens))

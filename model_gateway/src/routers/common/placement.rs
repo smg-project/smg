@@ -12,13 +12,19 @@
 //! refresh-on-miss that the provider and realtime paths use; this is the
 //! policy-registry path over the self-hosted routing pools.
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+    cell::Cell,
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
     response::Response,
 };
 use rand::RngExt;
+use smg_policy_controller::engine::{ShedReason, WireModes, WorkerId};
 use smg_worker::{
     health::overload::{
         BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_STALLED_FALLBACK, STAGE_SELECTION,
@@ -39,6 +45,7 @@ use crate::{
         CacheNamespace, ConsistentHashingPolicy, LoadBalancingPolicy, NamedList, PolicyRegistry,
         SelectWorkerInfo, WorkerRole,
     },
+    policy_controller::engine::{self, Ask, Hashes, Placed, PolicyEngine, Prompt, Unplaced},
     routers::{
         common::{
             header_utils, overload,
@@ -187,6 +194,25 @@ pub(crate) struct PlacementInputs<'a> {
     /// admission filter, so a tried worker with a place for the request is
     /// not given up for one that has none.
     pub tried: &'a [String],
+    /// The request's own id, the `rid` of its body. The policy engine's keys
+    /// read it where its document names it. The classic policies read
+    /// `rid_key`.
+    pub rid: Option<&'a str>,
+    /// Whether the answer is streamed. The policy engine's request states
+    /// it.
+    pub streaming: bool,
+    /// The retry number, `0` for a first attempt. The policy engine's
+    /// request states it.
+    pub attempt: u8,
+    /// The prompt's hashes, where the route made them
+    /// ([`Placer::hashes`]): the waiting form reads them and nothing else
+    /// of the prompt. `None` in the call that does not wait: the policy
+    /// engine's side makes them from `text` and `tokens`.
+    pub hashes: Option<&'a Hashes>,
+    /// The snapshot of the model's workers the route read for this attempt,
+    /// where it read one for a rule of its own: the placement then draws
+    /// its pool from it, and the registry is read once.
+    pub snapshot: Option<&'a Arc<ModelWorkerSnapshot>>,
 }
 
 /// The pool a placement draws from, before the availability filter.
@@ -409,6 +435,231 @@ pub(crate) fn accepted_by(
     Some(passed.iter().chain(rest).cloned().collect())
 }
 
+/// Why a placement placed nobody ([`Placer::place`],
+/// [`Placer::place_waiting`]). No answer is built and no counter is written
+/// here: the route judges the pool it chooses, where it answers.
+#[derive(Debug)]
+pub(crate) enum Missed {
+    /// Who decides took no worker. The route judges its pool
+    /// ([`single_failure`], [`failure_from`]): one judgment for both sides.
+    Nobody,
+    /// A verdict only the policy engine has: its document declined or queued
+    /// the request, a queue is full or out of time, or no decision was made.
+    /// The route answers it with [`Unplaced::answer`].
+    Engine(Unplaced),
+}
+
+/// Who places a router's requests. Chosen once, where the router is built,
+/// and asked at each of its sites through the one call ([`Placer::place`]).
+pub(crate) enum Placer {
+    /// The classic policies decide.
+    Classic(Arc<PolicyRegistry>),
+    /// The policy engine decides. The classic registry stands beside it for
+    /// what a placement still reads of it: the session key of a load guard
+    /// ([`Placer::session_key`]), whether the model's policy holds a request
+    /// to the worker it names ([`strict_target`]), and the name a selection
+    /// is counted under.
+    Engine(Arc<PolicyEngine>, Arc<PolicyRegistry>),
+}
+
+impl Placer {
+    /// The placer of a router whose requests `engine` places, and the
+    /// classic one where the router is handed none.
+    pub(crate) fn of(policies: &Arc<PolicyRegistry>, engine: Option<&Arc<PolicyEngine>>) -> Self {
+        match engine {
+            Some(engine) => Self::Engine(Arc::clone(engine), Arc::clone(policies)),
+            None => Self::Classic(Arc::clone(policies)),
+        }
+    }
+
+    /// Whether a placement waits: the gateway follows a controller, whose
+    /// engine is asked over its store. A family takes the waiting form
+    /// ([`Self::place_waiting`]) by this one question. In this process both
+    /// sides answer at once ([`Self::place`]).
+    #[inline]
+    pub(crate) fn waits(&self) -> bool {
+        match self {
+            Self::Classic(_) => false,
+            Self::Engine(engine, _) => !engine.in_process(),
+        }
+    }
+
+    /// One worker of `pool` for one attempt of a request of `model`, in one
+    /// pass on the calling thread: the pool on `wire`, the request's own
+    /// rule, the engines its retry tried, then whoever decides
+    /// ([`Decides`]). A route that holds a borrow no wait may hold places
+    /// here.
+    ///
+    /// The classic side is [`select_single`], over the snapshot the inputs
+    /// state where they state one ([`select_single_of`]), and its placement
+    /// owes nothing ([`Placed::of_worker`]). The engine's side decides over
+    /// the same candidates ([`EngineSide`]). A miss comes back unjudged
+    /// ([`Missed`]).
+    #[inline]
+    pub(crate) fn place(
+        &self,
+        registry: &WorkerRegistry,
+        model: &str,
+        pool: RoutingPool,
+        wire: Option<WireConstraint>,
+        inputs: &PlacementInputs<'_>,
+    ) -> Result<Placed, Missed> {
+        match self {
+            Self::Classic(policies) => {
+                let worker = match inputs.snapshot {
+                    Some(snapshot) => {
+                        select_single_of(registry, policies, model, snapshot, pool, wire, *inputs)
+                    }
+                    None => select_single(registry, policies, model, pool, wire, *inputs),
+                };
+                worker.map(Placed::of_worker).ok_or(Missed::Nobody)
+            }
+            Self::Engine(engine, policies) => {
+                place_by_engine(engine, policies, registry, model, pool, wire, inputs)
+            }
+        }
+    }
+
+    /// The value a load guard counts a session under. Asked at the
+    /// placement, where the inputs stand: a family keeps the value and hands
+    /// it to its guards. Both sides read the classic registry's
+    /// ([`PolicyRegistry::sticky_key`]).
+    #[inline]
+    pub(crate) fn session_key<'a>(
+        &self,
+        headers: Option<&'a HeaderMap>,
+        rid_key: Option<&'a str>,
+    ) -> Option<&'a str> {
+        let (Self::Classic(policies) | Self::Engine(_, policies)) = self;
+        policies.sticky_key(headers, rid_key)
+    }
+
+    /// The prompt's hashes for `model`, for a route that states them to the
+    /// waiting form ([`PlacementInputs::hashes`]): made while the route holds
+    /// the prompt, read behind it. `None` under the classic policies, which
+    /// read the prompt itself.
+    pub(crate) fn hashes(
+        &self,
+        model: &str,
+        text: Option<&str>,
+        tokens: Option<&[u32]>,
+        cache_namespace: Option<CacheNamespace>,
+    ) -> Option<Hashes> {
+        match self {
+            Self::Classic(_) => None,
+            Self::Engine(engine, _) => {
+                let prompt = Prompt {
+                    tokens,
+                    text,
+                    namespace: cache_namespace,
+                };
+                Some(engine.hashes(model, &prompt))
+            }
+        }
+    }
+
+    /// The placement that waits, under a controller's address
+    /// ([`Self::waits`]): the engine is asked over the controller's store,
+    /// three asks at most, and `rule` is asked of each worker picked.
+    ///
+    /// It stands outside a route's borrow of its request. It reads the
+    /// inputs' headers, request id, streaming flag and hashes, and nothing
+    /// of the prompt itself. `wires` are the wires the route dials, and
+    /// `tried_rows` the rows the controller's placements named for the
+    /// attempts that failed: a store's row cannot be read off a worker.
+    ///
+    /// Every verdict comes back as the engine's own ([`Missed::Engine`]).
+    /// The classic policies never wait: such a placer places nobody here.
+    pub(crate) async fn place_waiting(
+        &self,
+        model: &str,
+        pool: RoutingPool,
+        wires: WireModes,
+        inputs: &PlacementInputs<'_>,
+        rule: impl Fn(&dyn Worker) -> bool + Send + Sync,
+        tried_rows: &[WorkerId],
+    ) -> Result<Placed, Missed> {
+        let Self::Engine(engine, _) = self else {
+            return Err(Missed::Nobody);
+        };
+        let id = engine::mark();
+        let ask = Ask {
+            streaming: inputs.streaming,
+            headers: inputs.headers,
+            rid: inputs.rid,
+            wires,
+            tried: tried_rows,
+            hashes: inputs.hashes,
+            pool: Some(pool),
+            ..Ask::of(&id, model)
+        };
+        engine
+            .place_at(&ask, rule, Instant::now)
+            .await
+            .map_err(Missed::Engine)
+    }
+}
+
+/// The policy engine's side of [`Placer::place`]: the pass every placement
+/// runs ([`select_of`]) with the engine as who decides ([`EngineSide`]),
+/// over one read of the registry, the snapshot the inputs state or else the
+/// model's as the registry holds it now.
+///
+/// The engine's verdict on a request it did not place stands beside the
+/// pass. Where it says the engine found no worker to send to, the miss is
+/// the route's to judge, as where a classic policy took none: no endpoint
+/// is left, no target holds, or the pool is saturated under the gateway's
+/// own shed setting, whose answer the route's judgment builds and counts.
+/// Any other verdict keeps its own answer.
+fn place_by_engine(
+    engine: &PolicyEngine,
+    policies: &PolicyRegistry,
+    registry: &WorkerRegistry,
+    model: &str,
+    pool: RoutingPool,
+    wire: Option<WireConstraint>,
+    inputs: &PlacementInputs<'_>,
+) -> Result<Placed, Missed> {
+    debug_assert!(
+        engine.in_process(),
+        "a followed controller's engine is asked through the waiting form"
+    );
+    let read;
+    let snapshot = match inputs.snapshot {
+        Some(stated) => stated,
+        None => {
+            read = registry.get_routing_snapshot(model);
+            &read
+        }
+    };
+    let side = EngineSide {
+        engine,
+        policies,
+        snapshot,
+        pool,
+        inputs,
+        verdict: Cell::new(None),
+    };
+    if let Some(placed) = select_of(registry, &side, model, snapshot, pool, wire, *inputs) {
+        return Ok(placed);
+    }
+    Err(match side.verdict.take() {
+        None
+        | Some(
+            Unplaced::NoTargetHolds
+            | Unplaced::Shed {
+                reason: ShedReason::NoEndpoints,
+                ..
+            },
+        ) => Missed::Nobody,
+        Some(Unplaced::Shed {
+            reason: ShedReason::Saturated,
+            ..
+        }) if registry.overload_shed_enabled() => Missed::Nobody,
+        Some(verdict) => Missed::Engine(verdict),
+    })
+}
+
 /// Pick one worker for `model_id` from `pool`, or `None` when nothing is
 /// selectable. Records the selection metric under the chosen worker's own
 /// transport label.
@@ -439,6 +690,21 @@ pub(crate) fn select_single_of(
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
+    select_of(registry, policies, model_id, snapshot, pool, wire, inputs)
+}
+
+/// [`select_single_of`] for whoever decides ([`Decides`]): the pool of the
+/// snapshot under its name, or its part on a pinned wire, put to the
+/// selection.
+fn select_of<D: Decides>(
+    registry: &WorkerRegistry,
+    who: &D,
+    model_id: &str,
+    snapshot: &ModelWorkerSnapshot,
+    pool: RoutingPool,
+    wire: Option<WireConstraint>,
+    inputs: PlacementInputs<'_>,
+) -> Option<D::Picked> {
     let list = snapshot.pool(pool);
     if wire.is_none() {
         let whole = NamedList {
@@ -446,19 +712,12 @@ pub(crate) fn select_single_of(
             positions: None,
             members: Some(snapshot.pool_members_cell(pool)),
         };
-        return select_among(registry, policies, model_id, list, Some(whole), inputs);
+        return select_among(registry, who, model_id, list, Some(whole), inputs);
     }
     // A retry pinned to its retained plan's wire: a list of its own, which
     // nobody names.
     let pinned = Candidates::of(Arc::clone(list), wire);
-    select_among(
-        registry,
-        policies,
-        model_id,
-        pinned.as_slice(),
-        None,
-        inputs,
-    )
+    select_among(registry, who, model_id, pinned.as_slice(), None, inputs)
 }
 
 /// [`select_single`] over an explicit candidate slice: the entry for a caller
@@ -496,19 +755,19 @@ enum Miss {
 /// that is not available, beside workers that are). The second pass repeats
 /// what a pass records on its way (the routing key's source, the manual
 /// policy's branch, round robin's step), on this path alone.
-fn select_among(
+fn select_among<D: Decides>(
     registry: &WorkerRegistry,
-    policies: &PolicyRegistry,
+    who: &D,
     model_id: &str,
     candidates: &[Arc<dyn Worker>],
     whole: Option<NamedList<'_>>,
     inputs: PlacementInputs<'_>,
-) -> Option<Arc<dyn Worker>> {
+) -> Option<D::Picked> {
     // At most two rounds. The pass has this one caller, so it compiles into
     // the selection and a placement pays for no call between the two.
     let mut asked_again = false;
     loop {
-        match select_pass(registry, policies, model_id, candidates, whole, inputs) {
+        match select_pass(registry, who, model_id, candidates, whole, inputs) {
             Ok(selected) => return Some(selected),
             Err(Miss::NobodyAvailable) if !asked_again => {}
             Err(Miss::NobodyAvailable | Miss::Declined) => return None,
@@ -526,22 +785,368 @@ fn select_among(
     }
 }
 
-/// One pass of the single-worker selection. `whole` names the
-/// snapshot's own list when `candidates` is that list as the registry holds
-/// it: the policy is told the list's name when the candidates reach it as
-/// that list, and reads which workers it was handed once something narrowed
-/// them (a candidate filter that refuses a worker, a policy that needs its
-/// candidates filtered for it, the engines a retry already tried). A miss
-/// says why ([`Miss`]).
-fn select_pass(
+/// What who decides answered a pass ([`Decides::decide`]).
+pub(crate) enum Answered<P> {
+    /// It took a worker of the candidates.
+    Took(P),
+    /// It took none of them. The pass's own default for a pool whose every
+    /// worker is vetoed runs behind it.
+    Nobody,
+    /// It ended the request with a verdict of its own, which it keeps. No
+    /// default runs behind it and the selection is not asked again.
+    Refused,
+}
+
+/// Who decides the worker of a pass: the one thing the two implementations
+/// of a placement differ in.
+///
+/// A pass ([`select_pass`]) asks it three questions ahead of the decision:
+/// whether it tests a worker's availability itself, whether it holds the
+/// request to a worker the request names, and whether it lifts the overload
+/// veto for the request. It then asks for the decision over the candidates
+/// the pass narrowed. Every other step of a pass is written once, for both:
+/// the request's own rule, the engines a retry tried, the default for a pool
+/// whose every worker is vetoed and the selection's counters.
+///
+/// The classic policies decide through the [`PolicyRegistry`], and the
+/// policy engine through its own side ([`EngineSide`]). The compiler
+/// resolves which: no call on a request's path goes through a pointer for
+/// it.
+pub(crate) trait Decides {
+    /// What it keeps of one model for a pass: the model's policy object, or
+    /// nothing.
+    type Policy;
+    /// The request as its decision reads it.
+    type Request<'a>
+    where
+        Self: 'a;
+    /// What a pass hands back for a request it placed: the worker, or the
+    /// placement.
+    type Picked;
+
+    /// What it keeps of `model_id`.
+    fn policy(&self, model_id: &str) -> Self::Policy;
+
+    /// The name its selections are counted under.
+    fn name(&self, policy: &Self::Policy) -> &'static str;
+
+    /// Whether it tests a worker's availability itself, so the pass hands
+    /// it the candidates with no test of its own.
+    fn filters_unavailable(policy: &Self::Policy) -> bool;
+
+    /// Whether it holds the request to a worker the request names
+    /// ([`strict_target`]): the engines a retry tried then stay in.
+    fn keeps_target(policy: &Self::Policy, headers: Option<&HeaderMap>) -> bool;
+
+    /// The request of `inputs` over `candidates`, the pool as the request's
+    /// own rule left it.
+    fn request<'a>(
+        &'a self,
+        registry: &WorkerRegistry,
+        policy: &Self::Policy,
+        model_id: &str,
+        candidates: &[Arc<dyn Worker>],
+        inputs: &PlacementInputs<'a>,
+    ) -> Self::Request<'a>;
+
+    /// Whether the overload veto is lifted for `request`: a worker over the
+    /// thresholds and otherwise routable is then a candidate.
+    fn lifts_overload(request: &Self::Request<'_>) -> bool;
+
+    /// The decision over `available`, the candidates the pass narrowed.
+    /// `named` is the snapshot's own list where `available` is that list as
+    /// the registry holds it.
+    fn decide<'a>(
+        &self,
+        policy: &Self::Policy,
+        model_id: &str,
+        available: &[Arc<dyn Worker>],
+        named: Option<NamedList<'a>>,
+        request: &mut Self::Request<'a>,
+    ) -> Answered<Self::Picked>;
+
+    /// The worker of a placed request.
+    fn worker(picked: &Self::Picked) -> &Arc<dyn Worker>;
+
+    /// A request the pass's own default placed ([`overload_fallback`]).
+    fn by_default(worker: Arc<dyn Worker>) -> Self::Picked;
+}
+
+/// The classic policies decide: the model's policy object, asked through
+/// the registry, which applies the sticky routing-key override.
+impl Decides for PolicyRegistry {
+    type Policy = Arc<dyn LoadBalancingPolicy>;
+    type Request<'a> = SelectWorkerInfo<'a>;
+    type Picked = Arc<dyn Worker>;
+
+    #[inline]
+    fn policy(&self, model_id: &str) -> Self::Policy {
+        self.get_policy_or_default(model_id)
+    }
+
+    #[inline]
+    fn name(&self, policy: &Self::Policy) -> &'static str {
+        policy.name()
+    }
+
+    #[inline]
+    fn filters_unavailable(policy: &Self::Policy) -> bool {
+        policy_filters_unavailable_workers(policy.as_ref())
+    }
+
+    #[inline]
+    fn keeps_target(policy: &Self::Policy, headers: Option<&HeaderMap>) -> bool {
+        strict_target(policy.as_ref(), headers)
+    }
+
+    #[inline]
+    fn request<'a>(
+        &'a self,
+        registry: &WorkerRegistry,
+        policy: &Self::Policy,
+        model_id: &str,
+        candidates: &[Arc<dyn Worker>],
+        inputs: &PlacementInputs<'a>,
+    ) -> SelectWorkerInfo<'a> {
+        let mut info = SelectWorkerInfo {
+            request_text: inputs.text,
+            tokens: inputs.tokens,
+            headers: inputs.headers,
+            routing_key: self.sticky_header_key(inputs.headers),
+            rid_key: inputs.rid_key,
+            cache_namespace: inputs.cache_namespace,
+            // The cached hash ring (O(log n) lookup), for a policy that reads
+            // it: no other placement pays the registry's keyed read and the
+            // ring's shared count.
+            hash_ring: policy_reads_hash_ring(policy.as_ref())
+                .then(|| self.hash_ring(registry, model_id))
+                .flatten(),
+            role: WorkerRole::Single,
+            overload_lifted: false,
+            named: None,
+        };
+        // A request its policy places by session key keeps a regular owner over
+        // the overload thresholds (`LoadBalancingPolicy::routes_by_session_key`);
+        // `--worker-overload-shed` keeps the veto.
+        info.overload_lifted = !registry.overload_shed_enabled()
+            && policy.routes_by_session_key(&info)
+            && candidates
+                .iter()
+                .all(|w| *w.worker_type() == WorkerType::Regular);
+        info
+    }
+
+    #[inline]
+    fn lifts_overload(request: &SelectWorkerInfo<'_>) -> bool {
+        request.overload_lifted
+    }
+
+    #[inline]
+    fn decide<'a>(
+        &self,
+        policy: &Self::Policy,
+        model_id: &str,
+        available: &[Arc<dyn Worker>],
+        named: Option<NamedList<'a>>,
+        request: &mut SelectWorkerInfo<'a>,
+    ) -> Answered<Arc<dyn Worker>> {
+        // The name goes with the list itself: whatever narrowed the
+        // candidates handed on a list of its own, at another address, and
+        // nobody names that one.
+        request.named = named;
+        // The registry applies the routing-key sticky override when enabled
+        // and otherwise delegates to the configured policy.
+        match self.select_worker_for_model(policy, model_id, available, request) {
+            Some(idx) => Answered::Took(available[idx].clone()),
+            None => Answered::Nobody,
+        }
+    }
+
+    #[inline]
+    fn worker(picked: &Arc<dyn Worker>) -> &Arc<dyn Worker> {
+        picked
+    }
+
+    #[inline]
+    fn by_default(worker: Arc<dyn Worker>) -> Arc<dyn Worker> {
+        worker
+    }
+}
+
+/// The policy engine as who decides a pass ([`Decides`]), for one attempt:
+/// the engine, the pool the pass draws with the snapshot it is drawn from,
+/// and the attempt's inputs, of which the engine's request is stated.
+///
+/// Its three answers ahead of the decision. It tests a worker's availability
+/// itself, so the pass hands it the candidates untested, and its own rule
+/// steers a pool whose every worker is vetoed: the pass's default never runs
+/// behind it. It holds a request to the worker the request names where the
+/// model's classic policy does ([`strict_target`]): the engine's document
+/// states no such rule yet, so the candidates are narrowed to that worker
+/// ahead of the decision ([`targeted`]), as that policy finds it among its
+/// own. It lifts no overload veto ahead of the pass: a session's owner is
+/// kept inside the decision.
+struct EngineSide<'a> {
+    engine: &'a PolicyEngine,
+    policies: &'a PolicyRegistry,
+    snapshot: &'a Arc<ModelWorkerSnapshot>,
+    pool: RoutingPool,
+    inputs: &'a PlacementInputs<'a>,
+    /// The engine's verdict on a request it did not place.
+    verdict: Cell<Option<Unplaced>>,
+}
+
+impl Decides for EngineSide<'_> {
+    /// Whether the request is held to the worker it names.
+    type Policy = bool;
+    type Request<'a>
+        = ()
+    where
+        Self: 'a;
+    type Picked = Placed;
+
+    fn policy(&self, model_id: &str) -> bool {
+        let headers = self.inputs.headers;
+        // A request that names no worker pays the header's probe alone.
+        header_utils::extract_target_worker(headers).is_some()
+            && strict_target(
+                self.policies.get_policy_or_default(model_id).as_ref(),
+                headers,
+            )
+    }
+
+    /// The name of the policy the routing settings name: the engine's
+    /// document is written from it, and its selections are counted under
+    /// it as the classic side's are.
+    fn name(&self, _held: &bool) -> &'static str {
+        self.policies.get_default_policy().name()
+    }
+
+    #[inline]
+    fn filters_unavailable(_held: &bool) -> bool {
+        true
+    }
+
+    #[inline]
+    fn keeps_target(held: &bool, _headers: Option<&HeaderMap>) -> bool {
+        *held
+    }
+
+    #[inline]
+    fn request<'a>(
+        &'a self,
+        _registry: &WorkerRegistry,
+        _held: &bool,
+        _model_id: &str,
+        _candidates: &[Arc<dyn Worker>],
+        _inputs: &PlacementInputs<'a>,
+    ) {
+    }
+
+    #[inline]
+    fn lifts_overload(_request: &()) -> bool {
+        false
+    }
+
+    /// The engine's decision over `available`: the pool's own list by its
+    /// name where nothing narrowed the candidates (`named`), and what the
+    /// engine keeps of that list is read beside it. A narrowed list is
+    /// stated as the workers the request may take ([`Ask::among`]).
+    ///
+    /// The engines a retry tried stepped aside in the pass, by their
+    /// address, so the request names no tried row and states its retry
+    /// number. The prompt is lent as the inputs hold it, and its hashes are
+    /// made here where the route made none.
+    fn decide<'a>(
+        &self,
+        held: &bool,
+        model_id: &str,
+        available: &[Arc<dyn Worker>],
+        named: Option<NamedList<'a>>,
+        _request: &mut (),
+    ) -> Answered<Placed> {
+        let inputs = self.inputs;
+        let target = held.then(|| targeted(available, inputs.headers)).flatten();
+        let among: Option<Arc<[Arc<dyn Worker>]>> = match target {
+            Some(Some(target)) => Some(Arc::from([target])),
+            // The request names none of its candidates, and moves to no
+            // other worker.
+            Some(None) => return Answered::Refused,
+            None => named.is_none().then(|| available.iter().cloned().collect()),
+        };
+        let prompt = Prompt {
+            tokens: inputs.tokens,
+            text: inputs.text,
+            namespace: inputs.cache_namespace,
+        };
+        let made;
+        let hashes = match inputs.hashes {
+            Some(stated) => stated,
+            None => {
+                made = self.engine.hashes(model_id, &prompt);
+                &made
+            }
+        };
+        let id = engine::mark();
+        let ask = Ask {
+            streaming: inputs.streaming,
+            headers: inputs.headers,
+            rid: inputs.rid,
+            attempt: Some(inputs.attempt),
+            hashes: Some(hashes),
+            prompt: Some(&prompt),
+            pool: Some(self.pool),
+            among: among.as_ref(),
+            snapshot: Some(self.snapshot),
+            ..Ask::of(&id, model_id)
+        };
+        // The request's own rule is asked of the worker picked too: a later
+        // ask of the attempt reads the registry's list again, and that list
+        // can hold a worker the pass did not put to the rule.
+        let rule = |worker: &dyn Worker| {
+            inputs
+                .candidate_filter
+                .is_none_or(|accepts| accepts(worker))
+        };
+        match self.engine.place_here(&ask, rule, Instant::now) {
+            Some(Ok(placed)) => Answered::Took(placed),
+            Some(Err(verdict)) => {
+                self.verdict.set(Some(verdict));
+                Answered::Refused
+            }
+            // A followed controller's engine answers no ask at once: its
+            // routes place through the waiting form.
+            None => Answered::Refused,
+        }
+    }
+
+    #[inline]
+    fn worker(placed: &Placed) -> &Arc<dyn Worker> {
+        placed.worker()
+    }
+
+    #[inline]
+    fn by_default(worker: Arc<dyn Worker>) -> Placed {
+        Placed::of_worker(worker)
+    }
+}
+
+/// One pass of the single-worker selection, for whoever decides
+/// ([`Decides`]). `whole` names the snapshot's own list when `candidates`
+/// is that list as the registry holds it: who decides is told the list's
+/// name when the candidates reach it as that list, and reads which workers
+/// it was handed once something narrowed them (a candidate filter that
+/// refuses a worker, a policy that needs its candidates filtered for it, the
+/// engines a retry already tried). A miss says why ([`Miss`]).
+fn select_pass<D: Decides>(
     registry: &WorkerRegistry,
-    policies: &PolicyRegistry,
+    who: &D,
     model_id: &str,
     candidates: &[Arc<dyn Worker>],
     whole: Option<NamedList<'_>>,
     inputs: PlacementInputs<'_>,
-) -> Result<Arc<dyn Worker>, Miss> {
-    let policy = policies.get_policy_or_default(model_id);
+) -> Result<D::Picked, Miss> {
+    let policy = who.policy(model_id);
 
     // The per-request predicate applies to every entry point, so a caller
     // that sets it can never dispatch to a worker it rejects. A predicate
@@ -550,34 +1155,11 @@ fn select_pass(
     let accepted = accepted_by(candidates, inputs.candidate_filter);
     let candidates = accepted.as_deref().unwrap_or(candidates);
 
-    let mut info = SelectWorkerInfo {
-        request_text: inputs.text,
-        tokens: inputs.tokens,
-        headers: inputs.headers,
-        routing_key: policies.sticky_header_key(inputs.headers),
-        rid_key: inputs.rid_key,
-        cache_namespace: inputs.cache_namespace,
-        // The cached hash ring (O(log n) lookup), for a policy that reads
-        // it: no other placement pays the registry's keyed read and the
-        // ring's shared count.
-        hash_ring: policy_reads_hash_ring(policy.as_ref())
-            .then(|| policies.hash_ring(registry, model_id))
-            .flatten(),
-        role: WorkerRole::Single,
-        overload_lifted: false,
-        named: None,
-    };
-    // A request its policy places by session key keeps a regular owner over
-    // the overload thresholds (`LoadBalancingPolicy::routes_by_session_key`);
-    // `--worker-overload-shed` keeps the veto.
-    info.overload_lifted = !registry.overload_shed_enabled()
-        && policy.routes_by_session_key(&info)
-        && candidates
-            .iter()
-            .all(|w| *w.worker_type() == WorkerType::Regular);
+    let mut request = who.request(registry, &policy, model_id, candidates, &inputs);
+    let overload_lifted = D::lifts_overload(&request);
     let eligible = |worker: &Arc<dyn Worker>| {
         worker.is_available()
-            || (info.overload_lifted && overload::vetoed_by_overload_alone(worker.as_ref()))
+            || (overload_lifted && overload::vetoed_by_overload_alone(worker.as_ref()))
     };
 
     // Most policies already apply the complete availability predicate. Give
@@ -585,7 +1167,7 @@ fn select_pass(
     // worker into a second per-request Vec. Hash policies use a weaker health
     // predicate and keep the pre-filter.
     let filtered;
-    let available: &[Arc<dyn Worker>] = if policy_filters_unavailable_workers(policy.as_ref()) {
+    let available: &[Arc<dyn Worker>] = if D::filters_unavailable(&policy) {
         candidates
     } else {
         filtered = candidates
@@ -600,7 +1182,7 @@ fn select_pass(
     // A strict target indexes this slice (as `admission_prefilters` keeps
     // it), so it is never narrowed: the retry goes back to the targeted
     // worker.
-    let keeps_target = strict_target(policy.as_ref(), inputs.headers);
+    let keeps_target = D::keeps_target(&policy, inputs.headers);
     let untried;
     let available: &[Arc<dyn Worker>] = if inputs.tried.is_empty() || keeps_target {
         available
@@ -617,29 +1199,34 @@ fn select_pass(
         }
     };
     if available.is_empty() {
-        return overload_fallback(registry, policy.name(), model_id, candidates)
+        return overload_fallback(registry, who.name(&policy), model_id, candidates)
+            .map(D::by_default)
             .ok_or(Miss::NobodyAvailable);
     }
     // The name goes with the list itself, read here and nowhere above:
     // whatever narrowed the candidates handed on a list of its own, at
     // another address, and nobody names that one.
-    info.named = whole.filter(|named| std::ptr::eq(&named.list[..], available));
+    let named = whole.filter(|named| std::ptr::eq(&named.list[..], available));
 
-    // The registry applies the routing-key sticky override when enabled and
-    // otherwise delegates to the configured policy.
-    let Some(idx) = policies.select_worker_for_model(&policy, model_id, available, &info) else {
-        // A policy that filters availability itself misses on an
-        // all-overloaded pool the same way the pre-filter empties. Any other
-        // policy was handed available candidates and declined.
-        let miss = if policy_filters_unavailable_workers(policy.as_ref()) {
-            Miss::NobodyAvailable
-        } else {
-            Miss::Declined
-        };
-        return overload_fallback(registry, policy.name(), model_id, candidates).ok_or(miss);
+    let picked = match who.decide(&policy, model_id, available, named, &mut request) {
+        Answered::Took(picked) => picked,
+        Answered::Nobody => {
+            // A policy that filters availability itself misses on an
+            // all-overloaded pool the same way the pre-filter empties. Any other
+            // policy was handed available candidates and declined.
+            let miss = if D::filters_unavailable(&policy) {
+                Miss::NobodyAvailable
+            } else {
+                Miss::Declined
+            };
+            return overload_fallback(registry, who.name(&policy), model_id, candidates)
+                .map(D::by_default)
+                .ok_or(miss);
+        }
+        Answered::Refused => return Err(Miss::Declined),
     };
-    let selected = available[idx].clone();
-    if info.overload_lifted && !candidates.iter().any(|w| w.is_available()) {
+    let selected = D::worker(&picked);
+    if overload_lifted && !candidates.iter().any(|w| w.is_available()) {
         Metrics::record_worker_overload_fallback(STAGE_SELECTION);
         debug!(
             branch = BRANCH_ALL_OVERLOADED_FALLBACK,
@@ -653,10 +1240,10 @@ fn select_pass(
         metrics_labels::WORKER_REGULAR,
         selected.connection_mode().as_metric_label(),
         model_id,
-        policy.name(),
+        who.name(&policy),
     );
 
-    Ok(selected)
+    Ok(picked)
 }
 
 /// The steering default for a pool whose every worker is vetoed, by the
@@ -1727,6 +2314,9 @@ pub(crate) fn retain_decodes_with_a_room(
     }
     decode.narrow_to(pd_admission::has_free_room);
 }
+
+#[cfg(test)]
+mod placer_tests;
 
 #[cfg(test)]
 mod tests {

@@ -232,7 +232,7 @@ pub mod bench_support {
         time::Instant,
     };
 
-    use axum::http::{HeaderMap, HeaderValue};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use rand::RngExt;
     use smg_policy_controller::{
         engine::{
@@ -250,14 +250,14 @@ pub mod bench_support {
     use super::{
         attempt_ledger::AttemptLedger,
         overload,
-        placement::{select_pair, select_single, PlacementInputs},
+        placement::{select_pair, select_single, PlacementInputs, Placer},
     };
     use crate::{
         config::RouterConfig,
         observability::cache_trace,
         policies::{EnginePolicy, PolicyRegistry, Side},
         policy_controller::{
-            engine::{mark, Ask, End, PolicyEngine as EngineObjectOf, Prompt},
+            engine::{mark, Ask, End, PolicyEngine as EngineObjectOf, Prompt, Sent},
             start_in_process,
         },
         routers::common::{
@@ -384,8 +384,12 @@ pub mod bench_support {
     /// start builds for `config`'s policy under the setting, whatever
     /// `config` says of the setting, and over `registry`'s lists: what the
     /// routers ask where the engine decides every request of the document
-    /// whole.
-    pub struct EngineObject(EngineObjectOf);
+    /// whole. Beside it stands the classic policy registry the start builds
+    /// over the same engine, which a router holds beside the object.
+    pub struct EngineObject {
+        object: Arc<EngineObjectOf>,
+        policies: Arc<PolicyRegistry>,
+    }
 
     impl EngineObject {
         /// The object a gateway's start builds for `config` over `registry`,
@@ -416,11 +420,21 @@ pub mod bench_support {
                     config.policy.name()
                 ));
             }
+            let policies = PolicyRegistry::with_policy_engine(
+                config.policy.clone(),
+                config.routing_key_override.clone(),
+                Arc::clone(&started.engine),
+                started.origin,
+                true,
+            );
             let object = EngineObjectOf::own(started.engine, Arc::clone(registry));
             if let Some(loads) = loads {
                 object.read_loads(loads);
             }
-            Ok(Self(object))
+            Ok(Self {
+                object: Arc::new(object),
+                policies: Arc::new(policies),
+            })
         }
 
         /// How many times the reports of `model`'s workers on `route` were
@@ -434,6 +448,74 @@ pub mod bench_support {
                 .get()
                 .map_or(0, |members| members.conversions())
         }
+    }
+
+    /// Who places a cell's single requests, chosen once at the cell's start
+    /// as a router chooses where it is built: the classic policies of a
+    /// registry, or the gateway's engine object.
+    pub struct CellPlacer(Placer);
+
+    impl CellPlacer {
+        /// The policies of `policies` place: the classic ones, or the
+        /// objects that ask the engine ([`policies_asking_the_engine`]).
+        pub fn classic(policies: &Arc<PolicyRegistry>) -> Self {
+            Self(Placer::of(policies, None))
+        }
+
+        /// The engine object places, with the registry the start builds
+        /// beside it.
+        pub fn engine(object: &EngineObject) -> Self {
+            Self(Placer::of(&object.policies, Some(&object.object)))
+        }
+    }
+
+    /// One request's routing on the regular HTTP route, as its router runs
+    /// it for whoever places: the one placing call over the route's pool,
+    /// the dispatch-time read of the chosen worker's overload veto, the
+    /// dispatch's word where the placement owes one, the worker's load
+    /// guard from the send to the request's end, and the end's word.
+    /// `headers` are the request's, where it carries any: a routing key is
+    /// read from them for the placement and for the load guard. The worker
+    /// the request went to (`placed_on`), and `None` where it had no
+    /// worker.
+    ///
+    /// A placement by the classic policies owes nothing: no clock is read
+    /// for it and nothing is said at its dispatch or its end.
+    pub fn route_http(
+        registry: &WorkerRegistry,
+        placer: &CellPlacer,
+        model: &str,
+        tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
+    ) -> Option<usize> {
+        let inputs = PlacementInputs {
+            tokens,
+            headers,
+            ..Default::default()
+        };
+        let placed = placer
+            .0
+            .place(registry, model, RoutingPool::HttpRegular, None, &inputs)
+            .ok()?;
+        let shed = overload::shed_if_worker_overloaded(
+            placed.worker().as_ref(),
+            model,
+            registry.overload_shed_enabled(),
+        );
+        if shed.is_some() {
+            return None;
+        }
+        let (worker, mut sent) = Sent::of(placed);
+        if let Some(sent) = &mut sent {
+            sent.dispatched(Instant::now());
+        }
+        let went = placed_on(&worker);
+        let guard = WorkerLoadGuard::with_key(worker, placer.0.session_key(headers, None));
+        drop(guard);
+        if let Some(sent) = sent {
+            sent.ended(StatusCode::OK, true, Instant::now());
+        }
+        Some(went)
     }
 
     /// One request's routing by the gateway's engine object on `route`, as
@@ -462,7 +544,7 @@ pub mod bench_support {
             ),
         };
         let prompt = Prompt::of(tokens, None);
-        let hashes = object.0.hashes(model, &prompt);
+        let hashes = object.object.hashes(model, &prompt);
         let id = mark();
         let ask = Ask {
             wires,
@@ -475,7 +557,7 @@ pub mod bench_support {
         // The engine of this process decides on the calling thread: the
         // arm's future is ready at its first poll.
         let placing = pin!(object
-            .0
+            .object
             .place_where(&ask, |worker| pool.matches(worker), now));
         let Poll::Ready(Ok(mut placed)) = placing.poll(&mut Context::from_waker(Waker::noop()))
         else {

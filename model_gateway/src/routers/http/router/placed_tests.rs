@@ -15,7 +15,7 @@ use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
 use smg_policy_controller::{
     document::{AppliedSpec, KeySourceSpec, PolicySpec, RoutingKeySpec},
-    engine::{worker_id, PolicyEngine as OwnEngine},
+    engine::PolicyEngine as OwnEngine,
     policies::power_of_two::PowerOfTwoMetric,
     store::{
         GatewayId, HealthSink, LeasesStore, MemoryStore, WorkerStatus as RowStatus, WorkersStore,
@@ -54,10 +54,13 @@ const TRANSCRIBE: &str = "/v1/audio/transcriptions";
 const AUDIO_TYPE: &str = "audio/wav";
 
 fn router(worker_registry: Arc<WorkerRegistry>, policy_engine: Option<PolicyEngine>) -> Router {
+    let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+    let policy_engine = policy_engine.map(Arc::new);
     Router {
         worker_registry,
-        policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
-        policy_engine: policy_engine.map(Arc::new),
+        placer: Placer::of(&policy_registry, policy_engine.as_ref()),
+        policy_registry,
+        policy_engine,
         retry_config: fast_retry_config(1),
         max_payload_size: 1 << 20,
         stream_stall_timeout: None,
@@ -1061,23 +1064,6 @@ fn own_router(preset: &str, urls: &[&str]) -> Case<Router> {
     Ok(router(registry, Some(policy_engine)))
 }
 
-/// A retry names the worker of a failed attempt as tried where its route
-/// kept no placement of it. Under the engine of this process a place owes
-/// nothing and is its worker alone to its route: the worker is named by the
-/// id a whole decision names it by. The classic line names no row.
-#[test]
-fn a_retry_names_the_worker_of_a_placement_its_route_did_not_keep() -> Case {
-    let hosted = own_router("round_robin", &["http://127.0.0.1:1"])?;
-    let worker = hosted.worker_registry.get_all().pop().ok_or("no worker")?;
-    assert_eq!(
-        hosted.tried_row(&worker, None),
-        Some(worker_id(worker.as_ref()))
-    );
-    let classic = router(Arc::clone(&hosted.worker_registry), None);
-    assert_eq!(classic.tried_row(&worker, None), None);
-    Ok(())
-}
-
 /// `request` put to `router`'s streamed path on the generate route, with
 /// what the body-path counter counted for it: each path and reason, and how
 /// many requests.
@@ -1496,5 +1482,154 @@ async fn a_hinted_stream_keeps_its_worker_where_the_engine_of_this_process_place
     }
     let hits = [hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst)];
     assert!(hits.contains(&16), "the hint's requests spread: {hits:?}");
+    Ok(())
+}
+
+/// A router over `registry` whose requests the engine of this process
+/// places, or the classic policies where `engine` is `false`: the document
+/// is the one the gateway's own settings write for `config`.
+fn routed(config: &RouterConfig, registry: &Arc<WorkerRegistry>, engine: bool) -> Case<Router> {
+    if !engine {
+        return Ok(router(Arc::clone(registry), None));
+    }
+    let document = config.policy_document()?;
+    let engine = Arc::new(OwnEngine::new(config.hosted_policy(&document)?));
+    let policy_engine = PolicyEngine::own(engine, Arc::clone(registry));
+    Ok(router(Arc::clone(registry), Some(policy_engine)))
+}
+
+/// The settings of a round robin gateway that decides in its own process.
+fn round_robin(shed: bool) -> RouterConfig {
+    RouterConfig {
+        policy_controller: true,
+        policy: PolicyConfig::RoundRobin,
+        worker_overload_shed: shed,
+        ..RouterConfig::default()
+    }
+}
+
+async fn generate(router: &Router, model: &str) -> Case<Response> {
+    let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+    let request = serde_json::from_value(json!({"text": "hi"}))?;
+    Ok(router.route_generate(None, &meta, request, model).await)
+}
+
+/// A request that names no model is placed over every HTTP worker, whoever
+/// places: the workers of two models each take their turn.
+#[tokio::test]
+async fn a_request_that_names_no_model_is_placed_over_every_worker_by_both() -> Case {
+    for engine in [false, true] {
+        let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+        let (b, hits_b) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        for (url, model) in [(&a, "first-model"), (&b, "second-model")] {
+            let worker = BasicWorkerBuilder::new(url.as_str())
+                .status(WorkerStatus::Ready)
+                .model(ModelCard::new(model))
+                .build();
+            registry
+                .register(Arc::new(worker))
+                .ok_or("the worker did not register")?;
+        }
+        let router = routed(&round_robin(false), &registry, engine)?;
+        for _ in 0..4 {
+            let response = generate(&router, UNKNOWN_MODEL_ID).await?;
+            assert_eq!(response.status(), StatusCode::OK, "engine {engine}");
+        }
+        let hits = (hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst));
+        assert_eq!(hits, (2, 2), "engine {engine}");
+    }
+    Ok(())
+}
+
+/// Under `--worker-overload-shed` a pool whose every worker is over its
+/// thresholds is shed with the shed's counter, whoever places, and a model
+/// no worker serves is not found.
+#[tokio::test]
+async fn nobody_to_place_reads_the_same_answer_and_counter_from_both() -> Case {
+    for engine in [false, true] {
+        let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.set_overload_shed(true);
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(a.as_str())
+                .status(WorkerStatus::Ready)
+                .model(ModelCard::new(MODEL))
+                .build(),
+        );
+        registry
+            .register(Arc::clone(&worker))
+            .ok_or("the worker did not register")?;
+        let router = routed(&round_robin(true), &registry, engine)?;
+
+        let absent = generate(&router, "absent-model").await?;
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND, "engine {engine}");
+
+        assert!(registry.set_worker_overloaded(&worker, true));
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let shed = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            generate(&router, MODEL).await?
+        };
+        assert_eq!(
+            shed.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "engine {engine}"
+        );
+        let body = to_bytes(shed.into_body(), 4096).await?;
+        let error: Value = serde_json::from_slice(&body)?;
+        assert_eq!(
+            error["error"]["code"], "worker_overload_protection_shed",
+            "engine {engine}"
+        );
+        let rendered = recorder.handle().render();
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.starts_with("smg_worker_overload_shed_total{")
+                    && line.contains(r#"stage="selection""#)
+                    && line.ends_with(" 1")),
+            "engine {engine}: {rendered}"
+        );
+        assert_eq!(hits_a.load(Ordering::SeqCst), 0, "engine {engine}");
+    }
+    Ok(())
+}
+
+/// A worker's own failure is not tried again on a worker over its
+/// thresholds, whoever places: the first answer stands.
+#[tokio::test]
+async fn a_retry_is_not_sent_to_an_overloaded_worker_by_either() -> Case {
+    for engine in [false, true] {
+        let (a, hits_a) =
+            fixed_status_upstream(&[GENERATE], StatusCode::INTERNAL_SERVER_ERROR).await;
+        let (b, hits_b) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
+        for url in [&a, &b] {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url.as_str())
+                    .status(WorkerStatus::Ready)
+                    .model(ModelCard::new(MODEL))
+                    .build(),
+            );
+            registry
+                .register(Arc::clone(&worker))
+                .ok_or("the worker did not register")?;
+            workers.push(worker);
+        }
+        assert!(registry.set_worker_overloaded(&workers[1], true));
+        let mut router = routed(&round_robin(false), &registry, engine)?;
+        router.retry_config = fast_retry_config(3);
+
+        let response = generate(&router, MODEL).await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "engine {engine}"
+        );
+        let hits = (hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst));
+        assert_eq!(hits, (1, 0), "engine {engine}");
+    }
     Ok(())
 }

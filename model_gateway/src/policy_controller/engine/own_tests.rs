@@ -263,8 +263,8 @@ async fn a_place_holds_no_lease_and_names_its_worker_where_asked() {
 }
 
 /// A place reads no clock, and it is its worker and nothing else to its
-/// route: nothing of it is kept to its answer's end, and a retry names the
-/// worker by the id its placement would. A retry's whole decision is dated
+/// route: nothing of it is kept to its answer's end, and the id its
+/// placement names is its worker's own. A retry's whole decision is dated
 /// by one read of the clock and owes nothing either. Under least load, which
 /// takes the dispatch, a placement is dated and kept.
 #[tokio::test]
@@ -287,7 +287,7 @@ async fn a_place_reads_no_clock_and_its_route_keeps_its_worker_alone() {
     let row = placed.id();
     let (worker, kept) = Sent::of(placed);
     assert!(kept.is_none(), "nothing is owed of a place");
-    assert_eq!(policy_engine.row_of(worker.as_ref()), Some(row));
+    assert_eq!(worker_id(worker.as_ref()), row);
 
     let tried = [row];
     let retry = Ask {
@@ -304,7 +304,7 @@ async fn a_place_reads_no_clock_and_its_route_keeps_its_worker_alone() {
     let row = again.id();
     let (worker, kept) = Sent::of(again);
     assert!(kept.is_none(), "no stage takes a word of it");
-    assert_eq!(policy_engine.row_of(worker.as_ref()), Some(row));
+    assert_eq!(worker_id(worker.as_ref()), row);
     assert_ne!(row, tried[0]);
 
     let (policy_engine, _workers) = own("least_load", 3);

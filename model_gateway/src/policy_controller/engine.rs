@@ -67,6 +67,7 @@ use smg_policy_controller::{
     worker_host::Objects,
 };
 use smg_worker::{
+    health::overload::STAGE_SELECTION,
     identity::basic::{Worker, WorkerLoadGuard, WorkerType},
     load::state::{LoadReceiver, LoadSnapshot},
 };
@@ -864,15 +865,6 @@ impl PolicyEngine {
     /// reach the engine over the store that follows a controller.
     pub(crate) fn in_process(&self) -> bool {
         matches!(*self.door, Decider::Own(_))
-    }
-
-    /// The id a retry names `worker` by as tried, where its route kept no
-    /// placement of it: a placement that owed the engine of this process
-    /// nothing is its worker alone to its route ([`Sent::of`]), and its
-    /// [`Placed::id`] is read here. `None` under a followed controller's
-    /// engine: its every placement is kept and names its own row.
-    pub(crate) fn row_of(&self, worker: &dyn Worker) -> Option<WorkerId> {
-        self.in_process().then(|| worker_id(worker))
     }
 
     /// Whether the placement of a single request reads the request's body
@@ -1823,6 +1815,14 @@ impl PolicyEngine {
                 continue;
             };
             self.trace_decision(decision, Some(&worker));
+            // A pick the engine's rule for a pool whose every worker is
+            // vetoed made by lifting a veto: counted as the classic
+            // placement counts its own steer of such a pool.
+            match decision.trace().lifted {
+                LiftedVeto::None => {}
+                LiftedVeto::Overload => Metrics::record_worker_overload_fallback(STAGE_SELECTION),
+                LiftedVeto::Liveness => Metrics::record_worker_liveness_fallback(STAGE_SELECTION),
+            }
             if let Some(handle) = &mut handle {
                 handle.take(index);
             }
@@ -2137,7 +2137,21 @@ struct PlacedPair {
 }
 
 impl Placed {
+    /// A placement that is `worker` and nothing else: it holds no
+    /// decision's guard, so nothing is owed of it ([`Self::owes`]). What a
+    /// placement by the classic policies hands back.
+    #[inline]
+    pub(crate) fn of_worker(worker: Arc<dyn Worker>) -> Self {
+        Self {
+            worker,
+            named: Named::ByWorker,
+            pair: None,
+            handle: None,
+        }
+    }
+
     /// The worker the request goes to.
+    #[inline]
     pub(crate) fn worker(&self) -> &Arc<dyn Worker> {
         &self.worker
     }
@@ -2146,11 +2160,13 @@ impl Placed {
     /// of the request is owed to its engine (it holds its decision's
     /// guard), or it is a pair's. One that owes nothing is its worker and
     /// nothing else: each report below says nothing.
+    #[inline]
     pub(crate) fn owes(&self) -> bool {
         self.handle.is_some() || self.pair.is_some()
     }
 
     /// The worker alone, of a placement its route keeps nothing else of.
+    #[inline]
     pub(crate) fn into_worker(self) -> Arc<dyn Worker> {
         self.worker
     }

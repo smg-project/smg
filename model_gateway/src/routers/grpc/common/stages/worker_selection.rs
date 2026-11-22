@@ -532,6 +532,7 @@ impl<'a> SelectionInputs<'a> {
             cache_namespace: self.cache_namespace,
             candidate_filter,
             tried: &[],
+            ..Default::default()
         }
     }
 }
@@ -829,6 +830,7 @@ impl WorkerSelectionStage {
                     cache_namespace,
                     candidate_filter: Some(&admits),
                     tried: &ctx.tried,
+                    ..Default::default()
                 };
                 let (worker, placed) = self
                     .select_regular_attempt(
@@ -852,6 +854,7 @@ impl WorkerSelectionStage {
                     cache_namespace,
                     candidate_filter: Some(&pinned),
                     tried: &ctx.tried,
+                    ..Default::default()
                 };
                 let ((pair, placed), guard) = self
                     .select_pd_attempt(
@@ -2495,6 +2498,7 @@ impl WorkerSelectionStage {
                 cache_namespace,
                 candidate_filter,
                 tried,
+                ..Default::default()
             },
         )
     }
