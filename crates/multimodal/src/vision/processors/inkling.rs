@@ -8,10 +8,14 @@
 use image::{DynamicImage, GenericImageView, RgbImage};
 use ndarray::{ArrayD, IxDyn};
 
-use crate::vision::{
-    preprocessor_config::PreProcessorConfig,
-    processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
-    transforms::{self, TransformError},
+use crate::{
+    buffer_pool,
+    encoder_inputs::{f32_to_bf16_bits, EncoderDtype, EncoderInput, PixelNorm},
+    vision::{
+        preprocessor_config::PreProcessorConfig,
+        processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
+        transforms::{self, TransformError},
+    },
 };
 
 pub const INKLING_IMAGE_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
@@ -204,26 +208,30 @@ impl InklingImageProcessor {
         }
     }
 
-    fn append_image_patches(
+    /// The float a raw value of a channel is normalized to.
+    fn normalized(&self) -> impl Fn(f32, usize) -> f32 {
+        // Fused: (raw/255 - mean) / std = raw * (1/(255*std)) - mean/std.
+        let scale: [f32; 3] = std::array::from_fn(|c| 1.0 / (255.0 * self.std[c] as f32));
+        let bias: [f32; 3] = std::array::from_fn(|c| -(self.mean[c] as f32) / (self.std[c] as f32));
+        move |raw, channel| raw * scale[channel] + bias[channel]
+    }
+
+    fn append_image_patches<E: Copy, const N: usize>(
         &self,
         image: &DynamicImage,
-        mean: &[f64; 3],
-        std: &[f64; 3],
-        output: &mut Vec<f32>,
+        level: &impl Fn(f32, usize) -> [E; N],
+        output: &mut Vec<E>,
     ) {
         let rgb = self.prepare_rgb_image(image);
         let width = rgb.width() as usize;
         let height = rgb.height() as usize;
         let raw = rgb.as_raw();
         let (_, npw, _) = self.patch_grid(width, height);
-        // Fused: (raw/255 - mean) / std = raw * (1/(255*std)) - mean/std.
-        let scale: [f32; 3] = std::array::from_fn(|c| 1.0 / (255.0 * std[c] as f32));
-        let bias: [f32; 3] = std::array::from_fn(|c| -(mean[c] as f32) / (std[c] as f32));
         // PAD_RAW_VALUE is in the [0,1] domain; recover the raw byte for scale/bias.
         let pad_byte = PAD_RAW_VALUE * 255.0;
-        let pad_norm: [f32; 3] = std::array::from_fn(|c| pad_byte * scale[c] + bias[c]);
-        let table: [[f32; 256]; 3] =
-            std::array::from_fn(|c| std::array::from_fn(|byte| byte as f32 * scale[c] + bias[c]));
+        let pad_norm: [[E; N]; 3] = std::array::from_fn(|c| level(pad_byte, c));
+        let table: [[[E; N]; 256]; 3] =
+            std::array::from_fn(|c| std::array::from_fn(|byte| level(byte as f32, c)));
         let (pixels, _) = raw.as_chunks::<3>();
 
         for patch_idx in 0..height.div_ceil(self.patch_size) * npw {
@@ -243,41 +251,38 @@ impl InklingImageProcessor {
                     &[]
                 };
                 for pixel in on_image {
-                    output.extend_from_slice(&[
-                        table[0][usize::from(pixel[0])],
-                        table[1][usize::from(pixel[1])],
-                        table[2][usize::from(pixel[2])],
-                    ]);
+                    output.extend_from_slice(
+                        [
+                            table[0][usize::from(pixel[0])],
+                            table[1][usize::from(pixel[1])],
+                            table[2][usize::from(pixel[2])],
+                        ]
+                        .as_flattened(),
+                    );
                 }
                 for _ in on_image.len()..self.patch_size {
-                    output.extend_from_slice(&pad_norm);
+                    output.extend_from_slice(pad_norm.as_flattened());
                 }
             }
 
-            let single_temporal_patch_len = self.patch_size * self.patch_size * 3;
+            let single_temporal_patch_len = N * self.patch_size * self.patch_size * 3;
             for _ in 1..self.temporal_patch_size {
                 output.extend_from_within(patch_start..patch_start + single_temporal_patch_len);
             }
         }
     }
-}
 
-impl VisionPreProcessor for InklingImageProcessor {
-    fn default_mean(&self) -> [f64; 3] {
-        INKLING_IMAGE_MEAN
-    }
-
-    fn default_std(&self) -> [f64; 3] {
-        INKLING_IMAGE_STD
-    }
-
-    fn preprocess(
+    /// The pipeline of both outputs, the float tensor and the wire: `take`
+    /// gives the storage of the batch's elements, `level` the elements a raw
+    /// value of a channel is written as, `finish` the encoder input.
+    fn batch<E: Copy, const N: usize>(
         &self,
         images: &[&DynamicImage],
+        take: impl FnOnce(usize) -> Result<Vec<E>, TransformError>,
+        level: impl Fn(f32, usize) -> [E; N],
+        finish: impl FnOnce(Vec<E>, usize) -> Result<EncoderInput, TransformError>,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         TransformError::if_empty(images)?;
-
-        let (mean, std) = (self.mean, self.std);
 
         let mut feature_token_counts = Vec::with_capacity(images.len());
         let mut tokens_per_item = Vec::with_capacity(images.len());
@@ -298,33 +303,11 @@ impl VisionPreProcessor for InklingImageProcessor {
         // decode to huge dimensions; the reservation below would otherwise abort
         // the whole process (with_capacity/handle_alloc_error is uncatchable).
         self.ensure_patch_budget(total_patches)?;
-        let capacity = total_patches * self.num_patch_features();
-        let mut patches: Vec<f32> = Vec::new();
-        patches.try_reserve_exact(capacity).map_err(|e| {
-            TransformError::ShapeError(format!(
-                "Inkling: cannot reserve {capacity} f32 for image patches: {e}"
-            ))
-        })?;
+        let mut patches = take(N * total_patches * self.num_patch_features())?;
         for image in images {
-            self.append_image_patches(image, &mean, &std, &mut patches);
+            self.append_image_patches(image, &level, &mut patches);
         }
-
-        let encoder_input = ArrayD::from_shape_vec(
-            IxDyn(&[
-                total_patches,
-                self.temporal_patch_size,
-                self.patch_size,
-                self.patch_size,
-                3,
-            ]),
-            patches,
-        )
-        .map_err(|e| {
-            TransformError::ShapeError(format!(
-                "failed to create Inkling image encoder input [{total_patches}, {}, {}, {}, 3]: {e}",
-                self.temporal_patch_size, self.patch_size, self.patch_size
-            ))
-        })?;
+        let encoder_input = finish(patches, total_patches)?;
 
         Ok(
             PreprocessedEncoderInputs::new(encoder_input, feature_token_counts, item_sizes)
@@ -333,6 +316,110 @@ impl VisionPreProcessor for InklingImageProcessor {
                     ModelSpecificValue::int_1d(tokens_per_item),
                 ),
         )
+    }
+
+    /// The encoder input's shape for `total_patches` patches.
+    fn shape(&self, total_patches: usize) -> Vec<usize> {
+        vec![
+            total_patches,
+            self.temporal_patch_size,
+            self.patch_size,
+            self.patch_size,
+            3,
+        ]
+    }
+}
+
+impl VisionPreProcessor for InklingImageProcessor {
+    fn default_mean(&self) -> [f64; 3] {
+        INKLING_IMAGE_MEAN
+    }
+
+    fn default_std(&self) -> [f64; 3] {
+        INKLING_IMAGE_STD
+    }
+
+    fn preprocess(
+        &self,
+        images: &[&DynamicImage],
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        let normalized = self.normalized();
+        self.batch(
+            images,
+            |capacity| {
+                let mut patches: Vec<f32> = Vec::new();
+                patches.try_reserve_exact(capacity).map_err(|e| {
+                    TransformError::ShapeError(format!(
+                        "Inkling: cannot reserve {capacity} f32 for image patches: {e}"
+                    ))
+                })?;
+                Ok(patches)
+            },
+            |raw, channel| [normalized(raw, channel)],
+            |patches, total_patches| {
+                ArrayD::from_shape_vec(IxDyn(&self.shape(total_patches)), patches)
+                    .map(EncoderInput::from)
+                    .map_err(|e| {
+                        TransformError::ShapeError(format!(
+                            "failed to create Inkling image encoder input {:?}: {e}",
+                            self.shape(total_patches)
+                        ))
+                    })
+            },
+        )
+    }
+
+    /// A bfloat16 wire is written in one pass into a buffer of the pool: a
+    /// byte maps to the two bytes of its level on the wire, so neither the
+    /// float tensor nor the pass that narrows it is made.
+    fn preprocess_wire(
+        &self,
+        images: &[&DynamicImage],
+        dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        // float16 keeps the two passes: under the default constants one of
+        // its levels is not the one the norm below gives.
+        if dtype != EncoderDtype::BFloat16 {
+            return None;
+        }
+        let normalized = self.normalized();
+        // Mean and std in byte units, the norm the wire names. The fused
+        // levels round apart from it near zero and the config sets mean and
+        // std, so the one pass is taken only where every byte narrows to the
+        // norm's own level.
+        let norm = PixelNorm {
+            scale: 1.0,
+            offset: self.mean.map(|mean| mean as f32 * 255.0),
+            divisor: self.std.map(|std| std as f32 * 255.0),
+            channel_block: 1,
+        };
+        let named = norm.table_f32();
+        let agree = (0..3).all(|channel| {
+            (0..256).all(|value| {
+                f32_to_bf16_bits(named[channel][value])
+                    == f32_to_bf16_bits(normalized(value as f32, channel))
+            })
+        });
+        if !agree {
+            return None;
+        }
+        Some(self.batch(
+            images,
+            |elements| {
+                // Empty: the patches are appended, so no byte of a previous
+                // request can be part of the wire.
+                buffer_pool::take_empty(elements).map_err(|e| {
+                    TransformError::ShapeError(format!(
+                        "Inkling: cannot reserve {elements} bytes for image patches: {e}"
+                    ))
+                })
+            },
+            |raw, channel| f32_to_bf16_bits(normalized(raw, channel)).to_le_bytes(),
+            |wire, total_patches| {
+                EncoderInput::wire(wire, dtype, self.shape(total_patches), norm)
+                    .map_err(TransformError::ShapeError)
+            },
+        ))
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
@@ -579,5 +666,43 @@ mod tests {
             capped_processor.scaled_image_dimensions(3000, 2000),
             (3000, 2000)
         );
+    }
+
+    #[test]
+    fn inkling_wire_is_the_float_tensor_written_as_bfloat16_where_the_norm_names_it() {
+        let mut wide = RgbImage::new(83, 121);
+        for (x, y, pixel) in wide.enumerate_pixels_mut() {
+            *pixel = Rgb([(x * 3) as u8, (y * 2) as u8, (x + y) as u8]);
+        }
+        let (wide, small) = (DynamicImage::ImageRgb8(wide), test_image());
+        let images = [&wide, &small];
+        let processor = processor_without_rescale();
+        let two_pass = processor.preprocess(&images).unwrap();
+        let wire = processor
+            .preprocess_wire(&images, EncoderDtype::BFloat16)
+            .unwrap()
+            .unwrap();
+        assert_eq!(wire.feature_token_counts, two_pass.feature_token_counts);
+        assert_eq!(wire.encoder_input.shape(), two_pass.encoder_input.shape());
+        assert!(
+            wire.encoder_input
+                .into_bytes_as(EncoderDtype::BFloat16)
+                .unwrap()
+                == two_pass.encoder_input.write_as(EncoderDtype::BFloat16),
+            "the wire differs from the float tensor's bytes"
+        );
+        for dtype in [EncoderDtype::Float16, EncoderDtype::Float32] {
+            assert!(processor.preprocess_wire(&images, dtype).is_none());
+        }
+        // With a mean and a std of one half, three levels of byte 127 narrow
+        // to another bfloat16 than the byte-unit norm names.
+        let halves = InklingImageProcessor {
+            mean: [0.5; 3],
+            std: [0.5; 3],
+            ..processor_without_rescale()
+        };
+        assert!(halves
+            .preprocess_wire(&images, EncoderDtype::BFloat16)
+            .is_none());
     }
 }
