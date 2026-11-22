@@ -1615,7 +1615,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::document::spec::{AppliedSpec, PRESETS};
+    use crate::{
+        document::spec::{AppliedSpec, PRESETS},
+        engine::framework::{InTheWay, Place},
+    };
 
     /// The settings of a gateway that sets none, as its configuration
     /// defaults them. The document they mean is the `random` preset.
@@ -2466,6 +2469,28 @@ mod tests {
             let applied = validated(&expected).expect("the controller takes the document");
             assert!(applied.engine().needs().session_in_flight, "{name}");
         }
+    }
+
+    /// The override's rule stands in the way of one pick. `passthrough`
+    /// picks alone, so the document's answer for its place is one pick
+    /// under the settings as they default. Under the override the answer
+    /// names the rule: no caller is told to pick by itself past a pinned
+    /// key.
+    #[test]
+    fn the_overrides_rule_keeps_a_place_from_one_pick() {
+        let place_of = |settings: RoutingSettings| {
+            let document = settings.policy_document().expect("a document");
+            let applied = validated(&document).expect("the controller takes the document");
+            let place = applied.engine().place_for("", Phase::Single);
+            let ruled = Place::NotAlone {
+                profile: "passthrough",
+                in_the_way: InTheWay::Sessions,
+            };
+            (matches!(place, Place::Alone(_)), place == ruled)
+        };
+        let plain = config(at_flag_defaults("passthrough"));
+        assert_eq!(place_of(plain), (true, false));
+        assert_eq!(place_of(sticky("passthrough")), (false, true));
     }
 
     /// The override's own settings land in its rule. A key's first worker
