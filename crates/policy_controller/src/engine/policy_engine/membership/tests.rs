@@ -48,7 +48,7 @@ const MODEL: &str = "model-a";
 
 /// The plainest generation of a registry: a list's members and nothing
 /// beside them.
-struct Listed(Arc<[Arc<dyn Worker>]>);
+pub(in crate::engine::policy_engine) struct Listed(Arc<[Arc<dyn Worker>]>);
 
 impl fmt::Debug for Listed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -66,7 +66,7 @@ impl Generation for Listed {
     }
 }
 
-type Registry = WorkerRegistry<Listed>;
+pub(in crate::engine::policy_engine) type Registry = WorkerRegistry<Listed>;
 
 /// What the stages were told: the word and the worker's id.
 type Words = Vec<(&'static str, WorkerId)>;
@@ -77,12 +77,12 @@ fn url(at: usize) -> String {
 
 /// The fingerprint of the address `url(at)`: the id of the worker there
 /// where its host states none.
-fn id(at: usize) -> WorkerId {
+pub(in crate::engine::policy_engine) fn id(at: usize) -> WorkerId {
     worker_id(ready_worker(&url(at), MODEL).as_ref())
 }
 
 /// A registry in which the workers at `url(0)` to `url(workers - 1)` stand.
-fn registry(workers: usize) -> Arc<Registry> {
+pub(in crate::engine::policy_engine) fn registry(workers: usize) -> Arc<Registry> {
     let registry = Arc::new(Registry::new());
     for at in 0..workers {
         register(&registry, at);
@@ -91,7 +91,7 @@ fn registry(workers: usize) -> Arc<Registry> {
 }
 
 /// Registers a worker at `url(at)`, which holds none.
-fn register(registry: &Registry, at: usize) {
+pub(in crate::engine::policy_engine) fn register(registry: &Registry, at: usize) {
     let registered = registry.register(ready_worker(&url(at), MODEL));
     registered.expect("a free address");
 }
@@ -102,7 +102,7 @@ fn object(registry: &Registry, at: usize) -> ObjectId {
 }
 
 /// Removes the worker at `url(at)` from the registry.
-fn remove(registry: &Registry, at: usize) {
+pub(in crate::engine::policy_engine) fn remove(registry: &Registry, at: usize) {
     let removed = registry.remove(&object(registry, at));
     removed.expect("the worker was removed");
 }
@@ -133,14 +133,14 @@ fn flood(registry: &Registry, at: usize) {
 }
 
 /// `words` in the order of their ids: a whole read tells in no order.
-fn in_id_order(mut words: Words) -> Words {
+pub(in crate::engine::policy_engine) fn in_id_order(mut words: Words) -> Words {
     words.sort_by_key(|&(word, id)| (id.0, word));
     words
 }
 
 /// What the stages were told of single workers since the last call, in the
 /// order told: the joins and the leaves, without a whole read's snapshot.
-fn told(heard: &Heard) -> Words {
+pub(in crate::engine::policy_engine) fn told(heard: &Heard) -> Words {
     told_and_standing(heard).0
 }
 
@@ -210,7 +210,9 @@ fn replaced(object: &ObjectId, old: &Arc<dyn Worker>, new: &Arc<dyn Worker>) -> 
 }
 
 /// `registry` as a host hands it to the engine.
-fn handed(registry: &Arc<impl Members + 'static>) -> Arc<dyn Members> {
+pub(in crate::engine::policy_engine) fn handed(
+    registry: &Arc<impl Members + 'static>,
+) -> Arc<dyn Members> {
     Arc::clone(registry) as Arc<dyn Members>
 }
 

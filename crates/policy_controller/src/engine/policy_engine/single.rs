@@ -2440,12 +2440,24 @@ pub(crate) mod tests {
         hearing_as(panics, false, EventSet::LEASE)
     }
 
+    /// The document of [`hearing`]'s engine, for a case that has its engine
+    /// by another call, and what its picker hears.
+    pub(in crate::engine::policy_engine) fn hearing_spec() -> (AppliedSpec, Heard) {
+        hearing_spec_as(false, false, EventSet::LEASE)
+    }
+
     /// [`hearing`] with a picker that places by itself where `alone`, and
     /// that names the words `takes`.
     fn hearing_as(panics: bool, alone: bool, takes: EventSet) -> (PolicyEngine, Heard) {
+        let (spec, heard) = hearing_spec_as(panics, alone, takes);
+        (PolicyEngine::new(spec), heard)
+    }
+
+    /// The document of [`hearing_as`]'s engine, and what its picker hears.
+    fn hearing_spec_as(panics: bool, alone: bool, takes: EventSet) -> (AppliedSpec, Heard) {
         let heard = Heard::default();
         let kept = Arc::clone(&heard);
-        let engine = picked_by("hears", move || {
+        let spec = spec_picked_by("hears", move || {
             Box::new(Hears {
                 heard: Arc::clone(&kept),
                 panics,
@@ -2453,7 +2465,7 @@ pub(crate) mod tests {
                 takes,
             })
         });
-        (engine, heard)
+        (spec, heard)
     }
 
     /// The engine of the `random` preset with the picker `make` builds, a
@@ -2462,6 +2474,14 @@ pub(crate) mod tests {
         name: &'static str,
         make: impl Fn() -> Box<dyn Picker> + Send + Sync + 'static,
     ) -> PolicyEngine {
+        PolicyEngine::new(spec_picked_by(name, make))
+    }
+
+    /// The document of [`picked_by`]'s engine.
+    fn spec_picked_by(
+        name: &'static str,
+        make: impl Fn() -> Box<dyn Picker> + Send + Sync + 'static,
+    ) -> AppliedSpec {
         let mut stages = StageRegistry::builtin();
         let added = stages.picker(name, make);
         added.expect("a free name");
@@ -2470,7 +2490,7 @@ pub(crate) mod tests {
         let profile = document.profiles.get_mut("random");
         profile.expect("the preset's profile").pick = name.into();
         let spec = AppliedSpec::validate_in(&document, &stages, &[]);
-        PolicyEngine::new(spec.expect("the stages hold the picker"))
+        spec.expect("the stages hold the picker")
     }
 
     /// [`Hears`] as a stage of a host's own build that says it needs the

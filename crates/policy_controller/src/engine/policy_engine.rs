@@ -55,6 +55,7 @@ pub(super) mod pair;
 pub(super) mod place;
 mod signals;
 mod single;
+pub(super) mod start;
 mod task;
 mod with_shadow;
 
@@ -329,7 +330,9 @@ impl PoolMembers {
 }
 
 impl PolicyEngine {
-    /// The engine of `spec`, the document in force.
+    /// The engine of `spec`, the document in force, handed nothing of its
+    /// caller's data. A program has its engine by [`Self::start`], which
+    /// builds it here and makes every hand-over.
     #[must_use]
     pub fn new(mut spec: AppliedSpec) -> Self {
         let hears = spec.engine().hears();

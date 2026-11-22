@@ -501,4 +501,4 @@ impl PolicyEngine {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

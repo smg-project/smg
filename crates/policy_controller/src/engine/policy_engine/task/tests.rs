@@ -37,7 +37,7 @@ use crate::{
     },
 };
 
-const MODEL: &str = "model-a";
+pub(in crate::engine::policy_engine) const MODEL: &str = "model-a";
 
 /// The engine of a stock document, as a host that spawns its task holds it.
 fn preset(name: &str) -> Arc<PolicyEngine> {
@@ -47,7 +47,7 @@ fn preset(name: &str) -> Arc<PolicyEngine> {
     Arc::new(PolicyEngine::new(spec))
 }
 
-fn url(at: usize) -> String {
+pub(in crate::engine::policy_engine) fn url(at: usize) -> String {
     format!("http://worker-{at}:8000")
 }
 
@@ -59,7 +59,10 @@ fn pool(workers: usize) -> Arc<[Arc<dyn Worker>]> {
 
 /// One report a worker: the worker at `short` has no queue, every other a
 /// long one.
-fn reports(workers: usize, short: usize) -> HashMap<String, WorkerLoadResponse> {
+pub(in crate::engine::policy_engine) fn reports(
+    workers: usize,
+    short: usize,
+) -> HashMap<String, WorkerLoadResponse> {
     (0..workers)
         .map(|at| {
             let queued = if at == short { 0 } else { 90_000 };
@@ -71,7 +74,9 @@ fn reports(workers: usize, short: usize) -> HashMap<String, WorkerLoadResponse> 
 /// A load monitor's stand-in that published `reports`, and its channel as
 /// a monitor's subscription hands it behind a publication: what was
 /// published is marked seen, so the channel says nothing until the next.
-fn monitor(reports: &HashMap<String, WorkerLoadResponse>) -> (TestFeed, LoadReceiver) {
+pub(in crate::engine::policy_engine) fn monitor(
+    reports: &HashMap<String, WorkerLoadResponse>,
+) -> (TestFeed, LoadReceiver) {
     let mut channel = None;
     let feed = TestFeed::attached_to(|loads| channel = loads);
     feed.publish(reports);
@@ -82,8 +87,8 @@ fn monitor(reports: &HashMap<String, WorkerLoadResponse>) -> (TestFeed, LoadRece
 
 /// A request stated ahead over one list, with the snapshot its host gives
 /// it, where it gives one.
-struct Asks<'a> {
-    request: Request<'a>,
+pub(in crate::engine::policy_engine) struct Asks<'a> {
+    pub(in crate::engine::policy_engine) request: Request<'a>,
     members: &'a PoolMembers,
     loads: Option<Arc<LoadSnapshot>>,
 }
@@ -107,7 +112,11 @@ impl RequestMaker for Asks<'_> {
 }
 
 /// A request of `seed` over `members` that gives `loads`.
-fn asks(seed: u64, members: &PoolMembers, loads: Option<Arc<LoadSnapshot>>) -> Asks<'_> {
+pub(in crate::engine::policy_engine) fn asks(
+    seed: u64,
+    members: &PoolMembers,
+    loads: Option<Arc<LoadSnapshot>>,
+) -> Asks<'_> {
     let facts = RequestFacts {
         model: MODEL,
         seed,
@@ -126,7 +135,7 @@ fn asks(seed: u64, members: &PoolMembers, loads: Option<Arc<LoadSnapshot>>) -> A
 
 /// The place in its list of the worker a request's whole decision names
 /// first.
-fn picked(engine: &PolicyEngine, asks: &Asks<'_>) -> u32 {
+pub(in crate::engine::policy_engine) fn picked(engine: &PolicyEngine, asks: &Asks<'_>) -> u32 {
     let decided = engine.decide_under(GatewayId::LOCAL, asks, Instant::now());
     let whole = decided.expect("an answer").whole();
     let decision = whole.expect("a whole decision").0.decision;
@@ -135,12 +144,14 @@ fn picked(engine: &PolicyEngine, asks: &Asks<'_>) -> u32 {
 }
 
 /// Lets the task take what stands ready for it: no second passes.
-async fn settle() {
+pub(in crate::engine::policy_engine) async fn settle() {
     sleep(Duration::from_millis(1)).await;
 }
 
 /// A task spawned as a host spawns the engine's, past its first step.
-async fn spawned(task: impl Future<Output = ()> + Send + 'static) -> JoinHandle<()> {
+pub(in crate::engine::policy_engine) async fn spawned(
+    task: impl Future<Output = ()> + Send + 'static,
+) -> JoinHandle<()> {
     #[expect(
         clippy::disallowed_methods,
         reason = "the case holds the task's handle and ends the task"
