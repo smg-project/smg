@@ -686,6 +686,40 @@ fn an_alpha_composite_allocates_its_output_alone() {
     );
 }
 
+/// The Inkling2 processor reads an RGBA8 image where it stands: against the same pixels
+/// given as RGB8, its preprocess allocates nothing more.
+#[test]
+fn an_inkling2_rgba_image_is_read_where_it_stands() {
+    use llm_multimodal::vision::processors::Inkling2ImageProcessor;
+
+    let _window = window();
+    assert_eq!(
+        configure_parallelism(Parallelism::Inline),
+        Ok(()),
+        "the pins count the calling thread alone: this test must own the process's mode"
+    );
+    let processor = Inkling2ImageProcessor::new();
+    // Opaque everywhere, so the two inputs give the processor the same pixels.
+    let rgba = RgbaImage::from_fn(640, 480, |x, y| {
+        Rgba([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8, 255])
+    });
+    let rgb = DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(rgba.clone()).to_rgb8());
+    let rgba = DynamicImage::ImageRgba8(rgba);
+    let mut counts = Vec::new();
+    for image in [&rgb, &rgba] {
+        // Warm: the first pass pays for whatever the thread and the pool keep.
+        returned(processor.preprocess(&[image]).expect("warm"));
+        let (inputs, count) = counted(|| processor.preprocess(&[image]).expect("preprocess"));
+        returned(inputs);
+        counts.push(count);
+    }
+    assert_eq!(
+        (counts[1].calls, counts[1].bytes),
+        (counts[0].calls, counts[0].bytes),
+        "an RGBA8 image is read where it stands"
+    );
+}
+
 /// The Pillow-exact resizes of a decoded image read an RGB8 image where it stands: against
 /// the same pixels given as RGBA8, a resize saves the copy to RGB8, one call of three bytes
 /// a pixel.
