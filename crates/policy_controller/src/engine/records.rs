@@ -770,7 +770,7 @@ impl PoolRecords {
 ///
 /// The count is written under the claim alone, which is never waited for:
 /// a draw that finds the claim taken leaves its look-ups uncounted. Only a
-/// draw that looked a report up writes it, so no draw writes it once the
+/// decision that looked a report up writes it, so none writes it once the
 /// list holds the snapshot's rows.
 #[derive(Debug, Default)]
 struct LookUps {
@@ -812,7 +812,7 @@ struct Singly<'a> {
     live: &'a Live<'a>,
     /// The list's rows, where they are of the decision's snapshot.
     held: Option<Held>,
-    /// The records this decision wrote by a look-up of a report.
+    /// The records this decision wrote without the list's rows.
     looked_up: Cell<u32>,
 }
 

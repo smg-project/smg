@@ -21,7 +21,7 @@
 //!
 //! `--workers` is the list's size: every worker is ready and has a load
 //! report. `--publish-ms N` publishes the reports again, as a new snapshot,
-//! every `N` milliseconds while the callers run; `0`, the default,
+//! every `N` milliseconds while the timed decisions run; `0`, the default,
 //! publishes once. `--overloaded 1` puts every worker over its
 //! overload threshold, so the list admits no worker, and gives each worker
 //! requests in flight: its place plus one, the middle worker none, so the
@@ -52,7 +52,7 @@ use std::{
     env,
     hint::black_box,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc, Barrier,
     },
     thread,
@@ -60,6 +60,7 @@ use std::{
 };
 
 use counting_alloc::{calls, Counting};
+use parking_lot::{Condvar, Mutex};
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
     engine::{
@@ -330,19 +331,9 @@ fn main() {
     let start = Barrier::new(run.callers + 1);
     let (busy_nanos, placed, allocations) =
         (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
-    let (publications, published) = (AtomicU64::new(0), AtomicBool::new(false));
+    let (publications, done, ended) = (AtomicU64::new(0), Mutex::new(false), Condvar::new());
     let converted_before = host.members.conversions();
     let wall = thread::scope(|scope| {
-        // The monitor's side: the reports again, as a new snapshot.
-        if run.publish_ms > 0 {
-            scope.spawn(|| {
-                while !published.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_millis(run.publish_ms));
-                    feed.publish(&loads);
-                    publications.fetch_add(1, Ordering::Relaxed);
-                }
-            });
-        }
         let one_caller = |caller: u64| {
             let seed = |turn: u64| mix(caller << 40 | turn);
             for turn in 0..CALLER_WARM {
@@ -363,10 +354,21 @@ fn main() {
             .collect();
         start.wait();
         let started = Instant::now();
+        // The monitor's side while callers run: the reports as a new snapshot.
+        if run.publish_ms > 0 {
+            scope.spawn(|| {
+                let wait = |every| ended.wait_while_for(&mut done.lock(), |done| !*done, every);
+                while wait(Duration::from_millis(run.publish_ms)).timed_out() {
+                    feed.publish(&loads);
+                    publications.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
         for caller in callers {
             caller.join().expect("a caller that ends");
         }
-        published.store(true, Ordering::Relaxed);
+        *done.lock() = true;
+        ended.notify_one();
         started.elapsed()
     });
     let total = run.decisions * run.callers as u64;
