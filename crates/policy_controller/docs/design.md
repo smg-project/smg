@@ -509,7 +509,6 @@ pub struct PoolMembers {
     alone: OnceLock<(Box<str>, Option<AloneProfile>)>, // the profile one pick can decide (5.6)
     ring: OnceLock<PoolRing>,        // the list's hash ring, built off the request path
     affinity: PoolAffinity,          // this list's lookup table for cache affinity
-    part: bool,                      // the list was narrowed for one request (planned to go: 5.8)
 }
 ```
 
@@ -603,12 +602,15 @@ pub struct Constraints<'a> {
     pub stalled: &'a [u32],       // positions the host itself holds back
     pub held: &'a [u32],          // those of `stalled` that no rule may lift
     pub pins: Option<&'a dyn PinSource>, // session pins kept outside the engine (the old engine)
+    pub places: Option<&'a [u32]>, // the places of the list the request may take; `None`: every place
 }
 ```
 
 What is not built in the engine that stays: a request that states a subset hint, a demand, or
 protocols that not every worker of its list serves is refused, and the refusal names the input.
 A pair's encode items are always refused. Those inputs are honoured by the old engine only.
+A request that states places of its list (`Constraints::places`) is refused too, and the refusal
+names `places`, until the engine over worker lists honours them (5.8).
 
 ### 5.5 The decision **[built]**
 
@@ -733,8 +735,8 @@ deleting the old engine breaks the kept one.
 ### 5.8 What changes in the kept engine **[planned]**
 
 - It honours what it refuses today: a request held to some workers of its list states their
-  positions (`Constraints` gains them), in place of a list made for one request
-  (`PoolMembers::part` goes); demands; a pair's encode items.
+  positions (`Constraints::places`, which is built), in place of a list made for one request
+  (`PoolMembers::part`, which is removed); demands; a pair's encode items.
 - Six request fields that only the old engine's host fills leave with it (`pinned_at`,
   `lent_in_flight`, `lent_session_in_flight`, `session_counted`, `model_fingerprint`,
   `signal_cells`), and `Constraints::pins`. One of them needs a successor: a sessions rule with
