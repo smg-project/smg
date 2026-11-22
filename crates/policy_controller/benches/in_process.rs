@@ -47,7 +47,7 @@ use std::{
     hint::black_box,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Barrier,
+        Arc, Barrier, OnceLock,
     },
     thread,
     time::Instant,
@@ -55,10 +55,10 @@ use std::{
 
 use counting_alloc::{calls, Counting};
 use smg_policy_controller::{
-    document::{AppliedSpec, PolicySpec},
+    document::{AppliedSpec, Assignment, PolicySpec},
     engine::{
-        Constraints, Decided, Phase, Plain, PolicyEngine, PoolMembers, Request, RequestFacts,
-        RequestMaker, WorkerLists,
+        Constraints, Decided, DecisionEngine, HashSeeds, Identity, Phase, Plain, PolicyEngine,
+        PoolMembers, PromptHashes, Request, RequestFacts, RequestMaker, WorkerLists,
     },
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Side, TransportClass},
@@ -78,20 +78,83 @@ const MODEL: &str = "bench-model";
 /// Decisions a caller makes untimed first: the buffers a thread keeps.
 const CALLER_WARM: u64 = 256;
 
-/// A cell: its name, the preset its document is, and the request of one
-/// turn of its callers, by the turn's seed. The request is plain for every
-/// seed or for none: the bench asks it once a cell.
-type Cell = (&'static str, &'static str, fn(u64) -> Request<'static>);
+/// A cell: its name, its document, the request of one turn of its callers
+/// by the turn's seed, and what the cell makes once behind its engine. The
+/// request is plain for every seed or for none: the bench asks it once a
+/// cell.
+type Cell = (
+    &'static str,
+    fn() -> PolicySpec,
+    fn(u64) -> Request<'static>,
+    fn(&PolicyEngine),
+);
 
 /// The cells. A change that moves a policy's cost adds its entry here.
-const CELLS: [Cell; 6] = [
-    ("round_robin", "round_robin", plain),
-    ("random", "random", plain),
-    ("passthrough", "passthrough", plain),
-    ("power_of_two", "power_of_two", plain),
-    ("least_load", "least_load", plain),
-    ("bucket", "bucket", plain),
+const CELLS: [Cell; 9] = [
+    ("round_robin", || preset("round_robin"), plain, |_| ()),
+    ("random", || preset("random"), plain, |_| ()),
+    ("passthrough", || preset("passthrough"), plain, |_| ()),
+    ("power_of_two", || preset("power_of_two"), plain, |_| ()),
+    ("least_load", || preset("least_load"), plain, |_| ()),
+    ("bucket", || preset("bucket"), plain, |_| ()),
+    (
+        "round_robin_sessions",
+        || sessions_over("round_robin"),
+        plain,
+        |_| (),
+    ),
+    (
+        "round_robin_sessions_keyed",
+        || sessions_over("round_robin"),
+        session,
+        sessions,
+    ),
+    ("manual", || preset("manual"), plain, |_| ()),
 ];
+
+/// A built-in preset as a cell's document.
+fn preset(name: &str) -> PolicySpec {
+    PolicySpec::preset(name).expect("a preset's name")
+}
+
+/// The profile of the preset `name` under the stock sessions rule, a new
+/// session placed by the profile's own stages.
+fn sessions_over(name: &str) -> PolicySpec {
+    let mut document = preset("manual");
+    document.profiles = preset(name).profiles;
+    let binding = &mut document.bindings[0];
+    binding.profile = Some(name.into());
+    let rule = binding.sessions.as_mut().expect("the stock rule");
+    rule.assignment = Assignment::Delegate;
+    document
+}
+
+/// The sessions of a cell under a sessions rule: each one's routing key and
+/// the hashes of its prompt.
+static SESSIONS: OnceLock<Vec<(String, PromptHashes)>> = OnceLock::new();
+
+/// Makes the cell's 4,096 sessions, each with a prompt of 1,024 tokens of
+/// its own, hashed as `engine`'s document reads a prompt.
+fn sessions(engine: &PolicyEngine) {
+    let one = |at: u32| {
+        let tokens: Vec<u32> = (at * 100_000..at * 100_000 + 1_024).collect();
+        let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+        (format!("session-{at:04}"), hashes)
+    };
+    SESSIONS.get_or_init(|| (0..4_096).map(one).collect());
+}
+
+/// A request of one of the cell's sessions: its routing key in the clear,
+/// which a host counts on each worker, and its prompt's hashes.
+fn session(seed: u64) -> Request<'static> {
+    let sessions = SESSIONS.get().expect("the cell's sessions");
+    let (key, prompt) = &sessions[(seed % sessions.len() as u64) as usize];
+    let mut request = plain(seed);
+    request.facts.session_key = Identity::plain(key);
+    request.facts.session_counted = true;
+    prompt.write_to(&mut request.facts);
+    request
+}
 
 /// A plain single request of 1,024 prompt tokens: it asks only a worker.
 fn plain(seed: u64) -> Request<'static> {
@@ -253,15 +316,16 @@ impl Host {
 
 fn main() {
     let run = run();
-    let (name, preset, request) = run.cell;
+    let (name, document, request, behind) = run.cell;
     let workers: Arc<[Arc<dyn Worker>]> = (0..run.workers)
         .map(|at| ready_worker(&format!("http://worker-{at:04}:8000"), MODEL))
         .collect();
     for worker in workers.iter().filter(|_| run.overloaded) {
         worker.set_overloaded(true);
     }
-    let document = PolicySpec::preset(preset).expect("a preset's name");
-    let engine = PolicyEngine::new(AppliedSpec::validate(&document).expect("a valid preset"));
+    let document = document();
+    let engine = PolicyEngine::new(AppliedSpec::validate(&document).expect("a valid document"));
+    behind(&engine);
     let members = engine.pool_members(&workers);
     let mut receiver = None;
     let feed = TestFeed::attached_to(|loads| receiver = loads);

@@ -9,6 +9,10 @@
 //! picker's turns land, and it reads no fact of a request: the engine asks
 //! it before the request is made, so such a request is never made.
 //!
+//! Under a sessions rule the pick waits behind the making ([`alone_made`]).
+//! The rule pins a keyed request ahead of the profile, and the request made
+//! says whether it states a key: one that states none takes the pick there.
+//!
 //! **A key's rows, between** ([`keys::decide`]). A request that is made,
 //! under a sessions rule or a ring, is decided by the rows its key names:
 //! its key's pin, which is one worker's record, or its key's owner on the
@@ -41,10 +45,11 @@ use super::{keys, overlap, PolicyEngine, PoolMembers};
 use crate::{
     engine::{
         decision::{Decision, Shed, ShedReason, Trace, SUBSET_HINT, WIRES},
-        decision_engine::{AlonePick, DecideOutcome, Leased, Plain, Request},
+        decision_engine::{AlonePick, DecideOutcome, Leased, Plain, Request, RequestMaker},
+        framework::AloneProfile,
         records,
         sticky_sessions::SessionVerdict,
-        view::{Phase, Session},
+        view::{Phase, Session, WorkerId},
     },
     stages::Lifecycle,
     store::leases::DISPATCH_TTL,
@@ -65,10 +70,23 @@ pub(super) const PLACES: &str = "places";
 /// The crate's word, in a shed's `emptied_by`, for a pool no stage emptied.
 const NO_STAGE: &str = "none";
 
+/// The short path's answer ahead of a request's making ([`alone`]).
+pub(super) enum Ahead {
+    /// The place of the worker picked, and the profile whose picker picked
+    /// it.
+    Picked(AlonePick),
+    /// One pick of this profile's picker decides the place, and the place's
+    /// binding states a sessions rule: the pick waits for the request made
+    /// ([`alone_made`]).
+    Ruled(AloneProfile),
+    /// The request takes the whole pass ([`decide`]).
+    Whole,
+}
+
 /// The short path: the place in `members`, the list its host handed, of
 /// the worker picked for a plain single request of `model`, and the profile
-/// whose picker picked it ([`AlonePick`]). `None` where the request takes
-/// the whole pass ([`decide`]): it is no single request, its place is not
+/// whose picker picked it ([`Ahead::Picked`]). The request takes the whole
+/// pass ([`decide`]) where it is no single request, its place is not
 /// decided by one pick of a picker, a worker of the list is not dialed on a
 /// wire it states, or the picker's turns land on no eligible worker.
 ///
@@ -76,26 +94,78 @@ const NO_STAGE: &str = "none";
 /// made ahead of it, and nothing a host is handed of a pick is built here.
 /// Under a document that takes no word on a lease the place is the whole
 /// answer. Under any other the pick is noted ([`noted`]).
-pub(super) fn alone(
-    own: &PolicyEngine,
-    model: &str,
-    plain: Plain,
-    members: &PoolMembers,
-) -> Option<AlonePick> {
+///
+/// Under a sessions rule nothing is picked here ([`Ahead::Ruled`]). The
+/// rule pins a keyed request ahead of the profile, and only the request
+/// made says whether it states a key.
+pub(super) fn alone(own: &PolicyEngine, model: &str, plain: Plain, members: &PoolMembers) -> Ahead {
     if plain.phase != Phase::Single {
-        return None;
+        return Ahead::Whole;
     }
     // The whole pass declines such a list by name.
     if !plain.wires.is_empty() && !plain.wires.contains(members.wires()) {
-        return None;
+        return Ahead::Whole;
     }
-    let profile = members.alone(&own.spec, model)?;
+    let Some(place) = members.alone(&own.spec, model) else {
+        return Ahead::Whole;
+    };
+    if place.ruled {
+        return Ahead::Ruled(place.profile);
+    }
+    picked(own, place.profile, members).map_or(Ahead::Whole, Ahead::Picked)
+}
+
+/// The place in `members` of the worker picked under `profile`, and the
+/// profile ([`AlonePick`]). `None` where the picker's turns land on no
+/// eligible worker.
+fn picked(own: &PolicyEngine, profile: AloneProfile, members: &PoolMembers) -> Option<AlonePick> {
     let position = own.pick(profile, members, |state: RoutingState| state.eligible())?;
     Some(AlonePick {
         place: u32::try_from(position).ok()?,
         profile: profile.0,
         generation: own.spec.generation(),
     })
+}
+
+/// The short path for a request that is made and states no key, at a place
+/// whose binding's sessions rule kept it from the pick in front
+/// ([`Ahead::Ruled`]): the decision that names the worker picked under
+/// `profile`, alone. The rule reads a request's key and nothing else, so a
+/// plain request that states none is its place's. `None` where the request
+/// is not plain by its own word, or the picker's turns land on no eligible
+/// worker: it takes the whole pass ([`decide`]).
+///
+/// The decision's instant is written into the request's facts, as the
+/// whole pass writes it: the request's lease is issued from them, as every
+/// made request's is ([`issued`]).
+pub(super) fn alone_made(
+    own: &PolicyEngine,
+    request: &mut Request<'_>,
+    profile: AloneProfile,
+    members: &PoolMembers,
+    now: Instant,
+) -> Option<Decision> {
+    request.plain()?;
+    let (_, decision) = named(own, picked(own, profile, members)?, members)?;
+    request.facts.now_micros = own.clock.micros(now);
+    Some(decision)
+}
+
+/// The short path's pick as the decision that names the worker at the
+/// place picked, alone ([`AlonePick::decision`]), with that worker's id.
+/// `None` where the list holds no worker at the place.
+fn named(
+    own: &PolicyEngine,
+    pick: AlonePick,
+    members: &PoolMembers,
+) -> Option<(WorkerId, Decision)> {
+    let position = pick.place as usize;
+    let worker = members.workers().get(position)?;
+    // The list's records name each worker once a list: a pick reads the id
+    // there and hashes no address.
+    let id = *members.records(&own.spec, &own.clock).ids().get(position)?;
+    let dp_rank = records::worker_rank(worker.as_ref());
+    Some((id, pick.decision(id, dp_rank)))
 }
 
 /// The short path's pick under a document that takes a word on a lease,
@@ -112,12 +182,7 @@ pub(super) fn noted(
     plain: Plain,
     now: Instant,
 ) -> Option<DecideOutcome> {
-    let position = pick.place as usize;
-    let worker = members.workers().get(position)?;
-    // The list's records name each worker once a list: a pick reads the id
-    // there and hashes no address.
-    let id = *members.records(&own.spec, &own.clock).ids().get(position)?;
-    let dp_rank = records::worker_rank(worker.as_ref());
+    let (id, decision) = named(own, pick, members)?;
     let lease = Lease {
         id: LeaseId(own.leases.0.fetch_add(1, Ordering::Relaxed) + 1),
         kind: LeaseKind::Credit,
@@ -131,7 +196,7 @@ pub(super) fn noted(
         tokens: plain.prompt_tokens,
     };
     let decided = DecideOutcome {
-        decision: pick.decision(id, dp_rank),
+        decision,
         lease: Some(Leased {
             lease,
             due: now + DISPATCH_TTL,
@@ -344,13 +409,15 @@ mod tests {
         }
     }
 
-    /// A request stated ahead, with the list its host hands for it, and how
-    /// many times the engine made it.
+    /// A request stated ahead, with the list its host hands for it, how
+    /// many times the engine made it, and how many times it asked for the
+    /// load snapshot: once a whole pass over the list.
     struct Asks<'a> {
         request: Request<'a>,
         members: Option<&'a PoolMembers>,
         loads: Option<Arc<LoadSnapshot>>,
         made: Cell<u32>,
+        lent: Cell<u32>,
     }
 
     impl<'a> Asks<'a> {
@@ -360,6 +427,7 @@ mod tests {
                 members,
                 loads: None,
                 made: Cell::new(0),
+                lent: Cell::new(0),
             }
         }
     }
@@ -383,6 +451,7 @@ mod tests {
         }
 
         fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
+            self.lent.set(self.lent.get() + 1);
             self.loads.as_ref()
         }
     }
@@ -700,6 +769,111 @@ mod tests {
             Decision::Shed(shed) => assert_eq!(shed.emptied_by, "not-overloaded"),
             Decision::Queue(_) => panic!("no queue is planned"),
         }
+    }
+
+    /// Round robin's preset with the `manual` preset's sessions rule on its
+    /// binding and that rule's header in its view: a document that keeps a
+    /// request's routing key on its worker over round robin.
+    fn round_robin_under_a_rule() -> PolicyEngine {
+        let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+        let manual = PolicySpec::preset("manual").expect("a built-in preset");
+        document.view.headers.clone_from(&manual.view.headers);
+        let rule = &manual.bindings[0].sessions;
+        document.bindings[0].sessions.clone_from(rule);
+        document.generation = 1;
+        PolicyEngine::new(AppliedSpec::validate(&document).expect("the document validates"))
+    }
+
+    /// Under a sessions rule a request is made, since the rule reads its
+    /// key. One that then states no key is decided by its place's one pick,
+    /// as the place's requests are under no rule: the list's own rotation
+    /// takes one turn, one worker is named, and the whole pass is not
+    /// entered, so the load snapshot is not asked for and no worker's
+    /// record is written. The gateway's classic override hands a request
+    /// with no key to its policy's own selection
+    /// (`model_gateway/src/policies/registry.rs:610` at main `882be6f4f`).
+    /// A request that states a key is the rule's, and takes no turn of the
+    /// list.
+    #[test]
+    fn a_request_with_no_key_under_a_sessions_rule_is_one_pick_behind_its_making() {
+        let engine = round_robin_under_a_rule();
+        for workers in [8_usize, 64] {
+            let list = pool(workers);
+            let members = engine.pool_members(&list);
+            let turns = || members.rotation.0.load(Ordering::Relaxed);
+            let asks = Asks::of(request(), Some(&members));
+            let first = turns();
+            for turn in 0..workers as u64 * 2 {
+                let decided = decided(&engine, &asks);
+                let pick = decided.decision.pick().expect("a pick");
+                assert_eq!(pick.targets.len(), 1, "one worker named");
+                assert!(pick.trace.drew_first(), "no pass over the list ran");
+                let target = pick.targets.first().expect("the target");
+                let landed = (first + turn) as usize % workers;
+                assert_eq!(target.position as usize, landed, "the list's turn");
+                assert_eq!(turns(), first + turn + 1, "one turn a request");
+            }
+            assert_eq!(asks.made.get(), workers as u32 * 2, "made once each");
+            assert_eq!(asks.lent.get(), 0, "the whole pass was not entered");
+            let mut keyed = request();
+            keyed.facts.session_key = Identity::plain("a-key");
+            let keyed = Asks::of(keyed, Some(&members));
+            let word = turns();
+            assert!(decided(&engine, &keyed).decision.pick().is_some());
+            assert_eq!((turns(), keyed.lent.get()), (word, 1));
+        }
+    }
+
+    /// What the one pick does not decide under the rule takes the whole
+    /// pass, as it does under no rule. A second attempt is not plain: the
+    /// pass steps past the worker tried and names alternates. A list whose
+    /// every worker is overloaded is answered by the binding's own rule.
+    /// The lease of the one pick states what the pass's lease states of
+    /// such a request: no session, no verdict, the request's size and the
+    /// decision's instant on the engine's clock.
+    #[test]
+    fn what_one_pick_does_not_decide_under_a_sessions_rule_takes_the_whole_pass() {
+        let engine = round_robin_under_a_rule();
+        let list = pool(8);
+        let members = engine.pool_members(&list);
+        let now = Instant::now();
+        let leased = |asks: &Asks<'_>| {
+            let decided = engine.decide_under(GatewayId::LOCAL, asks, now);
+            let decided = decided.expect("an answer").whole().expect("whole").0;
+            let lease = decided.lease.expect("a lease").lease;
+            let states = (lease.session, lease.session_verdict, lease.tokens);
+            (decided.decision, lease.booked, states, lease.issued_micros)
+        };
+        let mut sized = request();
+        sized.facts.prompt_tokens = 321;
+        let first = Asks::of(sized, Some(&members));
+        let (_, picked, stated, dated) = leased(&first);
+        assert_eq!(stated, (Session::NONE, SessionVerdict::None, 321));
+        assert_eq!(dated, engine.clock.micros(now));
+        let tried = [picked];
+        let mut retry = sized;
+        retry.facts.tried = &tried;
+        retry.facts.attempt = 1;
+        let again = Asks::of(retry, Some(&members));
+        let word = members.rotation.0.load(Ordering::Relaxed);
+        let (decision, _, restated, redated) = leased(&again);
+        let pick = decision.pick().expect("a pick");
+        assert!(pick.targets.len() > 1, "the whole pass names alternates");
+        assert!(pick.targets.iter().all(|target| target.id != tried[0]));
+        assert_eq!((first.lent.get(), again.lent.get()), (0, 1));
+        assert_eq!(members.rotation.0.load(Ordering::Relaxed), word);
+        assert_eq!((restated, redated), (stated, dated), "the same of both");
+
+        for worker in list.iter() {
+            worker.set_overloaded(true);
+        }
+        let vetoed = Asks::of(sized, Some(&members));
+        match decided(&engine, &vetoed).decision {
+            Decision::Pick(pick) => assert_eq!(pick.trace.lifted, LiftedVeto::Overload),
+            Decision::Shed(shed) => assert_eq!(shed.emptied_by, "not-overloaded"),
+            Decision::Queue(_) => panic!("no queue is planned"),
+        }
+        assert_eq!((vetoed.made.get(), vetoed.lent.get()), (1, 1));
     }
 
     /// A request that hands no list is decided over no worker. One that

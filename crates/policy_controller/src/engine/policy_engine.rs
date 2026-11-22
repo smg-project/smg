@@ -58,7 +58,10 @@ use std::{
 use rustc_hash::FxHasher;
 use smg_worker::{identity::basic::Worker, runtime::RoutingState};
 
-use self::overlap::{Affinity, PoolAffinity};
+use self::{
+    overlap::{Affinity, PoolAffinity},
+    single::Ahead,
+};
 use super::{
     decision::ShadowKind,
     decision_engine::{
@@ -134,10 +137,10 @@ pub struct PoolMembers {
     /// The wires the list's workers are dialed on ([`Self::wires`]): read
     /// of their registrations at the first whole decision over the list.
     wires: OnceLock<WireModes>,
-    /// The model of the list's first single request and the profile the
+    /// The model of the list's first single request and the place the
     /// engine picks alone for it, where the document holds one
     /// ([`Self::alone`]).
-    alone: OnceLock<(Box<str>, Option<AloneProfile>)>,
+    alone: OnceLock<(Box<str>, Option<AlonePlace>)>,
     /// The list's hash ring ([`Self::ring`]): built off the path of a
     /// request, and by no decision ([`PolicyEngine::fill_ring`]).
     ring: OnceLock<PoolRing>,
@@ -150,6 +153,17 @@ pub struct PoolMembers {
     /// ([`Self::affinity`]): read at the list's first such decision, and by
     /// no other.
     affinity: PoolAffinity,
+}
+
+/// A place one pick decides, as a list keeps it ([`PoolMembers::alone`]):
+/// the profile whose picker picks, and whether the place's binding states a
+/// sessions rule. A rule pins a keyed request ahead of the profile, so under
+/// one the pick is a request's only once the request is made and states no
+/// key.
+#[derive(Clone, Copy, Debug)]
+struct AlonePlace {
+    profile: AloneProfile,
+    ruled: bool,
 }
 
 /// A word every pick over a pool writes, on cache lines of its own: what
@@ -252,21 +266,20 @@ impl PoolMembers {
         &self.affinity
     }
 
-    /// The profile the engine picks alone for a single request of `model`
-    /// over this list ([`Place::Alone`]), under a binding that states no
+    /// The place the engine picks alone for a single request of `model`
+    /// over this list ([`Place::Alone`]), with whether its binding states a
     /// sessions rule: `None` where the place's decision asks more than one
     /// pick. Found once a list, for the model of its first request: a
     /// gateway's list is one model's. Another model's request is answered
     /// by the document at its call.
-    fn alone(&self, spec: &AppliedSpec, model: &str) -> Option<AloneProfile> {
+    fn alone(&self, spec: &AppliedSpec, model: &str) -> Option<AlonePlace> {
         let find = || {
             let engine = spec.engine();
             let Place::Alone(profile) = engine.place_for(model, Phase::Single) else {
                 return None;
             };
-            // A sessions rule pins a keyed request ahead of the profile.
             let ruled = engine.binding(model, Phase::Single)?.sessions.is_some();
-            (!ruled).then_some(profile)
+            Some(AlonePlace { profile, ruled })
         };
         // A part is one ask's: its answer is kept nowhere, so nothing is
         // allocated for it.
@@ -548,14 +561,21 @@ impl PolicyEngine {
         // A plain request of a place one pick decides is decided ahead
         // of its making: the pick reads no fact of it.
         let mut picked = None;
+        // Under a sessions rule the place's pick waits for the request
+        // made, which says whether it states a key.
+        let mut ruled = None;
         if let (Some(plain), WorkerLists::Single(members)) = (maker.plain(), maker.workers()) {
-            if let Some(pick) = single::alone(self, maker.model(), plain, members) {
-                // No stage takes a word of the request: the place is
-                // the whole answer.
-                if !self.hears.intersects(EventSet::LEASE) {
-                    return Ok(Some(pick));
+            match single::alone(self, maker.model(), plain, members) {
+                Ahead::Picked(pick) => {
+                    // No stage takes a word of the request: the place is
+                    // the whole answer.
+                    if !self.hears.intersects(EventSet::LEASE) {
+                        return Ok(Some(pick));
+                    }
+                    picked = Some((pick, members, plain));
                 }
-                picked = Some((pick, members, plain));
+                Ahead::Ruled(profile) => ruled = Some(profile),
+                Ahead::Whole => {}
             }
         }
         let now = clock();
@@ -568,9 +588,12 @@ impl PolicyEngine {
         let mut request = maker.make(&self.spec);
         let later = request.constraints.decode_later;
         let decided = match (request.facts.phase, maker.workers()) {
-            (Phase::Single, WorkerLists::Single(members)) => {
-                single::decide(self, &mut request, members, maker.loads(), now)
-            }
+            // The rule reads a key and nothing else of a request: one that
+            // states none takes the pick the rule kept from it in front.
+            (Phase::Single, WorkerLists::Single(members)) => ruled
+                .filter(|_| request.facts.session_key.is_none())
+                .and_then(|profile| single::alone_made(self, &mut request, profile, members, now))
+                .unwrap_or_else(|| single::decide(self, &mut request, members, maker.loads(), now)),
             // A pair is decided at its prefill, over its host's two
             // lists.
             (Phase::Prefill, WorkerLists::Pair(lists)) => {
