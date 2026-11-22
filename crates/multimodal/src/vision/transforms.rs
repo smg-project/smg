@@ -3061,6 +3061,90 @@ pub(crate) fn resize_bicubic_torch_aa_cropped(
     )
 }
 
+/// [`expand_to_square`] of an RGB image followed by [`resize_bicubic_torch_aa`]
+/// to `out` x `out`, with the square never built. The width pass reads a row
+/// alone, so the padding above and below a wide image is one resampled row of
+/// `background` repeated, and a tall image's rows are padded a band at a
+/// time; the height pass then reads the rows the square's width pass gives:
+/// the same bytes. `None` where the square is the road: an image that is
+/// square, empty or already `out` on its longer side, and every target but x86-64,
+/// whose torch rows resample the whole ([`resize_torch_uint8_rgb`]).
+pub(crate) fn resize_bicubic_torch_aa_squared(
+    rgb: &RgbImage,
+    background: Rgb<u8>,
+    out: u32,
+) -> Option<RgbImage> {
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+    let (side, size) = (w.max(h), out as usize);
+    if !cfg!(target_arch = "x86_64") || w == h || side == size || size == 0 || w.min(h) == 0 {
+        return None;
+    }
+    // Both axes go from `side` to `out`: one kernel serves the two passes.
+    let kernel = &FixedKernel::new(
+        side,
+        size,
+        PilResizeFilter::Bicubic,
+        KernelQuantization::TorchUint8,
+    );
+    let pass = &WidthPass::new::<3>(kernel);
+    let data = &rgb.as_raw()[..w * h * 3];
+    let row = size * 3;
+    let mut rows = plain_buffer(side * row);
+    let (above, rest) = rows.split_at_mut((side - h) / 2 * row);
+    let (image, below) = rest.split_at_mut(h * row);
+    // The width pass of the image's rows from `start` on, as many as `dst`
+    // holds.
+    let width_rows = |start: usize, dst: &mut [u8], scratch: &mut BandScratch| {
+        if w > h {
+            return pass.rows::<3>(data, kernel, w, size, start, dst, scratch);
+        }
+        // The square's rows a band at a time: the padding of a row stays,
+        // the image's part of it is copied in.
+        let band_rows = (PIL_BAND_BYTES / (side * 3)).clamp(1, dst.len() / row);
+        let left = (side - w) / 2 * 3;
+        let mut band = background.0.repeat(side * band_rows);
+        for (src, dst) in data[start * w * 3..][..dst.len() / row * w * 3]
+            .chunks(band_rows * w * 3)
+            .zip(dst.chunks_mut(band_rows * row))
+        {
+            for (padded, line) in band.chunks_exact_mut(side * 3).zip(src.chunks_exact(w * 3)) {
+                padded[left..left + w * 3].copy_from_slice(line);
+            }
+            pass.rows::<3>(&band, kernel, side, size, 0, dst, scratch);
+        }
+    };
+    // A row of the width pass reads its own source row alone, so the rows are
+    // banded across the pool on an output the square's resize bands too.
+    let tasks = par_threads(size * row, h.min(size));
+    let scratch = &mut BandScratch::default();
+    if tasks <= 1 {
+        width_rows(0, image, scratch);
+    } else {
+        let task_rows = h.div_ceil(tasks);
+        parallel_scope(|scope| {
+            for (index, band) in image.chunks_mut(task_rows * row).enumerate() {
+                let width_rows = &width_rows;
+                scope.spawn(move |_| {
+                    width_rows(index * task_rows, band, &mut BandScratch::default());
+                });
+            }
+        });
+    }
+    if w > h {
+        let mut pad = plain_buffer(row);
+        let color = background.0.repeat(side);
+        pass.rows::<3>(&color, kernel, side, size, 0, &mut pad, scratch);
+        for line in above
+            .chunks_exact_mut(row)
+            .chain(below.chunks_exact_mut(row))
+        {
+            line.copy_from_slice(&pad);
+        }
+    }
+    let resized = pil_resample_vertical::<3>(&rows, size, size, kernel);
+    RgbImage::from_raw(out, out, resized)
+}
+
 /// Keys' cubic (`a = -0.5`) as torch's compiled CPU kernel evaluates it in
 /// `f32`: `((a + 2) x - (a + 3)) x x + 1` below one and
 /// `((a x - 5a) x + 8a) x - 4a` below two, with the fused multiply-adds its
@@ -4776,6 +4860,32 @@ mod tests {
                 crop_rgb(&whole, x, y, w, h).as_raw(),
                 &format!("{in_w}x{in_h} -> {out_w}x{out_h}, crop {w}x{h} at {x},{y}"),
             );
+        }
+    }
+
+    /// The squared entry point equals the square followed by the resize, at a
+    /// target the pool bands: a wide image, a tall one of several bands whose
+    /// last is short, and a tall one of a single band. Off x86-64 it leaves
+    /// the square to its caller.
+    #[test]
+    fn the_squared_torch_resize_equals_the_square_and_the_resize() {
+        let background = Rgb([122, 116, 104]);
+        for (seed, &(w, h)) in [(1920, 1079), (1079, 1920), (22, 47)].iter().enumerate() {
+            let data = gradient_rgb(w as usize, h as usize, seed * 11 + 5);
+            let rgb = RgbImage::from_raw(w, h, data).unwrap();
+            let squared = resize_bicubic_torch_aa_squared(&rgb, background, 672);
+            if cfg!(target_arch = "x86_64") {
+                let square = expand_to_square(&DynamicImage::ImageRgb8(rgb), background);
+                assert_same_bytes(
+                    squared.unwrap().as_raw(),
+                    resize_bicubic_torch_aa(&square, 672, 672)
+                        .into_rgb8()
+                        .as_raw(),
+                    &format!("{w}x{h} -> 672x672"),
+                );
+            } else {
+                assert!(squared.is_none(), "{w}x{h}");
+            }
         }
     }
 
