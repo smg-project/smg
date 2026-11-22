@@ -34,7 +34,7 @@
 //! | `signals`, `reachable_from` | not carried: the object has no field for them, and a collector reads them of the row by the id the holder keeps. A host that is no gateway has the object of a row one gateway alone reaches built with its checks off ([`Objects::with_host_local_unchecked`]) |
 //! | `zone`, `encode`, `vision`, `max_running`, `priority`, `demand_facts` | not carried: a decision's facts, read of the store's rows and never of an object |
 //! | `pairing` | not carried to the object: a decision's fact, read of the store's rows. The object derives its own at its build, and the store's door states that one in the row. [`facts()`] keeps the standing row's, and so does the controller's door, whose log carries none |
-//! | `overload` | not carried to the object: a decision's fact, read of the store's rows. [`facts()`] states the thresholds of the object's own registration over the standing row's. A replacement by id states them whole: one it leaves out is cleared ([`Over::Replaced`]) |
+//! | `overload` | not carried to the object, where the store judges overload: a decision's fact, read of the store's rows. Under a host whose own load monitor judges it ([`Objects::with_overload_thresholds`]), the object's thresholds: the row's own, each over the host's default for its signal, the usage as a ratio. [`facts()`] states the thresholds of the object's own registration over the standing row's. A replacement by id states them whole: one it leaves out is cleared ([`Over::Replaced`]) |
 //!
 //! A new object starts at its row's status. A replacement takes the
 //! standing object's running state, including its status. A host that gets

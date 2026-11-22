@@ -1,7 +1,8 @@
 //! The holder of a replica's worker objects: it follows the store's
 //! membership and writes the registry. A host can also ask it to follow
-//! the rows' status, and to write the store's overload verdicts on the
-//! objects.
+//! the rows' status, to write the store's overload verdicts on the
+//! objects, or to build each object with the thresholds its own load
+//! monitor judges overload by.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -28,7 +29,7 @@ use super::{
     credentials::Credentials,
     found::facts,
     membership_writer::{MembershipWriteOutcome, MembershipWriteRefused},
-    object::{builder, dial_address, status, unchecked},
+    object::{builder, dial_address, status, thresholds, unchecked},
 };
 use crate::{
     engine::view::{LoadRow, WorkerId},
@@ -248,6 +249,10 @@ pub struct Objects<G> {
     host_local_unchecked: bool,
     /// Whether the host's registrations hand in the objects they built.
     built_kept: bool,
+    /// The overload thresholds an object built from a row states for each
+    /// signal its row names none for, where the host asked for objects with
+    /// thresholds ([`Self::with_overload_thresholds`]).
+    overload_defaults: Option<OverloadThresholds>,
     /// The objects on offer through one registration's write, one a row.
     /// Empty outside one.
     offered: Mutex<Vec<Arc<dyn Worker>>>,
@@ -317,6 +322,26 @@ impl<G> Objects<G> {
         self.credentials = None;
         self
     }
+
+    /// Build each object from a row with overload thresholds: the row's
+    /// own, and `defaults` for each signal the row names none for. A row
+    /// whose thresholds change is laid again, so its object states the new
+    /// ones.
+    ///
+    /// For a host whose own load monitor judges overload: the worker
+    /// crate's monitor writes its verdict on an object by the thresholds
+    /// the object states, at each load report of its worker.
+    ///
+    /// Without it an object built from a row states no threshold, and a
+    /// load monitor writes no verdict on it: the store's verdict is the one
+    /// such a host mirrors ([`Self::mirror_overload`]). An object has one
+    /// judge, so a holder that builds its objects with thresholds mirrors
+    /// nothing.
+    #[must_use]
+    pub fn with_overload_thresholds(mut self, defaults: OverloadThresholds) -> Self {
+        self.overload_defaults = Some(defaults);
+        self
+    }
 }
 
 impl<G: Generation> Objects<G> {
@@ -331,6 +356,7 @@ impl<G: Generation> Objects<G> {
             forgotten_at: AtomicU64::new(0),
             host_local_unchecked: false,
             built_kept: false,
+            overload_defaults: None,
             offered: Mutex::new(Vec::new()),
             handing: Mutex::new(()),
             unhanded: AtomicU64::new(0),
@@ -571,7 +597,14 @@ impl<G: Generation> Objects<G> {
     /// its row names for itself. They need not explain the verdict. The
     /// store judges an engine's ranks together, and under the pool's
     /// thresholds where the row names none.
+    ///
+    /// A holder that builds its objects with thresholds
+    /// ([`Self::with_overload_thresholds`]) writes none: its host's load
+    /// monitor judges those objects, and a flag has one writer.
     pub fn mirror_overload(&self, store: &MemoryStore) -> usize {
+        if self.overload_defaults.is_some() {
+            return 0;
+        }
         let mut mirrored = self.mirrored.lock();
         // The objects whose flag is not their rows' verdict, each with the
         // verdict and what its edge's line states.
@@ -1051,11 +1084,18 @@ impl<G: Generation> Objects<G> {
         // A row one gateway alone reaches is built unchecked where the
         // host asked for it: nothing here can dial its worker.
         let reached = !self.host_local_unchecked || row.facts.reachable_from == Reachability::Any;
-        let worker = if reached {
+        let mut worker = if reached {
             builder(row)
         } else {
             unchecked(row)
         };
+        // The thresholds the host's own monitor judges the object by: the
+        // row's own, each over the host's default for its signal.
+        if let Some(defaults) = self.overload_defaults {
+            worker = worker
+                .overload(thresholds(&row.facts.overload))
+                .overload_defaults(defaults);
+        }
         // The registry's signal sender: the object says its connect signal
         // and each move of its liveness veto to the collector's loop.
         let mut worker = worker.connect_signal_tx(self.registry.connect_signal_sender());
@@ -1141,14 +1181,8 @@ fn reading(load: Option<LoadRow>, own: Overload) -> OverloadReading {
     OverloadReading {
         waiting_requests: load.map_or(0, |load| i64::from(load.queued)),
         kv_pressure: load.map_or(0.0, |load| f64::from(load.active_kv_permille) / 1_000.0),
-        thresholds: OverloadThresholds {
-            waiting_requests: own
-                .waiting_requests
-                .map(|count| usize::try_from(count).unwrap_or(usize::MAX)),
-            token_usage: own
-                .kv_usage_permille
-                .map(|permille| f64::from(permille) / 1_000.0),
-        },
+        // The row's own, with no default under them.
+        thresholds: OverloadThresholds::resolve(&thresholds(&own), OverloadThresholds::default()),
     }
 }
 
@@ -2093,6 +2127,60 @@ mod tests {
             replica.store.upsert(facts(A, 1));
             replica.follow();
             assert!(checked(&replica, A), "the row once any gateway dials it");
+        }
+    }
+
+    /// A host whose own load monitor judges overload asks for each object
+    /// built with its row's thresholds, each over the host's default for
+    /// its signal. A row whose thresholds move is laid again, and its
+    /// object states the new ones. A holder that was not asked builds an
+    /// object that states none, so its host's monitor writes no verdict.
+    #[test]
+    fn an_object_states_its_rows_thresholds_where_the_host_judges_overload() {
+        let defaults = OverloadThresholds {
+            waiting_requests: Some(8),
+            token_usage: Some(0.8),
+        };
+        let none = OverloadThresholds::default();
+        let stated = |replica: &Replica, url| replica.at(url).metadata().overload;
+        let mut judging = Replica::new();
+        let registry = Arc::clone(judging.objects.registry());
+        judging.objects = Objects::new(registry).with_overload_thresholds(defaults);
+        for (replica, asked) in [(Replica::new(), false), (judging, true)] {
+            replica.store.upsert(facts(A, 1));
+            replica.store.upsert(WorkerFacts {
+                overload: Overload {
+                    kv_usage_permille: Some(650),
+                    waiting_requests: None,
+                },
+                ..facts(B, 1)
+            });
+            replica.follow();
+            let own = OverloadThresholds {
+                waiting_requests: Some(8),
+                token_usage: Some(0.65),
+            };
+            assert_eq!(stated(&replica, A), if asked { defaults } else { none });
+            assert_eq!(stated(&replica, B), if asked { own } else { none });
+
+            // The row's thresholds move: its object is laid again.
+            let moved = Overload {
+                kv_usage_permille: None,
+                waiting_requests: Some(3),
+            };
+            replica.patch(
+                B,
+                WorkerPatch {
+                    overload: Some(moved),
+                    ..WorkerPatch::default()
+                },
+            );
+            replica.follow();
+            let own = OverloadThresholds {
+                waiting_requests: Some(3),
+                token_usage: Some(0.8),
+            };
+            assert_eq!(stated(&replica, B), if asked { own } else { none });
         }
     }
 
@@ -3605,6 +3693,25 @@ mod tests {
         assert_eq!(replica.mirror(), 1);
         assert!(!worker.is_overloaded());
         assert_eq!(replica.counted(), 0);
+    }
+
+    /// A holder that builds its objects with thresholds mirrors nothing:
+    /// its host's load monitor judges them, and the store's verdict is not
+    /// written beside the monitor's.
+    #[test]
+    fn a_holder_whose_objects_state_thresholds_mirrors_no_verdict() {
+        let mut replica = judging();
+        let registry = Arc::clone(replica.objects.registry());
+        replica.objects =
+            Objects::new(registry).with_overload_thresholds(OverloadThresholds::default());
+        let row = replica.stand(bounded(A));
+        replica.push(row, 3);
+        let over = replica
+            .store
+            .with_snapshot(|world| world.overloaded().count());
+        assert_eq!(over, 1, "the store judges the row over its own count");
+        assert_eq!(replica.mirror(), 0);
+        assert!(!replica.at(A).is_overloaded());
     }
 
     #[test]
