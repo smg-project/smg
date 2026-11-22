@@ -919,9 +919,13 @@ impl Format {
     /// answer (the response tags, the message close) frame the answer, not the thought, and stay
     /// dropped on every row they move: the think tags the model wrote stay and the answer comes
     /// back bare, and a thought that the response tag itself ends runs straight into the answer.
-    /// A state's own text rows stay with it: a trimmed stay is still trimmed, a framing state's
-    /// text still dropped; and a tag the end cut short is still dropped, as the legacy parsers
-    /// drop it on both their paths.
+    /// A marker whose every row stays in a content state (Command's response tags) frames the
+    /// answer inside that state and is not shown here: it stays dropped, or stays shown where
+    /// [`Self::without_calls`] showed it (a call's marker on a row inside its own region). A
+    /// marker that also moves the engine (a template's one close for its answer and its thought)
+    /// is shown as before. A state's own text rows stay with it: a trimmed stay is still
+    /// trimmed, a framing state's text still dropped; and a tag the end cut short is still
+    /// dropped, as the legacy parsers drop it on both their paths.
     /// A table without a thought changes only in what it shows; the thought-first mark and the
     /// layout, which serve the tags alone, go. A marker with no row out of the thought's state is
     /// its text and counts no malformed run, as in the table (`Self::is_remade`), so an output
@@ -939,7 +943,15 @@ impl Format {
             .iter()
             .filter(|row| {
                 let answer = |state: usize| self.emits(state) == Emits::Content;
-                wrapped && ((row.from == 0 && answer(row.to)) || (row.to == 0 && answer(row.from)))
+                let stays = |on: usize| {
+                    self.transitions
+                        .iter()
+                        .filter(|other| other.on == on)
+                        .all(|other| other.from == other.to && answer(other.to))
+                };
+                (wrapped
+                    && ((row.from == 0 && answer(row.to)) || (row.to == 0 && answer(row.from))))
+                    || stays(row.on)
             })
             .map(|row| row.on)
             .collect();
@@ -2502,6 +2514,15 @@ mod tests {
         let format = with_calls().thinks_first();
         assert!(format.validate().is_ok());
         assert!(format.without_reasoning().validate().is_ok());
+    }
+
+    #[test]
+    fn without_reasoning_shows_a_close_the_thought_and_the_answer_share() {
+        // A template's one close for its answer and its thought: its row out of the thought moves
+        // the engine, so it stays shown though its other row stays in the content.
+        let shared = two_states().transition("content", "close", "content");
+        let (content, reasoning, _) = said(&events(shared.without_reasoning(), "", "<a>Hm.</a>OK"));
+        assert_eq!((content.as_str(), reasoning.as_str()), ("<a>Hm.</a>OK", ""));
     }
 
     #[test]

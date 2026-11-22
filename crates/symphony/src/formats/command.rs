@@ -88,4 +88,31 @@ mod tests {
             assert_eq!(content(&run(output)), "Hello!", "{output}");
         }
     }
+
+    #[test]
+    fn without_its_thought_the_answer_reads_bare_and_the_call_still_reads() {
+        // The answer's markers frame the answer, not the thought: where the thought's own are
+        // shown they stay dropped, as the legacy tool parser strips them; with no tool declared
+        // the call's bytes follow the bare answer as content.
+        let call = "<|START_ACTION|>[{\"tool_call_id\": \"0\", \"tool_name\": \"get_weather\", \
+                    \"parameters\": {\"city\": \"Paris\"}}]<|END_ACTION|>";
+        let output = format!(
+            "<|START_THINKING|>Hm.<|END_THINKING|><|START_RESPONSE|>Checking.<|END_RESPONSE|>{call}"
+        );
+        let bare = "<|START_THINKING|>Hm.<|END_THINKING|>Checking.";
+        let whole = format!("{bare}{call}");
+        for (table, read, count) in [
+            (command(), bare, 1),
+            (command().without_calls(), whole.as_str(), 0),
+        ] {
+            let events = drive(
+                &mut Engine::new(table.without_reasoning(), Declared::default()),
+                "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>",
+                &[&output],
+            );
+            assert_eq!(content(&events), read);
+            assert_eq!(reasoning(&events), "");
+            assert_eq!(calls(&events).len(), count);
+        }
+    }
 }
