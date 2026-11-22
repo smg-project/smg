@@ -4,8 +4,8 @@
 //! against the descriptor in [`super::types`] (a retyped field fails the WIT
 //! test; the WIT order is the descriptor's, held by the byte-for-byte test,
 //! a struct's declaration order binding nothing). The host-only fields (a load row's
-//! resident-count flag, a candidate's position and
-//! sample instant, a request's host clock, affinity column and model fingerprint, a lease's
+//! resident-count flag, a candidate's position, sample instant and engine's place,
+//! a request's host clock, affinity column and model fingerprint, a lease's
 //! issue instant and session verdict, a target's and a pair's positions, a pair's decode
 //! verdict) are named as such.
 //! A `candidate` is tied to two structs, the engine's row and its entry of
@@ -203,7 +203,7 @@ pub(crate) fn all() -> Vec<Probe> {
                 position, id, role, dp_rank, dp_size, health, wire_modes, engine_kind, connector,
                 in_flight, load, load_sampled_at_micros, session_hit, session_in_flight,
                 pair_class, has_capacity, has_room, zone, labels, ec_compatible, vision,
-                host_local, active_sessions, key,
+                host_local, active_sessions, key, engine,
             } = &candidate,
             AffinityFacts {
                 overlap_blocks, predicted_blocks, admitted_age_ms, indexed_growth, indexed_blocks,
@@ -213,7 +213,7 @@ pub(crate) fn all() -> Vec<Probe> {
                 load, overlap_blocks, predicted_blocks, session_hit, session_in_flight,
                 pair_class, has_capacity, has_room, admitted_age_ms, indexed_growth, zone,
                 labels, ec_compatible, vision, host_local, active_sessions, key, indexed_blocks,
-            ] host [position, load_sampled_at_micros]),
+            ] host [position, load_sampled_at_micros, engine]),
         probe!("media", before [], MediaCounts { images, audio, video, bytes } host [], &media),
         probe!("request", before [], RequestFacts {
             model, namespace_seed, tenant, priority, streaming, max_output_tokens,

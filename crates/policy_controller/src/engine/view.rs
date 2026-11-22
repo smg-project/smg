@@ -721,7 +721,7 @@ impl Reads<'_> {
 }
 
 /// One candidate row: a worker, or one DP rank of a data-parallel worker:
-/// what every decision reads. Its fields take 103 bytes, and the row is
+/// what every decision reads. Its fields take 107 bytes, and the row is
 /// aligned to a 64-byte cache line: 128 bytes in memory, every row on a
 /// line's start.
 ///
@@ -833,6 +833,22 @@ pub struct Candidate {
     /// Zero when the host carries none. After the contract's first cut (the
     /// wire numbers its fields in the record's order).
     pub key: u32,
+    /// The place of the row's engine among the engines of its list, in the
+    /// order each engine's first row stands in the list: the rows that
+    /// state one place are the ranks of one data-parallel engine, and a
+    /// worker that stands alone states a place no other row states. Where
+    /// the list lists its engines ([`Engines`]) it is the place
+    /// [`Engines::rows`] takes. The number holds within one generation of
+    /// one list and is no id beyond it.
+    ///
+    /// The engine in a gateway's own process writes it, once a list, where
+    /// it finds the list's engines. The engine over the policy store and a
+    /// default record leave `0` on every row, which would read as one
+    /// engine: a stage reads the field under the engine in a gateway's own
+    /// process alone, until that engine is the one engine. In-process
+    /// only: no wire form carries it. After the contract's first cut (the
+    /// wire numbers its fields in the record's order).
+    pub engine: u32,
 }
 
 /// What a program says of a worker for the half of its record that no
@@ -1656,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn a_candidate_rows_fields_take_103_bytes() {
+    fn a_candidate_rows_fields_take_107_bytes() {
         // The row is written once per candidate per decision, so what its
         // fields take is a cost every policy pays. The alignment leaves
         // spare bytes, so the row's size no longer says it, and a field
@@ -1700,8 +1716,9 @@ mod tests {
             host_local,
             active_sessions,
             key,
+            engine,
         );
-        assert_eq!(ends.into_iter().max(), Some(103));
+        assert_eq!(ends.into_iter().max(), Some(107));
     }
 
     #[test]

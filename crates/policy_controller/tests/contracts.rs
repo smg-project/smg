@@ -126,6 +126,7 @@ fn candidate_record() -> &'static [&'static str] {
             host_local,
             active_sessions,
             key,
+            engine,
         }
     )
 }
@@ -561,7 +562,8 @@ struct ProtoMirror {
     /// Record fields the wire does not carry: a host instant, a host-local
     /// position, the in-process length of a fixed array, the trace the wire
     /// hoists into `Decision`, whether a report counts resident tokens, a
-    /// fingerprint the host carries of a name the wire carries.
+    /// fingerprint the host carries of a name the wire carries, the place
+    /// of a row's engine among the engines of its host's list.
     host_only: &'static [&'static str],
     /// Wire fields outside the record, in the wire's order: an event's key
     /// before it, controller facts, a wire-only input, the observability
@@ -616,7 +618,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Candidate",
             record: candidate_record(),
-            host_only: &["position", "load_sampled_at_micros"],
+            host_only: &["position", "load_sampled_at_micros", "engine"],
             wire_only: affinity_record(),
             wire: &[
                 ("id", Type::Fixed64),
@@ -894,7 +896,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "candidate",
             crate_record: candidate_record(),
-            host_only: &["position", "load_sampled_at_micros"],
+            host_only: &["position", "load_sampled_at_micros", "engine"],
             before: &[],
             beside: affinity_record(),
         },
