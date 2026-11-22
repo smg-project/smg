@@ -59,6 +59,11 @@ impl Picker for Passthrough {
         (0..pool.rows).find(|&at| keep(at))
     }
 
+    // The scan ends past the pool's last worker: it asked them all.
+    fn asks_every_worker(&self) -> bool {
+        true
+    }
+
     /// The pick is the first row every filter keeps, in the host's order,
     /// and the walk goes on to the last target: the whole pass's targets,
     /// row for row. A walk that meets [`DRAW_BOUND`] refused rows stops

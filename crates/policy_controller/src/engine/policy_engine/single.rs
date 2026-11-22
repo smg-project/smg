@@ -3,11 +3,13 @@
 //! **The short path, in front** ([`alone`]). Where the document decides the
 //! request's place by one pick of its picker
 //! ([`Place::Alone`](crate::engine::Place::Alone)), the decision is that
-//! pick: one turn of the list's own rotation and one read of the worker the
-//! turn lands on. It writes no record and takes no lock. It answers a plain
-//! request ([`Plain`]) over a list that holds an eligible worker where the
-//! picker's turns land, and it reads no fact of a request: the engine asks
-//! it before the request is made, so such a request is never made.
+//! pick: the picker's own rule over the list, with one read of each worker
+//! the rule asks. A rotation reads the worker its turn lands on, and a scan
+//! reads the list in order up to the first eligible worker. It writes no
+//! record and takes no lock. It answers a plain request ([`Plain`]) over a
+//! list where the rule finds an eligible worker, and it reads no fact of a
+//! request: the engine asks it before the request is made, so such a
+//! request is never made.
 //!
 //! **A key's rows, between** ([`keys::decide`]). A request that is made,
 //! under a sessions rule or a ring, is decided by the rows its key names:
@@ -70,7 +72,7 @@ const NO_STAGE: &str = "none";
 /// whose picker picked it ([`AlonePick`]). `None` where the request takes
 /// the whole pass ([`decide`]): it is no single request, its place is not
 /// decided by one pick of a picker, a worker of the list is not dialed on a
-/// wire it states, or the picker's turns land on no eligible worker.
+/// wire it states, or the picker's rule finds no eligible worker.
 ///
 /// It ends in the place picked. It reads no fact of a request, so none is
 /// made ahead of it, and nothing a host is handed of a pick is built here.
@@ -468,7 +470,17 @@ mod tests {
             }
             assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
             if workers <= 12 {
-                let _ = decided(&engine, &asks);
+                // The whole decision's rule, not the first worker: a worker
+                // that is not ready is never named, and the overload veto
+                // is lifted off the workers it alone refuses.
+                match decided(&engine, &asks).decision {
+                    Decision::Shed(shed) => assert_eq!((workers, shed.emptied_by), (1, "healthy")),
+                    Decision::Pick(pick) => {
+                        assert_eq!(pick.trace.lifted, LiftedVeto::Overload);
+                        assert!(pick.targets.iter().all(|target| target.position > 0));
+                    }
+                    Decision::Queue(_) => panic!("no queue is planned"),
+                }
                 assert_eq!(asks.made.get(), 1, "no worker is admitted: made once");
             }
         }

@@ -21,9 +21,11 @@
 //!
 //! `--workers` is the list's size: every worker is ready and has a load
 //! report, published once. `--overloaded 1` puts every worker over its
-//! overload threshold, so the list admits no worker. `--callers` threads
-//! each make `--decisions` timed decisions behind untimed first ones. The
-//! result is one line.
+//! overload threshold, so the list admits no worker, and gives each worker
+//! requests in flight: its place plus one, the middle worker none, so the
+//! rule for such a list has loads to steer by. `--callers` threads each
+//! make `--decisions` timed decisions behind untimed first ones. The result
+//! is one line.
 //!
 //! A time needs a quiet machine. A count of instructions does not: run a
 //! cell twice under callgrind with one caller and two values of
@@ -257,8 +259,15 @@ fn main() {
     let workers: Arc<[Arc<dyn Worker>]> = (0..run.workers)
         .map(|at| ready_worker(&format!("http://worker-{at:04}:8000"), MODEL))
         .collect();
-    for worker in workers.iter().filter(|_| run.overloaded) {
-        worker.set_overloaded(true);
+    if run.overloaded {
+        for (at, worker) in workers.iter().enumerate() {
+            worker.set_overloaded(true);
+            if at != workers.len() / 2 {
+                for _ in 0..=at {
+                    worker.increment_load();
+                }
+            }
+        }
     }
     let document = PolicySpec::preset(preset).expect("a preset's name");
     let engine = PolicyEngine::new(AppliedSpec::validate(&document).expect("a valid preset"));

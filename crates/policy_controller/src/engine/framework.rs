@@ -685,11 +685,12 @@ pub trait Picker: Lifecycle + Debug {
     /// One pick over `pool` by the picker's own rule alone
     /// ([`Picker::picks_alone`]). `keep` asks the caller's test of the
     /// worker at a position of the pool: one read of that worker. `Some`
-    /// is the position picked, which `keep` kept. `None` where the rule's
-    /// own bound ran out before a worker was kept, as a rotation's turns
-    /// past a refused worker do: the caller then reads the pool whole and
-    /// asks [`Picker::pick_among`] of the workers that pass. The default
-    /// picks nobody.
+    /// is the position picked, which `keep` kept. `None` where the rule
+    /// kept no worker. A rule whose own bound ran out first, as a
+    /// rotation's turns past a refused worker do, leaves the pool to its
+    /// caller, which reads it whole and asks [`Picker::pick_among`] of the
+    /// workers that pass. A rule that asked every worker settles it
+    /// ([`Picker::asks_every_worker`]). The default picks nobody.
     fn pick_alone(
         &self,
         pool: &PoolWord<'_>,
@@ -697,6 +698,15 @@ pub trait Picker: Lifecycle + Debug {
     ) -> Option<usize> {
         let _ = (pool, keep);
         None
+    }
+
+    /// Whether [`Picker::pick_alone`] asks `keep` of every worker of the
+    /// pool before it picks nobody, as a scan in the pool's order does and
+    /// a rotation's bounded turns do not. Its `None` then says that no
+    /// worker of the pool passes, and the caller does not read the pool a
+    /// second time to learn it. The default is no.
+    fn asks_every_worker(&self) -> bool {
+        false
     }
 
     /// The pick among the `passed` workers a whole pass left, as a place in

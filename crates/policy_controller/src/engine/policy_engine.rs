@@ -19,11 +19,13 @@
 //!   request.
 //! - **Once a request.** [`PolicyEngine::pick`] asks for one pick over the
 //!   pool, under a profile the engine picks by its picker alone
-//!   ([`Place::Alone`]). The pick turns the pool's own word and reads the
-//!   worker the turn lands on, by the pass's own test of a worker: no
-//!   row, no table, no request fact, no lock, and nothing allocated. A
-//!   list nothing is kept of (a part of a pool, as the pass narrowed it)
-//!   is passed over once ([`PolicyEngine::pick_among`]).
+//!   ([`Place::Alone`]). The pick is the picker's own rule: a rotation
+//!   turns the pool's own word and reads the worker the turn lands on, a
+//!   scan reads the pool's workers in order up to the first that passes.
+//!   Each read is the pass's own test of a worker: no row, no table, no
+//!   request fact, no lock, and nothing allocated. A list nothing is kept
+//!   of (a part of a pool, as the pass narrowed it) is passed over once
+//!   ([`PolicyEngine::pick_among`]).
 //!
 //! **A whole decision.** A gateway whose routers ask the engine for the
 //! whole decision asks through [`DecisionEngine`], as it asks a controller's
@@ -443,13 +445,15 @@ impl PolicyEngine {
     /// The entry for a caller that holds every other rule of a placement
     /// itself, as a gateway's classic placement pass does: which workers a
     /// request may take, what a retry skips, and what becomes of a pool no
-    /// worker of which passes. The picker turns the pool's own word, kept
-    /// in `members`, and the worker a turn lands on is read once and tested
-    /// by `admits`, the caller's own test of a worker's read: the one its
-    /// pass asks of every candidate, so the rule of a lifted veto has one
-    /// home. No row is read, no table looked up, no lock taken and nothing
-    /// allocated. Where the picker's turns all land on refused workers the
-    /// pool is passed over once, as [`Self::pick_among`] passes over a list.
+    /// worker of which passes. The picker's rule runs over the pool, whose
+    /// own word is kept in `members`, and each worker the rule asks is read
+    /// once and tested by `admits`, the caller's own test of a worker's
+    /// read: the one its pass asks of every candidate, so the rule of a
+    /// lifted veto has one home. No row is read, no table looked up, no
+    /// lock taken and nothing allocated. Where a rotation's turns all land
+    /// on refused workers the pool is passed over once, as
+    /// [`Self::pick_among`] passes over a list. A rule that asked every
+    /// worker and kept none is not followed by that pass.
     /// A part of a pool ([`PoolMembers::part`]) has no word of its own: the
     /// pick over it is [`Self::pick_among`]'s.
     #[must_use]
@@ -722,7 +726,8 @@ impl DecisionEngine for PolicyEngine {
 }
 
 /// [`PolicyEngine::pick`] by one test of a worker's read, compiled once a
-/// test: the picker's own pick over the pool's word, then the pass.
+/// test: the picker's own pick over the pool's word, then the pass where
+/// that pick left the pool open.
 #[inline(always)]
 fn pick_by(
     picker: &dyn Picker,
@@ -739,7 +744,9 @@ fn pick_by(
             .get(at)
             .is_some_and(|worker| admits(worker.routing_state()))
     });
-    if picked.is_some() {
+    // A rule that asked every worker and kept none has the pool's answer:
+    // the pass would read them all again to name nobody.
+    if picked.is_some() || picker.asks_every_worker() {
         return picked;
     }
     among(picker, workers, admits)
@@ -801,7 +808,7 @@ const fn mixed(count: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{cell::Cell, collections::BTreeSet};
 
     use openai_protocol::worker::WorkerStatus;
     use smg_worker::{runtime::StallReason, test_support::ready_worker};
@@ -1227,6 +1234,32 @@ mod tests {
             engine.pick_among(profile, &[], RoutingState::eligible),
             None
         );
+    }
+
+    /// A pick that asked every worker of a pool and kept none has the pool's
+    /// answer: a scan reads each worker once and no pass reads them again.
+    /// A rotation's turns stop short of the pool, which is then passed over.
+    #[test]
+    fn a_pick_that_asked_every_worker_is_not_followed_by_a_pass() {
+        for workers in [1, 2, 8, 64] {
+            let list = pool(workers);
+            for worker in list.iter() {
+                worker.set_overloaded(true);
+            }
+            let reads_under = |name: &str| {
+                let engine = preset(name);
+                let members = engine.pool_members(&list);
+                let reads = Cell::new(0);
+                let counted = |state: RoutingState| {
+                    reads.set(reads.get() + 1);
+                    state.eligible()
+                };
+                assert_eq!(engine.pick(alone(&engine), &members, counted), None);
+                reads.get()
+            };
+            assert_eq!(reads_under("passthrough"), workers, "each worker once");
+            assert!(reads_under("round_robin") > workers, "turns, then a pass");
+        }
     }
 
     /// A list the engine keeps nothing of is passed over once, and the
