@@ -275,7 +275,9 @@ message RequestFacts {
   sint32 priority = 4;
   bool streaming = 5;
   uint32 max_output_tokens = 6;
-  uint32 prompt_tokens = 7;  // the host's count or estimate
+  // The host's count or estimate, for a plugin whose row declares
+  // `prompt_size` among its needs; zero for any other.
+  uint32 prompt_tokens = 7;
   // One hash a whole block of the prompt, in order from the first. A hash is
   // of its own block's content and of nothing ahead of it: a prefix is named
   // by the fold of its blocks' hashes, which a stage that keys by one makes.
@@ -777,7 +779,8 @@ message PluginHelloAck {
 // `block_hashes` are filled only for a plugin whose row declares a request's
 // hashes (token hashes or text hashes among its needs), with the first 8,190
 // of a longer list; a plugin that declares neither receives none, whatever
-// the other stages of its generation read.
+// the other stages of its generation read. Its `prompt_tokens` is the
+// request's size only for a plugin whose row declares `prompt_size`.
 message PluginDecide {
   fixed64 decision_id = 1;
   RequestFacts request = 2;

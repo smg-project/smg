@@ -918,7 +918,7 @@ async fn bf16_batch_cache_reuses_large_batches_across_image_families() {
 /// A budget between a wire's length and its pooled class stores the batch
 /// once: the replay views the allocation of the fill, without a gather.
 #[tokio::test]
-async fn a_batch_whose_pooled_class_is_over_the_budget_is_cached_as_one_exact_copy() {
+async fn a_batch_whose_pooled_class_is_over_the_budget_is_cached_at_its_exact_length() {
     let batch = MediaBatch::Images(
         (0..8u8)
             .map(|id| {

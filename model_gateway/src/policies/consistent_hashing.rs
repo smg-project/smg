@@ -140,6 +140,29 @@ impl ConsistentHashingPolicy {
         Some(healthy_indices[idx])
     }
 
+    /// The place among `workers` that the explicit target of `headers`
+    /// names. `None` where the request names no worker. `Some(None)` is a
+    /// miss: the number is no place of a worker that is healthy and
+    /// eligible, and the request moves to no other worker.
+    ///
+    /// O(1) parse + O(1) bounds check + O(1) health check. The one reading
+    /// of the header: this policy's pick, and a route that narrows its
+    /// candidates to the target ahead of a policy engine
+    /// (`placement::targeted`).
+    pub(crate) fn target_among(
+        workers: &[Arc<dyn Worker>],
+        headers: Option<&http::HeaderMap>,
+    ) -> Option<Option<usize>> {
+        let named = extract_target_worker(headers)?;
+        let place = named.parse::<usize>().ok();
+        let holds = |&idx: &usize| {
+            workers
+                .get(idx)
+                .is_some_and(|worker| worker.is_healthy_and_eligible())
+        };
+        Some(place.filter(holds))
+    }
+
     /// The explicit session key the request hashes on. Explicit routing-key
     /// headers outrank the rid-derived session key (populated only under the
     /// routing-key override). Both header sides apply the hint caps: an
@@ -163,19 +186,14 @@ impl ConsistentHashingPolicy {
             return (None, Branch::NoHealthyWorkers);
         }
 
-        let target_worker = extract_target_worker(info.headers);
-        let routing_key = Self::session_key(info);
-
         // Priority 1: X-SMG-Target-Worker - direct routing by worker index
-        // O(1) parse + O(1) bounds check + O(1) health check
-        if let Some(idx_str) = target_worker {
-            if let Ok(idx) = idx_str.parse::<usize>() {
-                if idx < workers.len() && workers[idx].is_healthy_and_eligible() {
-                    return (Some(idx), Branch::TargetWorkerHit);
-                }
-            }
-            return (None, Branch::TargetWorkerMiss);
+        if let Some(target) = Self::target_among(workers, info.headers) {
+            return match target {
+                Some(idx) => (Some(idx), Branch::TargetWorkerHit),
+                None => (None, Branch::TargetWorkerMiss),
+            };
         }
+        let routing_key = Self::session_key(info);
 
         // Priority 2: X-SMG-Routing-Key - consistent hash routing (O(log n))
         if let Some(key) = routing_key {
@@ -233,6 +251,10 @@ impl LoadBalancingPolicy for ConsistentHashingPolicy {
 
     fn name(&self) -> &'static str {
         "consistent_hashing"
+    }
+
+    fn honors_routing_key(&self) -> bool {
+        true
     }
 
     /// A session key places the request on its ring owner. An explicit

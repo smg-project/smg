@@ -7,7 +7,7 @@
 
 use crate::{
     engine::decision::{Decision, Target},
-    tracking::lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
+    tracking::lease::{EventSet, Lease, Membership, Outcome, ReleaseReason, Side, Signal},
 };
 
 /// The lifecycle a stateful stage implements. Every hook defaults to a
@@ -112,6 +112,40 @@ pub trait Lifecycle: Send + Sync {
     fn needs_lifecycle(&self) -> bool {
         false
     }
+
+    /// The kinds of event the stage takes ([`EventSet`]). By default a
+    /// stage that says it needs the lifecycle's calls
+    /// ([`Self::needs_lifecycle`]) takes every word on a lease
+    /// ([`EventSet::LEASE`]: the issue, the dispatch, the completion and
+    /// the release), and any other stage takes none.
+    ///
+    /// The engine cannot see an overridden method, and a host that decides
+    /// in its own process tells a word on a lease only where a stage of
+    /// the document takes it, and keeps nothing for a word nobody takes: a
+    /// document none of whose stages takes one costs a request no lease.
+    /// So a stage that implements [`Self::on_decision_issued`],
+    /// [`Self::on_dispatched`], [`Self::on_completed`] or
+    /// [`Self::on_released`] and declares no need names that call's kind
+    /// here, or it is not told there. A stage that declares the need may
+    /// name the kinds it takes, and is then told no other: each kind left
+    /// out is a word its requests do not pay for. The engine asks once, at
+    /// its build: the answer is the stage's for the engine's life.
+    ///
+    /// A change of membership and a signal are told to every stage,
+    /// whatever it answers: no host reads those two kinds of the answer
+    /// yet. A plugin's stage answers every kind its plugin observes.
+    ///
+    /// The two answers part for a stage that takes a word only to drop
+    /// state early: it decides the same without the call and declares no
+    /// need, and it still names the word. Untold, it would keep that
+    /// state.
+    fn hears(&self) -> EventSet {
+        if self.needs_lifecycle() {
+            EventSet::LEASE
+        } else {
+            EventSet::NONE
+        }
+    }
 }
 
 /// A boxed stage forwards to the stage it holds.
@@ -153,6 +187,10 @@ impl<T: Lifecycle + ?Sized> Lifecycle for Box<T> {
     fn needs_lifecycle(&self) -> bool {
         (**self).needs_lifecycle()
     }
+
+    fn hears(&self) -> EventSet {
+        (**self).hears()
+    }
 }
 
 #[cfg(test)]
@@ -160,7 +198,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::engine::view::{Health, WorkerId};
+    use crate::{
+        document::spec::{AppliedSpec, PolicySpec, PRESETS},
+        engine::view::{Health, WorkerId},
+        tracking::lease::EventKind,
+    };
 
     /// A stage that counts what reached it, to prove the box forwards every
     /// hook and a stateless stage needs none.
@@ -174,6 +216,10 @@ mod tests {
 
         fn on_signal(&self, _: &Signal) {
             self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn hears(&self) -> EventSet {
+            EventSet::of([EventKind::Released, EventKind::Signal])
         }
     }
 
@@ -196,6 +242,64 @@ mod tests {
         assert!(Lifecycle::needs_lifecycle(&kept));
         let stateless: Box<dyn Lifecycle> = Box::new(Stateless);
         assert!(!Lifecycle::needs_lifecycle(&stateless));
+    }
+
+    /// A stage that declares no need takes no word unless it names one,
+    /// and a box says what its stage says. The two answers part: a stage
+    /// that takes a release only to drop state early needs no call, and
+    /// takes the word. A stage that needs the calls and names no word takes
+    /// every word on a lease. A release is a word on a lease, and a signal
+    /// is none.
+    #[test]
+    fn a_stage_takes_the_words_it_names_and_no_other() {
+        use EventKind::{Completed, Dispatched, Issued, Released};
+        let stateless: Box<dyn Lifecycle> = Box::new(Stateless);
+        assert_eq!(stateless.hears(), EventSet::NONE);
+        let counting: Box<dyn Lifecycle> = Box::new(Counting::default());
+        let ends = counting.hears();
+        assert!(ends.contains(Released) && !ends.contains(Completed));
+        assert!(ends.intersects(EventSet::LEASE) && !counting.needs_lifecycle());
+        assert!(!EventSet::of([EventKind::Signal]).intersects(EventSet::LEASE));
+        let kept: Box<dyn Lifecycle> = Box::new(Kept);
+        assert!(kept.needs_lifecycle());
+        assert_eq!(kept.hears(), EventSet::LEASE);
+        let both = ends.with(Issued);
+        assert!(both.contains(Issued) && both.contains(Released) && !both.contains(Dispatched));
+        assert_eq!(both.union(EventSet::ALL), EventSet::ALL);
+        assert_eq!(
+            EventSet::LEASE,
+            EventSet::of([Issued, Dispatched, Completed, Released])
+        );
+    }
+
+    /// The stock policies by the words their documents take. A rotation, a
+    /// draw and a pass-through take none: a request under them is owed no
+    /// word. A pick of two and least load take the dispatch, which moves
+    /// their count of sends, and a bucket the issue beside it. No stock
+    /// stage takes an end.
+    #[test]
+    fn the_stock_documents_name_the_words_they_take() {
+        let hears = |name: &str| {
+            let mut document = PolicySpec::preset(name).expect("a built-in preset");
+            document.generation = 1;
+            AppliedSpec::validate(&document)
+                .expect("the preset validates")
+                .engine()
+                .hears()
+        };
+        for silent in ["round_robin", "random", "passthrough"] {
+            assert_eq!(hears(silent), EventSet::NONE, "{silent}");
+        }
+        let sends = EventSet::of([EventKind::Dispatched]);
+        for counted in ["power_of_two", "least_load"] {
+            assert_eq!(hears(counted), sends, "{counted}");
+        }
+        let booked = EventSet::of([EventKind::Issued, EventKind::Dispatched]);
+        assert_eq!(hears("bucket"), booked);
+        for name in PRESETS {
+            let ends = EventSet::of([EventKind::Completed, EventKind::Released]);
+            assert!(!hears(name).intersects(ends), "{name}");
+        }
     }
 
     #[test]

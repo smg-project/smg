@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use smg_worker::{
     identity::basic::Worker,
-    worker::{ConnectionMode, HealthCheckConfig, WorkerSpec},
+    worker::{HealthCheckConfig, WorkerSpec},
 };
 
 use super::{membership_writer::Over, object::role};
@@ -47,11 +47,7 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
         engine: engine_of(worker).to_owned(),
         incarnation: standing.incarnation,
         role: role(spec.worker_type),
-        wire_modes: match spec.connection_mode {
-            ConnectionMode::Http => WireModes::HTTP,
-            ConnectionMode::Grpc => WireModes::GRPC,
-            ConnectionMode::Zmq => WireModes::ZMQ,
-        },
+        wire_modes: WireModes::from(spec.connection_mode),
         engine_kind: if spec.runtime_type.is_specified() {
             spec.runtime_type.as_str().to_owned()
         } else {
@@ -142,7 +138,10 @@ pub(crate) fn stated(
 /// reports. A layout fact the store keeps no slot for is left out, since
 /// its rule could not read it. `None` where the worker reports nothing, as
 /// the rule reads a row with no descriptor.
-fn pairing(worker: &dyn Worker) -> Option<Arc<PairingDescriptor>> {
+///
+/// A host that tells a worker it keeps no row of states them over
+/// [`facts`]' reading of the worker alone.
+pub fn pairing_descriptor(worker: &dyn Worker) -> Option<Arc<PairingDescriptor>> {
     let offered = worker.pd_pairing();
     let mut descriptor = PairingDescriptor {
         protocol: offered.explicit().map(str::to_owned),
@@ -161,16 +160,16 @@ fn pairing(worker: &dyn Worker) -> Option<Arc<PairingDescriptor>> {
 }
 
 /// [`stated`], with the pairing descriptor `built` derived at its build in
-/// place of the standing row's ([`pairing`]): the reading of a door whose
-/// rows hold a descriptor. A worker that reports nothing withdraws the
-/// standing one.
+/// place of the standing row's ([`pairing_descriptor`]): the reading of a
+/// door whose rows hold a descriptor. A worker that reports nothing
+/// withdraws the standing one.
 pub(crate) fn paired(
     built: &dyn Worker,
     standing: Option<&WorkerFacts>,
     over: Option<Over<'_>>,
 ) -> WorkerFacts {
     WorkerFacts {
-        pairing: pairing(built),
+        pairing: pairing_descriptor(built),
         ..stated(built, standing, over)
     }
 }
@@ -195,7 +194,7 @@ mod tests {
         worker::{HealthCheckConfig, OverloadUpdate, RuntimeType, WorkerSpec},
     };
 
-    use super::{facts, paired, pairing};
+    use super::{facts, paired, pairing_descriptor};
     use crate::{
         document::spec::Pairing,
         engine::{
@@ -361,7 +360,7 @@ mod tests {
             ],
         );
         let offered = worker.pd_pairing();
-        let stated = pairing(&worker).expect("a descriptor");
+        let stated = pairing_descriptor(&worker).expect("a descriptor");
         assert_eq!(stated.protocol.as_deref(), Some("pd"));
         assert_eq!(stated.transport.as_deref(), Some("nixl"));
         assert_eq!(stated.version.as_deref(), Some("1.2"));
@@ -388,7 +387,7 @@ mod tests {
             (RuntimeType::TokenSpeed, [("tier", "gold")], "mooncake"),
         ] {
             let worker = offering(runtime, &labels);
-            let stated = pairing(&worker).expect("a descriptor");
+            let stated = pairing_descriptor(&worker).expect("a descriptor");
             assert_eq!(stated.transport.as_deref(), Some(transport), "{runtime:?}");
             assert_eq!(stated.transport.as_deref(), worker.pd_pairing().transport());
         }
@@ -401,13 +400,13 @@ mod tests {
         spec.kv_connector = Some(" Custom ".to_owned());
         let padded = <BasicWorkerBuilder>::from_spec(spec).build();
         assert_eq!(padded.pd_pairing().transport(), Some(" custom "));
-        let read = pairing(&padded).expect("a descriptor");
+        let read = pairing_descriptor(&padded).expect("a descriptor");
         assert_eq!(read.transport.as_deref(), Some("custom"));
 
         // A worker that reports nothing offers no descriptor, and withdraws
         // the standing row's at a door that reads its own.
         let silent = offering(RuntimeType::Sglang, &[("version", " ")]);
-        assert_eq!(pairing(&silent), None);
+        assert_eq!(pairing_descriptor(&silent), None);
         let standing = WorkerFacts {
             pairing: Some(stated),
             ..WorkerFacts::default()

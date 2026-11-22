@@ -3,7 +3,12 @@
 //! to its binding and decides. A scorer or picker allocates nothing per
 //! decision: scratch lives in the per-thread [`Scratch`] the host keeps.
 
-use std::{any::Any, collections::HashMap, fmt::Debug, sync::Arc};
+use std::{
+    any::Any,
+    collections::HashMap,
+    fmt::Debug,
+    sync::{atomic::AtomicU64, Arc},
+};
 
 use crate::{
     document::spec::{Assignment, Needs},
@@ -13,7 +18,7 @@ use crate::{
             Trace, MAX_TARGETS, TRACE_TOP,
         },
         prefix_pass::forget_prefix_pass,
-        sticky_sessions::{self, Claim, SessionExpiry, SessionRule, SessionTable, SessionVerdict},
+        sticky_sessions::{self, Claim, SessionRule, SessionTable, SessionVerdict},
         view::{
             mean_in_flight, AffinityFacts, AffinityRows, Candidate, Constraints, LoadReportCutoff,
             Phase, PoolFacts, RequestFacts, WorkerId,
@@ -30,17 +35,21 @@ use crate::{
     },
     tracking::{
         dispatch_credit::DispatchCredit,
-        lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
+        lease::{EventKind, EventSet, Lease, Membership, Outcome, ReleaseReason, Side, Signal},
     },
     Draw,
 };
 
+mod alone;
 mod encode;
 mod engines;
+mod keyed;
 mod vetoed;
 
+pub use alone::{AloneProfile, InTheWay, NotAlone, Place};
 pub use encode::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
 use engines::{run_engines, run_owned};
+pub use keyed::PoolRows;
 use vetoed::AllVetoed;
 
 /// Drops candidates before scoring. A `soft` filter steps aside when it would
@@ -298,6 +307,29 @@ pub trait Scorer: Lifecycle + Debug {
         _kept: &mut Vec<u32>,
     ) -> bool {
         false
+    }
+
+    /// [`Self::own`] for a host that reads a row when it is asked about
+    /// one, and writes none ahead of the decision: the scorer names the
+    /// rows it meets by their places in the pool, which holds `rows` of
+    /// them, asks `keep` about each, once, and writes to `out` the places
+    /// of the rows it hands out, the pick first and its alternates behind
+    /// it, each one kept by `keep` and none twice. Returns how many it
+    /// wrote. They are the rows [`Self::own`] hands out over the same
+    /// pool, in its order. `0` where it places nothing by itself, as
+    /// [`Self::own`] says `false`: the profile's run over the whole pool
+    /// decides. A scorer that places by a ring walks the ring its host
+    /// lent ([`RequestFacts::ring`]) and places nothing where none is
+    /// lent. It reads no value of the seed's stream. The default places
+    /// nothing.
+    fn own_by_place(
+        &self,
+        _facts: &RequestFacts<'_>,
+        _rows: usize,
+        _keep: &mut dyn FnMut(u32) -> bool,
+        _out: &mut [u32; MAX_TARGETS],
+    ) -> usize {
+        0
     }
 
     /// How this scorer's values lie ([`ScoreSpread`]), asked once when the
@@ -635,6 +667,59 @@ pub trait Picker: Lifecycle + Debug {
     fn by_assignment(&self) -> bool {
         false
     }
+
+    /// Whether the picker places a request over a pool's workers by itself
+    /// ([`Picker::pick_alone`]): its own rule is its whole pick, and it
+    /// reads no row, no score and no count. A caller that keeps a worker's
+    /// health on the worker and holds every other rule of a placement
+    /// itself asks such a picker for one pick and nothing else of a
+    /// decision ([`Engine::place_for`]). The default is no. The engine reads
+    /// it where such a caller asks for a place's profile, not at a
+    /// decision.
+    fn picks_alone(&self) -> bool {
+        false
+    }
+
+    /// One pick over `pool` by the picker's own rule alone
+    /// ([`Picker::picks_alone`]). `keep` asks the caller's test of the
+    /// worker at a position of the pool: one read of that worker. `Some`
+    /// is the position picked, which `keep` kept. `None` where the rule's
+    /// own bound ran out before a worker was kept, as a rotation's turns
+    /// past a refused worker do: the caller then reads the pool whole and
+    /// asks [`Picker::pick_among`] of the workers that pass. The default
+    /// picks nobody.
+    fn pick_alone(
+        &self,
+        pool: &PoolWord<'_>,
+        keep: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<usize> {
+        let _ = (pool, keep);
+        None
+    }
+
+    /// The pick among the `passed` workers a whole pass left, as a place in
+    /// their list, which stands in the pool's order. `set` names the set
+    /// of them: a picker that keeps a rotation a set turns that set's own.
+    /// Asked with one worker or more. The default takes the first.
+    fn pick_among(&self, set: u64, passed: usize) -> usize {
+        let _ = (set, passed);
+        0
+    }
+}
+
+/// A pool as a picker that places over its workers by itself is handed it
+/// ([`Picker::pick_alone`]): its size and its own word.
+#[derive(Clone, Copy, Debug)]
+pub struct PoolWord<'a> {
+    /// How many workers the pool holds, in an order that stands for as long
+    /// as the pool does.
+    pub rows: usize,
+    /// The pool's own word, kept by the caller beside the pool for as long
+    /// as the pool stands, for the picker that places over it: a rotation
+    /// counts its turns in it, so the pool's rotation is found with the
+    /// pool and no table is looked up. It starts at a position the caller
+    /// drew.
+    pub word: &'a AtomicU64,
 }
 
 /// Per-decision state a stage set keeps across the stages of one profile
@@ -2485,6 +2570,208 @@ fn run_drawn(
     decision
 }
 
+/// The crate's own pickers that draw first, by name. Each one's draw reads
+/// a row of the pool through the test it is handed and in no other way: it
+/// reads the pool's size, draws places, and asks the test about the row at
+/// each. So its draw may be asked over rows whose records are not written
+/// yet ([`run_drawn_written`]). A host's stage takes no built-in's name and
+/// states its own ([`StageRegistry`](crate::stages::StageRegistry)), so a
+/// picker of one of these names is the crate's, and a host's own picker
+/// that draws first is handed every record written.
+#[cfg(feature = "in-process")]
+const DRAWS_BY_ITS_TEST: [&str; 6] = [
+    "power-of-two",
+    "power-of-two-count-first",
+    "best",
+    "random",
+    "passthrough",
+    "round-robin",
+];
+
+/// A plain single decision that is a draw's, as [`Engine::drawn_for`] found
+/// it: the profile that draws and its binding's word for a pool the
+/// overload veto empties.
+#[cfg(feature = "in-process")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Drawn {
+    index: u16,
+    vetoed: AllVetoed,
+}
+
+/// A record no decision wrote, as a debug build leaves every row before a
+/// draw over unwritten rows: its fixed half, every veto set and a count no
+/// worker holds. A stage that read it would refuse the row or cost it past
+/// every written one, and the cases that hold such a draw to the whole
+/// write's pick would part.
+#[cfg(all(debug_assertions, feature = "in-process"))]
+fn unwritten(fixed: &Candidate) -> Candidate {
+    let mut row = *fixed;
+    row.health.healthy = false;
+    row.health.breaker_open = true;
+    row.health.stalled = true;
+    row.health.draining = true;
+    row.health.overloaded = true;
+    row.in_flight = u32::MAX;
+    row
+}
+
+/// [`run_drawn`] for a host that keeps the fixed half of its rows and
+/// writes a row's record when the decision asks about the row: the picker
+/// draws over `fixed`, the rows as they stand with no live value, and the
+/// row a draw lands on is written into `rows` at its own place (`write`,
+/// handed the fixed row and the place, writes the whole record there)
+/// before the profile's filters are asked about the written record. The scorers and the picker's order
+/// then read `rows` at the places the draw kept, and nowhere else: the
+/// profile draws first, so each of its filters and scorers answers row by
+/// row ([`draws_first`]), and its picker is one whose draw reads a row
+/// through its test alone ([`DRAWS_BY_ITS_TEST`]). The rows a host named
+/// are written before they join the rows drawn. A draw that keeps nobody
+/// widens to the whole pass as [`run_drawn`]'s does, over every row
+/// written.
+///
+/// The decision is the one [`run_drawn`] makes over the same rows written
+/// whole: the same draws of the seed's stream, the same test of each row
+/// drawn, the same scores of the rows kept. A row the draw did not ask
+/// about holds whatever an earlier decision of the thread left in `rows`;
+/// a debug build overwrites it first ([`unwritten`]).
+///
+/// In a gateway's own process alone: no other host keeps its rows in two
+/// halves.
+#[cfg(feature = "in-process")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the draw's inputs and the host's two halves of a row: the fixed rows, the buffer and the write"
+)]
+#[inline(never)]
+fn run_drawn_written(
+    engine: &Engine,
+    drawn: Drawn,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    fixed: &[Candidate],
+    rows: &mut [Candidate],
+    write: &mut dyn FnMut(&Candidate, &mut Candidate),
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+) -> Decision {
+    let Drawn { index, vetoed } = drawn;
+    let at = usize::from(index);
+    let (profile, tests) = (&engine.profiles[at], engine.row_tests[at]);
+    debug_assert_eq!(fixed.len(), rows.len(), "one buffer row a fixed row");
+    #[cfg(debug_assertions)]
+    for (row, fixed) in rows.iter_mut().zip(fixed) {
+        *row = unwritten(fixed);
+    }
+    buf.reserve(fixed.len());
+    buf.kept.clear();
+    let mut draw = Draw::new(facts.seed);
+    let masked = tests.is_some_and(|tests| tests.masked(cx));
+    let drew = {
+        // The row a draw lands on, written at its place: the written
+        // record is the one the filters are asked about.
+        let mut ask = |fixed: &Candidate| {
+            let Some(row) = rows.get_mut(fixed.position as usize) else {
+                return false;
+            };
+            write(fixed, row);
+            let row = &*row;
+            match tests {
+                Some(tests) => tests.keeps(facts, row, cx) && !(masked && cx.masks(row.position)),
+                None => profile.filters.iter().all(|f| f.keep(facts, row, cx)),
+            }
+        };
+        profile
+            .picker
+            .draw_first(facts, pool, fixed, &mut ask, &mut buf.kept, &mut draw)
+    };
+    // The host caps both lists at the profile's sample, as it does for a
+    // draw over written rows: a debug build alone asserts it.
+    debug_assert!(
+        facts.named.is_none_or(|named| {
+            let cap = engine.profile_needs[at].sample as usize;
+            cap == 0 || named.holders.len().max(named.warming.len()) <= cap
+        }),
+        "each list of rows named stands at or under the profile's sample"
+    );
+    // A picker that read no value of the stream left the seed as it was.
+    let resumed;
+    let after = if draw.state() == facts.seed {
+        facts
+    } else {
+        resumed = RequestFacts {
+            seed: draw.state(),
+            ..*facts
+        };
+        &resumed
+    };
+    if drew {
+        let mut targets = Targets::new();
+        match after.named {
+            Some(named) if profile.picker.joined_by_named() => {
+                // The rows named are few: each is written before the join
+                // asks about it, but a row the draw kept, which is written.
+                let holders = named.holders.iter().map(|holder| holder.row);
+                for place in holders.chain(named.warming.iter().copied()) {
+                    if buf.kept.contains(&place) {
+                        continue;
+                    }
+                    let at = place as usize;
+                    if let (Some(fixed), Some(row)) = (fixed.get(at), rows.get_mut(at)) {
+                        write(fixed, row);
+                    }
+                }
+                let mut keep = |c: &Candidate| profile.filters.iter().all(|f| f.keep(facts, c, cx));
+                order_joined(profile, after, named, rows, &mut keep, buf, &mut targets);
+            }
+            _ => {
+                let band = combine(
+                    profile,
+                    after,
+                    rows,
+                    &buf.kept,
+                    &mut buf.scores,
+                    &mut buf.stage,
+                );
+                profile
+                    .picker
+                    .order_drawn(after, rows, &buf.kept, &buf.scores, band, &mut targets);
+            }
+        }
+        if !targets.is_empty() {
+            let trace = trace_drawn(index, facts, pool, rows, &buf.kept, &buf.scores);
+            return Decision::Pick(Pick {
+                targets,
+                trace,
+                session_verdict: SessionVerdict::None,
+            });
+        }
+    }
+    // The draw says nothing of the pool: the whole pass reads every row,
+    // and the pool's facts say of the rows written what a host that wrote
+    // them first says ([`PoolFacts::reported`]).
+    let mut reported = true;
+    for (row, fixed) in rows.iter_mut().zip(fixed) {
+        write(fixed, row);
+        reported &= row.load.is_some();
+    }
+    let pool = &PoolFacts { reported, ..*pool };
+    let set = Set {
+        candidates: rows,
+        class: None,
+        partnered: None,
+        fold: None,
+        encode: false,
+        vetoed,
+    };
+    let mut decision = run_whole(engine, index, after, pool, set, cx, buf);
+    match &mut decision {
+        Decision::Pick(pick) => pick.trace.seed = facts.seed,
+        Decision::Shed(shed) => shed.trace.seed = facts.seed,
+        Decision::Queue(queue) => queue.trace.seed = facts.seed,
+    }
+    decision
+}
+
 /// The whole pass of an encode item of the `epd` plan: the plan's rules
 /// filter the encode pool before the profile's ([`filter`]). Out of line,
 /// so the decision's entry builds one set for every other request and the
@@ -2953,6 +3240,12 @@ pub struct Engine {
     /// and its sessions rule, folded per phase ([`Self::needs_for_phase`]),
     /// indexed by [`slot`].
     phase_needs: [Needs; PHASES.len()],
+    /// Per phase, whether a binding that covers it under the single plan
+    /// pins a key or reads a ring: the phases whose requests the keyed
+    /// decision over rows read one at a time answers or lends a ring
+    /// ([`Self::decide_keyed`]), indexed by [`slot`]. Every other phase's
+    /// request is turned away there by this one read.
+    keyed: [bool; PHASES.len()],
     sessions: SessionTable,
     assignment: AssignmentStages,
     /// Per profile, what its stages ask of a decision beyond the profile's
@@ -2978,6 +3271,12 @@ pub struct Engine {
     /// decision reads it where the profile's mark says so, and no other
     /// decision does.
     orders: Vec<Order>,
+    /// Per profile, whether its draw may be asked before a row's record is
+    /// written ([`Engine::drawn_for`]): it draws first, and its picker is
+    /// one of the crate's own, whose draw reads a row through the test it
+    /// is handed and in no other way ([`DRAWS_BY_ITS_TEST`]).
+    #[cfg(feature = "in-process")]
+    written_draws: Box<[bool]>,
     /// What the door needs of a seat, zero on the plain path.
     seat_flags: u8,
     explain_sample: u32,
@@ -2996,6 +3295,11 @@ pub struct Engine {
     /// profiles' names: a later engine finds a profile's by its name
     /// ([`Engine::succeed`]).
     pub(crate) sent_credits: Vec<Arc<DispatchCredit>>,
+    /// The kinds of event the document takes, but for its counts of sends
+    /// ([`Lifecycle::hears`] adds those): each stage's answer, asked once at
+    /// the build, with the engine's own. A word of a request is told to
+    /// every profile's stages, so the answer is the document's.
+    hears: EventSet,
 }
 
 /// A stage that keeps a number of the reports, by its place in the engine.
@@ -3425,6 +3729,18 @@ fn shortest_sweep(bindings: &[Binding]) -> u64 {
         .filter(|sweep| *sweep > 0)
         .min()
         .unwrap_or(0)
+}
+
+/// The shards of the session table of an engine of `bindings`
+/// ([`SessionTable::with_shards`]): four a core of the host where a binding
+/// has a sessions rule, since every keyed decision takes its key's shard's
+/// mutex, and one where no rule looks a key up.
+fn session_shards(bindings: &[Binding]) -> usize {
+    if bindings.iter().any(|binding| binding.sessions.is_some()) {
+        sticky_sessions::shards_for_this_host()
+    } else {
+        1
+    }
 }
 
 /// How long a worker that left keeps its pins in the session table
@@ -3990,6 +4306,7 @@ impl Engine {
         // phase and adds nothing (the gateway's own document binds every
         // model's pair phases before its catch-all for the regular ones).
         let mut phase_needs = [Needs::default(); PHASES.len()];
+        let mut keyed = [false; PHASES.len()];
         for phase in PHASES {
             for binding in bindings
                 .iter()
@@ -4002,6 +4319,12 @@ impl Engine {
                         .and_then(|i| profile_needs.get(usize::from(i)))
                         .copied()
                         .unwrap_or_default();
+                    // A rule that pins a key, or a stage that places by a
+                    // ring, the profile's or its shadow's: what a keyed
+                    // decision answers for, or lends a ring for.
+                    let reads_ring = own.ring || shadow.ring;
+                    keyed[slot(phase)] |=
+                        binding.plan == Plan::Single && (binding.sessions.is_some() || reads_ring);
                     phase_needs[slot(phase)] = phase_needs[slot(phase)]
                         .or(own)
                         .or(shadow)
@@ -4039,8 +4362,9 @@ impl Engine {
                 break;
             }
         }
-        let sessions =
-            SessionTable::new(shortest_sweep(&bindings)).with_absence(absence(&bindings));
+        let sessions = SessionTable::new(shortest_sweep(&bindings))
+            .with_absence(absence(&bindings))
+            .with_shards(session_shards(&bindings));
         let orders: Vec<Order> = profiles.iter().map(Order::of).collect();
         let marks: Vec<Marks> = profiles
             .iter()
@@ -4048,6 +4372,13 @@ impl Engine {
             .map(|(profile, &order)| Marks::of(profile, order))
             .collect();
         let keeping = marks.iter().any(|marks| marks.scoped());
+        #[cfg(feature = "in-process")]
+        let written_draws = profiles
+            .iter()
+            .map(|profile| {
+                draws_first(profile) && DRAWS_BY_ITS_TEST.contains(&profile.picker.name())
+            })
+            .collect();
         let stating = profiles
             .iter()
             .map(|profile| {
@@ -4065,6 +4396,22 @@ impl Engine {
             .map(|(profile, &folded)| profile.named_by(folded))
             .collect();
         let keepers = Keeper::of(&profiles);
+        // The engine's own: the session table follows a dispatch where a
+        // binding states a sessions rule. At an issue the engine does
+        // nothing but tell its stages: the record of dispatched prefixes
+        // is its host's to write, where the host decides.
+        let own = if bindings.iter().any(|binding| binding.sessions.is_some()) {
+            EventSet::NONE.with(EventKind::Dispatched)
+        } else {
+            EventSet::NONE
+        };
+        let hears = profiles.iter().fold(own, |hears, profile| {
+            let stages = profile
+                .scorers
+                .iter()
+                .map(|weighted| weighted.scorer.hears());
+            stages.fold(hears.union(profile.picker.hears()), EventSet::union)
+        });
         let shadows = bindings
             .iter()
             .any(|binding| binding.shadow.is_some() || binding.decode_shadow.is_some());
@@ -4152,6 +4499,7 @@ impl Engine {
             generation,
             needs,
             phase_needs,
+            keyed,
             sessions,
             assignment: AssignmentStages::default(),
             marks,
@@ -4159,12 +4507,15 @@ impl Engine {
             named_by,
             row_tests,
             orders,
+            #[cfg(feature = "in-process")]
+            written_draws,
             seat_flags: (u8::from(keeping) * KEEPS_SLOT_STATE) | (u8::from(shadows) * SHADOWS),
             explain_sample: 0,
             max_report_age_ms: None,
             keepers,
             stating,
             sent_credits: Vec::new(),
+            hears,
         }
     }
 
@@ -4738,11 +5089,25 @@ impl Engine {
         facts: &'a RequestFacts<'a>,
         cx: &'a Constraints<'a>,
     ) -> Option<RowTest<'a>> {
-        let at = usize::from(index);
-        let filters = &self.profiles.get(at)?.filters[..];
-        if self.marks.get(at)?.keyed() {
+        if self.marks.get(usize::from(index))?.keyed() {
             return None;
         }
+        self.row_test_at(index, facts, cx)
+    }
+
+    /// The test the profile at `index` asks of one row under `cx`, whatever
+    /// the key's mark says: [`Self::keeps_at`] for a caller that reads the
+    /// overload veto as its own pass does, lifted in `cx` for a kept key
+    /// ([`Self::decide_keyed`]). `None` where the pass alone can say which
+    /// rows stay ([`Profile::asked_by_row`]).
+    fn row_test_at<'a>(
+        &'a self,
+        index: u16,
+        facts: &'a RequestFacts<'a>,
+        cx: &'a Constraints<'a>,
+    ) -> Option<RowTest<'a>> {
+        let at = usize::from(index);
+        let filters = &self.profiles.get(at)?.filters[..];
         let tests = match self.named_by.get(at)?.held {
             Held::Unasked => return None,
             Held::Folded(tests) => Some(tests),
@@ -4831,6 +5196,110 @@ impl Engine {
         // request, which may answer before it reads its key.
         scratch.sessions_found.forget();
         self.decide_as::<true>(facts, pool, candidates, cx, scratch)
+    }
+
+    /// The draw a plain single decision of `facts` is, over a pool of
+    /// `rows` rows whose host writes a row's record when the decision asks
+    /// about the row ([`Self::decide_drawn`]). `None` where
+    /// [`Self::decide`] would not decide these facts by its draw at once,
+    /// or the profile's draw may not be asked before the records
+    /// ([`DRAWS_BY_ITS_TEST`]): that host writes every row and asks
+    /// [`Self::decide`].
+    ///
+    /// The conditions are the ones [`Self::decide`] comes to its draw
+    /// under, in its order: the binding the request resolves to; no column
+    /// of affinity facts, which is one entry a written row; no scope to
+    /// open, no assignment that places and no key that lifts a veto; no
+    /// sessions rule over a keyed request; no encode item; no list of the
+    /// pool's engines for a profile that decides over them; a pool of
+    /// [`DRAW_FROM`] rows or more; and a profile that draws for every
+    /// request, or for this one, which names rows. `pool` is read for its
+    /// list of engines alone.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn drawn_for(
+        &self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        rows: usize,
+    ) -> Option<Drawn> {
+        if rows < DRAW_FROM || !facts.affinity.is_empty() {
+            return None;
+        }
+        let (entry, index, _) = self.resolve(facts.model, facts.phase)?;
+        let at = usize::from(index);
+        if !self.written_draws.get(at).copied().unwrap_or(false) {
+            return None;
+        }
+        let marks = self.marks[at];
+        let binding = &entry.binding;
+        let keyed = binding.sessions.is_some()
+            && binding.plan == Plan::Single
+            && !facts.session_key.is_none();
+        let encode = matches!(
+            (binding.plan, facts.phase),
+            (Plan::Epd { .. }, Phase::Encode)
+        );
+        if !marks.asks_nothing_first() || keyed || encode {
+            return None;
+        }
+        if marks.first() & (Marks::ENGINES | Marks::OWNS) != 0 && !pool.engines.is_empty() {
+            return None;
+        }
+        let ahead = marks.ahead();
+        let draws =
+            ahead == Marks::DRAWS_FIRST || (facts.named.is_some() && ahead & Marks::JOINED != 0);
+        draws.then_some(Drawn {
+            index,
+            vetoed: entry.vetoed,
+        })
+    }
+
+    /// [`Self::decide`] for a decision that is a draw's ([`Self::drawn_for`]
+    /// said so of these facts and this pool), by a host that keeps the
+    /// fixed half of its rows and writes a row's record when the decision
+    /// asks about the row.
+    ///
+    /// `fixed` are the pool's rows with no live value, in the pool's order,
+    /// and `rows` is the host's buffer of as many rows. `write` is handed a
+    /// fixed row and the buffer's row at its place, and writes the whole
+    /// record there: it is called for each row the draw asks about, for
+    /// each row the request names, and for every row where the draw keeps
+    /// nobody and the whole pass decides. The decision is the one
+    /// [`Self::decide`] makes over the same rows written whole. No lock
+    /// and no allocation beyond the stages' own.
+    #[cfg(feature = "in-process")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one decision's inputs, and the host's two halves of a row: the fixed rows, the buffer and the write"
+    )]
+    pub(crate) fn decide_drawn(
+        &self,
+        drawn: Drawn,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        fixed: &[Candidate],
+        rows: &mut [Candidate],
+        write: &mut dyn FnMut(&Candidate, &mut Candidate),
+        cx: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Decision {
+        // The plain entry decides: a debug build keeps it for the shadow's
+        // stop on a mix of the two.
+        #[cfg(debug_assertions)]
+        {
+            scratch.kept_last = false;
+        }
+        run_drawn_written(
+            self,
+            drawn,
+            facts,
+            pool,
+            fixed,
+            rows,
+            write,
+            cx,
+            &mut scratch.single,
+        )
     }
 
     /// The body of the two entries. `KEEPS` is the keeping entry's form.
@@ -5293,11 +5762,7 @@ impl Engine {
         } else if handed {
             found.pins
         } else {
-            match self.sessions.held(key) {
-                Some((pins, SessionExpiry::At(at))) if facts.now_micros < at => pins,
-                Some((pins, SessionExpiry::Never)) if facts.now_micros < u64::MAX => pins,
-                _ => [WorkerId(0); 2],
-            }
+            self.sessions.pins_at(key, facts.now_micros)
         };
         if WRITE_SESSIONS && KEEPS {
             // What the table gave at the read: the shadow starts from it.
@@ -6471,6 +6936,18 @@ impl Lifecycle for Engine {
             profile.picker.needs_lifecycle()
                 || profile.scorers.iter().any(|w| w.scorer.needs_lifecycle())
         })
+    }
+
+    /// The words the document takes: a stage's, the session table's at a
+    /// dispatch under a sessions rule, the record of dispatched prefixes
+    /// at an issue, and a count of sends at a dispatch. Folded at the
+    /// build: one read here.
+    fn hears(&self) -> EventSet {
+        if self.sent_credits.is_empty() {
+            self.hears
+        } else {
+            self.hears.with(EventKind::Dispatched)
+        }
     }
 }
 

@@ -152,12 +152,11 @@ pub(super) async fn preprocess(
             // Let the owned split copy those slices in parallel.
             let limit = budget.saturating_sub(1);
             // A pooled buffer's class can be over the budget while its bytes
-            // fit: share one exact-length copy, so a replay reads the entries
-            // without a gather, and return the buffer to the pool.
+            // fit: shrink it to its exact length, which the allocator does in
+            // place, so a replay reads the entries without a gather.
             if let EncoderInput::Wire { bytes, .. } = &mut batch.encoder_input {
                 if bytes.capacity() > limit && bytes.len() <= limit {
-                    let exact = bytes.to_vec();
-                    buffer_pool::recycle(std::mem::replace(bytes, exact));
+                    bytes.shrink_to_fit();
                 }
             }
             batch.encoder_input.share_wire(limit);

@@ -18,7 +18,7 @@ use crate::{
             ZoneCapacity,
         },
     },
-    plugins::shared::shown_hashes,
+    plugins::shared::{shown_hashes, shown_size},
     tracking::{
         in_flight::with_counts,
         lease::{
@@ -253,7 +253,7 @@ pub(crate) fn request<'a>(
         priority: facts.priority,
         streaming: facts.streaming,
         max_output_tokens: facts.max_output_tokens,
-        prompt_tokens: facts.prompt_tokens,
+        prompt_tokens: shown_size(facts, needs),
         block_hashes: shown_hashes(facts, needs),
         hash_kind: hash_kind(facts.hash_kind),
         session_key: session_identity(facts, exposure.session_key),
@@ -723,7 +723,8 @@ impl Packed {
         put(buf, REQ_TENANT, &tenant_hash.to_le_bytes());
         put(buf, REQ_SESSION_KEY, &session_hash.to_le_bytes());
         put(buf, REQ_BUDGET, &facts.budget_micros.to_le_bytes());
-        put(buf, REQ_PROMPT_TOKENS, &facts.prompt_tokens.to_le_bytes());
+        let size = shown_size(facts, needs);
+        put(buf, REQ_PROMPT_TOKENS, &size.to_le_bytes());
         put(buf, REQ_MAX_OUTPUT, &facts.max_output_tokens.to_le_bytes());
         put(buf, REQ_PRIORITY, &facts.priority.to_le_bytes());
         put(buf, REQ_HASH_COUNT, &hash_count.to_le_bytes());
@@ -1441,6 +1442,41 @@ mod tests {
         assert_eq!(record.block_hashes, &longer[..3]);
     }
 
+    /// Both forms carry the request's size for a row that declares it, and
+    /// zero for a row that does not, whatever else it declares. A plugin
+    /// that reads the size undeclared reads zero at once: of a request its
+    /// host read whole as of one its host sent on unread.
+    #[test]
+    fn a_view_carries_the_requests_size_its_row_declares() {
+        let facts = RequestFacts {
+            prompt_tokens: 512,
+            ..RequestFacts::default()
+        };
+        let sized = Needs {
+            prompt_size: true,
+            ..Needs::default()
+        };
+        let other = Needs {
+            token_hashes: true,
+            text_hashes: true,
+            loads: true,
+            ..Needs::default()
+        };
+        for (needs, shown) in [(sized, 512), (other, 0), (Needs::default(), 0)] {
+            let record = request(&facts, &Exposure::default(), needs, &[], &[]);
+            assert_eq!(record.prompt_tokens, shown, "{needs:?}");
+            let mut packed = Packed::default();
+            packed
+                .fill_request(&facts, &Exposure::default(), needs)
+                .expect("the request packs");
+            assert_eq!(
+                le_u32(&packed.request, REQ_PROMPT_TOKENS),
+                shown,
+                "{needs:?}"
+            );
+        }
+    }
+
     /// The two u64 sections are written a section at a time: every hash and
     /// every tried id sits at its own eight bytes, little-endian and in
     /// order, the tried ids after the hashes, at any length of either, in
@@ -1532,6 +1568,8 @@ mod tests {
             named: None,
             signal_cells: None,
             client_key: 0,
+            ring: None,
+            ring_awaited: false,
         };
         let exposure = Exposure {
             tenant: Reveal::Plain,

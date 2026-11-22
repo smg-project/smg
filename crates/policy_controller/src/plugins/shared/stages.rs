@@ -401,6 +401,13 @@ macro_rules! forward_lifecycle {
                         .as_ref()
                         .is_some_and(|fallback| fallback.needs_lifecycle())
             }
+
+            // The events the plugin observes, and its fallback's.
+            fn hears(&self) -> EventSet {
+                self.fallback.as_ref().map_or(self.observes, |fallback| {
+                    self.observes.union(fallback.hears())
+                })
+            }
         }
     };
 }

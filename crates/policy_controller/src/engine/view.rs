@@ -7,7 +7,7 @@
 //! into the spec's declared lists (zones, engine kinds, connectors, labels,
 //! headers) are the same positions here.
 
-use crate::{load::signals, tracking::in_flight};
+use crate::{load::signals, policies::consistent_hashing::PoolRing, tracking::in_flight};
 
 /// The stable identity of a candidate: a hash of the registration key and the
 /// incarnation, never a URL. A same-URL replacement is a new id.
@@ -22,6 +22,20 @@ pub enum Role {
     Prefill,
     Decode,
     Encode,
+}
+
+/// The role of a worker object of this type.
+#[cfg(any(feature = "in-process", feature = "worker-host"))]
+impl From<smg_worker::worker::WorkerType> for Role {
+    fn from(worker_type: smg_worker::worker::WorkerType) -> Self {
+        use smg_worker::worker::WorkerType;
+        match worker_type {
+            WorkerType::Regular => Self::Single,
+            WorkerType::Prefill => Self::Prefill,
+            WorkerType::Decode => Self::Decode,
+            WorkerType::Encode => Self::Encode,
+        }
+    }
 }
 
 /// Which phase of a request a decision is for.
@@ -44,6 +58,19 @@ pub enum Phase {
     Prefill,
     Decode,
     Encode,
+}
+
+impl Phase {
+    /// The phase's name, as a document writes it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+            Self::Encode => "encode",
+        }
+    }
 }
 
 /// What the request's block hashes were computed over.
@@ -136,6 +163,19 @@ impl WireModes {
 
     pub const fn is_empty(self) -> bool {
         self.0 == 0
+    }
+}
+
+/// The one wire a worker object of this connection mode serves.
+#[cfg(any(feature = "in-process", feature = "worker-host"))]
+impl From<smg_worker::worker::ConnectionMode> for WireModes {
+    fn from(mode: smg_worker::worker::ConnectionMode) -> Self {
+        use smg_worker::worker::ConnectionMode;
+        match mode {
+            ConnectionMode::Http => Self::HTTP,
+            ConnectionMode::Grpc => Self::GRPC,
+            ConnectionMode::Zmq => Self::ZMQ,
+        }
     }
 }
 
@@ -894,7 +934,12 @@ pub struct RequestFacts<'a> {
     pub priority: i32,
     pub streaming: bool,
     pub max_output_tokens: u32,
-    /// The host's token count or estimate.
+    /// The host's token count or estimate. A stage that reads it declares
+    /// [`Needs::prompt_size`](crate::document::Needs::prompt_size): a host
+    /// that sends a request on without reading its prompt states zero
+    /// where no stage does. Nothing masks the field for a stage of a
+    /// host's own build, which reads it here: undeclared, it reads zero on
+    /// such a request and the true size on every other.
     pub prompt_tokens: u32,
     /// One hash a whole block of the prompt, in order from the first,
     /// capped by the host. A hash is of its own block's content and of
@@ -1024,6 +1069,25 @@ pub struct RequestFacts<'a> {
     /// The wire's request facts carry it to a controller, and a plugin's
     /// frame keeps `0` under every exposure.
     pub client_key: u64,
+    /// The hash ring of the list the candidates are, where the host keeps
+    /// one a list ([`PoolRing`]): a stage that places by a ring reads this
+    /// one, with no lock, and its own ring learns nothing of the decision.
+    /// `None` where the host keeps none: such a stage then places by its
+    /// own ring, which learns its members from the candidates. A host
+    /// lends the ring of the list it hands as the candidates and never the
+    /// ring of another list: a ring of another length than the candidates
+    /// is its caller's error, which a debug build stops at and any other
+    /// build passes over, placing by the stage's own ring. A pair takes
+    /// none: each side is a list of its own. In-process only.
+    pub ring: Option<&'a PoolRing>,
+    /// The host keeps a ring for the candidates' list and that ring is not
+    /// built yet, so [`Self::ring`] is `None`. Such a host builds a list's
+    /// ring off the path of a request, and a request that comes first
+    /// neither builds it nor waits for it. A stage that places by a ring
+    /// places such a request as one that carries no key, by its profile's
+    /// draw, and neither reads its own ring nor teaches it. In-process
+    /// only.
+    pub ring_awaited: bool,
 }
 
 /// The multiplier that spreads a session's model and phase over its key.
@@ -1463,13 +1527,13 @@ mod tests {
 
     /// A request's facts are copied where a decision narrows or resumes
     /// them, so their size is a cost of those decisions: the pin is exact.
-    /// The signal cells are one word, for every signal, and the client's
-    /// key is one word more: a field the facts gain moves this number and
-    /// carries the decision bench's cells that copy the facts
-    /// (`benches/decision.rs`).
+    /// The signal cells are one word, for every signal, the client's key
+    /// is one word more and the lent ring another: a field the facts gain
+    /// moves this number and carries the decision bench's cells that copy
+    /// the facts (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
-        assert_eq!(size_of::<RequestFacts<'_>>(), 296);
+        assert_eq!(size_of::<RequestFacts<'_>>(), 304);
     }
 
     #[test]

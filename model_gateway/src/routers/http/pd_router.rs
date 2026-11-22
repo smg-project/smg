@@ -1864,6 +1864,7 @@ impl PDRouter {
             )
             .await;
         Self::record_attempt_outcomes(
+            ledger,
             prefill.as_ref(),
             decode.as_ref(),
             response.status(),
@@ -2064,8 +2065,11 @@ impl PDRouter {
     /// status is the decode's there, and recording it on the prefill would
     /// reset the failures the drain counts. A streamed decode head's success
     /// was recorded before its relay task was spawned
-    /// (`create_streaming_response`), so it is not recorded again.
+    /// (`create_streaming_response`), so it is not recorded again. A failure
+    /// goes through the request's `ledger`, which charges a worker once a
+    /// request however many of its attempts failed there.
     fn record_attempt_outcomes(
+        ledger: &AttemptLedger,
         prefill: &dyn Worker,
         decode: &dyn Worker,
         status: StatusCode,
@@ -2077,10 +2081,10 @@ impl PDRouter {
             prefill_outcome == PrefillOutcome::FromStatus && failed_side != Some(PdSide::Decode);
         let attempt_records_decode = failed_side != Some(PdSide::Prefill);
         if attempt_records_prefill {
-            prefill.record_outcome(status.as_u16());
+            ledger.record_outcome(prefill, status.as_u16());
         }
         if attempt_records_decode && !(decode_head_recorded && status.is_success()) {
-            decode.record_outcome(status.as_u16());
+            ledger.record_outcome(decode, status.as_u16());
         }
 
         // Record worker errors for server errors (5xx)
@@ -6277,6 +6281,7 @@ mod tests {
                 // What the drain records when the prefill body fails.
                 prefill.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
                 PDRouter::record_attempt_outcomes(
+                    &AttemptLedger::default(),
                     prefill.as_ref(),
                     decode.as_ref(),
                     StatusCode::OK,
@@ -9190,6 +9195,7 @@ mod tests {
         );
         let recorded = half_open_decode_worker();
         PDRouter::record_attempt_outcomes(
+            &AttemptLedger::default(),
             prefill.as_ref(),
             recorded.as_ref(),
             StatusCode::OK,
@@ -9201,6 +9207,7 @@ mod tests {
 
         let unrecorded = half_open_decode_worker();
         PDRouter::record_attempt_outcomes(
+            &AttemptLedger::default(),
             prefill.as_ref(),
             unrecorded.as_ref(),
             StatusCode::OK,
@@ -10754,6 +10761,45 @@ mod tests {
         assert!(
             decode.circuit_breaker_can_execute(),
             "one request's retried decode cuts opened the breaker"
+        );
+    }
+
+    /// The parallel dispatch's twin: a decode worker's 503 is replayed for
+    /// every attempt the retry config allows, and the request charges that
+    /// worker once.
+    #[tokio::test]
+    async fn retried_parallel_decode_refusals_charge_one_breaker_failure() {
+        let prefill_url = healthy_stub(Shape::Parallel, PdSide::Prefill).await;
+        let (decode_url, attempts) = refusing_stub(StatusCode::SERVICE_UNAVAILABLE).await;
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(decode_url)
+                .worker_type(WorkerType::Decode)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        decode.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        let router = quick_retry_router();
+        let prefill = create_test_worker(prefill_url, WorkerType::Prefill, true);
+        for worker in [Arc::from(prefill), Arc::clone(&decode)] {
+            router.worker_registry.register_or_replace(worker);
+        }
+
+        let response = chat_through(&router, false).await;
+
+        assert_eq!(
+            (response.status(), attempts.lock().unwrap().len()),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                router.retry_config.max_retries as usize
+            ),
+            "the answer and the attempts on the refusing decode worker"
+        );
+        assert!(
+            decode.circuit_breaker_can_execute(),
+            "one request's retried decode refusals opened the breaker"
         );
     }
 

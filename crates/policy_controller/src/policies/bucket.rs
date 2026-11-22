@@ -73,7 +73,7 @@ use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    document::spec::{BucketParams, ProfileSpec},
+    document::spec::{BucketParams, Needs, ProfileSpec},
     engine::{
         decision::{Decision, Target},
         framework::{Scorer, TieBand},
@@ -81,7 +81,7 @@ use crate::{
     },
     policies::standard_filters,
     stages::{lifecycle::Lifecycle, retired_workers::RetiredWorkers},
-    tracking::lease::{Lease, Membership, Side},
+    tracking::lease::{EventKind, EventSet, Lease, Membership, Side},
 };
 
 /// How the `bucket` policy is composed: its filters, its scorers and its
@@ -914,6 +914,14 @@ impl Lifecycle for Bucket {
     fn needs_lifecycle(&self) -> bool {
         true
     }
+
+    /// The issue books and the dispatch books again where the request went
+    /// elsewhere. A booking ages off: neither end is taken.
+    fn hears(&self) -> EventSet {
+        EventSet::NONE
+            .with(EventKind::Issued)
+            .with(EventKind::Dispatched)
+    }
 }
 
 impl Scorer for Bucket {
@@ -924,6 +932,16 @@ impl Scorer for Bucket {
     // Places by its book of issues and dispatches: a late one moves the pick.
     fn refuses_by_reports(&self) -> bool {
         false
+    }
+
+    // A prefill is placed by the prompt's size, so a host that can send a
+    // request on unread reads it under this stage: a size of zero would
+    // send every request to the owner of the smallest sizes.
+    fn needs(&self) -> Needs {
+        Needs {
+            prompt_size: true,
+            ..Needs::default()
+        }
     }
 
     fn score(

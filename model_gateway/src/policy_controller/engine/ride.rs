@@ -120,6 +120,19 @@ impl Deref for Sent {
 }
 
 impl Sent {
+    /// A placement as its HTTP route holds it: the worker, and the
+    /// placement itself where a word of the request is owed to its engine
+    /// ([`Placed::owes`]). A placement that owes none is its worker and
+    /// nothing else: its send is told to nobody, no clock is read at its
+    /// dispatch or its end, and its answer's body is not held to its end.
+    pub(crate) fn of(placed: Placed) -> (Arc<dyn Worker>, Option<Self>) {
+        if placed.owes() {
+            (Arc::clone(placed.worker()), Some(Self::from(placed)))
+        } else {
+            (placed.into_worker(), None)
+        }
+    }
+
     /// The request was sent to the worker at `now`. Said once.
     pub(crate) fn dispatched(&mut self, now: Instant) {
         self.at = Some(now);

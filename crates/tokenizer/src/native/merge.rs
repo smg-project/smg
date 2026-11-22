@@ -529,8 +529,22 @@ impl MergeTable {
             min_operand[left as usize] = min_operand[left as usize].min(rank);
             min_operand[right as usize] = min_operand[right as usize].min(rank);
         }
-        let mut raws = Raws::for_tokens(ranks.len(), ranks.keys().map(Vec::len).sum());
+        // The tokens in rank order, placed and not sorted: the analysis
+        // orders them by id, one pass where they come in order. A token
+        // another of its rank displaces goes after the placed ones.
+        let mut by_rank: Vec<Option<&Vec<u8>>> = vec![None; ranks_end];
+        let mut twice = Vec::new();
         for (token, &rank) in ranks {
+            if let Some(first) = by_rank[rank as usize].replace(token) {
+                twice.push((rank, first));
+            }
+        }
+        let placed = by_rank
+            .iter()
+            .enumerate()
+            .filter_map(|(rank, token)| token.map(|token| (rank as u32, token)));
+        let mut raws = Raws::for_tokens(ranks.len(), ranks.keys().map(Vec::len).sum());
+        for (rank, token) in placed.chain(twice) {
             raws.push(rank, token.iter().copied().map(Some), |_| true);
         }
         table.preformed = Box::new(Preformed::analyse(&table, raws, &min_operand));
@@ -712,7 +726,7 @@ impl MergeTable {
 
     /// Reads one word of every line of the table, the buckets first, then
     /// the grid and the filter (the small, hot tables last, so they stay in
-    /// the nearer caches), and keeps nothing: a thread's first encode with
+    /// the nearer caches), and keeps nothing: an early encode of a thread with
     /// the encoder calls it so that the table's lines come in as one stream
     /// then rather than one dependent probe at a time during the first-sight
     /// pieces of the texts after it. In a fresh process the table was built

@@ -340,6 +340,7 @@ const POLICY_DECISIONS_TOTAL: &str = "smg_policy_decisions_total";
 const POLICY_DECISION_SECONDS: &str = "smg_policy_decision_seconds";
 const POLICY_SHADOW_DECISIONS_TOTAL: &str = "smg_policy_shadow_decisions_total";
 const POLICY_DECISION_FAULTS_TOTAL: &str = "smg_policy_decision_faults_total";
+const POLICY_UNBOUND_MODELS_TOTAL: &str = "smg_policy_unbound_models_total";
 
 /// Time to first token on edges that resolve it. The same observation as
 /// `smg_router_ttft_seconds`, which keeps the request-duration buckets (and
@@ -825,6 +826,11 @@ pub(crate) fn init_metrics() {
         POLICY_DECISION_FAULTS_TOTAL,
         "Policy controller decisions that panicked, with the shadow decisions that panicked \
          beside a live decision that stood"
+    );
+    describe_counter!(
+        POLICY_UNBOUND_MODELS_TOTAL,
+        "Models that got their first worker while no binding of the supplied policy document \
+         names them: the classic policies place their requests"
     );
     describe_counter!(
         "smg_worker_errors_total",
@@ -2326,16 +2332,38 @@ impl Metrics {
         });
     }
 
-    /// Count and time one policy decision for `model_id`. The counter asks
-    /// `profile_name` only when it needs a handle for a profile. A decision
-    /// no profile made counts under an empty `profile` label and keeps its
-    /// handle under no generation. Where a profile's generation is gone, the
-    /// empty label is used and that handle is discarded after counting.
+    /// Count and time one policy decision for `model_id`: its count
+    /// ([`Self::count_policy_decision`]) and its duration, `seconds`.
+    #[inline]
     pub fn record_policy_decision(
         model_id: &str,
         decision: PolicyDecision,
         profile_name: impl FnOnce() -> Option<Arc<str>>,
         seconds: f64,
+    ) {
+        let PolicyDecision { outcome, mode, .. } = decision;
+        Self::count_policy_decision(model_id, decision, profile_name);
+        handles::with_static(
+            &handles::POLICY_DECISION_SECONDS,
+            (mode, outcome),
+            || histogram!(POLICY_DECISION_SECONDS, "mode" => mode, "outcome" => outcome),
+            |time| time.record(seconds),
+        );
+    }
+
+    /// Count one policy decision for `model_id` and time nothing: a pick
+    /// that ran no stage of a profile is counted like any other decision,
+    /// and has no duration its two reads of a clock would be worth. The
+    /// counter asks `profile_name` only when it needs a handle for a
+    /// profile. A decision no profile made counts under an empty `profile`
+    /// label and keeps its handle under no generation. Where a profile's
+    /// generation is gone, the empty label is used and that handle is
+    /// discarded after counting.
+    #[inline]
+    pub fn count_policy_decision(
+        model_id: &str,
+        decision: PolicyDecision,
+        profile_name: impl FnOnce() -> Option<Arc<str>>,
     ) {
         let PolicyDecision {
             generation,
@@ -2390,12 +2418,6 @@ impl Metrics {
             let name = profile.and_then(|_| profile_name());
             build(intern_model_label(model_id), name).increment(1);
         }
-        handles::with_static(
-            &handles::POLICY_DECISION_SECONDS,
-            (mode, outcome),
-            || histogram!(POLICY_DECISION_SECONDS, "mode" => mode, "outcome" => outcome),
-            |time| time.record(seconds),
-        );
     }
 
     /// The count of the shadow decisions that said `kind` beside a live
@@ -2443,6 +2465,13 @@ impl Metrics {
             "stage" => stage
         )
         .increment(1);
+    }
+
+    /// A model got its first worker while no binding of the supplied
+    /// policy document plans its single requests: the classic policies
+    /// place them.
+    pub fn record_policy_unbound_model() {
+        counter!(POLICY_UNBOUND_MODELS_TOTAL).increment(1);
     }
 
     /// Record a request placed although every worker it could use is
