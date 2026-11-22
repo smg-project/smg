@@ -726,12 +726,16 @@ impl ResponseStreamEventEmitter {
                 let Some(value) = value else { continue };
                 let mut text = [0u8; 32];
                 let mut rest = &mut text[..];
-                if serde_json::to_writer(&mut rest, &value).is_ok() {
-                    let left = rest.len();
-                    if let Ok(value) = serde_json::from_slice(&text[..text.len() - left]) {
-                        response_obj[key] = value;
+                let exact = match serde_json::to_writer(&mut rest, &value) {
+                    Ok(()) => {
+                        let left = rest.len();
+                        serde_json::from_slice(&text[..text.len() - left]).ok()
                     }
-                }
+                    Err(_) => None,
+                };
+                // An f32 prints in at most 16 bytes, so this never falls back
+                // in practice; if it did, keep the key with the widened number.
+                response_obj[key] = exact.unwrap_or_else(|| json!(value));
             }
             Self::add_optional_field(&mut response_obj, "truncation", req.truncation.as_ref());
             Self::add_optional_field(&mut response_obj, "user", req.user.as_ref());
