@@ -1,8 +1,10 @@
 //! Inkling2 native still-image preprocessing, without training-only virtual resizing.
 //!
-//! Features retain separate F32 divide/subtract/divide normalization until the
-//! common BF16 wire conversion. Grid cells are pixel-major RGB patches with two
-//! identical temporal slices; every cell produces one language-model token.
+//! Features retain separate F32 divide/subtract/divide normalization; a
+//! bfloat16 or float16 wire narrows each level of it in the processor's own
+//! per-byte table, any other destination in the common wire conversion. Grid
+//! cells are pixel-major RGB patches with two identical temporal slices; every
+//! cell produces one language-model token.
 
 use std::collections::HashMap;
 
@@ -10,10 +12,14 @@ use image::{DynamicImage, GenericImageView};
 use ndarray::{ArrayD, IxDyn};
 use serde_json::{json, Value};
 
-use crate::vision::{
-    preprocessor_config::PreProcessorConfig,
-    processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
-    transforms::TransformError,
+use crate::{
+    buffer_pool,
+    encoder_inputs::{f32_to_bf16_bits, f32_to_f16_bits, EncoderDtype, EncoderInput, PixelNorm},
+    vision::{
+        preprocessor_config::PreProcessorConfig,
+        processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
+        transforms::TransformError,
+    },
 };
 
 const PATCH_SIZE: usize = 40;
@@ -140,26 +146,15 @@ impl Inkling2ImageProcessor {
         let scaled = raw / 255.0_f32;
         (scaled - MEAN[channel]) / STD[channel]
     }
-}
 
-impl VisionPreProcessor for Inkling2ImageProcessor {
-    fn default_mean(&self) -> [f64; 3] {
-        super::inkling::INKLING_IMAGE_MEAN
-    }
-
-    fn default_std(&self) -> [f64; 3] {
-        super::inkling::INKLING_IMAGE_STD
-    }
-
-    /// Transparent pixels are composited over the native checkerboard here,
-    /// so the frame must reach the processor with its alpha channel.
-    fn keeps_alpha(&self) -> bool {
-        true
-    }
-
-    fn preprocess(
-        &self,
+    /// The pipeline of both outputs, the float tensor and the wire: `take`
+    /// gives the storage of the batch's elements, `level` the elements a raw
+    /// value of a channel is written as, `finish` the encoder input.
+    fn batch<E: Copy, const N: usize>(
         images: &[&DynamicImage],
+        take: impl FnOnce(usize) -> Result<Vec<E>, TransformError>,
+        level: impl Fn(f32, usize) -> [E; N],
+        finish: impl FnOnce(Vec<E>, usize) -> Result<EncoderInput, TransformError>,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let mut counts = Vec::with_capacity(images.len());
         let mut sizes = Vec::with_capacity(images.len());
@@ -188,15 +183,10 @@ impl VisionPreProcessor for Inkling2ImageProcessor {
             total = next_total;
         }
 
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(total * PATCH_VALUES)
-            .map_err(|error| {
-                TransformError::ShapeError(format!("Inkling2 patch allocation failed: {error}"))
-            })?;
-        let padding = std::array::from_fn::<_, 3, _>(|channel| Self::normalized(-1.0, channel));
-        let table: [[f32; 256]; 3] = std::array::from_fn(|channel| {
-            std::array::from_fn(|value| Self::normalized(value as f32, channel))
+        let mut output = take(N * total * PATCH_VALUES)?;
+        let padding = std::array::from_fn::<_, 3, _>(|channel| level(-1.0, channel));
+        let table: [[[E; N]; 256]; 3] = std::array::from_fn(|channel| {
+            std::array::from_fn(|value| level(value as f32, channel))
         });
         for image in images {
             // An RGB image is read where it stands: `to_rgba8` would copy it
@@ -233,11 +223,14 @@ impl VisionPreProcessor for Inkling2ImageProcessor {
                         };
                         let copied = if rgb.is_some() { on_image.len() } else { 0 };
                         for &[red, green, blue] in &block[y - patch_y * PATCH_SIZE][..copied] {
-                            output.extend_from_slice(&[
-                                table[0][usize::from(red)],
-                                table[1][usize::from(green)],
-                                table[2][usize::from(blue)],
-                            ]);
+                            output.extend_from_slice(
+                                [
+                                    table[0][usize::from(red)],
+                                    table[1][usize::from(green)],
+                                    table[2][usize::from(blue)],
+                                ]
+                                .as_flattened(),
+                            );
                         }
                         let with_alpha = if rgb.is_none() {
                             &rgba[on_image.clone()]
@@ -256,22 +249,25 @@ impl VisionPreProcessor for Inkling2ImageProcessor {
                                         / 255) as u8
                                 })
                             };
-                            output.extend_from_slice(&[
-                                table[0][usize::from(red)],
-                                table[1][usize::from(green)],
-                                table[2][usize::from(blue)],
-                            ]);
+                            output.extend_from_slice(
+                                [
+                                    table[0][usize::from(red)],
+                                    table[1][usize::from(green)],
+                                    table[2][usize::from(blue)],
+                                ]
+                                .as_flattened(),
+                            );
                         }
                         for _ in on_image.len()..PATCH_SIZE {
-                            output.extend_from_slice(&padding);
+                            output.extend_from_slice(padding.as_flattened());
                         }
                     }
-                    output.extend_from_within(start..start + PATCH_VALUES / TEMPORAL_PATCH_SIZE);
+                    output
+                        .extend_from_within(start..start + N * PATCH_VALUES / TEMPORAL_PATCH_SIZE);
                 }
             }
         }
-        let tensor = ArrayD::from_shape_vec(IxDyn(&[total, 2, 40, 40, 3]), output)
-            .map_err(|error| TransformError::ShapeError(error.to_string()))?;
+        let tensor = finish(output, total)?;
         let tokens_per_item = counts.iter().map(|&count| count as i64).collect();
         Ok(PreprocessedEncoderInputs::new(tensor, counts, sizes)
             .with_extra(
@@ -286,6 +282,82 @@ impl VisionPreProcessor for Inkling2ImageProcessor {
                 "vision_original_thw",
                 ModelSpecificValue::int_2d(original, images.len(), 3),
             ))
+    }
+}
+
+impl VisionPreProcessor for Inkling2ImageProcessor {
+    fn default_mean(&self) -> [f64; 3] {
+        super::inkling::INKLING_IMAGE_MEAN
+    }
+
+    fn default_std(&self) -> [f64; 3] {
+        super::inkling::INKLING_IMAGE_STD
+    }
+
+    /// Transparent pixels are composited over the native checkerboard here,
+    /// so the frame must reach the processor with its alpha channel.
+    fn keeps_alpha(&self) -> bool {
+        true
+    }
+
+    fn preprocess(
+        &self,
+        images: &[&DynamicImage],
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        Self::batch(
+            images,
+            |elements| {
+                let mut output = Vec::new();
+                output.try_reserve_exact(elements).map_err(|error| {
+                    TransformError::ShapeError(format!("Inkling2 patch allocation failed: {error}"))
+                })?;
+                Ok(output)
+            },
+            |raw, channel| [Self::normalized(raw, channel)],
+            |output, total| {
+                ArrayD::from_shape_vec(IxDyn(&[total, 2, 40, 40, 3]), output)
+                    .map(EncoderInput::from)
+                    .map_err(|error| TransformError::ShapeError(error.to_string()))
+            },
+        )
+    }
+
+    /// The two narrow float dtypes are written in one pass into a buffer of
+    /// the pool: a byte maps to the bytes of its level on the wire, so neither
+    /// the float tensor nor the pass that narrows it is made.
+    fn preprocess_wire(
+        &self,
+        images: &[&DynamicImage],
+        dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        let narrow: fn(f32) -> u16 = match dtype {
+            EncoderDtype::BFloat16 => f32_to_bf16_bits,
+            EncoderDtype::Float16 => f32_to_f16_bits,
+            EncoderDtype::Float32 | EncoderDtype::Uint8 => return None,
+        };
+        // Mean and std in byte units: a byte's level is this norm's in both
+        // narrow dtypes, and not in float32.
+        let norm = PixelNorm {
+            scale: 1.0,
+            offset: MEAN.map(|mean| mean * 255.0),
+            divisor: STD.map(|std| std * 255.0),
+            channel_block: 1,
+        };
+        Some(Self::batch(
+            images,
+            |elements| {
+                // Cleared: the patches are appended, so no byte of a previous
+                // request can be part of the wire.
+                let mut wire = buffer_pool::take(elements);
+                wire.clear();
+                Ok(wire)
+            },
+            |raw, channel| narrow(Self::normalized(raw, channel)).to_le_bytes(),
+            |wire, total| {
+                EncoderInput::wire(wire, dtype, vec![total, 2, 40, 40, 3], norm)
+                    .map_err(TransformError::ShapeError)
+            },
+        ))
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
@@ -572,5 +644,44 @@ mod tests {
             .preprocess_video(&[pixels(1, 1, false)], &VideoClipOptions::sampled_at(1.0))
             .is_err());
         assert!(processor.keeps_alpha());
+    }
+
+    #[test]
+    fn inkling2_wire_is_the_float_tensor_written_in_both_narrow_dtypes() {
+        let processor = Inkling2ImageProcessor::from_preprocessor_config(&config()).unwrap();
+        let images = [&pixels(83, 121, false), &pixels(57, 80, true)];
+        let two_pass = processor.preprocess(&images).unwrap();
+        for dtype in [EncoderDtype::BFloat16, EncoderDtype::Float16] {
+            let narrow = |level: f32| match dtype {
+                EncoderDtype::BFloat16 => f32_to_bf16_bits(level),
+                _ => f32_to_f16_bits(level),
+            };
+            let wire = processor.preprocess_wire(&images, dtype).unwrap().unwrap();
+            assert_eq!(wire.feature_token_counts, two_pass.feature_token_counts);
+            assert_eq!(
+                integers(&wire, "vision_grid_thw"),
+                integers(&two_pass, "vision_grid_thw")
+            );
+            assert_eq!(wire.encoder_input.shape(), two_pass.encoder_input.shape());
+            // The norm the wire names gives every byte its level.
+            let levels = wire.encoder_input.pixel_norm().unwrap().table_f32();
+            for (channel, levels) in levels.iter().enumerate() {
+                for (value, &level) in levels.iter().enumerate() {
+                    assert_eq!(
+                        narrow(level),
+                        narrow(Inkling2ImageProcessor::normalized(value as f32, channel)),
+                        "{dtype} channel {channel} byte {value}"
+                    );
+                }
+            }
+            assert!(
+                wire.encoder_input.into_bytes_as(dtype).unwrap()
+                    == two_pass.encoder_input.write_as(dtype),
+                "{dtype}: the wire differs from the float tensor's bytes"
+            );
+        }
+        assert!(processor
+            .preprocess_wire(&images, EncoderDtype::Float32)
+            .is_none());
     }
 }
