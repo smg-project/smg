@@ -12,6 +12,11 @@ use smg_policy_controller::{
 };
 
 use super::*;
+use crate::{
+    config::{ManualAssignmentMode, RouterConfig},
+    policies::DecidedByEngine,
+    policy_controller::start_in_process,
+};
 
 const MODEL: &str = "test-model";
 const WINDOW: u32 = 16;
@@ -310,4 +315,91 @@ async fn an_explicit_target_holds_the_request_to_the_worker_it_names() {
         turns[place.expect("a worker of the pool")] += 1;
     }
     assert!(turns[0] == 0 && turns[1] > 0 && turns[2] > 0, "{turns:?}");
+}
+
+/// The regular stage as a gateway's start builds it under the manual policy
+/// with the setting on: over the engine of the manual document, which
+/// decides every request, with the policy registry the start builds beside
+/// that engine. The registry too, for what it holds.
+fn manual_stage(registry: &Arc<WorkerRegistry>) -> (WorkerSelectionStage, Arc<PolicyRegistry>) {
+    let config = RouterConfig {
+        policy_controller: true,
+        policy: PolicyConfig::Manual {
+            eviction_interval_secs: 60,
+            max_idle_secs: 14_400,
+            assignment_mode: ManualAssignmentMode::Random,
+        },
+        ..RouterConfig::default()
+    };
+    let started = start_in_process(&config, None)
+        .expect("the document starts")
+        .expect("the setting starts an engine");
+    assert!(started.decides_whole());
+    let policies = Arc::new(PolicyRegistry::with_policy_engine(
+        config.policy.clone(),
+        config.routing_key_override.clone(),
+        Arc::clone(&started.engine),
+        started.origin,
+        true,
+    ));
+    let engine = PolicyEngine::own(started.engine, Arc::clone(registry));
+    let stage = WorkerSelectionStage::new(
+        Arc::clone(registry),
+        Arc::clone(&policies),
+        WorkerSelectionMode::Regular,
+        None,
+    )
+    .with_policy_engine(Some(Arc::new(engine)));
+    (stage, policies)
+}
+
+/// The worker `stage` places a first attempt under the routing key `key`
+/// on, the placement told its dispatch: a key's pin is made there.
+async fn dispatched_under(
+    stage: &WorkerSelectionStage,
+    registry: &Arc<WorkerRegistry>,
+    key: &str,
+) -> Arc<dyn Worker> {
+    let mut ctx = prompt_of(registry, 3);
+    let mut headers = HeaderMap::new();
+    let key = HeaderValue::from_str(key).expect("a header value");
+    headers.insert("x-smg-routing-key", key);
+    ctx.input.headers = Some(headers);
+    stage.execute(&mut ctx).await.expect("a worker");
+    let placed = ctx.state.placed.as_mut();
+    placed
+        .expect("the engine placed it")
+        .dispatched(Instant::now());
+    Arc::clone(single(ctx.state.workers.as_ref()))
+}
+
+/// Under the manual policy the regular stage of the gRPC wire asks the
+/// engine for every attempt. A key's requests follow the pin its first
+/// dispatch made, and many keys reach every worker. The registry holds the
+/// policy's name alone, with no classic policy behind it, and the stage
+/// never asks it for a worker.
+#[tokio::test]
+async fn under_the_manual_policy_the_engine_places_and_no_classic_policy_is_asked() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let workers = ["grpc://w0:8000", "grpc://w1:8000", "grpc://w2:8000"]
+        .map(|url| listed(&registry, url, RuntimeType::Vllm, None, UNLABELED));
+    let (stage, policies) = manual_stage(&registry);
+
+    let pinned = dispatched_under(&stage, &registry, "conversation-0").await;
+    for _ in 0..PLACEMENTS {
+        let again = dispatched_under(&stage, &registry, "conversation-0").await;
+        assert!(Arc::ptr_eq(&again, &pinned), "a key left its pin");
+    }
+    let mut keys = [0; 3];
+    for key in 1..=48 {
+        let on = dispatched_under(&stage, &registry, &format!("conversation-{key}")).await;
+        let place = workers.iter().position(|worker| Arc::ptr_eq(worker, &on));
+        keys[place.expect("a worker of the pool")] += 1;
+    }
+    assert!(keys.iter().all(|&taken| taken > 0), "{keys:?}");
+
+    let default = policies.get_default_policy();
+    let held = default.as_any().downcast_ref::<DecidedByEngine>();
+    let held = held.expect("the registry holds the policy's name alone");
+    assert!(!held.was_asked(), "the stage asked the classic policy");
 }
