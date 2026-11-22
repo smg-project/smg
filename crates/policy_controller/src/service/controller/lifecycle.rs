@@ -52,8 +52,8 @@ use crate::{
         completed::Class,
         released::{Reason, What},
     },
-    store::{Dispatch, GatewayId, Hand, MemoryStore, Said, Sides, StoreSnapshot},
-    tracking::lease::{LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+    store::{GatewayId, Hand, MemoryStore, Sides, StoreSnapshot},
+    tracking::lease::{Dispatch, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass},
 };
 
 /// A `Dispatched` frame: the gateway's lease moves to dispatched at `now`.
@@ -290,10 +290,10 @@ pub(crate) mod tests {
         },
         stages::{lifecycle::Lifecycle, registry::StageRegistry},
         store::{
-            DecodeSide, Dispatch, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore,
-            MemoryStore, PickRecord, SessionsStore, WorkerFacts, WorkersStore,
+            DecodeSide, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore,
+            PickRecord, SessionsStore, WorkerFacts, WorkersStore,
         },
-        tracking::lease::{Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+        tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
     };
 
     const A: GatewayId = GatewayId(11);

@@ -594,8 +594,8 @@ mod tests {
             elector::{Elector, TickOutcome},
             proto::{self, busy::Reason, decide_answer::Answer, identity::Form},
         },
-        store::{leases::DISPATCH_TTL, HealthSink, LeasesStore},
-        tracking::lease::{LeaseId, ReleaseReason, Side},
+        store::{HealthSink, LeasesStore},
+        tracking::lease::{LeaseId, ReleaseReason, Side, DISPATCH_TTL},
     };
 
     const ID: &str = "controller-0";

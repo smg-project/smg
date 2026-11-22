@@ -48,8 +48,8 @@ use crate::{
             SUBSET_HINT, WIRES,
         },
         decision_engine::{
-            DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Leased, Request,
-            RequestMaker, SweepOutcome,
+            DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused, HeldDecision,
+            Leased, Request, RequestMaker, SweepOutcome,
         },
         decision_slot::DecisionSlot,
         demands::{self, DemandFacts, Demands},
@@ -67,15 +67,14 @@ use crate::{
     },
     stages::lifecycle::Lifecycle,
     store::{
-        leases::DISPATCH_TTL, pairing::Refusal, AffinityQuery, AffinityRowsBuffers, AtWork,
-        DecodeIssue, DecodeRefused, DecodeSide, Dispatch, EncodePairBuffers, GatewayId, Hand,
-        HealthSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, MemoryStore, PairBuffers,
-        PickRecord, Pin, Said, SessionsStore, Sides, StoreSnapshot, ViewBuffers, ViewFacts,
-        ViewQuery,
+        pairing::Refusal, AffinityQuery, AffinityRowsBuffers, AtWork, DecodeIssue, DecodeSide,
+        EncodePairBuffers, GatewayId, Hand, HealthSink, LeaseRecord, LeaseRefused, LeaseState,
+        LeasesStore, MemoryStore, PairBuffers, PickRecord, Pin, SessionsStore, Sides,
+        StoreSnapshot, ViewBuffers, ViewFacts, ViewQuery,
     },
     tracking::{
         in_flight::WorkerSlot,
-        lease::{Lease, LeaseId, LeaseKind, Outcome, Side},
+        lease::{Dispatch, Lease, LeaseId, LeaseKind, Outcome, Said, Side, DISPATCH_TTL},
     },
 };
 
@@ -4487,6 +4486,7 @@ pub(crate) mod tests {
         document::spec::{AppliedSpec, Needs, PolicySpec},
         engine::{
             decision::{Decision, LiftedVeto, ShedReason, Target, Targets},
+            decision_engine::DecodeRefused,
             decision_slot::DecisionSlot,
             demands::{DemandFacts, Demands},
             framework::{self, DecisionScope, EncodeItems, EncodePlaced, Filter, Picker, TieBand},
@@ -4500,12 +4500,14 @@ pub(crate) mod tests {
         policies::random::Random,
         stages::{lifecycle::Lifecycle, pickers::Best, registry::StageRegistry},
         store::{
-            DecodeMark, DecodeRefused, Dispatch, EncodeHandoff, EncodeOffer, GatewayId, HealthSink,
-            HealthWrite, LeaderBits, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource,
-            MemoryStore, PickRecord, Said, SessionsStore, VetoWrite, ViewBuffers, ViewQuery,
-            WorkerFacts, WorkerStatus, WorkersStore,
+            DecodeMark, EncodeHandoff, EncodeOffer, GatewayId, HealthSink, HealthWrite, LeaderBits,
+            LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore, PickRecord,
+            SessionsStore, VetoWrite, ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus,
+            WorkersStore,
         },
-        tracking::lease::{Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+        tracking::lease::{
+            Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass,
+        },
     };
 
     mod shadow;

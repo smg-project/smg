@@ -71,8 +71,8 @@ use crate::{
     service::proto::{
         self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form,
     },
-    store::{DecodeIssue, Hand, MemoryStore, Said},
-    tracking::lease::{Lease, LeaseId, ReleaseReason, Side},
+    store::{DecodeIssue, Hand, MemoryStore},
+    tracking::lease::{Lease, LeaseId, ReleaseReason, Said, Side},
 };
 
 /// Why a frame is refused before any decision: the field, by its path in

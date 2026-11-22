@@ -80,8 +80,8 @@ use crate::{
     names::intern,
     policies::consistent_hashing::PoolRing,
     stages::Lifecycle,
-    store::{pairing::Refusal, GatewayId, Said},
-    tracking::lease::{EventKind, EventSet, Side},
+    store::{pairing::Refusal, GatewayId},
+    tracking::lease::{EventKind, EventSet, Said, Side},
 };
 
 /// The engine of one policy document, for a gateway that decides in its own

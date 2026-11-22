@@ -10,15 +10,12 @@ pub(super) use crate::tracking::in_flight::{InFlightCounts, WorkerSlot};
 use crate::{
     engine::{
         decision::{Targets, MAX_TARGETS},
+        decision_engine::DecodeRefused,
         view::{Session, WorkerId},
     },
     store::GatewayId,
-    tracking::lease::{Lease, LeaseId, Outcome, ReleaseReason, Side},
+    tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side},
 };
-
-/// The time a gateway has to name a lease's dispatch: the design's default.
-/// A lease still issued past it is released as abandoned.
-pub(crate) const DISPATCH_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The state of a single's lease or of one side of a pair's lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -326,29 +323,6 @@ impl Sides {
     }
 }
 
-/// What a gateway's `Dispatched` report says beside its lease.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Dispatch {
-    /// Which target of the pick the gateway dispatched to.
-    pub target_index: u8,
-    pub side: Side,
-    /// Decision to dispatch on the gateway's clock, in microseconds.
-    pub since_decision_micros: u32,
-}
-
-/// What is said of a lease, as a session hands a frame's word and a
-/// `Decide` stream a release to the leases' file
-/// ([`MemoryStore::hand`](super::MemoryStore::hand)).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Said {
-    /// The dispatch the frame names, and the instant the frame was read.
-    Dispatched(Dispatch, Instant),
-    /// The outcome of the side that ended.
-    Completed(Outcome),
-    /// The side given up, where the frame names one, and the reason.
-    Released(Option<Side>, ReleaseReason),
-}
-
 /// Why a lease was not recorded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeaseRefused {
@@ -370,21 +344,6 @@ pub enum LeaseRefused {
     /// same id is taken once a claim settles its file. A store of one
     /// file refuses none by it: there every id names that file.
     Unclaimed,
-}
-
-/// Why a call could not issue the decode side of a pair's lease.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DecodeRefused {
-    /// No lease of the gateway under that id.
-    NoLease,
-    /// The lease was filed without a chosen decode side.
-    NotChosen,
-    /// The prefill side is waiting for dispatch or has ended.
-    PrefillNotHeld,
-    /// The chosen side was already issued or dispatched, even if it has
-    /// ended, or its host gave it up, or it took as many calls as one
-    /// lease takes.
-    DecodeStands,
 }
 
 /// Where leases are recorded.

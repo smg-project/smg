@@ -74,14 +74,14 @@ use crate::{
     engine::{
         decision::{Decision, Target},
         decision_engine::{
-            DecideOutcome, DecisionEngine, DecisionRefused, HeldDecision, HeldDecode, Leased,
-            Request, RequestMaker,
+            DecideOutcome, DecisionEngine, DecisionRefused, DecodeRefused, HeldDecision,
+            HeldDecode, Leased, Request, RequestMaker,
         },
         framework::{EncodeItems, EncodePlaced},
         view::WorkerId,
     },
-    store::{DecodeRefused, Dispatch, GatewayId, Said},
-    tracking::lease::{LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+    store::GatewayId,
+    tracking::lease::{Dispatch, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass},
 };
 
 /// Where a handle's decision came from, and where its reports go.
@@ -793,8 +793,8 @@ mod tests {
         engine::{
             decision::{Decision, ShadowKind, Target, Targets},
             decision_engine::{
-                DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Request,
-                RequestMaker, SweepOutcome,
+                DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused,
+                HeldDecision, Request, RequestMaker, SweepOutcome,
             },
             framework::{EncodeItems, EncodePlaced, Picker, TieBand},
             prompt_hashes::{HashSeeds, PromptHashes},
@@ -811,10 +811,12 @@ mod tests {
         policies::random::Random,
         stages::lifecycle::Lifecycle,
         store::{
-            pairing::Refusal, DecodeRefused, Dispatch, GatewayId, HealthSink, LeaseState,
-            LeasesStore, MemoryStore, Said, WorkersStore,
+            pairing::Refusal, GatewayId, HealthSink, LeaseState, LeasesStore, MemoryStore,
+            WorkersStore,
         },
-        tracking::lease::{Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+        tracking::lease::{
+            Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass,
+        },
     };
 
     /// What a stage heard of a lease.

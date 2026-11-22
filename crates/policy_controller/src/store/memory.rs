@@ -25,6 +25,7 @@ use rustc_hash::FxHashMap;
 use crate::{
     document::spec::AppliedSpec,
     engine::{
+        decision_engine::DecodeRefused,
         prompt_hashes::{block_size_and_depth, HashSeeds, PromptHashes},
         view::{LoadRow, Role, Session, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS},
     },
@@ -36,8 +37,8 @@ use crate::{
         journal::{Journal, JournalKinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{
-            DecodeMark, DecodeRefused, DecodeSide, Dispatch, InFlightCounts, LeaseRecord,
-            LeaseRefused, LeaseState, LeasesStore, Said, Sides, WorkerSlot, DISPATCH_TTL,
+            DecodeMark, DecodeSide, InFlightCounts, LeaseRecord, LeaseRefused, LeaseState,
+            LeasesStore, Sides, WorkerSlot,
         },
         loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
         reservations::{ReservationKind, ReservationStore},
@@ -54,7 +55,10 @@ use crate::{
         },
         GatewayId,
     },
-    tracking::lease::{LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
+    tracking::lease::{
+        Dispatch, LeaseId, Membership, Outcome, ReleaseReason, Said, Side, TransportClass,
+        DISPATCH_TTL,
+    },
 };
 
 mod blocks;
