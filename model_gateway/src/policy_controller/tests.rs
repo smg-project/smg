@@ -1010,16 +1010,12 @@ async fn the_http_pair_router_places_an_explicit_target_as_with_the_setting_off(
 }
 
 /// A gateway of many routers mounts every family. In process the HTTP
-/// pair family is the classic router where the document plans pairs: the
-/// registry's policies place its sides. Under the manual policy the
-/// document plans single requests alone, since a sessions rule runs under
-/// no pair plan, and the engine decides every one of them: nothing in the
-/// process places a pair, and the family refuses by name, as under any
-/// document that plans none. Under a controller's address the family
-/// refuses by name too: the pair is the controller's to decide there, and
-/// no ask reaches it yet.
+/// pair family is the classic router under every configuration, the manual
+/// policy's too: the registry's policies place its sides. Under a
+/// controller's address the family refuses by name: the pair is the
+/// controller's to decide there, and no ask reaches it yet.
 #[tokio::test]
-async fn many_routers_mount_the_http_pair_router_where_this_process_places_pairs() -> Case {
+async fn many_routers_mount_the_http_pair_router_unless_they_follow_a_controller() -> Case {
     use crate::routers::{factory::router_ids, RouterFactory};
 
     let mut regular = picked(quiet());
@@ -1041,7 +1037,7 @@ async fn many_routers_mount_the_http_pair_router_where_this_process_places_pairs
     for (config, serves) in [
         (regular, true),
         (pair, true),
-        (manual, false),
+        (manual, true),
         (following, false),
     ] {
         let context = Arc::new(AppContext::from_config(config.clone(), 30, None, None).await?);
@@ -1100,12 +1096,12 @@ async fn the_grpc_pair_router_is_built_under_the_setting() -> Case {
 }
 
 /// A gateway of many routers mounts every family. In process the gRPC
-/// pair family is the classic router where the document plans pairs: the
-/// registry's policies place its sides. Under the manual policy, whose
-/// document plans single requests alone, and under a controller's address
-/// the family refuses by name, as the HTTP pair family does.
+/// pair family is the classic router under every configuration, the manual
+/// policy's too: the registry's policies place its sides. Under a
+/// controller's address the family refuses by name, as the HTTP pair
+/// family does.
 #[tokio::test]
-async fn many_routers_mount_the_grpc_pair_router_where_this_process_places_pairs() -> Case {
+async fn many_routers_mount_the_grpc_pair_router_unless_they_follow_a_controller() -> Case {
     use crate::routers::{factory::router_ids, RouterFactory};
 
     let mut regular = picked(quiet());
@@ -1127,7 +1123,7 @@ async fn many_routers_mount_the_grpc_pair_router_where_this_process_places_pairs
     for (config, serves) in [
         (regular, true),
         (pair, true),
-        (manual, false),
+        (manual, true),
         (following, false),
     ] {
         let context = Arc::new(AppContext::from_config(config.clone(), 30, None, None).await?);

@@ -756,10 +756,12 @@ fn a_stage_that_reads_media_is_not_decided_whole_while_no_route_states_it() -> C
 /// worker's record, its report or the prompt's size. So is the manual
 /// policy: it leaves the placement to its sessions rule, whose key the
 /// gateway's own ask derives and whose pins are the engine's table, and
-/// the rule compares at most a count the worker object keeps. A policy
-/// that places by a hash ring or by a header of the request is not yet:
-/// the routers keep their classic pass under it, and a supplied document
-/// of it is refused by its first stage that asks more than a pick.
+/// the rule compares at most a count the worker object keeps. A gateway of
+/// many routers under it is not: it serves pairs, which a sessions rule
+/// does not plan. A policy that places by a hash ring or by a header of
+/// the request is not yet: the routers keep their classic pass under it,
+/// and a supplied document of it is refused by its first stage that asks
+/// more than a pick.
 #[test]
 fn the_engine_decides_whole_what_this_process_feeds() -> Case {
     let started = |policy: PolicyConfig| -> Result<InProcess, Box<dyn Error>> {
@@ -802,6 +804,21 @@ fn the_engine_decides_whole_what_this_process_feeds() -> Case {
             assignment_mode,
         };
         assert!(started(manual)?.decides_whole(), "{assignment_mode:?}");
+        // A gateway of many routers serves pairs beside single requests,
+        // and a sessions rule plans none: under the manual policy its
+        // routers keep the classic pass for every request.
+        let many = RouterConfig {
+            policy_controller: true,
+            enable_igw: true,
+            policy: PolicyConfig::Manual {
+                eviction_interval_secs: 60,
+                max_idle_secs: 14_400,
+                assignment_mode,
+            },
+            ..RouterConfig::default()
+        };
+        let many = start_in_process(&many, None)?.ok_or("the setting starts an engine")?;
+        assert!(!many.decides_whole(), "{assignment_mode:?}");
     }
     // The bucket stage places by the prompt's size and says so, and this
     // process counts the size: a route that would send a body on unread

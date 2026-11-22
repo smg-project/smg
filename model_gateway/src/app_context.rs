@@ -1562,20 +1562,28 @@ mod tests {
 
     /// Under the manual policy a gateway that decides in its own process
     /// holds the engine object the routers ask, whatever the assignment of
-    /// a key's first request. Under the two policies that place by a hash
-    /// ring it holds none yet: the classic policy places their requests.
+    /// a key's first request. A gateway of many routers holds none under
+    /// it: it serves pairs, which a sessions rule does not plan, and keeps
+    /// its classic pass. Under the two policies that place by a hash ring
+    /// a gateway holds none yet: the classic policy places their requests.
     #[tokio::test]
     async fn a_context_in_process_holds_the_engine_object_under_the_manual_policy() {
         use crate::config::ManualAssignmentMode;
 
-        let built = |policy: PolicyConfig| async move {
+        let built = |policy: PolicyConfig, enable_igw: bool| async move {
             let config = RouterConfig {
                 policy_controller: true,
+                enable_igw,
                 ..config_with_policy(policy)
             };
             AppContext::from_config(config, 10, None, None)
                 .await
                 .expect("a context")
+        };
+        let manual = |assignment_mode| PolicyConfig::Manual {
+            eviction_interval_secs: 60,
+            max_idle_secs: 14_400,
+            assignment_mode,
         };
         for assignment_mode in [
             ManualAssignmentMode::Random,
@@ -1583,14 +1591,11 @@ mod tests {
             ManualAssignmentMode::MinGroup,
             ManualAssignmentMode::Delegate,
         ] {
-            let manual = PolicyConfig::Manual {
-                eviction_interval_secs: 60,
-                max_idle_secs: 14_400,
-                assignment_mode,
-            };
-            let context = built(manual).await;
+            let context = built(manual(assignment_mode), false).await;
             assert!(context.policy_engine.is_some(), "{assignment_mode:?}");
         }
+        let many = built(manual(ManualAssignmentMode::Random), true).await;
+        assert!(many.policy_engine.is_none(), "a gateway of many routers");
         let prefix_hash = PolicyConfig::PrefixHash {
             prefix_token_count: 256,
             load_factor: 1.25,
@@ -1599,7 +1604,7 @@ mod tests {
         };
         for policy in [PolicyConfig::ConsistentHashing, prefix_hash] {
             let name = policy.name();
-            let context = built(policy).await;
+            let context = built(policy, false).await;
             assert!(context.policy_engine.is_none(), "{name}");
         }
     }

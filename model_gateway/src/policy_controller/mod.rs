@@ -207,6 +207,10 @@ pub(crate) struct InProcess {
     /// The stages the document was validated over, a host's own among
     /// them: a check of another document against this one reads them.
     pub(crate) stages: Arc<StageRegistry>,
+    /// Whether the routers ask the engine for each request's whole
+    /// decision ([`Self::decides_whole`]), as the start read it of the
+    /// document and of the gateway's routers.
+    whole: bool,
 }
 
 impl InProcess {
@@ -222,8 +226,16 @@ impl InProcess {
     /// routers keep their classic placement pass, whose policies ask the
     /// engine for the pick. The set grows with what the engine decides
     /// whole, and this question goes when it decides every document.
+    ///
+    /// A gateway of many routers keeps that pass under a sessions rule too.
+    /// It serves pairs beside single requests, and a sessions rule runs
+    /// under the single plan alone, so its document plans no pair: asked
+    /// for every request, the engine would leave the pair routers nothing
+    /// to decide by, and they would refuse by name the requests their
+    /// classic routers serve. That holds until the routers choose who
+    /// decides for each family they mount.
     pub(crate) fn decides_whole(&self) -> bool {
-        self.engine.spec().engine().single_and_fed(fed())
+        self.whole
     }
 }
 
@@ -420,11 +432,19 @@ fn engine_for(
     } else {
         DocumentOrigin::Supplied
     };
+    // A gateway of many routers serves pairs beside single requests, and a
+    // document that states a sessions rule plans none: its routers keep
+    // the classic pass ([`InProcess::decides_whole`]).
+    let rule_beside_pairs = config.enable_igw
+        && document
+            .bindings
+            .iter()
+            .any(|binding| binding.sessions.is_some());
+    let whole = !rule_beside_pairs && engine.spec().engine().single_and_fed(fed());
     if origin == DocumentOrigin::Supplied {
         // A place the engine does not pick alone is decided by its whole
         // pass where the routers ask the engine for every request of the
         // document, and by nothing where they do not.
-        let whole = engine.spec().engine().single_and_fed(fed());
         if let Some(place) = engine.not_alone().filter(|_| !whole) {
             return Err(StartError::NotAlone {
                 profile: place.profile.to_owned(),
@@ -441,6 +461,7 @@ fn engine_for(
         written,
         applied: SystemTime::now(),
         stages,
+        whole,
     }))
 }
 
