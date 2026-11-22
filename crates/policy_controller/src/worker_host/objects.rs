@@ -335,8 +335,8 @@ impl<G> Objects<G> {
     /// Without it an object built from a row states no threshold, and a
     /// load monitor writes no verdict on it: the store's verdict is the one
     /// such a host mirrors ([`Self::mirror_overload`]). An object has one
-    /// judge, so a holder that builds its objects with thresholds mirrors
-    /// nothing.
+    /// judge: a host that builds its objects with thresholds does not also
+    /// mirror the store's verdict on them.
     ///
     /// The two judges do not read the same thresholds. A policy document's
     /// binding thresholds, which the store reads under a row that names
@@ -604,14 +604,7 @@ impl<G: Generation> Objects<G> {
     /// its row names for itself. They need not explain the verdict. The
     /// store judges an engine's ranks together, and under the pool's
     /// thresholds where the row names none.
-    ///
-    /// A holder that builds its objects with thresholds
-    /// ([`Self::with_overload_thresholds`]) writes none: its host's load
-    /// monitor judges those objects, and a flag has one writer.
     pub fn mirror_overload(&self, store: &MemoryStore) -> usize {
-        if self.overload_defaults.is_some() {
-            return 0;
-        }
         let mut mirrored = self.mirrored.lock();
         // The objects whose flag is not their rows' verdict, each with the
         // verdict and what its edge's line states.
@@ -3700,25 +3693,6 @@ mod tests {
         assert_eq!(replica.mirror(), 1);
         assert!(!worker.is_overloaded());
         assert_eq!(replica.counted(), 0);
-    }
-
-    /// A holder that builds its objects with thresholds mirrors nothing:
-    /// its host's load monitor judges them, and the store's verdict is not
-    /// written beside the monitor's.
-    #[test]
-    fn a_holder_whose_objects_state_thresholds_mirrors_no_verdict() {
-        let mut replica = judging();
-        let registry = Arc::clone(replica.objects.registry());
-        replica.objects =
-            Objects::new(registry).with_overload_thresholds(OverloadThresholds::default());
-        let row = replica.stand(bounded(A));
-        replica.push(row, 3);
-        let over = replica
-            .store
-            .with_snapshot(|world| world.overloaded().count());
-        assert_eq!(over, 1, "the store judges the row over its own count");
-        assert_eq!(replica.mirror(), 0);
-        assert!(!replica.at(A).is_overloaded());
     }
 
     #[test]
