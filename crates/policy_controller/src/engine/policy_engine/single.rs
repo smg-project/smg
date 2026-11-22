@@ -38,12 +38,11 @@ use smg_worker::{load::state::LoadSnapshot, runtime::RoutingState};
 use super::{keys, overlap, PolicyEngine, PoolMembers};
 use crate::{
     engine::{
-        decision::{Decision, Shed, ShedReason, Target, Trace},
-        decision_engine::{AlonePick, HeldDecision, Plain},
+        decision::{Decision, Shed, ShedReason, Target, Trace, SUBSET_HINT, WIRES},
+        decision_engine::{AlonePick, DecideOutcome, HeldDecision, Leased, Plain, Request},
         framework::Engine,
         records,
         sticky_sessions::SessionVerdict,
-        store_backed_engine::{DecideOutcome, Leased, Request, SUBSET_HINT, WIRES},
         view::{Phase, Session},
     },
     stages::Lifecycle,
@@ -322,11 +321,12 @@ mod tests {
         document::spec::{AppliedSpec, PolicySpec},
         engine::{
             decision::{LiftedVeto, Targets},
-            decision_engine::{Decided, DecisionEngine, RequestMaker, WorkerLists},
+            decision_engine::{
+                Decided, DecisionEngine, DecisionRefused, RequestMaker, WorkerLists,
+            },
             framework::{Picker, Place, PoolWord, TieBand},
             prompt_hashes::HashSeeds,
             records::worker_id,
-            store_backed_engine::DecisionRefused,
             view::{Candidate, Constraints, Identity, RequestFacts, WireModes, WorkerId},
         },
         policies::random::Random,

@@ -62,14 +62,14 @@ use self::overlap::{Affinity, PoolAffinity};
 use super::{
     decision::ShadowKind,
     decision_engine::{
-        AlonePick, Decided, DecisionEngine, HeldDecision, RequestMaker, WorkerLists,
+        AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Request,
+        RequestMaker, SweepOutcome, WorkerLists,
     },
     framework::{
         release, AloneProfile, EncodeItems, EncodePlaced, NotAlone, Picker, Place, PoolWord,
     },
     prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
-    store_backed_engine::{DecideOutcome, DecisionRefused, Request, SweepOutcome},
     view::{fingerprint, Phase, WireModes, WorkerId},
 };
 use crate::{

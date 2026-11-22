@@ -950,10 +950,9 @@ mod tests {
         document::spec::MAX_BLOCK_HASHES,
         engine::{
             decision::{
-                Decision, LiftedVeto, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target,
+                self, Decision, LiftedVeto, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target,
                 Targets, Trace,
             },
-            store_backed_engine,
             store_backed_engine::unnamed,
             view::{
                 fingerprint, AffinityFacts, Constraints, HashKind, Header, Identity, MediaCounts,
@@ -1925,7 +1924,7 @@ mod tests {
             },
             ..Pick::default()
         });
-        let shed = store_backed_engine::shed(ShedReason::NoEndpoints, "wires", 0, 6);
+        let shed = decision::shed(ShedReason::NoEndpoints, "wires", 0, 6);
         let encoded = |decision| {
             super::decision(decision)
                 .trace

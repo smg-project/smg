@@ -49,12 +49,11 @@ use super::{single, PolicyEngine, PoolMembers};
 use crate::{
     document::spec::AppliedSpec,
     engine::{
-        decision::{Decision, ShedReason, Target},
-        decision_engine::HeldDecision,
+        decision::{shed, Decision, ShedReason, Target, SUBSET_HINT, WIRES},
+        decision_engine::{DecideOutcome, HeldDecision, Leased, Request},
         framework::{Engine, PairPools, Scratch},
         pair_classes::PartnerClasses,
         records::{DecisionClock, Live},
-        store_backed_engine::{shed, DecideOutcome, Leased, Request, SUBSET_HINT, WIRES},
         view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, Session, WorkerId},
     },
     stages::Lifecycle,

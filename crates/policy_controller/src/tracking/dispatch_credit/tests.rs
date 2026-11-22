@@ -6,8 +6,7 @@ use serde_json::json;
 use crate::{
     document::{AppliedSpec, PolicySpec, SpecError, API_VERSION},
     engine::{
-        decision, framework,
-        store_backed_engine::{Request, StoreBackedEngine},
+        decision, decision_engine::Request, framework, store_backed_engine::StoreBackedEngine,
         Candidate, Constraints, Engine, Filter, LoadRow, Pair, PoolFacts, RequestFacts, Scorer,
         Scratch, Target, TieBand, WorkerId,
     },
