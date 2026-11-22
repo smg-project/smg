@@ -3,8 +3,8 @@
 //! A host hands the engine its load monitor's channel
 //! ([`PolicyEngine::set_loads`]) and spawns [`PolicyEngine::run`] once. The
 //! task runs the engine's upkeep once a second and keeps the newest load
-//! snapshot at hand, so a single request's decision whose request gives
-//! none reads the engine's and never touches the channel.
+//! snapshot at hand, so a decision whose request gives none reads the
+//! engine's and never touches the channel.
 
 use std::{
     fmt,
@@ -24,7 +24,7 @@ use tokio::time::{self, MissedTickBehavior};
 
 use super::PolicyEngine;
 use crate::engine::{
-    decision_engine::{DecisionEngine, SweepOutcome},
+    decision_engine::{DecisionEngine, RequestMaker, SweepOutcome},
     framework::release,
 };
 
@@ -56,9 +56,9 @@ impl fmt::Debug for Loads {
 }
 
 impl Loads {
-    /// The newest snapshot at hand, for a single request's decision whose
-    /// request gives none: none where the host handed no channel, or the
-    /// task has not read it yet.
+    /// The newest snapshot at hand, for a decision whose request gives
+    /// none: none where the host handed no channel, or the task has not
+    /// read it yet.
     #[inline]
     pub(super) fn newest(&self) -> Option<Guard<Option<Arc<LoadSnapshot>>>> {
         let handed = self.handed.load(Ordering::Relaxed);
@@ -81,6 +81,27 @@ impl Loads {
     }
 }
 
+/// The snapshot one decision reads, held for as long as the decision reads
+/// it ([`PolicyEngine::loads_read`]).
+pub(super) enum LoadsRead<'a> {
+    /// The snapshot the request gives.
+    Given(&'a Arc<LoadSnapshot>),
+    /// The engine's newest, read where the request gives none.
+    Kept(Option<Guard<Option<Arc<LoadSnapshot>>>>),
+}
+
+impl LoadsRead<'_> {
+    /// The snapshot: none where the request gives none and the engine
+    /// keeps none at hand.
+    #[inline]
+    pub(super) fn snapshot(&self) -> Option<&Arc<LoadSnapshot>> {
+        match self {
+            Self::Given(given) => Some(given),
+            Self::Kept(kept) => kept.as_ref().and_then(|newest| newest.as_ref()),
+        }
+    }
+}
+
 /// The load monitor's next publication on `feed`: `false` where the monitor
 /// ended. Never ready with no channel.
 async fn published(feed: Option<&mut LoadReceiver>) -> bool {
@@ -99,17 +120,29 @@ impl PolicyEngine {
     /// ([`Needs::loads`](crate::document::spec::Needs::loads)) keeps none,
     /// and no decision of it reads a report.
     ///
-    /// The engine's task reads the channel ([`Self::run`]). A single
-    /// request's decision reads the snapshot its request gives where it
-    /// gives one
+    /// The engine's task reads the channel ([`Self::run`]). A decision
+    /// reads the snapshot its request gives where it gives one
     /// ([`RequestMaker::loads`](crate::engine::RequestMaker::loads)), and
-    /// the newest the task keeps at hand otherwise. A pair's decision
-    /// reads no load report.
+    /// the newest the task keeps at hand otherwise: a single request's, a
+    /// pair's first, and a pair's decode decided again.
     pub fn set_loads(&self, loads: LoadReceiver) {
         if self.spec.needs().loads {
             let mut feed = self.loads.feed.lock();
             *feed = (feed.0 + 1, Some(loads));
             self.loads.handed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The snapshot a made request's decision reads, held for the
+    /// decision ([`LoadsRead`]): the one the request gives where it gives
+    /// one, and the newest the task keeps at hand otherwise. A single
+    /// request's decision, a pair's first and a pair's decode decided again
+    /// all read theirs here.
+    #[inline]
+    pub(super) fn loads_read<'a>(&self, maker: &'a impl RequestMaker) -> LoadsRead<'a> {
+        match maker.loads() {
+            Some(given) => LoadsRead::Given(given),
+            None => LoadsRead::Kept(self.loads.newest()),
         }
     }
 

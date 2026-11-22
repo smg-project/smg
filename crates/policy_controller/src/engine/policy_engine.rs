@@ -685,7 +685,9 @@ impl PolicyEngine {
                 // A pair is decided at its prefill, over its host's two
                 // lists.
                 (Phase::Prefill, WorkerLists::Pair(lists)) => {
-                    Ok(pair::decide(self, &lists, &mut request, None, now))
+                    let read = self.loads_read(maker);
+                    let loads = read.snapshot();
+                    Ok(pair::decide(self, &lists, &mut request, None, loads, now))
                 }
                 (Phase::Single | Phase::Prefill, _) => Ok(single::over_none(self, &request)),
                 (Phase::Decode | Phase::Encode, _) => Err(DecisionRefused::PairSide),
@@ -722,7 +724,9 @@ impl PolicyEngine {
             let mut request = self.made(maker);
             Ok(match maker.workers() {
                 WorkerLists::Pair(lists) => {
-                    pair::decide(self, &lists, &mut request, Some(held), now)
+                    let read = self.loads_read(maker);
+                    let loads = read.snapshot();
+                    pair::decide(self, &lists, &mut request, Some(held), loads, now)
                 }
                 _ => single::over_none(self, &request),
             })
@@ -732,7 +736,7 @@ impl PolicyEngine {
     /// A made single request's whole decision over its host's list, for
     /// every entry that decides one. It reads the snapshot the request
     /// gives where it gives one, and the newest the engine's own task
-    /// keeps at hand otherwise.
+    /// keeps at hand otherwise ([`Self::loads_read`]).
     ///
     /// Under a binding that names a shadow, the shadow profile decides
     /// behind the live one ([`with_shadow::decide`]). What it said is
@@ -748,14 +752,8 @@ impl PolicyEngine {
         now: Instant,
         said: &mut Option<Shadowed>,
     ) -> super::decision::Decision {
-        let kept;
-        let loads = match maker.loads() {
-            Some(given) => Some(given),
-            None => {
-                kept = self.loads.newest();
-                kept.as_ref().and_then(|newest| newest.as_ref())
-            }
-        };
+        let read = self.loads_read(maker);
+        let loads = read.snapshot();
         // Under a document that names a shadow the list's word says
         // whether this binding does.
         if self.any_shadow {
@@ -815,7 +813,9 @@ impl PolicyEngine {
             // A pair is decided at its prefill, over its host's two
             // lists.
             (Phase::Prefill, WorkerLists::Pair(lists)) => {
-                let decided = pair::decided(self, &lists, &mut request, None, now);
+                let read = self.loads_read(maker);
+                let loads = read.snapshot();
+                let decided = pair::decided(self, &lists, &mut request, None, loads, now);
                 *whole = Some((decided, later));
                 return Ok(None);
             }
@@ -871,7 +871,9 @@ impl DecisionEngine for PolicyEngine {
             let mut request = self.made(maker);
             Ok(match maker.workers() {
                 WorkerLists::Pair(lists) => {
-                    pair::decided(self, &lists, &mut request, Some(held), now)
+                    let read = self.loads_read(maker);
+                    let loads = read.snapshot();
+                    pair::decided(self, &lists, &mut request, Some(held), loads, now)
                 }
                 _ => single::issued(self, single::over_none(self, &request), &request, now),
             })
