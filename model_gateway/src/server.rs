@@ -2139,7 +2139,9 @@ const LISTEN_QUEUE: u32 = i32::MAX.unsigned_abs();
 
 /// A listener on `addr` with [`LISTEN_QUEUE`] asked for. The runtime's own
 /// bind takes no queue length and its socket queued 128 connections on a
-/// host that allows 4096: a burst of new connections overflowed it.
+/// host that allows 4096: a burst of new connections overflowed it. Runs
+/// inside the runtime: the socket registers with its reactor before
+/// `into_std` hands it back.
 fn listen_on(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
     let socket = match addr {
         std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
