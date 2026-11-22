@@ -452,9 +452,20 @@ const READ_BACK_PER_BYTE: Duration = Duration::from_nanos(32);
 const READ_BACK_WITHIN: Duration = Duration::from_millis(20);
 
 /// The processors this process may run on, or `usize::MAX` where the
-/// system does not say, so that no encoder has more callers than that.
+/// system does not say, so that no encoder has more threads inside a long
+/// text than that.
 fn processors() -> usize {
     std::thread::available_parallelism().map_or(usize::MAX, usize::from)
+}
+
+/// A thread inside a long text (`NativeEncoder::inside`). The count gives
+/// it up on drop, so an encode that unwinds leaves the count right.
+struct Inside<'a>(&'a AtomicUsize);
+
+impl Drop for Inside<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 /// The size a long text unit is cut into for the pool, at the first stable
 /// boundary past each multiple of it.
@@ -1599,10 +1610,13 @@ pub(crate) struct NativeEncoder {
     /// The thread that loaded this encoder, and when its rehearsal had read
     /// the merge table through ([`Self::rehearse`]).
     load_read: OnceLock<(ThreadId, Instant)>,
-    /// [`processors`] when the encoder was made: once more threads than
-    /// this have called, a thread reads its table back
+    /// [`processors`] when the encoder was made: while more threads than
+    /// this are inside a long text, a thread reads its table back
     /// (`PieceCache::reads_back`).
     processors: usize,
+    /// The threads inside a long text of their own now
+    /// (`READ_BACK_MIN_BYTES` or more, no unit on the pool).
+    inside: AtomicUsize,
 }
 
 impl std::fmt::Debug for NativeEncoder {
@@ -1726,6 +1740,7 @@ impl NativeEncoder {
             callers: AtomicUsize::new(0),
             load_read: OnceLock::new(),
             processors: processors(),
+            inside: AtomicUsize::new(0),
         })
     }
 
@@ -1813,6 +1828,7 @@ impl NativeEncoder {
             callers: AtomicUsize::new(0),
             load_read: OnceLock::new(),
             processors: processors(),
+            inside: AtomicUsize::new(0),
         })
     }
 
@@ -2515,6 +2531,7 @@ impl NativeEncoder {
             callers: AtomicUsize::new(0),
             load_read: OnceLock::new(),
             processors: processors(),
+            inside: AtomicUsize::new(0),
         })
     }
 
@@ -2940,10 +2957,16 @@ impl NativeEncoder {
         let mut ids = Vec::with_capacity(before.len() + text.len() / 3 + 8 + after.len());
         ids.extend_from_slice(before);
         let mut cache = self.piece_cache_for_text(text.len());
-        // The count of callers never falls, and the clock is read only
-        // past it. Not for a unit on the pool: it is no text of its thread.
-        if text.len() >= READ_BACK_MIN_BYTES
-            && self.callers.load(Ordering::Relaxed) > self.processors
+        // Only while more threads are inside a long text than the process
+        // has processors, and the clock is read only then. Not for a unit
+        // on the pool: it is no text of its thread.
+        let inside = (text.len() >= READ_BACK_MIN_BYTES).then(|| {
+            let others = self.inside.fetch_add(1, Ordering::Relaxed);
+            (Inside(&self.inside), others)
+        });
+        if inside
+            .as_ref()
+            .is_some_and(|(_, others)| *others >= self.processors)
             && cache.reads_back(Instant::now(), text.len())
         {
             cache.packed.read_through();
