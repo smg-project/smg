@@ -680,8 +680,8 @@ waits for it (5.2).
 **The short path.** A request is *plain* when it names no tried or excluded worker and states no
 hint, no demand, no lifted overload veto, no later decode, no held-back worker and no places of its
 list. A profile is decided by *one pick* when its picker needs nothing of the request, it has no
-scorer and no filter beyond the health tests, and its binding has no sessions rule. On main two
-pickers say so: round robin and `passthrough`.
+scorer and no filter beyond the health tests, and its binding has no sessions rule and names no
+shadow. On main two pickers say so: round robin and `passthrough`.
 
 1. The engine asks `maker.plain()`. If the request is plain and a single one, the host handed one
    list, every worker of the list serves the protocols the request states, and the list's model
@@ -709,6 +709,7 @@ pickers say so: round robin and `passthrough`.
    of 16 workers or more, a profile whose picker draws first (`random`, `round-robin`,
    `passthrough`, power of two, `best` with a sample) has only the drawn workers' records written.
    No draw is made for a request held to places: every worker's record is written.
+   Under a binding that names a shadow every worker's record is written, for the two decisions.
 8. **Filters.** Each filter removes records. If a filter leaves nothing, the binding's rule for a
    list wholly over its thresholds may still pick among the workers the overload filter removed.
    Otherwise the decision is a refusal that names the filter: `Saturated` for the overload filter,
@@ -758,8 +759,8 @@ the kept one. `GatewayId` is still defined in the store.
   `lent_in_flight`, `lent_session_in_flight`, `session_counted`, `model_fingerprint`,
   `signal_cells`), and `Constraints::pins`. One of them needs a successor: a sessions rule with
   a cap asks `session_counted` of its host today.
-- The trait's two methods that the kept engine answers with a constant, `decide_encode_pair` and
-  `shadowed`, are built or removed.
+- The trait's method that the kept engine answers with a constant, `decide_encode_pair`, is built
+  or removed.
 - The record of sent prefixes becomes the two trees (section 4.5).
 
 ## 6. The lease and its events **[built]**
@@ -1421,7 +1422,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The policy document: profiles, bindings by model and phase, plans, overload, routing key, sessions | **[built]** | |
 | Bindings by tenant, priority, header, prompt size, labels; a session id issued by the engine (`issue_session_id`) | **[planned]** | in the schema; a document that writes one is refused as not in this build |
 | `canary`, `override: allowed`, `admission` | **[planned]** | in the schema; a document that writes one is refused, and the error names the field |
-| `shadow`, `explain.sample` | **[partly]** | run in the old engine only (decision 7) |
+| `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; a pair's shadows and `explain.sample` run in the old engine only (decision 7) |
 | The ten presets and the conversion from routing settings | **[built]** | |
 | The stage interfaces and a builder's own stages | **[built]** | |
 | The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, a demand, mixed protocols, encode items; no recorded line replays through it |
@@ -1547,8 +1548,9 @@ every fallback engine".
 
 ### Decision 7: shadow and explain
 
-Both run in the old engine only. A document that writes `canary`, `override: allowed` or
-`admission` is refused. No engine runs them.
+The kept engine runs a single request's shadow, and counts as skipped one that reads affinity
+rows of its own. A pair's shadows and the explain sample run in the old engine only. A document
+that writes `canary`, `override: allowed` or `admission` is refused. No engine runs them.
 
 | Option | Cost |
 |---|---|
