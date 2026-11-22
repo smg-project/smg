@@ -696,12 +696,8 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
                 let cancelled = Outcome {
                     side,
                     served: worker,
-                    status: 0,
-                    class: TransportClass::Cancelled,
-                    ttft_micros: 0,
-                    tokens_in: 0,
-                    tokens_out: 0,
                     duration_micros: micros(now.saturating_duration_since(sent)),
+                    ..Outcome::reported(0, TransportClass::Cancelled)
                 };
                 self.say(lease, side, Said::Completed(cancelled), now);
             }

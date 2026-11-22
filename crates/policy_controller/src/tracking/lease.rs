@@ -115,6 +115,33 @@ pub struct Outcome {
     pub duration_micros: u32,
 }
 
+impl Outcome {
+    /// An outcome that states how its request ended and nothing it
+    /// measured: the status and the class, with every measure zero, under
+    /// no side and no served worker. Its caller adds what it measured by
+    /// struct update.
+    ///
+    /// A placement that is told an end (`Placement::ended`, with the feature
+    /// `in-process`) writes the side and the served worker over: its caller
+    /// leaves both as made here. A guard's caller states both.
+    ///
+    /// The class has no default: it feeds a worker's health, and an end
+    /// whose caller forgot it must not read as [`TransportClass::Ok`].
+    #[must_use]
+    pub const fn reported(status: u16, class: TransportClass) -> Self {
+        Self {
+            side: Side::Single,
+            served: WorkerId(0),
+            status,
+            class,
+            ttft_micros: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            duration_micros: 0,
+        }
+    }
+}
+
 /// Why a lease was released before its completion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReleaseReason {
@@ -405,5 +432,24 @@ mod tests {
         assert_ne!(prefill.side, decode.side);
         assert_eq!(prefill.target_index, decode.target_index);
         assert_eq!(decode.kind, LeaseKind::Reservation);
+    }
+
+    /// An outcome made by its constructor states the status and the class
+    /// it was given and nothing else: every measure is zero, and it names
+    /// no side and no served worker. It is the literal it stands for.
+    #[test]
+    fn an_outcome_reported_states_its_end_and_no_measure() {
+        let reported = Outcome::reported(503, TransportClass::ServerError);
+        let literal = Outcome {
+            side: Side::Single,
+            served: WorkerId(0),
+            status: 503,
+            class: TransportClass::ServerError,
+            ttft_micros: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            duration_micros: 0,
+        };
+        assert_eq!(reported, literal);
     }
 }

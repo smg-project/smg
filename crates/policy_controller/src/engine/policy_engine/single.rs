@@ -1731,6 +1731,10 @@ mod tests {
             self.0.on_completed(lease, outcome);
             self.1.lock().push(*outcome);
         }
+
+        fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+            self.0.on_released(lease, reason);
+        }
     }
 
     impl Picker for Ends {
@@ -1749,6 +1753,59 @@ mod tests {
         ) {
             self.0.pick(facts, candidates, kept, scores, band, out);
         }
+    }
+
+    /// An engine whose one stage is [`Ends`], with what the stage hears
+    /// and the outcomes it keeps.
+    fn hearing_ends() -> (&'static PolicyEngine, Heard, Arc<Mutex<Vec<Outcome>>>) {
+        let (heard, ends) = (Heard::default(), Arc::new(Mutex::new(Vec::new())));
+        let kept = (Arc::clone(&heard), Arc::clone(&ends));
+        let engine = picked_by("ends", move || {
+            let hears = Hears {
+                heard: Arc::clone(&kept.0),
+                panics: false,
+                alone: false,
+                takes: EventSet::LEASE,
+            };
+            Box::new(Ends(hears, Arc::clone(&kept.1)))
+        });
+        (Box::leak(Box::new(engine)), heard, ends)
+    }
+
+    /// A single request's placement goes out under any side its host names
+    /// but an encode side, as it ends under any. A host that names its one
+    /// call a decode side or a prefill side says the request's dispatch:
+    /// the stage counts the request as sent while it runs, and a drop
+    /// behind the send is an end of class cancelled, not a release.
+    #[test]
+    fn a_single_requests_placement_is_sent_under_the_side_its_host_names() {
+        let (engine, heard, ends) = hearing_ends();
+        let list = pool(4);
+        let members = engine.pool_members(&list);
+        let words = || std::mem::take(&mut *heard.lock());
+        for side in [Side::Decode, Side::Prefill, Side::Single] {
+            let asks = Asks::of(request(), Some(&members));
+            let (decided, later) = answered(engine, &asks).whole().expect("a whole decision");
+            let first = decided
+                .decision
+                .pick()
+                .and_then(|pick| pick.targets.first().copied());
+            let first = first.expect("a target");
+            let worker = Arc::clone(&list[first.position as usize]);
+            let now = Instant::now();
+            let placement =
+                crate::tracking::Placement::taken(engine, decided, later, now, 0, worker, None);
+            let mut placement = placement.expect("a placement");
+            assert_eq!(words(), [("issued", first.id, 0)]);
+            placement.sent(side);
+            assert_eq!(words(), [("dispatched", first.id, 0)], "{side:?}");
+            drop(placement);
+            assert_eq!(words(), [("completed", first.id, 0)], "{side:?}");
+            let cancelled = std::mem::take(&mut *ends.lock());
+            let classes: Vec<TransportClass> = cancelled.iter().map(|end| end.class).collect();
+            assert_eq!(classes, [TransportClass::Cancelled], "{side:?}");
+        }
+        assert_eq!((engine.faults(), engine.unheard()), (0, 0));
     }
 
     /// An encode side's end says nothing through a placement, as its send
@@ -1968,6 +2025,39 @@ mod tests {
         let stated = spans.lock().clone();
         assert_eq!(stated.len(), 1, "one dispatch");
         assert!(stated[0] >= 1_000_000, "{stated:?}");
+        assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+    }
+
+    /// A caller ends its request with an outcome that names no side and no
+    /// worker ([`Outcome::reported`]), and adds what it measured. The
+    /// placement writes the worker of the target it took, and what the
+    /// caller measured stands.
+    #[test]
+    fn a_placement_ends_under_an_outcome_that_names_no_worker() {
+        let (engine, _, ends) = hearing_ends();
+        let list = pool(4);
+        let members = engine.pool_members(&list);
+        let asks = Asks::of(request(), Some(&members));
+        let (decided, later) = answered(engine, &asks).whole().expect("a whole decision");
+        let picked = decided.decision.pick().expect("a pick");
+        let first = *picked.targets.first().expect("a target");
+        let worker = Arc::clone(&list[first.position as usize]);
+        let now = Instant::now();
+        let placement =
+            crate::tracking::Placement::taken(engine, decided, later, now, 0, worker, None);
+        let mut placement = placement.expect("a placement");
+        let measured = Outcome {
+            tokens_out: 34,
+            duration_micros: 5_000,
+            ..Outcome::reported(200, TransportClass::Ok)
+        };
+        assert_eq!(measured.served, WorkerId(0), "no worker named");
+        placement.ended(Side::Single, measured);
+        let told = Outcome {
+            served: first.id,
+            ..measured
+        };
+        assert_eq!(*ends.lock(), [told]);
         assert_eq!((engine.faults(), engine.unheard()), (0, 0));
     }
 

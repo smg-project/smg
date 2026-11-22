@@ -58,7 +58,8 @@ pub struct Placement<'a> {
     /// Where the request goes, as the host's own worker object: a pair's
     /// prefill.
     pub worker: Arc<dyn Worker>,
-    /// A pair's decode worker.
+    /// A pair's decode worker. Its host reads it and leaves it in place:
+    /// [`Placement::decode_id`] answers `None` once it is taken out.
     pub decode: Option<Arc<dyn Worker>>,
     /// The routing key the document derived for the request, for its
     /// host's in-flight counters. `None` where none was derived. Neither
@@ -186,15 +187,18 @@ impl Placement<'_> {
     /// One side of the request went out: its dispatch, said once
     /// ([`DecisionGuard::dispatched`], and
     /// [`DecisionGuard::dispatched_decode`] for a pair's decode). No lease
-    /// stands for an encode side, so its word says nothing.
+    /// stands for an encode side, so its word says nothing. A single
+    /// request's lease goes out under any other side its host names, as
+    /// [`Self::ended`] ends it under any.
     pub fn sent(&mut self, side: Side) {
         let Some(held) = &mut self.held else {
             return;
         };
+        let pair = held.target().pair.is_some();
         match side {
-            Side::Single | Side::Prefill => held.dispatched(Instant::now()),
-            Side::Decode => held.dispatched_decode(Instant::now()),
             Side::Encode => {}
+            Side::Decode if pair => held.dispatched_decode(Instant::now()),
+            Side::Single | Side::Prefill | Side::Decode => held.dispatched(Instant::now()),
         }
     }
 
