@@ -70,6 +70,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Choose the policy controller for the whole process when `on`.
+    pub fn policy_controller(mut self, on: bool) -> Self {
+        self.config.policy_controller = on;
+        self
+    }
+
     pub fn cache_boundaries(mut self, boundaries: Vec<usize>) -> Self {
         self.config.cache_boundaries = boundaries;
         self
@@ -1066,7 +1072,34 @@ impl RouterConfig {
 mod tests {
     use std::collections::HashMap;
 
+    use smg_policy_controller::document::PolicySpec;
+
     use super::*;
+
+    #[test]
+    fn a_document_given_with_the_switch_off_is_refused() {
+        // A host hands the document itself, and no launcher stands before it.
+        let document = PolicySpec::preset("random").expect("the preset");
+        let off = RouterConfig {
+            policy_spec: Some(document.clone()),
+            ..RouterConfig::builder().igw(true).build_unchecked()
+        };
+        assert!(matches!(
+            off.validate().expect_err("the document needs the controller"),
+            ConfigError::InvalidValue { field, value, reason }
+                if field == "policy_spec" && value == "the given document"
+                    && reason == "a policy document is run by the policy controller: set --policy-controller on"
+        ));
+        let on = RouterConfig {
+            policy_spec: Some(document),
+            ..RouterConfig::builder()
+                .igw(true)
+                .policy_controller(true)
+                .build_unchecked()
+        };
+        assert!(on.policy_controller);
+        on.validate().expect("the switch is on");
+    }
 
     /// Test complex routing mode helper method
     #[test]

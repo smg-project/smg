@@ -1908,7 +1908,26 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// The refusal of a policy document that would not run as it was given:
+    /// one beside the switch off. The validator holds a configuration to
+    /// it, and so can a start that is handed a configuration it never
+    /// validated.
+    pub(crate) fn validate_policy_document(config: &RouterConfig) -> ConfigResult<()> {
+        // A host hands the document itself. With the switch off it would be
+        // dropped, and the classic policies would serve.
+        if !config.policy_controller && config.policy_spec.is_some() {
+            return Err(ConfigError::invalid_value(
+                "policy_spec",
+                "the given document",
+                "a policy document is run by the policy controller: set --policy-controller on",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        Self::validate_policy_document(config)?;
+
         let has_service_discovery = config.discovery.is_some();
         let invalid_decode_policy = match &config.mode {
             RoutingMode::PrefillDecode { decode_policy, .. } if !config.enable_igw => {

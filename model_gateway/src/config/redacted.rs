@@ -135,6 +135,7 @@ const PLAIN: &[&str] = &[
     "upstream_http2",
     "enable_wasm",
     "storage_hook_wasm_path",
+    "policy_controller",
 ];
 
 /// The fields `redacted` rewrites before they leave, as the classification
