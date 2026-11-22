@@ -9,8 +9,11 @@
 //! `recorder()` in the group's `mod.rs`).
 
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
-use smg::observability::metrics_server::start_metrics_server;
-use smg_worker::{identity::builder::BasicWorkerBuilder, metrics::writers::Metrics};
+use smg::{
+    observability::metrics_server::start_metrics_server,
+    routers::grpc::backend_client::BasicWorkerBuilder,
+};
+use smg_worker::metrics::writers::Metrics;
 
 use crate::metrics::recorder;
 
