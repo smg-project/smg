@@ -2166,6 +2166,12 @@ pub(crate) mod tests {
             let heard = match *change {
                 Membership::Added(id) => ("joined", id, 0),
                 Membership::Removed(id) => ("left", id, 0),
+                // The ids that stand, one word each.
+                Membership::Snapshot(ids) => {
+                    let standing = ids.iter().map(|&id| ("standing", id, 0));
+                    self.heard.lock().extend(standing);
+                    return;
+                }
                 _ => return,
             };
             self.heard.lock().push(heard);

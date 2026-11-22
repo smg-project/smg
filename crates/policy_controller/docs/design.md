@@ -914,10 +914,13 @@ host that states none is named by the fingerprint of the worker's address.
 | `StatusChanged` | nothing: a decision reads a worker's status on its object |
 
 A worker removed and another registered at its address come as a `Removed` and a `Registered`,
-so a leave and then a join. The events are a broadcast that drops its oldest for a reader that
-falls behind: the task then reads the registry whole and tells what changed. The session table
-is told nothing: a pin on a worker that is gone stands until the session's idle time or two
-other workers end it.
+so a leave and then a join. Where the registration is heard first, the worker is read as its
+id's next life: a leave and a join of the id, and the removal then tells nothing. The events
+are a broadcast that drops its oldest for a reader that falls behind: the task then reads the
+registry whole, tells what changed, and last tells the ids that stand, so a policy keeps
+nothing of a worker whose whole life the channel dropped. It does the same behind a channel
+that closed. The session table is told nothing: a pin on a worker that is gone stands until the
+session's idle time or two other workers end it.
 
 For each request the host implements a small trait and calls the engine. A host writes `model`
 and `make`; the other three methods have default bodies:

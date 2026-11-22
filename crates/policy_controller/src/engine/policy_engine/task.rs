@@ -186,8 +186,10 @@ impl PolicyEngine {
     /// own code. Each was held, and the task went on. While the upkeep's
     /// panics raise the count it does not run whole: session keys past
     /// their end can stay on file, though every request is still answered.
-    /// While the follow's raise it, the stages are told no join and no
-    /// leave.
+    /// While the follow's raise it, a join whose answer of the host
+    /// panicked is lost until a whole read of the registry succeeds. A
+    /// removal asks the host nothing and is still told. A host whose code
+    /// panics at one worker every time fails every whole read.
     #[must_use]
     pub fn upkeep_faults(&self) -> u64 {
         self.upkeep_faults.load(Ordering::Relaxed)

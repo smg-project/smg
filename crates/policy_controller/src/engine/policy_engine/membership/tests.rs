@@ -134,10 +134,20 @@ fn in_id_order(mut words: Words) -> Words {
     words
 }
 
-/// What the stages were told since the last call, in the order told.
+/// What the stages were told of single workers since the last call, in the
+/// order told: the joins and the leaves, without a whole read's snapshot.
 fn told(heard: &Heard) -> Words {
+    told_and_standing(heard).0
+}
+
+/// What the stages were told since the last call: the joins and the leaves
+/// in the order told, and the ids its snapshots named, in their order.
+fn told_and_standing(heard: &Heard) -> (Words, Vec<WorkerId>) {
     let words = std::mem::take(&mut *heard.lock());
-    words.into_iter().map(|(word, id, _)| (word, id)).collect()
+    let words = words.into_iter().map(|(word, id, _)| (word, id));
+    let (standing, single): (Words, Words) = words.partition(|&(word, _)| word == "standing");
+    let standing = standing.into_iter().map(|(_, id)| id).collect();
+    (single, sorted(standing))
 }
 
 /// `ids` in their order.
@@ -353,8 +363,8 @@ fn a_follow_that_fell_behind_reads_the_registry_whole() {
 /// The events the channel kept come behind a whole read and may be older
 /// than it. A worker registered and removed at an address ahead of the
 /// read, where the read found the next one, is heard behind the read: its
-/// registration is a join again, and its removal tells no leave of the id
-/// the standing worker is held under.
+/// registration reads as the id's next life, a leave and a join, and its
+/// removal tells no leave of the id the standing worker is held under.
 #[test]
 fn a_removal_heard_behind_a_whole_read_tells_no_leave_of_a_standing_worker() {
     let registry = registry(1);
@@ -367,8 +377,65 @@ fn a_removal_heard_behind_a_whole_read_tells_no_leave_of_a_standing_worker() {
     remove(&registry, 1);
     register(&registry, 1);
     drain(&engine, &mut follow);
-    assert_eq!(told(&heard), [("joined", id(1)), ("joined", id(1))]);
+    let read_then_heard = [("joined", id(1)), ("left", id(1)), ("joined", id(1))];
+    assert_eq!(told(&heard), read_then_heard);
     assert_eq!(held(&follow), sorted(vec![id(0), id(1)]));
+}
+
+/// A worker whose whole life the channel dropped is in no list of a whole
+/// read: the follow never held it, and it stands no more. The read tells
+/// the stages the ids that stand, so a stage drops what a request left
+/// under any other, and tells nothing else. The follow's first read tells
+/// them too.
+#[test]
+fn a_whole_read_tells_the_stages_the_ids_that_stand() {
+    let registry = registry(2);
+    let (engine, heard, mut follow) = following(&registry);
+    let (joined, standing) = told_and_standing(&heard);
+    assert_eq!(joined.len(), 2);
+    assert_eq!(standing, sorted(vec![id(0), id(1)]), "at its start");
+
+    register(&registry, 2);
+    remove(&registry, 2);
+    flood(&registry, 1);
+    drain(&engine, &mut follow);
+    let (single, standing) = told_and_standing(&heard);
+    assert_eq!(single, [], "the follow never held the worker");
+    assert_eq!(standing, sorted(vec![id(0), id(1)]));
+}
+
+/// A registry can say a registration at an address ahead of the removal it
+/// follows. A worker registered under an id another is held under is the
+/// id's next life: the stages are told a leave of the id and then its
+/// join, so they keep nothing of the earlier life, and the earlier
+/// worker's removal then tells nothing. The removal of the last worker
+/// under the id is its leave.
+#[test]
+fn a_registration_heard_ahead_of_the_removal_it_follows_is_the_ids_next_life() {
+    let registry = registry(0);
+    let (engine, heard, mut follow) = following(&registry);
+    let (first, next) = (ObjectId::new(), ObjectId::new());
+    let registered = |object: &ObjectId| WorkerEvent::Registered {
+        worker_id: object.clone(),
+        worker: ready_worker(&url(0), MODEL),
+    };
+    let removed = |object: &ObjectId| WorkerEvent::Removed {
+        worker_id: object.clone(),
+        worker: ready_worker(&url(0), MODEL),
+    };
+
+    assert!(engine.tells(&mut follow, Ok(registered(&first))));
+    assert_eq!(told(&heard), [("joined", id(0))]);
+
+    assert!(engine.tells(&mut follow, Ok(registered(&next))));
+    assert_eq!(told(&heard), [("left", id(0)), ("joined", id(0))]);
+
+    assert!(engine.tells(&mut follow, Ok(removed(&first))));
+    assert_eq!(told(&heard), [], "the id's next life stands");
+
+    assert!(engine.tells(&mut follow, Ok(removed(&next))));
+    assert_eq!(told(&heard), [("left", id(0))]);
+    assert_eq!(held(&follow), []);
 }
 
 /// The engine's own task follows the registry its host handed: the workers
