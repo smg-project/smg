@@ -214,9 +214,11 @@ pub struct HeldDecision<'a> {
     /// The target its host took: the pick's first, or the one a take moved
     /// to. A pair's decode is in it.
     pub target: &'a Target,
-    /// A pair's decode side. `None` for a single's lease, which carries
-    /// nothing of a pair's.
-    pub decode: Option<HeldDecode>,
+    /// A pair's decode side, read under a pair's lease alone
+    /// ([`Lease::side`] is [`Side::Prefill`]). A single's lease has none:
+    /// its handle lends no session and a side that never stood chosen,
+    /// and no reader takes them.
+    pub decode: HeldDecode,
 }
 
 /// What a guard holds of a pair's decode side ([`HeldDecision::decode`]):

@@ -1425,10 +1425,10 @@ mod tests {
             lease: &lease,
             index: 1,
             target: &taken,
-            decode: Some(HeldDecode {
+            decode: HeldDecode {
                 session,
                 chosen: false,
-            }),
+            },
         };
         tell(engine, &held, dispatched(Side::Prefill, 1));
         tell(engine, &held, dispatched(Side::Decode, 1));
@@ -1468,10 +1468,10 @@ mod tests {
             lease: &lease,
             index: 0,
             target: &taken,
-            decode: Some(HeldDecode {
+            decode: HeldDecode {
                 session,
                 chosen: false,
-            }),
+            },
         };
         let prefill = ("released", Side::Prefill, 1, 0, own, 7_000, 0);
         let decode = ("released", Side::Decode, 101, 0, session, 7_000, 0);
@@ -1505,10 +1505,10 @@ mod tests {
             lease: &lease,
             index: 1,
             target: &taken,
-            decode: Some(HeldDecode {
+            decode: HeldDecode {
                 session,
                 chosen: true,
-            }),
+            },
         };
         tell(engine, &held, dispatched(Side::Decode, 1));
         assert_eq!(
@@ -1536,10 +1536,10 @@ mod tests {
             lease: &lease,
             index: 0,
             target: &taken,
-            decode: Some(HeldDecode {
+            decode: HeldDecode {
                 session,
                 chosen: true,
-            }),
+            },
         };
         tell(
             engine,
@@ -1605,6 +1605,42 @@ mod tests {
             other => panic!("not shed: {other:?}"),
         }
         assert_eq!((host.engine.faults(), host.engine.unheard()), (0, 0));
+    }
+
+    /// A guard lends its pair's session of the decode phase with the decode
+    /// side ([`HeldDecode::session`]), and every word of that side is told
+    /// under it: the session the side's issue stated, which is not the
+    /// prefill side's.
+    #[test]
+    fn a_guards_decode_side_is_told_under_the_session_of_its_issue() {
+        let host = Host::of(1, 1);
+        let classes = every(1, 1);
+        let (asks, now) = (host.asks(&classes, false), Instant::now());
+        let mut guard = DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &asks, now)
+            .expect("a decision");
+        let decode = target_at(guard.decision(), 0).pair.expect("a pair");
+        guard.dispatched(now);
+        guard.dispatched_decode(now);
+        guard.completed(&outcome(Side::Decode, decode.decode_id), now);
+        drop(guard);
+        let heard = std::mem::take(&mut *host.heard.lock());
+        let told = |side: Side| -> Vec<(&'static str, Session)> {
+            let of_side = heard.iter().filter(|word| word.1 == side);
+            of_side.map(|word| (word.0, word.4)).collect()
+        };
+        let own = asks.0.facts.session();
+        let decode_side = told(Side::Decode);
+        let issued = decode_side.first().expect("the decode's issue").1;
+        assert_ne!(issued, own, "each side keeps its own session");
+        assert_eq!(
+            decode_side,
+            [
+                ("issued", issued),
+                ("dispatched", issued),
+                ("completed", issued),
+            ]
+        );
+        assert!(told(Side::Prefill).iter().all(|word| word.1 == own));
     }
 
     /// A decode sent later stands chosen in its guard. Behind the prefill's
