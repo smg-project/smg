@@ -2596,8 +2596,11 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
 /// the same tokens, on texts made of the tokens, their prefixes, other text
 /// and characters sharing a token's first bytes; for a set of one first byte
 /// (the automaton's own search), one with `/t` (the split search, from a
-/// text's second lone slash on), one with a token in fullwidth bars among
-/// `<` tokens (the chain shape), one of tokens beyond ASCII only,
+/// text's second lone slash on), one of two first bytes with the common one
+/// last (`ed`), one whose token holds two places of the search past its
+/// start (`aaaab`: the automaton's own search again), one with a token in
+/// fullwidth bars among `<` tokens (the chain shape), one of tokens beyond
+/// ASCII only,
 /// one with more than three first bytes (tab and newline runs, `<`, `[` and
 /// runs of a mark beyond ASCII), one whose prefixes stand whole (every
 /// token shorter than the prefix length), one the library declines as it
@@ -2607,9 +2610,11 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
 /// and one cut to thirteen-byte prefixes for the narrow searcher.
 #[test]
 fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
-    let sets: [(&[&str], bool); 6] = [
+    let sets: [(&[&str], bool); 8] = [
         (&["<a>", "<ab>", "<abc>", "<|x|>", "<"], false),
         (&["<a>", "<ab>", "/t", "[b]"], true),
+        (&["<a>", "ed", "eda"], true),
+        (&["aaaab", "c"], false),
         (
             &[
                 "<a>",

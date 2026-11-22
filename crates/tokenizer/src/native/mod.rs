@@ -1093,9 +1093,12 @@ type AddedTokenList = Vec<Added>;
 
 /// One set of added tokens, matched leftmost-longest as `AddedVocabulary`
 /// matches them. The automaton's own search scans a text for the tokens'
-/// first bytes when there are at most three of them, all ASCII; a set the
-/// scan cannot take (a token starting beyond ASCII, or more than three
-/// first bytes) it searches by the tokens' rarest bytes instead, which for a
+/// first bytes when there are at most three of them, all ASCII, each `<`,
+/// `[` or `]`; a set of two or three with another first byte takes a byte
+/// search of its own ([`Search::FirstBytes`]), unless a token of it holds
+/// more than one place of that search past its start. A set the scan cannot
+/// take (a token starting beyond ASCII, or more than three first bytes) the
+/// automaton searches by the tokens' rarest bytes instead, which for a
 /// vocabulary of a thousand `<` tokens and one fenced in fullwidth bars were
 /// the bars' continuation bytes, frequent in CJK text: that search was a
 /// third of a 2 KB encode (measured). Such a set takes its candidates from
@@ -1146,6 +1149,9 @@ impl Prefixes {
     /// shorter one would stop the pass at places no token stands.
     const NARROW_MIN_LEN: usize = 8;
     const MAX_FIRST_BYTES: usize = 16;
+    /// The most places of the byte search a token may hold past its own
+    /// start: one, the slash of `</think>` in a set with `/think`.
+    const MAX_INNER: usize = 1;
 
     /// Whether a search of our own beats the automaton's on `tokens`: a first
     /// byte beyond ASCII or more than three distinct ones, which its
@@ -1204,7 +1210,8 @@ impl Prefixes {
     /// What searches for `tokens`: the byte search for two or three first
     /// bytes, all ASCII; else the searcher over the prefixes
     /// ([`Self::chosen`]), none when there are none to take or the library
-    /// declines the set.
+    /// declines the set, and none where the byte search would have a text
+    /// walked over and over.
     fn of(tokens: &[Added]) -> Option<Self> {
         let firsts = Self::distinct(tokens, 1);
         let bytes: Vec<u8> = firsts
@@ -1225,6 +1232,28 @@ impl Prefixes {
                         Some(&second) => seconds[which][usize::from(second)] = true,
                         None => seconds[which] = [true; 256],
                     }
+                }
+                // A token that holds places of this search past its own start
+                // has the anchored automaton walk them again from each. With
+                // at most `MAX_INNER` in a token, no byte of a text is walked
+                // more than that plus three times; a set beyond it (`aaaab`: a
+                // text of `a` walked from every byte) keeps the automaton's
+                // own search.
+                let inner = |token: &Added| {
+                    let content = token.content.as_bytes();
+                    let pairs = content.iter().zip(content.iter().skip(1));
+                    pairs
+                        .skip(1)
+                        .filter(|(first, second)| {
+                            bytes
+                                .iter()
+                                .position(|byte| byte == *first)
+                                .is_some_and(|which| seconds[which][usize::from(**second)])
+                        })
+                        .count()
+                };
+                if tokens.iter().any(|token| inner(token) > Self::MAX_INNER) {
+                    return None;
                 }
                 let pair = Pair::of(bytes, &seconds);
                 return Some(Self {
