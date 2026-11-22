@@ -660,6 +660,17 @@ struct RoutingArgs {
     /// workload where every request has a holder. 0 disables.
     #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
     worker_warmup_divert_every: u64,
+
+    /// Choose off for the classic routing policies or on for the policy
+    /// controller. With on, the routing flags keep their meaning through a
+    /// policy document
+    #[arg(
+        long,
+        value_parser = ["on", "off"],
+        default_value = "off",
+        help_heading = "Routing Policy"
+    )]
+    policy_controller: String,
 }
 
 #[derive(clap::Args, Debug)]
@@ -2075,6 +2086,26 @@ mod tests {
             .chain(args.iter().map(|s| (*s).to_string()))
             .collect();
         Cli::parse_from(argv).router_args
+    }
+
+    #[test]
+    fn the_switch_flows_into_router_config() {
+        use clap::error::ErrorKind;
+
+        for (flags, enabled) in [
+            (&[][..], false),
+            (&["--policy-controller", "on"][..], true),
+            (&["--policy-controller", "off"][..], false),
+        ] {
+            let config = cli_args_from(flags)
+                .to_router_config(vec![], vec![])
+                .expect("the routing configuration");
+            assert_eq!(config.policy_controller, enabled, "{flags:?}");
+        }
+        let refusal = Cli::try_parse_from(["smg", "--policy-controller", "other"])
+            .expect_err("the switch takes only on and off");
+        assert_eq!(refusal.kind(), ErrorKind::InvalidValue);
+        assert!(refusal.to_string().contains("--policy-controller"));
     }
 
     #[test]

@@ -1310,6 +1310,7 @@ impl CliArgs {
             .maybe_reasoning_parser(self.model.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.model.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.model.mcp_config_path.as_ref())
+            .policy_controller(self.routing.policy_controller == "on")
             .dp_aware(self.routing.dp_aware)
             .pd_pairing_mode(
                 PdPairingMode::parse(&self.routing.pd_pairing_mode).unwrap_or_default(),
