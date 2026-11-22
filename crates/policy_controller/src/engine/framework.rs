@@ -2539,7 +2539,8 @@ fn order_joined(
 /// before the scorers run ([`order_joined`]). A draw that keeps nobody says
 /// nothing of the pool: the decision widens to the whole pass
 /// ([`run_whole`]), whose stages alone shed, name a stage and ask the
-/// all-vetoed rule.
+/// all-vetoed rule. Nothing is drawn for a request its host holds to places
+/// ([`places`]): the whole pass decides it.
 ///
 /// Where the build folded the profile's filters into one test of a row
 /// (`row_tests`), a row is asked about in that one test, and about the host's
@@ -2578,6 +2579,9 @@ fn run_drawn(
             .draw_first(facts, pool, candidates, ask, &mut buf.kept, &mut draw)
     };
     let drew = match rows {
+        // A request held to places is the whole pass's, which opens its
+        // set with them: nothing is drawn, and the pass below decides.
+        _ if places::stated(cx) => false,
         Some(tests) if tests.masked(cx) => {
             draw_by(&mut |c| tests.keeps(facts, c, cx) && !cx.masks(c.position))
         }
@@ -2757,7 +2761,9 @@ fn run_drawn_written(
     buf.kept.clear();
     let mut draw = Draw::new(facts.seed);
     let masked = tests.is_some_and(|tests| tests.masked(cx));
-    let drew = {
+    // A request held to places is the whole pass's, which opens its set
+    // with them: nothing is drawn, and every row is written below.
+    let drew = !places::stated(cx) && {
         // The row a draw lands on, written at its place: the written
         // record is the one the filters are asked about.
         let mut ask = |fixed: &Candidate| {
