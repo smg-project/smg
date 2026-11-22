@@ -101,10 +101,10 @@ pub(super) fn unchecked(row: &WorkerRow) -> BasicWorkerBuilder {
 
 /// The row's own overload thresholds in the worker crate's form: what an
 /// object states where its host's load monitor judges overload by it
-/// ([`Objects::with_overload_thresholds`](super::Objects::with_overload_thresholds)),
-/// and what the line of a mirrored verdict says. The usage goes back from
-/// permille to the ratio an engine reports: the object's own registration
-/// reads it back as the same permille ([`facts`](super::facts)).
+/// ([`Objects::with_overload_thresholds`](super::Objects::with_overload_thresholds)).
+/// The usage goes back from permille to the ratio an engine reports: the
+/// object's own registration reads it back as the same permille
+/// ([`facts`](super::facts)).
 pub(super) fn thresholds(overload: &Overload) -> OverloadUpdate {
     OverloadUpdate {
         waiting_requests: overload
