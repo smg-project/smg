@@ -555,14 +555,11 @@ const WAITING_PIECES: usize = 32;
 const WAITING_GAP: usize = 32;
 
 /// A short piece the thread's packed table missed, waiting for its answer
-/// (see `Native::waits`): where the probe ended, with the piece's key; where
-/// its hole of one id stands in the output; and the cache's count of clears
-/// at the miss (`PieceCache::clears`), since a vacancy taken before a clear
-/// names no slot of the table as it is.
+/// (see `Native::waits`): where the probe ended, with the piece's key, and
+/// where its hole of one id stands in the output.
 struct Waiting {
     vacancy: Vacancy,
     at: usize,
-    clears: usize,
 }
 
 /// One thread's cache of the pieces it met with one encoder, each with the
@@ -613,6 +610,10 @@ struct PieceCache {
     /// a waiting piece's vacancy is of the table as it was before the next
     /// clear.
     clears: usize,
+    /// `clears` when the waiting pieces were last answered: after a clear
+    /// since then a waiting piece's vacancy may name no slot of the table
+    /// as it is, and every waiting piece asks the table again.
+    answered_clears: usize,
     /// Whether the thread's misses ask the encoder's learned table before
     /// they are merged and tell it after (`NativeEncoder::learned_pieces`):
     /// the thread has cleared, and the encoder's threads share what they
@@ -651,6 +652,7 @@ impl PieceCache {
             answer: Vec::new(),
             last_miss: 0,
             clears: 0,
+            answered_clears: 0,
             shares: false,
             calls_to_read: 2,
             asked: 0,
@@ -4063,25 +4065,28 @@ impl NativeEncoder {
     /// one id in the output and waits, and up to [`WAITING_PIECES`] are
     /// answered together ([`Self::answer_waiting`]), their lines read at once
     /// (measured: a first sight of a word list 15 to 17 % faster, new text
-    /// of 16 tokens 5 to 10 %, of 256 tokens 8 to 12 %). False for a miss
-    /// that stands alone: the seed answers it where it is met. True for a
-    /// piece that waits; the waiting pieces are answered here, this one the
-    /// last of them, when they are as many as are answered together or the
-    /// miss is not close behind the last one.
+    /// of 16 tokens 5 to 10 %, of 256 tokens 8 to 12 %). [`Self::seeded`]
+    /// puts a miss close behind the last one (`near`) on the list itself
+    /// while both lists have room and no answer is due; this is the rest of
+    /// the wait. False for a miss that stands alone: the seed answers it
+    /// where it is met. True for a piece that waits; the waiting pieces are
+    /// answered here, this one the last of them, when they are as many as
+    /// are answered together or the miss is not close behind the last one.
     #[cold]
     #[inline(never)]
-    fn waits(&self, vacancy: Vacancy, ids: &mut Vec<u32>, cache: &mut PieceCache) -> bool {
-        let at = ids.len();
-        let close = cache.shares || at.wrapping_sub(cache.last_miss) <= WAITING_GAP;
-        cache.last_miss = at;
+    fn waits(
+        &self,
+        vacancy: Vacancy,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+        near: bool,
+    ) -> bool {
+        let close = near || cache.shares;
         if !close && cache.waiting.is_empty() {
             return false;
         }
-        cache.waiting.push(Waiting {
-            vacancy,
-            at,
-            clears: cache.clears,
-        });
+        let at = ids.len();
+        cache.waiting.push(Waiting { vacancy, at });
         ids.push(0);
         if !close || cache.waiting.len() >= WAITING_PIECES {
             self.answer_waiting(ids, cache);
@@ -4102,7 +4107,8 @@ impl NativeEncoder {
     /// tokens; no first loop keeps none). Then the pieces are answered, the
     /// last hole first, and each is learned as [`Self::seeded`] and the slow
     /// call learn it: at its vacancy, unless the cache was cleared since the
-    /// miss, when the piece asks the table again. An answer of one id is
+    /// waiting pieces were last answered (`PieceCache::answered_clears`),
+    /// when the piece asks the table again. An answer of one id is
     /// written into its hole. An answer that is not one id stays in the
     /// thread's scratch list until the last piece is answered; one pass
     /// from the last hole down then places them all: the output grows once,
@@ -4150,7 +4156,7 @@ impl NativeEncoder {
             let mut vacancy = Some(piece.vacancy);
             let mut one = None;
             let from = answer.len();
-            if piece.clears != cache.clears {
+            if cache.answered_clears != cache.clears {
                 match cache.packed.probe(key) {
                     Ok(entry) => {
                         one = cache.packed.one_or_append(entry, &mut answer);
@@ -4248,6 +4254,7 @@ impl NativeEncoder {
         }
         cache.waiting = waiting;
         cache.waiting.clear();
+        cache.answered_clears = cache.clears;
         cache.answer = answer;
         if learned.is_some() {
             cache.judge_asks(asked, of_use);
@@ -4321,11 +4328,26 @@ impl NativeEncoder {
         // together only while both fit the processor's window, and a first
         // sight with a few dozen instructions more in front of the read was
         // 4 to 25 % slower (measured on first sights of word lists).
-        if (cache.packed.slots() <= THREAD_BACKING_SLOTS || cache.shares)
-            && self.misses_wait
-            && self.waits(vacancy, ids, cache)
-        {
-            return true;
+        if (cache.packed.slots() <= THREAD_BACKING_SLOTS || cache.shares) && self.misses_wait {
+            let at = ids.len();
+            let near = at.wrapping_sub(cache.last_miss) <= WAITING_GAP;
+            cache.last_miss = at;
+            // A miss close behind the last one takes its place on the list
+            // here while both lists have room and no answer is due: one call
+            // a piece and not two (counted: 54 instructions a piece to its
+            // place on the list, 82 through `Self::waits`).
+            if near
+                && cache.waiting.len() < cache.waiting.capacity()
+                && cache.waiting.len() + 1 < WAITING_PIECES
+                && at < ids.capacity()
+            {
+                cache.waiting.push(Waiting { vacancy, at });
+                ids.push(0);
+                return true;
+            }
+            if self.waits(vacancy, ids, cache, near) {
+                return true;
+            }
         }
         self.seeded_alone(vacancy, ids, cache)
     }
