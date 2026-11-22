@@ -191,6 +191,14 @@ impl WorkerFacts {
     /// The labels of one row.
     pub const LABELS: usize = 128;
 
+    /// Why no row holds `zone`, where none does: a zone's one test of
+    /// length, with the words of its refusal. The store, the controller's
+    /// registration and a gateway's workers API all ask here, so the
+    /// three take the same zones.
+    pub fn zone_refusal(zone: &str) -> Option<&'static str> {
+        (zone.len() > Self::NAME_BYTES).then_some("a zone is at most 256 bytes")
+    }
+
     /// Whether these facts name the models `other` names, in any order and
     /// however often. The order is a fact of its own (a row's events are
     /// indexed under its first model), and a reorder alone is no other

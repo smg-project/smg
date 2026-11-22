@@ -56,9 +56,6 @@ fn validate_worker_url_request(url: &str) -> Result<(), WorkerServiceError> {
 /// worker but a mistake or a probe, and every log line and metric label
 /// derived from the URL would carry them.
 const MAX_WORKER_URL_BYTES: usize = 2048;
-/// Longest zone a registration states: the policy controller's own bound
-/// of a zone, so a zone this API takes its store and its registration take.
-const MAX_ZONE_BYTES: usize = WorkerFacts::NAME_BYTES;
 /// Most labels a worker carries (an engine reports a few dozen); held at
 /// registration, at the admin check of a PATCH and again where the PATCH
 /// merges into the worker.
@@ -131,15 +128,10 @@ fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
     if let Some(refusal) = control_character_refusal(strings) {
         return Err(bad_request(refusal));
     }
-    if let Some(zone) = spec
-        .zone
-        .as_deref()
-        .filter(|zone| zone.len() > MAX_ZONE_BYTES)
-    {
-        return Err(bad_request(format!(
-            "zone is {} bytes long; at most {MAX_ZONE_BYTES} are accepted",
-            zone.len()
-        )));
+    // A zone's length is the policy controller's own test, so a zone this
+    // API takes its store and its registration take.
+    if let Some(refusal) = spec.zone.as_deref().and_then(WorkerFacts::zone_refusal) {
+        return Err(bad_request(refusal.to_string()));
     }
     validate_labels(&spec.labels)?;
     validate_cost(spec.cost)?;

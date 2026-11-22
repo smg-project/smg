@@ -203,12 +203,8 @@ impl WorkerFacts {
                 "a model id is not empty and holds no blank and no control character",
             );
         }
-        if self
-            .zone
-            .as_ref()
-            .is_some_and(|zone| zone.len() > Self::NAME_BYTES)
-        {
-            return past("zone", "a zone is at most 256 bytes");
+        if let Some(why) = self.zone.as_deref().and_then(Self::zone_refusal) {
+            return past("zone", why);
         }
         if self.labels.len() > Self::LABELS {
             return past("labels", "a row holds at most 128 labels");

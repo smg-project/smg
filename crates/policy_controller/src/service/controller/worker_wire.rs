@@ -1041,8 +1041,8 @@ fn over(
             "no row holds a topology in this build",
         ));
     }
-    if spec.zone.len() > NAME_BYTES {
-        return Err(refused("spec.zone", "a zone is at most 256 bytes"));
+    if let Some(why) = WorkerFacts::zone_refusal(&spec.zone) {
+        return Err(refused("spec.zone", why));
     }
     if spec.labels.len() > LABELS {
         return Err(refused("spec.labels", "a row holds at most 128 labels"));
