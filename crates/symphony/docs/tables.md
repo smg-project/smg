@@ -568,9 +568,9 @@ What the table says beyond `inkling`, whose rows it shares:
   consumed them with the kind's marker. Without the lead the derivation, which starts from the
   turn's own state, wrote Inkling's tag: from the first token it owed the thought's or the
   answer's marker where the model writes `<|message_model|>`, a marker with no row out of the
-  state the turn starts in. The forced call's tag is Inkling's unchanged: the call marker
-  triggers it inside whatever message the model is writing, and the opener before it is free
-  text.
+  state the turn starts in. A forced call's tag takes the opener too: owed before the call's
+  marker where the engine starts at the first token, optional otherwise; a call the request does
+  not owe keeps Inkling's tag, the opener written in its free text.
 - **The opener said again inside a message is the opener.** A row on `<|message_model|>` from
   each body back into it, framing as a kind said again is, the kind marker after it the kind.
   The answer tag's optional way in admits the opener and the kind marker after an engine that
@@ -865,6 +865,26 @@ v1.1, whose template writes each call one `}` short (`{"name": …, "arguments":
 bellwether's reference heals and this table does not read; and the Ultra's CPT checkpoint
 (`Llama-3_1-Nemotron-Ultra-253B-CPT-v1`), whose bare `{"name": …, "parameters": …}` object is
 Llama 3.1's own syntax, which the `json` table reads.
+
+## Command (`command`)
+
+What the table says beyond the others:
+
+- **Every part has its own pair of markers, and the answer's move nothing.** The thought and the
+  list of calls are states their markers open and close, as Llama Nemotron's are. The answer is
+  the content state the turn starts in: `<|START_RESPONSE|>` and `<|END_RESPONSE|>` are dropped
+  where they stand, so an answer with no marker around it is content too, as Command R v01,
+  whose template has none of the markers, writes its own.
+- **A call is `tool_name` and `parameters`.** The outline reads those keys beside `name` and
+  `arguments`; the `tool_call_id` the template counts from zero is another member, and the
+  call's id is the engine's.
+
+What it leaves open: the structural tag derived from the table spells a call `name` and
+`arguments`, which the table reads and the template does not write. A checkpoint whose template
+writes the answer between `<|START_TEXT|>` and `<|END_TEXT|>` has no recorded output and no row
+here. Command R v01's two recorded cases hold content alone: a call it writes in another spelling
+than the action markers (its `tool_use` template, which a request with tools selects, is not among
+the recorded sets) reads as content here, as it does with the legacy parser.
 
 ## MiniCPM5 (`minicpm5`)
 

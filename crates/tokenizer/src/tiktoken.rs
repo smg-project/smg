@@ -1387,12 +1387,12 @@ impl TiktokenTokenizer {
 
 impl Decoder for TiktokenTokenizer {
     /// A vocabulary with the per-id table decodes through it, as its streams
-    /// do: every id's bytes concatenated, specials dropped by the table's
-    /// per-id marks when asked, one UTF-8 conversion, in place of the crate's
-    /// lookup per id; bytes that are not UTF-8 render lossily and are logged
-    /// as the crate path logs its fallback. An id the table lacks, or a
-    /// vocabulary too sparse for one, takes the crate's decode below, with
-    /// its unknown-id error and its lossy fallback.
+    /// do: whole tokens appended as text, the other bytes converted per run,
+    /// specials dropped by the table's per-id marks when asked, in place of
+    /// the crate's lookup per id; bytes that are not UTF-8 render lossily and
+    /// are logged as the crate path logs its fallback. An id the table lacks,
+    /// or a vocabulary too sparse for one, takes the crate's decode below,
+    /// with its unknown-id error and its lossy fallback.
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
         if let Some((text, lossy)) = self
             .byte_level

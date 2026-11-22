@@ -13,9 +13,12 @@ use std::sync::Arc;
 
 use openai_protocol::worker::WorkerStatus;
 use smg_policy_controller::{
-    engine::view::WorkerId,
-    store::{Maker, WorkerFacts},
-    worker_host::{Expect, Membership, Objects, Over, Refused, Remover, Standing, Wrote},
+    engine::WorkerId,
+    store::{Registrant, WorkerFacts},
+    worker_host::{
+        MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Objects, Over,
+        Precondition, Remover, RowRevision,
+    },
 };
 use smg_worker::identity::basic::Worker;
 
@@ -24,13 +27,16 @@ use crate::routers::common::snapshot::ModelWorkerSnapshot;
 /// A removal's door: the feed's, and a drain the store took is marked on
 /// the row's worker in the registry.
 pub(crate) struct DrainingDoor {
-    door: Arc<dyn Membership>,
+    door: Arc<dyn MembershipWriter>,
     rows: Arc<Objects<ModelWorkerSnapshot>>,
 }
 
 impl DrainingDoor {
     /// `door`, over the objects `rows` holds.
-    pub(crate) fn new(door: Arc<dyn Membership>, rows: Arc<Objects<ModelWorkerSnapshot>>) -> Self {
+    pub(crate) fn new(
+        door: Arc<dyn MembershipWriter>,
+        rows: Arc<Objects<ModelWorkerSnapshot>>,
+    ) -> Self {
         Self { door, rows }
     }
 
@@ -53,14 +59,14 @@ impl DrainingDoor {
     }
 }
 
-impl Membership for DrainingDoor {
+impl MembershipWriter for DrainingDoor {
     fn found(
         &self,
-        maker: &Maker,
-        expect: Expect,
+        maker: &Registrant,
+        expect: Precondition,
         url: &str,
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
-    ) -> Result<Wrote, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.door.found(maker, expect, url, state)
     }
 
@@ -68,35 +74,46 @@ impl Membership for DrainingDoor {
     // on, so the holder keeps the objects the registration built.
     fn found_rows(
         &self,
-        maker: &Maker,
-        expect: Expect,
+        maker: &Registrant,
+        expect: Precondition,
         built: &[Arc<dyn Worker>],
         over: Option<Over<'_>>,
-    ) -> Result<Vec<Wrote>, Refused> {
+    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
         self.door.found_rows(maker, expect, built, over)
     }
 
-    fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
+    fn drained(
+        &self,
+        by: Remover<'_>,
+        url: &str,
+        seen: RowRevision,
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         let wrote = self.door.drained(by, url, seen)?;
         // `Unmoved` is a row that was draining already: the removal that
         // marked it may have ended before its mark reached the worker.
-        if let Wrote::Draining(row) | Wrote::Unmoved(row) = wrote {
+        if let MembershipWriteOutcome::Draining(row) | MembershipWriteOutcome::Unmoved(row) = wrote
+        {
             self.mark(row);
         }
         Ok(wrote)
     }
 
-    fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
+    fn gone(
+        &self,
+        by: Remover<'_>,
+        url: &str,
+        seen: RowRevision,
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.door.gone(by, url, seen)
     }
 
     // The feed's door hands a rebuilt worker to the holder, as a built one.
     fn refreshed(
         &self,
-        seen: Standing,
+        seen: RowRevision,
         built: &Arc<dyn Worker>,
         over: &Arc<dyn Worker>,
-    ) -> Result<Wrote, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.door.refreshed(seen, built, over)
     }
 }

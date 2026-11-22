@@ -28,8 +28,11 @@ import grpc
 
 from smg_grpc_servicer.vllm.media_refs import MediaRefItem, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
+    MEDIA_FAULT_CLIENT,
+    MEDIA_FAULT_TRANSIENT,
     MODE_INPROCESS,
     MODE_OFF,
+    MmMediaFetchFault,
     MmProcessorUnavailable,
     MmSettings,
     build_mm_processor,
@@ -45,6 +48,15 @@ KIND_UNAVAILABLE = "unavailable"
 KIND_INTERNAL = "internal"
 # The request's own media failed; the payload is `(code, message)`.
 KIND_MEDIA = "media"
+# A media fetch that failed for the reference's own reason: Rust reports it
+# as the media's fault (the media-fault trailer), so the gateway answers for
+# the media and does not replay the request.
+KIND_MEDIA_CLIENT = "media_client"
+KIND_MEDIA_TRANSIENT = "media_transient"
+_MEDIA_FAULT_KINDS = {
+    MEDIA_FAULT_CLIENT: KIND_MEDIA_CLIENT,
+    MEDIA_FAULT_TRANSIENT: KIND_MEDIA_TRANSIENT,
+}
 
 _RETRYABLE_CODES = (
     grpc.StatusCode.UNAVAILABLE,
@@ -313,9 +325,19 @@ class RustMediaBridge:
         """Classify the outcome the way the Python servicer maps it to a
         status (`kind_for_code`): retryable failures UNAVAILABLE, the caller's
         INVALID_ARGUMENT and NOT_FOUND, anything else INTERNAL; a failure of the
-        request's own media (`mark_client_media`) is `media`, with its code."""
+        request's own media (`mark_client_media`) is `media`, with its code, and
+        a media fetch fault leaves under its own kind."""
         try:
             result = future.result()
+        except MmMediaFetchFault as e:
+            logger.warning(
+                "Media of request %s could not be fetched (%s): %s", request_id, e.fault, e
+            )
+            # A binding that predates a kind would read it as internal: the
+            # kind is sent only where the callback lists it.
+            kind = _MEDIA_FAULT_KINDS.get(e.fault)
+            listed = kind in getattr(done, "media_fault_kinds", ())
+            done(kind if listed else KIND_UNAVAILABLE, str(e))
         except MmProcessorUnavailable as e:
             logger.warning("Media processing unavailable for request %s: %s", request_id, e)
             done(KIND_UNAVAILABLE, str(e))

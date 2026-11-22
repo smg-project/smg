@@ -25,8 +25,11 @@ use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
 };
 use smg_policy_controller::{
-    Candidate, Catalog, Constraints, Engine, Lease, Lifecycle, PolicySpec, PoolFacts,
-    PowerOfTwoMetric, RequestFacts, Scratch, Side, Target,
+    document::PolicySpec,
+    engine::{Candidate, Constraints, Engine, PoolFacts, RequestFacts, Scratch, Target},
+    policies::power_of_two::PowerOfTwoMetric,
+    stages::{Lifecycle, StageRegistry},
+    tracking::{Lease, Side},
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -143,7 +146,7 @@ fn forms(c: &mut Criterion) {
 }
 
 fn least_cost(c: &mut Criterion) {
-    if !Catalog::builtin()
+    if !StageRegistry::builtin()
         .scorers()
         .any(|name| name == "least-cost")
     {

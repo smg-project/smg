@@ -9,8 +9,13 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 use smg_policy_controller::{
-    Assignment, Candidate, Constraints, Engine, Health, Identity, Lease, Lifecycle, PolicySpec,
-    PoolFacts, Recovery, RequestFacts, Scratch, SessionsSpec, Side, WorkerId,
+    document::{Assignment, PolicySpec, Recovery, SessionsSpec},
+    engine::{
+        Candidate, Constraints, Engine, Health, Identity, PoolFacts, RequestFacts, Scratch,
+        WorkerId,
+    },
+    stages::Lifecycle,
+    tracking::{Lease, Side},
 };
 
 use crate::{Outcome, Recorded, Replayed};

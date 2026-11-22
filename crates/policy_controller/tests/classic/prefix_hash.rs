@@ -27,8 +27,11 @@
 
 use serde::Deserialize;
 use smg_policy_controller::{
-    fingerprint, Candidate, Constraints, Engine, HashKind, Health, Identity, PolicySpec, PoolFacts,
-    RequestFacts, Scratch, WorkerId,
+    document::PolicySpec,
+    engine::{
+        fingerprint, Candidate, Constraints, Engine, HashKind, Health, Identity, PoolFacts,
+        RequestFacts, Scratch, WorkerId,
+    },
 };
 
 use crate::{same_outcome, Outcome};

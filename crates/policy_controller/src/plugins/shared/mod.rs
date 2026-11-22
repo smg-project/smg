@@ -10,11 +10,11 @@
 //! A kind (the WebAssembly host in the `wasm` module) implements
 //! `BoundPlugin`, a trait of this crate alone, for the plugin it bound and
 //! builds on these: the engine sees stages and a
-//! [`DecisionScope`](crate::DecisionScope), never a kind. The module is built
+//! [`DecisionScope`](crate::engine::DecisionScope), never a kind. The module is built
 //! when a kind is.
 
 pub(crate) mod breaker;
-pub mod config;
+pub(crate) mod config;
 mod counters;
 mod open;
 mod stages;
@@ -24,9 +24,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-pub use config::{
-    BreakerSpec, EventKind, EventSet, Exposure, Failure, FrameBudget, HeaderSet, Reveal,
-};
+pub use config::{BreakerSpec, Exposure, Failure, FrameBudget, HeaderSet, Reveal};
 pub use counters::Counters;
 pub use open::OpenDecisions;
 pub(crate) use open::{own_bound, HalfOpen, OpenDecision, Part};

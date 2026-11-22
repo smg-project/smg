@@ -6,9 +6,9 @@
 
 use std::fmt;
 
+use crate::engine::{sticky_sessions::SessionVerdict, view::WorkerId};
 #[cfg(feature = "controller")]
-use crate::service::proto::{self, LiftedVeto};
-use crate::{engine::view::WorkerId, sessions::SessionVerdict};
+use crate::service::proto;
 
 /// Targets a decision carries at most: the pick and its alternates.
 pub const MAX_TARGETS: usize = 4;
@@ -233,7 +233,7 @@ impl fmt::Debug for Survivors {
 /// a byte the record had spare: the trace is no larger for it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
-pub enum Lifted {
+pub enum LiftedVeto {
     /// No veto was lifted.
     #[default]
     None,
@@ -247,12 +247,12 @@ pub enum Lifted {
 /// The contract's word for the mark: the one mapper, for every writer of a
 /// trace.
 #[cfg(feature = "controller")]
-impl From<Lifted> for LiftedVeto {
-    fn from(mark: Lifted) -> Self {
+impl From<LiftedVeto> for proto::LiftedVeto {
+    fn from(mark: LiftedVeto) -> Self {
         match mark {
-            Lifted::None => Self::None,
-            Lifted::Overload => Self::Overload,
-            Lifted::Liveness => Self::Liveness,
+            LiftedVeto::None => Self::None,
+            LiftedVeto::Overload => Self::Overload,
+            LiftedVeto::Liveness => Self::Liveness,
         }
     }
 }
@@ -272,7 +272,7 @@ pub struct Trace {
     /// The top candidates and their combined scores, best first: of the set
     /// the picker compared, which is every candidate the filters left unless
     /// the picker narrows them. Where a profile's ranks put rows in front
-    /// ([`Scorer::score_front`](crate::Scorer::score_front)) the scores are
+    /// ([`Scorer::score_front`](crate::engine::Scorer::score_front)) the scores are
     /// those rows' sums among themselves: a stage asked of them alone
     /// normalizes over them, so a score need not be the one the whole pass
     /// gives its row. The rows are the whole pass's, and their order too
@@ -284,10 +284,10 @@ pub struct Trace {
     pub top_len: u8,
     pub seed: u64,
     pub generation: u64,
-    /// The soft veto lifted for this pick ([`Lifted`]): `None` unless that
+    /// The soft veto lifted for this pick ([`LiftedVeto`]): `None` unless that
     /// veto as it stands left the pool nobody, or left a key handed on at
     /// its sessions rule's in-flight cap nobody.
-    pub lifted: Lifted,
+    pub lifted: LiftedVeto,
 }
 
 impl Default for Trace {
@@ -300,7 +300,7 @@ impl Default for Trace {
             top_len: 0,
             seed: 0,
             generation: 0,
-            lifted: Lifted::default(),
+            lifted: LiftedVeto::default(),
         }
     }
 }
@@ -325,7 +325,7 @@ impl Trace {
 
     /// Whether the decision drew first: its picker drew the rows it hands
     /// out and every filter of the profile was asked about each of them
-    /// alone ([`Picker::draw_first`](crate::Picker::draw_first)). No pass
+    /// alone ([`Picker::draw_first`](crate::engine::Picker::draw_first)). No pass
     /// over the pool ran, so the trace counts nothing of the pool:
     /// `survivors` holds no count, which is the mark read here, and `top`
     /// is of the rows drawn.
@@ -354,7 +354,7 @@ impl Trace {
                 .collect(),
             seed: self.seed,
             generation: self.generation,
-            lifted: LiftedVeto::from(self.lifted) as i32,
+            lifted: proto::LiftedVeto::from(self.lifted) as i32,
             ..proto::Trace::default()
         }
     }
@@ -379,7 +379,7 @@ pub enum OverlapSource {
 /// held is `blocks` over `of`, and a miss reads zero of `of`. `of` is zero
 /// only where no stage said: the profile holds no such stage, or the
 /// decision was made at an entry that asks none
-/// ([`Engine::decide_stated`](crate::Engine::decide_stated) asks). A
+/// ([`Engine::decide_stated`](crate::engine::Engine::decide_stated) asks). A
 /// stage counts a request as one block at the least.
 ///
 /// Six bytes, in bytes a pick's targets had spare behind their count: a
@@ -417,7 +417,7 @@ impl Overlap {
 /// A pick: ordered targets, the trace, and what a sessions rule did with
 /// the request's key (`None` without one). The host copies that verdict
 /// onto the lease it commits, and fills the lease's session from the
-/// request ([`crate::RequestFacts::session`]) for every keyed request, rule
+/// request ([`crate::engine::RequestFacts::session`]) for every keyed request, rule
 /// or no rule: the verdict alone says whether the commit moves a pin.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Pick {
@@ -654,7 +654,7 @@ mod tests {
                 top_len: 0,
                 seed: 0,
                 generation: 0,
-                lifted: Lifted::None,
+                lifted: LiftedVeto::None,
             }
         );
         assert_eq!(trace.made_under(), None);
@@ -669,9 +669,9 @@ mod tests {
     /// record had spare, and a trace no rule wrote reads none.
     #[test]
     fn the_mark_of_a_lifted_veto_costs_the_trace_no_byte() {
-        assert_eq!(size_of::<Lifted>(), 1);
+        assert_eq!(size_of::<LiftedVeto>(), 1);
         assert_eq!(size_of::<Trace>(), 72);
-        assert_eq!(Trace::default().lifted, Lifted::None);
+        assert_eq!(Trace::default().lifted, LiftedVeto::None);
     }
 
     /// The overlap costs the pick no byte: it shares the eight bytes the

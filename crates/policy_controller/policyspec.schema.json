@@ -108,7 +108,7 @@
           "default": 256
         },
         "max_report_age_ms": {
-          "description": "With this limit in milliseconds set, `least-load`, `resident-work`,\n`least-cost` and the KV-pressure gates of `prefix-affinity` and\n`warmup-slice` treat older reports as missing. A report exactly at\nthe limit still counts. A host-registered stage reads a report\nunder the limit through its build context's `reports()`, and one\nthat reads the row's report itself sees it at any age. Overload\nverdicts can still reflect older reports, and plugins interpret\nreport age themselves. Omit it to use reports of any age.",
+          "description": "With this limit in milliseconds set, `least-load`, `resident-work`,\n`least-cost` and the KV-pressure gates of `prefix-affinity` and\n`warmup-slice` treat older reports as missing. A report exactly at\nthe limit still counts. A host-registered stage reads a report\nunder the limit through its build context's `load_report_reader()`,\nand one that reads the row's report itself sees it at any age.\nOverload verdicts can still reflect older reports, and plugins\ninterpret report age themselves. Omit it to use reports of any age.",
           "type": [
             "integer",
             "null"

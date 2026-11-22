@@ -12,9 +12,9 @@
 //! carries no session key, and nothing else reads it
 //! ([`RequestFacts::client_key`]).
 //!
-//! [`RequestFacts::client_key`]: crate::RequestFacts::client_key
+//! [`RequestFacts::client_key`]: crate::engine::RequestFacts::client_key
 //!
-//! [`RequestFacts::session_key`]: crate::RequestFacts::session_key
+//! [`RequestFacts::session_key`]: crate::engine::RequestFacts::session_key
 
 use crate::{
     document::spec::{BindingSpec, RoutingKeySpec, SessionsSpec, ViewSpec, KEY_BYTES},
@@ -25,7 +25,7 @@ use crate::{
 /// reads them ([`AppliedSpec::key_sources_for`]): in order, and the first
 /// that holds a value is the key.
 ///
-/// [`AppliedSpec::key_sources_for`]: crate::AppliedSpec::key_sources_for
+/// [`AppliedSpec::key_sources_for`]: crate::document::AppliedSpec::key_sources_for
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeySources {
     sources: Box<[Source]>,

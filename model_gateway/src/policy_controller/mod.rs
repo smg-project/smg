@@ -45,18 +45,21 @@
 
 use std::sync::Arc;
 
-pub(crate) use smg_policy_controller::document::spec::PlanName;
+pub(crate) use smg_policy_controller::document::PlanName;
 use smg_policy_controller::{
-    document::operator::{Format, SpecDoor, SpecRejected},
+    document::{
+        operator::{DocumentManager, Format, SpecRejected},
+        RoutingSettingsError,
+    },
+    stages::StageRegistry,
     store::MemoryStore,
-    Catalog,
 };
 use smg_worker::connection::engine::EngineConnector;
 use tracing::info;
 
 use crate::{
     app_context::AppContext,
-    config::{validation::ConfigValidator, ConfigError, PolicyDocumentError, RouterConfig},
+    config::{validation::ConfigValidator, ConfigError, RouterConfig},
     routers::{common::snapshot::WorkerRegistry, RouterTrait},
 };
 
@@ -102,7 +105,7 @@ pub(crate) enum StartError {
     /// The routing configuration holds a setting no policy document says, or
     /// one that disagrees with the document a user gave.
     #[error(transparent)]
-    Document(#[from] PolicyDocumentError),
+    Document(#[from] RoutingSettingsError),
     /// The document did not write as the YAML the door reads.
     #[error("the policy document did not write as YAML: {0}")]
     Unwritten(#[from] serde_yaml::Error),
@@ -116,7 +119,7 @@ pub(crate) enum StartError {
 /// operators' door over it, which holds the start's document as written.
 pub(crate) struct Started {
     pub(crate) store: Arc<MemoryStore>,
-    pub(crate) door: Arc<SpecDoor>,
+    pub(crate) door: Arc<DocumentManager>,
 }
 
 /// [`start_with`] as the stock gateway starts: no stages of a host. The
@@ -152,7 +155,7 @@ pub(crate) fn start(config: &RouterConfig) -> Result<Option<Arc<MemoryStore>>, S
 /// None of them is served by the classic policies in silence.
 pub(crate) fn start_with(
     config: &RouterConfig,
-    stages: Option<Catalog>,
+    stages: Option<StageRegistry>,
 ) -> Result<Option<Started>, StartError> {
     ConfigValidator::validate_policy_document(config)?;
     if !config.policy_controller {
@@ -173,7 +176,7 @@ pub(crate) fn start_with(
         return Ok(None);
     }
     let document = config.policy_document_in_force()?;
-    let stages = stages.unwrap_or_else(Catalog::builtin);
+    let stages = stages.unwrap_or_else(StageRegistry::builtin);
     // A given document may hold what its YAML does not say, a `kind` line.
     // The typed check refuses it by the door's own word before the door
     // reads the YAML, over the same stages and denied headers.
@@ -195,13 +198,13 @@ pub(crate) fn start_with(
 /// print and the start never part.
 pub(crate) fn hosted(
     config: &RouterConfig,
-    stages: Option<Catalog>,
+    stages: Option<StageRegistry>,
     written: &str,
 ) -> Result<Started, SpecRejected> {
     let store = Arc::new(MemoryStore::new());
     let denied = config.denied_view_headers().map(str::to_owned);
-    let stages = stages.unwrap_or_else(Catalog::builtin);
-    let door = SpecDoor::new(Arc::clone(&store), Arc::new(stages), denied.into());
+    let stages = stages.unwrap_or_else(StageRegistry::builtin);
+    let door = DocumentManager::new(Arc::clone(&store), Arc::new(stages), denied.into());
     door.apply(written.as_bytes().to_vec(), Format::Yaml)?;
     Ok(Started {
         store,

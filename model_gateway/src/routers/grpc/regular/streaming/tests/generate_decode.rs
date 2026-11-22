@@ -85,6 +85,7 @@ async fn generated_texts(
         backend_type: "test",
         model: "byte-level-test".to_string(),
         expected_choices: 1,
+        dispatch_wait: None,
     };
     let (tx, rx) = sse_channel();
     let result = if with_logprobs {
@@ -189,6 +190,7 @@ async fn stream_with_failing_decode(
         backend_type: "test",
         model: MODEL.to_string(),
         expected_choices: 1,
+        dispatch_wait: None,
     };
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(FailingTokenizer {
         special_tokens: llm_tokenizer::SpecialTokens::default(),

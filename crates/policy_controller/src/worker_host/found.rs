@@ -7,7 +7,7 @@ use smg_worker::{
     worker::{ConnectionMode, HealthCheckConfig, WorkerSpec},
 };
 
-use super::{door::Over, object::role};
+use super::{membership_writer::Over, object::role};
 use crate::{
     engine::view::{threshold_permille, WireModes},
     store::{
@@ -205,9 +205,9 @@ mod tests {
         store::{
             encoding::{EncodeHandoff, EncodeOffer},
             pairing::{mismatch, Member, PairingDescriptor, LAYOUT_FACTS},
-            Ask, GatewayId, HealthPolicy, LoadSink as _, LoadSource, Maker, MemoryStore, Overload,
-            Reachability, Signals, ViewBuffers, WorkerFacts, WorkerRow, WorkerStatus,
-            WorkersStore as _,
+            GatewayId, HealthPolicy, LoadSink as _, LoadSource, MemoryStore, Overload,
+            Reachability, Registrant, Signals, ViewBuffers, ViewQuery, WorkerFacts, WorkerRow,
+            WorkerStatus, WorkersStore as _,
         },
         worker_host::object,
     };
@@ -221,7 +221,7 @@ mod tests {
             status: WorkerStatus::Ready,
             revision: 1,
             admitted_at: Instant::now(),
-            maker: Maker::Control,
+            maker: Registrant::Control,
         }
     }
 
@@ -547,7 +547,7 @@ mod tests {
         store.publish_now();
         store.record(id, 0, LoadRow::default(), now, LoadSource::Stream);
         store.publish_now();
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GatewayId(1),
             now,
             pinned: None,

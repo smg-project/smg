@@ -2383,8 +2383,8 @@ impl Decoder for HuggingFaceTokenizer {
 
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
         // A byte-level vocabulary decodes through the table its streams use:
-        // every id's bytes concatenated and one UTF-8 conversion, in place of
-        // the `tokenizers` decoder chain over every piece.
+        // whole tokens appended as text and the other bytes converted per
+        // run, in place of the `tokenizers` decoder chain over every piece.
         if let Some(table) = &self.byte_level {
             return Ok(table.decode(token_ids, skip_special_tokens));
         }

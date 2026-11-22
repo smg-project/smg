@@ -473,6 +473,11 @@ pub async fn create_tokenizer_async_with_chat_template(
         }
     }
 
+    // A path that is not on this host fails here: the Hub is never asked for it.
+    if names_a_path(model_name_or_path) {
+        return Err(Error::msg(format!("File not found: {model_name_or_path}")));
+    }
+
     // Try to download tokenizer files from HuggingFace
     match download_tokenizer_from_hf(model_name_or_path).await {
         Ok(cache_dir) => {
@@ -482,6 +487,14 @@ pub async fn create_tokenizer_async_with_chat_template(
             "Failed to download tokenizer from HuggingFace: {e}"
         ))),
     }
+}
+
+/// Whether `name` can only be a path, never a repository id (`owner/name`):
+/// absolute, relative to `.` or `~`, or more than one separator. The Python
+/// binding's loader holds the same rule; the gateway's `names_a_local_path`
+/// is close to it.
+fn names_a_path(name: &str) -> bool {
+    Path::new(name).is_absolute() || name.starts_with(['.', '~']) || name.matches('/').count() > 1
 }
 
 /// The tokenizer of a checkpoint downloaded from the Hub, from the files in
@@ -927,6 +940,22 @@ mod tests {
         let encoding = tokenizer.encode(text, false).unwrap();
         let decoded = tokenizer.decode(encoding.token_ids(), false).unwrap();
         assert_eq!(decoded, text);
+    }
+
+    /// A path that is not on this host is no repository id: the load fails
+    /// as a missing file, and the Hub is not asked for it.
+    #[tokio::test]
+    async fn a_path_that_does_not_exist_is_not_asked_of_the_hub() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        for name in [missing.to_str().unwrap(), "./owner/name"] {
+            let error = create_tokenizer_async(name)
+                .await
+                .err()
+                .expect("nothing to load")
+                .to_string();
+            assert_eq!(error, format!("File not found: {name}"));
+        }
     }
 
     #[tokio::test]

@@ -6,24 +6,31 @@
 use std::{any::Any, collections::HashMap, fmt::Debug, sync::Arc};
 
 use crate::{
-    affinity::{forget_judged, WarmRule},
-    document::spec::Needs,
+    document::spec::{Assignment, Needs},
     engine::{
         decision::{
-            Decision, Lifted, Overlap, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace,
-            MAX_TARGETS, TRACE_TOP,
+            Decision, LiftedVeto, Overlap, Pick, Shed, ShedReason, Survivors, Target, Targets,
+            Trace, MAX_TARGETS, TRACE_TOP,
         },
+        prefix_pass::forget_prefix_pass,
+        sticky_sessions::{self, Claim, SessionExpiry, SessionRule, SessionTable, SessionVerdict},
         view::{
-            mean_in_flight, AffinityFacts, Candidate, Constraints, NamedAffinity, Phase, PoolFacts,
-            ReportCutoff, RequestFacts, WorkerId,
+            mean_in_flight, AffinityFacts, AffinityRows, Candidate, Constraints, LoadReportCutoff,
+            Phase, PoolFacts, RequestFacts, WorkerId,
         },
+        warm_up::WarmUpRule,
     },
     load::signals::SignalCells,
-    sessions::{Assignment, Claim, Forgets, SessionRule, SessionTable, SessionVerdict},
-    stages::builtins::{target_of, Best, FewestSessions, LeastRequests, Random, RowTests},
+    policies::random::Random,
+    stages::{
+        filters::RowTests,
+        lifecycle::Lifecycle,
+        pickers::{target_of, Best},
+        scorers::{FewestSessions, LeastRequests},
+    },
     tracking::{
-        lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
-        sent::SentCredit,
+        dispatch_credit::DispatchCredit,
+        lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
     },
     Draw,
 };
@@ -146,7 +153,7 @@ impl TieBand {
 /// How the values a scorer writes for the rows of one decision lie
 /// ([`Scorer::spread`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Spread {
+pub enum ScoreSpread {
     /// Anywhere in `0.0..=1.0`.
     Any,
     /// On levels in `0.0..=1.0` at least this far apart: two rows read one
@@ -164,7 +171,7 @@ pub enum Spread {
 /// What a rank's answer left in front, said beside its scores
 /// ([`Scorer::score_front`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Front {
+pub enum ScoreFront {
     /// Nothing is said of the scores.
     Unsaid,
     /// Every row was written the ceiling, 1.0: the stage parts nothing.
@@ -180,19 +187,19 @@ pub enum Front {
     Whole,
 }
 
-impl Front {
+impl ScoreFront {
     /// The word a stage's scores read as under its spread, in one pass over
-    /// them. Under levels: [`Front::Alike`] where every row stands at the
-    /// ceiling, [`Front::At`] where some do and every other row stands a
+    /// them. Under levels: [`ScoreFront::Alike`] where every row stands at the
+    /// ceiling, [`ScoreFront::At`] where some do and every other row stands a
     /// whole level or more under it, and nothing of any other scores. A
     /// stage that orders nothing reads alike, and one that promises no
     /// levels says nothing.
     #[must_use]
-    pub fn of(spread: Spread, stage: &[f32]) -> Self {
+    pub fn of(spread: ScoreSpread, stage: &[f32]) -> Self {
         let step = match spread {
-            Spread::Levels(step) => step,
-            Spread::Alike => return Self::Alike,
-            Spread::Any => return Self::Unsaid,
+            ScoreSpread::Levels(step) => step,
+            ScoreSpread::Alike => return Self::Alike,
+            ScoreSpread::Any => return Self::Unsaid,
         };
         // Two counts and no way out early: the pass stays free of branches
         // on the rows.
@@ -250,7 +257,7 @@ pub trait Scorer: Lifecycle + Debug {
     /// ([`Self::spread`]) and no other. It orders them as it would among
     /// every row, reading of the rows behind them what it needs, or says
     /// that it must be asked whole ([`Self::score_front`],
-    /// [`Front::Whole`]). The promise is the order and not the values: a
+    /// [`ScoreFront::Whole`]). The promise is the order and not the values: a
     /// scorer that spreads its values over the rows asked writes a front's
     /// rows further apart, and two of them that a sum over every row
     /// rounds together are ordered there, where the whole pass draws among
@@ -293,20 +300,20 @@ pub trait Scorer: Lifecycle + Debug {
         false
     }
 
-    /// How this scorer's values lie ([`Spread`]), asked once when the engine
-    /// is built. A scorer that writes levels is a rank where its weight
-    /// outweighs every stage behind it: a plain decision then asks those
-    /// stages of the rows at its ceiling alone, where they fill the
-    /// decision's targets and are at most half of the rows it was asked of,
-    /// where each of those stages orders nothing or answers for a front
-    /// alone ([`Self::front_wise`]), and where at most one of them that is
-    /// no rank orders the rows. A stage that cannot promise its levels says nothing,
+    /// How this scorer's values lie ([`ScoreSpread`]), asked once when the
+    /// engine is built. A scorer that writes levels is a rank where its weight
+    /// outweighs every stage behind it: a plain decision then asks those stages
+    /// of the rows at its ceiling alone, where they fill the decision's targets
+    /// and are at most half of the rows it was asked of, where each of those
+    /// stages orders nothing or answers for a front alone
+    /// ([`Self::front_wise`]), and where at most one of them that is no rank
+    /// orders the rows. A stage that cannot promise its levels says nothing,
     /// the default.
-    fn spread(&self) -> Spread {
-        Spread::Any
+    fn spread(&self) -> ScoreSpread {
+        ScoreSpread::Any
     }
 
-    /// As [`Self::score`], with what the answer left in front ([`Front`]),
+    /// As [`Self::score`], with what the answer left in front ([`ScoreFront`]),
     /// over three lists: the pool, the kept rows, which are the rows
     /// [`Self::score`] is handed, and the rows asked, a part of the kept
     /// rows in their order. `out[i]` is the score of `asked[i]`: a stage
@@ -316,10 +323,10 @@ pub trait Scorer: Lifecycle + Debug {
     /// and it reads nothing of the scores where every row stands alike. It
     /// asks it too of a stage behind a rank, of the rows the rank put in
     /// front, which says there that it must be asked whole
-    /// ([`Front::Whole`]) where it does not answer for them alone. A
+    /// ([`ScoreFront::Whole`]) where it does not answer for them alone. A
     /// scorer that says its front has one body behind both entries, so a
     /// row scores alike by either. It says the word from what that body
-    /// knows, or reads it off the scores ([`Front::of`]). A debug build
+    /// knows, or reads it off the scores ([`ScoreFront::of`]). A debug build
     /// checks the word against the scores. The default scores the rows
     /// asked and says nothing.
     fn score_front(
@@ -329,8 +336,11 @@ pub trait Scorer: Lifecycle + Debug {
         _kept: &[u32],
         asked: &[u32],
         out: &mut [f32],
-    ) -> (TieBand, Front) {
-        (self.score(facts, candidates, asked, out), Front::Unsaid)
+    ) -> (TieBand, ScoreFront) {
+        (
+            self.score(facts, candidates, asked, out),
+            ScoreFront::Unsaid,
+        )
     }
 
     /// Whether this scorer says what a pick's first target holds of its
@@ -378,26 +388,27 @@ pub trait Scorer: Lifecycle + Debug {
 
     /// The warm-up ruling this stage applies, where it applies one: what a
     /// host that names a pool's warming rows enters
-    /// ([`WarmRule::name`]). No other stage holds one.
-    fn warm_rule(&self) -> Option<WarmRule> {
+    /// ([`WarmUpRule::list_warming_rows`]). No other stage holds one.
+    fn warm_up_rule(&self) -> Option<WarmUpRule> {
         None
     }
 }
 
-/// What a picker's narrowing left of the survivors: the first `compared` are
+/// Two counts over the survivors a picker's narrowing reordered, not a list
+/// of its own: the first `compared` are
 /// the set it compares, and the next `alternates` are survivors it passed
 /// over that still follow its pick as alternates, in the order it left them.
 /// They follow a pick and never stand in for one: when the picker pushes no
 /// target, none is appended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Narrowed {
+pub struct Shortlist {
     /// How many survivors, from the front, the picker compares.
     pub compared: usize,
     /// How many survivors behind those follow the pick as alternates.
     pub alternates: usize,
 }
 
-impl Narrowed {
+impl Shortlist {
     /// Every survivor is compared.
     pub const fn all(survivors: usize) -> Self {
         Self {
@@ -445,7 +456,7 @@ const _: () = assert!(RANK_FROM == DRAW_FROM);
 
 /// What a picker draws ([`Picker::unit`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Unit {
+pub enum DrawUnit {
     /// A row: a worker, or one rank of a data-parallel worker.
     #[default]
     Row,
@@ -478,8 +489,8 @@ pub trait Picker: Lifecycle + Debug {
         _facts: &RequestFacts<'_>,
         _candidates: &[Candidate],
         kept: &mut [u32],
-    ) -> Narrowed {
-        Narrowed::all(kept.len())
+    ) -> Shortlist {
+        Shortlist::all(kept.len())
     }
 
     /// Orders the rows it is handed. The engine hands the set `narrow` left
@@ -508,14 +519,14 @@ pub trait Picker: Lifecycle + Debug {
         false
     }
 
-    /// The unit the picker draws ([`Unit`]); a row by default. The engine
+    /// The unit the picker draws ([`DrawUnit`]); a row by default. The engine
     /// reads it once per profile when it is built. A picker that says the
     /// engine draws first ([`Picker::draws_first`]) and compares two rows:
     /// it is handed the two rows that stand for the engines drawn, through
     /// [`Picker::order_drawn`], and the engine of the first target it
     /// pushes is the one taken.
-    fn unit(&self) -> Unit {
-        Unit::Row
+    fn unit(&self) -> DrawUnit {
+        DrawUnit::Row
     }
 
     /// Finds the rows the picker hands out without the survivors' list: it
@@ -559,7 +570,7 @@ pub trait Picker: Lifecycle + Debug {
     }
 
     /// Whether the rows a host named in the affinity column's place
-    /// ([`NamedAffinity`]) join the rows this picker draws first: the
+    /// ([`AffinityRows`]) join the rows this picker draws first: the
     /// engine keeps, behind the rows drawn, each named row every filter
     /// keeps, and hands the stages the drawn rows' mean in flight, so a
     /// named row does not move the mean it is judged against. The engine
@@ -650,7 +661,7 @@ pub trait DecisionScope: Send + Sync + Debug {
 
 /// A scorer with its weight in the profile's combination.
 #[derive(Debug)]
-pub struct Weighted {
+pub struct WeightedScorer {
     pub scorer: Box<dyn Scorer>,
     pub weight: f32,
 }
@@ -660,7 +671,7 @@ pub struct Weighted {
 pub struct Profile {
     pub name: String,
     pub filters: Vec<Box<dyn Filter>>,
-    pub scorers: Vec<Weighted>,
+    pub scorers: Vec<WeightedScorer>,
     pub picker: Box<dyn Picker>,
 }
 
@@ -685,16 +696,16 @@ impl Profile {
         }
     }
 
-    /// The rulings of this profile's warm-up stages ([`Scorer::warm_rule`]),
+    /// The rulings of this profile's warm-up stages ([`Scorer::warm_up_rule`]),
     /// in the stages' order.
-    fn warm_rules(&self) -> impl Iterator<Item = WarmRule> + '_ {
+    fn warm_rules(&self) -> impl Iterator<Item = WarmUpRule> + '_ {
         let stages = self.scorers.iter();
-        stages.filter_map(|stage| stage.scorer.warm_rule())
+        stages.filter_map(|stage| stage.scorer.warm_up_rule())
     }
 
     /// The cap of each list of rows a host names in the affinity column's
-    /// place for a decision of this profile ([`Engine::named_for`]): its
-    /// sample, [`u32::MAX`] where it takes none, and `0` where it is named
+    /// place for a decision of this profile ([`Engine::affinity_rows_cap`]):
+    /// its sample, [`u32::MAX`] where it takes none, and `0` where it is named
     /// no row.
     fn named_cap(&self) -> u32 {
         let needs = self.needs();
@@ -1003,7 +1014,7 @@ struct Buffers {
     undoubted: Vec<Candidate>,
     /// The veto the rule lifted for the rows it kept ([`vetoed::emptied`]):
     /// the mark of its pick's trace ([`vetoed::steered`]).
-    lifted: Lifted,
+    lifted: LiftedVeto,
     /// The pool size every buffer holds room for ([`Buffers::reserve`]).
     room: usize,
 }
@@ -1152,7 +1163,7 @@ fn combine(
         let stage_band = weighted.scorer.score(facts, candidates, kept, stage);
         // Among its leading ranks a decision by rank does not ask a stage
         // that orders nothing, so the band of one is none here too
-        // ([`Spread::Alike`]).
+        // ([`ScoreSpread::Alike`]).
         debug_assert!(
             bandless(weighted, stage_band),
             "{} orders nothing and returned a band",
@@ -1215,26 +1226,26 @@ fn score_and_pick(
 }
 
 /// Whether a stage's band is one its spread allows: a stage that says it
-/// orders nothing returns none ([`Spread::Alike`]). Read in debug builds
+/// orders nothing returns none ([`ScoreSpread::Alike`]). Read in debug builds
 /// at every ask of a stage: a leading one that orders nothing is not asked
 /// by rank, and one behind a stage that orders the rows is.
-fn bandless(weighted: &Weighted, band: TieBand) -> bool {
-    weighted.scorer.spread() != Spread::Alike || band.0 == 0.0
+fn bandless(weighted: &WeightedScorer, band: TieBand) -> bool {
+    weighted.scorer.spread() != ScoreSpread::Alike || band.0 == 0.0
 }
 
-/// Whether a rank's scores are what it said of them ([`Front`]): at the
+/// Whether a rank's scores are what it said of them ([`ScoreFront`]): at the
 /// ceiling in the count it named, and every other row a step of its spread
 /// under it. Read in debug builds, where a stage that says a wrong word
 /// fails its author's case; a build without the check trusts the word.
-fn as_said(spread: Spread, said: Front, stage: &[f32]) -> bool {
+fn as_said(spread: ScoreSpread, said: ScoreFront, stage: &[f32]) -> bool {
     let ceilings = stage.iter().filter(|&&value| value >= 1.0).count();
     match said {
-        Front::Unsaid | Front::Whole => true,
-        Front::Alike => ceilings == stage.len(),
-        Front::At(n) => {
+        ScoreFront::Unsaid | ScoreFront::Whole => true,
+        ScoreFront::Alike => ceilings == stage.len(),
+        ScoreFront::At(n) => {
             let step = match spread {
-                Spread::Levels(step) => step,
-                Spread::Any | Spread::Alike => 0.0,
+                ScoreSpread::Levels(step) => step,
+                ScoreSpread::Any | ScoreSpread::Alike => 0.0,
             };
             ceilings == n as usize
                 && stage
@@ -1259,7 +1270,7 @@ fn as_said(spread: Spread, said: Front, stage: &[f32]) -> bool {
 /// it. That sum lies under every row in front by more than the later
 /// stages add, so the targets come from the rows in front. A stage asked
 /// of them alone orders them as it would among every row, or says that it
-/// must be asked whole ([`Front::Whole`]), so their order is the weighted
+/// must be asked whole ([`ScoreFront::Whole`]), so their order is the weighted
 /// sum's over every row wherever that sum tells them apart. It does not
 /// everywhere: a stage that spreads its values over the rows it is handed
 /// writes a front's rows further apart, and two of them whose values among
@@ -1306,7 +1317,7 @@ fn combine_ranked(
     let mut held = 0.0f32;
     // The leading ranks, while every row is tied. `Alike` stands for no
     // rank having parted the rows.
-    let mut front = Front::Alike;
+    let mut front = ScoreFront::Alike;
     let mut i = 0;
     while i < ranks {
         let weighted = &stages[i];
@@ -1323,10 +1334,10 @@ fn combine_ranked(
         let (mut stage_band, mut said) = weighted
             .scorer
             .score_front(facts, candidates, kept, kept, stage);
-        if said == Front::Whole {
+        if said == ScoreFront::Whole {
             // It was handed every row: its plain answer is its word.
             stage_band = weighted.scorer.score(facts, candidates, kept, stage);
-            said = Front::Unsaid;
+            said = ScoreFront::Unsaid;
         }
         debug_assert!(
             as_said(weighted.scorer.spread(), said, stage),
@@ -1334,7 +1345,7 @@ fn combine_ranked(
             weighted.scorer.name()
         );
         band += share * stage_band.0.clamp(0.0, 1.0);
-        if said == Front::Alike {
+        if said == ScoreFront::Alike {
             held += share;
             continue;
         }
@@ -1346,8 +1357,8 @@ fn combine_ranked(
         break;
     }
     match front {
-        Front::Alike => scores.fill(held),
-        Front::At(n)
+        ScoreFront::Alike => scores.fill(held),
+        ScoreFront::At(n)
             if order.fronts(i - 1)
                 && n as usize >= MAX_TARGETS
                 && n as usize * 2 <= rows
@@ -1381,7 +1392,7 @@ fn combine_ranked(
                 }
             }
         }
-        Front::At(_) | Front::Unsaid | Front::Whole => {}
+        ScoreFront::At(_) | ScoreFront::Unsaid | ScoreFront::Whole => {}
     }
     // Every row is asked on, as a profile without ranks asks: no row stood
     // in front, or the rows in front could not decide alone.
@@ -1426,7 +1437,7 @@ fn combine_ranked(
 ///
 /// `None` where the rows in front cannot decide alone, the rows' sums left
 /// as the ranks wrote them: a stage said it must be asked whole
-/// ([`Front::Whole`]), or the tie band is wider than the ranks' room
+/// ([`ScoreFront::Whole`]), or the tie band is wider than the ranks' room
 /// ([`Order`]) and reaches a row behind. Out of line: a decision that puts
 /// nobody in front carries none of this.
 #[inline(never)]
@@ -1486,14 +1497,14 @@ fn combine_few(
         let (stage_band, said) = weighted
             .scorer
             .score_front(facts, candidates, kept, asked, out);
-        // Checked ahead of the way out: a band beside `Front::Whole` is
+        // Checked ahead of the way out: a band beside `ScoreFront::Whole` is
         // not read, and is none all the same.
         debug_assert!(
             bandless(weighted, stage_band),
             "{} orders nothing and returned a band",
             weighted.scorer.name()
         );
-        if said == Front::Whole {
+        if said == ScoreFront::Whole {
             whole = true;
             break;
         }
@@ -1507,15 +1518,15 @@ fn combine_few(
             *sum += share * value.clamp(0.0, 1.0);
         }
         match said {
-            Front::At(front) if level && order.fronts(i) && i < last => {
+            ScoreFront::At(front) if level && order.fronts(i) && i < last => {
                 let left = fewer(out, tied, sums, few, front as usize);
                 // The rows it left in front stand at its ceiling. Where it
                 // left them all it parted them, unless all stand there.
                 level = left < few || front as usize == few;
                 few = left;
             }
-            Front::Alike => {}
-            Front::At(_) | Front::Unsaid | Front::Whole => level = false,
+            ScoreFront::Alike => {}
+            ScoreFront::At(_) | ScoreFront::Unsaid | ScoreFront::Whole => level = false,
         }
     }
     if whole || band > order.room {
@@ -2068,7 +2079,7 @@ impl<'a> Set<'a> {
 /// The stage a pool is shed under when none of its rows takes the images
 /// its request carries: the `epd` plan's vision rule sheds under it, and so
 /// does a request's vision demand
-/// ([`Unmet::Vision`](crate::engine::demands::Unmet::Vision)).
+/// ([`UnmetDemand::Vision`](crate::engine::demands::UnmetDemand::Vision)).
 pub(crate) const VISION: &str = "vision";
 
 /// The `epd` plan's vision rule: a request carrying images takes an encoder
@@ -2291,7 +2302,7 @@ fn draws_first(profile: &Profile) -> bool {
 /// no candidate and is passed over.
 fn join_named(
     facts: &RequestFacts<'_>,
-    named: &NamedAffinity<'_>,
+    named: &AffinityRows<'_>,
     candidates: &[Candidate],
     keep: &mut dyn FnMut(&Candidate) -> bool,
     kept: &mut Vec<u32>,
@@ -2314,7 +2325,7 @@ fn join_named(
 fn order_joined(
     profile: &Profile,
     after: &RequestFacts<'_>,
-    named: NamedAffinity<'_>,
+    named: AffinityRows<'_>,
     candidates: &[Candidate],
     keep: &mut dyn FnMut(&Candidate) -> bool,
     buf: &mut Buffers,
@@ -2322,7 +2333,7 @@ fn order_joined(
 ) {
     let mean = join_named(after, &named, candidates, keep, &mut buf.kept);
     let joined = RequestFacts {
-        named: Some(NamedAffinity {
+        named: Some(AffinityRows {
             mean_in_flight: Some(mean),
             ..named
         }),
@@ -2644,8 +2655,8 @@ enum Pattern<'a> {
 
 /// What a host names a profile's rows by, where it names them in the
 /// affinity column's place: the cap of each list
-/// ([`Engine::named_for`]), the one ruling of the warming rows
-/// ([`Engine::warm_rule_for`]), and the record of sent prefixes, whether
+/// ([`Engine::affinity_rows_cap`]), the one ruling of the warming rows
+/// ([`Engine::warm_up_rule_for`]), and the record of sent prefixes, whether
 /// its holders are named ([`Engine::reads_sent_for`]) and whether ahead
 /// of the index's ([`Engine::reads_sent_alone_for`]). A naming that
 /// fills its cap is held to a test of the profile's own too
@@ -2658,7 +2669,7 @@ pub(crate) struct NamedBy {
     cap: u32,
     /// The one ruling its warm-up stages rule by: `None` where it holds
     /// no such stage, and where two of them rule by different numbers.
-    rule: Option<WarmRule>,
+    rule: Option<WarmUpRule>,
     /// Whether the record of sent prefixes names holders for it: a stage
     /// of it reads them, and it is named rows.
     sent: bool,
@@ -2952,8 +2963,8 @@ pub struct Engine {
     profile_needs: Vec<Needs>,
     /// Per profile, what a host names the rows of its decisions by
     /// ([`NamedBy`]), said once at the build: the cap
-    /// ([`Self::named_for`]), the warm-up ruling
-    /// ([`Self::warm_rule_for`]), the record of sent prefixes
+    /// ([`Self::affinity_rows_cap`]), the warm-up ruling
+    /// ([`Self::warm_up_rule_for`]), the record of sent prefixes
     /// ([`Self::reads_sent_for`], [`Self::reads_sent_alone_for`]) and
     /// the test a full cap is held to ([`Self::keeps_for`]).
     named_by: Vec<NamedBy>,
@@ -2984,7 +2995,7 @@ pub struct Engine {
     /// One tally per profile that reads sends, in the order of the
     /// profiles' names: a later engine finds a profile's by its name
     /// ([`Engine::succeed`]).
-    pub(crate) sent_credits: Vec<Arc<SentCredit>>,
+    pub(crate) sent_credits: Vec<Arc<DispatchCredit>>,
 }
 
 /// A stage that keeps a number of the reports, by its place in the engine.
@@ -3017,17 +3028,18 @@ impl Keeper {
     }
 }
 
-/// A stage keeps state a decider, so each model decides at its own seat.
-pub(crate) const KEEPS_DECIDERS: u8 = 1;
+/// A stage keeps state for each decision slot, so each model decides at its
+/// own slot.
+pub(crate) const KEEPS_SLOT_STATE: u8 = 1;
 /// The generation samples decisions at the seat where they were made.
 pub(crate) const SAMPLES_DECISIONS: u8 = 2;
 /// A binding of the generation names a shadow.
 pub(crate) const SHADOWS: u8 = 4;
 
 /// Which of a profile's leading stages are ranks, read once when the engine
-/// is built: a stage that writes levels ([`Spread::Levels`]) and whose
+/// is built: a stage that writes levels ([`ScoreSpread::Levels`]) and whose
 /// weight outweighs every stage behind it, or a stage that orders nothing
-/// ([`Spread::Alike`]). A rank leaves two rows tied, or apart by more than
+/// ([`ScoreSpread::Alike`]). A rank leaves two rows tied, or apart by more than
 /// every later stage can add, so the stages behind it are asked of the rows
 /// it left tied ([`combine_ranked`]).
 ///
@@ -3073,12 +3085,12 @@ impl Order {
         let mut room = f32::INFINITY;
         for (i, stage) in stages.iter().enumerate().take(Self::MOST) {
             match stage.scorer.spread() {
-                Spread::Alike => order.alike |= 1 << i,
-                Spread::Levels(step) => {
+                ScoreSpread::Alike => order.alike |= 1 << i,
+                ScoreSpread::Levels(step) => {
                     // The most the stages behind can add between two rows.
                     let behind: f32 = stages[i + 1..]
                         .iter()
-                        .filter(|later| later.scorer.spread() != Spread::Alike)
+                        .filter(|later| later.scorer.spread() != ScoreSpread::Alike)
                         .map(|later| later.weight)
                         .sum();
                     // By how much its step outweighs them, of the whole.
@@ -3088,13 +3100,13 @@ impl Order {
                     }
                     room = room.min(over / 2.0);
                     let alone = stages[i + 1..].iter().all(|later| {
-                        later.scorer.spread() == Spread::Alike || later.scorer.front_wise()
+                        later.scorer.spread() == ScoreSpread::Alike || later.scorer.front_wise()
                     });
                     if alone {
                         order.fronts |= 1 << i;
                     }
                 }
-                Spread::Any => break,
+                ScoreSpread::Any => break,
             }
             order.ranks = i as u8 + 1;
         }
@@ -3103,7 +3115,7 @@ impl Order {
         // so no rank of the profile puts rows in front.
         let plain = stages[usize::from(order.ranks)..]
             .iter()
-            .filter(|later| later.scorer.spread() != Spread::Alike)
+            .filter(|later| later.scorer.spread() != ScoreSpread::Alike)
             .count();
         if plain > 1 {
             order.fronts = 0;
@@ -3225,7 +3237,7 @@ impl Marks {
         } else {
             0
         };
-        let engines = if draws_first != 0 && profile.picker.unit() == Unit::Engine {
+        let engines = if draws_first != 0 && profile.picker.unit() == DrawUnit::Engine {
             Self::ENGINES
         } else {
             0
@@ -3417,12 +3429,12 @@ fn shortest_sweep(bindings: &[Binding]) -> u64 {
 
 /// How long a worker that left keeps its pins in the session table
 /// ([`SessionTable::left`]): the longest TTL among the bindings' sessions
-/// rules, a rule with none counting as [`ABSENCE_MICROS`], which is the
-/// time too where no binding has a rule.
+/// rules, a rule with none counting as [`ABSENT_WORKER_PIN_TTL_MICROS`], which
+/// is the time too where no binding has a rule.
 ///
-/// [`ABSENCE_MICROS`]: crate::sessions::ABSENCE_MICROS
+/// [`ABSENT_WORKER_PIN_TTL_MICROS`]: crate::engine::sticky_sessions::ABSENT_WORKER_PIN_TTL_MICROS
 fn absence(bindings: &[Binding]) -> u64 {
-    let stated = crate::sessions::ABSENCE_MICROS;
+    let stated = sticky_sessions::ABSENT_WORKER_PIN_TTL_MICROS;
     let rules = bindings.iter().filter_map(|b| b.sessions.as_ref());
     let longest = rules.map(|rule| rule.ttl_micros.unwrap_or(stated));
     longest.max().unwrap_or(stated)
@@ -3847,7 +3859,7 @@ fn column_fits(column: &[AffinityFacts], pool: &[Candidate]) -> bool {
 }
 
 /// A debug build asserts that the rows a host named in the column's place
-/// ([`NamedAffinity`]) stand for `pool`, once where a
+/// ([`AffinityRows`]) stand for `pool`, once where a
 /// decision takes its inputs: both lists ascending and under the pool's
 /// size, beside an empty column, and no mean in flight, which is the
 /// engine's to set behind a draw. A list out of order hides a holder from
@@ -4039,7 +4051,7 @@ impl Engine {
         let stating = profiles
             .iter()
             .map(|profile| {
-                let stated = |weighted: &Weighted| weighted.scorer.states_overlap();
+                let stated = |weighted: &WeightedScorer| weighted.scorer.states_overlap();
                 profile.scorers.iter().position(stated)
             })
             .collect();
@@ -4147,7 +4159,7 @@ impl Engine {
             named_by,
             row_tests,
             orders,
-            seat_flags: (u8::from(keeping) * KEEPS_DECIDERS) | (u8::from(shadows) * SHADOWS),
+            seat_flags: (u8::from(keeping) * KEEPS_SLOT_STATE) | (u8::from(shadows) * SHADOWS),
             explain_sample: 0,
             max_report_age_ms: None,
             keepers,
@@ -4297,7 +4309,7 @@ impl Engine {
     }
 
     /// Whether any profile of this generation holds a stage that keeps
-    /// state a decider ([`crate::engine::decider`]): a plugin's kept instance is
+    /// state a decider ([`crate::engine`]): a plugin's kept instance is
     /// its decider's, and every profile's stages hear every lease. Under
     /// such a generation a host that seats its callers by thread decides
     /// each request at its model's decider, so that state has one writer
@@ -4308,8 +4320,8 @@ impl Engine {
     /// scope. A stage kind that keeps state a decider and opens none
     /// joins this fact: without it such a host would split that state by
     /// thread, with no error.
-    pub fn keeps_deciders(&self) -> bool {
-        self.seat_flags & KEEPS_DECIDERS != 0
+    pub fn keeps_slot_state(&self) -> bool {
+        self.seat_flags & KEEPS_SLOT_STATE != 0
     }
 
     pub(crate) fn seat_flags(&self) -> u8 {
@@ -4329,7 +4341,7 @@ impl Engine {
     /// The sample of the profile that decides a request of `phase` for
     /// `model` ([`Needs::sample`]), `0` where that profile never draws and
     /// where no binding matches. A host that names a decision's rows takes
-    /// its cap from [`Self::named_for`], not from here: a profile that
+    /// its cap from [`Self::affinity_rows_cap`], not from here: a profile that
     /// keeps its column has a sample too, and one that takes none is
     /// named without a cap. [`Self::needs_for`] answers for a
     /// worker's stream, where the larger of two needs is the safe one: for a
@@ -4514,7 +4526,7 @@ impl Engine {
 
     /// The cap of each list of rows a host names again for the shadow of
     /// the binding at `at` ([`ShadowRows::Own`]): the shadow profile's
-    /// own, as [`Self::named_for`] says a live profile's. `0` where the
+    /// own, as [`Self::affinity_rows_cap`] says a live profile's. `0` where the
     /// binding names no shadow. A host asks it where it names such rows,
     /// and for no other decision.
     pub(crate) fn shadow_cap_at(&self, at: u32) -> u32 {
@@ -4574,23 +4586,23 @@ impl Engine {
     /// its profile's warm-up stages rule by, `None` where that profile holds
     /// no such stage, where two of them rule by different numbers, or no
     /// binding matches. A host that names a pool's warming rows enters it
-    /// ([`WarmRule::name`]): it names a pool by one ruling, and a profile
-    /// that applies two is named no rows ([`Self::named_for`]). A binding
-    /// is found by model and phase alone, so a pool is decided by one
-    /// profile and has one ruling.
-    pub fn warm_rule_for(&self, model: &str, phase: Phase) -> Option<WarmRule> {
+    /// ([`WarmUpRule::list_warming_rows`]): it names a pool by one ruling, and
+    /// a profile that applies two is named no rows
+    /// ([`Self::affinity_rows_cap`]). A binding is found by model and phase
+    /// alone, so a pool is decided by one profile and has one ruling.
+    pub fn warm_up_rule_for(&self, model: &str, phase: Phase) -> Option<WarmUpRule> {
         let (_, index, _) = self.resolve(model, phase)?;
         self.named_by[usize::from(index)].rule
     }
 
     /// The ruling a host reads a pool's warming rows by, for the decisions
     /// of `phase` for `model`: the live profile's
-    /// ([`Self::warm_rule_for`]) and, where that profile rules by none and
+    /// ([`Self::warm_up_rule_for`]) and, where that profile rules by none and
     /// its binding's shadow is named rows of its own, the shadow
     /// profile's. A live profile that rules by none reads no warming row,
     /// so the rows it is handed do not move.
-    pub fn pool_rule_for(&self, model: &str, phase: Phase) -> Option<WarmRule> {
-        self.warm_rule_for(model, phase).or_else(|| {
+    pub fn pool_rule_for(&self, model: &str, phase: Phase) -> Option<WarmUpRule> {
+        self.warm_up_rule_for(model, phase).or_else(|| {
             let (at, rows) = self.shadow_for(model, phase)?;
             if rows != ShadowRows::Own {
                 return None;
@@ -4602,7 +4614,7 @@ impl Engine {
 
     /// Whether the profile a decision resolves to reads sent prefixes: a
     /// stage of it reads them, and its decisions are named rows
-    /// ([`Self::named_for`]). A profile that is named no row reads no
+    /// ([`Self::affinity_rows_cap`]). A profile that is named no row reads no
     /// holder, so its pool keeps no record. The answer is of what the
     /// build kept: a membership write asks it of every pool, and no stage
     /// is asked again.
@@ -4669,7 +4681,7 @@ impl Engine {
     /// for itself here: [`Self::needs_for`] is merged over a pair's two
     /// phases and a binding's sessions rule, and says where to ask. The cap
     /// is the profile's own, said once at the build: a decision reads it.
-    pub fn named_for(&self, model: &str, phase: Phase) -> u32 {
+    pub fn affinity_rows_cap(&self, model: &str, phase: Phase) -> u32 {
         self.resolve(model, phase)
             .map_or(0, |(_, index, _)| self.named_by[usize::from(index)].cap)
     }
@@ -4780,7 +4792,7 @@ impl Engine {
     /// the key's counts ([`RequestFacts::session_counted`]). The request's
     /// affinity column is empty or holds one entry a candidate; any other is
     /// refused, as a decline under the stage name `affinity-column`. Rows
-    /// named in the column's place ([`NamedAffinity`]) are read as the host
+    /// named in the column's place ([`AffinityRows`]) are read as the host
     /// derived them: a debug build asserts that they stand for the pool. A
     /// profile that shows its rows to a plugin is declined over rows that
     /// carry a mask or a pin beside them, under the stage name
@@ -5008,7 +5020,7 @@ impl Engine {
     ) -> Decision {
         // What a pass of an earlier decision judged by is no word of this
         // one's pick.
-        forget_judged();
+        forget_prefix_pass();
         let mut decision = self.decide(facts, pool, candidates, cx, scratch);
         if let Decision::Pick(pick) = &mut decision {
             let overlap = self.overlap_of(facts, candidates, pick);
@@ -5028,7 +5040,7 @@ impl Engine {
         cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Decision {
-        forget_judged();
+        forget_prefix_pass();
         let mut decision = self.decide_keeping(facts, pool, candidates, cx, scratch);
         if let Decision::Pick(pick) = &mut decision {
             let overlap = self.overlap_of(facts, candidates, pick);
@@ -5212,7 +5224,7 @@ impl Engine {
     /// overload veto as it stands, and a key no pin takes is placed by the
     /// profile with the veto lifted. Where the pass with the veto standing
     /// kept nobody, that placement says the lifted veto in its trace
-    /// ([`Lifted::Overload`]). A placement that lands on one of the key's
+    /// ([`LiftedVeto::Overload`]). A placement that lands on one of the key's
     /// pins again follows that pin under the rule's in-flight cap
     /// ([`Self::respill`]): nothing is claimed, and a key handed on reads
     /// the veto as it stands before the lifted pass's survivors. Handed on
@@ -5282,8 +5294,8 @@ impl Engine {
             found.pins
         } else {
             match self.sessions.held(key) {
-                Some((pins, Forgets::At(at))) if facts.now_micros < at => pins,
-                Some((pins, Forgets::Never)) if facts.now_micros < u64::MAX => pins,
+                Some((pins, SessionExpiry::At(at))) if facts.now_micros < at => pins,
+                Some((pins, SessionExpiry::Never)) if facts.now_micros < u64::MAX => pins,
                 _ => [WorkerId(0); 2],
             }
         };
@@ -5444,7 +5456,7 @@ impl Engine {
             if all_vetoed {
                 // The lifted pass alone kept a worker: the placement stands
                 // by the lift and says so, as the all-vetoed rule's pick does.
-                pick.trace.lifted = Lifted::Overload;
+                pick.trace.lifted = LiftedVeto::Overload;
             }
             // No routable pin (a fresh key, or every pin down): the key is
             // claimed at the decision, so concurrent requests agree on the
@@ -5745,7 +5757,7 @@ impl Engine {
                 profile, index, rule, placing, facts, pool, candidates, buf, pin,
             ) {
                 if let Decision::Pick(pick) = &mut respilled {
-                    pick.trace.lifted = Lifted::Overload;
+                    pick.trace.lifted = LiftedVeto::Overload;
                 }
                 return Some(respilled);
             }
@@ -6265,7 +6277,7 @@ impl Engine {
 
 #[inline(never)]
 fn all_reports_current(candidates: &[Candidate], now_micros: u64, max_age_ms: u64) -> bool {
-    let cutoff = ReportCutoff::new(now_micros, max_age_ms);
+    let cutoff = LoadReportCutoff::new(now_micros, max_age_ms);
     candidates.iter().all(|row| cutoff.load(row).is_some())
 }
 
@@ -6468,26 +6480,25 @@ mod tests {
 
     use super::*;
     use crate::{
-        affinity::{Gates, PrefixAffinity},
-        document::{
-            spec,
-            spec::{PolicySpec, PowerOfTwoMetric, PrefixAffinityParams, SpillParams},
-        },
+        document::spec::{self, PolicySpec, PrefixAffinityParams, Recovery, SpillParams},
         engine::{
-            decision,
-            decision::Pair,
-            view,
-            view::{Health, Identity, MediaCounts, Role, Session, WorkerId},
+            decision::{self, Pair},
+            view::{self, Health, Identity, MediaCounts, Role, Session, WorkerId},
         },
-        sessions::Recovery,
+        policies::{
+            cache_aware::{Gates, PrefixAffinity},
+            manual::Manual,
+            passthrough::Passthrough,
+            power_of_two::{PowerOfTwo, PowerOfTwoCountFirst, PowerOfTwoMetric},
+            random::Random,
+            round_robin::RoundRobin,
+        },
         stages::{
-            builtins,
-            builtins::{
-                Best, CountFirst, Healthy, LeastRequests, Manual, NotOverloaded, NotTried,
-                Passthrough, PowerOfTwo, PowerOfTwoCountFirst, Random, RoundRobin,
-            },
+            filters::{Healthy, NotOverloaded, NotTried},
+            pickers::{self, Best, CountFirst},
+            scorers::{self, LeastRequests},
         },
-        tracking::counts::tests::Lent,
+        tracking::in_flight::tests::Lent,
     };
 
     fn candidate(position: u32, in_flight: u32) -> Candidate {
@@ -6508,7 +6519,7 @@ mod tests {
         Profile {
             name: "least".into(),
             filters: vec![Box::new(Healthy), Box::new(NotTried)],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(LeastRequests),
                 weight: 1.0,
             }],
@@ -6551,7 +6562,7 @@ mod tests {
     fn by_sessions() -> Profile {
         Profile {
             name: "by-sessions".into(),
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(FewestSessions),
                 weight: 1.0,
             }],
@@ -6656,7 +6667,9 @@ mod tests {
         let steered = engine
             .shadow(&facts, &pool, &rows, &cx, &mut scratch)
             .expect("the binding shadows");
-        assert!(matches!(steered, Decision::Pick(pick) if pick.trace.lifted == Lifted::Overload));
+        assert!(
+            matches!(steered, Decision::Pick(pick) if pick.trace.lifted == LiftedVeto::Overload)
+        );
         engine.shed_when_all_vetoed(0);
         let shed = engine
             .shadow(&facts, &pool, &rows, &cx, &mut scratch)
@@ -6761,7 +6774,7 @@ mod tests {
                     &mut Scratch::new(),
                 )
                 .expect("a shadow decision");
-            assert_eq!(decision.trace().lifted, Lifted::Liveness);
+            assert_eq!(decision.trace().lifted, LiftedVeto::Liveness);
             assert_eq!(
                 decision
                     .pick()
@@ -7163,7 +7176,7 @@ mod tests {
         let cache = || Profile {
             name: "cache".into(),
             filters: vec![Box::new(Healthy)],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(PrefixAffinity::new(
                     &params,
                     Gates::of(Some(&params), None, Some(16)),
@@ -7373,7 +7386,7 @@ mod tests {
             pin: WorkerId,
         }
 
-        impl crate::PinSource for Later {
+        impl crate::engine::PinSource for Later {
             fn pinned(&self, _: Session, _: Option<u64>) -> Option<WorkerId> {
                 (self.asked.fetch_add(1, Ordering::Relaxed) != 0).then_some(self.pin)
             }
@@ -7613,7 +7626,7 @@ mod tests {
             seen: Mutex<Option<[WorkerId; 2]>>,
         }
 
-        impl crate::PinSource for Behind<'_> {
+        impl crate::engine::PinSource for Behind<'_> {
             fn pinned(&self, key: Session, _: Option<u64>) -> Option<WorkerId> {
                 let sessions = self.engine.sessions();
                 let _ = sessions.restore(key, 10, &self.rule, self.stored);
@@ -7789,7 +7802,7 @@ mod tests {
             others: [WorkerId; 2],
         }
 
-        impl crate::PinSource for TwoPins<'_> {
+        impl crate::engine::PinSource for TwoPins<'_> {
             fn pinned(&self, key: Session, _: Option<u64>) -> Option<WorkerId> {
                 let sessions = self.engine.sessions();
                 sessions.lookup(key, 10, &SESSIONS);
@@ -7854,7 +7867,7 @@ mod tests {
     fn shadow_rows_lent_out_of_order_stop_a_debug_build() {
         let engine = with_shadow(least_requests_profile(), Some(SESSIONS));
         let rows = [candidate(0, 0), candidate(1, 3)];
-        let keyed = |row, in_flight| crate::KeyedRow { row, in_flight };
+        let keyed = |row, in_flight| crate::engine::KeyedRow { row, in_flight };
         let lent = [keyed(1, 2), keyed(0, 2)];
         let facts = RequestFacts {
             lent_session_in_flight: Some(&lent),
@@ -8059,7 +8072,7 @@ mod tests {
         let count = Arc::new(AtomicU32::new(0));
         let engine = with_shadow(
             Profile {
-                scorers: vec![Weighted {
+                scorers: vec![WeightedScorer {
                     scorer: Box::new(Dispatches(Arc::clone(&count))),
                     weight: 1.0,
                 }],
@@ -8256,7 +8269,7 @@ mod tests {
     fn a_shadow_of_other_filters_is_named_rows_of_its_own_under_a_sample() {
         use crate::{
             document::spec::{BestParams, PickStage, ProfileSpec, ShadowSpec},
-            stages::catalog::Catalog,
+            stages::registry::StageRegistry,
         };
         /// A filter that is shown the whole view: the default word. The
         /// engine asks its profile's filters of no row ahead of a naming.
@@ -8272,7 +8285,7 @@ mod tests {
             }
         }
         type Turn<'a> = &'a dyn Fn(&mut ProfileSpec);
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         let added = catalog.filter("whole", || Box::new(Whole));
         added.expect("a free name");
         let rows = |sample: u32, both: Turn<'_>, shadow: Turn<'_>| {
@@ -8337,7 +8350,7 @@ mod tests {
         let second = aware.profiles.values().next();
         let second = second.expect("the preset's profile").clone();
         let aware = aware.validate().expect("the preset validates");
-        let rule = aware.warm_rule_for("m", Phase::Single);
+        let rule = aware.warm_up_rule_for("m", Phase::Single);
         assert!(rule.is_some());
         assert_eq!(aware.pool_rule_for("m", Phase::Single), rule);
 
@@ -8347,7 +8360,7 @@ mod tests {
         document.profiles.insert("second".into(), second);
         document.bindings[0].shadow = Some(spec::ShadowSpec::Profile("second".into()));
         let engine = document.validate().expect("a binding with a shadow");
-        assert_eq!(engine.warm_rule_for("m", Phase::Single), None);
+        assert_eq!(engine.warm_up_rule_for("m", Phase::Single), None);
         assert_eq!(engine.pool_rule_for("m", Phase::Single), rule);
     }
 
@@ -8575,7 +8588,7 @@ mod tests {
             }),
             ..PrefixAffinityParams::default()
         };
-        let stage = || Weighted {
+        let stage = || WeightedScorer {
             scorer: Box::new(PrefixAffinity::new(
                 &params,
                 Gates::of(Some(&params), None, Some(16)),
@@ -8645,13 +8658,13 @@ mod tests {
     fn a_profile_states_its_overlap_by_a_scorer_at_any_place() {
         let params = PrefixAffinityParams::default();
         for ahead in [0usize, 1, 255, 256, 300] {
-            let mut scorers: Vec<Weighted> = (0..ahead)
-                .map(|_| Weighted {
+            let mut scorers: Vec<WeightedScorer> = (0..ahead)
+                .map(|_| WeightedScorer {
                     scorer: Box::new(LeastRequests),
                     weight: 1.0,
                 })
                 .collect();
-            scorers.push(Weighted {
+            scorers.push(WeightedScorer {
                 scorer: Box::new(PrefixAffinity::new(
                     &params,
                     Gates::of(Some(&params), None, Some(16)),
@@ -8735,7 +8748,7 @@ mod tests {
             vec![Profile {
                 name: "cache".into(),
                 filters: vec![Box::new(Healthy)],
-                scorers: vec![Weighted {
+                scorers: vec![WeightedScorer {
                     scorer: Box::new(stage),
                     weight: 1.0,
                 }],
@@ -9085,7 +9098,7 @@ mod tests {
         let profile = Profile {
             name: "overlap".into(),
             filters: vec![Box::new(Healthy)],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(ByOverlap),
                 weight: 1.0,
             }],
@@ -9206,13 +9219,13 @@ mod tests {
     /// column.
     #[test]
     fn a_holder_a_host_named_leads_as_the_deepest_overlap_of_a_column_does() {
-        use crate::{NamedAffinity, NamedHolder};
+        use crate::engine::{AffinityHolder, AffinityRows};
         let engine = overlap_engine(Binding {
             model: "m".into(),
             ..single_binding()
         });
         let pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
-        let decide = |column: &[AffinityFacts], named: Option<NamedAffinity<'_>>| {
+        let decide = |column: &[AffinityFacts], named: Option<AffinityRows<'_>>| {
             let facts = RequestFacts {
                 model: "m",
                 affinity: column,
@@ -9228,24 +9241,24 @@ mod tests {
             )
         };
         let holders = [
-            NamedHolder {
+            AffinityHolder {
                 row: 0,
                 overlap_blocks: 10,
                 predicted_blocks: 0,
             },
-            NamedHolder {
+            AffinityHolder {
                 row: 1,
                 overlap_blocks: 90,
                 predicted_blocks: 0,
             },
         ];
-        let named = NamedAffinity {
+        let named = AffinityRows {
             holders: &holders,
-            ..NamedAffinity::default()
+            ..AffinityRows::default()
         };
         assert_eq!(lead(&decide(&[], Some(named))), Some(1));
         // Nobody named decides too.
-        assert!(decide(&[], Some(NamedAffinity::default())).pick().is_some());
+        assert!(decide(&[], Some(AffinityRows::default())).pick().is_some());
         // A request that names nothing reads its column.
         assert_eq!(lead(&decide(&held(&[10, 90, 20]), None)), Some(1));
     }
@@ -9260,7 +9273,7 @@ mod tests {
     fn rows_named_out_of_order_past_the_pool_or_beside_a_column_stop_a_debug_build() {
         use std::panic::{catch_unwind, AssertUnwindSafe};
 
-        use crate::{NamedAffinity, NamedHolder};
+        use crate::engine::{AffinityHolder, AffinityRows};
         let engine = overlap_engine(Binding {
             model: "m".into(),
             ..single_binding()
@@ -9277,9 +9290,9 @@ mod tests {
             ("rows named beside a column", &column[..], &[1][..], &[][..]),
         ];
         for (what, column, holders, warming) in shapes {
-            let holders: Vec<NamedHolder> = holders
+            let holders: Vec<AffinityHolder> = holders
                 .iter()
-                .map(|&row| NamedHolder {
+                .map(|&row| AffinityHolder {
                     row,
                     overlap_blocks: 90,
                     predicted_blocks: 0,
@@ -9289,7 +9302,7 @@ mod tests {
                 let facts = RequestFacts {
                     model: "m",
                     affinity: column,
-                    named: Some(NamedAffinity {
+                    named: Some(AffinityRows {
                         holders: &holders,
                         warming,
                         thin: false,
@@ -9430,7 +9443,7 @@ mod tests {
         let (prefills, decodes) = (paired(2), paired(2));
         let facts = RequestFacts {
             model: "m",
-            named: Some(NamedAffinity::default()),
+            named: Some(AffinityRows::default()),
             ..RequestFacts::default()
         };
         let decision = engine.decide_pair(
@@ -9453,16 +9466,16 @@ mod tests {
     #[test]
     fn a_pair_side_reads_no_rows_named_on_the_request() {
         let (prefills, decodes) = (paired(2), paired(2));
-        let holders = [crate::NamedHolder {
+        let holders = [crate::engine::AffinityHolder {
             row: 1,
             overlap_blocks: 8,
             predicted_blocks: 0,
         }];
         let facts = RequestFacts {
             model: "m",
-            named: Some(NamedAffinity {
+            named: Some(AffinityRows {
                 holders: &holders,
-                ..NamedAffinity::default()
+                ..AffinityRows::default()
             }),
             // A pin is a position in one pool: no side takes it either.
             pinned_at: 2,
@@ -9600,7 +9613,7 @@ mod tests {
             ..least_requests_profile()
         };
         let scored = Profile {
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(Scored),
                 weight: 1.0,
             }],
@@ -10617,7 +10630,7 @@ mod tests {
             vec![Profile {
                 name: "least".into(),
                 filters: vec![Box::new(Healthy)],
-                scorers: vec![Weighted {
+                scorers: vec![WeightedScorer {
                     scorer: Box::new(LeastRequests),
                     weight: 1.0,
                 }],
@@ -10827,7 +10840,7 @@ mod tests {
             vec![Profile {
                 name: "probed".into(),
                 filters: vec![Box::new(Healthy)],
-                scorers: vec![Weighted {
+                scorers: vec![WeightedScorer {
                     scorer: Box::new(Handed(Arc::clone(&handed))),
                     weight: 1.0,
                 }],
@@ -10944,13 +10957,13 @@ mod tests {
     fn a_picker_that_claims_more_than_the_survivors_is_held_to_them() {
         /// The first row compared leads; the narrowing claims what it holds.
         #[derive(Debug)]
-        struct Claims(Narrowed);
+        struct Claims(Shortlist);
         impl Lifecycle for Claims {}
         impl Picker for Claims {
             fn name(&self) -> &'static str {
                 "claims"
             }
-            fn narrow(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &mut [u32]) -> Narrowed {
+            fn narrow(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &mut [u32]) -> Shortlist {
                 self.0
             }
             fn pick(
@@ -10968,11 +10981,11 @@ mod tests {
             }
         }
         let pool = [candidate(0, 1), candidate(1, 2), candidate(2, 3)];
-        let all = Narrowed {
+        let all = Shortlist {
             compared: usize::MAX,
             alternates: usize::MAX,
         };
-        let one = Narrowed {
+        let one = Shortlist {
             compared: 1,
             alternates: usize::MAX,
         };
@@ -11017,8 +11030,8 @@ mod tests {
             fn name(&self) -> &'static str {
                 "declines"
             }
-            fn narrow(&self, _: &RequestFacts<'_>, _: &[Candidate], kept: &mut [u32]) -> Narrowed {
-                Narrowed {
+            fn narrow(&self, _: &RequestFacts<'_>, _: &[Candidate], kept: &mut [u32]) -> Shortlist {
+                Shortlist {
                     compared: 1,
                     alternates: kept.len().saturating_sub(1),
                 }
@@ -11126,7 +11139,7 @@ mod tests {
                     Profile {
                         name: "prefill".into(),
                         filters: vec![Box::new(Healthy)],
-                        scorers: vec![Weighted {
+                        scorers: vec![WeightedScorer {
                             scorer: Box::new(LeastRequests),
                             weight: 1.0,
                         }],
@@ -11237,7 +11250,7 @@ mod tests {
                 Profile {
                     name: "prefill".into(),
                     filters: vec![Box::new(Healthy)],
-                    scorers: vec![Weighted {
+                    scorers: vec![WeightedScorer {
                         scorer: Box::new(LeastRequests),
                         weight: 1.0,
                     }],
@@ -12515,7 +12528,7 @@ mod tests {
                     Box::new(NotOverloaded),
                     Box::new(NotTried),
                 ],
-                scorers: vec![Weighted {
+                scorers: vec![WeightedScorer {
                     scorer: Box::new(LeastRequests),
                     weight: 1.0,
                 }],
@@ -12760,11 +12773,11 @@ mod tests {
             name: "mixed".into(),
             filters: vec![],
             scorers: vec![
-                Weighted {
+                WeightedScorer {
                     scorer: Box::new(Wide),
                     weight: 3.0,
                 },
-                Weighted {
+                WeightedScorer {
                     scorer: Box::new(LeastRequests),
                     weight: 1.0,
                 },
@@ -12823,7 +12836,7 @@ mod tests {
             let profile = Profile {
                 name: "one".into(),
                 filters: vec![],
-                scorers: vec![Weighted {
+                scorers: vec![WeightedScorer {
                     scorer: Box::new(Given),
                     weight,
                 }],
@@ -12963,7 +12976,7 @@ mod tests {
         }
     }
 
-    impl crate::PinSource for Stored {
+    impl crate::engine::PinSource for Stored {
         fn pinned(&self, key: Session, ttl_micros: Option<u64>) -> Option<WorkerId> {
             self.asked.lock().expect("the case's lock").push(ttl_micros);
             (key == self.key).then_some(self.worker)
@@ -13075,7 +13088,7 @@ mod tests {
         other: WorkerId,
     }
 
-    impl crate::PinSource for Racing<'_> {
+    impl crate::engine::PinSource for Racing<'_> {
         fn pinned(&self, key: Session, _: Option<u64>) -> Option<WorkerId> {
             let _ = self
                 .engine
@@ -13334,7 +13347,7 @@ mod tests {
     fn capped(
         engine: &Engine,
         pool: &[Candidate],
-        lent: Option<&[crate::KeyedRow]>,
+        lent: Option<&[crate::engine::KeyedRow]>,
     ) -> (u32, SessionVerdict) {
         let facts = RequestFacts {
             model: "m",
@@ -13367,8 +13380,8 @@ mod tests {
         // The key's worker carries the most requests from here: the stages
         // place a request of the key at its cap on the second row.
         pool[0].in_flight = 9;
-        let keyed = |row, in_flight| crate::KeyedRow { row, in_flight };
-        let lent = |rows: &[crate::KeyedRow]| capped(&engine, &pool, Some(rows));
+        let keyed = |row, in_flight| crate::engine::KeyedRow { row, in_flight };
+        let lent = |rows: &[crate::engine::KeyedRow]| capped(&engine, &pool, Some(rows));
         assert_eq!(lent(&[]), (0, Pinned), "no request of the key in flight");
         assert_eq!(lent(&[keyed(0, 1)]), (0, Pinned), "under the cap");
         assert_eq!(lent(&[keyed(0, 2)]), (1, Respill), "at the cap");
@@ -13390,7 +13403,7 @@ mod tests {
     fn rows_lent_out_of_order_stop_a_debug_build() {
         let engine = session_engine(SESSIONS);
         let pool = vec![candidate(0, 0), candidate(1, 3)];
-        let keyed = |row, in_flight| crate::KeyedRow { row, in_flight };
+        let keyed = |row, in_flight| crate::engine::KeyedRow { row, in_flight };
         let answer = capped(&engine, &pool, Some(&[keyed(1, 2), keyed(0, 2)]));
         panic!("a list out of order answered {answer:?}");
     }
@@ -14704,7 +14717,7 @@ mod tests {
             vec![Profile {
                 name: "two".into(),
                 filters: vec![Box::new(Healthy)],
-                scorers: vec![Weighted {
+                scorers: vec![WeightedScorer {
                     scorer: Box::new(LeastRequests),
                     weight: 1.0,
                 }],
@@ -15171,7 +15184,7 @@ mod tests {
 
     #[test]
     fn a_profile_of_the_engines_own_filters_draws_as_one_asked_a_call_a_filter() {
-        use crate::stages::builtins::filters_of;
+        use crate::stages::filters::filters_of;
         // A request names one row tried, and the host one excluded.
         let (pool, mask) = tested_rows();
         let (mut drew, mut masked) = (0u32, 0u32);
@@ -15240,7 +15253,7 @@ mod tests {
     /// lifted.
     #[test]
     fn the_namings_test_is_the_draws_own() {
-        use crate::stages::builtins::filters_of;
+        use crate::stages::filters::filters_of;
         let (pool, mask) = tested_rows();
         let mut refused = 0u32;
         for set in 0..32u8 {
@@ -15285,7 +15298,7 @@ mod tests {
     /// mark, whatever the request carries.
     #[test]
     fn the_namings_test_is_none_where_the_pass_alone_can_say() {
-        use crate::stages::builtins::filters_of;
+        use crate::stages::filters::filters_of;
         /// A filter that is shown the whole view: the default word.
         #[derive(Debug)]
         struct Whole;
@@ -15358,7 +15371,7 @@ mod tests {
 
     #[test]
     fn a_whole_pass_by_the_folded_test_decides_as_one_asked_a_stage_at_a_time() {
-        use crate::stages::builtins::filters_of;
+        use crate::stages::filters::filters_of;
         // A row's shape: ready, or refused by one of four bits.
         fn shaped(rows: u32, shape: impl Fn(u32) -> u32) -> Vec<Candidate> {
             (0..rows)
@@ -15493,7 +15506,7 @@ mod tests {
     /// the fold holds none of them.
     #[test]
     fn a_whole_pass_over_an_encode_items_set_is_asked_a_stage_at_a_time() {
-        use crate::stages::builtins::filters_of;
+        use crate::stages::filters::filters_of;
         let engine = engine_of(filters_of(0b11111), Box::new(Passthrough));
         assert!(engine.row_tests[0].is_some(), "the profile folds");
         // Two rows every filter keeps. The item's rule refuses the first.
@@ -15593,7 +15606,7 @@ mod tests {
         };
         let item = lifted(&engine, true);
         assert!(
-            matches!(&item, Decision::Pick(pick) if pick.trace.lifted == Lifted::Overload),
+            matches!(&item, Decision::Pick(pick) if pick.trace.lifted == LiftedVeto::Overload),
             "the rule steers the item"
         );
         assert_eq!(item, lifted(&each, true), "the item's set, lifted");
@@ -15613,7 +15626,7 @@ mod tests {
     /// decision. The all-vetoed rule's pick is the fold's often.
     #[test]
     fn a_folded_engine_decides_as_a_staged_one_on_scratches_that_are_kept() {
-        use crate::stages::builtins::filters_of;
+        use crate::stages::filters::filters_of;
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut next = |n: u64| {
             state ^= state << 13;
@@ -15708,7 +15721,7 @@ mod tests {
                             // Equal to the staged twin, not modelled: a shed,
                             // or the rule's pick behind its lifted pass.
                             emptied += 1;
-                            steered += u32::from(got.trace().lifted == Lifted::Overload);
+                            steered += u32::from(got.trace().lifted == LiftedVeto::Overload);
                             continue;
                         }
                         let mut stepped = false;
@@ -15758,7 +15771,7 @@ mod tests {
     #[test]
     fn an_engine_of_as_many_scorers_as_a_place_names_is_built() {
         let scorers = (0..u16::MAX)
-            .map(|_| Weighted {
+            .map(|_| WeightedScorer {
                 scorer: Box::new(LeastRequests),
                 weight: 1.0,
             })
@@ -16077,8 +16090,8 @@ mod tests {
 
     // ---- a draw the rows a host named join
 
-    fn holding(row: u32, overlap_blocks: u32) -> crate::NamedHolder {
-        crate::NamedHolder {
+    fn holding(row: u32, overlap_blocks: u32) -> crate::engine::AffinityHolder {
+        crate::engine::AffinityHolder {
             row,
             overlap_blocks,
             predicted_blocks: 0,
@@ -16086,14 +16099,14 @@ mod tests {
     }
 
     /// A request of sixteen blocks whose host names `holders`.
-    fn naming(seed: u64, holders: &[crate::NamedHolder]) -> RequestFacts<'_> {
+    fn naming(seed: u64, holders: &[crate::engine::AffinityHolder]) -> RequestFacts<'_> {
         static HASHES: [u64; 16] = [0; 16];
         RequestFacts {
             block_hashes: &HASHES,
             prompt_tokens: 256,
-            named: Some(NamedAffinity {
+            named: Some(AffinityRows {
                 holders,
-                ..NamedAffinity::default()
+                ..AffinityRows::default()
             }),
             ..request(seed)
         }
@@ -16141,11 +16154,11 @@ mod tests {
             vec![Profile {
                 name: "sampled".into(),
                 filters: vec![Box::new(Healthy)],
-                scorers: vec![Weighted {
-                    scorer: Box::new(builtins::ResidentWork::new(0)),
+                scorers: vec![WeightedScorer {
+                    scorer: Box::new(scorers::ResidentWork::new(0)),
                     weight: 1.0,
                 }],
-                picker: Box::new(builtins::SampledBest::new(4)),
+                picker: Box::new(pickers::SampledBest::new(4)),
             }],
             vec![Binding {
                 model: "m".into(),
@@ -16201,7 +16214,8 @@ mod tests {
     #[should_panic(expected = "at or under the profile's sample")]
     fn rows_named_past_the_sample_stop_a_debug_build_where_the_picker_draws() {
         let engine = preset("cache_aware");
-        let holders: Vec<crate::NamedHolder> = (0..17).map(|row| holding(row, 12)).collect();
+        let holders: Vec<crate::engine::AffinityHolder> =
+            (0..17).map(|row| holding(row, 12)).collect();
         let decision = drawn(&engine, &naming(1, &holders), &pool_of(64, |_| false));
         panic!("seventeen rows named answered {decision:?}");
     }
@@ -16255,7 +16269,7 @@ mod tests {
                 name: "whole".into(),
                 filters: vec![Box::new(Healthy), Box::new(Whole)],
                 scorers: Vec::new(),
-                picker: Box::new(builtins::SampledBest::new(16)),
+                picker: Box::new(pickers::SampledBest::new(16)),
             }],
             vec![single_binding()],
             1,
@@ -16315,7 +16329,7 @@ mod tests {
         let mut kept = vec![0, 1];
         let mean = join_named(
             &facts,
-            &NamedAffinity::default(),
+            &AffinityRows::default(),
             &pool,
             &mut |_: &Candidate| true,
             &mut kept,
@@ -16330,10 +16344,10 @@ mod tests {
     fn the_join_passes_over_a_row_named_past_the_pool() {
         let pool = pool_of(4, |i| i == 2);
         let holders = [holding(1, 12), holding(2, 12), holding(9, 12)];
-        let named = NamedAffinity {
+        let named = AffinityRows {
             holders: &holders,
             warming: &[3, 4, u32::MAX],
-            ..NamedAffinity::default()
+            ..AffinityRows::default()
         };
         let mut asked = Vec::new();
         let mut keep = |row: &Candidate| {
@@ -16374,7 +16388,7 @@ mod tests {
             name: name.into(),
             filters: vec![Box::new(Healthy)],
             scorers: Vec::new(),
-            picker: Box::new(builtins::SampledBest::new(sample)),
+            picker: Box::new(pickers::SampledBest::new(sample)),
         };
         Engine::new(
             vec![sampled("narrow", 4), sampled("wide", 16)],
@@ -16393,7 +16407,8 @@ mod tests {
         let engine = two_samples();
         assert_eq!(engine.needs().sample, 16);
         let pool = pool_of(64, |_| false);
-        let holders: Vec<crate::NamedHolder> = (0..16).map(|row| holding(row, 12)).collect();
+        let holders: Vec<crate::engine::AffinityHolder> =
+            (0..16).map(|row| holding(row, 12)).collect();
         for (model, sample) in [("narrow", 4usize), ("wide", 16)] {
             let cap = engine.sample_for(model, Phase::Single) as usize;
             assert_eq!(cap, sample, "{model}");
@@ -16416,7 +16431,7 @@ mod tests {
     #[should_panic(expected = "at or under the profile's sample")]
     fn rows_capped_by_the_engines_summary_stop_a_debug_build_under_a_narrower_profile() {
         let engine = two_samples();
-        let holders: Vec<crate::NamedHolder> = (0..engine.needs().sample)
+        let holders: Vec<crate::engine::AffinityHolder> = (0..engine.needs().sample)
             .map(|row| holding(row, 12))
             .collect();
         let facts = RequestFacts {
@@ -16437,10 +16452,10 @@ mod tests {
         let engine = preset("cache_aware");
         let holders = [holding(3, 12)];
         let facts = RequestFacts {
-            named: Some(NamedAffinity {
+            named: Some(AffinityRows {
                 holders: &holders,
                 mean_in_flight: Some(2.0),
-                ..NamedAffinity::default()
+                ..AffinityRows::default()
             }),
             ..request(1)
         };
@@ -16608,7 +16623,8 @@ mod tests {
         assert_eq!(engine.needs_for("mixed", Phase::Decode).sample, 16);
         assert_eq!(engine.sample_for("mixed", Phase::Decode), 4);
         assert_eq!(engine.sample_for("nobody", Phase::Decode), 0);
-        let holders: Vec<crate::NamedHolder> = (0..4).map(|row| holding(row, 12)).collect();
+        let holders: Vec<crate::engine::AffinityHolder> =
+            (0..4).map(|row| holding(row, 12)).collect();
         let facts = RequestFacts {
             model: "mixed",
             phase: Phase::Decode,
@@ -16667,11 +16683,11 @@ mod tests {
             self.score_front(facts, candidates, kept, kept, out).0
         }
 
-        fn spread(&self) -> Spread {
+        fn spread(&self) -> ScoreSpread {
             if self.says {
-                Spread::Levels(self.step)
+                ScoreSpread::Levels(self.step)
             } else {
-                Spread::Any
+                ScoreSpread::Any
             }
         }
 
@@ -16686,16 +16702,16 @@ mod tests {
             _: &[u32],
             asked: &[u32],
             out: &mut [f32],
-        ) -> (TieBand, Front) {
+        ) -> (TieBand, ScoreFront) {
             let mut top = 0;
             for (o, &row) in out.iter_mut().zip(asked) {
                 *o = self.levels[candidates[row as usize].position as usize];
                 top += u32::from(*o >= 1.0);
             }
             let front = if self.says {
-                Front::At(top)
+                ScoreFront::At(top)
             } else {
-                Front::Unsaid
+                ScoreFront::Unsaid
             };
             (TieBand(0.0), front)
         }
@@ -16785,8 +16801,8 @@ mod tests {
             TieBand(0.0)
         }
 
-        fn spread(&self) -> Spread {
-            Spread::Alike
+        fn spread(&self) -> ScoreSpread {
+            ScoreSpread::Alike
         }
     }
 
@@ -16852,7 +16868,7 @@ mod tests {
     }
 
     /// One profile over the healthy rows: `stages` under `picker`.
-    fn staged(stages: Vec<Weighted>, picker: Box<dyn Picker>) -> Engine {
+    fn staged(stages: Vec<WeightedScorer>, picker: Box<dyn Picker>) -> Engine {
         Engine::new(
             vec![Profile {
                 name: "staged".into(),
@@ -16867,8 +16883,8 @@ mod tests {
     }
 
     /// A rank of `levels` with a step of a half, and a stage of any values.
-    fn rank(levels: &[f32], weight: f32, says: bool) -> Weighted {
-        Weighted {
+    fn rank(levels: &[f32], weight: f32, says: bool) -> WeightedScorer {
+        WeightedScorer {
             scorer: Box::new(Levelled {
                 levels: levels.to_vec(),
                 step: 0.5,
@@ -16878,8 +16894,8 @@ mod tests {
         }
     }
 
-    fn valued(values: &[f32], band: f32) -> Weighted {
-        Weighted {
+    fn valued(values: &[f32], band: f32) -> WeightedScorer {
+        WeightedScorer {
             scorer: Box::new(Valued(values.to_vec(), band)),
             weight: 1.0,
         }
@@ -16905,8 +16921,8 @@ mod tests {
     /// alone.
     #[test]
     fn the_build_reads_which_leading_stages_are_ranks() {
-        let order = |stages: Vec<Weighted>| staged(stages, Box::new(Best)).orders[0];
-        let level = |step: f32, weight: f32| Weighted {
+        let order = |stages: Vec<WeightedScorer>| staged(stages, Box::new(Best)).orders[0];
+        let level = |step: f32, weight: f32| WeightedScorer {
             scorer: Box::new(Levelled {
                 levels: Vec::new(),
                 step,
@@ -16914,15 +16930,15 @@ mod tests {
             }),
             weight,
         };
-        let any = |weight: f32| Weighted {
+        let any = |weight: f32| WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight,
         };
-        let flat = |weight: f32| Weighted {
+        let flat = |weight: f32| WeightedScorer {
             scorer: Box::new(Flat(Arc::default())),
             weight,
         };
-        let wise = |weight: f32| Weighted {
+        let wise = |weight: f32| WeightedScorer {
             weight,
             ..valued(&[], 0.0)
         };
@@ -17018,7 +17034,7 @@ mod tests {
         let pool = ranked_pool(9);
         // The targets by position, and the rows the stage behind was handed.
         let asked = |levels: &[f32]| {
-            let probe = Weighted {
+            let probe = WeightedScorer {
                 scorer: Box::new(Asked(Arc::clone(&handed))),
                 weight: 1.0,
             };
@@ -17048,7 +17064,7 @@ mod tests {
         assert_eq!(order, vec![8, 7, 6, 5]);
         // Behind a stage that does not answer for a front alone no row
         // stands in front: four of nine, and every row is asked.
-        let whole = Weighted {
+        let whole = WeightedScorer {
             scorer: Box::new(Handed(Arc::clone(&handed))),
             weight: 1.0,
         };
@@ -17066,7 +17082,7 @@ mod tests {
     #[test]
     fn a_request_that_names_rows_is_asked_by_rank_where_the_picker_never_draws() {
         let handed = Arc::new(Mutex::new(Vec::new()));
-        let probe = Weighted {
+        let probe = WeightedScorer {
             scorer: Box::new(Asked(Arc::clone(&handed))),
             weight: 1.0,
         };
@@ -17075,7 +17091,7 @@ mod tests {
         assert_eq!(engine.marks[0].ahead(), Marks::RANKED);
         let pool = ranked_pool(9);
         let facts = RequestFacts {
-            named: Some(NamedAffinity::default()),
+            named: Some(AffinityRows::default()),
             ..request(7)
         };
         let decision = reported(&engine, &facts, &pool);
@@ -17114,7 +17130,7 @@ mod tests {
             self.0.front_wise()
         }
 
-        fn spread(&self) -> Spread {
+        fn spread(&self) -> ScoreSpread {
             self.0.spread()
         }
 
@@ -17125,7 +17141,7 @@ mod tests {
             kept: &[u32],
             asked: &[u32],
             out: &mut [f32],
-        ) -> (TieBand, Front) {
+        ) -> (TieBand, ScoreFront) {
             self.0.score_front(facts, candidates, kept, asked, out)
         }
 
@@ -17137,8 +17153,8 @@ mod tests {
             self.0.scope()
         }
 
-        fn warm_rule(&self) -> Option<WarmRule> {
-            self.0.warm_rule()
+        fn warm_up_rule(&self) -> Option<WarmUpRule> {
+            self.0.warm_up_rule()
         }
     }
 
@@ -17192,11 +17208,11 @@ mod tests {
                 says: true,
             };
             vec![
-                Weighted {
+                WeightedScorer {
                     scorer: Box::new(RowWise(ranks)),
                     weight: 4.0,
                 },
-                Weighted {
+                WeightedScorer {
                     scorer: Box::new(RowWise(Asked(Arc::clone(&handed)))),
                     weight: 1.0,
                 },
@@ -17204,13 +17220,13 @@ mod tests {
         };
         let pool = ranked_pool(16);
         let names = RequestFacts {
-            named: Some(NamedAffinity::default()),
+            named: Some(AffinityRows::default()),
             ..request(7)
         };
         // Under the built-in picker of that kind the profile holds the
         // three marks. A request that names none is asked by rank: the
         // stage behind the rank of the four rows in front.
-        let sampled = builtins::SampledBest::new(2);
+        let sampled = pickers::SampledBest::new(2);
         let engine = staged(stages(), Box::new(sampled));
         assert_eq!(
             engine.marks[0].ahead(),
@@ -17243,11 +17259,11 @@ mod tests {
         let asks = Arc::new(Mutex::new(0));
         let stages = vec![
             rank(&[1.0, 0.5, 0.0, 0.5, 1.0], 4.0, true),
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(Flat(Arc::clone(&asks))),
                 weight: 1.0,
             },
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(Asked(Arc::default())),
                 weight: 1.0,
             },
@@ -17264,22 +17280,31 @@ mod tests {
         assert_eq!(ranked, summed);
     }
 
-    /// The word a stage's scores read as under its spread ([`Front::of`]):
+    /// The word a stage's scores read as under its spread ([`ScoreFront::of`]):
     /// alike where every row stands at the ceiling, a count where every
     /// other row stands a whole level or more under it, and nothing of any
     /// other scores.
     #[test]
     fn a_word_is_read_off_the_scores_by_the_spread() {
-        let levels = Spread::Levels(0.5);
-        assert_eq!(Front::of(levels, &[1.0, 1.0]), Front::Alike);
-        assert_eq!(Front::of(levels, &[]), Front::Alike);
-        assert_eq!(Front::of(levels, &[1.0, 0.5, 0.0, 1.0]), Front::At(2));
-        assert_eq!(Front::of(levels, &[0.5, 0.0]), Front::At(0));
+        let levels = ScoreSpread::Levels(0.5);
+        assert_eq!(ScoreFront::of(levels, &[1.0, 1.0]), ScoreFront::Alike);
+        assert_eq!(ScoreFront::of(levels, &[]), ScoreFront::Alike);
+        assert_eq!(
+            ScoreFront::of(levels, &[1.0, 0.5, 0.0, 1.0]),
+            ScoreFront::At(2)
+        );
+        assert_eq!(ScoreFront::of(levels, &[0.5, 0.0]), ScoreFront::At(0));
         // A row less than a whole level under the ceiling, or no number.
-        assert_eq!(Front::of(levels, &[1.0, 0.75]), Front::Unsaid);
-        assert_eq!(Front::of(levels, &[1.0, f32::NAN]), Front::Unsaid);
-        assert_eq!(Front::of(Spread::Any, &[1.0, 0.0]), Front::Unsaid);
-        assert_eq!(Front::of(Spread::Alike, &[1.0, 1.0]), Front::Alike);
+        assert_eq!(ScoreFront::of(levels, &[1.0, 0.75]), ScoreFront::Unsaid);
+        assert_eq!(ScoreFront::of(levels, &[1.0, f32::NAN]), ScoreFront::Unsaid);
+        assert_eq!(
+            ScoreFront::of(ScoreSpread::Any, &[1.0, 0.0]),
+            ScoreFront::Unsaid
+        );
+        assert_eq!(
+            ScoreFront::of(ScoreSpread::Alike, &[1.0, 1.0]),
+            ScoreFront::Alike
+        );
     }
 
     /// A pool under the count a decision is taken by rank from is asked as
@@ -17291,11 +17316,11 @@ mod tests {
         let levels: Vec<f32> = (0..16).map(|i| if i < 4 { 1.0 } else { 0.5 }).collect();
         let stages = vec![
             rank(&levels, 4.0, true),
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(Flat(Arc::clone(&asks))),
                 weight: 1.0,
             },
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(Asked(Arc::default())),
                 weight: 1.0,
             },
@@ -17320,8 +17345,8 @@ mod tests {
     /// parameters is not of this build yet.
     #[test]
     fn a_ranked_decision_is_the_weighted_sums_under_every_picker() {
-        use crate::stages::catalog::{Catalog, Found};
-        let catalog = Catalog::builtin();
+        use crate::stages::registry::{Found, StageRegistry};
+        let catalog = StageRegistry::builtin();
         let build = |name: &str| match catalog.find_picker(name) {
             Some(Found::Built(picker)) => Some(picker),
             Some(Found::Typed | Found::With(_)) => None,
@@ -17407,7 +17432,7 @@ mod tests {
     /// A rank of the tests that says `1` of the scores `0`, which its
     /// first rows read; every other row reads nothing.
     #[derive(Debug)]
-    struct Says(Vec<f32>, Front);
+    struct Says(Vec<f32>, ScoreFront);
 
     impl Lifecycle for Says {}
 
@@ -17426,8 +17451,8 @@ mod tests {
             self.score_front(facts, candidates, kept, kept, out).0
         }
 
-        fn spread(&self) -> Spread {
-            Spread::Levels(0.5)
+        fn spread(&self) -> ScoreSpread {
+            ScoreSpread::Levels(0.5)
         }
 
         fn score_front(
@@ -17437,7 +17462,7 @@ mod tests {
             _: &[u32],
             _: &[u32],
             out: &mut [f32],
-        ) -> (TieBand, Front) {
+        ) -> (TieBand, ScoreFront) {
             out.fill(0.0);
             out[..self.0.len()].copy_from_slice(&self.0);
             (TieBand(0.0), self.1)
@@ -17447,9 +17472,9 @@ mod tests {
     /// A decision over twelve rows under a rank that says `said` of
     /// `scores`, ahead of a stage that answers for a front alone: the
     /// profile is decided by rank, so the engine reads the word.
-    fn told(scores: &[f32], said: Front) {
+    fn told(scores: &[f32], said: ScoreFront) {
         let stages = vec![
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(Says(scores.to_vec(), said)),
                 weight: 4.0,
             },
@@ -17467,7 +17492,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "says said At(5) of scores that read otherwise")]
     fn a_rank_that_miscounts_its_front_fails_a_debug_build() {
-        told(&[1.0, 1.0, 1.0, 1.0], Front::At(5));
+        told(&[1.0, 1.0, 1.0, 1.0], ScoreFront::At(5));
     }
 
     /// And so does one whose row stands within a step of the ceiling: the
@@ -17476,7 +17501,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "says said At(4) of scores that read otherwise")]
     fn a_rank_with_a_row_within_a_step_of_its_ceiling_fails_a_debug_build() {
-        told(&[1.0, 1.0, 1.0, 1.0, 0.75], Front::At(4));
+        told(&[1.0, 1.0, 1.0, 1.0, 0.75], ScoreFront::At(4));
     }
 
     /// The cache-aware preset by rank is its weighted sum. Over pools of 4
@@ -17767,7 +17792,7 @@ mod tests {
         let pool: Vec<Candidate> = (0..16).map(|i| candidate(i, 0)).collect();
         let first: Vec<f32> = (0..16).map(|i| if i < 8 { 1.0 } else { 0.5 }).collect();
         let asked = |second: &[f32]| {
-            let probe = Weighted {
+            let probe = WeightedScorer {
                 scorer: Box::new(Asked(Arc::clone(&handed))),
                 weight: 1.0,
             };
@@ -17806,7 +17831,7 @@ mod tests {
         let mut second = vec![0.5; 16];
         second[2..4].fill(0.0);
         second[4..8].fill(1.0);
-        let probe = Weighted {
+        let probe = WeightedScorer {
             scorer: Box::new(Asked(Arc::clone(&handed))),
             weight: 1.0,
         };
@@ -17868,7 +17893,7 @@ mod tests {
         let second: Vec<f32> = (0..16).map(|i| if i < 4 { 1.0 } else { 0.5 }).collect();
         let mut third = vec![-1.0; 16];
         third[..3].copy_from_slice(&[0.25, 0.5, 0.75]);
-        let sparse = Weighted {
+        let sparse = WeightedScorer {
             scorer: Box::new(Sparse(third, Arc::clone(&handed))),
             weight: 1.0,
         };
@@ -17896,7 +17921,7 @@ mod tests {
         let mut third = vec![0.5; 16];
         third[2..6].fill(1.0);
         let stages = |says| {
-            let probe = Weighted {
+            let probe = WeightedScorer {
                 scorer: Box::new(Asked(Arc::clone(&handed))),
                 weight: 1.0,
             };
@@ -17933,7 +17958,7 @@ mod tests {
     #[test]
     fn a_pool_not_said_to_hold_a_report_on_every_row_is_asked_whole_at_once() {
         let handed = Arc::new(Mutex::new(Vec::new()));
-        let probe = Weighted {
+        let probe = WeightedScorer {
             scorer: Box::new(Asked(Arc::clone(&handed))),
             weight: 1.0,
         };
@@ -17975,7 +18000,7 @@ mod tests {
     fn a_front_is_listed_anew_over_a_scratch_that_held_another() {
         let handed = Arc::new(Mutex::new(Vec::new()));
         let front_of = |levels: &[f32]| {
-            let probe = Weighted {
+            let probe = WeightedScorer {
                 scorer: Box::new(Asked(Arc::clone(&handed))),
                 weight: 1.0,
             };
@@ -18046,10 +18071,13 @@ mod tests {
             kept: &[u32],
             asked: &[u32],
             out: &mut [f32],
-        ) -> (TieBand, Front) {
+        ) -> (TieBand, ScoreFront) {
             let lists = [kept.to_vec(), asked.to_vec()];
             self.0.lock().expect("the asks").push(lists);
-            (self.score(facts, candidates, asked, out), Front::Unsaid)
+            (
+                self.score(facts, candidates, asked, out),
+                ScoreFront::Unsaid,
+            )
         }
     }
 
@@ -18072,7 +18100,7 @@ mod tests {
             .collect();
         let first: Vec<f32> = (0..20).map(|i| if i < 8 { 1.0 } else { 0.5 }).collect();
         let second: Vec<f32> = (0..20).map(|i| if i < 4 { 1.0 } else { 0.5 }).collect();
-        let probe = Weighted {
+        let probe = WeightedScorer {
             scorer: Box::new(Shown(Arc::clone(&shown))),
             weight: 1.0,
         };
@@ -18125,12 +18153,15 @@ mod tests {
             _: &[u32],
             asked: &[u32],
             out: &mut [f32],
-        ) -> (TieBand, Front) {
+        ) -> (TieBand, ScoreFront) {
             if asked.len() < self.1 {
                 self.0.lock().expect("the asks").push(asked.len());
-                return (TieBand::NORMALIZED, Front::Whole);
+                return (TieBand::NORMALIZED, ScoreFront::Whole);
             }
-            (self.score(facts, candidates, asked, out), Front::Unsaid)
+            (
+                self.score(facts, candidates, asked, out),
+                ScoreFront::Unsaid,
+            )
         }
     }
 
@@ -18143,7 +18174,7 @@ mod tests {
         let levels: Vec<f32> = (0..16).map(|i| if i < 8 { 1.0 } else { 0.5 }).collect();
         let decided = |least: usize| {
             let asks = Arc::new(Mutex::new(Vec::new()));
-            let stage = Weighted {
+            let stage = WeightedScorer {
                 scorer: Box::new(Wholly(Arc::clone(&asks), least)),
                 weight: 1.0,
             };
@@ -18190,8 +18221,8 @@ mod tests {
             TieBand(0.0)
         }
 
-        fn spread(&self) -> Spread {
-            Spread::Levels(0.5)
+        fn spread(&self) -> ScoreSpread {
+            ScoreSpread::Levels(0.5)
         }
 
         fn score_front(
@@ -18201,8 +18232,8 @@ mod tests {
             _: &[u32],
             _: &[u32],
             _: &mut [f32],
-        ) -> (TieBand, Front) {
-            (TieBand(0.0), Front::Whole)
+        ) -> (TieBand, ScoreFront) {
+            (TieBand(0.0), ScoreFront::Whole)
         }
     }
 
@@ -18256,8 +18287,8 @@ mod tests {
             TieBand(0.0)
         }
 
-        fn spread(&self) -> Spread {
-            Spread::Alike
+        fn spread(&self) -> ScoreSpread {
+            ScoreSpread::Alike
         }
     }
 
@@ -18277,12 +18308,12 @@ mod tests {
             .collect();
         let handed = Arc::new(Mutex::new(Vec::new()));
         let mut stages = vec![rank(&lead, 8.0, true)];
-        stages.extend((0..7).map(|_| Weighted {
+        stages.extend((0..7).map(|_| WeightedScorer {
             scorer: Box::new(Flat(Arc::default())),
             weight: 1.0,
         }));
         stages.push(rank(&last, 1.0, true));
-        stages.push(Weighted {
+        stages.push(WeightedScorer {
             scorer: Box::new(Still(Arc::clone(&handed))),
             weight: 1.0,
         });
@@ -18331,8 +18362,8 @@ mod tests {
             TieBand(0.0)
         }
 
-        fn spread(&self) -> Spread {
-            Spread::Levels(0.5)
+        fn spread(&self) -> ScoreSpread {
+            ScoreSpread::Levels(0.5)
         }
     }
 
@@ -18347,11 +18378,11 @@ mod tests {
         let early: Vec<f32> = (0..16).map(|i| 1.0 - i as f32 / 16.0).collect();
         let stages = vec![
             rank(&lead, 8.0, true),
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(Among(Arc::clone(&asks))),
                 weight: 2.0,
             },
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(Valued(early, 0.0)),
                 weight: 0.5,
             },
@@ -18406,7 +18437,7 @@ mod tests {
         let stages = |probe: &Arc<Mutex<Vec<u32>>>| {
             vec![
                 rank(&lead, 4.0, true),
-                Weighted {
+                WeightedScorer {
                     scorer: Box::new(Asked(Arc::clone(probe))),
                     weight: 1.0,
                 },
@@ -18454,16 +18485,16 @@ mod tests {
             TieBand(0.5)
         }
 
-        fn spread(&self) -> Spread {
-            Spread::Alike
+        fn spread(&self) -> ScoreSpread {
+            ScoreSpread::Alike
         }
     }
 
     /// A stage that says it orders nothing returns no band
-    /// ([`Spread::Alike`]): a decision by rank does not ask it, so a band of
-    /// its own would widen the whole pass's ties and no other's. One that
-    /// returns a band fails a debug build where it is asked: its author's
-    /// case, never two decisions in the field.
+    /// ([`ScoreSpread::Alike`]): a decision by rank does not ask it, so a band
+    /// of its own would widen the whole pass's ties and no other's. One that
+    /// returns a band fails a debug build where it is asked: its author's case,
+    /// never two decisions in the field.
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "banded orders nothing and returned a band")]
@@ -18471,7 +18502,7 @@ mod tests {
         let lead: Vec<f32> = (0..16).map(|i| if i < 8 { 1.0 } else { 0.5 }).collect();
         let stages = vec![
             rank(&lead, 4.0, true),
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(Banded),
                 weight: 1.0,
             },
@@ -18487,11 +18518,11 @@ mod tests {
     fn banded_behind(levels: &[f32]) {
         let stages = vec![
             rank(levels, 8.0, true),
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(Asked(Arc::default())),
                 weight: 1.0,
             },
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(Banded),
                 weight: 1.0,
             },
@@ -18545,8 +18576,8 @@ mod tests {
             TieBand(0.0)
         }
 
-        fn spread(&self) -> Spread {
-            Spread::Alike
+        fn spread(&self) -> ScoreSpread {
+            ScoreSpread::Alike
         }
 
         fn score_front(
@@ -18556,9 +18587,9 @@ mod tests {
             _: &[u32],
             _: &[u32],
             out: &mut [f32],
-        ) -> (TieBand, Front) {
+        ) -> (TieBand, ScoreFront) {
             out.fill(1.0);
-            (TieBand(0.5), Front::Whole)
+            (TieBand(0.5), ScoreFront::Whole)
         }
     }
 
@@ -18572,11 +18603,11 @@ mod tests {
     fn a_band_beside_the_word_to_be_asked_whole_fails_a_debug_build() {
         let stages = vec![
             rank(&[1.0, 0.5, 1.0, 0.0, 1.0, 0.5, 1.0, 0.0, 0.5], 8.0, true),
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(Asked(Arc::default())),
                 weight: 1.0,
             },
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(BandedWhole),
                 weight: 1.0,
             },
@@ -18593,7 +18624,7 @@ mod tests {
     fn a_leading_rank_that_must_be_asked_whole_is_asked_plainly() {
         let levels = [1.0, 0.5, 1.0, 0.0, 0.5, 1.0, 1.0, 0.0, 1.0, 0.5];
         let values = [0.1, 0.9, 0.3, 0.8, 0.2, 0.7, 0.4, 0.6, 0.5, 0.0];
-        let shy = Weighted {
+        let shy = WeightedScorer {
             scorer: Box::new(Shy(levels.to_vec())),
             weight: 3.0,
         };

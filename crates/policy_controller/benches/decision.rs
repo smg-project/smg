@@ -36,8 +36,13 @@ use criterion::{
 use placed::page_start_buffer;
 use preset::SIZES;
 use smg_policy_controller::{
-    Constraints, Decision, Identity, Lease, Lifecycle, Lifted, ModelFingerprint, PolicySpec,
-    PoolFacts, RequestFacts, Scratch, Side, Target, PRESETS,
+    document::{PolicySpec, PRESETS},
+    engine::{
+        Constraints, Decision, Identity, LiftedVeto, ModelFingerprint, PoolFacts, RequestFacts,
+        Scratch, Target,
+    },
+    stages::Lifecycle,
+    tracking::{Lease, Side},
 };
 
 fn view_build(c: &mut Criterion) {
@@ -146,7 +151,7 @@ fn decide(c: &mut Criterion) {
         };
         let steers = matches!(
             engine.decide(&asked, &pool, &view, &cx, &mut scratch),
-            Decision::Pick(pick) if pick.trace.lifted == Lifted::Overload
+            Decision::Pick(pick) if pick.trace.lifted == LiftedVeto::Overload
         );
         if !steers {
             continue;

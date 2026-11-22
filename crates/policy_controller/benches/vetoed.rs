@@ -25,8 +25,9 @@ use common::{build_view, engine_of, fleet};
 use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
 };
-use smg_policy_controller::{
-    Candidate, Constraints, Decision, Engine, Identity, Lifted, PoolFacts, RequestFacts, Scratch,
+use smg_policy_controller::engine::{
+    Candidate, Constraints, Decision, Engine, Identity, LiftedVeto, PoolFacts, RequestFacts,
+    Scratch,
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -95,7 +96,7 @@ fn paths(c: &mut Criterion) {
                 &Constraints::default(),
                 &mut Scratch::new(),
             ),
-            Decision::Pick(pick) if pick.trace.lifted == Lifted::Overload
+            Decision::Pick(pick) if pick.trace.lifted == LiftedVeto::Overload
         );
         if kept {
             decide_over(&mut group, "kept_key_over", &engine, &view);

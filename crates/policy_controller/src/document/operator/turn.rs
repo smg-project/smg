@@ -11,14 +11,14 @@ use tokio::sync::Mutex;
 /// refused at once. The last call out is read in the step that gives its
 /// place back.
 #[derive(Debug)]
-pub struct Turn {
+pub struct SerialTurn {
     waiting: usize,
     /// The calls let in: the one that runs and the ones that wait.
     let_in: Arc<AtomicUsize>,
     turn: Arc<Mutex<()>>,
 }
 
-impl Turn {
+impl SerialTurn {
     /// One running call and at most `waiting` calls awaiting their turn.
     pub fn new(waiting: usize) -> Self {
         Self {
@@ -125,7 +125,7 @@ mod tests {
     /// from two threads at one instant, round after round.
     #[test]
     fn of_calls_that_leave_together_one_alone_is_the_last_out() {
-        let turn = Turn::new(32);
+        let turn = SerialTurn::new(32);
         let outs = Arc::new(AtomicUsize::new(0));
         for round in 1..=2_000 {
             let (go, ready) = (AtomicBool::new(false), AtomicUsize::new(0));

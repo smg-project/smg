@@ -152,14 +152,31 @@ impl ShortPieceKey {
             return None;
         }
         match text.get(start..).and_then(|rest| rest.first_chunk::<16>()) {
-            Some(window) => {
-                let word = u128::from_le_bytes(*window);
-                Some(Self(
-                    (word & KEEP_LOW[len]) | ((len as u128) << LENGTH_SHIFT),
-                ))
-            }
+            Some(window) => Some(Self::of_window(window, len)),
             None => Self::of(text.get(start..end)?),
         }
+    }
+
+    /// [`Self::at`] by its sixteen-byte read alone: `None` also for a piece
+    /// with fewer than sixteen bytes of the text from its start on, which
+    /// [`Self::at`] reads on its own. For a probe compiled into a loop, which
+    /// keeps the one read there and asks [`Self::at`] off the loop.
+    #[inline(always)]
+    pub(super) fn in_window(text: &[u8], start: usize, end: usize) -> Option<Self> {
+        let len = end.checked_sub(start)?;
+        if len == 0 || len > SHORT_PIECE_MAX_BYTES {
+            return None;
+        }
+        let window = text.get(start..)?.first_chunk::<16>()?;
+        Some(Self::of_window(window, len))
+    }
+
+    /// The key of the piece of `len` bytes, `1..=15`, that `window` opens
+    /// with: the word masked to the length.
+    #[inline(always)]
+    fn of_window(window: &[u8; 16], len: usize) -> Self {
+        let word = u128::from_le_bytes(*window);
+        Self((word & KEEP_LOW[len]) | ((len as u128) << LENGTH_SHIFT))
     }
 
     /// The bytes of the piece the key stands for, in the low fifteen of the
@@ -209,6 +226,20 @@ impl Entry {
         key: 0,
         ids: [0; INLINE_IDS],
     };
+
+    /// Appends the entry's ids to `out` when it holds them inline, all four
+    /// and then the length set to the count, and answers true; false, with
+    /// nothing appended, for an entry whose ids are in the spill.
+    #[inline(always)]
+    fn append_inline(&self, out: &mut Vec<u32>) -> bool {
+        let count = (self.key >> COUNT_SHIFT) as usize;
+        if count > INLINE_IDS {
+            return false;
+        }
+        out.extend_from_slice(&self.ids);
+        out.truncate(out.len() - (INLINE_IDS - count));
+        true
+    }
 }
 
 /// The table; see the module documentation.
@@ -242,8 +273,13 @@ impl ShortPieceTable {
 
     /// The slots a table for about `entries` pieces has: a power of two that
     /// holds them under the fill bound, [`MIN_SLOTS`] at least.
-    pub(super) fn slots_for(entries: usize) -> usize {
-        (entries * 4 / 3 + 1).next_power_of_two().max(MIN_SLOTS)
+    pub(super) const fn slots_for(entries: usize) -> usize {
+        let slots = (entries * 4 / 3 + 1).next_power_of_two();
+        if slots < MIN_SLOTS {
+            MIN_SLOTS
+        } else {
+            slots
+        }
     }
 
     /// A table of `slots` slots with room for `reserved` before it has to
@@ -317,6 +353,24 @@ impl ShortPieceTable {
         }
     }
 
+    /// [`Self::lookup`] for a probe compiled into a loop, which keeps only
+    /// the answer of an entry with inline ids there: such a hit appends the
+    /// ids. `Err` for every other piece: with the vacancy of a miss, or with
+    /// `None` for an entry whose ids are in the spill, which
+    /// [`Self::lookup`] appends off the loop.
+    #[inline(always)]
+    pub(super) fn lookup_inline(
+        &self,
+        key: ShortPieceKey,
+        out: &mut Vec<u32>,
+    ) -> Result<(), Option<Vacancy>> {
+        match self.probe(key) {
+            Ok(entry) if entry.append_inline(out) => Ok(()),
+            Ok(_) => Err(None),
+            Err(vacancy) => Err(Some(vacancy)),
+        }
+    }
+
     /// The probe: the entry of `key`, or where the walk ended on an empty
     /// slot when the table does not hold the piece.
     #[inline(always)]
@@ -368,11 +422,8 @@ impl ShortPieceTable {
     /// from the spill.
     #[inline(always)]
     pub(super) fn append(&self, entry: &Entry, out: &mut Vec<u32>) {
-        let count = (entry.key >> COUNT_SHIFT) as usize;
-        if count <= INLINE_IDS {
-            out.extend_from_slice(&entry.ids);
-            out.truncate(out.len() - (INLINE_IDS - count));
-        } else {
+        if !entry.append_inline(out) {
+            let count = (entry.key >> COUNT_SHIFT) as usize;
             let start = entry.ids[0] as usize;
             out.extend_from_slice(&self.spill[start..start + count]);
         }
@@ -663,6 +714,33 @@ mod tests {
         assert_eq!(ShortPieceKey::at(&text, 5, 4), None);
     }
 
+    /// The key by the sixteen-byte read alone is the key read from the text
+    /// wherever sixteen bytes of the text remain from the piece's start on,
+    /// and `None` nearer the end, where [`ShortPieceKey::at`] reads the piece
+    /// on its own.
+    #[test]
+    fn a_key_by_the_one_read_is_the_texts_key_or_none_near_the_end() {
+        let text: Vec<u8> = (0..40u8)
+            .map(|b| b.wrapping_mul(37).wrapping_add(11))
+            .collect();
+        for start in 0..=text.len() {
+            for len in 0..=17 {
+                let end = (start + len).min(text.len());
+                let expected = if text.len() - start >= 16 {
+                    ShortPieceKey::at(&text, start, end)
+                } else {
+                    None
+                };
+                assert_eq!(
+                    ShortPieceKey::in_window(&text, start, end),
+                    expected,
+                    "{start}+{len}"
+                );
+            }
+        }
+        assert_eq!(ShortPieceKey::in_window(&text, 5, 4), None);
+    }
+
     #[test]
     fn a_table_starts_empty_and_answers_what_it_was_given() {
         let mut table = ShortPieceTable::new();
@@ -719,6 +797,33 @@ mod tests {
         assert_eq!(ids_of(&table, b"abcde"), Some(vec![1, 2, 3, 4, 5]));
         assert_eq!(ids_of(&table, b"abcd"), Some(vec![1, 2, 3, 4]));
         assert_eq!(table.spill.len(), 20);
+    }
+
+    /// The lookup a loop keeps answers an entry with inline ids as
+    /// [`ShortPieceTable::lookup`] does. An entry with spilled ids comes
+    /// back with nothing appended and no vacancy, and a miss with the
+    /// vacancy the insert takes.
+    #[test]
+    fn an_inline_lookup_appends_inline_ids_and_hands_the_other_pieces_back() {
+        let mut table = ShortPieceTable::for_entries(4);
+        assert!(table.insert(key(b"abcd"), &[1, 2, 3, 4], 4));
+        assert!(table.insert(key(b"abcde"), &[1, 2, 3, 4, 5], 4));
+        let mut out = vec![9];
+        assert!(table.lookup_inline(key(b"abcd"), &mut out).is_ok());
+        assert_eq!(out, [9, 1, 2, 3, 4]);
+        assert!(matches!(
+            table.lookup_inline(key(b"abcde"), &mut out),
+            Err(None)
+        ));
+        assert_eq!(out, [9, 1, 2, 3, 4]);
+        let Err(Some(vacancy)) = table.lookup_inline(key(b"new"), &mut out) else {
+            panic!("a miss with its vacancy");
+        };
+        assert_eq!(out, [9, 1, 2, 3, 4]);
+        assert!(table.insert_at(vacancy, &[7], 4));
+        assert_eq!(ids_of(&table, b"new"), Some(vec![7]));
+        assert!(table.lookup(key(b"abcde"), &mut out).is_none());
+        assert_eq!(out, [9, 1, 2, 3, 4, 1, 2, 3, 4, 5]);
     }
 
     #[test]

@@ -5016,6 +5016,37 @@ fn a_threads_packed_table_grows_with_use_and_follows_a_fallen_share() {
     assert_eq!(native.encode(Some(model), "a few words", false), Ok(short));
 }
 
+/// At the full share a thread counts its packed table by its slots, apart
+/// from its wide table and its map: it keeps a share of packed pieces and
+/// one more, at the start of a call and when it learns the next. Under a
+/// share cut for more threads the one count over the three tiers clears
+/// them, as it did.
+#[test]
+fn a_thread_at_the_full_share_counts_its_packed_table_by_its_slots() {
+    let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let model = tokenizer.get_model();
+    // The threads counted, and the clears of a thread that holds a share of
+    // packed pieces and one more, and learns the next.
+    for (threads, clears) in [(1, 0), (32, 1)] {
+        let native = seeded(&tokenizer);
+        let mut cache = native.thread_piece_cache().borrow_mut();
+        native.threads.store(threads, Ordering::Relaxed);
+        let share = native.piece_cache_share();
+        for i in 0..=share as u32 {
+            let key = ShortPieceKey::of(word(i).as_bytes()).expect("key");
+            assert!(cache.packed.insert(key, &[1], share));
+        }
+        drop(cache);
+        native
+            .encode_with(Some(model), " one more piece", false, false)
+            .expect("ids");
+        let cache = native.thread_piece_cache().borrow();
+        assert_eq!(cache.clears, clears, "{threads} threads");
+    }
+}
+
 /// A thread whose share fell (threads joined) since it last read it is
 /// within the new share from the start of its next encode call, with no
 /// miss in that call.

@@ -16,14 +16,15 @@ use std::{
 use openai_protocol::model_card::ModelCard;
 use parking_lot::Mutex;
 use smg_policy_controller::{
-    engine::view::{Role, WireModes, WorkerId},
+    engine::{Role, WireModes, WorkerId},
     store::{
-        Ask as ViewAsk, GatewayId, HealthPolicy, LoadSink as StoreLoadSink, Maker, MemoryStore,
-        Overload, ViewBuffers, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
+        GatewayId, HealthPolicy, LoadSink as StoreLoadSink, MemoryStore, Overload, Registrant,
+        ViewBuffers, ViewQuery as ViewAsk, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
         PUBLISH_WINDOW,
     },
     worker_host::{
-        Expect, Membership, Objects, Over, Refused, Remover, Standing, StoreDoor, Wrote,
+        MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Objects, Over,
+        Precondition, Remover, RowRevision, StoreMembershipWriter,
     },
 };
 use smg_worker::{
@@ -79,13 +80,18 @@ fn stated() -> WorkerFacts {
     }
 }
 
-fn register(door: &dyn Membership) -> Result<WorkerId, String> {
+fn register(door: &dyn MembershipWriter) -> Result<WorkerId, String> {
     register_with(door, stated)
 }
 
-fn register_with(door: &dyn Membership, facts: fn() -> WorkerFacts) -> Result<WorkerId, String> {
-    match door.found(&Maker::Control, Expect::Nothing, URL, &|_| facts()) {
-        Ok(Wrote::Registered(id)) => Ok(id),
+fn register_with(
+    door: &dyn MembershipWriter,
+    facts: fn() -> WorkerFacts,
+) -> Result<WorkerId, String> {
+    match door.found(&Registrant::Control, Precondition::Absent, URL, &|_| {
+        facts()
+    }) {
+        Ok(MembershipWriteOutcome::Registered(id)) => Ok(id),
         other => Err(format!("expected a registration, got {other:?}")),
     }
 }
@@ -254,7 +260,7 @@ fn a_worker_with_no_row_keeps_the_registrys_health() {
         );
         assert_eq!(worker.status(), reference.status());
     }
-    assert!(store.snapshot().1.is_empty());
+    assert!(store.all_rows().1.is_empty());
     assert_eq!(store.epoch(), epoch);
 }
 
@@ -402,7 +408,7 @@ fn a_replacement_at_the_door_moves_the_gauge_of_both_groups() {
                     .build(),
             );
             feed.door
-                .found_built(&Maker::Control, Expect::Anything, &new, None)
+                .found_built(&Registrant::Control, Precondition::Any, &new, None)
                 .expect("the door takes the registration");
             assert_eq!(pool_size(&handle, model).as_deref(), Some("1"), "{model}");
             if let Some(left) = left {
@@ -423,15 +429,17 @@ async fn a_replacement_takes_no_request_until_its_object_is_laid() {
     register(&*feed.door).expect("the worker registers");
     let old = registry.get_by_url(URL).expect("the first object stands");
 
-    let replaced =
-        StoreDoor::new(Arc::clone(&store)).found(&Maker::Control, Expect::Anything, URL, &|_| {
-            WorkerFacts {
-                models: vec![MODEL.to_owned(), "model-b".to_owned()],
-                ..stated()
-            }
-        });
+    let replaced = StoreMembershipWriter::new(Arc::clone(&store)).found(
+        &Registrant::Control,
+        Precondition::Any,
+        URL,
+        &|_| WorkerFacts {
+            models: vec![MODEL.to_owned(), "model-b".to_owned()],
+            ..stated()
+        },
+    );
     assert!(
-        matches!(replaced, Ok(Wrote::Another { .. })),
+        matches!(replaced, Ok(MembershipWriteOutcome::Another { .. })),
         "{replaced:?}"
     );
     let stale = registry.get_by_url(URL).expect("the old object stands");
@@ -492,8 +500,8 @@ fn a_second_write_of_the_same_facts_moves_nothing() {
     let before = registry.get_by_url(URL).expect("the worker stands");
     assert_eq!(
         feed.door
-            .found(&Maker::Control, Expect::Anything, URL, &|_| stated()),
-        Ok(Wrote::Unmoved(row))
+            .found(&Registrant::Control, Precondition::Any, URL, &|_| stated()),
+        Ok(MembershipWriteOutcome::Unmoved(row))
     );
     let after = registry.get_by_url(URL).expect("the worker still stands");
     assert!(Arc::ptr_eq(&before, &after));
@@ -518,15 +526,21 @@ fn a_built_worker_is_the_rows_object_when_its_write_returns() {
     let first = built();
     let wrote = feed
         .door
-        .found_built(&Maker::Control, Expect::Anything, &first, None);
-    assert!(matches!(wrote, Ok(Wrote::Registered(_))), "{wrote:?}");
+        .found_built(&Registrant::Control, Precondition::Any, &first, None);
+    assert!(
+        matches!(wrote, Ok(MembershipWriteOutcome::Registered(_))),
+        "{wrote:?}"
+    );
     assert!(held(&first));
 
     let second = built();
     let wrote = feed
         .door
-        .found_built(&Maker::Control, Expect::Anything, &second, None);
-    assert!(matches!(wrote, Ok(Wrote::Unmoved(_))), "{wrote:?}");
+        .found_built(&Registrant::Control, Precondition::Any, &second, None);
+    assert!(
+        matches!(wrote, Ok(MembershipWriteOutcome::Unmoved(_))),
+        "{wrote:?}"
+    );
     assert!(held(&second));
     assert_eq!(second.api_key().map(String::as_str), Some("key"));
 
@@ -535,15 +549,18 @@ fn a_built_worker_is_the_rows_object_when_its_write_returns() {
     let third = built();
     let guarded = |over| {
         feed.door.found_built(
-            &Maker::Control,
-            Expect::Anything,
+            &Registrant::Control,
+            Precondition::Any,
             &third,
             Some(Over::Updated(over)),
         )
     };
-    assert_eq!(guarded(&first), Err(Refused::Moved));
+    assert_eq!(guarded(&first), Err(MembershipWriteRefused::Moved));
     assert!(held(&second));
-    assert!(matches!(guarded(&second), Ok(Wrote::Unmoved(_))));
+    assert!(matches!(
+        guarded(&second),
+        Ok(MembershipWriteOutcome::Unmoved(_))
+    ));
     assert!(held(&third));
     assert_eq!(feed.objects.unhanded(), 0);
 }
@@ -566,7 +583,7 @@ fn a_refreshed_worker_is_the_rows_object_when_its_write_returns() {
     };
     let seen = || {
         let row = store.by_key(URL).expect("the row");
-        Standing {
+        RowRevision {
             row: row.id,
             revision: row.revision,
         }
@@ -575,21 +592,30 @@ fn a_refreshed_worker_is_the_rows_object_when_its_write_returns() {
     let first = built("gold");
     let wrote = feed
         .door
-        .found_built(&Maker::Control, Expect::Anything, &first, None);
-    assert!(matches!(wrote, Ok(Wrote::Registered(_))), "{wrote:?}");
+        .found_built(&Registrant::Control, Precondition::Any, &first, None);
+    assert!(
+        matches!(wrote, Ok(MembershipWriteOutcome::Registered(_))),
+        "{wrote:?}"
+    );
 
     let equal = built("gold");
     let wrote = feed.door.refreshed(seen(), &equal, &first);
-    assert!(matches!(wrote, Ok(Wrote::Unmoved(_))), "{wrote:?}");
+    assert!(
+        matches!(wrote, Ok(MembershipWriteOutcome::Unmoved(_))),
+        "{wrote:?}"
+    );
     assert!(held(&equal));
 
     let late = feed.door.refreshed(seen(), &built("silver"), &first);
-    assert_eq!(late, Err(Refused::Moved));
+    assert_eq!(late, Err(MembershipWriteRefused::Moved));
     assert!(held(&equal));
 
     let moved = built("silver");
     let wrote = feed.door.refreshed(seen(), &moved, &equal);
-    assert!(matches!(wrote, Ok(Wrote::InPlace(_))), "{wrote:?}");
+    assert!(
+        matches!(wrote, Ok(MembershipWriteOutcome::InPlace(_))),
+        "{wrote:?}"
+    );
     assert!(held(&moved));
 }
 
@@ -632,14 +658,14 @@ fn three_ranks_registered_in_one_turn_leave_three_handed_objects() {
     let built = ranks(3, None);
     let wrote = feed
         .door
-        .found_rows(&Maker::Control, Expect::Nothing, &built, None);
+        .found_rows(&Registrant::Control, Precondition::Absent, &built, None);
     assert!(
         matches!(
             wrote.as_deref(),
             Ok([
-                Wrote::Registered(_),
-                Wrote::Registered(_),
-                Wrote::Registered(_)
+                MembershipWriteOutcome::Registered(_),
+                MembershipWriteOutcome::Registered(_),
+                MembershipWriteOutcome::Registered(_)
             ])
         ),
         "{wrote:?}"
@@ -653,8 +679,11 @@ fn three_ranks_registered_in_one_turn_leave_three_handed_objects() {
     let alone = ranks(3, None);
     let refused = feed
         .door
-        .found_rows(&Maker::Control, Expect::Anything, &alone[1..2], None);
-    assert!(matches!(refused, Err(Refused::Past(_))), "{refused:?}");
+        .found_rows(&Registrant::Control, Precondition::Any, &alone[1..2], None);
+    assert!(
+        matches!(refused, Err(MembershipWriteRefused::Past(_))),
+        "{refused:?}"
+    );
     assert_eq!(stand(&registry, &built), [true; 3]);
     assert_eq!(stand(&registry, &alone), [false; 3]);
     assert_eq!(feed.objects.unhanded(), 0);
@@ -668,16 +697,20 @@ fn ranks_registered_again_lay_each_row_with_its_own_object() {
     let (registry, feed) = bed(&store);
     let first = ranks(3, None);
     feed.door
-        .found_rows(&Maker::Control, Expect::Nothing, &first, None)
+        .found_rows(&Registrant::Control, Precondition::Absent, &first, None)
         .expect("three ranks registered");
     let again = ranks(3, Some(1));
     let wrote = feed
         .door
-        .found_rows(&Maker::Control, Expect::Anything, &again, None);
+        .found_rows(&Registrant::Control, Precondition::Any, &again, None);
     assert!(
         matches!(
             wrote.as_deref(),
-            Ok([Wrote::Unmoved(_), Wrote::InPlace(_), Wrote::Unmoved(_)])
+            Ok([
+                MembershipWriteOutcome::Unmoved(_),
+                MembershipWriteOutcome::InPlace(_),
+                MembershipWriteOutcome::Unmoved(_)
+            ])
         ),
         "{wrote:?}"
     );
@@ -694,19 +727,22 @@ fn a_width_that_shrinks_ends_the_object_of_the_rank_that_left() {
     let (registry, feed) = bed(&store);
     let wide = ranks(3, None);
     feed.door
-        .found_rows(&Maker::Control, Expect::Nothing, &wide, None)
+        .found_rows(&Registrant::Control, Precondition::Absent, &wide, None)
         .expect("three ranks registered");
     let narrow = ranks(2, None);
     let wrote = feed
         .door
-        .found_rows(&Maker::Control, Expect::Anything, &narrow, None);
+        .found_rows(&Registrant::Control, Precondition::Any, &narrow, None);
     assert!(
-        matches!(wrote.as_deref(), Ok([_, _, Wrote::Removed(_)])),
+        matches!(
+            wrote.as_deref(),
+            Ok([_, _, MembershipWriteOutcome::Removed(_)])
+        ),
         "{wrote:?}"
     );
     assert_eq!(stand(&registry, &narrow), [true; 2]);
     assert!(registry.get_by_url(wide[2].url()).is_none());
-    assert_eq!(store.snapshot().1.len(), 2);
+    assert_eq!(store.all_rows().1.len(), 2);
     assert_eq!(feed.objects.unhanded(), 0);
 }
 
@@ -726,13 +762,16 @@ fn a_worker_that_states_a_width_and_no_rank_is_one_row_with_its_object() {
     assert_eq!((built[0].dp_rank(), built[0].dp_size()), (None, Some(4)));
     let wrote = feed
         .door
-        .found_rows(&Maker::Control, Expect::Nothing, &built, None);
+        .found_rows(&Registrant::Control, Precondition::Absent, &built, None);
     assert!(
-        matches!(wrote.as_deref(), Ok([Wrote::Registered(_)])),
+        matches!(
+            wrote.as_deref(),
+            Ok([MembershipWriteOutcome::Registered(_)])
+        ),
         "{wrote:?}"
     );
     assert_eq!(stand(&registry, &built), [true]);
-    assert_eq!(store.snapshot().1.len(), 1);
+    assert_eq!(store.all_rows().1.len(), 1);
     assert_eq!(feed.objects.unhanded(), 0);
 }
 
@@ -751,8 +790,11 @@ async fn a_drained_row_takes_no_decision_and_a_gone_row_leaves_the_registry() {
 
     let object = feed.objects.object(row).expect("the row has an object");
     let seen = feed.objects.standing(&object).expect("the object's row");
-    let by = Remover::Maker(&Maker::Control);
-    assert_eq!(feed.door.drained(by, URL, seen), Ok(Wrote::Draining(row)));
+    let by = Remover::Registrant(&Registrant::Control);
+    assert_eq!(
+        feed.door.drained(by, URL, seen),
+        Ok(MembershipWriteOutcome::Draining(row))
+    );
     let drained = policy_engine
         .place(&ask(b"next"), Instant::now())
         .await
@@ -760,7 +802,10 @@ async fn a_drained_row_takes_no_decision_and_a_gone_row_leaves_the_registry() {
     assert!(matches!(drained, Unplaced::Shed { .. }), "{drained:?}");
     assert!(registry.get_by_url(URL).is_some());
 
-    assert_eq!(feed.door.gone(by, URL, seen), Ok(Wrote::Removed(row)));
+    assert_eq!(
+        feed.door.gone(by, URL, seen),
+        Ok(MembershipWriteOutcome::Removed(row))
+    );
     assert!(registry.get_by_url(URL).is_none());
     assert!(feed.objects.object(row).is_none());
 }
@@ -770,11 +815,11 @@ fn a_refused_write_tells_nobody() {
     let (registry, feed) = bed(&Arc::new(MemoryStore::default()));
     register(&*feed.door).expect("the worker registers");
     let before = registry.get_by_url(URL).expect("the worker stands");
-    let another = Maker::provider("pool", "second").expect("a maker");
+    let another = Registrant::provider("pool", "second").expect("a maker");
     assert!(matches!(
         feed.door
-            .found(&another, Expect::Anything, URL, &|_| stated()),
-        Err(Refused::NotMaker(_))
+            .found(&another, Precondition::Any, URL, &|_| stated()),
+        Err(MembershipWriteRefused::NotRegistrant(_))
     ));
     let after = registry.get_by_url(URL).expect("the worker still stands");
     assert!(Arc::ptr_eq(&before, &after));
@@ -788,7 +833,7 @@ struct AtRegistration {
 impl Wake for AtRegistration {
     fn wake(self: Arc<Self>) {
         self.members
-            .get_or_init(|| self.store.world().members(MODEL, Role::Single));
+            .get_or_init(|| self.store.snapshot().members(MODEL, Role::Single));
     }
 }
 
@@ -815,7 +860,7 @@ fn the_registry_tells_of_a_registration_before_the_store_publishes_it() {
         Poll::Ready(Ok(WorkerEvent::Registered { .. }))
     ));
     assert_eq!(at_registration.members.get(), Some(&None));
-    assert_eq!(store.world().members(MODEL, Role::Single), Some(1));
+    assert_eq!(store.snapshot().members(MODEL, Role::Single), Some(1));
 }
 
 #[test]
@@ -826,7 +871,7 @@ fn a_membership_write_holds_the_feed_turn_through_its_listener() {
         let door = Weak::clone(door);
         let calls = Arc::clone(&calls);
         FeedDoor {
-            door: StoreDoor::new(Arc::clone(&store)).telling(move || {
+            door: StoreMembershipWriter::new(Arc::clone(&store)).telling(move || {
                 let door = door.upgrade().expect("the caller holds the door");
                 assert!(door.turn.try_lock().is_none());
                 calls.fetch_add(1, Ordering::Relaxed);
@@ -837,13 +882,19 @@ fn a_membership_write_holds_the_feed_turn_through_its_listener() {
         }
     });
     let row = register(&*door).expect("the worker registers");
-    let seen = Standing {
+    let seen = RowRevision {
         row,
         revision: store.get(row).expect("the worker's row").revision,
     };
-    let by = Remover::Maker(&Maker::Control);
-    assert_eq!(door.drained(by, URL, seen), Ok(Wrote::Draining(row)));
-    assert_eq!(door.gone(by, URL, seen), Ok(Wrote::Removed(row)));
+    let by = Remover::Registrant(&Registrant::Control);
+    assert_eq!(
+        door.drained(by, URL, seen),
+        Ok(MembershipWriteOutcome::Draining(row))
+    );
+    assert_eq!(
+        door.gone(by, URL, seen),
+        Ok(MembershipWriteOutcome::Removed(row))
+    );
     assert_eq!(calls.load(Ordering::Relaxed), 3);
 }
 
@@ -950,7 +1001,7 @@ fn a_worker_with_no_row_writes_no_load() {
         .registry
         .register(Arc::clone(&stranger))
         .expect("the worker registers");
-    let shown = loads.store.world();
+    let shown = loads.store.snapshot();
     let now = Instant::now();
     let answer = report(6);
     loads.sink.record(&stranger, 0, &answer, now, now);
@@ -967,7 +1018,7 @@ fn a_worker_with_no_row_writes_no_load() {
     );
     assert_eq!(StoreLoadSink::ranks(&*loads.store, loads.row), 0);
     assert_eq!(loads.store.publish_due(), None);
-    assert!(Arc::ptr_eq(&shown, &loads.store.world()));
+    assert!(Arc::ptr_eq(&shown, &loads.store.snapshot()));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1028,7 +1079,7 @@ fn a_settle_writes_the_stores_overload_verdict_on_a_replaced_object() {
         ..limited()
     };
     let door = &loads.feed.door;
-    door.found(&Maker::Control, Expect::Anything, URL, &|_| moved())
+    door.found(&Registrant::Control, Precondition::Any, URL, &|_| moved())
         .expect("the row moves in place");
     let second = loads.registry.get_by_url(URL).expect("the row's object");
     assert!(!Arc::ptr_eq(&loads.worker, &second));
@@ -1112,7 +1163,7 @@ impl Wake for AtObject {
         self.read.get_or_init(|| {
             (
                 self.feed.turn.try_lock().is_none(),
-                self.feed.store.world().members(MODEL, Role::Single),
+                self.feed.store.snapshot().members(MODEL, Role::Single),
             )
         });
     }
@@ -1145,7 +1196,7 @@ async fn the_loop_settles_a_row_written_past_the_door_under_the_feeds_turn() {
     // The loop laid the object under the turn, then showed the row.
     assert_eq!(at_object.read.get(), Some(&(true, None)));
     assert!(registry.get_by_url(URL).is_some());
-    assert_eq!(store.world().members(MODEL, Role::Single), Some(1));
+    assert_eq!(store.snapshot().members(MODEL, Role::Single), Some(1));
 }
 
 #[tokio::test(start_paused = true)]

@@ -1919,7 +1919,7 @@ mod tests {
     /// object under that id. A second POST of the address is a conflict.
     #[tokio::test]
     async fn under_the_policy_controller_a_post_becomes_a_ready_row_under_its_id() {
-        use smg_policy_controller::store::{Maker, WorkerStatus as RowStatus, WorkersStore};
+        use smg_policy_controller::store::{Registrant, WorkerStatus as RowStatus, WorkersStore};
 
         use crate::admin::worker_service::WorkerServiceError;
 
@@ -1948,7 +1948,7 @@ mod tests {
 
         let row = store.by_key(&url).expect("the worker's row");
         assert_eq!(row.status, RowStatus::Ready);
-        assert_eq!(row.maker, Maker::Control);
+        assert_eq!(row.maker, Registrant::Control);
         assert_eq!(registry.get_id_by_url(&url), Some(id.clone()));
         let laid = registry.get(&id).expect("the row's object");
         let rows = &hosted.door_feed().expect("the feed").objects;
@@ -1971,8 +1971,8 @@ mod tests {
     #[tokio::test]
     async fn under_the_policy_controller_a_post_that_fails_behind_its_row_takes_the_row_out() {
         use smg_policy_controller::{
-            store::{Maker, WorkersStore},
-            worker_host::{Expect, WRITE_WORKERS_AT_DOOR_STEP},
+            store::{Registrant, WorkersStore},
+            worker_host::{Precondition, WRITE_WORKERS_TO_STORE_STEP},
         };
         use smg_worker::workflow::single_attempt;
         use wfaas::{
@@ -1996,7 +1996,7 @@ mod tests {
             move |run: &mut WorkflowContext<WorkerWorkflowData>| {
                 let worker = built(&run.data.config.url);
                 let wrote = door
-                    .found_built(&Maker::Control, Expect::Nothing, &worker, None)
+                    .found_built(&Registrant::Control, Precondition::Absent, &worker, None)
                     .is_ok();
                 run.data.actual_workers = Some(vec![worker]);
                 Box::pin(async move {
@@ -2016,7 +2016,7 @@ mod tests {
             let newer = Arc::clone(&newer);
             move |run: &mut WorkflowContext<WorkerWorkflowData>| {
                 if run.data.config.url == relaid {
-                    door.found_built(&Maker::Control, Expect::Anything, &newer, None)
+                    door.found_built(&Registrant::Control, Precondition::Any, &newer, None)
                         .expect("the newer registration");
                 }
                 Box::pin(async { Ok(StepResult::Failure) })
@@ -2031,7 +2031,7 @@ mod tests {
                 WorkflowDefinition::new("worker_registration", "Write the row, then fail")
                     .add_step(
                         StepDefinition::new(
-                            WRITE_WORKERS_AT_DOOR_STEP,
+                            WRITE_WORKERS_TO_STORE_STEP,
                             "Write the row",
                             Arc::new(write),
                         )
@@ -2395,8 +2395,8 @@ mod tests {
     async fn under_the_policy_controller_an_update_job_is_judged_at_the_door() {
         use openai_protocol::{model_card::ModelCard, worker::RuntimeType};
         use smg_policy_controller::{
-            store::{Maker, WorkersStore},
-            worker_host::{facts, Expect, DISCOVERY},
+            store::{Registrant, WorkersStore},
+            worker_host::{facts, Precondition, DISCOVERY},
         };
 
         use crate::routers::grpc::backend_client::BasicWorkerBuilder;
@@ -2421,9 +2421,9 @@ mod tests {
                 .model(ModelCard::new("m"))
                 .build(),
         );
-        let maker = Maker::provider(DISCOVERY, theirs).expect("a maker");
+        let maker = Registrant::provider(DISCOVERY, theirs).expect("a maker");
         let door = &hosted.door_feed().expect("the feed").door;
-        door.found(&maker, Expect::Anything, theirs, &|standing| {
+        door.found(&maker, Precondition::Any, theirs, &|standing| {
             facts(found.as_ref(), standing)
         })
         .expect("the provider's row");

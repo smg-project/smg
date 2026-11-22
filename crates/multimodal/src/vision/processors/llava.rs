@@ -241,6 +241,16 @@ impl LlavaProcessor {
         self
     }
 
+    /// Refuse a patch size of zero: the token count divides by it.
+    pub(crate) fn validate(&self) -> Result<(), TransformError> {
+        if self.patch_size == 0 {
+            return Err(TransformError::ShapeError(
+                "LLaVA patch_size must be positive".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Process a single image through the LLaVA 1.5 pipeline.
     ///
     /// The processing flow depends on `self.aspect_ratio`:
@@ -440,6 +450,33 @@ impl LlavaNextProcessor {
         self
     }
 
+    /// Refuse a size of zero the token count, the anyres grid or the sample
+    /// crops divide by.
+    pub(crate) fn validate(&self) -> Result<(), TransformError> {
+        self.base.validate()?;
+        let crop = self.sample_crop();
+        let zero = if self.base.image_size == 0 {
+            "image_size"
+        } else if crop.0 == 0 || crop.1 == 0 {
+            "crop_size (or size, when it is absent)"
+        } else {
+            return Ok(());
+        };
+        Err(TransformError::ShapeError(format!(
+            "LLaVA-NeXT {zero} must be positive"
+        )))
+    }
+
+    /// The crop `divide_to_samples` steps by: `crop_size`, else the square
+    /// target.
+    fn sample_crop(&self) -> (u32, u32) {
+        let transforms = &self.base.transforms;
+        let target = transforms
+            .target_size
+            .map_or(self.base.image_size, |(h, _w)| h);
+        transforms.crop_size.unwrap_or((target, target))
+    }
+
     /// Create a new LLaVA-NeXT processor with default settings.
     ///
     /// Default grid pinpoints are common LLaVA-NeXT resolutions.
@@ -586,11 +623,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
             .target_size
             .map(|(h, _w)| h)
             .unwrap_or(self.base.image_size);
-        let crop_size = self
-            .base
-            .transforms
-            .crop_size
-            .unwrap_or((target_size, target_size));
+        let crop_size = self.sample_crop();
 
         for image in images {
             let original_size = image.dimensions();

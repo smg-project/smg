@@ -121,14 +121,16 @@ impl MessagePreparationStage {
             Err(e) => {
                 // As in the chat preparation: one WARN and the mark only for
                 // a refusal typed as the request's own; every other failure
-                // keeps ERROR and stays unmarked.
+                // keeps ERROR and stays unmarked, the one that is the
+                // template's own whatever the request holds answered in the
+                // server's class.
                 let refused = e.is_refusal();
                 if refused {
                     warn!(function = "MessagePreparationStage::execute", error = %e, "Failed to process messages");
                 } else {
                     error!(function = "MessagePreparationStage::execute", error = %e, "Failed to process messages");
                 }
-                let answer = error::bad_request("process_messages_failed", String::from(e));
+                let answer = e.answer();
                 return Err(if refused {
                     utils::reported(answer)
                 } else {
@@ -242,17 +244,6 @@ impl MessagePreparationStage {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
-
-    use crate::routers::grpc::utils::message_utils::invalid_multimodal_request;
-
-    #[test]
-    fn invalid_multimodal_input_maps_to_bad_request() {
-        let response = invalid_multimodal_request("unsupported audio modality");
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
     /// A byte-level tokenizer over `template`, in a directory the caller keeps
     /// alive for as long as the tokenizer is used.
     fn byte_tokenizer_with_template(

@@ -31,7 +31,7 @@
 use std::{
     fs::File,
     io::{Cursor, Read},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use llm_multimodal::vision::{
@@ -40,6 +40,14 @@ use llm_multimodal::vision::{
     VisionPreProcessor,
 };
 use ndarray::{Array4, Array5};
+
+/// A directory of the crate's test fixtures. cargo starts a test in the
+/// crate directory, where a path from the repository root finds nothing.
+fn fixture_dir(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
 
 /// Open array `name` of the `.npz` archive at `path`: the archive is a zip whose members are the
 /// arrays as `.npy` files, read here in full and parsed as one.
@@ -126,9 +134,8 @@ fn load_golden_num_tokens(path: &Path) -> usize {
 /// * `mode` - Either "llava" (standard CLIP) or "llava_pad" (expand-to-square mode)
 /// * `image_name` - Name of the test image (e.g., "square", "tall", "wide", "small")
 fn run_golden_test(mode: &str, image_name: &str) {
-    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden").join(mode);
-    let image_path =
-        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = fixture_dir("golden").join(mode);
+    let image_path = fixture_dir("images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
         eprintln!("Golden test fixtures for {mode}/{image_name} not found, skipping test");
@@ -275,7 +282,7 @@ fn test_llava_pad_golden_grayscale() {
 
 #[test]
 fn test_llava_token_count() {
-    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/llava");
+    let golden_dir = fixture_dir("golden/llava");
 
     if !golden_dir.exists() {
         eprintln!("Golden test fixtures not found, skipping test");
@@ -316,9 +323,8 @@ fn load_golden_qwen2_vl_pixels(path: &Path) -> (Vec<f32>, (usize, usize)) {
 /// 2. num_tokens calculation is correct
 /// 3. Pixel values match after reshaping to patch format
 fn run_qwen2_vl_golden_test(image_name: &str) {
-    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/qwen2_vl");
-    let image_path =
-        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = fixture_dir("golden/qwen2_vl");
+    let image_path = fixture_dir("images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
         eprintln!("Golden test fixtures for qwen2_vl/{image_name} not found, skipping test");
@@ -465,9 +471,8 @@ fn test_qwen2_vl_golden_grayscale() {
 /// - factor: 32 (vs 28)
 /// - normalization: [0.5, 0.5, 0.5] (vs CLIP)
 fn run_qwen3_vl_golden_test(image_name: &str) {
-    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/qwen3_vl");
-    let image_path =
-        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = fixture_dir("golden/qwen3_vl");
+    let image_path = fixture_dir("images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
         eprintln!("Golden test fixtures for qwen3_vl/{image_name} not found, skipping test");
@@ -707,9 +712,8 @@ fn find_max_diff_location_5d(
 /// 3. num_img_tokens matches HuggingFace output
 /// 4. Pixel values match within tolerance
 fn run_phi3_vision_golden_test(image_name: &str) {
-    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/phi3_vision");
-    let image_path =
-        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = fixture_dir("golden/phi3_vision");
+    let image_path = fixture_dir("images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
         eprintln!("Golden test fixtures for phi3_vision/{image_name} not found, skipping test");
@@ -875,9 +879,8 @@ fn test_phi3_vision_golden_grayscale() {
 /// - Normalization: [0.5, 0.5, 0.5] (vs CLIP)
 /// - Default dynamic_hd: 36 (vs 16)
 fn run_phi4_vision_golden_test(image_name: &str) {
-    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/phi4_vision");
-    let image_path =
-        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = fixture_dir("golden/phi4_vision");
+    let image_path = fixture_dir("images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
         eprintln!("Golden test fixtures for phi4_vision/{image_name} not found, skipping test");
@@ -1068,9 +1071,8 @@ fn load_llama4_pixels(path: &Path) -> (Vec<f32>, Vec<usize>) {
 /// - Normalization: [0.5, 0.5, 0.5] mean/std
 /// - Global tile added when num_tiles > 1
 fn run_llama4_vision_golden_test(image_name: &str) {
-    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/llama4_vision");
-    let image_path =
-        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = fixture_dir("golden/llama4_vision");
+    let image_path = fixture_dir("images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
         eprintln!("Golden test fixtures for llama4_vision/{image_name} not found, skipping test");
@@ -1245,9 +1247,8 @@ fn load_pixtral_image_sizes(path: &Path) -> Vec<(usize, usize)> {
 /// - Normalization: CLIP mean/std
 /// - No tiling - single output per image
 fn run_pixtral_golden_test(image_name: &str) {
-    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/pixtral");
-    let image_path =
-        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = fixture_dir("golden/pixtral");
+    let image_path = fixture_dir("images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
         eprintln!("Golden test fixtures for pixtral/{image_name} not found, skipping test");

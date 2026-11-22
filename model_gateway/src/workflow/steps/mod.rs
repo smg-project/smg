@@ -30,7 +30,7 @@ pub use shared::{
     UpdatePoliciesStep, WorkerList,
 };
 use shared::{RegisterBesideRowsStep, REGISTER_WORKERS_STEP};
-use smg_policy_controller::worker_host::{registration_at_door, WRITE_WORKERS_AT_DOOR_STEP};
+use smg_policy_controller::worker_host::{registration_into_store, WRITE_WORKERS_TO_STORE_STEP};
 use smg_worker::{
     jobs::WorkerJobAsker,
     workflow::{
@@ -177,7 +177,7 @@ pub(crate) fn worker_registration_line(
             "Register Workers",
             Arc::new(RegisterBesideRowsStep::new(Arc::clone(&feed.objects))),
         )
-        .depends_on(&[WRITE_WORKERS_AT_DOOR_STEP, "create_external_workers"]),
+        .depends_on(&[WRITE_WORKERS_TO_STORE_STEP, "create_external_workers"]),
     }
     .with_timeout(Duration::from_secs(5))
     .with_failure_action(FailureAction::FailWorkflow);
@@ -192,7 +192,7 @@ pub(crate) fn worker_registration_line(
         None => {
             worker_registration_workflow::<AppContext>(&settings, gates("classify_worker_type"))
         }
-        Some(feed) => registration_at_door::<AppContext>(
+        Some(feed) => registration_into_store::<AppContext>(
             &settings,
             gates("classify_worker_type"),
             Arc::clone(&feed.door),
@@ -339,7 +339,7 @@ mod tests {
     use openai_protocol::worker::WorkerStatus;
     use serde_json::{json, Value};
     use smg_policy_controller::store::{
-        Maker, MemoryStore, WorkerStatus as RowStatus, WorkersStore,
+        MemoryStore, Registrant, WorkerStatus as RowStatus, WorkersStore,
     };
     use smg_worker::{
         identity::basic::{BasicWorker, Worker},
@@ -1291,7 +1291,7 @@ mod tests {
         assert_eq!(built.len(), 2);
         let object = registry.get_by_url(&url).expect("the row's object");
         assert!(built.iter().any(|built| Arc::ptr_eq(built, &object)));
-        assert_eq!(store.snapshot().1.len(), 1);
+        assert_eq!(store.all_rows().1.len(), 1);
         assert_eq!(feed.objects.unhanded(), 0);
     }
 
@@ -1327,7 +1327,7 @@ mod tests {
 
         let row = store.by_key(&url).expect("the worker's row");
         assert_eq!(row.status, RowStatus::Ready);
-        assert_eq!(row.maker, Maker::Control);
+        assert_eq!(row.maker, Registrant::Control);
 
         let object = registry.get_by_url(&url).expect("the row's object");
         assert_eq!(feed.objects.object(row.id), registry.get_id_by_url(&url));

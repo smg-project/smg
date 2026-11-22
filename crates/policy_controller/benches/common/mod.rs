@@ -3,7 +3,8 @@
 //! reused buffer. Shared by the single-threaded `decision` and `epd` benches
 //! and the `contention` bench, so all three measure one fleet.
 use smg_policy_controller::{
-    Candidate, Engine, Health, LoadRow, PolicySpec, SignalSource, WorkerId,
+    document::PolicySpec,
+    engine::{Candidate, Engine, Health, LoadRow, SignalSource, WorkerId},
 };
 
 /// What a host reads per worker before it writes a row.

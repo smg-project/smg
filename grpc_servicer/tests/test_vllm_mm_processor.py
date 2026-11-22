@@ -6,9 +6,11 @@ Run with: pytest grpc_servicer/tests/test_vllm_mm_processor.py
 import argparse
 import asyncio
 import binascii
+import errno
 import importlib.util
 import logging
 import os
+import socket
 import sys
 import types
 from dataclasses import dataclass
@@ -895,6 +897,67 @@ class TestFetchErrorClassification:
             run(p._fetch(0, _Item("image", url)))
         assert raised.value is exc
         return mm_processor.client_media_code(raised.value)
+
+    def test_a_failure_that_names_the_references_host_is_typed_as_the_medias(self):
+        """A refused connection and a name that does not resolve are the
+        reference's own (client); a timeout and an origin 5xx may pass
+        (transient). Each leaves as a fetch fault with its kind, still an
+        `MmProcessorUnavailable`; a timeout, which has no words, gets its own."""
+
+        class ClientConnectorError(OSError):
+            def __init__(self, os_error, host="a"):
+                super().__init__(f"Cannot connect to host {host}:443 [{os_error}]")
+                self.os_error, self.host = os_error, host
+
+        class ClientResponseError(Exception):
+            def __init__(self, status):
+                super().__init__(f"{status}, message='the origin said so'")
+                self.status = status
+
+        # Stands in for the fetcher's HTTP client library: the exception
+        # classes the classifier reads, with the library's own inheritance.
+        http = types.SimpleNamespace(
+            ClientConnectorError=ClientConnectorError,
+            ClientConnectorDNSError=type("DNSError", (ClientConnectorError,), {}),
+            ClientSSLError=type("SSLError", (ClientConnectorError,), {}),
+            ClientProxyConnectionError=type("ProxyConnectionError", (ClientConnectorError,), {}),
+            ClientResponseError=ClientResponseError,
+            ClientHttpProxyError=type("HttpProxyError", (ClientResponseError,), {}),
+        )
+        no_name = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+        wrong_version = OSError(1, "[SSL: WRONG_VERSION_NUMBER] wrong version number")
+        for exc, fault, words in [
+            (ClientConnectorError(ConnectionRefusedError(111, "refused")), "client", None),
+            (http.ClientConnectorDNSError(no_name), "client", None),
+            # Read by its class: the TLS library's generic code 1 is EPERM's.
+            (http.ClientSSLError(wrong_version), "client", None),
+            (TimeoutError(), "transient", "timed out"),
+            (ClientResponseError(503), "transient", None),
+        ]:
+            p = self.processor(exc)
+            p._fetch_fault = mm_processor.fetch_fault_classifier(http)
+            with pytest.raises(mm_processor.MmMediaFetchFault) as raised:
+                run(p._fetch(3, _Item("image", "https://a/1.png")))
+            assert raised.value.fault == fault, repr(exc)
+            assert str(raised.value) == f"media_refs[3]: fetch failed: {words or exc}", repr(exc)
+            assert isinstance(raised.value, mm_processor.MmProcessorUnavailable)
+        # What names the worker (its proxy, its resolver, its route, its
+        # egress rules) or another host stays the plain retryable error.
+        for exc in [
+            http.ClientProxyConnectionError(ConnectionRefusedError(111, "refused")),
+            http.ClientHttpProxyError(502),
+            ClientConnectorError(ConnectionRefusedError(111, "refused"), host="b"),
+            http.ClientConnectorDNSError(socket.gaierror(socket.EAI_AGAIN, "try again")),
+            ClientConnectorError(OSError(errno.EHOSTUNREACH, "No route to host")),
+            ClientConnectorError(PermissionError(errno.EPERM, "Operation not permitted")),
+            ClientConnectorError(ConnectionResetError(104, "Connection reset by peer")),
+            ClientResponseError(429),
+        ]:
+            p = self.processor(exc)
+            p._fetch_fault = mm_processor.fetch_fault_classifier(http)
+            with pytest.raises(mm_processor.MmProcessorUnavailable) as raised:
+                run(p._fetch(3, _Item("image", "https://a/1.png")))
+            assert type(raised.value) is mm_processor.MmProcessorUnavailable, repr(exc)
 
     def test_caller_errors_pass_through(self):
         p = self.processor(self._CallerError("415 Unsupported Media Type"))

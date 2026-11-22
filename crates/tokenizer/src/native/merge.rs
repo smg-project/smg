@@ -58,13 +58,13 @@ use tokenizers::{
 use crate::{
     encode_path::Declined,
     tiktoken::MAX_BYTE_LEVEL_TABLE_IDS,
-    word_cache::{entries_of, ReadBpe},
+    word_cache::{entries_of, Listing, ReadBpe},
 };
 
 mod preformed;
 mod serialized;
 
-use preformed::{char_len, code_point, is_continuation, Preformed, NO_CHAR};
+use preformed::{char_len, code_point, is_continuation, Preformed, Raws, NO_CHAR};
 
 /// Entries of one bucket of the pair table: sixteen bytes each, so a bucket
 /// is one 64-byte cache line, read whole.
@@ -397,19 +397,23 @@ impl MergeTable {
             for (byte, &c) in alphabet.iter().enumerate() {
                 byte_of[c as usize] = Some(byte as u8);
             }
-            let raw_of = |token: &str| -> Option<Vec<u8>> {
-                token
-                    .chars()
-                    .map(|c| byte_of.get(c as usize).copied().flatten())
-                    .collect()
-            };
             // The entries borrowed from the read's listing when it has one,
             // by id where the read says the ids are the range, else through
             // a clone of the vocabulary map.
-            let raws = entries_of(bpe, read)
-                .filter_map(|(id, token)| raw_of(token.as_ref()).map(|raw| (id, raw)))
-                .filter(|(_, raw)| !table.lacks_a_token_for(raw))
-                .collect();
+            let entries = entries_of(bpe, read);
+            // A token stands for a byte per character, so its text bounds its
+            // bytes: the listing's text, all of them (none without a listing).
+            let listed = read
+                .and_then(|read| read.tokens.as_deref())
+                .map_or(0, Listing::bytes);
+            let mut raws = Raws::for_tokens(entries.size_hint().1.unwrap_or_default(), listed);
+            for (id, token) in entries {
+                let token: &str = token.as_ref();
+                let raw = token
+                    .chars()
+                    .map(|c| byte_of.get(c as usize).copied().flatten());
+                raws.push(id, raw, |raw| !table.lacks_a_token_for(raw));
+            }
             table.preformed = Box::new(Preformed::analyse(&table, raws, &min_operand));
         }
         Ok(table)
@@ -481,10 +485,16 @@ impl MergeTable {
             }
             let before = splits.len();
             for cut in 1..token.len() {
-                if let (Some(&left), Some(&right)) =
-                    (ranks.get(&token[..cut]), ranks.get(&token[cut..]))
-                {
-                    splits.push((left, right, rank));
+                let (left, right) = token.split_at(cut);
+                // The longer half is less often a token than the shorter: it
+                // is looked up first, and the shorter only where it is one.
+                let halves = if left.len() < right.len() {
+                    ranks.get(right).and_then(|b| Some((ranks.get(left)?, b)))
+                } else {
+                    ranks.get(left).and_then(|a| Some((a, ranks.get(right)?)))
+                };
+                if let Some((&a, &b)) = halves {
+                    splits.push((a, b, rank));
                 }
             }
             if splits.len() == before {
@@ -519,10 +529,10 @@ impl MergeTable {
             min_operand[left as usize] = min_operand[left as usize].min(rank);
             min_operand[right as usize] = min_operand[right as usize].min(rank);
         }
-        let raws = ranks
-            .iter()
-            .map(|(token, &rank)| (rank, token.clone()))
-            .collect();
+        let mut raws = Raws::for_tokens(ranks.len(), ranks.keys().map(Vec::len).sum());
+        for (token, &rank) in ranks {
+            raws.push(rank, token.iter().copied().map(Some), |_| true);
+        }
         table.preformed = Box::new(Preformed::analyse(&table, raws, &min_operand));
         Ok(table)
     }
@@ -1108,18 +1118,19 @@ impl<const N: usize> ShortMerge<N> {
     #[inline(always)]
     fn run(mut self, table: &MergeTable, ids: &mut Vec<u32>) {
         let pairs = self.n.saturating_sub(1);
+        let mut best = NO_KEY;
         for at in 0..pairs {
             let merge = table.merge_of(self.symbols[at], self.symbols[at + 1]);
-            self.set_pair(at, merge);
+            best = best.min(self.set_pair(at, merge));
         }
-        self.settle(table, pairs, ids);
+        self.settle(table, best, ids);
     }
 
-    /// Merges from the `pairs` of the first round until no live pair is a
-    /// merge, and appends the ids to `ids`.
+    /// Merges from `best`, the least key of the first round, until no live
+    /// pair is a merge, and appends the ids to `ids`. It borrows the state:
+    /// taken by value it is copied here, even with both functions inlined.
     #[inline(always)]
-    fn settle(mut self, table: &MergeTable, pairs: usize, ids: &mut Vec<u32>) {
-        let mut best = self.least(pairs);
+    fn settle(&mut self, table: &MergeTable, mut best: i32, ids: &mut Vec<u32>) {
         while best != NO_KEY {
             best = self.merge_at(table, (best as u32 & SHORT_KEY_MASK) as usize);
         }

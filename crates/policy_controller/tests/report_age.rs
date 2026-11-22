@@ -5,13 +5,18 @@
 use std::time::{Duration, Instant};
 
 use smg_policy_controller::{
-    store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
-        WorkersStore,
+    document::{PolicySpec, SpecError, API_VERSION},
+    engine::{
+        AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Decision, Engine,
+        Health, LoadRow, PairPools, Phase, PoolFacts, RequestFacts, Role, ScoreFront, Scratch,
+        Target, WorkerId,
     },
-    AffinityFacts, Candidate, Constraints, Decision, Engine, Front, Health, Lease, Lifecycle,
-    LoadRow, Membership, NamedAffinity, NamedHolder, PairPools, Phase, PolicySpec, PoolFacts,
-    RequestFacts, Role, Scratch, Side, SpecError, Target, WorkerId, API_VERSION,
+    stages::Lifecycle,
+    store::{
+        GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, ViewQuery, WorkerFacts,
+        WorkerStatus, WorkersStore,
+    },
+    tracking::{Lease, Membership, Side},
 };
 
 const LIMIT_MS: u64 = 27;
@@ -81,7 +86,7 @@ fn the_report_age_limit_is_optional_and_validated_by_name() {
     with_view.view.block_size = Some(16);
     let view = serde_json::to_value(&with_view).expect("JSON");
     assert!(view["view"].get("max_report_age_ms").is_none());
-    for name in smg_policy_controller::PRESETS {
+    for name in smg_policy_controller::document::PRESETS {
         assert_eq!(
             PolicySpec::preset(name)
                 .expect("a preset")
@@ -180,7 +185,7 @@ fn least_load_asks_for_the_whole_pool_when_the_front_has_a_stale_report() {
         stage
             .score_front(&request(), &rows, &kept, &[0, 1], &mut out)
             .1,
-        Front::Whole
+        ScoreFront::Whole
     );
     let with_stale = stage.score_front(&request(), &rows, &kept, &[1, 2], &mut out);
     let scores = out;
@@ -238,24 +243,24 @@ fn prefix_affinity_ignores_stale_reports_in_the_kv_gate() {
     let stage = &limited.profiles()[0].scorers[0].scorer;
     assert_eq!(
         stage.score_front(&facts, &rows, &kept, &kept, &mut front).1,
-        Front::At(1)
+        ScoreFront::At(1)
     );
     assert_eq!(front, stale.as_slice());
     let named = RequestFacts {
-        named: Some(NamedAffinity {
-            holders: &[NamedHolder {
+        named: Some(AffinityRows {
+            holders: &[AffinityHolder {
                 row: 0,
                 overlap_blocks: 8,
                 predicted_blocks: 0,
             }],
-            ..NamedAffinity::default()
+            ..AffinityRows::default()
         }),
         affinity: &[],
         ..facts
     };
     assert_eq!(
         stage.score_front(&named, &rows, &kept, &kept, &mut front).1,
-        Front::Unsaid
+        ScoreFront::Unsaid
     );
     assert_eq!(front, stale.as_slice());
     rows[0].load = None;
@@ -285,12 +290,12 @@ fn the_warmup_slice_ignores_stale_reports_in_the_kv_gate() {
     let stage = &limited.profiles()[0].scorers[0].scorer;
     assert_eq!(
         stage.score_front(&facts, &rows, &kept, &kept, &mut front).1,
-        Front::At(1)
+        ScoreFront::At(1)
     );
     assert_eq!(front, stale.as_slice());
     rows[0].load = None;
     assert_eq!(stale, scores(&bare, &facts, &rows));
-    assert!(limited.warm_rule_for("", Phase::Single).is_some());
+    assert!(limited.warm_up_rule_for("", Phase::Single).is_some());
 }
 
 #[test]
@@ -460,14 +465,14 @@ fn check_view_limit(limit_ms: u64) {
     store.publish_now();
     let engine = policy(r#""least-load""#, Some(limit_ms));
     let decide = |at, written| {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GatewayId(0),
             now: at,
             pinned: None,
             affinity: false,
             signal_cells: false,
         };
-        store.with_world(|world| {
+        store.with_snapshot(|world| {
             let mut buffers = ViewBuffers::default();
             let view = world
                 .view("m", Role::Single, &ask, written, &mut buffers)

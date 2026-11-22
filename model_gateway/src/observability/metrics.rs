@@ -96,6 +96,8 @@ mod handles {
     pub(super) struct StreamHandles {
         /// `smg_router_ttft_seconds`.
         pub(super) ttft: OnceCell<Histogram>,
+        /// `smg_router_dispatch_wait_seconds`.
+        pub(super) dispatch_wait: OnceCell<Histogram>,
         /// `smg_router_tpot_seconds`.
         pub(super) tpot: OnceCell<Histogram>,
         /// `smg_router_time_to_first_token_seconds`.
@@ -350,6 +352,14 @@ pub(crate) const TIME_TO_FIRST_TOKEN_SECONDS: &str = "smg_router_time_to_first_t
 /// family's quantity.
 pub(crate) const REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS: &str =
     "smg_router_request_time_per_output_token_seconds";
+
+/// The wait ahead of the dispatch the first-token clock starts at: from the
+/// request's entry at the edge to the answering attempt's RPC dispatch.
+/// Observed with `smg_router_ttft_seconds`, for the same requests and under
+/// the same labels, so the two add up to the time to first token from the
+/// request's receipt. A streamed Responses tool loop observes one per turn,
+/// a later turn's from that turn's start.
+pub(crate) const DISPATCH_WAIT_SECONDS: &str = "smg_router_dispatch_wait_seconds";
 
 /// Histogram buckets for `smg_router_time_to_first_token_seconds`: six per
 /// decade (1, 1.5, 2, 3, 5, 7.5) from 10 ms to 10 s, where a first-token
@@ -681,10 +691,15 @@ pub(crate) fn init_metrics() {
     // per-token families hold streamed answers alone: a collected answer is
     // built from the drained stream and sees no first token, and a streamed
     // Responses answer on the Harmony pipeline records only the prefill-decode
-    // first-token pair, none of these four.
+    // first-token pair, none of these four. The dispatch wait is observed with
+    // the first token: it ends where the first-token clock starts.
     describe_histogram!(
         "smg_router_ttft_seconds",
         "Time to first token of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline); the clock starts at the answering attempt's RPC dispatch (the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes), so a refused attempt's wait and its backoff are in smg_router_request_duration_seconds, the backoff alone in smg_worker_retry_backoff_seconds, and the refused attempt counted by smg_worker_retries_total, not here"
+    );
+    describe_histogram!(
+        DISPATCH_WAIT_SECONDS,
+        "Dispatch wait of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline, so no wait): from the request's entry at the edge to the answering attempt's RPC dispatch (the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes), where the clock of smg_router_ttft_seconds starts, so the body read, admission, tokenizing, templating, worker selection, a refused attempt's wait and its backoff are here; observed with smg_router_ttft_seconds, once per observation of it and under the same labels, so the two add up to the time to first token from the request's receipt; a streamed Responses tool loop observes one per turn, as it observes smg_router_ttft_seconds: the first turn's from the request's entry, a later turn's from that turn's start, after the generations and tool calls before it, so a later turn's two add up to the time to first token from the turn's start"
     );
     describe_histogram!(
         "smg_router_tpot_seconds",
@@ -1217,6 +1232,12 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     let ttft_matcher = Matcher::Suffix(String::from("ttft_seconds"));
     let tpot_matcher = Matcher::Suffix(String::from("tpot_seconds"));
 
+    // The dispatch wait (edge entry to the answering attempt's dispatch) ends
+    // in `_wait_seconds`, not `duration_seconds`: matched by its full name, it
+    // keeps the request-latency buckets (an operator's list with them), as
+    // the TTFT it adds up with does.
+    let dispatch_wait_matcher = Matcher::Full(String::from(DISPATCH_WAIT_SECONDS));
+
     // The first-token and per-output-token families: their own log-spaced
     // edges, which `--prometheus-duration-buckets` does not replace.
     let first_token_matcher = Matcher::Full(String::from(TIME_TO_FIRST_TOKEN_SECONDS));
@@ -1254,7 +1275,8 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     HashMap::from([
         (duration_matcher, duration_bucket.clone()),
         (ttft_matcher, duration_bucket.clone()),
-        (tpot_matcher, duration_bucket),
+        (tpot_matcher, duration_bucket.clone()),
+        (dispatch_wait_matcher, duration_bucket),
         (first_token_matcher, TIME_TO_FIRST_TOKEN_BUCKETS.to_vec()),
         (
             per_output_token_matcher,
@@ -1422,6 +1444,12 @@ pub struct StreamingMetricsParams<'a> {
     pub endpoint: &'static str,
     /// Time to first token (None if no tokens were generated)
     pub ttft: Option<Duration>,
+    /// The request's wait ahead of the dispatch `ttft` runs from: its entry
+    /// at the edge to that dispatch (for a later turn of a streamed tool
+    /// loop, that turn's start to its dispatch). Recorded only with `ttft`.
+    /// None for a generation dispatched under no entry stamp, and for a
+    /// collected answer.
+    pub dispatch_wait: Option<Duration>,
     /// Total generation time
     pub generation_duration: Duration,
     /// Input token count (None for endpoints that don't track this)
@@ -1966,7 +1994,8 @@ impl Metrics {
     /// TTFT, TPOT, generation duration and the token counters, with the TPOT
     /// computed here. A streamed answer records at its end; a collected one
     /// when its response is built, with no TTFT (no first token is seen on
-    /// that path) and so no TPOT.
+    /// that path) and so no TPOT. The dispatch wait is recorded where the
+    /// TTFT is and only with it, so the two families count the same requests.
     pub fn record_streaming_metrics(params: StreamingMetricsParams<'_>) {
         let StreamingMetricsParams {
             router_type,
@@ -1974,6 +2003,7 @@ impl Metrics {
             model_id,
             endpoint,
             ttft,
+            dispatch_wait,
             generation_duration,
             input_tokens,
             cached_tokens,
@@ -1999,6 +2029,7 @@ impl Metrics {
             )
         };
         let ttft_histogram = || duration_histogram("smg_router_ttft_seconds");
+        let dispatch_wait_histogram = || duration_histogram(DISPATCH_WAIT_SECONDS);
         let tpot_histogram = || duration_histogram("smg_router_tpot_seconds");
         let first_token_histogram = || duration_histogram(TIME_TO_FIRST_TOKEN_SECONDS);
         let per_output_token_histogram =
@@ -2023,6 +2054,9 @@ impl Metrics {
                 let seconds = ttft.as_secs_f64();
                 ttft_histogram().record(seconds);
                 first_token_histogram().record(seconds);
+                if let Some(wait) = dispatch_wait {
+                    dispatch_wait_histogram().record(wait.as_secs_f64());
+                }
             }
             if let Some(tpot) = tpot {
                 let seconds = tpot.as_secs_f64();
@@ -2057,6 +2091,11 @@ impl Metrics {
                         kept.first_token
                             .get_or_init(first_token_histogram)
                             .record(seconds);
+                        if let Some(wait) = dispatch_wait {
+                            kept.dispatch_wait
+                                .get_or_init(dispatch_wait_histogram)
+                                .record(wait.as_secs_f64());
+                        }
                     }
                     if let Some(tpot) = tpot {
                         let seconds = tpot.as_secs_f64();

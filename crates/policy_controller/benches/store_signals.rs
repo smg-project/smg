@@ -30,12 +30,13 @@ use std::{
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
+    document::{AppliedSpec, PolicySpec, API_VERSION},
+    engine::{Constraints, LoadRow, RequestFacts, Role, Scratch, SignalSource, WorkerId},
+    stages::StageRegistry,
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, SignalSink, Taken, ViewBuffers,
-        WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        GatewayId, LoadSink, LoadSource, MemoryStore, SignalSink, SignalWriteOutcome, ViewBuffers,
+        ViewQuery, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    AppliedSpec, Catalog, Constraints, LoadRow, PolicySpec, RequestFacts, Role, Scratch,
-    SignalSource, WorkerId, API_VERSION,
 };
 
 use crate::reads_two::ReadsTwo;
@@ -49,7 +50,7 @@ const UNIT: &str = "tokens";
 
 /// The document every cell runs under: four signals, two of them read.
 fn applied() -> AppliedSpec {
-    let mut catalog = Catalog::builtin();
+    let mut catalog = StageRegistry::builtin();
     catalog
         .scorer_with("reads-two", |build| {
             let used = build.signal_column("used")?;
@@ -90,7 +91,7 @@ fn state(store: &MemoryStore, id: WorkerId, index: usize, at: Instant) {
     for (nth, column) in columns.iter().enumerate() {
         let value = ((index * 7 + nth * 3) % 23) as f64;
         let taken = store.signal_value(id, 0, column, UNIT, value, at);
-        assert_eq!(taken, Taken::Written, "{}", column.name());
+        assert_eq!(taken, SignalWriteOutcome::Written, "{}", column.name());
     }
 }
 
@@ -138,7 +139,7 @@ fn decide_cells(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_store_signals/decide");
     for n in SIZES {
         let (store, _, opened) = pool_of(n);
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: ASKER,
             now: opened + Duration::from_secs(1),
             pinned: None,
@@ -153,7 +154,7 @@ fn decide_cells(c: &mut Criterion) {
             group.bench_with_input(BenchmarkId::new(door, n), &n, |b, _| {
                 b.iter(|| {
                     seed = seed.wrapping_add(1);
-                    store.with_world(|world| {
+                    store.with_snapshot(|world| {
                         let view =
                             world.view(MODEL, Role::Single, black_box(&ask), written, &mut out);
                         let view = view.expect("the pool");

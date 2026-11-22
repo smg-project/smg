@@ -188,9 +188,9 @@ controller = [
 ]
 
 # The gateway's side of the controller's protocol: the reference client, the
-# link a host's requests share and the watcher. It adds no dependency to the
-# controller's. The gateway builds it on the targets the controller builds
-# on, to follow a controller.
+# link a host's requests share, the watcher and the worker follower. It adds
+# no dependency to the controller's. The gateway builds it on the targets
+# the controller builds on, to follow a controller.
 client = ["controller"]
 
 # The Kubernetes Lease backend of the elector.
@@ -245,6 +245,10 @@ criterion = "0.8"
 # the same stand-in served over HTTP.
 axum = { workspace = true }
 http = { workspace = true }
+# The worker follower's tests answer as a controller would: a body of frames
+# that ends with trailers, or never ends.
+http-body = "1.0"
+http-body-util = { workspace = true }
 # The load driver's unit tests add the test macro and tokio's paused clock.
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
 # The spec store cases collect the lines the source logs.
@@ -337,7 +341,7 @@ name = "ingest"
 required-features = ["controller"]
 
 [[test]]
-name = "membership_door"
+name = "membership_calls"
 required-features = ["controller", "worker-host"]
 
 [[test]]
@@ -375,7 +379,7 @@ name = "affinity"
 harness = false
 
 [[bench]]
-name = "affinity_named"
+name = "affinity_rows"
 harness = false
 
 [[bench]]
@@ -417,7 +421,7 @@ name = "store_pair"
 harness = false
 
 [[bench]]
-name = "store_lent"
+name = "store_lent_rows"
 harness = false
 
 [[bench]]
@@ -433,7 +437,7 @@ name = "store_journal"
 harness = false
 
 [[bench]]
-name = "store_named"
+name = "store_affinity_rows"
 harness = false
 
 [[bench]]
@@ -485,7 +489,7 @@ name = "predictor"
 harness = false
 
 [[bench]]
-name = "sent"
+name = "dispatch_credit"
 harness = false
 
 [[bench]]
@@ -501,7 +505,7 @@ harness = false
 # A registered scorer's read of a row's report through the view's
 # reading, beside the same scorer reading the row's field.
 [[bench]]
-name = "reports"
+name = "load_report_reader"
 harness = false
 
 [lints]

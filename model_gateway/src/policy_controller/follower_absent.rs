@@ -19,8 +19,12 @@ pub(crate) enum Followed {
 pub(crate) struct Settings;
 
 impl Settings {
-    pub(crate) fn new(_address: String, _config: &RouterConfig) -> Self {
-        Self
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the follower's settings refuse TLS files that do not pair; none is read here"
+    )]
+    pub(crate) fn new(_address: String, _config: &RouterConfig) -> Result<Self, String> {
+        Ok(Self)
     }
 }
 

@@ -1,8 +1,12 @@
 //! A document supplies the parameters of a filter registered by its host.
 
 use smg_policy_controller::{
-    Candidate, Catalog, Constraints, Decision, Filter, Health, PolicySpec, PoolFacts, RequestFacts,
-    Scratch, StageBuild, StageError, WorkerId, API_VERSION,
+    document::{PolicySpec, API_VERSION},
+    engine::{
+        Candidate, Constraints, Decision, Filter, Health, PoolFacts, RequestFacts, Scratch,
+        WorkerId,
+    },
+    stages::{StageBuild, StageError, StageRegistry},
 };
 
 /// Keeps the workers with `slots` of their eight request slots free.
@@ -24,7 +28,7 @@ impl Filter for MinFree {
 
 #[test]
 fn a_yaml_parameter_moves_the_rows_kept() {
-    let mut catalog = Catalog::builtin();
+    let mut catalog = StageRegistry::builtin();
     catalog
         .filter_with("min-free", |build: &mut StageBuild<'_>| {
             let rule: MinFree = build.params()?;

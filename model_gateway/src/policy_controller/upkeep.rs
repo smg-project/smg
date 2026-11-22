@@ -19,7 +19,7 @@ use std::{
 };
 
 use metrics::Counter;
-use smg_policy_controller::engine::{decision::ShadowKind, door::SHADOW_ROWS};
+use smg_policy_controller::engine::{ShadowKind, SHADOW_ROWS};
 use tokio::{
     task::JoinHandle,
     time::{interval, MissedTickBehavior},
@@ -127,10 +127,9 @@ mod tests {
 
     use futures::FutureExt;
     use smg_policy_controller::{
-        document::spec::ShadowSpec,
-        engine::decision::ShadowKind,
+        document::{AppliedSpec, PolicySpec, ShadowSpec},
+        engine::ShadowKind,
         store::{GatewayId, LeasesStore, MemoryStore},
-        AppliedSpec, PolicySpec,
     };
 
     use super::{start, turn, Series, EVERY};

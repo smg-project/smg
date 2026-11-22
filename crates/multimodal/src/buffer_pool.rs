@@ -16,16 +16,17 @@
 //! ([`EncoderInput::into_bytes_as`](crate::encoder_inputs::EncoderInput::into_bytes_as)).
 //!
 //! Geometry: a length between [`SMALLEST`] and [`LARGEST`] is served from the
-//! class of its next power of two (nine classes, 256 KiB to 64 MiB), so one
+//! class of its next power of two (ten classes, 256 KiB to 128 MiB), so one
 //! class serves every length up to its size and the pages past the length
 //! are never touched; a length outside the range is allocated as before. The
-//! pool holds at most [`BOUND`] bytes of capacity in all, process-wide; a
-//! buffer offered beyond that is freed as before. Resident memory grows by
+//! pool holds at most [`BOUND`] bytes of capacity in the classes below the
+//! top one, and one idle buffer of the top class beside them, process-wide;
+//! a buffer offered beyond that is freed as before. Resident memory grows by
 //! at most the bytes requests wrote into the kept buffers, so by at most the
-//! bound: a 1024x768 request writes 2.4 MB into a 4 MiB-class frame and
-//! 18.9 MB into a 32 MiB-class `float32` wire, and the bound holds seven
-//! such pairs; at eight runtime threads the steady state is the in-flight
-//! count's worth of them.
+//! bound and that one buffer: a 1024x768 request writes 2.4 MB into a
+//! 4 MiB-class frame and 18.9 MB into a 32 MiB-class `float32` wire, and the
+//! bound holds seven such pairs; at eight runtime threads the steady state
+//! is the in-flight count's worth of them.
 //!
 //! One pool for the process rather than one per thread: a buffer is taken on
 //! the thread that decodes or preprocesses and comes back from the thread
@@ -46,9 +47,12 @@ use image::DynamicImage;
 /// tile in bfloat16 (677,376 bytes), sits in the 1 MiB class above this floor.
 pub const SMALLEST: usize = 256 << 10;
 /// The longest buffer the pool serves; a longer one is allocated as before.
-pub const LARGEST: usize = 64 << 20;
-/// The capacity the pool holds in all, the idle buffers of every class
-/// together.
+/// Ten 1024x768 images on `llama4`, 130 tiles of 336x336, write one bfloat16
+/// wire of 88 MB, which sits in this top class; the pool keeps one idle
+/// buffer of it, outside [`BOUND`].
+pub const LARGEST: usize = 128 << 20;
+/// The capacity the pool holds below the top class, the idle buffers of
+/// those classes together.
 pub const BOUND: usize = 256 << 20;
 /// What a buffer holds when handed out in a debug build.
 pub const SENTINEL: u8 = 0xA5;
@@ -64,7 +68,7 @@ pub(crate) struct BufferPool {
 struct Idle {
     /// The idle buffers of each class, each with the class's capacity.
     classes: [Vec<Vec<u8>>; CLASSES],
-    /// The capacity of every idle buffer together.
+    /// The capacity of every idle buffer below the top class together.
     held: usize,
 }
 
@@ -142,7 +146,7 @@ impl BufferPool {
         let kept = {
             let mut idle = self.idle();
             let kept = idle.classes[index].pop();
-            if kept.is_some() {
+            if kept.is_some() && capacity != LARGEST {
                 idle.held -= capacity;
             }
             kept
@@ -158,20 +162,31 @@ impl BufferPool {
     }
 
     /// `buf` back for the next request: kept when it is a class's buffer and
-    /// the bound has room, freed as before otherwise. Any buffer may be
-    /// offered.
+    /// the bound has room (in the top class, when none of it is idle), freed
+    /// as before otherwise. Any buffer may be offered.
     pub(crate) fn recycle(&self, buf: Vec<u8>) {
         let capacity = buf.capacity();
         let Some(index) = class_index(capacity) else {
             return;
         };
-        // A buffer the bound turns away is freed after the lock is released.
+        // A buffer turned away is freed after the lock is released.
         let turned_away = {
             let mut idle = self.idle();
-            if idle.held + capacity > BOUND {
+            // The top class stays out of the bound, where one of its buffers
+            // would take the room of many smaller ones, and keeps a single
+            // idle buffer, since the pool never frees what it keeps.
+            let top = capacity == LARGEST;
+            let full = if top {
+                !idle.classes[index].is_empty()
+            } else {
+                idle.held + capacity > BOUND
+            };
+            if full {
                 Some(buf)
             } else {
-                idle.held += capacity;
+                if !top {
+                    idle.held += capacity;
+                }
                 idle.classes[index].push(buf);
                 None
             }
@@ -179,7 +194,7 @@ impl BufferPool {
         drop(turned_away);
     }
 
-    /// The capacity held in all.
+    /// The capacity held below the top class.
     #[cfg(test)]
     pub(crate) fn held(&self) -> usize {
         self.idle().held
@@ -192,7 +207,7 @@ pub(crate) fn take(len: usize) -> Vec<u8> {
 }
 
 /// A buffer back to the process's pool: kept for the next request of its
-/// class, or freed when it is outside the classes or the pool is at its bound.
+/// class, or freed when it is outside the classes or the pool has no room.
 pub fn recycle(buf: Vec<u8>) {
     shared().recycle(buf);
 }
@@ -290,6 +305,20 @@ mod tests {
     }
 
     #[test]
+    fn a_buffer_between_64_and_128_mib_is_kept_and_handed_out_again() {
+        // The first length of the top class: one byte past 64 MiB sits in
+        // the 128 MiB class.
+        let len = (64 << 20) + 1;
+        let pool = BufferPool::new();
+        let first = pool.take(len);
+        let address = first.as_ptr();
+        assert_eq!(first.capacity(), 128 << 20);
+        pool.recycle(first);
+        let again = pool.take(len);
+        assert_eq!(again.as_ptr(), address);
+    }
+
+    #[test]
     fn a_recycled_buffer_serves_the_next_take_of_its_class_at_the_new_length() {
         let pool = BufferPool::new();
         let first = pool.take(3 * SMALLEST / 2);
@@ -334,16 +363,32 @@ mod tests {
     #[test]
     fn the_bound_turns_a_buffer_away() {
         let pool = BufferPool::new();
-        for _ in 0..BOUND / LARGEST {
-            pool.recycle(Vec::with_capacity(LARGEST));
+        // The largest class the bound counts.
+        let class = LARGEST / 2;
+        for _ in 0..BOUND / class {
+            pool.recycle(Vec::with_capacity(class));
         }
         assert_eq!(pool.held(), BOUND);
         pool.recycle(Vec::with_capacity(SMALLEST));
         assert_eq!(pool.held(), BOUND);
-        drop(pool.take(LARGEST));
-        assert_eq!(pool.held(), BOUND - LARGEST);
+        drop(pool.take(class));
+        assert_eq!(pool.held(), BOUND - class);
         pool.recycle(Vec::with_capacity(SMALLEST));
-        assert_eq!(pool.held(), BOUND - LARGEST + SMALLEST);
+        assert_eq!(pool.held(), BOUND - class + SMALLEST);
+    }
+
+    #[test]
+    fn the_top_class_keeps_one_idle_buffer_outside_the_bound() {
+        let pool = BufferPool::new();
+        pool.recycle(Vec::with_capacity(LARGEST));
+        // A second one that comes back while the first is idle is freed.
+        pool.recycle(Vec::with_capacity(LARGEST));
+        assert_eq!(pool.idle().classes[CLASSES - 1].len(), 1);
+        // The classes below keep their whole bound beside it.
+        for _ in 0..BOUND / SMALLEST {
+            pool.recycle(Vec::with_capacity(SMALLEST));
+        }
+        assert_eq!(pool.idle().classes[0].len(), BOUND / SMALLEST);
     }
 
     #[test]
