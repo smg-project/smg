@@ -578,7 +578,8 @@ impl PolicyEngine {
             // A pair is decided at its prefill, over its host's two
             // lists.
             (Phase::Prefill, WorkerLists::Pair(lists)) => {
-                let decided = pair::decided(self, &lists, &mut request, None, now);
+                let loads = maker.loads();
+                let decided = pair::decided(self, &lists, &mut request, None, loads, now);
                 *whole = Some((decided, later));
                 return Ok(None);
             }
@@ -634,7 +635,7 @@ impl DecisionEngine for PolicyEngine {
             let mut request = maker.make(&self.spec);
             Ok(match maker.workers() {
                 WorkerLists::Pair(lists) => {
-                    pair::decided(self, &lists, &mut request, Some(held), now)
+                    pair::decided(self, &lists, &mut request, Some(held), maker.loads(), now)
                 }
                 _ => single::issued(self, single::over_none(self, &request), &request, now),
             })

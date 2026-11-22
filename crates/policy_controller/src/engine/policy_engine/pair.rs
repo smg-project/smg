@@ -362,7 +362,9 @@ pub(super) fn issue_decode(
 /// next id ([`issue`]). With the view of the guard that holds the first it
 /// is the decode asked again behind the prefill that view names, and a pick
 /// issues the decode side under the held lease, dated at this call
-/// ([`issue_decode`]). A lease's dispatch is due as a single's.
+/// ([`issue_decode`]). A lease's dispatch is due as a single's. Both lists'
+/// records read their workers' reports in `loads`, the snapshot the host
+/// hands for this call, as a single's do.
 ///
 /// A request held to wires is its host's to hand lists for. Where a worker
 /// of either list is dialed on a wire the request does not state, the
@@ -372,6 +374,7 @@ pub(super) fn decided(
     lists: &PairLists<'_>,
     request: &mut Request<'_>,
     held: Option<&HeldDecision<'_>>,
+    loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
 ) -> DecideOutcome {
     let wires = request.constraints.wire_modes;
@@ -385,7 +388,7 @@ pub(super) fn decided(
     }
     let (spec, later) = (&own.spec, request.constraints.decode_later);
     let prefill = held.map(|held| held.target.id);
-    let decision = lists.decide(spec, None, &own.clock, now, request, prefill);
+    let decision = lists.decide(spec, loads, &own.clock, now, request, prefill);
     let (engine, facts) = (spec.engine(), &request.facts);
     let issued = match held {
         // A shed writes no word that every pick shares.
@@ -413,6 +416,7 @@ mod tests {
     use parking_lot::Mutex;
     use smg_worker::{
         identity::{basic::Worker, builder::BasicWorkerBuilder},
+        load::state::one_rank_load,
         test_support::no_health_check,
         worker::{WorkerSpec, WorkerStatus, WorkerType},
     };
@@ -969,8 +973,9 @@ mod tests {
         members: [PoolMembers; 2],
     }
 
-    /// A pair's request stated ahead, with the lists its host hands for it.
-    struct Asks<'a>(Request<'a>, PairLists<'a>);
+    /// A pair's request stated ahead, with the lists its host hands for it
+    /// and its snapshot of the workers' reports, where it lends one.
+    struct Asks<'a>(Request<'a>, PairLists<'a>, Option<Arc<LoadSnapshot>>);
 
     impl RequestMaker for Asks<'_> {
         fn model(&self) -> &str {
@@ -984,15 +989,29 @@ mod tests {
         fn workers(&self) -> WorkerLists<'_> {
             WorkerLists::Pair(self.1)
         }
+
+        fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
+            self.2.as_ref()
+        }
     }
 
     impl Host {
         fn of(prefills: usize, decodes: usize) -> Self {
+            let (spec, heard) = hearing();
+            Self::under(spec, heard, prefills, decodes)
+        }
+
+        /// The host's lists under the engine of `spec`.
+        fn under(
+            spec: AppliedSpec,
+            heard: Arc<Mutex<Vec<Word>>>,
+            prefills: usize,
+            decodes: usize,
+        ) -> Self {
             let side = |name: &str, worker_type, count| -> Arc<[Arc<dyn Worker>]> {
                 let url = |at: usize| format!("grpc://{name}-{at}:9000");
                 (0..count).map(|at| worker(url(at), worker_type)).collect()
             };
-            let (spec, heard) = hearing();
             let engine = PolicyEngine::new(spec);
             let prefills = side("prefill", WorkerType::Prefill, prefills);
             let decodes = side("decode", WorkerType::Decode, decodes);
@@ -1029,7 +1048,7 @@ mod tests {
                 facts: keyed(),
                 constraints,
             };
-            Asks(request, lists)
+            Asks(request, lists, None)
         }
 
         /// What the stages heard since the last call: each word, its side
@@ -1420,5 +1439,72 @@ mod tests {
                 ("completed", Side::Decode, decode, at),
             ]
         );
+    }
+
+    /// Each side of a pair that scores by load reads its workers' reports in
+    /// the snapshot its host hands for the call: the prefill and the decode
+    /// with the shortest queue are picked at every seed. The decode decided
+    /// again behind its prefill reads the snapshot of its own call. Handed
+    /// no snapshot, the same engine reads no report and its picks spread
+    /// over both lists.
+    #[test]
+    fn a_pair_that_scores_by_load_reads_the_reports_its_host_hands() {
+        let mut document = PolicySpec::pair_presets("least_load", "least_load").expect("presets");
+        document.generation = 3;
+        let spec = AppliedSpec::validate(&document).expect("a valid document");
+        let host = Host::under(spec, Arc::default(), 4, 4);
+        let classes = every(4, 4);
+        // Every worker of a side waits on a long queue but the one at `idle`.
+        let reports = |side: &'static str, idle: usize| {
+            (0..4).map(move |at| {
+                let queued = if at == idle { 0 } else { 90_000 };
+                let url = format!("grpc://{side}-{at}:9000");
+                (url, one_rank_load(queued, 0.1, 1_000.0))
+            })
+        };
+        let snapshot = |prefill, decode| {
+            let both = reports("prefill", prefill).chain(reports("decode", decode));
+            LoadSnapshot::from_loads_for_test(both.collect())
+        };
+        let asks = |seed: u64, later: bool, loads: Option<Arc<LoadSnapshot>>| {
+            let mut stated = host.asks(&classes, later);
+            stated.0.facts = RequestFacts { seed, ..facts() };
+            stated.2 = loads;
+            stated
+        };
+        let first = |stated: &Asks<'_>| {
+            let decided = host
+                .engine
+                .decide_under(GatewayId::LOCAL, stated, Instant::now());
+            let (outcome, _) = decided
+                .expect("an answer")
+                .whole()
+                .expect("a whole decision");
+            host.picked(&outcome.decision)
+        };
+        let mut unread = [[0_u32; 4]; 2];
+        for seed in 0..64 {
+            let fed = asks(seed, false, Some(snapshot(2, 1)));
+            assert_eq!(first(&fed), (2, 1), "seed {seed}");
+            let (prefill, decode) = first(&asks(seed, false, None));
+            unread[0][prefill] += 1;
+            unread[1][decode] += 1;
+        }
+        assert!(
+            unread.iter().flatten().all(|&picks| picks > 0),
+            "{unread:?}"
+        );
+        // The decode decided again: its call's snapshot names another decode.
+        for seed in 0..16 {
+            let now = Instant::now();
+            let sent = asks(seed, true, Some(snapshot(2, 1)));
+            let mut guard = DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &sent, now)
+                .expect("a decision");
+            assert_eq!(host.picked(guard.decision()), (2, 1), "seed {seed}");
+            guard.dispatched(now);
+            let call = asks(seed, true, Some(snapshot(2, 3)));
+            let again = *guard.decide_decode_under(&call, now).expect("a decision");
+            assert_eq!(host.picked(&again), (2, 3), "seed {seed}");
+        }
     }
 }
