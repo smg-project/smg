@@ -1502,8 +1502,17 @@ async fn a_built_contexts_timer_ends_a_lease_whose_dispatch_was_never_named() ->
     for _ in 0..3 {
         tokio::time::advance(upkeep::EVERY).await;
     }
-    tokio::task::yield_now().await;
-    assert_eq!(LeasesStore::live(&**store, GatewayId::LOCAL), 0);
+    // A turn is made on a thread that may block, off this one: the case
+    // waits for it by the wall clock, five seconds at most.
+    let live = || LeasesStore::live(&**store, GatewayId::LOCAL);
+    for _ in 0..5_000 {
+        if live() == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(live(), 0);
     drop(placed);
     Ok(())
 }
