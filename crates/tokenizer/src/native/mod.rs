@@ -4153,7 +4153,10 @@ impl NativeEncoder {
         answer.clear();
         for piece in waiting.iter().rev() {
             let key = piece.vacancy.key();
-            let mut vacancy = Some(piece.vacancy);
+            // By reference: as a copy the vacancy was written to the stack
+            // for every piece, for the calls that few pieces make.
+            let anew;
+            let mut vacancy = Some(&piece.vacancy);
             let mut one = None;
             let from = answer.len();
             if cache.answered_clears != cache.clears {
@@ -4162,16 +4165,23 @@ impl NativeEncoder {
                         one = cache.packed.one_or_append(entry, &mut answer);
                         vacancy = None;
                     }
-                    Err(fresh) => vacancy = Some(fresh),
+                    Err(fresh) => {
+                        anew = fresh;
+                        vacancy = Some(&anew);
+                    }
                 }
             }
             if let Some(vacancy) = vacancy {
-                match self.seed.probe(key) {
-                    Ok(entry) => {
-                        one =
-                            self.keep_answer(&self.seed, entry, vacancy, from, &mut answer, cache);
-                    }
-                    Err(_) => match cache.packed.probe(key) {
+                if let Ok(entry) = self.seed.probe(key) {
+                    one = self.keep_answer(&self.seed, entry, vacancy, from, &mut answer, cache);
+                } else {
+                    // The seed does not hold it: the thread's table (a
+                    // copy of a piece of this batch), the learned table
+                    // or a merge answers. The hint lays the loop out for
+                    // the pieces the seed answers; all three ride the
+                    // cold edge.
+                    std::hint::cold_path();
+                    match cache.packed.probe(key) {
                         Ok(entry) => one = cache.packed.one_or_append(entry, &mut answer),
                         Err(fresh) => {
                             let part = learned.and_then(|learned| learned.read(key));
@@ -4182,8 +4192,14 @@ impl NativeEncoder {
                             if let Some((table, entry)) = held {
                                 // Another thread, or this one before a
                                 // clear, has merged it.
-                                one =
-                                    self.keep_answer(table, entry, fresh, from, &mut answer, cache);
+                                one = self.keep_answer(
+                                    table,
+                                    entry,
+                                    &fresh,
+                                    from,
+                                    &mut answer,
+                                    cache,
+                                );
                                 of_use += 1;
                             } else {
                                 // A writer needs the part to itself.
@@ -4211,7 +4227,7 @@ impl NativeEncoder {
                                 }
                             }
                         }
-                    },
+                    }
                 }
             }
             match one {
@@ -4271,16 +4287,16 @@ impl NativeEncoder {
         &self,
         table: &ShortPieceTable,
         entry: &Entry,
-        vacancy: Vacancy,
+        vacancy: &Vacancy,
         from: usize,
         answer: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) -> Option<u32> {
         let one = table.one_or_append(entry, answer);
-        if cache.short_full(cache.share) || !cache.packed.keep(vacancy, entry) {
+        if cache.short_full(cache.share) || !cache.packed.keep(*vacancy, entry) {
             // Not kept as a copy: remembered from its ids.
             answer.extend(one);
-            self.remember_seeded(vacancy, from, answer, cache);
+            self.remember_seeded(*vacancy, from, answer, cache);
             if one.is_some() {
                 answer.truncate(from);
             }
