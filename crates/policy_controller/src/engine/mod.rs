@@ -66,7 +66,7 @@ pub use prompt_hashes::{HashSeeds, PromptHashes};
 pub use records::{decide, worker_id, worker_rank, DecisionClock, Live, PoolRecords};
 pub use shadow::SHADOW_ROWS;
 pub use sticky_sessions::{
-    SessionExpiry, SessionPins, SessionRule, SessionTable, SessionVerdict,
+    DecodeVerdict, SessionExpiry, SessionPins, SessionRule, SessionTable, SessionVerdict,
     ABSENT_WORKER_PIN_TTL_MICROS,
 };
 pub use store_backed_engine::{

@@ -434,6 +434,7 @@ mod tests {
             demands::Demands,
             framework::{Filter, Picker, TieBand},
             records::worker_id,
+            sticky_sessions::{DecodeVerdict, SessionVerdict},
             view::{Health, Identity, Role, WireModes, WorkerId},
         },
         stages::{Best, HasCapacity, StageRegistry},
@@ -1390,7 +1391,7 @@ mod tests {
                 pair: Some(Pair {
                     decode_position: at,
                     decode_id: WorkerId(decode),
-                    decode_dp_rank: 0,
+                    ..Pair::default()
                 }),
             });
         }
@@ -1452,6 +1453,47 @@ mod tests {
         tell(engine, &held, completed(Side::Encode, 1));
         tell(engine, &held, dispatched(Side::Single, 0));
         assert!(pair.words().is_empty());
+    }
+
+    /// Each side's lease states its own side's session verdict. The
+    /// prefill's is the pick's. The decode's is the one the pair of the
+    /// pick's first target keeps, whatever the prefill's is, and a claim
+    /// names that pair's decode.
+    #[test]
+    fn each_side_of_a_pair_states_its_own_session_verdict() {
+        let pair = decided(1);
+        let engine = pair.spec.engine();
+        let stated = |decode_verdict| {
+            let mut targets = Targets::new();
+            targets.push(Target {
+                id: WorkerId(1),
+                pair: Some(Pair {
+                    decode_id: WorkerId(101),
+                    decode_verdict,
+                    ..Pair::default()
+                }),
+                ..Target::default()
+            });
+            let decision = Decision::Pick(Pick {
+                targets,
+                session_verdict: SessionVerdict::Pinned,
+                ..Pick::default()
+            });
+            let issued = issue(engine, &keyed(), &decision, LeaseId(9), true);
+            let (prefill, _) = issued.expect("a pair's lease");
+            let decode = issue_decode(engine, &keyed(), &decision, &prefill, 9_900);
+            let decode = decode.expect("the decode side's lease");
+            (prefill.session_verdict, decode.session_verdict)
+        };
+        let claimed = SessionVerdict::Claimed(WorkerId(101));
+        for (kept, whole) in [
+            (DecodeVerdict::NONE, SessionVerdict::None),
+            (DecodeVerdict::PINNED, SessionVerdict::Pinned),
+            (DecodeVerdict::RESPILL, SessionVerdict::Respill),
+            (DecodeVerdict::CLAIMED, claimed),
+        ] {
+            assert_eq!(stated(kept), (SessionVerdict::Pinned, whole));
+        }
     }
 
     #[test]

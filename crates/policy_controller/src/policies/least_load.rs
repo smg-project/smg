@@ -961,7 +961,7 @@ mod tests {
             pair: Some(Pair {
                 decode_position: 0,
                 decode_id: WorkerId(2),
-                decode_dp_rank: 0,
+                ..Pair::default()
             }),
         };
         scorer.on_dispatched(&lease, &target, Side::Prefill, 0);
@@ -1037,6 +1037,7 @@ mod tests {
                 decode_position: 1,
                 decode_id: WorkerId(7),
                 decode_dp_rank: 1,
+                ..Pair::default()
             }),
         };
         ll.on_dispatched(&lease, &pair, Side::Decode, 0);

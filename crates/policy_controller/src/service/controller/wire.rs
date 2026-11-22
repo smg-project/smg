@@ -1948,6 +1948,7 @@ mod tests {
                 decode_position: 1,
                 decode_id: WorkerId(52),
                 decode_dp_rank: 3,
+                ..Pair::default()
             }),
         });
         targets.push(Target {

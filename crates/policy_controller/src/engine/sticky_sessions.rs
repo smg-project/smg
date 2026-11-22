@@ -62,6 +62,41 @@ pub enum SessionVerdict {
     Claimed(WorkerId),
 }
 
+/// A [`SessionVerdict`] without the worker a claim names: what a pair's
+/// decode side keeps of its own verdict, in a byte its pair had spare
+/// ([`Pair::decode_verdict`]). A claim names the decode the pair names, so
+/// the whole verdict is read back with that worker ([`Self::on`]).
+///
+/// It is a byte with a name for each verdict, and no enum: every value of
+/// the byte is a verdict's or reads as none, so the byte tells nothing of
+/// whether a target names a pair, and a pick is laid out as it was.
+///
+/// [`Pair::decode_verdict`]: crate::engine::decision::Pair::decode_verdict
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecodeVerdict(u8);
+
+impl DecodeVerdict {
+    /// [`SessionVerdict::None`].
+    pub const NONE: Self = Self(0);
+    /// [`SessionVerdict::Pinned`].
+    pub const PINNED: Self = Self(1);
+    /// [`SessionVerdict::Respill`].
+    pub const RESPILL: Self = Self(2);
+    /// [`SessionVerdict::Claimed`], of the decode the pair names.
+    pub const CLAIMED: Self = Self(3);
+
+    /// The whole verdict, where a claim names `worker`.
+    #[must_use]
+    pub const fn on(self, worker: WorkerId) -> SessionVerdict {
+        match self {
+            Self::PINNED => SessionVerdict::Pinned,
+            Self::RESPILL => SessionVerdict::Respill,
+            Self::CLAIMED => SessionVerdict::Claimed(worker),
+            _ => SessionVerdict::None,
+        }
+    }
+}
+
 /// The pins of one key: the preferred worker first, the failover second;
 /// `WorkerId(0)` is an empty slot.
 pub type SessionPins = [WorkerId; 2];
