@@ -417,7 +417,7 @@ pub(crate) mod tests {
                 Decided, DecisionEngine, DecisionRefused, RequestMaker, WorkerLists,
             },
             demands::{DemandFacts, Demands},
-            framework::{Picker, Place, PoolWord, TieBand},
+            framework::{Picker, Place, PoolWord, TieBand, DRAW_FROM},
             prompt_hashes::HashSeeds,
             records::worker_id,
             view::{
@@ -924,6 +924,44 @@ pub(crate) mod tests {
             Decision::Pick(pick) => assert_eq!(pick.trace.lifted, LiftedVeto::Overload),
             Decision::Shed(shed) => assert_eq!(shed.emptied_by, "not-overloaded"),
             Decision::Queue(_) => panic!("no queue is planned"),
+        }
+    }
+
+    /// Round robin under a sessions rule that leaves a new session to the
+    /// profile (`delegate`) turns one rotation for a request with no routing
+    /// key and for a new session: in turn they take the list's workers one
+    /// after the other, under the draw's floor, at it and above it. The
+    /// gateway's classic override asks its one policy for both
+    /// (`model_gateway/src/policies/round_robin.rs:142-167`): for a request
+    /// with no key at `model_gateway/src/policies/registry.rs:471` and for a
+    /// new session at `:581`.
+    #[test]
+    fn a_plain_request_and_a_new_session_share_one_rotation_under_delegate() {
+        let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+        let manual = PolicySpec::preset("manual").expect("a built-in preset");
+        document.view.headers.clone_from(&manual.view.headers);
+        let mut rule = manual.bindings[0].sessions.clone().expect("its rule");
+        rule.assignment = Assignment::Delegate;
+        document.bindings[0].sessions = Some(rule);
+        let keys = ["key-a", "key-b", "key-c", "key-d", "key-e", "key-f"];
+        for workers in [DRAW_FROM - 1, DRAW_FROM, 64] {
+            let spec = AppliedSpec::validate(&document).expect("the document validates");
+            let engine = PolicyEngine::new(spec);
+            let list = pool(workers);
+            let members = engine.pool_members(&list);
+            let mut places = Vec::new();
+            for turn in 0..12_usize {
+                let mut ask = request();
+                if turn % 2 == 1 {
+                    ask.facts.session_key = Identity::plain(keys[turn / 2]);
+                }
+                let asks = Asks::of(ask, Some(&members));
+                let decided = decided(&engine, &asks);
+                let pick = decided.decision.pick().expect("a pick");
+                places.push(pick.targets.first().expect("the target").position as usize);
+            }
+            let in_turn: Vec<usize> = (0..12).map(|turn| (places[0] + turn) % workers).collect();
+            assert_eq!(places, in_turn, "{workers} workers");
         }
     }
 
