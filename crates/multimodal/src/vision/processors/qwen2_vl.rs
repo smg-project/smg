@@ -108,7 +108,8 @@ impl Qwen2VLProcessor {
     }
 
     /// Create a processor with custom settings.
-    pub fn with_config(
+    #[cfg(test)]
+    fn with_config(
         patch_size: usize,
         merge_size: usize,
         min_pixels: usize,
