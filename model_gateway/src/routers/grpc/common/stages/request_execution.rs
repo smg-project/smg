@@ -21,6 +21,7 @@ use smg_worker::{
     metrics::writers::Metrics as WorkerMetrics,
 };
 use tokio::sync::{oneshot, watch};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
@@ -852,12 +853,14 @@ struct EncodeRace {
 /// the moment it lands and the prefill side's wait ends on it (the dispatch
 /// phase in [`dispatch_pd_sides`], the first-response phase in
 /// [`first_prefill_response_within`]) instead of running to its silence
-/// bound. `None` for an empty plan.
+/// bound. `None` for an empty plan. The jobs end with their request, as its
+/// generate streams do: a send still in flight is dropped once nothing of
+/// the request holds the watch (see [`supervise_encode_sends`]).
 #[expect(
     clippy::disallowed_methods,
     reason = "EPD encode dispatch is intentionally supervised in the background while the prefill side blocks on embedding receive."
 )]
-fn launch_encode_dispatch(encode_dispatch: EncodeDispatchPlan) -> Option<EncodeWatch> {
+pub(super) fn launch_encode_dispatch(encode_dispatch: EncodeDispatchPlan) -> Option<EncodeWatch> {
     if encode_dispatch.is_empty() {
         return None;
     }
@@ -866,7 +869,7 @@ fn launch_encode_dispatch(encode_dispatch: EncodeDispatchPlan) -> Option<EncodeW
     let sends: FuturesUnordered<_> = encode_dispatch
         .into_jobs()
         .into_iter()
-        .map(|job| tokio::spawn(async move { job.dispatch().await }))
+        .map(|job| AbortOnDropHandle::new(tokio::spawn(async move { job.dispatch().await })))
         .collect();
 
     debug!(
@@ -895,12 +898,17 @@ fn launch_encode_dispatch(encode_dispatch: EncodeDispatchPlan) -> Option<EncodeW
 /// Supervise an EPD request's encode sends: the first failure among
 /// `outcomes` goes on `failed` the moment it lands, a sibling still in
 /// flight notwithstanding; later failures are logged. Nobody listening (the
-/// side answered, or failed on its own) is fine.
+/// side answered, or failed on its own) is fine while the request holds the
+/// watch. Once nothing holds it the request is over: the supervisor goes,
+/// and the sends still in flight are dropped with `outcomes`.
 async fn supervise_encode_sends(
     mut outcomes: impl Stream<Item = Result<(), String>> + Unpin,
     failed: watch::Sender<Option<String>>,
 ) {
-    while let Some(outcome) = outcomes.next().await {
+    while let Some(outcome) = tokio::select! {
+        () = failed.closed() => None,
+        outcome = outcomes.next() => outcome,
+    } {
         let Err(failure) = outcome else {
             continue;
         };
