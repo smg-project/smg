@@ -541,6 +541,12 @@ impl RequestPipeline {
         self.grouped_dp_sticky
     }
 
+    /// Whether this pipeline's selection stage was handed a policy engine.
+    #[cfg(test)]
+    pub(crate) fn asks_policy_engine(&self) -> bool {
+        self.stages.worker_selection.asks_policy_engine()
+    }
+
     /// Ingress phase: run the request-owning stages through request building.
     async fn run_ingress(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         macro_rules! step {

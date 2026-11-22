@@ -184,6 +184,12 @@ impl WorkerSelectionStage {
         self
     }
 
+    /// Whether this stage was handed a policy engine to place by.
+    #[cfg(test)]
+    pub(crate) fn asks_policy_engine(&self) -> bool {
+        self.policy_engine.is_some()
+    }
+
     /// State whether the pair's policy settings keep a request to the worker
     /// it names ([`placement::pair_keeps_target`]).
     pub(crate) fn with_pair_keeps_target(mut self, keeps: bool) -> Self {
