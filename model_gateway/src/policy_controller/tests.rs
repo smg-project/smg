@@ -148,7 +148,8 @@ fn a_setting_no_document_says_stops_the_start_by_its_name() -> Case {
 /// document, a session rule on the policy's binding, and a gateway that
 /// decides in its own process runs it. A start over a store does not yet:
 /// it stops by the setting's name, where the rule is the override's. The
-/// manual policy's own rule starts there as before, under the override too.
+/// manual policy's own rule starts there as before, under the override too,
+/// and under a pair plan it is refused by the document's check as before.
 #[test]
 fn the_overrides_session_rule_stops_a_start_over_a_store_by_its_name() -> Case {
     let mut config = picked(RouterConfig::default());
@@ -156,7 +157,7 @@ fn the_overrides_session_rule_stops_a_start_over_a_store_by_its_name() -> Case {
     for policy in [PolicyConfig::RoundRobin, PolicyConfig::Random] {
         config.policy = policy;
         let ruled = config.policy_document_in_force()?;
-        assert!(ruled.bindings.iter().all(|b| b.sessions.is_some()));
+        assert!(ruled.states_sessions());
         let refusal = start(&config)
             .err()
             .ok_or("a start over a store took the override's rule")?;
@@ -166,12 +167,37 @@ fn the_overrides_session_rule_stops_a_start_over_a_store_by_its_name() -> Case {
             "routing_key_override.enabled = true: a gateway that follows a controller does not place by the sticky sessions' rule yet"
         );
     }
-    config.policy = PolicyConfig::Manual {
+    let manual = PolicyConfig::Manual {
         eviction_interval_secs: 60,
         max_idle_secs: 14_400,
         assignment_mode: ManualAssignmentMode::Random,
     };
+    config.policy = manual.clone();
     assert!(start(&config)?.is_some());
+
+    // A pair gateway whose sides are manual states the manual policy's own
+    // rule under a pair plan, whatever its main policy. The document's
+    // check refuses that in its own words, as it did: the override's
+    // sentence is not the reason.
+    config.policy = PolicyConfig::RoundRobin;
+    config.mode = RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: Some(manual.clone()),
+        decode_policy: Some(manual),
+    };
+    let ruled = config.policy_document_in_force()?;
+    assert!(ruled.states_sessions());
+    let refusal = start(&config)
+        .err()
+        .ok_or("a start over a store took a session rule under a pair plan")?;
+    assert!(matches!(refusal, StartError::Spec(_)), "{refusal:?}");
+    assert!(
+        refusal
+            .to_string()
+            .ends_with("sessions run under the single plan"),
+        "{refusal}"
+    );
     Ok(())
 }
 

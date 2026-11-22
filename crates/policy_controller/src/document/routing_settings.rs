@@ -184,6 +184,14 @@ pub struct RoutingKeyOverrideSettings {
     pub assignment_mode: Assignment,
 }
 
+impl RoutingKeyOverrideSettings {
+    /// The requests of one key a worker carries under the sticky override
+    /// before the key's next request is placed again. The gateway's own
+    /// sticky map and the session rule the override lands as read this one
+    /// number.
+    pub const INFLIGHT_CAP: u16 = 2;
+}
+
 /// The kinds of worker a gateway routes to. A side names its own policy or
 /// runs under the main one. The pools of a mode and their addresses are the
 /// gateway's own, and no part of this type.
@@ -1458,10 +1466,6 @@ fn override_places(policy: &PolicySettings, config: &RoutingSettings) -> bool {
     config.routing_key_override.enabled && !reads_the_key_itself
 }
 
-/// The requests of one key a worker carries under the sticky override
-/// before the next is placed again: the gateway's own count.
-const OVERRIDE_INFLIGHT_CAP: u16 = 2;
-
 /// The session rule the sticky override places a keyed request by, beside
 /// a policy that reads no key itself, as the gateway's own sticky map keeps
 /// a key:
@@ -1505,7 +1509,7 @@ fn override_rule(config: &RoutingSettings) -> Result<SessionsSpec, RoutingSettin
         ttl_s,
         sweep_s,
         assignment: assignment_mode,
-        inflight_cap: OVERRIDE_INFLIGHT_CAP,
+        inflight_cap: RoutingKeyOverrideSettings::INFLIGHT_CAP,
         issue_session_id: false,
         recovery: match assignment_mode {
             Assignment::Delegate => Recovery::Latest,
@@ -2398,6 +2402,12 @@ mod tests {
                 });
             });
             assert_eq!(written.as_ref(), Ok(&expected), "{name}");
+            let stated = |config: &RoutingSettings| {
+                let document = config.policy_document().expect("a document");
+                document.states_sessions()
+            };
+            assert!(stated(&sticky), "{name}");
+            assert!(!stated(&config(at_flag_defaults(name))), "{name}");
             let applied = validated(&expected).expect("the controller takes the document");
             assert!(applied.engine().needs().session_in_flight, "{name}");
         }
@@ -2431,7 +2441,11 @@ mod tests {
             assigned.routing_key_override.assignment_mode = assignment;
             let rule = rule(&assigned);
             assert_eq!((rule.assignment, rule.recovery), (assignment, recovery));
-            assert_eq!(rule.inflight_cap, 2, "{assignment:?}");
+            assert_eq!(
+                rule.inflight_cap,
+                RoutingKeyOverrideSettings::INFLIGHT_CAP,
+                "{assignment:?}"
+            );
         }
 
         let mut timed = sticky();

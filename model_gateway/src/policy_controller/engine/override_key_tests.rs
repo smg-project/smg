@@ -5,8 +5,10 @@
 //! ([`PolicyRegistry::sticky_key`]). The engine's own ask reads it for the
 //! decision ([`Ask::keys`]): the sessions rule pins it, and the rule's cap
 //! reads the guard's count under it. The cap compares the right count only
-//! where the two read one text, so the table below holds them to each
-//! other source by source.
+//! where the two read one text. Both take a key's suffixes off by one
+//! function. The sources' order, a value's validity and the byte cap are
+//! read by each, so the table below holds the two to each other source by
+//! source.
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use smg_policy_controller::document::{AppliedSpec, KeySource};

@@ -335,7 +335,6 @@ pub(crate) fn start_with(
     let Some(document) = document_in_force(config)? else {
         return Ok(None);
     };
-    override_over_a_store(config, &document)?;
     let stages = stages.unwrap_or_else(StageRegistry::builtin);
     // A given document may hold what its YAML does not say, a `kind` line.
     // The typed check refuses it by the door's own word before the door
@@ -343,6 +342,9 @@ pub(crate) fn start_with(
     document
         .validate_in(&stages, &config.denied_view_headers())
         .map_err(SpecRejected::Invalid)?;
+    // Behind the document's own check: a rule that check refuses keeps the
+    // check's words, as the manual policy's rule under a pair plan does.
+    override_over_a_store(config, &document)?;
     let written = serde_yaml::to_string(&document)?;
     let started = hosted(config, Some(stages), &written)?;
     info!("The policy controller is picked for this gateway");
@@ -360,16 +362,16 @@ pub(crate) fn start_with(
 /// leases, and no case holds that count to the gateway's yet. So the start
 /// stops by the setting's name there, as it did before the rule had a
 /// document.
+///
+/// `document` is one its own check took, so a rule in it runs under the
+/// single plan: the override's, or the manual policy's own, which starts
+/// over a store as before.
 fn override_over_a_store(config: &RouterConfig, document: &PolicySpec) -> Result<(), StartError> {
     use crate::config::PolicyConfig;
 
     // The manual policy states a rule of its own, under the override too.
     let own_rule = matches!(config.policy, PolicyConfig::Manual { .. });
-    let ruled = document
-        .bindings
-        .iter()
-        .any(|binding| binding.sessions.is_some());
-    if config.routing_key_override.enabled && ruled && !own_rule {
+    if config.routing_key_override.enabled && document.states_sessions() && !own_rule {
         return Err(RoutingSettingsError::UnsupportedSetting {
             setting: "routing_key_override.enabled",
             value: true.to_string(),
@@ -476,11 +478,7 @@ fn engine_for(
     // A gateway of many routers serves pairs beside single requests, and a
     // document that states a sessions rule plans none: its routers keep
     // the classic pass ([`InProcess::decides_whole`]).
-    let rule_beside_pairs = config.enable_igw
-        && document
-            .bindings
-            .iter()
-            .any(|binding| binding.sessions.is_some());
+    let rule_beside_pairs = config.enable_igw && document.states_sessions();
     let whole = !rule_beside_pairs && engine.spec().engine().single_and_fed(fed());
     if origin == DocumentOrigin::Supplied {
         // A place the engine does not pick alone is decided by its whole

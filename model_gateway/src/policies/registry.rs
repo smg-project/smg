@@ -12,7 +12,10 @@ use http::{header::HeaderName, HeaderMap};
 use openai_protocol::UNKNOWN_MODEL_ID;
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxBuildHasher;
-use smg_policy_controller::engine::{AloneProfile, Phase, Place, PolicyEngine};
+use smg_policy_controller::{
+    document::{strip_lineage, RoutingKeyOverrideSettings},
+    engine::{AloneProfile, Phase, Place, PolicyEngine},
+};
 use smg_worker::{
     identity::{
         basic::{RequestCompletionSink, Worker, WorkerType},
@@ -326,30 +329,9 @@ pub struct PolicyRegistry {
 /// A sticky key with this many of its own requests already in flight on its
 /// pinned worker (router-local, counted per replica) is bypassed and the
 /// request reassigned. Guards one conversation stacking onto its pin; total
-/// worker load is not a respill trigger.
-const STICKY_INFLIGHT_CAP: u16 = 2;
-
-/// `conv_t2_r1` -> `conv`: strip one trailing `_r<n>` retry suffix, then one
-/// trailing `_t<n>` turn suffix. A bare retry suffix is stripped too: a retry
-/// shares identity with its original regardless of turn structure.
-fn strip_lineage_suffixes(rid: &str) -> &str {
-    strip_suffix_tag(strip_suffix_tag(rid, 'r'), 't')
-}
-
-fn strip_suffix_tag(s: &str, tag: char) -> &str {
-    let Some((head, tail)) = s.rsplit_once('_') else {
-        return s;
-    };
-    let digits = match tail.strip_prefix(tag) {
-        Some(d) => d,
-        None => return s,
-    };
-    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
-        head
-    } else {
-        s
-    }
-}
+/// worker load is not a respill trigger. The number is the routing
+/// settings' own, which the session rule the override lands as reads too.
+const STICKY_INFLIGHT_CAP: u16 = RoutingKeyOverrideSettings::INFLIGHT_CAP;
 
 impl PolicyRegistry {
     /// Create a new PolicyRegistry with a default policy (no routing-key override).
@@ -528,16 +510,15 @@ impl PolicyRegistry {
 
     /// Derive the session key from a request id: trailing `_r<n>` retry and
     /// `_t<n>` turn suffixes are stripped so every turn of a conversation
-    /// shares one key. `None` when the override is disabled, there is no rid,
-    /// or the key exceeds the routing-key byte cap; a rid that is nothing but
-    /// suffix keys as itself.
+    /// shares one key (`conv_t2_r1` keys as `conv`), by the function a policy
+    /// document's sources are stripped by ([`strip_lineage`]). `None` when
+    /// the override is disabled, there is no rid, or the key exceeds the
+    /// routing-key byte cap; a rid that is nothing but suffix keys as itself.
     pub fn derive_rid_key<'a>(&self, rid: Option<&'a str>) -> Option<&'a str> {
         if !self.routing_key_override {
             return None;
         }
-        let rid = rid?;
-        let stripped = strip_lineage_suffixes(rid);
-        let key = if stripped.is_empty() { rid } else { stripped };
+        let key = strip_lineage(rid?);
         (!key.is_empty() && key.len() <= ROUTING_KEY_HINT_MAX_BYTES).then_some(key)
     }
 
@@ -556,24 +537,15 @@ impl PolicyRegistry {
         self.routing_key_headers.first()
     }
 
-    /// A key that is nothing but suffix keys as itself, like the rid path.
-    fn strip_header_key(raw: &str) -> &str {
-        let stripped = strip_lineage_suffixes(raw);
-        if stripped.is_empty() {
-            raw
-        } else {
-            stripped
-        }
-    }
-
     /// The one header-derived key: the resolved routing key, lineage-stripped
-    /// when the override is enabled, raw otherwise. Placement hands it to
+    /// when the override is enabled, raw otherwise. A key that is nothing but
+    /// suffix keys as itself, like the rid path. Placement hands it to
     /// every policy as `SelectWorkerInfo::routing_key` and the load guard
     /// counts under it, so selection and accounting agree by construction.
     pub fn sticky_header_key<'a>(&self, headers: Option<&'a HeaderMap>) -> Option<&'a str> {
         let raw = self.resolve_routing_key(headers)?;
         Some(if self.routing_key_override {
-            Self::strip_header_key(raw)
+            strip_lineage(raw)
         } else {
             raw
         })
@@ -3604,27 +3576,31 @@ mod tests {
         );
     }
 
-    /// The policy controller's strip hands the key this registry's own
-    /// strip hands: a suffix's counter has any number of digits on both.
+    /// The registry strips a key by the policy controller's own function,
+    /// for a header's key as for a request id's: one retry suffix leaves,
+    /// then one turn suffix, a suffix's counter has any number of digits,
+    /// and a key that is nothing but suffix keys as itself.
     #[test]
-    fn the_controllers_strip_hands_the_registrys_key() {
+    fn a_headers_key_and_a_request_ids_lose_the_same_suffixes() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
         let padded = "9".repeat(21);
-        for key in [
-            "conv_t2",
-            "conv_t2_r1",
-            "conv_r3",
-            "conv_t2_t3",
-            "_t1",
-            "conv_t",
-            "conv",
-            &format!("conv_t{padded}"),
-            &format!("conv_t2_r{padded}"),
+        for (sent, key) in [
+            ("conv_t2", "conv"),
+            ("conv_t2_r1", "conv"),
+            ("conv_r3", "conv"),
+            ("conv_t2_t3", "conv_t2"),
+            ("_t1", "_t1"),
+            ("conv_t", "conv_t"),
+            ("conv", "conv"),
+            (format!("conv_t{padded}").as_str(), "conv"),
+            (format!("conv_t2_r{padded}").as_str(), "conv"),
         ] {
-            assert_eq!(
-                smg_policy_controller::document::strip_lineage(key),
-                PolicyRegistry::strip_header_key(key),
-                "{key}"
-            );
+            let headers = headers_with_routing_key(sent);
+            assert_eq!(reg.sticky_header_key(Some(&headers)), Some(key), "{sent}");
+            assert_eq!(reg.derive_rid_key(Some(sent)), Some(key), "{sent}");
         }
     }
 }

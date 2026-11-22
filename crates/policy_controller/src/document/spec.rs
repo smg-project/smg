@@ -5091,6 +5091,14 @@ impl PolicySpec {
         index_matching(&self.index, model)
     }
 
+    /// Whether a binding of the document states a sessions rule.
+    #[must_use]
+    pub fn states_sessions(&self) -> bool {
+        self.bindings
+            .iter()
+            .any(|binding| binding.sessions.is_some())
+    }
+
     /// The JSON schema of the document, generated from these types: the
     /// published `policyspec.schema.json`.
     pub fn schema() -> Schema {
