@@ -4175,9 +4175,11 @@ impl NativeEncoder {
                 if let Ok(entry) = self.seed.probe(key) {
                     one = self.keep_answer(&self.seed, entry, vacancy, from, &mut answer, cache);
                 } else {
-                    // A piece the seed does not hold is merged, which is
-                    // long: the hint keeps the loop's values in registers
-                    // for the pieces the seed answers.
+                    // The seed does not hold it: the thread's table (a
+                    // copy of a piece of this batch), the learned table
+                    // or a merge answers. The hint lays the loop out for
+                    // the pieces the seed answers; all three ride the
+                    // cold edge.
                     std::hint::cold_path();
                     match cache.packed.probe(key) {
                         Ok(entry) => one = cache.packed.one_or_append(entry, &mut answer),
