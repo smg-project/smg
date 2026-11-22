@@ -1,9 +1,8 @@
 //! The gateway's value of a membership generation ([`Generation`]): the
-//! members with their routing pools ([`ModelPools`]), and the cells that
-//! keep what else the routers derive from them (the prefill and decode
-//! pairs, the window floors, the labels the workers say together, the hash
-//! ring). The registry builds one at every publish; the routing readers
-//! hand it to a request.
+//! members with their routing pools ([`ModelPools`]), and the cells for what
+//! else the routers derive (the prefill and decode pairs, the window floors,
+//! the labels the workers say together, the hash ring). The registry builds
+//! one at every publish; the routing readers hand it to a request.
 
 use std::{
     ops::Deref,
@@ -185,11 +184,10 @@ pub(crate) struct ModelLabels {
 #[derive(Debug)]
 #[repr(align(128))]
 pub struct ModelWorkerSnapshot {
-    /// The members, the routing pools projected from them ([`Self::pool`])
-    /// and, beside each pool, the cell for what the policy engine keeps of
-    /// it ([`Self::pool_members_cell`]). An engine's value is in a box of
-    /// its own: it stands on cache lines of its own, and a snapshot no
-    /// engine picks over holds the empty cells alone.
+    /// The members, their routing pools ([`Self::pool`]) and, beside each
+    /// pool, the cell for what the policy engine keeps of it
+    /// ([`Self::pool_members_cell`]): a box of its own, on cache lines of its
+    /// own, so a snapshot no engine picks over holds the empty cells alone.
     pools: ModelPools<RoutingPool, Box<PoolMembers>, { RoutingPool::COUNT }>,
     /// The compatible prefill/decode pairs per wire and pairing mode, built
     /// once from the pools above (see [`PdPairIndex`]).
