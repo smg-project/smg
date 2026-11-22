@@ -75,6 +75,7 @@ use super::{
     lease_events,
     prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
+    sticky_sessions::{shards_for_this_host, SessionTable},
     view::{fingerprint, FixedFacts, Phase, WireModes, WorkerId},
 };
 use crate::{
@@ -127,6 +128,12 @@ pub struct PolicyEngine {
     /// ([`EventSet::LEASE`]) costs a request no lease, no id and no word,
     /// and its plain requests are answered a place ([`Decided::Alone`]).
     hears: EventSet,
+    /// The session table, one for the engine's life: the pins of every key
+    /// a sessions rule placed. The document's engine reads and writes it
+    /// through a pointer ([`AppliedSpec::share_sessions`]), so a pin
+    /// outlives the document it was made under. It has the host's shards
+    /// whatever the first document rules: no table ever takes its place.
+    sessions: Arc<SessionTable>,
     /// What the affinity stages read across decisions: the host's indexes
     /// of cache events, once it handed them, and the engine's record of the
     /// prefixes it sent, one a model ([`Self::affinity`]).
@@ -261,8 +268,12 @@ impl PoolMembers {
 impl PolicyEngine {
     /// The engine of `spec`, the document in force.
     #[must_use]
-    pub fn new(spec: AppliedSpec) -> Self {
+    pub fn new(mut spec: AppliedSpec) -> Self {
         let hears = spec.engine().hears();
+        // The table takes the document's two times where the document's
+        // engine takes the pointer.
+        let sessions = Arc::new(SessionTable::new(0).with_shards(shards_for_this_host()));
+        spec.share_sessions(Arc::clone(&sessions));
         Self {
             hears,
             spec,
@@ -273,6 +284,7 @@ impl PolicyEngine {
             unheard: AtomicU64::new(0),
             upkeep_faults: AtomicU64::new(0),
             leases: OwnWord(AtomicU64::new(0)),
+            sessions,
             affinity: Affinity::default(),
             loads: task::Loads::default(),
         }
@@ -745,8 +757,7 @@ impl DecisionEngine for PolicyEngine {
     // read of a key sweeps the table. The records of sent prefixes take a
     // bounded step of the work they left waiting.
     fn sweep(&self, now: Instant) -> SweepOutcome {
-        let sessions = self.spec.engine().sessions();
-        sessions.sweep_due(self.clock.micros(now));
+        self.sessions.sweep_due(self.clock.micros(now));
         self.affinity.sweep();
         SweepOutcome::default()
     }
