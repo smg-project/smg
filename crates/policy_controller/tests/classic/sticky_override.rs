@@ -105,6 +105,11 @@ impl Row {
             "power_of_two" => PolicySettings::PowerOfTwo {
                 load_metric: LoadMetricSetting::ExpectedWait,
             },
+            "least_load" => PolicySettings::LeastLoad {
+                kv_pressure_weight: 0.15,
+                mean_prefill_tokens: 1024,
+                default_throughput: 2000.0,
+            },
             "passthrough" => PolicySettings::Passthrough,
             "bucket" => PolicySettings::Bucket {
                 balance_abs_threshold: 64,
@@ -404,10 +409,9 @@ fn a_key_goes_where_its_policy_sends_it_and_then_follows_its_pin() {
         }
         let pin = keyed.pick(Some("k1"), "m", 1);
         assert_eq!(pin, alone.pick(None, "m", 1), "{workers}: a new key");
-        // The pool turns against the pinned worker.
+        // Worker 0 is back: the policy alone goes there, and the pin stays.
         for bed in [&mut keyed, &mut alone] {
             bed.pool[0].health.healthy = true;
-            bed.pool[pin].in_flight = 200;
         }
         assert_eq!(keyed.pick(Some("k1"), "m", 2), pin, "{workers}: a pin");
         let next = keyed.pick(None, "m", 3);
@@ -695,3 +699,285 @@ pub const INLINE: &str = r#"{
     }
   ]
 }"#;
+
+/// The policies that count what they sent a worker, under the override,
+/// through the engine over a gateway's worker objects. There a request's
+/// guard says its dispatch, and no stage hears the dispatch of a request
+/// the sessions rule placed. The beds above run the engine's rows, where a
+/// host says every dispatch whole.
+#[cfg(feature = "in-process")]
+mod sends {
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    use smg_policy_controller::{
+        document::{AppliedSpec, Assignment},
+        engine::{
+            Constraints, Identity, PlacedBy, PolicyEngine, PoolMembers, Request, RequestFacts,
+            RequestMaker, WorkerLists,
+        },
+        store::GatewayId,
+        tracking::DecisionGuard,
+    };
+    use smg_worker::{
+        identity::basic::Worker,
+        load::state::{one_rank_load, LoadSnapshot},
+        test_support::ready_worker,
+    };
+
+    use super::{Outcome, Row};
+
+    const MODEL: &str = "m";
+
+    /// The engine of the settings' document for `policy` at its flags'
+    /// defaults, with the sticky override on or off.
+    fn engine(policy: &str, overridden: bool) -> PolicyEngine {
+        let row = Row {
+            name: policy.into(),
+            policy: policy.into(),
+            assignment: Assignment::Delegate,
+            workers: Vec::new(),
+            steps: Vec::new(),
+            outcome: Outcome::Sequence(Vec::new()),
+        };
+        let document = if overridden { row.spec() } else { row.alone() };
+        let document = document.expect("the settings' document");
+        PolicyEngine::new(AppliedSpec::validate(&document).expect("the document validates"))
+    }
+
+    /// A request stated ahead, with the list and the reports its host hands.
+    struct Asks<'a> {
+        request: Request<'a>,
+        members: &'a PoolMembers,
+        loads: &'a Arc<LoadSnapshot>,
+    }
+
+    impl RequestMaker for Asks<'_> {
+        fn model(&self) -> &str {
+            MODEL
+        }
+
+        fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
+            self.request
+        }
+
+        fn workers(&self) -> WorkerLists<'_> {
+            WorkerLists::Single(self.members)
+        }
+
+        fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
+            Some(self.loads)
+        }
+    }
+
+    /// A decision its host holds: its guard, the place of its first target
+    /// and who placed it.
+    type Decided<'e> = (DecisionGuard<&'e PolicyEngine>, usize, PlacedBy);
+
+    /// A gateway's side of its engines: one list of worker objects, the
+    /// reports a decision reads of them, and the requests in flight.
+    struct Host<'e> {
+        list: Arc<[Arc<dyn Worker>]>,
+        loads: Arc<LoadSnapshot>,
+        /// The instant every report was sampled at. The request `nth` is
+        /// decided and sent `nth + 1` milliseconds behind it, so no report
+        /// reflects a send.
+        start: Instant,
+        held: Vec<DecisionGuard<&'e PolicyEngine>>,
+    }
+
+    impl<'e> Host<'e> {
+        /// A list whose worker `at` reports `queued[at]` tokens waiting and
+        /// one request running, which the gateway holds on it.
+        fn new(queued: &[i32]) -> Self {
+            let list: Arc<[Arc<dyn Worker>]> = (0..queued.len())
+                .map(|at| ready_worker(&format!("http://worker-{at}:8000"), MODEL))
+                .collect();
+            for worker in list.iter() {
+                worker.increment_load();
+            }
+            let start = Instant::now();
+            Self {
+                list,
+                loads: Self::reports(start, queued),
+                start,
+                held: Vec::new(),
+            }
+        }
+
+        /// The reports of [`Self::new`], sampled at `start`.
+        fn reports(start: Instant, queued: &[i32]) -> Arc<LoadSnapshot> {
+            let reports = queued.iter().enumerate().map(|(at, &queued)| {
+                let mut report = one_rank_load(queued, 0.1, 1_000.0);
+                report.sampled_at = Some(start);
+                (format!("http://worker-{at}:8000"), report)
+            });
+            LoadSnapshot::from_loads_for_test(reports.collect())
+        }
+
+        fn at(&self, nth: u32) -> Instant {
+            self.start + Duration::from_millis(1) * (nth + 1)
+        }
+
+        /// The request `nth` of `tokens` prompt tokens under `key`, with no
+        /// key where it is empty, decided by `engine` and not sent yet.
+        fn decide(
+            &self,
+            engine: &'e PolicyEngine,
+            members: &PoolMembers,
+            (key, tokens, nth): (&'static str, u32, u32),
+        ) -> Decided<'e> {
+            let session_key = match key {
+                "" => Identity::NONE,
+                key => Identity::plain(key),
+            };
+            let asks = Asks {
+                request: Request {
+                    id: b"request",
+                    facts: RequestFacts {
+                        model: MODEL,
+                        seed: u64::from(nth),
+                        prompt_tokens: tokens,
+                        session_key,
+                        session_counted: true,
+                        ..RequestFacts::default()
+                    },
+                    constraints: Constraints::default(),
+                },
+                members,
+                loads: &self.loads,
+            };
+            let decided =
+                DecisionGuard::decide_under(engine, GatewayId::LOCAL, &asks, self.at(nth));
+            let mut guard = decided.expect("a decision");
+            let by = guard.decision().pick().expect("a pick").placed_by();
+            let place = guard.take(0).expect("the first target").position as usize;
+            (guard, place, by)
+        }
+
+        /// The dispatch of a decided request `nth` is said to its engine,
+        /// and the request stays in flight.
+        fn say(&mut self, mut guard: DecisionGuard<&'e PolicyEngine>, nth: u32) {
+            guard.dispatched(self.at(nth));
+            self.held.push(guard);
+        }
+
+        /// The gateway's own counts of a request sent to `place` under
+        /// `key`: the worker object's requests, and its requests of the key.
+        fn count(&self, place: usize, key: &str) {
+            self.list[place].increment_load();
+            if !key.is_empty() {
+                self.list[place].increment_routing_key_load(key);
+            }
+        }
+
+        /// One request decided by `engine` and sent: the place it went to
+        /// and who placed it.
+        fn send(
+            &mut self,
+            engine: &'e PolicyEngine,
+            members: &PoolMembers,
+            asked: (&'static str, u32, u32),
+        ) -> (usize, PlacedBy) {
+            let (guard, place, by) = self.decide(engine, members, asked);
+            self.say(guard, asked.2);
+            self.count(place, asked.0);
+            (place, by)
+        }
+    }
+
+    /// A pinned request is none of the requests its policy sent. Two
+    /// workers each report one request running, and the second reports
+    /// 5,000 tokens waiting. A key's first request of 1,000 tokens goes to
+    /// the first worker, placed by the policy, and its next request of
+    /// 10,000 tokens follows the pin. The policy then prices the first
+    /// worker at the 1,000 tokens it placed there and at one request more
+    /// that the gateway holds there, at the mean prompt of 1,024 tokens:
+    /// 3,048 with the running request, under the second worker's 6,024. So
+    /// a request with no key goes to the first worker. Counted as a send
+    /// of the policy's, the pinned request would price that worker at
+    /// 12,024.
+    ///
+    /// The pinned request still weighs what a request in flight weighs:
+    /// with 1,500 tokens waiting on the second worker, 2,524 in all, the
+    /// request with no key goes there.
+    ///
+    /// The gateway's policy hears of no request its sticky map placed
+    /// (`model_gateway/src/policies/registry.rs:543-546`), and prices a
+    /// request the gateway holds that it did not place at the mean prompt
+    /// (`model_gateway/src/policies/least_load.rs:802`). Its `power_of_two`
+    /// scores with the same credit
+    /// (`model_gateway/src/policies/power_of_two.rs:28`). No sheet records
+    /// either under the override with a pinned request of a stated size,
+    /// so this case states the rule.
+    #[test]
+    fn a_pinned_request_is_none_of_the_requests_its_policy_sent() {
+        for policy in ["least_load", "power_of_two"] {
+            let engine = engine(policy, true);
+            let mut host = Host::new(&[0, 5_000]);
+            let members = engine.pool_members(&host.list);
+            let first = host.send(&engine, &members, ("k1", 1_000, 0));
+            assert_eq!(first, (0, PlacedBy::Stages), "{policy}: a new key");
+            let pinned = host.send(&engine, &members, ("k1", 10_000, 1));
+            assert_eq!(pinned, (0, PlacedBy::Rule), "{policy}: its pin");
+            let (_, place, _) = host.decide(&engine, &members, ("", 1_000, 2));
+            assert_eq!(
+                place, 0,
+                "{policy}: the pinned request is no send of the policy's"
+            );
+            host.loads = Host::reports(host.start, &[0, 1_500]);
+            let (_, place, _) = host.decide(&engine, &members, ("", 1_000, 3));
+            assert_eq!(
+                place, 1,
+                "{policy}: the pinned request weighs as one in flight"
+            );
+        }
+    }
+
+    /// `least_load` under the override, which no sheet of the gateway
+    /// records, held to the gateway's rule
+    /// (`model_gateway/src/policies/registry.rs`, `select_sticky`) by a twin
+    /// engine that runs the policy alone over the same worker objects. The
+    /// twin is asked, and told a dispatch, wherever the gateway asks its
+    /// policy: at a key's first request, at a key's request with two of its
+    /// requests on its worker, and at a request with no key. It is not
+    /// asked at a pinned request and hears of none. So the two engines
+    /// hold one count of sends, and each request the policy places goes to
+    /// one worker under both, behind pinned requests of 500 to 20,000
+    /// tokens. Over three workers and over sixteen.
+    #[test]
+    fn least_load_places_under_the_override_as_the_policy_alone_places() {
+        for workers in [3, 16] {
+            let (keyed, alone) = (engine("least_load", true), engine("least_load", false));
+            let queued: Vec<i32> = (0..workers).map(|at| at * 700).collect();
+            let mut host = Host::new(&queued);
+            let members = keyed.pool_members(&host.list);
+            let twin = alone.pool_members(&host.list);
+            let (mut pinned, mut behind) = (0, 0);
+            for nth in 0..48_u32 {
+                let key = ["k0", "k1", "k2", "k3", "k4", ""][nth as usize % 6];
+                let tokens = [1_000, 12_000, 3_000, 20_000, 500][nth as usize % 5];
+                let (guard, place, by) = host.decide(&keyed, &members, (key, tokens, nth));
+                if by == PlacedBy::Rule {
+                    pinned += 1;
+                } else {
+                    let (asked, twin_place, _) = host.decide(&alone, &twin, ("", tokens, nth));
+                    assert_eq!(
+                        place, twin_place,
+                        "{workers} workers: request {nth}, {key:?}"
+                    );
+                    host.say(asked, nth);
+                    behind += u32::from(pinned > 0);
+                }
+                host.say(guard, nth);
+                host.count(place, key);
+            }
+            assert!(
+                pinned >= 8 && behind >= 8,
+                "{workers} workers: {pinned} pinned requests, {behind} placed behind one"
+            );
+        }
+    }
+}

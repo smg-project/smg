@@ -61,6 +61,7 @@ use crate::{
         decision_engine::{AlonePick, DecideOutcome, Leased, Plain, Request},
         demands::UnmetDemand,
         framework::Engine,
+        lease_events,
         records::{self, PoolRecords},
         sticky_sessions::SessionVerdict,
         view::{Constraints, Phase, RequestFacts, Session},
@@ -357,6 +358,9 @@ fn shed(
 /// on the calling thread and inside the decision's own catch. From the
 /// answer the lease is its guard's: nothing of it is filed.
 ///
+/// A pick the binding's sessions rule placed alone is issued too, and no
+/// stage hears its issue ([`lease_events::stages_hear`]).
+///
 /// Under a document that takes no word a pick has no lease: no id is
 /// taken, and its guard owes the engine nothing.
 pub(super) fn issued(
@@ -383,7 +387,7 @@ pub(super) fn issued(
             tokens: facts.prompt_tokens,
         })
     });
-    let issue = own.hears.contains(EventKind::Issued);
+    let issue = own.hears.contains(EventKind::Issued) && lease_events::stages_hear(&decision);
     if let Some(lease) = lease.as_ref().filter(|_| issue) {
         own.spec.engine().on_decision_issued(lease, &decision);
     }

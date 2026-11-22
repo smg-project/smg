@@ -445,11 +445,16 @@ impl Overlap {
 /// the profile asked, where it follows a pin of the request's key, and
 /// where its own assignment places the key.
 ///
-/// It has two readers, both in a host that keeps what a profile's stages did
+/// Two readers stand in a host that keeps what a profile's stages did
 /// with a request: the write of the record of sent prompts, and the store of
 /// a prompt in a lent token tree. Neither keeps anything behind a pick the
 /// rule placed, as a gateway's sticky map keeps a request it places from the
 /// gateway's policy.
+///
+/// A third tells a single request's lease to the stages in a gateway's own
+/// process (`lease_events::stages_hear`): no stage hears the issue or the
+/// dispatch of a pick the rule placed, and the session table hears the
+/// dispatch.
 ///
 /// The word does not cross the crate's frame: no wire message carries it,
 /// since the record is written where the decision is made.

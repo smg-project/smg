@@ -24,6 +24,14 @@ use crate::{
 /// pick on file. One that panics at another decision's issue, or at the
 /// release of a lease its decision gives up, costs that request its
 /// decision.
+///
+/// In a gateway's own process a stage hears neither the issue nor the
+/// dispatch of a single request the binding's sessions rule placed alone:
+/// a pin of the request's key followed, or the rule's own assignment. No
+/// stage placed that request, as a gateway's sticky map keeps a request it
+/// places from the gateway's policy. Its completion and its release are
+/// told as any request's. A host that tells a lease's words off its file
+/// tells every word of such a request too.
 pub trait Lifecycle: Send + Sync {
     /// The engine issued `decision` under `lease`. Its host filed the
     /// lease as it issued it, in process as behind a served controller:
@@ -107,8 +115,9 @@ pub trait Lifecycle: Send + Sync {
     /// leave, and not yet of the end of a lease whose gateway was let go: it
     /// refuses a document that names such a stage as not in this build
     /// ([`crate::document::SpecError::NotInBuild`]). A host that embeds the engine
-    /// makes every call. `false` by default: a stage that takes a call to
-    /// shed state early decides the same without it.
+    /// makes every call but the two the trait's own note names. `false` by
+    /// default: a stage that takes a call to shed state early decides the
+    /// same without it.
     fn needs_lifecycle(&self) -> bool {
         false
     }
