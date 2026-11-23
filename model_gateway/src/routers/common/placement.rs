@@ -595,13 +595,6 @@ impl Placed {
     /// prefill. [`Self::sent`] says the send. A guard dropped unsent says
     /// nothing: the answer's own drop lets its side go, which the engine
     /// hears as a release.
-    #[cfg_attr(
-        not(any(test, feature = "test-util")),
-        expect(
-            dead_code,
-            reason = "a pair route's decode guard calls it, from that route's own commit"
-        )
-    )]
     #[inline]
     pub(crate) fn ahead(&self, key: Option<&str>) -> WorkerLoadGuard {
         let worker = Arc::clone(&self.worker);

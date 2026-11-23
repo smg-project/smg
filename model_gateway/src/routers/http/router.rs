@@ -3024,6 +3024,7 @@ mod tests {
                     REASON_RETRYABLE, REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE,
                     REASON_WASM_REQUEST_HOOK,
                 },
+                placement::tests::hearing_engine_on,
                 request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
                 test_support::fast_retry_config,
             },
@@ -7414,6 +7415,37 @@ mod tests {
                 "{model}: the bytes are whole"
             );
         }
+    }
+
+    /// A typed request the policy engine placed reaches the engine by its
+    /// load guard: one dispatch where this route makes the guard, one end
+    /// where the answer's body is read and the guard dropped, and no release.
+    #[tokio::test]
+    async fn the_engine_hears_a_typed_request_by_its_load_guard() {
+        let url = spawn_sized_worker(r#"{"choices":[]}"#, "application/json").await;
+        let router = streaming_router(
+            PolicyConfig::RoundRobin,
+            1024 * 1024,
+            vec![plain_worker(&url)],
+        );
+        let heard = hearing_engine_on(&router.policy_registry);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        .unwrap();
+
+        let response = router
+            .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            ["issued", "dispatched Single", "completed Cancelled"]
+        );
     }
 
     /// The plain path ends a cut stream with its error event too, so a sized

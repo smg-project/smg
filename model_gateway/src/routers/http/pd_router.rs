@@ -137,22 +137,63 @@ fn own_failure(response: &Response) -> Option<PdSide> {
 }
 
 /// The load one admitted PD request holds. The Prefill guard is released
-/// when the Prefill phase ends; the Decode guard rides on the response body.
+/// when the Prefill phase ends; the Decode guard rides on the response body,
+/// from the decode's send on ([`DecodeAhead::sent`]).
 struct PdLoadGuards {
     prefill: PrefillLoadGuard,
-    decode: WorkerLoadGuard,
+    decode: DecodeAhead,
+}
+
+/// A pair's decode from its selection to its send: the placement's answer
+/// for the decode, and that answer's load guard made ahead of the send
+/// ([`Placed::ahead`]). The decode worker is counted from the selection on,
+/// under the key this route always counted it under.
+///
+/// Each dispatch shape sends the decode's request in one place, and says so
+/// there ([`Self::sent`]): the guard a response keeps comes out of that call
+/// alone. Where the policy engine placed the pair, it hears the decode's
+/// dispatch at that call and the decode's end where that guard is dropped. A
+/// decode that is never sent (its prefill failed, the request was refused on
+/// the way) is dropped whole: its worker is counted no more, and the engine
+/// hears its side of the pair released.
+struct DecodeAhead {
+    guard: WorkerLoadGuard,
+    answer: Placed,
+}
+
+impl DecodeAhead {
+    /// The decode `answer` names, counted from now under `key`.
+    fn new(answer: Placed, key: Option<&str>) -> Self {
+        Self {
+            guard: answer.ahead(key),
+            answer,
+        }
+    }
+
+    /// The decode worker, for what a dispatch builds ahead of the send.
+    fn worker(&self) -> &dyn Worker {
+        self.answer.worker().as_ref()
+    }
+
+    /// The decode's request goes out now: the worker it goes to, and the load
+    /// guard that holds the worker's count to the request's end.
+    fn sent(self) -> (Arc<dyn Worker>, WorkerLoadGuard) {
+        let guard = self.answer.sent(self.guard);
+        (self.answer.into_guarded_worker(), guard)
+    }
 }
 
 /// What every dispatch body sets up before its first side goes out: the two
-/// serialized sides and the two load guards taken apart, the request headers
-/// as every side is sent them (the caller's, lent while tracing is off; a copy
-/// carrying the trace context while it is on), and the
-/// prefill engine's runtime label the PD metrics are recorded under.
+/// serialized sides and the two load guards taken apart (the decode's still
+/// ahead of its send), the request headers as every side is sent them (the
+/// caller's, lent while tracing is off; a copy carrying the trace context
+/// while it is on), and the prefill engine's runtime label the PD metrics are
+/// recorded under.
 struct PdSetup<'a> {
     prefill_body: Bytes,
     decode_body: Bytes,
     prefill_guard: PrefillLoadGuard,
-    decode_guard: WorkerLoadGuard,
+    decode: DecodeAhead,
     headers_with_trace: Cow<'a, HeaderMap>,
     runtime: &'static str,
 }
@@ -167,14 +208,14 @@ impl<'a> PdSetup<'a> {
         let (prefill_body, decode_body) = side_bodies;
         let PdLoadGuards {
             prefill: prefill_guard,
-            decode: decode_guard,
+            decode,
         } = guards;
         let headers_with_trace = with_trace_context_http(headers);
         Self {
             prefill_body,
             decode_body,
             prefill_guard,
-            decode_guard,
+            decode,
             headers_with_trace,
             runtime: prefill.metadata().spec.runtime_type.as_str(),
         }
@@ -1113,7 +1154,6 @@ impl PDRouter {
                         prefill_endpoint,
                         context,
                         Arc::clone(&prefill),
-                        Arc::clone(&decode),
                         guards,
                         ledger,
                     )
@@ -1135,7 +1175,6 @@ impl PDRouter {
                     dp_rank,
                     context,
                     Arc::clone(&prefill),
-                    Arc::clone(&decode),
                     guards,
                     ledger,
                 )
@@ -1241,7 +1280,6 @@ impl PDRouter {
                 (prefill_body, decode_body),
                 context,
                 Arc::clone(&prefill),
-                Arc::clone(&decode),
                 guards,
                 &mut prefill_outcome,
                 ledger,
@@ -1593,17 +1631,12 @@ impl PDRouter {
     }
 
     // Internal method that performs the actual dual dispatch (without retry logic)
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one attempt carries both sides, their guards and who records the prefill"
-    )]
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
         side_bodies: (Bytes, Bytes),
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
-        decode: Arc<dyn Worker>,
         guards: PdLoadGuards,
         prefill_outcome: &mut PrefillOutcome,
         ledger: &AttemptLedger,
@@ -1612,7 +1645,7 @@ impl PDRouter {
             prefill_body,
             decode_body,
             prefill_guard,
-            decode_guard,
+            decode,
             headers_with_trace,
             runtime,
         } = PdSetup::new(headers, side_bodies, guards, prefill.as_ref());
@@ -1627,7 +1660,7 @@ impl PDRouter {
             None,
         );
         let decode_request = self.build_post_with_headers(
-            decode.as_ref(),
+            decode.worker(),
             context.route,
             decode_body,
             headers,
@@ -1638,7 +1671,7 @@ impl PDRouter {
         // Note: Using borrowed references avoids heap allocation
         events::RequestPDSentEvent {
             prefill_url: prefill.redacted_url(),
-            decode_url: decode.redacted_url(),
+            decode_url: decode.worker().redacted_url(),
         }
         .emit();
 
@@ -1733,6 +1766,8 @@ impl PDRouter {
             }
             Ok((dispatch_start.elapsed(), resp))
         };
+        // Both sides go out here: the decode's send is said.
+        let (decode, decode_guard) = decode.sent();
         let pd_result = tokio::try_join!(prefill_fut, decode_fut);
 
         events::RequestReceivedEvent {}.emit();
@@ -1967,7 +2002,6 @@ impl PDRouter {
         dp_rank: Option<usize>,
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
-        decode: Arc<dyn Worker>,
         guards: PdLoadGuards,
         ledger: &AttemptLedger,
     ) -> Response {
@@ -1975,7 +2009,7 @@ impl PDRouter {
             prefill_body,
             decode_body,
             prefill_guard,
-            decode_guard,
+            decode,
             headers_with_trace,
             runtime,
         } = PdSetup::new(headers, side_bodies, guards, prefill.as_ref());
@@ -1995,7 +2029,7 @@ impl PDRouter {
         let harvested = if relay {
             events::RequestPDSentEvent {
                 prefill_url: prefill.redacted_url(),
-                decode_url: decode.redacted_url(),
+                decode_url: decode.worker().redacted_url(),
             }
             .emit();
 
@@ -2114,12 +2148,15 @@ impl PDRouter {
         };
 
         let decode_request = self.build_post_with_headers(
-            decode.as_ref(),
+            decode.worker(),
             context.route,
             decode_body,
             headers,
             dp_rank,
         );
+        // The decode side goes out here, behind its prefill's answer: its
+        // send is said.
+        let (decode, decode_guard) = decode.sent();
         let decode_response = match send_with_stale_conn_retry(decode_request).await {
             Ok(response) => response,
             Err(e) => return Self::decode_transport_failed(ledger, decode.as_ref(), &e),
@@ -2158,7 +2195,6 @@ impl PDRouter {
         prefill_endpoint: &MoriIoEndpoint,
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
-        decode: Arc<dyn Worker>,
         guards: PdLoadGuards,
         ledger: &AttemptLedger,
     ) -> Response {
@@ -2166,7 +2202,7 @@ impl PDRouter {
             prefill_body,
             decode_body,
             prefill_guard,
-            decode_guard,
+            decode,
             headers_with_trace,
             runtime,
         } = PdSetup::new(headers, side_bodies, guards, prefill.as_ref());
@@ -2174,7 +2210,7 @@ impl PDRouter {
         Metrics::record_pd_kv_connector_mode(KvConnectorMode::MoriIo.metrics_label());
         events::RequestPDSentEvent {
             prefill_url: prefill.redacted_url(),
-            decode_url: decode.redacted_url(),
+            decode_url: decode.worker().redacted_url(),
         }
         .emit();
 
@@ -2187,7 +2223,7 @@ impl PDRouter {
             dp_rank,
         );
         let decode_request = self.build_post_with_headers(
-            decode.as_ref(),
+            decode.worker(),
             context.route,
             decode_body,
             headers,
@@ -2199,6 +2235,8 @@ impl PDRouter {
             prefill_request,
             self.max_payload_size,
         );
+        // The decode side goes out here, beside its prefill: its send is said.
+        let (decode, decode_guard) = decode.sent();
         let decode_side = send_with_stale_conn_retry(decode_request);
         tokio::pin!(decode_side);
 
@@ -2502,14 +2540,14 @@ impl PDRouter {
         )
         .await
         .map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
-        // The prefill's side went into its guard. The decode's guard is not
-        // made from its answer yet.
-        let (prefill, decode) = (prefill.into_guarded_worker(), decode.worker_alone_for_now());
+        // The prefill's side went into its guard. The decode's guard is made
+        // ahead of its send, and its side stays with its answer until then.
+        let pair = (prefill.into_guarded_worker(), Arc::clone(decode.worker()));
         let guards = PdLoadGuards {
             prefill: prefill_guard,
-            decode: WorkerLoadGuard::with_key(Arc::clone(&decode), sticky_key),
+            decode: DecodeAhead::new(decode, sticky_key),
         };
-        Ok(((prefill, decode), guards))
+        Ok((pair, guards))
     }
 
     /// The pair index `model_id` routes within. Shared HTTP-transport
@@ -3474,7 +3512,11 @@ mod tests {
         middleware::{test_support::json_of, ReportedRefusal},
         observability::logging::test_support::{test_subscriber, RefusalLineCounter},
         routers::{
-            common::sse::SSE_CHANNEL_BUFFER, grpc::backend_client::BasicWorkerBuilder,
+            common::{
+                placement::tests::{hearing_pairs_on, Heard},
+                sse::SSE_CHANNEL_BUFFER,
+            },
+            grpc::backend_client::BasicWorkerBuilder,
             http::test_support,
         },
         server::http_client_builder,
@@ -7647,7 +7689,6 @@ mod tests {
                     (Bytes::from_static(b"{}"), Bytes::from_static(b"{}")),
                     context,
                     Arc::clone(&prefill),
-                    Arc::clone(&decode),
                     guards,
                     &mut outcome,
                     &ledger,
@@ -7717,7 +7758,7 @@ mod tests {
                 })
                 .await;
                 let router = admission_test_router(prefill_url, decode_url);
-                let ((prefill, decode), guards) = router
+                let ((prefill, _), guards) = router
                     .select_pd_pair_with_admission(
                         UNKNOWN_MODEL_ID,
                         PlacementInputs::default(),
@@ -7739,7 +7780,6 @@ mod tests {
                             headers: None,
                         },
                         prefill,
-                        decode,
                         guards,
                         &mut outcome,
                         &AttemptLedger::default(),
@@ -7828,7 +7868,6 @@ mod tests {
                         (Bytes::from_static(b"{}"), Bytes::from_static(b"{}")),
                         context,
                         Arc::clone(&prefill),
-                        Arc::clone(&decode),
                         guards,
                         &mut outcome,
                         &ledger,
@@ -8945,6 +8984,155 @@ mod tests {
         );
     }
 
+    /// The three shapes a pair's two sides go out in. Each has its own line
+    /// where the decode side is sent.
+    #[derive(Clone, Copy, Debug)]
+    enum Sends {
+        BothAtOnce,
+        PrefillFirst,
+        ConcurrentWrite,
+    }
+
+    /// A router of one attempt over one healthy pair that is sent in `shape`,
+    /// with a policy engine placing its pairs, and what that engine's decode
+    /// stage hears (`hearing_pairs_on`).
+    async fn heard_pair_router(shape: Sends) -> (PDRouter, Heard) {
+        let router = single_attempt_router();
+        let heard = hearing_pairs_on(&router.policy_registry, false);
+        match shape {
+            Sends::BothAtOnce => register_pd_pair(
+                &router,
+                healthy_stub(Shape::Parallel, PdSide::Prefill).await,
+                healthy_stub(Shape::Parallel, PdSide::Decode).await,
+            ),
+            Sends::PrefillFirst => {
+                let prefill = healthy_stub(Shape::Sequential, PdSide::Prefill).await;
+                let decode = healthy_stub(Shape::Sequential, PdSide::Decode).await;
+                for worker in sequential_pair(prefill, decode) {
+                    router.worker_registry.register_or_replace(worker);
+                }
+            }
+            Sends::ConcurrentWrite => {
+                let (prefill, _) = spawn_moriio_prefill_stub(StubHandoff::Minted).await;
+                let decode = healthy_stub(Shape::Sequential, PdSide::Decode).await;
+                register_moriio_pair_with(
+                    &router,
+                    (prefill, Some("write")),
+                    (decode, "write"),
+                    &[CONCURRENT_WRITE],
+                );
+            }
+        }
+        (router, heard)
+    }
+
+    /// Every word the policy engine hears of one unstreamed chat request it
+    /// placed on a healthy pair that is sent in `shape`, once the answer's
+    /// body is read to its end.
+    async fn heard_of_a_served_pair(shape: Sends) -> Vec<String> {
+        let (router, heard) = heard_pair_router(shape).await;
+        let response = chat_through(&router, false).await;
+        assert_eq!(response.status(), StatusCode::OK, "{shape:?}");
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let heard = heard.lock().expect("the stage heard");
+        heard.clone()
+    }
+
+    /// Both sides at once: the engine hears the prefill's dispatch where the
+    /// selection makes its guard and the decode's where the two requests go
+    /// out, then each side's end where its guard is dropped, the prefill's at
+    /// its answer and the decode's behind the answer's body. Nothing is
+    /// released.
+    #[tokio::test]
+    async fn the_engine_hears_both_sides_of_a_pair_sent_at_once() {
+        assert_eq!(
+            heard_of_a_served_pair(Sends::BothAtOnce).await,
+            [
+                "issued",
+                "issued",
+                "dispatched Prefill",
+                "dispatched Decode",
+                "completed Cancelled",
+                "completed Cancelled",
+            ]
+        );
+    }
+
+    /// The prefill first: the engine hears the decode's dispatch where the
+    /// decode's request goes out, behind the prefill's answer, and not at the
+    /// selection, where the decode's guard is made. The prefill's guard is
+    /// dropped at its answer, ahead of that send.
+    #[tokio::test]
+    async fn the_engine_hears_the_decode_of_a_pair_sent_behind_its_prefill() {
+        assert_eq!(
+            heard_of_a_served_pair(Sends::PrefillFirst).await,
+            [
+                "issued",
+                "issued",
+                "dispatched Prefill",
+                "completed Cancelled",
+                "dispatched Decode",
+                "completed Cancelled",
+            ]
+        );
+    }
+
+    /// A MoRI-IO pair written concurrently: the engine hears the decode's
+    /// dispatch where the decode's request goes out beside its prefill's,
+    /// then the two ends as the both-at-once shape tells them.
+    #[tokio::test]
+    async fn the_engine_hears_both_sides_of_a_pair_written_concurrently() {
+        assert_eq!(
+            heard_of_a_served_pair(Sends::ConcurrentWrite).await,
+            [
+                "issued",
+                "issued",
+                "dispatched Prefill",
+                "dispatched Decode",
+                "completed Cancelled",
+                "completed Cancelled",
+            ]
+        );
+    }
+
+    /// A decode that is never sent is no dispatch: where the prefill refuses
+    /// a pair that is sent prefill first, the engine hears the prefill's
+    /// dispatch and end, and the decode's side released. The decode worker
+    /// was counted from the selection, and is counted no more.
+    #[tokio::test]
+    async fn the_engine_hears_a_decode_that_is_never_sent_as_released() {
+        let router = single_attempt_router();
+        let heard = hearing_pairs_on(&router.policy_registry, false);
+        let (prefill, _) = faulty_stub(Fault::Refuses(StatusCode::SERVICE_UNAVAILABLE)).await;
+        let decode = healthy_stub(Shape::Sequential, PdSide::Decode).await;
+        let [_, decode] = sequential_pair(prefill, decode).map(|worker| {
+            router
+                .worker_registry
+                .register_or_replace(Arc::clone(&worker));
+            worker
+        });
+
+        let response = chat_through(&router, false).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(response);
+
+        let mut heard = heard.lock().expect("the stage heard").clone();
+        heard.sort();
+        assert_eq!(
+            heard,
+            [
+                "completed Cancelled",
+                "dispatched Prefill",
+                "issued",
+                "issued",
+                "released Abandoned",
+            ]
+        );
+        assert_eq!(decode.load(), 0);
+    }
+
     /// A decode policy with a favourite: the worker at that address whenever
     /// it is among the candidates, as a policy that holds a session or a
     /// cached prefix picks one worker for one request at every attempt.
@@ -9725,7 +9913,7 @@ mod tests {
             prefill: PrefillLoadGuard::Unbounded {
                 _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
             },
-            decode: WorkerLoadGuard::with_key(Arc::clone(&decode), None),
+            decode: DecodeAhead::new(Placed::from(Arc::clone(&decode)), None),
         };
         assert_eq!((prefill.load(), decode.load()), (1, 1));
         let mut headers = HeaderMap::new();
