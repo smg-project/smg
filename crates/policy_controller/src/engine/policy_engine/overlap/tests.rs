@@ -5,7 +5,7 @@ use std::{borrow::Cow, cell::RefCell, sync::atomic::AtomicUsize, thread, time::D
 
 use kv_index::{
     compute_request_content_hashes, request_prefix_hashes, ChainBlockMap, ChainIndex, ContentHash,
-    StoredBlock,
+    GroupKind, SequenceHash, StoredBlock,
 };
 use smg_worker::test_support::ready_worker;
 
@@ -2511,4 +2511,178 @@ fn a_lower_bound_keeps_its_sweep_past_a_decider_that_holds_the_record() {
         left <= 100 - PrefixRecord::SWEEP,
         "one step of the sweep leaves {left} placements"
     );
+}
+
+/// A mask that names `numbers`, a bit a number.
+fn naming(numbers: &[u32]) -> Vec<u64> {
+    let mut mask = vec![0u64; 2];
+    for &number in numbers {
+        set(&mut mask, number as usize);
+    }
+    mask
+}
+
+/// The blocks of `hashes` as a worker's main store names them to its view:
+/// the worker's own hash of a block, here the block's prefix hash, and the
+/// block's content hash.
+fn named(hashes: &[u64]) -> Vec<(SequenceHash, ContentHash)> {
+    let contents: Vec<ContentHash> = hashes.iter().map(|&hash| ContentHash(hash)).collect();
+    let prefixes = request_prefix_hashes(&contents);
+    prefixes.into_iter().zip(contents).collect()
+}
+
+/// The numbers the index gave the first `count` workers.
+fn numbers(index: &ChainIndex, count: usize) -> Vec<u32> {
+    let number = |at| index.worker_id(&address(at)).expect("a number");
+    (0..count).map(number).collect()
+}
+
+/// On a fleet none of whose workers keeps cache groups, the lookup within
+/// groups is the chain index's own capped lookup, holder for holder, under
+/// every mask, cap and draw. Holders a host scored itself are kept by the
+/// same rule: as many, of the same depths.
+#[test]
+fn the_lookup_within_groups_is_the_plain_lookup_where_no_worker_keeps_groups() {
+    let index = ChainIndex::new();
+    let request = [1u64, 2, 3];
+    // Three blocks, two, two and one.
+    for (at, depth) in [3usize, 2, 2, 1].into_iter().enumerate() {
+        store(&index, at, &request[..depth]);
+    }
+    let all = numbers(&index, 4);
+    let groups = GroupViews::new();
+    let contents: Vec<ContentHash> = request.iter().map(|&hash| ContentHash(hash)).collect();
+    let depths = |kept: &[(u32, u32)]| {
+        let mut depths: Vec<u32> = kept.iter().map(|&(_, depth)| depth).collect();
+        depths.sort_unstable();
+        depths
+    };
+    let none: &[u32] = &[];
+    for among in [&all[..], &all[1..], none] {
+        let within = naming(among);
+        for cap in [0usize, 1, 2, 3, 16] {
+            for drawn in 0..2u32 {
+                let said = format!("{among:?}, cap {cap}, draw {drawn}");
+                let (mut plain, mut grouped) = (vec![(9, 9)], vec![(9, 9)]);
+                index.deepest_into(&request, |hash| *hash, &within, cap, |_| drawn, &mut plain);
+                let mut below = |_: u32| drawn;
+                deepest_within_groups(
+                    &index,
+                    &groups,
+                    &request,
+                    BLOCK,
+                    &within,
+                    cap,
+                    &mut below,
+                    &mut grouped,
+                );
+                assert_eq!(grouped, plain, "{said}");
+                let scores = index.find_matches(&contents, false).scores;
+                let mut scored = vec![(9, 9)];
+                deepest_of_within_groups(
+                    scores,
+                    &groups,
+                    &request,
+                    BLOCK,
+                    &within,
+                    cap,
+                    &mut below,
+                    &mut scored,
+                );
+                assert_eq!(depths(&scored), depths(&plain), "{said}");
+                let holds = |&(number, depth): &(u32, u32)| {
+                    let at = all.iter().position(|&held| held == number);
+                    at.is_some_and(|at| [3, 2, 2, 1][at] == depth) && among.contains(&number)
+                };
+                assert!(scored.iter().all(holds), "{said}: {scored:?}");
+            }
+        }
+    }
+}
+
+/// Where a worker keeps cache groups, each holder is lowered to what its
+/// groups can serve, by the index crate's own rule, before the deepest are
+/// kept. A holder lowered below another loses its place to it, and a holder
+/// lowered to nothing leaves.
+#[test]
+fn a_holder_is_lowered_to_what_its_groups_serve_before_the_deepest_are_kept() {
+    let index = ChainIndex::new();
+    let request = [1u64, 2, 3];
+    // Workers 0, 1 and 2 hold the three blocks and worker 3 holds two.
+    for (at, depth) in [3usize, 3, 3, 2].into_iter().enumerate() {
+        store(&index, at, &request[..depth]);
+    }
+    let all = numbers(&index, 4);
+    let groups = GroupViews::new();
+    // Worker 1's state group keeps the request's first block alone.
+    let first = groups.get_or_create(all[1]);
+    first.learn(1, Some(GroupKind::State), 0);
+    first.main_stored(None, &named(&request));
+    first.group_stored(1, &[named(&request)[0].0]);
+    // Worker 2's keeps a block of another prompt and none of the request.
+    let other = groups.get_or_create(all[2]);
+    other.learn(1, Some(GroupKind::State), 0);
+    other.main_stored(None, &named(&request));
+    other.main_stored(None, &named(&[9]));
+    other.group_stored(1, &[named(&[9])[0].0]);
+
+    // What the index crate's rule says each worker serves of its depth.
+    let contents: Vec<ContentHash> = request.iter().map(|&hash| ContentHash(hash)).collect();
+    let prefixes = request_prefix_hashes(&contents);
+    let served = |at: usize, depth: u32| {
+        let view = groups.get(all[at]);
+        view.map_or(depth, |view| {
+            view.cap(&prefixes, depth, BLOCK as usize).depth
+        })
+    };
+    let serves = [served(0, 3), served(1, 3), served(2, 3), served(3, 2)];
+    assert_eq!(serves, [3, 1, 0, 2]);
+
+    let within = naming(&all);
+    let lookup = |cap: usize| {
+        let mut kept = vec![(u32::MAX, 0)];
+        let mut below = |_: u32| 0u32;
+        deepest_within_groups(
+            &index, &groups, &request, BLOCK, &within, cap, &mut below, &mut kept,
+        );
+        kept.sort_unstable();
+        kept
+    };
+    // Every holder its groups leave a block, at the depth they serve.
+    assert_eq!(lookup(16), [(all[0], 3), (all[1], 1), (all[3], 2)]);
+    // The deepest two behind the lowering: worker 1 is as deep as worker 0
+    // in the index, and worker 3 takes its place.
+    assert_eq!(lookup(2), [(all[0], 3), (all[3], 2)]);
+    assert_eq!(lookup(1), [(all[0], 3)]);
+    // A worker the mask does not name is no holder.
+    let mut kept = Vec::new();
+    let mut below = |_: u32| 0u32;
+    deepest_within_groups(
+        &index,
+        &groups,
+        &request,
+        BLOCK,
+        &naming(&all[1..]),
+        16,
+        &mut below,
+        &mut kept,
+    );
+    kept.sort_unstable();
+    assert_eq!(kept, [(all[1], 1), (all[3], 2)]);
+
+    // Holders a host scored itself are lowered and kept by the same rule.
+    let scores = index.find_matches(&contents, false).scores;
+    let mut scored = vec![(u32::MAX, 0)];
+    deepest_of_within_groups(
+        scores,
+        &groups,
+        &request,
+        BLOCK,
+        &within,
+        2,
+        &mut below,
+        &mut scored,
+    );
+    scored.sort_unstable();
+    assert_eq!(scored, lookup(2));
 }

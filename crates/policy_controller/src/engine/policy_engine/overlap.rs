@@ -58,7 +58,7 @@ use std::{
 };
 
 use arc_swap::ArcSwapOption;
-use kv_index::{ChainIndex, TenantId, TokenTree};
+use kv_index::{request_prefix_hashes, ChainIndex, ContentHash, GroupViews, TenantId, TokenTree};
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smg_worker::identity::basic::Worker;
@@ -154,6 +154,130 @@ impl CacheIndex for ChainIndex {
     ) {
         Self::deepest_into(self, block_hashes, |hash| *hash, within, cap, below, kept);
     }
+}
+
+/// [`CacheIndex::deepest_into`] for a host that keeps its workers' cache
+/// groups beside its chain index.
+///
+/// On a fleet with no worker that keeps groups the chain index keeps the
+/// deepest holders itself, and nothing is allocated. Where a worker keeps
+/// cache groups, every holder's depth is first lowered to what its groups
+/// can serve ([`kv_index::WorkerGroups::cap`]), a holder lowered to nothing
+/// leaves, and the deepest are kept after.
+#[inline]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the lookup's own arguments, beside the index and its groups"
+)]
+pub fn deepest_within_groups(
+    index: &ChainIndex,
+    groups: &GroupViews,
+    block_hashes: &[u64],
+    block_size: u32,
+    within: &[u64],
+    cap: usize,
+    below: &mut dyn FnMut(u32) -> u32,
+    kept: &mut Vec<(u32, u32)>,
+) {
+    if groups.is_empty() {
+        index.deepest_into(block_hashes, |hash| *hash, within, cap, below, kept);
+        return;
+    }
+    kept.clear();
+    index.score_into(
+        block_hashes,
+        |hash| *hash,
+        false,
+        |worker, depth| {
+            if is_set(within, worker as usize) {
+                kept.push((worker, depth));
+            }
+        },
+    );
+    keep_within_groups(Some(groups), block_hashes, block_size, cap, below, kept);
+}
+
+/// [`deepest_within_groups`] over holders a host scored by an index of its
+/// own: each of `holders` is a worker's number and the count of leading
+/// blocks it holds. Those `within` names go to `kept`, which is emptied
+/// first. Each is lowered to what its groups can serve, and the deepest are
+/// kept.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the lookup's own arguments, beside the holders and their groups"
+)]
+pub fn deepest_of_within_groups(
+    holders: impl IntoIterator<Item = (u32, u32)>,
+    groups: &GroupViews,
+    block_hashes: &[u64],
+    block_size: u32,
+    within: &[u64],
+    cap: usize,
+    below: &mut dyn FnMut(u32) -> u32,
+    kept: &mut Vec<(u32, u32)>,
+) {
+    kept.clear();
+    let holders = holders.into_iter();
+    kept.extend(holders.filter(|&(worker, _)| is_set(within, worker as usize)));
+    let groups = (!groups.is_empty()).then_some(groups);
+    keep_within_groups(groups, block_hashes, block_size, cap, below, kept);
+}
+
+/// Lowers each holder of `kept` to what its cache groups can serve, where
+/// the host's workers keep `groups`, and keeps the deepest, at most `cap`.
+fn keep_within_groups(
+    groups: Option<&GroupViews>,
+    block_hashes: &[u64],
+    block_size: u32,
+    cap: usize,
+    below: &mut dyn FnMut(u32) -> u32,
+    kept: &mut Vec<(u32, u32)>,
+) {
+    if let Some(groups) = groups {
+        let table = groups.read();
+        let mut prefixes = Vec::new();
+        kept.retain_mut(|(worker, depth)| {
+            let Some(view) = table.view(*worker) else {
+                return true;
+            };
+            if prefixes.is_empty() {
+                let contents: Vec<ContentHash> =
+                    block_hashes.iter().map(|&hash| ContentHash(hash)).collect();
+                prefixes = request_prefix_hashes(&contents);
+            }
+            *depth = (*depth).min(view.cap(&prefixes, *depth, block_size as usize).depth);
+            *depth > 0
+        });
+    }
+    keep_deepest(kept, cap, below);
+}
+
+/// Keeps the deepest of `kept`, at most `cap`, as the chain index's capped
+/// lookup does: every holder of a depth that fits whole, from the deepest
+/// down, and of the depth the cap cuts as many as fit, each as likely as
+/// another by `below`, which is asked for a value under its argument.
+fn keep_deepest(kept: &mut Vec<(u32, u32)>, cap: usize, below: &mut dyn FnMut(u32) -> u32) {
+    if kept.len() <= cap {
+        return;
+    }
+    kept.sort_unstable_by_key(|&(_, depth)| std::cmp::Reverse(depth));
+    let Some(&(_, cut)) = kept.get(cap) else {
+        return;
+    };
+    // The holders of the depth the cap cuts, and those of them that fit.
+    let from = kept.partition_point(|&(_, depth)| depth > cut);
+    let until = kept.partition_point(|&(_, depth)| depth >= cut);
+    let room = cap.saturating_sub(from);
+    for taken in 0..room {
+        let left = until - from - taken;
+        if left < 2 {
+            break;
+        }
+        let left = u32::try_from(left).unwrap_or(u32::MAX);
+        let drawn = below(left).min(left - 1) as usize;
+        kept.swap(from + taken, from + taken + drawn);
+    }
+    kept.truncate(cap);
 }
 
 /// Where a host keeps its models' indexes of cache events, and its trees
