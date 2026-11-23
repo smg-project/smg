@@ -1103,11 +1103,11 @@ fn classic_single_of(
 }
 
 /// [`select_single`] over an explicit candidate slice: the entry for a caller
-/// with a candidate rule the pools cannot express, such as dropping DP-aware
-/// workers from a path that cannot pin a rank. Nobody names such a list for
-/// a classic policy. `candidates` are the caller's own part of `pool`, which
-/// the policy engine alone reads: it places the request over the pool's own
-/// list, held to that part.
+/// with a candidate rule the pools cannot express. Its one caller, the
+/// multipart transcription, hands its pool whole. Nobody names such a list
+/// for a classic policy. `candidates` are the caller's own part of `pool`,
+/// which the policy engine alone reads: it places the request over the
+/// pool's own list, held to that part.
 #[inline(always)]
 pub(crate) fn select_from(
     registry: &WorkerRegistry,

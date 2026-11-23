@@ -113,7 +113,6 @@ impl Replayed for Row {
                     window: worker.window(),
                     ..DemandFacts::default()
                 },
-                rank: None,
             });
         }
         let mut bed = Bed::new(self.shed, &pooled)?;

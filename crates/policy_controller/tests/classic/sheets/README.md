@@ -31,12 +31,12 @@ Two sheets record a rank of one worker and no worker: `minimum_tokens.json` hold
 minimum-tokens policy gives each request after each thing its rank cache is handed about the worker, and
 `sticky_rank.json` holds the rank the gateway pins each request of one grouped worker to by its sticky key.
 
-Five sheets record no policy: each holds one of the gateway's hard demands, what a request must have of the worker
+Four sheets record no policy: each holds one of the gateway's hard demands, what a request must have of the worker
 that takes it, kept before any policy runs. `retry_wire.json` holds the runtime and the transport a retry stays on,
 `media_refs.json` where a request's forwarded media references and its pixel media may go, `context_window.json`
-the two bounds a worker's context window puts on a request, `constraint_decider.json` the workers a retry may take
-once the request's constraint was decided on its first worker, and `rank_pin.json` the workers a route that pins no
-data-parallel rank leaves out. Each also holds the gateway's refusal where a demand leaves the pool nobody.
+the two bounds a worker's context window puts on a request, and `constraint_decider.json` the workers a retry may
+take once the request's constraint was decided on its first worker. Each also holds the gateway's refusal where a
+demand leaves the pool nobody.
 
 ```
 crates/policy_controller/tests/classic/sheets/
@@ -57,7 +57,6 @@ crates/policy_controller/tests/classic/sheets/
   media_refs.json
   context_window.json
   constraint_decider.json
-  rank_pin.json
 model_gateway/src/         the gateway's recorders, each a test module beside the code it runs
   policies/classic_rows.rs                                                  power_of_two.json
   policies/classic_manual_rows.rs                                           manual.json
@@ -72,7 +71,6 @@ model_gateway/src/         the gateway's recorders, each a test module beside th
   routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs   media_refs.json
   routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs   context_window.json
   routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs   constraint_decider.json
-  routers/http/router/classic_rank_rows.rs                                  rank_pin.json
   policies/classic_cache_aware_rows.rs                                      cache_aware.json
   policies/classic_sticky_override_rows.rs                                  sticky_override.json
 crates/worker/src/         the worker crate's recorders, test modules beside the load monitor
@@ -256,19 +254,18 @@ pool, which is the pool's order and no rule of the policy.
   `key-0` upward: a pairs row (`pairs` true) asks each twice and counts the keys whose two requests took one rank,
   then the others, and a spread row counts what each rank took, the largest count first. Nothing in a row draws:
   a key's rank is its hash, and the recorder runs each row twice and stops if the two runs differ.
-- **demand row of the five demand sheets:** a pool of regular workers under `round_robin`, whether a pool over on
-  every worker is shed (`shed`), and a list of requests. A worker has its `state` (`free`, `over` or `down`) and, on
-  the four sheets of the gRPC pipeline, its `runtime` and its `transport` (`grpc` or `zmq`). Each sheet adds the
+- **demand row of the four demand sheets:** a pool of regular workers under `round_robin`, whether a pool over on
+  every worker is shed (`shed`), and a list of requests. A worker has its `state` (`free`, `over` or `down`), its
+  `runtime` and its `transport` (`grpc` or `zmq`). Each sheet adds the
   registration's own words for its demand and, beside them, what the gateway reads of those words. On
   `media_refs.json`: the `mm_processor` label and a `supports_vision` label of `false`, then
   `processes_references`, `gateway_pipeline` and `vision`. On `context_window.json`: the `window` the model card
   states, absent where it states none. On `constraint_decider.json`: the three decoding labels, then `policy`,
-  `whole_turn` and `vocabulary`. On `rank_pin.json`: the `dp_rank` and `dp_size` of a registration that names a
-  rank, then `rank_registered`. A request states its demands, each absent where it has none: the `wire` of a
+  `whole_turn` and `vocabulary`. A request states its demands, each absent where it has none: the `wire` of a
   retry (a runtime and a transport), `references` with the pipeline pin of its plan (`any`, `only` the gateway's
   own pipeline, `never` it), `pixels`, `input_tokens` with `scoring_position` and `output_tokens`, and
-  `decided_on`, the place of the worker the first attempt's constraint was decided on. A row of `rank_pin.json`
-  lists no request: its one answer is a transcription's. The recorder places a request sixteen times the pool's size,
+  `decided_on`, the place of the worker the first attempt's constraint was decided on. The recorder places a
+  request sixteen times the pool's size,
   so the rotation walks every worker the demands leave it. An answer is `placed`, the places of those workers in
   the row's list, or `refused`: the response's `status`, its `code`, whether it carries `retry_after`, and its
   `message`. Nothing draws: the recorder runs each row twenty times, each time from a fresh pool and a fresh
@@ -307,7 +304,6 @@ directory. The sha256 is of the file as committed.
 | `media_refs.json` | media by reference and pixel media: the workers that process references, the pipeline a plan pins, the vision encoder, and each refusal where a demand leaves nobody | `a4935a5acd15151641b1988e234016a95fd172da` | 10 demand rows | `5c624c90b8b3195fa18b73390fb07e822b94876134c088aaccf359da6bdc7990` | `classic_hard_demand_rows.rs` |
 | `context_window.json` | the context window: the input and the completion budget each against the window, a scoring position, an unknown window, the widest window a refusal names | `a4935a5acd15151641b1988e234016a95fd172da` | 8 demand rows | `bf49bf479afab2621fa118ea07c35ff21cbbd0b06dcb499fa1d1318bd60e0f62` | `classic_hard_demand_rows.rs` |
 | `constraint_decider.json` | the constraint's decider on a retry: the workers that decide a constraint as the first attempt's worker did, and the pool's answer where none is left | `a4935a5acd15151641b1988e234016a95fd172da` | 5 demand rows | `5008922d28db1276f4a202de44b24935b8f10fe8d3581a0e9483d597358493c0` | `classic_hard_demand_rows.rs` |
-| `rank_pin.json` | the rank rule of a route that pins no rank: the workers that registered a data-parallel rank are left out, and the refusal where every worker registered one | `a4935a5acd15151641b1988e234016a95fd172da` | 11 demand rows | `774c494485af59153ef9579acde444459bc37f001741b7da95903679151c59f7` | `classic_rank_rows.rs` |
 | `cache_aware.json` | cache aware in single placement, under each of its three matchers: a holder kept, the count gate and its spill, its factor under the command line's defaults, a margin under its floor, a miss, a match at the threshold, a holder tried or not usable, the two KV gates, a request that ends, the blocks a worker stores and removes | `bfe189b332349c44cf7e3b6e1102a9b5a2699d9d` | 28: 26 sequence, 2 drawn | `f13a642dc9252e0328f8092b3ff322a03f270d918311c3b5c5dd29979ab8f085` | `classic_cache_aware_rows.rs` |
 | `sticky_override.json` | the routing-key override over a policy that reads no key: a pin under the cap and under its model, a key seen first under the map's modes and under `delegate`, each pin order after a failover, and at the cap a pin that follows, a pick on the pinned worker again, a pick on a worker at the cap, every worker at the cap, no other worker routable | `26f90083091e4dd791420febd88beda3bef3faac` | 18: 14 sequence, 4 drawn | `d74b5e3c8a31b4f1c8cd55cef5629acad0659658c830d937f94b056e9580562b` | `classic_sticky_override_rows.rs` |
 
@@ -342,7 +338,6 @@ The overload and minimum-tokens sheets' recorders are tests of the worker crate:
 | `media_refs.json` | `worker_selection::classic_hard_demand_rows` |
 | `context_window.json` | `worker_selection::classic_hard_demand_rows` |
 | `constraint_decider.json` | `worker_selection::classic_hard_demand_rows` |
-| `rank_pin.json` | `router::classic_rank_rows` |
 | `cache_aware.json` | `policies::classic_cache_aware_rows` |
 | `sticky_override.json` | `policies::classic_sticky_override_rows` |
 
@@ -360,8 +355,7 @@ recorder's own repeat of the hand-over the monitor's poll loop makes, and each r
 which the policy forwards to. The sticky rank sheet's recorder is a child of the stage that sends a request to its
 worker, and calls the stage's own pin. The four demand sheets of the gRPC pipeline share one recorder, a child of the
 worker selection stage: it calls the two functions a first attempt and a retry both call for a single worker, the
-selection and the refusal where it names nobody, and writes one sheet a demand. The rank sheet's recorder is a
-child of the HTTP router and calls the transcription route's own selection.
+selection and the refusal where it names nobody, and writes one sheet a demand.
 
 A sheet is never edited by hand. A new recording replaces the whole sheet and its row in the table above, in one
 pull request that names the commit and says which rows moved: a sequence row moves only when the policy's
@@ -379,7 +373,7 @@ cargo test -p smg-policy-controller --features ingest,in-process,worker-host --t
 A few rows of each sheet a module replays are also copied into the crate's test source, and the replay holds each
 copy to its sheet.
 
-`retry_wire.json`, `media_refs.json`, `context_window.json`, `rank_pin.json`, `sticky_rank.json` and
+`retry_wire.json`, `media_refs.json`, `context_window.json`, `sticky_rank.json` and
 `encode_pair.json` replay over worker objects, which the `in-process` feature brings. The encode sheet's fleets are
 decided by the engine's entry for an encode request over three lists of worker objects.
 
@@ -472,6 +466,3 @@ fails once the reason no longer holds.
 - `media_refs.json`, `context_window.json`: every row replays.
 - `constraint_decider.json`: owed whole. No module replays this sheet yet, and the replay names it as owed
   until the change that brings its module.
-- `rank_pin.json`: every row replays, each worker stating whether it registered a rank (`rank_registered`) and
-  each request that no rank can be pinned for it. A worker's object registers the `dp_rank` and `dp_size` its row
-  records.
