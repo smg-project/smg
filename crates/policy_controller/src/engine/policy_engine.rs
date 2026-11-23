@@ -796,11 +796,8 @@ impl PolicyEngine {
     ///
     /// [`DecisionRefused::Faulted`] where the decision panicked.
     #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the controller's service calls it once it decides by this engine"
-        )
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "a controller's deciding thread calls it")
     )]
     pub(crate) fn decide_decode_without_lease(
         &self,

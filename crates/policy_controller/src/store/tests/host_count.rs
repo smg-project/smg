@@ -14,7 +14,9 @@ use std::{
 
 use parking_lot::Mutex;
 
-use super::{booking, done, facts, followed, issue_pair, on, pair, ready, LeaseRecord, Session};
+use super::{
+    booking, chosen_pair, done, facts, followed, issue_pair, on, pair, ready, LeaseRecord, Session,
+};
 use crate::{
     engine::{
         decision::{Target, Targets},
@@ -430,6 +432,65 @@ fn every_door_of_the_leases_steps_a_sessions_count_with_its_lease() {
     assert_eq!(keyed(), [0, 2, 0], "a restore");
     assert_eq!(leases.drop_gateways(&[gateway]), [2]);
     assert_eq!(keyed(), [0, 0, 0], "a gone gateway");
+    assert!(counts.iter().all(|kept| kept.held() == 0));
+}
+
+/// A pair's side steps its session's count where it steps its own. A
+/// decode side that stands chosen books no session: its own dispatch
+/// books it. One side's end gives up that side's session alone, while the
+/// other side stands.
+#[test]
+fn a_pairs_side_steps_its_sessions_count_at_its_own_dispatch_and_end() {
+    let store = MemoryStore::new();
+    let workers = ["http://p:1", "http://d:1"].map(|key| ready(&store, key));
+    let counts = workers.map(|id| handed(&store, id));
+    let [p, _] = workers;
+    let keyed = || counts.each_ref().map(|kept| kept.of(KEY));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+
+    let (record, mut decode) = chosen_pair(id.0, p, &[workers[1]], now);
+    decode.session = KEY;
+    issue_pair(leases, (of_session(record, KEY), decode)).expect("the key is free");
+    assert_eq!(keyed(), [1, 0], "a chosen decode side books no session");
+    assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
+    assert!(leases.dispatched(gateway, id, on(Side::Decode, 0), now));
+    assert_eq!(keyed(), [1, 1], "a chosen decode side's own dispatch");
+    let gone = ReleaseReason::ClientGone;
+    assert!(leases.released(gateway, id, Some(Side::Decode), gone));
+    assert_eq!(keyed(), [1, 0], "the decode side's end");
+    assert!(leases.released(gateway, id, Some(Side::Prefill), gone));
+    assert_eq!(keyed(), [0, 0], "the prefill side's end");
+    assert!(counts.iter().all(|kept| kept.held() == 0));
+}
+
+/// A decode call's issue books the side's session on the worker it names,
+/// and the issue taken back gives it up: the prefill side's stands.
+#[cfg(feature = "controller")]
+#[test]
+fn a_decode_issue_taken_back_gives_up_its_sessions_count() {
+    let store = MemoryStore::new();
+    let workers = ["http://p:1", "http://d:1", "http://e:1"].map(|key| ready(&store, key));
+    let counts = workers.map(|id| handed(&store, id));
+    let [p, d, e] = workers;
+    let keyed = || counts.each_ref().map(|kept| kept.of(KEY));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+
+    let (record, mut decode) = chosen_pair(id.0, p, &[d], now);
+    decode.session = KEY;
+    issue_pair(leases, (of_session(record, KEY), decode)).expect("the key is free");
+    assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
+    let mut issued = super::decode_side(e);
+    issued.session = KEY;
+    assert_eq!(leases.issue_decode(gateway, id, issued, now), Ok(()));
+    assert_eq!(keyed(), [1, 0, 1], "a decode call's issue");
+    assert!(store.take_back_decode(gateway, id, ReleaseReason::Abandoned));
+    assert_eq!(keyed(), [1, 0, 0], "the issue taken back");
+    assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
+    assert_eq!(keyed(), [0, 0, 0], "a release of every side");
     assert!(counts.iter().all(|kept| kept.held() == 0));
 }
 

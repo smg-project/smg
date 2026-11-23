@@ -175,9 +175,9 @@ fn tell(world: &StoreSnapshot, found: &Sides, said: Said, listed: &impl Fn(Worke
 /// instant. A side filed later is told here under its
 /// lease dated `at`, the instant of that filing as its caller states it.
 /// A served controller files a side later for a pair whose frame stated
-/// the later decode: at the dispatch that sends the side with no call,
-/// dated by the read of that dispatch's frame. It serves no decode call
-/// yet: on the day it does, the date is the decider's read at the call.
+/// the later decode: at its decode call, dated by the decider's read at
+/// the call, or at the dispatch that sends the side with no call, dated by
+/// the read of that dispatch's frame.
 /// The lease on file keeps the instant of the pair's first decision for
 /// its other words.
 ///
@@ -185,7 +185,7 @@ fn tell(world: &StoreSnapshot, found: &Sides, said: Said, listed: &impl Fn(Worke
 /// its newest as a clock that went back, and ends what it passed. So a
 /// later issue bears neither the instant of that first decision nor the
 /// date a gateway gives a dispatch.
-fn issued_later(
+pub(crate) fn issued_later(
     world: &StoreSnapshot,
     engine: &Engine,
     lease: &Lease,

@@ -158,8 +158,8 @@ use tonic::{transport::Endpoint, Code};
 /// one.
 const READS_KEPT_LOADS: bool = false;
 
-/// A controller decides no prefill whose plan pairs no side, no decode call
-/// and no encode request yet.
+/// A controller decides no prefill whose plan pairs no side, no decode frame
+/// that names no lease and no encode request yet.
 const DECIDES_PHASES: bool = false;
 
 /// A new document's engine starts with no session pin yet: a pinned key is
