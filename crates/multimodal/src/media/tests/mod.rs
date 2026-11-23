@@ -315,12 +315,11 @@ use futures::stream;
 use super::{
     checked_payload_length, collect_http_body_with_limit, decode_base64_with_limit,
     decoder_unavailable, effective_sample_fps, ensure_input_byte_limit,
-    expected_sampled_frame_count, expected_stdout_bytes, fallback_failed, fps_filter_for_metadata,
-    is_video_budget_error, parse_ffmpeg_duration_seconds, parse_ffprobe_video_info,
-    parse_ppm_stream, read_file_with_limit, run_video_command_output, split_png_stream,
-    video_metadata_from, video_temp_suffix, write_temp_video_file, FrameSampling, MediaConnector,
-    MediaConnectorConfig, MediaConnectorError, MediaSource, ProbedVideoInfo, VideoFetchConfig,
-    VideoMetadata,
+    expected_sampled_frame_count, fallback_failed, fps_filter_for_metadata, is_video_budget_error,
+    parse_ffmpeg_duration_seconds, parse_ffprobe_video_info, parse_ppm_stream,
+    read_file_with_limit, run_video_command_output, split_png_stream, video_metadata_from,
+    video_temp_suffix, write_temp_video_file, FrameSampling, MediaConnector, MediaConnectorConfig,
+    MediaConnectorError, MediaSource, ProbedVideoInfo, VideoFetchConfig, VideoMetadata,
 };
 use crate::error::MediaFault;
 
@@ -458,14 +457,13 @@ fn ffprobe_metadata_prefers_short_video_stream_over_long_container() {
         container_frames: info.container_frames,
         from_container: false,
     };
-    assert_eq!(expected_sampled_frame_count(metadata, cfg), 4);
+    assert_eq!(expected_sampled_frame_count(metadata, cfg), Some(4));
     assert_eq!(fps_filter_for_metadata(metadata, cfg), "fps=4.000000");
-    assert_eq!(expected_stdout_bytes(None, metadata, 4096), 4096);
     let unknown = VideoMetadata {
         duration_seconds: None,
         ..metadata
     };
-    assert_eq!(expected_stdout_bytes(None, unknown, 4096), 0);
+    assert_eq!(expected_sampled_frame_count(unknown, cfg), None);
 }
 
 #[test]
@@ -585,7 +583,7 @@ async fn a_refused_output_reservation_ends_the_decode() {
     let command = tokio::process::Command::new(dir.path().join("ffmpeg"));
     let error = run_video_command_output(command, "ffmpeg", usize::MAX)
         .await
-        .expect_err("no allocator gives usize::MAX bytes");
+        .expect_err("a reservation of usize::MAX bytes is refused");
     assert_eq!(error.fault(), MediaFault::Internal);
     assert!(is_video_budget_error(&error), "{error}");
 }

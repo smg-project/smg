@@ -3418,15 +3418,25 @@ fn is_video_budget_error(error: &MediaConnectorError) -> bool {
         || is_out_of_memory(error)
 }
 
-/// `true` for a decoder command that was refused memory: the reservation of
-/// its output ([`run_video_command_output`]), or a pipe the system could not
-/// serve. Where the error of a frame runner decides a fallback, this one ends
-/// the decode by rule: no next runner, no sequential pass after the seeks, no
-/// resampling after a resized selection. The probes handle their own errors.
-/// It reads the kind, which is what
-/// [`MediaConnectorError::fallback_failed`] keeps of such an error.
+/// `true` for a decode that was refused memory: one of its reservations
+/// ([`out_of_memory`]), or a pipe the system could not serve. Where the error
+/// of a frame runner decides a fallback, this one ends the decode by rule: no
+/// next runner, no sequential pass after the seeks, no resampling after a
+/// resized selection. The probes handle their own errors. It reads the kind,
+/// which is what [`MediaConnectorError::fallback_failed`] keeps of such an
+/// error.
 fn is_out_of_memory(error: &MediaConnectorError) -> bool {
     matches!(error, MediaConnectorError::DecodeIo(io) if io.kind() == std::io::ErrorKind::OutOfMemory)
+}
+
+/// The error of a reservation the allocator refused, which is this process's:
+/// a command's output, the joined output of the seek runs, the raw runner's
+/// frame records.
+fn out_of_memory(message: String) -> MediaConnectorError {
+    MediaConnectorError::DecodeIo(std::io::Error::new(
+        std::io::ErrorKind::OutOfMemory,
+        message,
+    ))
 }
 
 /// Runs a decoder command to completion under the video process timeout. A
@@ -3456,9 +3466,8 @@ async fn run_video_command_output(
 
     let mut stdout = Vec::new();
     stdout.try_reserve_exact(stdout_bytes).map_err(|e| {
-        MediaConnectorError::DecodeIo(std::io::Error::new(
-            std::io::ErrorKind::OutOfMemory,
-            format!("failed to reserve {stdout_bytes} bytes for the {program} output: {e}"),
+        out_of_memory(format!(
+            "failed to reserve {stdout_bytes} bytes for the {program} output: {e}"
         ))
     })?;
     command
@@ -3525,10 +3534,10 @@ async fn decode_video_with_ffmpeg_ppm(
 ) -> Result<DecodedRgbVideo, MediaConnectorError> {
     let frame_args = FfmpegFrameArgs::for_metadata(selection, metadata, cfg).await?;
     let frame_size = rawvideo_frame_size(metadata.width, metadata.height)?;
-    let target_frames = selection.map_or_else(
-        || expected_sampled_frame_count(metadata, cfg),
-        FrameSelection::unique_count,
-    );
+    let counted = selection
+        .map(FrameSelection::unique_count)
+        .or_else(|| expected_sampled_frame_count(metadata, cfg));
+    let target_frames = counted.unwrap_or(cfg.max_frames);
     let decoded_bytes = checked_decoded_rgb_bytes(target_frames, frame_size)?;
     let output_limit = decoded_bytes
         .checked_add(target_frames.saturating_mul(64))
@@ -3549,7 +3558,21 @@ async fn decode_video_with_ffmpeg_ppm(
         "rgb24",
         "pipe:1",
     ]);
-    let stdout_bytes = expected_stdout_bytes(selection, metadata, output_limit);
+    // A count that is only the frame ceiling states no size, so that a few
+    // frames do not reserve the ceiling. Without a selection the decoder's
+    // frame count is that ceiling, and it ends at the output limit only after
+    // the frame that reaches it: below the ceiling, one frame past the limit
+    // can arrive.
+    let past_limit = if selection.is_none() && target_frames < cfg.max_frames {
+        frame_size.saturating_add(64)
+    } else {
+        0
+    };
+    let stdout_bytes = counted.map_or(0, |_| {
+        output_limit
+            .saturating_add(past_limit)
+            .min(video_max_decoded_bytes())
+    });
     let output = run_video_command_checked(command, "ffmpeg", stdout_bytes).await?;
 
     let mut video = parse_ppm_rgb_video(Bytes::from(output.stdout))?;
@@ -3579,10 +3602,10 @@ async fn decode_video_with_ffmpeg_raw(
 ) -> Result<DecodedRgbVideo, MediaConnectorError> {
     let frame_args = FfmpegFrameArgs::for_metadata(selection, metadata, cfg).await?;
     let frame_size = rawvideo_frame_size(metadata.width, metadata.height)?;
-    let target_frames = selection.map_or_else(
-        || expected_sampled_frame_count(metadata, cfg),
-        FrameSelection::unique_count,
-    );
+    let counted = selection
+        .map(FrameSelection::unique_count)
+        .or_else(|| expected_sampled_frame_count(metadata, cfg));
+    let target_frames = counted.unwrap_or(cfg.max_frames);
     let decoded_bytes = checked_decoded_rgb_bytes(target_frames, frame_size)?;
     let output_limit = decoded_bytes.to_string();
     // Rawvideo has no per-frame header, so stdout is framed by the metadata's
@@ -3606,14 +3629,15 @@ async fn decode_video_with_ffmpeg_raw(
         "rgb24",
         "pipe:1",
     ]);
-    let stdout_bytes = expected_stdout_bytes(selection, metadata, decoded_bytes);
+    // Headerless output ends at its limit, which is its size: nothing passes it.
+    let stdout_bytes = counted.map_or(0, |_| decoded_bytes);
     let output = run_video_command_checked(command, "ffmpeg", stdout_bytes).await?;
 
     let frame_count = output.stdout.len() / frame_size;
     checked_decoded_rgb_bytes(frame_count, frame_size)?;
     let mut frames = Vec::new();
     frames.try_reserve(frame_count).map_err(|e| {
-        MediaConnectorError::VideoDecode(format!(
+        out_of_memory(format!(
             "failed to reserve {frame_count} decoded video frame records: {e}"
         ))
     })?;
@@ -4009,7 +4033,7 @@ async fn decode_video_with_ffmpeg_seek(
     let mut data = Vec::new();
     data.try_reserve(expected_bytes.saturating_add(selection.unique_count().saturating_mul(64)))
         .map_err(|e| {
-            MediaConnectorError::VideoDecode(format!(
+            out_of_memory(format!(
                 "failed to reserve {expected_bytes} bytes for the decoded video frames: {e}"
             ))
         })?;
@@ -4136,36 +4160,17 @@ fn fps_filter_for_metadata(metadata: VideoMetadata, cfg: VideoFetchConfig) -> St
         .unwrap_or_else(|| format!("fps={}", cfg.sample_fps))
 }
 
-fn expected_sampled_frame_count(metadata: VideoMetadata, cfg: VideoFetchConfig) -> usize {
-    if let Some(duration) = metadata.duration_seconds {
-        if duration.is_finite() && duration > 0.0 {
-            return (duration * cfg.sample_fps)
-                .round()
-                .clamp(cfg.min_frames as f64, cfg.max_frames as f64) as usize;
-        }
-    }
-    cfg.max_frames
-}
-
-/// The size a runner states for its command's stdout: `bytes` when the frames
-/// behind it are a selection's or a duration's, 0 (not known) when
-/// [`expected_sampled_frame_count`] gave only the frame ceiling of a clip
-/// whose length the probe did not give, so that a few frames do not reserve
-/// the ceiling.
-fn expected_stdout_bytes(
-    selection: Option<&FrameSelection>,
-    metadata: VideoMetadata,
-    bytes: usize,
-) -> usize {
-    let counted = selection.is_some()
-        || metadata
-            .duration_seconds
-            .is_some_and(|duration| duration.is_finite() && duration > 0.0);
-    if counted {
-        bytes
-    } else {
-        0
-    }
+/// The frames a clip is resampled to by its duration; `None` for a clip whose
+/// length the probe did not give, which is held to the frame ceiling alone.
+fn expected_sampled_frame_count(metadata: VideoMetadata, cfg: VideoFetchConfig) -> Option<usize> {
+    let duration = metadata
+        .duration_seconds
+        .filter(|duration| duration.is_finite() && *duration > 0.0)?;
+    Some(
+        (duration * cfg.sample_fps)
+            .round()
+            .clamp(cfg.min_frames as f64, cfg.max_frames as f64) as usize,
+    )
 }
 
 fn effective_sample_fps(duration_seconds: Option<f64>, cfg: VideoFetchConfig) -> f64 {
