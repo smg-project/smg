@@ -53,30 +53,16 @@ impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
         self.lead.term() == Some(self.term)
     }
 
-    /// A verdict's write, under the fences. The status that stands on the
-    /// row goes back to the registry, which sets a lagging object to it.
+    /// A verdict's write, run under the fences of a health write: the lead,
+    /// read before the object's mutation lock and again under it, the
+    /// object the holder laid, and the revision that object was built from.
+    /// The status that stands on the row goes back to the registry, which
+    /// sets a lagging object to it.
     fn write(
         &self,
         worker_id: &ObjectId,
         revision: u64,
         write_row: impl FnOnce(&S, RowRevision) -> HealthWrite,
-    ) -> HealthWrite {
-        self.fenced(worker_id, revision, |store, standing| {
-            let write = write_row(store, standing);
-            (write, write.stands().map(status))
-        })
-    }
-
-    /// Runs `write_row` under the fences of a health write: the lead, read
-    /// before the object's mutation lock and again under it, the object
-    /// the holder laid, and the revision that object was built from. The
-    /// closure answers its write, and the status the registry sets the
-    /// object to where it sets one.
-    fn fenced(
-        &self,
-        worker_id: &ObjectId,
-        revision: u64,
-        write_row: impl FnOnce(&S, RowRevision) -> (HealthWrite, Option<ObjectStatus>),
     ) -> HealthWrite {
         if !self.leads() {
             return HealthWrite::Stale;
@@ -90,7 +76,8 @@ impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
             let Some(standing) = self.objects.standing_of(worker_id, object) else {
                 return (HealthWrite::Stale, None);
             };
-            write_row(self.store.as_ref(), standing)
+            let write = write_row(self.store.as_ref(), standing);
+            (write, write.stands().map(status))
         };
         self.objects
             .registry()
