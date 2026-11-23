@@ -4362,6 +4362,9 @@ struct BindingContext<'a> {
     /// The profiles whose built picker leaves the placement to a sessions
     /// rule ([`Picker::by_assignment`]), by name.
     by_assignment: &'a [&'a str],
+    /// Whether the host makes the lifecycle's calls
+    /// ([`StageRegistry::makes_lifecycle_calls`]).
+    lifecycle: bool,
 }
 
 fn check_bounds<T>(bounds: &Bounds<T>, at: &At) -> Result<(), SpecError>
@@ -4911,6 +4914,16 @@ fn check_binding(
             }
         }
     }
+    // A host that makes some lifecycle calls only keeps one session verdict
+    // for a pair's lease: its decode side's dispatch would settle that
+    // side's claim by the prefill side's word. A rule under the pair plan
+    // is not in such a host's build.
+    if b.sessions.is_some() && b.plan.unwrap_or_default() == PlanName::PdPair && !cx.lifecycle {
+        deferred.note(
+            at.field("sessions"),
+            "the session verdict a pair's decode side keeps of its own",
+        );
+    }
     if let (Some(binding), Some(sessions)) = (built.as_mut(), &b.sessions) {
         let rule = session_rule(sessions, cx.index, binding.plan)?;
         needs.active_sessions |= rule.assignment == Assignment::MinGroup;
@@ -5264,6 +5277,7 @@ impl PolicySpec {
                 live_profiles: &live_profiles,
                 scoped_stages: &scoped_stages,
                 by_assignment: &by_assignment,
+                lifecycle: catalog.makes_lifecycle_calls(),
             };
             if let Some(built) = check_binding(binding, &cx, &mut needs, &mut deferred)? {
                 if binding
@@ -8190,6 +8204,36 @@ mod tests {
             r#"{"apiVersion":"smg.policy/v1","profiles":{"sticky":{"pick":"manual"}},"bindings":[{"profile":"sticky"}]}"#,
         );
         assert!(single.validate().is_ok());
+    }
+
+    /// A host that makes some lifecycle calls only keeps one session
+    /// verdict for the two sides of a pair's lease. A sessions rule under
+    /// the pair plan is not in its build, by the rule's place. The same
+    /// rule under the single plan is, and so is a pair under no rule.
+    #[test]
+    fn a_pairs_sessions_rule_is_not_in_the_build_of_a_host_with_one_verdict_a_lease() {
+        let (whole, some) = (
+            StageRegistry::builtin(),
+            StageRegistry::builtin().without_lifecycle(),
+        );
+        let rule = r#"{"sticky_header":"x-session-id","inflight_cap":65535}"#;
+        let pair = format!(
+            r#"{{"plan":"pd-pair","profiles":{{"prefill":"q","decode":"q"}},"sessions":{rule}}}"#
+        );
+        let pair = spec_with_binding(&pair);
+        assert!(pair.validate_in(&whole, &[]).is_ok());
+        assert_eq!(
+            pair.validate_in(&some, &[]).err(),
+            Some(SpecError::NotInBuild {
+                path: "bindings[0].sessions".to_string(),
+                what: "the session verdict a pair's decode side keeps of its own",
+            })
+        );
+        let single = spec_with_binding(&format!(r#"{{"profile":"q","sessions":{rule}}}"#));
+        assert!(single.validate_in(&some, &[]).is_ok());
+        let unruled =
+            spec_with_binding(r#"{"plan":"pd-pair","profiles":{"prefill":"q","decode":"q"}}"#);
+        assert!(unruled.validate_in(&some, &[]).is_ok());
     }
 
     /// A sessions rule runs under the single plan, and on the two sides of
