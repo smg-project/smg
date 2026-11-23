@@ -1,7 +1,11 @@
 //! Jobs the gateway runs through its control plane. The application context
 //! runs the workflows and handles their reservations and cancel marks.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use dashmap::DashSet;
@@ -98,6 +102,10 @@ pub enum Job {
 }
 
 impl Job {
+    /// The type names of the tokenizer jobs: their status route reads them.
+    pub(crate) const ADD_TOKENIZER_TYPE: &str = "AddTokenizer";
+    pub(crate) const REMOVE_TOKENIZER_TYPE: &str = "RemoveTokenizer";
+
     /// Get job type as string for logging
     pub fn job_type(&self) -> &'static str {
         match self {
@@ -110,8 +118,8 @@ impl Job {
             Job::RegisterMcpServer { .. } => "RegisterMcpServer",
             Job::AddWasmModule { .. } => "AddWasmModule",
             Job::RemoveWasmModule { .. } => "RemoveWasmModule",
-            Job::AddTokenizer { .. } => "AddTokenizer",
-            Job::RemoveTokenizer { .. } => "RemoveTokenizer",
+            Job::AddTokenizer { .. } => Self::ADD_TOKENIZER_TYPE,
+            Job::RemoveTokenizer { .. } => Self::REMOVE_TOKENIZER_TYPE,
         }
     }
 
@@ -127,8 +135,8 @@ impl Job {
             | "RegisterMcpServer"
             | "AddWasmModule"
             | "RemoveWasmModule"
-            | "AddTokenizer"
-            | "RemoveTokenizer" => worker_url.to_string(),
+            | Self::ADD_TOKENIZER_TYPE
+            | Self::REMOVE_TOKENIZER_TYPE => worker_url.to_string(),
             _ => WorkerJob::shown_key(job_type, worker_url),
         }
     }
@@ -544,6 +552,7 @@ impl JobHost for AppContext {
                 // or discovery registration of the same URL read none, so no
                 // other kind can consume a mark meant for the POST's job.
                 if take_mark(run.cancelled_before_start, run.own_id) {
+                    run.ended_by_delete.store(true, Ordering::Relaxed);
                     return Err("Registration cancelled before it started".to_string());
                 }
                 let engines = workflow_engines(context)?;
@@ -571,6 +580,9 @@ impl JobHost for AppContext {
                 // no state to cancel and left its mark: the workflow just
                 // started is cancelled here, and the wait below ends with it.
                 if take_mark(run.cancelled_before_start, run.own_id) {
+                    // The `DELETE` is answered already: whatever the cancel
+                    // and the wait below return, a `DELETE` ended this job.
+                    run.ended_by_delete.store(true, Ordering::Relaxed);
                     engines
                         .worker_registration
                         .cancel_workflow(instance_id)
@@ -643,6 +655,9 @@ impl JobHost for AppContext {
                 // is its own pass's to reconcile.
                 match outcome {
                     Err(failure) if create_only => {
+                        if state.status == WorkflowStatus::Cancelled {
+                            run.ended_by_delete.store(true, Ordering::Relaxed);
+                        }
                         // The registry says what this registration left in it
                         // (its workers still the entries under their URLs, by
                         // id and revision): a worker registered or replaced
@@ -1114,7 +1129,7 @@ pub(crate) fn recording_for_tests(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Weak;
+    use std::sync::{atomic::AtomicBool, Weak};
 
     use dashmap::DashMap;
     use openai_protocol::worker::JobStatus;
@@ -1147,6 +1162,7 @@ mod tests {
                 &JobRun {
                     cancelled_before_start,
                     own_id,
+                    ended_by_delete: &AtomicBool::new(false),
                 },
             )
             .await
@@ -1213,6 +1229,85 @@ mod tests {
         );
         assert!(context.worker_registry.get_url_by_id(&id).is_none());
         assert_eq!(queue.get_status(url).unwrap().status, "failed");
+    }
+
+    #[tokio::test]
+    async fn a_failed_registration_reads_failed_with_its_reason_at_its_id() {
+        use crate::{
+            admin::worker_service::WorkerService, endpoints::tokenize::get_tokenizer_status,
+        };
+
+        let context = create_test_app_context();
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        context.worker_job_queue.set(Arc::clone(&queue)).unwrap();
+        let service = WorkerService::new(
+            Arc::clone(&context.worker_registry),
+            Arc::clone(&context.worker_job_queue),
+            context.router_config.clone(),
+        );
+        let url = "http://user:pass@worker:8000";
+        let fail = || async {
+            let id = context.worker_registry.reserve_id_for_url(url);
+            let _ = queue
+                .submit_and_wait(
+                    Job::AddWorker {
+                        config: Box::new(WorkerSpec::new(url)),
+                        registration_mode: WorkerRegistrationMode::CreateOnly,
+                        asker: WorkerJobAsker::Api,
+                    },
+                    Duration::from_secs(5),
+                )
+                .await;
+            id
+        };
+
+        let id = fail().await;
+        let read = service
+            .get_worker(id.as_str())
+            .expect("the id of a failed registration answers while its status is kept")
+            .0;
+        let status = read.job_status.expect("its job status");
+        assert_eq!(status.status, "failed");
+        assert_eq!(
+            status.message.as_deref(),
+            Some("Workflow engines not initialized")
+        );
+        // No plain address: the view writes it as the job's own lines write it.
+        assert_eq!(read.spec.url, Endpoint::redacted_str(url));
+        assert_eq!(status.worker_url, read.spec.url);
+        // The tokenizer status route takes the status of a tokenizer job alone.
+        let at_tokenizers = get_tokenizer_status(&context, id.as_str()).await;
+        assert_eq!(at_tokenizers.status().as_u16(), 404);
+
+        // A later failure of the same URL replaces the kept one.
+        let later = fail().await;
+        assert!(service.get_worker(later.as_str()).is_ok());
+        assert!(service.get_worker(id.as_str()).is_err());
+
+        // The pending view of a reserved id writes the address in that form too.
+        let held = context.worker_registry.reserve_id_for_url(url);
+        assert_eq!(
+            service.get_worker(held.as_str()).unwrap().0.spec.url,
+            read.spec.url
+        );
+
+        // A plain address reads as registered, byte for byte.
+        let plain = "http://worker:8000/";
+        let plain_id = context.worker_registry.reserve_id_for_url(plain);
+        let _ = queue
+            .submit_and_wait(
+                Job::AddWorker {
+                    config: Box::new(WorkerSpec::new(plain)),
+                    registration_mode: WorkerRegistrationMode::CreateOnly,
+                    asker: WorkerJobAsker::Api,
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+        assert_eq!(
+            service.get_worker(plain_id.as_str()).unwrap().0.spec.url,
+            plain
+        );
     }
 
     #[tokio::test]

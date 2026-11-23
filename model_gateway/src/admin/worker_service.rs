@@ -24,7 +24,7 @@ use smg_worker::{
         basic::{merge_labels, worker_to_info, Worker, WorkerType},
         endpoint::Endpoint,
     },
-    jobs::WorkerJobAsker,
+    jobs::{queue::QueueJob, WorkerJobAsker},
     labels::has_control_character,
     registry::WorkerId,
     workflow::find_workers_by_url,
@@ -410,7 +410,8 @@ impl std::fmt::Display for WorkerServiceError {
                     f,
                     "Worker at URL '{url}' with ID {id} is being removed; its removal drains \
                     it for {drain_secs}s, the worker's configured drain, before the URL is \
-                    free. Retry once GET /workers/{id} answers 404."
+                    free. Retry once GET /workers/{id} answers 404 or its job status reads \
+                    failed."
                 )
             }
             Self::CreateInProgress {
@@ -883,14 +884,27 @@ impl WorkerService {
             return Ok(GetWorkerResponse(worker_info));
         }
 
-        if let Some(worker_url) = self.worker_registry.get_url_by_id(&worker_id) {
-            if let Some(status) = job_queue.get_status(&worker_url) {
-                return Ok(GetWorkerResponse(WorkerInfo::pending(
-                    worker_id.as_str(),
-                    worker_url,
-                    Some(status),
-                )));
-            }
+        // A registration in flight holds its id. One that failed has released
+        // it: the queue keeps its failed status under the id until its
+        // finished statuses age out.
+        let in_flight = self
+            .worker_registry
+            .get_url_by_id(&worker_id)
+            .and_then(|worker_url| job_queue.get_status(&worker_url));
+        let failed = || {
+            job_queue
+                .get_status(worker_id.as_str())
+                .filter(|status| status.job_type == Job::REGISTRATION_TYPE)
+        };
+        if let Some(mut status) = in_flight.or_else(failed) {
+            // A plain address as registered, any other as the gateway's log
+            // lines write it.
+            status.worker_url = Endpoint::redacted_url(&status.worker_url);
+            return Ok(GetWorkerResponse(WorkerInfo::pending(
+                worker_id.as_str(),
+                status.worker_url.clone(),
+                Some(status),
+            )));
         }
 
         Err(WorkerServiceError::NotFound {
