@@ -87,7 +87,7 @@ use smg_policy_controller::{
         Constraints, Decided, Identity, LentList, ListCell, Phase, Plain, PolicyEngine, Request,
         RequestFacts, RequestMaker, TokenEntry, TokenKey, WorkerId, WorkerLists,
     },
-    policies::consistent_hashing::LentRing,
+    policies::consistent_hashing::{Head, LentRing},
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Side, TransportClass},
 };
@@ -261,6 +261,11 @@ const CELLS: &[Cell] = &[
         ..Cell::PLAIN
     },
     Cell {
+        name: "prefix_hash_prompt",
+        document: || preset("prefix_hash"),
+        ..Cell::PLAIN
+    },
+    Cell {
         name: "random",
         document: || preset("random"),
         ..Cell::PLAIN
@@ -359,6 +364,14 @@ struct ListOrder(Vec<String>);
 impl LentRing for ListOrder {
     fn position(&self, _: &str) -> u64 {
         0
+    }
+
+    // A head stands at its own size: nothing is hashed for it either.
+    fn head_position(&self, head: Head<'_>) -> Option<u64> {
+        Some(match head {
+            Head::Tokens(ids) => ids.len() as u64,
+            Head::Text(text) => text.len() as u64,
+        })
     }
 
     fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
@@ -716,9 +729,9 @@ fn main() {
     let (publish, converted) = (|| feed.publish(&loads), || host.conversions());
     // The one call a host makes for a request, where the run asks it.
     if place::asked(&run, &host) {
-        let rule = ruled::stated(&run);
+        let (rule, ring) = (ruled::stated(&run), place::lent(&host));
         measure(&run, &host, upkeep, publish, converted, |_| {
-            place::one(&host, rule)
+            place::one(&host, rule, ring)
         });
         return;
     }

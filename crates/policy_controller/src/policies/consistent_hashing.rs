@@ -36,6 +36,9 @@
 //! the blocks the request was hashed by, text windows at four bytes a
 //! token under the text kind. A request that carries no whole block has no
 //! key, and the tokens past a request's last whole block are not in its key.
+//! On a ring the request's caller lends no block is folded: the prompt's
+//! heads are cut at the token ([`HeadRule::heads`]) and the lender says
+//! where each stands ([`LentRing::head_position`]).
 //!
 //! Under the view's boundaries the prefix is keyed at the deepest boundary
 //! the request reaches, and the form's depth serves a request that reaches
@@ -58,7 +61,7 @@ use crate::{
     },
     policies::{
         cache_aware::Gates,
-        prefix_hash::{prefix_key, Prefix},
+        prefix_hash::{prefix_key, HeadRule, Prefix},
         standard_filters,
     },
     stages::{lifecycle::Lifecycle, retired_workers::RetiredWorkers},
@@ -70,7 +73,7 @@ mod lent_ring;
 
 #[cfg(test)]
 pub(crate) use lent_ring::InOrder;
-pub use lent_ring::LentRing;
+pub use lent_ring::{Head, LentRing};
 
 /// How the `consistent_hashing` policy is composed: its filters, its scorers
 /// and its picker.
@@ -1062,9 +1065,17 @@ impl Scorer for ConsistentHash {
     }
 
     // The ring keyed by no prefix is asked where the routing value's own
-    // text stands. The prefix form is asked for another text.
+    // text stands. The prefix form is asked where a head stands.
     fn places_by_key_text(&self) -> bool {
         self.prefix.is_none()
+    }
+
+    fn places_by_heads(&self) -> Option<HeadRule<'_>> {
+        let prefix = self.prefix.as_ref()?;
+        Some(HeadRule {
+            depth: prefix.tokens,
+            boundaries: &prefix.boundaries,
+        })
     }
 
     /// The ring places a request that carries a routing key by its walk

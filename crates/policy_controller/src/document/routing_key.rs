@@ -94,7 +94,8 @@ pub struct DerivedKeys<'a> {
     /// A caller whose own policy asks its ring for another text than the
     /// key's states that text's position itself: under the gateway's
     /// `prefix_hash` the text is sixteen hex digits of a hash of the key's
-    /// bytes.
+    /// bytes, which the one call leaves to the lender
+    /// ([`LentRing::head_position`]).
     ///
     /// `None` where the request carries neither key, and where no ring is
     /// lent: nothing is hashed for such a request.
@@ -282,19 +283,33 @@ impl KeySources {
         rid: Option<&'a str>,
         ring: Option<&dyn LentRing>,
     ) -> DerivedKeys<'a> {
-        let position = |text: &str| ring.map(|ring| ring.position(text));
+        self.derive_keys_by(header, rid, |text, _| ring.map(|ring| ring.position(text)))
+    }
+
+    /// [`Self::derive_keys`] with the place asked of `place`: it is handed
+    /// the text of the value a ring places the request by and whether that
+    /// value is the client's, once, and is not asked where the request
+    /// carries neither value. The prefix form of a ring is asked where a
+    /// routing value's text stands as a head does, and nothing of a
+    /// client's.
+    pub(crate) fn derive_keys_by<'a>(
+        &'a self,
+        header: impl Fn(&str) -> Option<&'a [u8]>,
+        rid: Option<&'a str>,
+        place: impl FnOnce(&str, bool) -> Option<u64>,
+    ) -> DerivedKeys<'a> {
         match self.session(&header, rid) {
             Some((key, text)) => DerivedKeys {
                 session: Some(key),
                 client_key: 0,
-                ring_position: position(text),
+                ring_position: place(text, false),
             },
             None => {
                 let client = self.client(&header);
                 DerivedKeys {
                     session: None,
                     client_key: client.map_or(0, |value| fingerprint(value.as_bytes())),
-                    ring_position: client.and_then(position),
+                    ring_position: client.and_then(|value| place(value, true)),
                 }
             }
         }

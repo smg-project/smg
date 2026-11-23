@@ -1065,7 +1065,7 @@ That is too much. The gateway's earlier integration needs a module of its own of
 13,856 lines (tests included) for it, and a branch in every route.
 
 A host that keeps a hash ring of a model's workers can lend it with a request: the request's facts
-carry the ring, behind a trait of two methods (`LentRing`), and where the request stands on it
+carry the ring, behind one trait (`LentRing`), and where the request stands on it
 (`RequestFacts::ring`, `RequestFacts::ring_positions`). A trap for the lender. Under `prefix_hash`
 classic asks its ring for the sixteen hex digits of the hash of the bytes a request is placed by,
 also where those bytes are a routing key's (`model_gateway/src/policies/prefix_hash.rs:223`,
@@ -1074,10 +1074,16 @@ also where those bytes are a routing key's (`model_gateway/src/policies/prefix_h
 place from the wrong text sends routing keys to other workers than classic does, and no test in
 the crate sees it.
 
+The trait keeps the two questions apart: `position` answers for a key's own text, `head_position`
+for a head of the request, each by the lender's own recipe.
+
 A caller of the one call states the ring alone (`PlaceRequest::ring`). The engine reads where the
 routing value stands on it with the request's keys, under a profile whose ring stage places a value
-by its own text. Under `prefix_hash` such a request is lent no ring yet: the stage's own ring
-places it.
+by its own text. Under `prefix_hash` the engine cuts the request into the heads classic cuts it
+into, a routing value first, and asks the ring where each stands (`LentRing::head_position`). A
+ring whose lender places no head answers nothing: such a request is lent no ring, the lender is
+asked about no further head, and the stage's own ring places the request. A request that has no
+head states no place and is lent no ring either.
 
 ### 8.2 The contract as designed **[partly]**
 
@@ -1671,10 +1677,10 @@ On main: 18 sheets, 482 lines.
 |---|---|---|
 | replayed and passing | 16 | 459 |
 | recorded, replayed by nothing (`constraint_decider`, `minimum_tokens`) | 2 | 23 |
-| replayed through the engine that stays (`PolicyEngine`) | **5** | **45** |
+| replayed through the engine that stays (`PolicyEngine`) | **5**, and 31 lines of `prefix_hash` | **76** |
 | replayed lines held to an answer of the crate's own, not classic's | | 12 |
 
-A replay of all fourteen decision sheets through `PolicyEngine` over worker objects is in work and not on main yet: on main the four hard-demand sheets (`retry_wire`, `media_refs`, `context_window`, `rank_pin`; 37 lines) and `sticky_rank` (8 lines) replay through it. Measured
+A replay of all fourteen decision sheets through `PolicyEngine` over worker objects is in work and not on main yet: on main the four hard-demand sheets (`retry_wire`, `media_refs`, `context_window`, `rank_pin`; 37 lines), `sticky_rank` (8 lines) and 31 lines of `prefix_hash` replay through it. Measured
 with it locally on 2026-11-22, on main (`096c0f5ea`): of the 408 lines that record a decision
 (point 1 below), the engine answers 286 as classic recorded and 28 differently, and 94 cannot
 be asked yet. Of the 94, 25 are declined because the request states a hard demand, 16 need a
@@ -1684,7 +1690,7 @@ the ring) lose lines, so the replay can fail.
 
 Five things follow, and they are the first work of section 16.
 
-1. **Only the four hard-demand sheets and `sticky_rank` (45 lines) go through the engine that stays** in main's own tests. The other replays
+1. **Only the four hard-demand sheets, `sticky_rank` and 31 lines of `prefix_hash` (76 lines) go through the engine that stays** in main's own tests. The other replays
    call the decision function over hand-built candidates. Fourteen sheets
    (408 lines) record a decision, and each has to replay through `PolicyEngine` over worker
    objects. The other four (74 lines: `overload` 25, `pair_index` 23, `minimum_tokens` 18,
@@ -1720,8 +1726,11 @@ Five things follow, and they are the first work of section 16.
    requests stand on a ring: 30 list their workers in a request's ring order and one has
    nothing to hash. They replay on a ring their caller lends and hold their recorded answers,
    the held ten-token line among them. That replay calls the decision function over hand-built
-   candidates. Through `PolicyEngine` over worker objects with a lent ring no recorded line is
-   measured yet. The other 16 measure which tokens are in a prompt's key (15 lines) or how
+   candidates. Through `PolicyEngine::place` over worker objects, with the ring lent and no place
+   stated, the 31 hold their recorded answers too: the engine cuts each request into its heads
+   and the line's ring answers for each
+   (`the_classic_prefix_hash_rows_replay_through_the_one_call_with_no_place_stated`). The other
+   16 measure which tokens are in a prompt's key (15 lines) or how
    2,000 prompts spread over eight workers (1 line); the second held line is one of the 15.
    With a lent ring a request's place is the host's to state, so these 16 test the host's
    recipe. In the crate they stay on the crate's own ring with its own hashes, which a caller
@@ -1795,10 +1804,10 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; a pair's shadows run in no engine, and `explain.sample` is kept by the served controller alone (decision 7) |
 | The ten presets and the conversion from routing settings | **[built]** | |
 | The stage interfaces and a builder's own stages | **[built]** | |
-| The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, an encode request's demand, mixed protocols; of the recorded lines only the four hard-demand sheets and `sticky_rank` (45) replay through it |
+| The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, an encode request's demand, mixed protocols; of the recorded lines only the four hard-demand sheets and `sticky_rank` (45), and 31 lines of `prefix_hash`, replay through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |
 | `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. Every other request the engine names the holders of reads the engine's own record, with its three faults: a request whose caller names no entry is one. The string tree is planned |
-| `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | placed on the ring the host lends (decision 3): through `place` the plain ring alone, at the place the engine reads with the request's keys; `prefix_hash` at the places a host that writes the request's facts itself states; that both are classic's is proven at stage 3; a host that lends none is placed on the crate's ring, which may be another worker than classic's |
+| `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | placed on the ring the host lends (decision 3): through `place` the plain ring at the place the engine reads with the request's keys, and `prefix_hash` at the places the host's ring answers for the request's heads, where it answers for a head; that both are classic's is proven at stage 3; a host that lends none is placed on the crate's ring, which may be another worker than classic's |
 | `manual` and sticky sessions on that engine | **[partly]** | their sheets replay through the decision function, not through the engine |
 | `bucket` on that engine | **[partly]** | the same |
 | Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; five of its 40 lines are held to an answer of the crate's own |
@@ -1878,7 +1887,7 @@ different modes would disagree.
 
 | Option | Cost |
 |---|---|
-| (a) The host lends the ring it keeps; the engine asks it which workers a routing key reaches. | Crate only: one deletion and four changes. The crate's ring beside a worker list is deleted (1,728 lines removed, 230 added, 17 files). The four changes are about 580, 270, 450 and 550 changed lines, about 370 of them product code and 1,050 proof. The host lends its ring through a trait of two methods and states where a request stands on it. The crate then writes no hash and no ring for such a host, so a request is placed on classic's own ring. The price in proof: 16 of the 47 recorded `prefix_hash` lines test which tokens are in a key. In the crate they keep replaying on the crate's own ring, share for share as on main. A gateway then never runs that ring, so for a gateway they are proven at stage 3 (section 13.1), where the change also cuts classic's key recipe and classic's ring lookup into functions that classic and the lender both call. A controller has no classic ring to be lent: until (b) it keeps its own ring and places a routing key on another worker than a gateway would. |
+| (a) The host lends the ring it keeps; the engine asks it which workers a routing key reaches. | Crate only: one deletion and four changes. The crate's ring beside a worker list is deleted (1,728 lines removed, 230 added, 17 files). The four changes are about 580, 270, 450 and 550 changed lines, about 370 of them product code and 1,050 proof. The host lends its ring through one trait (`LentRing`) and states where a request stands on it. The crate then writes no hash and no ring for such a host, so a request is placed on classic's own ring. The price in proof: 16 of the 47 recorded `prefix_hash` lines test which tokens are in a key. In the crate they keep replaying on the crate's own ring, share for share as on main. A gateway then never runs that ring, so for a gateway they are proven at stage 3 (section 13.1), where the change also cuts classic's key recipe and classic's ring lookup into functions that classic and the lender both call. A controller has no classic ring to be lent: until (b) it keeps its own ring and places a routing key on another worker than a gateway would. |
 | (b) Classic's ring (one file, 508 lines) moves to a crate both sides use. | A pure move, about 15 lines changed beside it. The gateway, the engine and the controller then build one ring type. |
 | (c) The crate's ring is changed to classic's hashes. | About 125 lines. Classic's recipe written twice; a gateway would keep two rings for a model. |
 

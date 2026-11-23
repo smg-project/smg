@@ -1229,9 +1229,10 @@ pub struct RequestFacts<'a> {
     /// keeps it beside the request. A prompt gives one entry for each of
     /// its heads the caller's ring places it by, the deepest first: a stage
     /// under a bounded-load rule tries the entries in that order, and any
-    /// other reads the first. The one call states a routing value's entry
-    /// alone: a prompt's entries are stated by a host that writes the
-    /// request's facts itself. In-process only: no frame carries it.
+    /// other reads the first. The one call states them by the profile's
+    /// word: a routing value's own entry under the plain ring, and under
+    /// the prefix form what the lender answers for each head
+    /// ([`LentRing::head_position`]). In-process only: no frame carries it.
     pub ring_positions: &'a [u64],
 }
 
