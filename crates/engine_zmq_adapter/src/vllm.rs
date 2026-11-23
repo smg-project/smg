@@ -1262,7 +1262,9 @@ impl VocabBounds {
 /// as this check knows, so a forged, mismatched or unmeasured claim gets
 /// the ordinary bounds. A decode side whose KV load fails, or which is
 /// preempted, and is recomputed reads what vLLM's own frontend would have
-/// let through.
+/// let through. So does the sliding window a MoRIIO pull replays on a model
+/// with bounded replay (DeepSeek-V4.1 in vLLM 0.32): that connector restores
+/// no such window, and the reported tail does not cover it.
 ///
 /// An id past the model's vocabulary that a position is allowed to hold is
 /// still a target of `prompt_logprobs`, which reads the logits at every
