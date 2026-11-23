@@ -394,10 +394,10 @@ pub(crate) fn accepted_by(
 /// Under the classic policies that guard is the one a route made before,
 /// counted under the route's own key. Where the policy engine placed the
 /// request (`policy_controller: on`), the guard is counted under the routing
-/// value the engine derived, and it keeps the engine's placement to the
-/// request's end: the engine hears the dispatch where the guard is made and
-/// the end where the guard is dropped. It is told no outcome: the worker
-/// object has it.
+/// value the engine names, and under the route's own key where it names
+/// none. It keeps the engine's placement to the request's end: the engine
+/// hears the dispatch where the guard is made and the end where the guard
+/// is dropped. It is told no outcome: the worker object has it.
 #[derive(Debug)]
 pub(crate) struct Placed {
     worker: Arc<dyn Worker>,
@@ -417,8 +417,10 @@ enum PickedBy {
         /// guard took tells the engine a release where this answer is
         /// dropped.
         placement: Mutex<Option<Box<Placement<'static>>>>,
-        /// The routing value the engine derived for the request, which the
-        /// guard counts it under. `None` where the engine derived none.
+        /// The routing value the engine names for the request, which the
+        /// guard counts it under. `None` where the engine names none: a
+        /// value it keeps as a fingerprint alone, a document that reads no
+        /// value. The guard then counts under its route's key.
         routing_key: Option<Box<str>>,
     },
 }
@@ -475,10 +477,11 @@ impl Placed {
     ///
     /// `key` is the route's own key for the request, which a classic
     /// policy's answer is counted under. An answer of the policy engine is
-    /// counted under the routing value the engine derived, and `key` is not
-    /// read. The first guard made from such an answer takes the engine's
-    /// placement and tells the engine the dispatch. A later one is a plain
-    /// guard under the same value.
+    /// counted under the routing value the engine names, and under `key`
+    /// where the engine names none: the count a classic policy that names
+    /// no key leaves on the worker. The first guard made from an engine's
+    /// answer takes the engine's placement and tells the engine the
+    /// dispatch. A later one is a plain guard under the same value.
     pub(crate) fn guard(&self, key: Option<&str>) -> WorkerLoadGuard {
         self.by.guard(Arc::clone(&self.worker), key)
     }
@@ -514,7 +517,7 @@ impl PickedBy {
         else {
             return WorkerLoadGuard::with_key(worker, key);
         };
-        let guard = WorkerLoadGuard::with_key(worker, routing_key.as_deref());
+        let guard = WorkerLoadGuard::with_key(worker, routing_key.as_deref().or(key));
         match placement.lock().take() {
             Some(mut placement) => {
                 placement.sent(Side::Single);
@@ -5807,9 +5810,10 @@ mod tests {
     /// With an engine handed to the registry the placement asks it, and the
     /// engine hears the request by its load guard: the dispatch where the
     /// guard is made and the end where it is dropped. A second guard and the
-    /// answer's own drop tell it nothing. The guard counts the request under
-    /// the engine's routing value, which this document derives none of, and
-    /// not under the key its route reads.
+    /// answer's own drop tell it nothing. This document names no routing
+    /// value, so the guard counts the request under its route's own key, as
+    /// the guard of a classic policy that names no key does
+    /// (`a_classic_answer_counts_under_its_routes_key`).
     #[test]
     fn the_engine_hears_a_placed_request_by_its_load_guard() {
         let registry = http_registry(&["http://h:1", "http://h:2"]);
@@ -5820,7 +5824,8 @@ mod tests {
         let placed = answered(&registry, &policies, PlacementInputs::default());
         assert_eq!(said(), ["issued"]);
         let guard = placed.guard(Some("the route's own key"));
-        assert_eq!((placed.load(), placed.routing_key_load()), (1, 0));
+        let counted = placed.routing_key_inflight("the route's own key");
+        assert_eq!((placed.load(), counted), (1, 1));
         assert_eq!(said(), ["issued", "dispatched Single"]);
 
         let second = placed.guard(None);
@@ -5854,7 +5859,7 @@ mod tests {
     }
 
     /// The guard of an engine's answer counts the request under the routing
-    /// value the engine derived, where the route reads no key. The document
+    /// value the engine names, whatever key its route reads. The document
     /// here reads the value from the body's own id, which the engine keeps
     /// in the clear. The value keeps its worker.
     #[test]
@@ -5876,8 +5881,13 @@ mod tests {
             ..Default::default()
         };
         let placed = answered(&registry, &policies, keyed);
-        let guard = placed.guard(None);
-        assert_eq!((placed.load(), placed.routing_key_load()), (1, 1));
+        let guard = placed.guard(Some("the route's own key"));
+        let under = |key: &str| placed.routing_key_inflight(key);
+        assert_eq!(placed.load(), 1);
+        assert_eq!(
+            (under("conversation-1"), under("the route's own key")),
+            (1, 0)
+        );
         for _ in 0..4 {
             assert_eq!(pick(&registry, &policies, keyed).url(), placed.url());
         }
