@@ -114,3 +114,20 @@ fn build_matches_frozen_goldens() {
         assert_parity(endpoint, Mode::Regular, &deps);
     }
 }
+
+/// `--parser-flags-over-registry` reaches the response processors a chat or messages pipeline
+/// is built with, through the resolver they read the parser names with; off by default.
+#[test]
+fn the_parser_flags_over_registry_option_reaches_the_configured_processors() {
+    for over in [false, true] {
+        let deps = PipelineDeps::test_default().with_parser_flags_over_registry(over);
+        let (processor, _streaming) = deps.configured_processors("grpc");
+        assert_eq!(
+            processor.parser_resolver.names("m").flags_over_registry,
+            over
+        );
+        let pipeline =
+            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
+        assert_eq!(pipeline.parser_flags_over_registry(), over);
+    }
+}

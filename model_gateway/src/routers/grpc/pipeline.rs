@@ -332,6 +332,10 @@ pub(crate) struct RequestPipeline {
     /// How each attempt pins a sticky request to an engine of a grouped
     /// data-parallel worker.
     grouped_dp_sticky: GroupedDpSticky,
+    /// `--parser-flags-over-registry` as the deps the pipeline was built from
+    /// carried it to their response processors, for the tests.
+    #[cfg(test)]
+    parser_flags_over_registry: bool,
 }
 
 /// Outcome of one full pipeline run.
@@ -510,6 +514,8 @@ impl RequestPipeline {
             tool_parser_factory: deps.tool_parser_factory.clone(),
             request_timeout: deps.request_timeout,
             grouped_dp_sticky: deps.grouped_dp_sticky,
+            #[cfg(test)]
+            parser_flags_over_registry: deps.parser_flags_over_registry,
         })
     }
 
@@ -524,6 +530,14 @@ impl RequestPipeline {
     #[cfg(test)]
     pub(crate) fn grouped_dp_sticky(&self) -> GroupedDpSticky {
         self.grouped_dp_sticky
+    }
+
+    /// Whether the deps the pipeline was built from have Symphony read the
+    /// configured parser names before its registry
+    /// (`--parser-flags-over-registry`).
+    #[cfg(test)]
+    pub(crate) fn parser_flags_over_registry(&self) -> bool {
+        self.parser_flags_over_registry
     }
 
     /// Ingress phase: run the request-owning stages through request building.

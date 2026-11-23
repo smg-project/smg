@@ -25,7 +25,8 @@ use crate::{
                 mm_settings, pool_processes_media_refs, registration_lacks_media_processing,
             },
             regular::symphony::{
-                check_names, labels_select_nothing, set_aside_by_the_registry, table_label_read,
+                check_names, flags_read_first, labels_select_nothing, set_aside_by_the_registry,
+                table_label_read,
             },
             utils::{ModelNames, Names},
             zmq_client::zmq_handshake_address,
@@ -299,8 +300,10 @@ fn symphony_table_of(
 /// while no worker of the model is registered, naming the model, both readers and the one used;
 /// `None` for the model's later workers, a worker whose labels select a reader, a model the
 /// registry does not know, flags that select nothing or the registry's own table, the legacy
-/// parser choice, and `--parser-flags-over-registry` (`flags_over_registry`), under which the flags
-/// read the model as they name it and the registry sets nothing aside. Workers of one model
+/// parser choice, and `--parser-flags-over-registry` (`flags_over_registry`) where the flags read
+/// first (`regular::symphony::flags_read_first`), under which they read the model as they name it
+/// and the registry sets nothing aside; a reasoning name alone that selects a table is still set
+/// aside then, and the message says the option leaves it to the registry. Workers of one model
 /// registering at the same moment may each say it, as the override check above may: the registry
 /// gains the worker a step later.
 fn registry_reads_over_the_flags(
@@ -312,7 +315,7 @@ fn registry_reads_over_the_flags(
     registry: &WorkerRegistry,
 ) -> Option<String> {
     if parser != ParserChoice::Symphony
-        || flags_over_registry
+        || (flags_over_registry && flags_read_first(flags))
         || !labels_select_nothing(&card_names(card))
         || !registry.get_by_model(&card.id).is_empty()
     {
@@ -321,10 +324,16 @@ fn registry_reads_over_the_flags(
     let (table, named) = set_aside_by_the_registry(flags, &card.id)?;
     let spell =
         |name: Option<&str>| name.map_or_else(|| "unset".to_string(), |name| format!("'{name}'"));
+    let reasoning_name_alone = if flags_over_registry {
+        " (a reasoning name alone, which --parser-flags-over-registry leaves to the registry for \
+         the models it knows; a tool-call name puts the flags first)"
+    } else {
+        ""
+    };
     Some(format!(
         "the registry's table '{}' reads model '{}' for worker {}, whose labels select \
          no reader; the gateway's --tool-call-parser {} / --reasoning-parser {} name {named}, which \
-         reads only the models the registry does not know",
+         reads only the models the registry does not know{reasoning_name_alone}",
         table.name(),
         card.id,
         Endpoint::redacted_str(worker_url),
@@ -783,6 +792,37 @@ mod tests {
                 ConnectionMode::Grpc,
                 &flags,
                 false
+            ),
+            Some("qwen3")
+        );
+        // A reasoning name alone that selects a table does not read first: the registry reads
+        // the model it knows, so the registration says the name is set aside, under the option
+        // too, and publishes the registry's table.
+        let step = ModelCard::new("stepfun-ai/Step-3.5-Flash");
+        let qwen3_reasoning = Names {
+            tool: None,
+            reasoning: Some("qwen3".to_string()),
+        };
+        assert!(registry_reads_over_the_flags(
+            &step,
+            "grpc://a:1",
+            ParserChoice::Symphony,
+            &qwen3_reasoning,
+            true,
+            &fresh
+        )
+        .is_some_and(|message| {
+            message.contains("'qwen3_tagged'")
+                && message.contains("the table 'qwen3'")
+                && message.contains("--parser-flags-over-registry leaves to the registry")
+        }));
+        assert_eq!(
+            symphony_table_of(
+                &step,
+                ParserChoice::Symphony,
+                ConnectionMode::Grpc,
+                &qwen3_reasoning,
+                true
             ),
             Some("qwen3")
         );
