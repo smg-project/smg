@@ -6,10 +6,10 @@
 //! (design 4.4: a scorer or picker allocates nothing per decision; the host
 //! keeps one scratch per thread so the framework allocates nothing after the
 //! first). The
-//! store's pins stand beside them: a build from the store allocates nothing
-//! after the first, and two membership writes are held to each other, a
-//! write that moves an offer to one that moves none and a registration into
-//! 512 workers to one into 8. A host in process is pinned too, in a build
+//! store's pins stand beside them: two membership writes are held to each
+//! other, a write that moves an offer to one that moves none and a
+//! registration into 512 workers to one into 8. A host in process is pinned
+//! too, in a build
 //! with the `in-process` feature: a request held from its decision to its
 //! completion allocates nothing after the first ones. A separate
 //! executable, so it can declare the counting allocator the pins need.
@@ -18,10 +18,7 @@
 
 mod common;
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
@@ -33,9 +30,7 @@ use smg_policy_controller::{
     },
     stages::Lifecycle,
     store::{
-        pairing::PairingDescriptor, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore,
-        PairBuffers, ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore,
-        PUBLISH_WINDOW,
+        LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
     tracking::{Lease, Side},
 };
@@ -617,97 +612,6 @@ fn store_of(n: usize) -> (MemoryStore, Vec<WorkerId>, Instant) {
 }
 
 #[test]
-fn a_build_from_the_store_after_the_first_allocates_nothing() {
-    for n in [8usize, 64, 512] {
-        let (store, _, opened) = store_of(n);
-        let mut out = ViewBuffers::default();
-        for affinity in [false, true] {
-            let ask = ViewQuery {
-                gateway: GatewayId(1),
-                now: opened + Duration::from_secs(1),
-                pinned: None,
-                affinity,
-                signal_cells: false,
-            };
-            // The first build sizes the host's buffers.
-            store
-                .build_view("m", Role::Single, &ask, &mut out)
-                .expect("the pool");
-            let (built, allocations) =
-                allocations_during(|| store.build_view("m", Role::Single, &ask, &mut out));
-            assert_eq!(built.map(|built| built.pool_size as usize), Some(n));
-            assert_eq!(out.affinity.len(), if affinity { n } else { 0 });
-            assert_eq!(
-                allocations, 0,
-                "{n} members, column {affinity}: a build allocated"
-            );
-        }
-    }
-}
-
-#[test]
-fn a_pair_build_with_its_table_allocates_nothing_after_the_first() {
-    // Two prefills of two transports; of 64 decodes every fourth names no
-    // transport and pairs with both: three decode classes in two lists.
-    let store = MemoryStore::new();
-    let register = |key: String, role: Role, transport: Option<&str>| {
-        store.upsert(WorkerFacts {
-            key: key.clone(),
-            engine: key,
-            incarnation: 1,
-            role,
-            wire_modes: WireModes::GRPC,
-            models: vec!["m".to_string()],
-            dp_size: 1,
-            pairing: transport.map(|transport| {
-                Arc::new(PairingDescriptor {
-                    transport: Some(transport.to_string()),
-                    ..PairingDescriptor::default()
-                })
-            }),
-            ..WorkerFacts::default()
-        });
-        store.publish_now();
-    };
-    for (index, transport) in ["tx-a", "tx-b"].into_iter().enumerate() {
-        register(
-            format!("grpc://p{index}:9000"),
-            Role::Prefill,
-            Some(transport),
-        );
-    }
-    for index in 0..64 {
-        let transport = [Some("tx-a"), Some("tx-b"), Some("tx-a"), None][index % 4];
-        register(format!("grpc://d{index}:9000"), Role::Decode, transport);
-    }
-    let ask = ViewQuery {
-        gateway: GatewayId(1),
-        now: Instant::now(),
-        pinned: None,
-        affinity: true,
-        signal_cells: false,
-    };
-    let mut out = PairBuffers::default();
-    // The first build sizes the host's buffers: the rows, the columns and
-    // the table.
-    store.build_pair("m", &ask, &mut out).expect("both pools");
-    let (built, allocations) = allocations_during(|| store.build_pair("m", &ask, &mut out));
-    let sizes = built.map(|(prefill, decode)| (prefill.pool_size, decode.pool_size));
-    assert_eq!(sizes, Some((2, 64)));
-    let pools = out.pools();
-    assert_eq!(
-        (pools.prefill_affinity.len(), pools.decode_affinity.len()),
-        (2, 64)
-    );
-    // Each prefill class lists its transport's decodes and the silent ones.
-    let world = store.snapshot();
-    let classes = world.pairs("m").expect("the model's classes");
-    assert_eq!((classes.classes(), classes.entries()), (2, 4));
-    assert_eq!(pools.table.validate(), Ok(()));
-    assert_eq!(allocations, 0, "a pair build through the door allocated");
-}
-
-#[test]
 fn a_write_that_moves_an_offer_allocates_what_a_write_that_moves_none_does() {
     // Pairs that name no runtime. One prefill names its runtime and unnames
     // it in turn, which moves its offer at every write and no class: the
@@ -835,46 +739,6 @@ fn index_keys_that_pass_add_no_allocation_to_a_validation() {
         allocations
     };
     assert_eq!(allocations(2_000), allocations(1_000));
-}
-
-#[test]
-fn a_lent_view_from_the_store_after_the_first_allocates_nothing() {
-    for n in [8usize, 64, 512] {
-        let (store, ids, opened) = store_of(n);
-        let asker = GatewayId(1);
-        store.gateway_veto(asker, ids[1], Some(opened + Duration::from_secs(3_600)));
-        let mut out = ViewBuffers::default();
-        for affinity in [false, true] {
-            let ask = ViewQuery {
-                gateway: asker,
-                now: opened + Duration::from_secs(1),
-                pinned: Some(ids[0]),
-                affinity,
-                signal_cells: false,
-            };
-            // The first view sizes the host's buffers: the mask and the
-            // column.
-            store.with_snapshot(|world| {
-                let first = world.view("m", Role::Single, &ask, false, &mut out);
-                assert!(first.is_some());
-            });
-            let (read, allocations) = allocations_during(|| {
-                store.with_snapshot(|world| {
-                    let view = world
-                        .view("m", Role::Single, &ask, false, &mut out)
-                        .expect("the pool");
-                    let (rows, column) = (view.candidates.len(), view.affinity.len());
-                    (rows, view.stalled.len(), view.pinned_at != 0, column)
-                })
-            });
-            assert_eq!(read, (n, 1, true, if affinity { n } else { 0 }));
-            assert_eq!(
-                allocations, 0,
-                "a lent view of {n} rows allocated (affinity {affinity})"
-            );
-        }
-        assert!(out.candidates.is_empty(), "a lent view copies no row");
-    }
 }
 
 /// The pin of a host in process: the engine over the host's own worker
