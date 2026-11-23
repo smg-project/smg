@@ -1504,21 +1504,20 @@ const CLIENT_HEADERS: [&str; 2] = ["x-forwarded-for", "cookie"];
 ///   them. Under the override they read the request's own id behind that,
 ///   and every source loses its turn and retry suffixes.
 /// - `prefix_hash` reads the configured headers alone.
-/// - `random`, `power_of_two`, `least_load`, `passthrough`, `bucket` and
-///   `cache_aware` read no key themselves. Under the override they read
-///   one ([`override_places`]):
+/// - `random`, `round_robin`, `power_of_two`, `least_load`, `passthrough`,
+///   `bucket` and `cache_aware` read no key themselves. Under the override
+///   they read one ([`override_places`]):
 ///   the configured headers, then the request's own id, each without its
 ///   turn and retry suffixes. The binding's session rule pins that key
 ///   ([`override_rule`]).
 ///
-/// Four reads have no document yet and are refused by the setting's name.
-/// The gateway's override places a keyed request of `prefix_hash` and
-/// `round_robin` by its sticky map too, and
-/// [`unplaced`] says what each lacks. In a gateway of many routers the
-/// override's rule would plan single requests alone, beside pairs the
-/// gateway serves too. And under the override the gateway reads the routing
-/// key header as sent where no configured header names it, while a block
-/// strips every source or none.
+/// Three reads have no document yet and are refused by the setting's name.
+/// The gateway's override places a keyed request of `prefix_hash` by its
+/// sticky map too, and [`unplaced`] says what it lacks. In a gateway of
+/// many routers the override's rule would plan single requests alone,
+/// beside pairs the gateway serves too. And under the override the gateway
+/// reads the routing key header as sent where no configured header names
+/// it, while a block strips every source or none.
 ///
 /// `consistent_hashing` also names its two client headers as client
 /// sources: a key from them places a request that carries no session key,
@@ -1616,10 +1615,19 @@ fn key_sources(
 /// stages place a single request by nothing its key hands them. The
 /// gateway's sticky map places a keyed request of every policy but
 /// `manual` and `consistent_hashing`, which place by the key themselves.
-/// The two left out here are refused, each for what its answer still
-/// lacks ([`unplaced`]).
+/// `prefix_hash` alone is left out here and refused, for what its answer
+/// still lacks ([`unplaced`]).
 ///
 /// - `random` draws.
+/// - `round_robin` takes turns. The gateway asks one policy object for a
+///   request with no key, for a key's first request and for a key at its
+///   pin's cap (`model_gateway/src/policies/registry.rs:664`, `:774`,
+///   `:745`), so the three take the turns of one rotation, and a request
+///   that follows its pin takes none (`:736-739`). The rotation is the
+///   list's own, by row, and where the row's worker takes no request, the
+///   rotation of the workers that do
+///   (`model_gateway/src/policies/round_robin.rs:142-168`). This crate's
+///   stage turns the same two for the three.
 /// - `power_of_two` and `least_load` compare workers by load. Both score
 ///   a worker by its report and by the requests the policy placed on it
 ///   since. A request the rule placed is none of those: the rule keeps it
@@ -1655,6 +1663,7 @@ fn override_places(policy: &PolicySettings, config: &RoutingSettings) -> bool {
     let placed = matches!(
         policy,
         PolicySettings::Random
+            | PolicySettings::RoundRobin
             | PolicySettings::PowerOfTwo { .. }
             | PolicySettings::LeastLoad { .. }
             | PolicySettings::Passthrough
@@ -1665,17 +1674,10 @@ fn override_places(policy: &PolicySettings, config: &RoutingSettings) -> bool {
 }
 
 /// Why the sticky override has no document yet under a policy whose keyed
-/// requests the gateway's sticky map places:
-///
-/// - `prefix_hash` hashes a key a header handed and no key the request's
-///   own id handed: the gateway places that request by its prompt. A
-///   binding has one key, and its ring places by it whatever its source.
-/// - `round_robin` turns one rotation in the gateway, for a keyed request
-///   its sticky map hands the policy and for a request with no key
-///   (`model_gateway/src/policies/registry.rs:664` and `:774`). This
-///   crate's stage turns the pool's rotation for a request with no key in
-///   a list of sixteen workers or more, and the survivors' own for a key
-///   with no pin.
+/// requests the gateway's sticky map places. `prefix_hash` is the one: it
+/// hashes a key a header handed and no key the request's own id handed,
+/// and the gateway places that request by its prompt. A binding has one
+/// key, and its ring places by it whatever its source.
 ///
 /// The kinds the rule or their own key places never reach this function:
 /// each is named, so a new kind builds once its sentence is written.
@@ -1684,12 +1686,10 @@ fn unplaced(policy: &PolicySettings) -> &'static str {
         PolicySettings::PrefixHash { .. } => {
             "under the override this policy's ring would place a key the request's own id handed, and the gateway places that request by its prompt"
         }
-        PolicySettings::RoundRobin => {
-            "under the override this policy would turn one rotation for a key with no pin and another for a request with no key in a list of sixteen workers or more, and the gateway turns one for both"
-        }
         PolicySettings::Manual { .. }
         | PolicySettings::ConsistentHashing
         | PolicySettings::Random
+        | PolicySettings::RoundRobin
         | PolicySettings::Passthrough
         | PolicySettings::CacheAware { .. }
         | PolicySettings::PowerOfTwo { .. }
@@ -2552,14 +2552,11 @@ mod tests {
         );
 
         // The override places every other policy's keyed requests itself,
-        // and under these two its rule has no document yet.
-        for name in ["prefix_hash", "round_robin"] {
-            assert_eq!(
-                refusal(&overridden(name)),
-                ("routing_key_override.enabled", "true".to_string()),
-                "{name}"
-            );
-        }
+        // and under this one its rule has no document yet.
+        assert_eq!(
+            refusal(&overridden("prefix_hash")),
+            ("routing_key_override.enabled", "true".to_string())
+        );
 
         // Behind other configured headers the gateway reads the routing key
         // header as sent, and a block strips every source or none.
@@ -2597,8 +2594,9 @@ mod tests {
     /// rule: each places a single request by nothing its key hands it. The
     /// gateway's answers with the override are recorded under the first
     /// two.
-    const PLACED: [&str; 6] = [
+    const PLACED: [&str; 7] = [
         "random",
+        "round_robin",
         "power_of_two",
         "least_load",
         "passthrough",
@@ -2786,12 +2784,6 @@ mod tests {
             why(&sticky("prefix_hash")),
             "under the override this policy's ring would place a key the request's own id \
              handed, and the gateway places that request by its prompt"
-        );
-        assert_eq!(
-            why(&sticky("round_robin")),
-            "under the override this policy would turn one rotation for a key with no pin and \
-             another for a request with no key in a list of sixteen workers or more, and the \
-             gateway turns one for both"
         );
     }
 
@@ -3179,14 +3171,14 @@ mod tests {
     #[test]
     fn a_pair_mode_plans_pairs_alone_where_its_main_policy_has_no_document() {
         // Under the override the hash ring on both sides of the pair has a
-        // document, and a main policy of round robin has none for its keyed
-        // requests.
+        // document, and a main policy of `prefix_hash` has none for its
+        // keyed requests.
         let mut keyed = RoutingSettings {
             mode: pair_mode(
                 Some(PolicySettings::ConsistentHashing),
                 Some(PolicySettings::ConsistentHashing),
             ),
-            ..config(PolicySettings::RoundRobin)
+            ..config(at_flag_defaults("prefix_hash"))
         };
         keyed.routing_key_override.enabled = true;
         let alone = pair_alone(&keyed).expect("the pair's own document");
@@ -3656,10 +3648,10 @@ mod tests {
     /// and the sticky override is off and on. Where the pair's own document
     /// is refused, the mode's is refused by the same sentence. Where the
     /// controller's check takes the pair's own document, it takes the
-    /// mode's, which binds a single request behind the pair in all but two:
-    /// under the override, beside sides of the hash ring, a main policy of
-    /// `round_robin` or `prefix_hash` has no document for its keyed
-    /// requests, and the pair is planned alone.
+    /// mode's, which binds a single request behind the pair in all but
+    /// one: under the override, beside sides of the hash ring, a main
+    /// policy of `prefix_hash` has no document for its keyed requests, and
+    /// the pair is planned alone.
     #[test]
     fn no_pair_mode_loses_its_document_to_its_single_request() {
         let mut alone_still = Vec::new();
@@ -3687,9 +3679,6 @@ mod tests {
             }
         }
         let ring = Some("consistent_hashing");
-        assert_eq!(
-            alone_still,
-            [("round_robin", ring, true), ("prefix_hash", ring, true)]
-        );
+        assert_eq!(alone_still, [("prefix_hash", ring, true)]);
     }
 }

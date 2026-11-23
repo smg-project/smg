@@ -102,6 +102,7 @@ impl Row {
     ) -> Result<PolicySpec, String> {
         let policy = match self.policy.as_str() {
             "random" => PolicySettings::Random,
+            "round_robin" => PolicySettings::RoundRobin,
             "power_of_two" => PolicySettings::PowerOfTwo {
                 load_metric: LoadMetricSetting::ExpectedWait,
             },
@@ -732,6 +733,7 @@ mod sends {
         identity::basic::Worker,
         load::state::{one_rank_load, LoadSnapshot},
         test_support::ready_worker,
+        worker::WorkerStatus,
     };
 
     use super::{Outcome, Row};
@@ -891,9 +893,12 @@ mod sends {
             };
             let decided =
                 DecisionGuard::decide_under(engine, GatewayId::LOCAL, &asks, self.at(nth));
-            let mut guard = decided.expect("a decision");
-            let by = guard.decision().pick().expect("a pick").placed_by();
-            let place = guard.take(0).expect("the first target").position as usize;
+            let guard = decided.expect("a decision");
+            // The host takes no other target: its dispatch names the first.
+            // A decision no stage and no rule hears of comes with no lease.
+            let pick = guard.decision().pick().expect("a pick");
+            let first = pick.targets.first().expect("the first target");
+            let (place, by) = (first.position as usize, pick.placed_by());
             (guard, place, by)
         }
 
@@ -1009,9 +1014,9 @@ mod sends {
     /// rule moves it under `delegate`
     /// (`model_gateway/src/policies/registry.rs`, `select_sticky`). The
     /// book reads the gateway's counts and the place a request went to,
-    /// and no word of the engine it is held against. Every worker of these
-    /// cases takes requests all along, so a key's leading pin is the one
-    /// pin its rule reads.
+    /// and no word of the engine it is held against. No worker of these
+    /// cases stops taking requests, so a key's leading pin is the one pin
+    /// its rule reads.
     #[derive(Default)]
     struct Pins(HashMap<&'static str, usize>);
 
@@ -1150,6 +1155,125 @@ mod sends {
                 pinned >= 8 && behind >= 8 && ended >= 8 && capped >= 8,
                 "{workers} workers: {pinned} pinned requests, {behind} placed behind one, \
                  {ended} pinned requests ended, {capped} keyed requests at their pin's cap"
+            );
+        }
+    }
+
+    /// The gateway's rotation under `round_robin`, kept by the host's own
+    /// book as its policy turns it
+    /// (`model_gateway/src/policies/round_robin.rs:142-168`). A request
+    /// takes the list's next row. Where that worker takes no request, it
+    /// takes the next of the rotation of the workers that do, and the
+    /// list's rotation has moved on all the same. A rotation starts where
+    /// its policy object first sights it, which no engine repeats, so the
+    /// book keeps every pair of starts the placements so far allow: the
+    /// list's rotation's, and the other's.
+    struct Turns(Vec<(usize, usize)>);
+
+    impl Turns {
+        /// Every pair of starts over a list of `workers` rows.
+        fn over(workers: usize) -> Self {
+            let starts = (0..workers).flat_map(|row| (0..workers).map(move |turn| (row, turn)));
+            Self(starts.collect())
+        }
+
+        /// A request the policy placed went to `place`, in a list whose
+        /// workers `ready` take requests: the starts that put it there
+        /// stay, each a turn on. Whether any stays.
+        fn placed(&mut self, ready: &[bool], place: usize) -> bool {
+            let kept: Vec<usize> = (0..ready.len()).filter(|&at| ready[at]).collect();
+            self.0.retain_mut(|(row, turn)| {
+                let at = *row % ready.len();
+                *row += 1;
+                if ready[at] {
+                    return at == place;
+                }
+                *turn += 1;
+                kept[(*turn - 1) % kept.len()] == place
+            });
+            !self.0.is_empty()
+        }
+    }
+
+    /// `round_robin` under the override, which no sheet of the gateway
+    /// records, held to the gateway's rule
+    /// (`model_gateway/src/policies/registry.rs`, `select_sticky`) by a twin
+    /// engine that runs the policy alone over the same worker objects, as
+    /// `least_load` is above. The gateway asks one policy object for a
+    /// request with no key, for a key's first request and for a key at its
+    /// pin's cap (`:664`, `:774`, `:745`), and not for a request that
+    /// follows its pin (`:736-739`). So the three kinds take the turns of
+    /// one rotation, and the twin, asked wherever the gateway asks its
+    /// policy, turns its own in step: each request the policy places goes
+    /// to one worker under both.
+    ///
+    /// Each of those requests is held to the gateway's rotation too
+    /// ([`Turns`]). Behind the first request, the worker two rows on takes
+    /// no request for a third of the run: the list's rotation lands on its
+    /// row at once, and no key is pinned on it. Over three workers, under
+    /// the size a rotation drew its turn from before, over sixteen, at it,
+    /// and over sixty-four. Each request is held to the gateway's rule by
+    /// the key's leading pin ([`Pins::rule`]), and each decision's verdict
+    /// to the gateway's write of that pin ([`Pins::sent`]).
+    #[test]
+    fn round_robin_places_under_the_override_as_the_policy_alone_places() {
+        for workers in [3, 16, 64] {
+            let (keyed, alone) = (engine("round_robin", true), engine("round_robin", false));
+            let mut host = Host::new(&vec![0; workers]);
+            let (list, cell) = (Arc::clone(&host.list), ListCell::default());
+            let members = lent(&list, &cell);
+            let (mut pins, mut turns) = (Pins::default(), Turns::over(workers));
+            // The workers that take requests, and the one that takes none
+            // for a while.
+            let (mut ready, mut refused) = (vec![true; workers], None);
+            let (mut pinned, mut capped, mut ended) = (0, 0, 0);
+            // The requests the policy placed while a worker took none.
+            let mut passed = 0;
+            for nth in 0..96_u32 {
+                if nth == 32 {
+                    let at: usize = refused.take().expect("a refused worker");
+                    host.list[at].set_status(WorkerStatus::Ready);
+                    ready[at] = true;
+                }
+                if nth >= 8 && nth % 2 == 0 {
+                    let oldest = host.held.pop_front().expect("a request in flight");
+                    ended += u32::from(oldest.0.len() == 1);
+                    host.ended(oldest, nth);
+                }
+                let key = ["k0", "k1", "k2", "k3", "k4", ""][nth as usize % 6];
+                let (guard, place, by) = host.decide(&keyed, members, (key, 1_000, nth));
+                let at_cap = pins.rule(&host, key, (place, by));
+                pins.sent(&host, key, place, verdict(&guard));
+                let mut guards = vec![guard];
+                if by == PlacedBy::Rule {
+                    pinned += 1;
+                } else {
+                    let (twin, twin_place, _) = host.decide(&alone, members, ("", 1_000, nth));
+                    assert_eq!(
+                        place, twin_place,
+                        "{workers} workers: request {nth}, {key:?}"
+                    );
+                    guards.push(twin);
+                    assert!(
+                        turns.placed(&ready, place),
+                        "{workers} workers: request {nth}, {key:?}, on {place}: no start of the \
+                         gateway's two rotations puts it there"
+                    );
+                    capped += u32::from(at_cap);
+                    passed += u32::from(refused.is_some());
+                }
+                host.sent(guards, (key, nth), place);
+                if nth == 0 {
+                    let at = (place + 2) % workers;
+                    host.list[at].set_status(WorkerStatus::NotReady);
+                    (ready[at], refused) = (false, Some(at));
+                }
+            }
+            assert!(
+                pinned >= 8 && capped >= 8 && ended >= 8 && passed >= 8,
+                "{workers} workers: {pinned} pinned requests, {capped} keyed requests at their \
+                 pin's cap, {ended} pinned requests ended, {passed} requests placed while a \
+                 worker took none"
             );
         }
     }
