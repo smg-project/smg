@@ -346,7 +346,7 @@ class NativeEncoder:
             require(isinstance(destination, str) and bool(destination), "invalid receiver address")
             addr = urlsplit("//" + destination)
             require(
-                addr.hostname == expected_host
+                (addr.hostname or "").lower() == expected_host.lower()
                 and bool(addr.port)
                 and not (
                     addr.username or addr.password or addr.path or addr.query or addr.fragment
@@ -359,7 +359,8 @@ class NativeEncoder:
             )
             destination = (request.get("prefill_host"), request.get("embedding_port"))
             require(
-                destination[0] == expected_host
+                isinstance(destination[0], str)
+                and destination[0].lower() == expected_host.lower()
                 and type(destination[1]) is int
                 and 0 < destination[1] <= 65535,
                 "receiver differs from frozen P host",

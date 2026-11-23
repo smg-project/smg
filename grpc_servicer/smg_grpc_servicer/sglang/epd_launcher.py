@@ -31,9 +31,14 @@ def available_cpus():
 
 def complete(args, role):
     """Derive native contracts and finite limits instead of requiring duplicated deployment JSON."""
-    for field in ("nnodes", "pp_size", "dp_size", "attn_dp_size"):
+    restricted = (
+        ("nnodes", "pp_size", "dp_size", "attn_dp_size")
+        if role == "encoder"
+        else ("nnodes", "pp_size")
+    )
+    for field in restricted:
         if getattr(args, field, 1) != 1:
-            raise ValueError(f"managed EPD does not support native {field} != 1")
+            raise ValueError(f"managed EPD {role} does not support native {field} != 1")
     if getattr(args, "enable_unified_memory", False):
         raise ValueError("managed EPD does not support unified-memory KV envelopes")
     revision = getattr(args, "revision", None)
@@ -63,6 +68,8 @@ def complete(args, role):
         tp_size=args.tp_size,
     )
     if role == "encoder":
+        if not (1 <= args.port <= 65525):
+            raise ValueError("managed encoder --port must be in 1..=65525 (control uses port + 10)")
         max_active, max_receivers = 64, 8
         config.update(
             max_active=max_active,

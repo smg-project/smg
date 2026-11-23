@@ -78,7 +78,8 @@ fn compatible_contracts(
         }
         && e.model_revision == p.model_revision
         && e.processor_contract == p.processor_contract
-        && e.layout_contract == p.layout_contract
+        && e.layout_contract == LAYOUT
+        && p.layout_contract == LAYOUT
         && e.embedding_dtype == p.embedding_dtype
         && (p.role == "decode" || e.embedding_backend == p.embedding_backend)
 }
