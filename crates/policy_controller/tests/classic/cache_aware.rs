@@ -20,10 +20,8 @@
 //!   the row's own history: each request wrote its prompt for the worker it
 //!   was placed on.
 //!
-//! A row under the index is replayed over two feeds of that column
-//! ([`Feed`]): the replay's own count of the blocks each worker stored, and
-//! this crate's store, its index written by the same reports and asked for
-//! the request's holders. The rows of the pool are lent on both.
+//! A row under the index is handed that column by the replay's own count
+//! of the blocks each worker stored.
 //!
 //! The profile is stated here from the row's configuration ([`Row::spec`]).
 //! Every worker of a row is as young as the row, and no index holds a
@@ -31,31 +29,24 @@
 
 use std::time::Instant;
 
-use kv_index::{compute_content_hash, request_prefix_hashes, ContentHash};
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
 use smg_policy_controller::{
-    document::{AppliedSpec, PolicySpec},
+    document::PolicySpec,
     engine::{
-        AffinityFacts, Candidate, Constraints, Decision, Engine, HashKind, Health, LoadRow, Phase,
+        AffinityFacts, Candidate, Constraints, Decision, Engine, HashKind, Health, LoadRow,
         PoolFacts, RequestFacts, Role, Scratch, ShedReason, SignalSource, Target, WorkerId,
     },
     stages::Lifecycle,
-    store::{
-        AffinityQuery, AffinityRowsBuffers, BatchFacts, BatchOutcome, GatewayId, KvEvent,
-        KvEventSink, MemoryStore, Signals, StoredBlock, ViewBuffers, ViewQuery, WorkerFacts,
-        WorkerStatus, WorkersStore,
-    },
     tracking::{Lease, Side, TransportClass},
 };
 
-use crate::{same_outcome, Outcome, Recorded, Replayed};
+use crate::{Outcome, Recorded, Replayed};
 
 /// The classic policy these rows record, as a sheet's head names it.
 pub const POLICY: &str = "cache_aware";
 
 const MODEL: &str = "m";
-const GATEWAY: GatewayId = GatewayId(1);
 
 /// Characters of a text an id: a prompt carried as text spells each id as
 /// four hex digits.
@@ -298,154 +289,9 @@ fn id(i: usize) -> WorkerId {
     WorkerId(1_000 + i as u64)
 }
 
-/// What hands a row under the index its affinity column.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Feed {
-    /// The replay's own count of the blocks each worker stored.
-    Lent,
-    /// This crate's store: its index written by the same reports, and its
-    /// naming of the request's holders.
-    Served,
-}
-
-/// The whole blocks of a prompt as a worker reports them: each block's
-/// content hash, named by the hash of the prefix that ends at it.
-fn blocks(prompt: &[u32], block_size: usize) -> Vec<StoredBlock> {
-    let contents: Vec<ContentHash> = prompt
-        .chunks_exact(block_size)
-        .map(compute_content_hash)
-        .collect();
-    contents
-        .iter()
-        .zip(request_prefix_hashes(&contents))
-        .map(|(&content_hash, seq_hash)| StoredBlock {
-            seq_hash,
-            content_hash,
-        })
-        .collect()
-}
-
-/// A store under the row's profile whose index holds what the row's workers
-/// report: each `stored` and `removed` step reaches it as a batch of the
-/// worker's events, and each request asks it which rows hold the request's
-/// leading blocks. One store serves one run of its row.
-struct Served {
-    store: MemoryStore,
-    ids: Vec<WorkerId>,
-    /// The number of each worker's last batch.
-    sequence: Vec<u64>,
-    view: ViewBuffers,
-    named: AffinityRowsBuffers,
-}
-
-impl Served {
-    fn new(spec: &PolicySpec, workers: usize) -> Self {
-        let store = MemoryStore::new();
-        let applied = AppliedSpec::validate(spec).expect("the row's profile validates");
-        store.apply(applied).expect("above the unbound start");
-        let ids = (0..workers)
-            .map(|place| {
-                let key = format!("grpc://w{place}:9000");
-                let id = store
-                    .upsert(WorkerFacts {
-                        engine: key.clone(),
-                        key,
-                        incarnation: 1,
-                        models: vec![MODEL.to_string()],
-                        dp_size: 1,
-                        signals: Signals {
-                            events: true,
-                            ..Signals::default()
-                        },
-                        ..WorkerFacts::default()
-                    })
-                    .id();
-                let revision = WorkersStore::get(&store, id).expect("the row").revision;
-                store
-                    .set_status(id, WorkerStatus::Ready, revision)
-                    .expect("the status");
-                id
-            })
-            .collect();
-        store.publish_now();
-        Self {
-            store,
-            ids,
-            sequence: vec![0; workers],
-            view: ViewBuffers::default(),
-            named: AffinityRowsBuffers::default(),
-        }
-    }
-
-    /// One batch of one event from the worker at `place`.
-    fn admit(&mut self, place: usize, event: KvEvent) {
-        self.sequence[place] += 1;
-        let facts = BatchFacts {
-            sequence: self.sequence[place],
-            ..BatchFacts::default()
-        };
-        let outcome = self.store.admit(self.ids[place], 0, facts, &[event]);
-        assert_eq!(outcome, BatchOutcome::Applied, "the batch is applied");
-    }
-
-    /// What each worker holds of a request for `prompt`, and the blocks the
-    /// index holds of it, by the store's naming of the request's holders.
-    fn holds(&mut self, prompt: &[u32], block_size: usize, seed: u64) -> Vec<(u32, u32)> {
-        let hashes: Vec<u64> = prompt
-            .chunks_exact(block_size)
-            .map(|block| compute_content_hash(block).0)
-            .collect();
-        let Self {
-            store,
-            ids,
-            view,
-            named,
-            ..
-        } = self;
-        let mut holds: Vec<(u32, u32)> = ids
-            .iter()
-            .map(|&id| (0, store.indexed_blocks(id, 0) as u32))
-            .collect();
-        store.deciding(|world| {
-            let ask = ViewQuery {
-                gateway: GATEWAY,
-                now: Instant::now(),
-                pinned: None,
-                affinity: false,
-                signal_cells: false,
-            };
-            let read = world
-                .view(MODEL, Role::Single, &ask, false, view)
-                .expect("the pool of the row's model");
-            let naming = AffinityQuery {
-                gateway: GATEWAY,
-                block_hashes: &hashes,
-                namespace_seed: 0,
-                seed,
-                cap: world
-                    .spec()
-                    .engine()
-                    .affinity_rows_cap(MODEL, Phase::Single),
-                wires: None,
-                now_micros: read.built.now_micros,
-            };
-            world.fill_affinity_rows(MODEL, Role::Single, &naming, read.candidates, named);
-            for holder in named.affinity().holders {
-                let id = read.candidates[holder.row as usize].id;
-                let place = ids
-                    .iter()
-                    .position(|&own| own == id)
-                    .expect("a worker of the row");
-                holds[place].0 = holder.overlap_blocks;
-            }
-        });
-        holds
-    }
-}
-
 /// The engine of the row's profile over the row's pool in its starting
 /// state, with the host's side of a dispatch and what each worker holds.
-struct Bed<'a> {
+struct Bed {
     engine: Engine,
     pool: Vec<Candidate>,
     scratch: Scratch,
@@ -463,19 +309,15 @@ struct Bed<'a> {
     /// nothing where the request was not placed: a row numbers its
     /// requests by every pick, as its recorder does.
     picked: Vec<Option<(Lease, Target, usize)>>,
-    /// The store that names the holders, under the served feed.
-    served: Option<&'a mut Served>,
-    /// What stops the row's run, the first such thing in its own words:
-    /// the store's index and the row's own count reading a request apart,
-    /// or the end of a request that no worker holds.
+    /// What stops the row's run, in its own words: the end of a request
+    /// that no worker holds.
     parted: Option<String>,
 }
 
-impl<'a> Bed<'a> {
+impl Bed {
     /// The bed, or the validator's words when this crate does not build the
-    /// row's profile. Under the served feed the store is new, and its index
-    /// empty.
-    fn new(row: &Row, spec: &PolicySpec, served: Option<&'a mut Served>) -> Result<Self, String> {
+    /// row's profile.
+    fn new(row: &Row, spec: &PolicySpec) -> Result<Self, String> {
         let engine = spec.validate().map_err(|err| err.to_string())?;
         let clock = 1_000;
         let pool = row
@@ -503,41 +345,13 @@ impl<'a> Bed<'a> {
             ids_per_block: row.ids_per_block(),
             held: vec![Vec::new(); row.workers.len()],
             picked: Vec::new(),
-            served,
             parted: None,
         })
     }
 
     /// The affinity column of a request for `prompt`: the replay's own
-    /// count, or under the served feed what the store's index names, held
-    /// to that count entry for entry.
-    fn column(&mut self, prompt: &[u32], seed: u64) -> Vec<AffinityFacts> {
-        let counted = self.counted(prompt);
-        let per = self.ids_per_block;
-        let Some(served) = &mut self.served else {
-            return counted;
-        };
-        let named: Vec<AffinityFacts> = served
-            .holds(prompt, per, seed)
-            .into_iter()
-            .map(|(overlap, indexed)| AffinityFacts {
-                overlap_blocks: overlap,
-                indexed_growth: indexed,
-                indexed_blocks: indexed,
-                ..AffinityFacts::default()
-            })
-            .collect();
-        if named != counted && self.parted.is_none() {
-            self.parted = Some(format!(
-                "the store's index names {named:?} where the row's reports count {counted:?}"
-            ));
-        }
-        named
-    }
-
-    /// The affinity column of a request for `prompt` by the replay's own
     /// count, under the row's matcher.
-    fn counted(&self, prompt: &[u32]) -> Vec<AffinityFacts> {
+    fn column(&self, prompt: &[u32]) -> Vec<AffinityFacts> {
         let per = self.ids_per_block;
         match self.matcher {
             // Every worker by its own depth: the leading blocks of the
@@ -590,7 +404,7 @@ impl<'a> Bed<'a> {
     fn pick(&mut self, prompt: &[[u32; 2]], tried: &[usize], seed: u64) -> usize {
         self.clock += 1_000;
         let prompt = ids(prompt);
-        let column = self.column(&prompt, seed);
+        let column = self.column(&prompt);
         let tried: Vec<WorkerId> = tried.iter().map(|&i| id(i)).collect();
         let text = self.matcher == Matcher::Text;
         let facts = RequestFacts {
@@ -704,13 +518,6 @@ impl<'a> Bed<'a> {
             }
             Step::Stored { worker, prompt } => {
                 let prompt = ids(prompt);
-                if let Some(served) = &mut self.served {
-                    let stored = KvEvent::Stored {
-                        parent: None,
-                        blocks: blocks(&prompt, per),
-                    };
-                    served.admit(*worker, stored);
-                }
                 let held = &mut self.held[*worker];
                 for blocks in 1..=prompt.len() / per {
                     let prefix = &prompt[..blocks * per];
@@ -725,14 +532,6 @@ impl<'a> Bed<'a> {
                 kept_blocks,
             } => {
                 let prompt = ids(prompt);
-                if let Some(served) = &mut self.served {
-                    let gone = blocks(&prompt, per)
-                        .iter()
-                        .skip(*kept_blocks)
-                        .map(|block| block.seq_hash)
-                        .collect();
-                    served.admit(*worker, KvEvent::Removed(gone));
-                }
                 self.held[*worker]
                     .retain(|h| h.len() <= kept_blocks * per || !prompt.starts_with(h));
             }
@@ -748,18 +547,12 @@ fn shared_blocks(a: &[u32], b: &[u32], ids_per_block: usize) -> u32 {
 }
 
 /// The row run once from a fresh engine: where each request was placed, or
-/// the validator's words, or what stopped the run: the store's index and
-/// the row's own count reading a request apart, or the end of a request
+/// the validator's words, or what stopped the run: the end of a request
 /// that no worker holds. `draw` separates the seeds of a drawn row's
 /// runs; a sequence row is run `0`. `spec` is the row's profile, read once
-/// a row, and `served` the store of the served feed.
-fn run(
-    row: &Row,
-    spec: &PolicySpec,
-    draw: u64,
-    served: Option<&mut Served>,
-) -> Result<Vec<usize>, String> {
-    let mut bed = Bed::new(row, spec, served)?;
+/// a row.
+fn run(row: &Row, spec: &PolicySpec, draw: u64) -> Result<Vec<usize>, String> {
+    let mut bed = Bed::new(row, spec)?;
     let picked = row
         .steps
         .iter()
@@ -773,63 +566,25 @@ fn run(
 }
 
 /// This crate's outcome for the row, in the shape of the recorded one, or
-/// its refusal of the row's profile. A row under the index answers over
-/// both feeds: where the lent feed gives the recorded outcome, the answer
-/// is the served feed's. A drawn row's served run is one draw: it holds the
-/// store's index to the row's own count at each request ([`Bed::column`]),
-/// and with the two columns equal entry for entry the draws are the lent
-/// feed's.
+/// its refusal of the row's profile.
 fn replay(row: &Row) -> Replayed {
-    let lent = replay_over(row, Feed::Lent);
-    let (recorded, drawn) = match &lent {
-        Replayed::Ran(outcome) => (
-            same_outcome(&row.outcome, outcome),
-            matches!(outcome, Outcome::Counts { .. }),
-        ),
-        Replayed::Refused(_) => (false, false),
-    };
-    if row.matcher != Matcher::Events || !recorded {
-        return lent;
-    }
-    if !drawn {
-        return replay_over(row, Feed::Served);
-    }
-    let once = row.spec().and_then(|spec| {
-        let mut served = Served::new(&spec, row.workers.len());
-        run(row, &spec, 1, Some(&mut served))
-    });
-    match once {
-        Ok(_) => lent,
-        Err(why) => Replayed::Refused(why),
-    }
-}
-
-/// The row's outcome over one feed.
-fn replay_over(row: &Row, feed: Feed) -> Replayed {
     let spec = match row.spec() {
         Ok(spec) => spec,
         Err(why) => return Replayed::Refused(why),
     };
-    let mut served = (feed == Feed::Served).then(|| Served::new(&spec, row.workers.len()));
     match &row.outcome {
-        Outcome::Sequence(_) => match run(row, &spec, 0, served.as_mut()) {
+        Outcome::Sequence(_) => match run(row, &spec, 0) {
             Ok(picked) => Replayed::Ran(Outcome::Sequence(picked)),
             Err(why) => Replayed::Refused(why),
         },
         Outcome::Counts { draws, .. } => {
-            // A store serves one run, so the draws run over the lent feed
-            // alone. A drawn row's served run is the one draw `replay`
-            // makes over a store of its own.
-            if served.is_some() {
-                return Replayed::Refused("a drawn row draws over the lent feed alone".to_string());
-            }
             // Each draw runs the row from a fresh engine, as the recorder
             // ran it from a fresh policy. The row's last request is the one
             // counted. A drawn row places every request: a draw that places
             // one nowhere answers as its sequence, which no count equals.
             let mut counts = vec![0u32; row.workers.len()];
             for draw in 1..=u64::from(*draws) {
-                match run(row, &spec, draw, None) {
+                match run(row, &spec, draw) {
                     Ok(picked) => {
                         if picked.iter().any(|&place| place >= counts.len()) {
                             return Replayed::Ran(Outcome::Sequence(picked));
