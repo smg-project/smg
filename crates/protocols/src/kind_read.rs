@@ -805,8 +805,9 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for Fitted<T> {
 /// attribute is read by [`fitted`]. What the kinds and the fields would not
 /// read as the derive of the enum does is refused at compile time: the enum
 /// and its variants may carry the attributes of `@known` alone (on a variant a
-/// doc comment and `#[serde(rename = "...")]`), and an attribute of a field
-/// may not stand behind `cfg_attr`, which could hide a serde attribute.
+/// doc comment and `#[serde(rename = "...")]`), an attribute of a field may
+/// not stand behind `cfg_attr`, which could hide a serde attribute, and a
+/// field may not stand behind `cfg`, which that struct would leave out.
 macro_rules! by_kind {
     (@key #[serde(tag = $key:literal)] $($more:tt)*) => { $key };
     (@key #[$($other:tt)*] $($more:tt)*) => { $crate::kind_read::by_kind!(@key $($more)*) };
@@ -822,6 +823,9 @@ macro_rules! by_kind {
     (@f $ctx:tt [$($done:tt)*] [$($names:ident)*] [$($keep:tt)*] #[cfg_attr $($no:tt)*] $($more:tt)*) => {
         compile_error!("by_kind! does not read a field attribute behind cfg_attr")
     };
+    (@f $ctx:tt [$($done:tt)*] [$($names:ident)*] [$($keep:tt)*] #[cfg $($no:tt)*] $($more:tt)*) => {
+        compile_error!("by_kind! does not read a field behind cfg")
+    };
     (@f $ctx:tt [$($done:tt)*] [$($names:ident)*] [$($keep:tt)*] #[$($other:tt)*] $($more:tt)*) => {
         $crate::kind_read::by_kind!(@f $ctx [$($done)*] [$($names)*] [$($keep)*] $($more)*)
     };
@@ -835,10 +839,10 @@ macro_rules! by_kind {
     };
     (@f ($name:ident $variant:ident $rest:ident) [$($done:tt)*] [$($names:ident)*] []) => {{
         #[derive(serde::Deserialize)]
-        struct Fields {
+        struct __ByKindFields {
             $($done)*
         }
-        let fields = <Fields as serde::Deserialize>::deserialize($rest)?;
+        let fields = <__ByKindFields as serde::Deserialize>::deserialize($rest)?;
         Ok($name::$variant { $($names: fields.$names),* })
     }};
     (
@@ -857,23 +861,25 @@ macro_rules! by_kind {
             $crate::kind_read::by_kind!(@known $(#[$($emeta)*])*);
             $( $crate::kind_read::by_kind!(@known $(#[$($vmeta)*])*); )*
 
+            // A field's type is named again inside `of_kind`, where these items
+            // are in scope too: they carry names no type of a caller has.
             #[derive(serde::Deserialize)]
             #[serde(variant_identifier)]
-            pub(crate) enum Kind {
+            pub(crate) enum __ByKindKind {
                 $( $(#[$($vmeta)*])* $variant ),*
             }
 
             impl $crate::kind_read::ByKind for $name {
                 const KEY: &'static str = $crate::kind_read::by_kind!(@key $(#[$($emeta)*])*);
                 const EXPECTING: &'static str = concat!("internally tagged enum ", stringify!($name));
-                type Kind = Kind;
+                type Kind = __ByKindKind;
 
-                fn of_kind<'de, D: serde::Deserializer<'de>>(
-                    kind: Kind,
-                    rest: D,
-                ) -> Result<Self, D::Error> {
+                fn of_kind<'de, __D: serde::Deserializer<'de>>(
+                    kind: __ByKindKind,
+                    rest: __D,
+                ) -> ::std::result::Result<Self, __D::Error> {
                     match kind {
-                        $( Kind::$variant => $crate::kind_read::by_kind!(@f ($name $variant rest) [] [] [] $($body)*), )*
+                        $( __ByKindKind::$variant => $crate::kind_read::by_kind!(@f ($name $variant rest) [] [] [] $($body)*), )*
                     }
                 }
             }
