@@ -751,8 +751,18 @@ impl RequestMaker for Made<'_, '_> {
         if tokens.is_some() || text.is_some() {
             let cell = self.of_call.map_or(&self.hashes, |call| &call.hashes);
             let hashes = cell.get_or_init(|| {
+                // By the id the list's workers registered under, as their
+                // table finds its index: a request may name the model by
+                // another.
+                let listed = match &request.lists {
+                    WorkerLists::None => None,
+                    WorkerLists::Single(list) => list.workers.first(),
+                    WorkerLists::Pair(lists) => lists.prefill.workers.first(),
+                    WorkerLists::Encode(lists) => lists.pair.prefill.workers.first(),
+                };
+                let model = listed.map_or(request.model, |worker| worker.model_id());
                 self.engine
-                    .prompt_hashes(request.model, tokens, text, request.prompt.seeds)
+                    .prompt_hashes(model, tokens, text, request.prompt.seeds)
             });
             hashes.write_to(&mut facts);
         }

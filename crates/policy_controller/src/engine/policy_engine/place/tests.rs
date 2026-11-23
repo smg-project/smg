@@ -33,7 +33,7 @@ use crate::{
         list_cell::tests::PublishedList,
         records::worker_id,
         view::{fingerprint, Candidate, FixedFacts, HashKind},
-        EncodeLists, PairAdmission, PairLists, PartnerClasses,
+        CacheIndex, CacheIndexes, EncodeLists, PairAdmission, PairLists, PartnerClasses,
     },
     policies::{
         consistent_hashing::{Head, InOrder as Lent},
@@ -478,6 +478,50 @@ fn the_prompts_blocks_are_hashed_under_its_partition_once() {
     let facts = made.make(engine.spec()).facts;
     assert!(facts.block_hashes.is_empty());
     assert_eq!(facts.prompt_tokens, 0);
+}
+
+/// A request that is lent a worker is hashed by the block size the host
+/// knows under the id the first worker of its list registered under, the
+/// id the list's table finds its index by, whatever size the host knows
+/// under the id the request states. A pair is hashed by its prefill list.
+#[test]
+fn a_prompt_is_hashed_by_the_block_size_of_its_workers_id() {
+    struct Learned;
+    impl CacheIndexes for Learned {
+        fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+            None
+        }
+
+        fn block_size(&self, model: &str) -> Option<u32> {
+            Some(if model == MODEL { 4 } else { 8 })
+        }
+    }
+    let engine = preset("cache_aware");
+    engine.affinity.set_indexes(Arc::new(Learned));
+    let members = PublishedList::new(pool(2));
+    // The pair's decode registered under the id the request states.
+    let decodes = PublishedList::new([ready_worker("http://decode-0:8000", "another-id")].into());
+    let classes = PartnerClasses::number(1, [&[0_u32][..], &[0][..]]);
+    let pair = PairLists {
+        decode: decodes.lent(),
+        ..pair_of(&members, &classes)
+    };
+    let tokens: Vec<u32> = (0..600).collect();
+    for lists in [
+        WorkerLists::Single(members.lent()),
+        WorkerLists::Pair(pair),
+        three_of(pair),
+    ] {
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(&tokens),
+                ..Prompt::NONE
+            },
+            ..PlaceRequest::of("another-id", lists)
+        };
+        let made = Made::new(&engine, &request, &[]);
+        assert_eq!(made.make(engine.spec()).facts.block_size, 4);
+    }
 }
 
 /// A first attempt that names nothing tried or missed, demands nothing,
