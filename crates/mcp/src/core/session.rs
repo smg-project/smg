@@ -286,8 +286,25 @@ impl<'a> McpToolSession<'a> {
     /// Execute a single tool while preserving pending approval state.
     pub async fn execute_tool_result(&self, input: ToolExecutionInput) -> ToolExecutionResult {
         let invoked_name = input.tool_name.clone();
+        // A session calls what it admitted: an alias the inventory now holds
+        // with another target than the one this session listed is not this
+        // session's tool.
+        let admitted = self.exposed_name_map.get(&invoked_name).filter(|binding| {
+            binding.server_key == binding.associated_server_key
+                || self
+                    .orchestrator
+                    .tool_inventory()
+                    .get_entry(&binding.server_key, &binding.resolved_tool_name)
+                    .is_none_or(|now| {
+                        self.mcp_tools.iter().any(|listed| {
+                            listed.qualified_name == now.qualified_name
+                                && listed.alias_target.as_ref().map(|alias| &alias.target)
+                                    == now.alias_target.as_ref().map(|alias| &alias.target)
+                        })
+                    })
+        });
 
-        if let Some(binding) = self.exposed_name_map.get(&invoked_name) {
+        if let Some(binding) = admitted {
             let resolved_tool_name = binding.resolved_tool_name.clone();
             let mut request_ctx = self.request_ctx_for(binding.approval_mode);
             // The call carries the pool key of the binding its tool is
@@ -1007,6 +1024,45 @@ mod tests {
                 "{tool}"
             );
         }
+    }
+
+    /// A session calls what it admitted: an alias registered again with
+    /// another target is not this session's tool.
+    #[tokio::test]
+    async fn an_alias_registered_again_with_another_target_is_not_called() {
+        let orchestrator = McpOrchestrator::new_test();
+        insert_test_tool(&orchestrator, "server1", "search");
+        insert_test_tool(&orchestrator, "server2", "search");
+        orchestrator
+            .register_alias("find", "server1", "search", None)
+            .unwrap();
+        let session = McpToolSession::new(
+            &orchestrator,
+            vec![McpServerBinding {
+                label: "one".to_string(),
+                server_key: "server1".to_string(),
+                allowed_tools: None,
+                list_error: None,
+                pool_key: None,
+            }],
+            "test-request",
+        );
+        assert!(session.has_exposed_tool("find"));
+
+        orchestrator
+            .register_alias("find", "server2", "search", None)
+            .unwrap();
+        let output = session
+            .execute_tool(ToolExecutionInput {
+                call_id: "call".to_string(),
+                tool_name: "find".to_string(),
+                arguments: json!({}),
+            })
+            .await;
+        assert_eq!(
+            output.error_message.as_deref(),
+            Some("Tool 'find' is not in this session's exposed tool map")
+        );
     }
 
     #[test]
