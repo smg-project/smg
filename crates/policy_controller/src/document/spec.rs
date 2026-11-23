@@ -2062,10 +2062,15 @@ pub struct ProfileSpec {
     /// a send leaves the send counted. Unset, a report sampled at or after
     /// a send ends it. A written zero is refused, as a zero limit is. A
     /// profile whose stages do not read its count of sends is refused if it
-    /// sets a delay. The limit ends a send whatever the delay. A new
-    /// document's profile of the same name takes over the sends the
-    /// standing profile holds and shares them: a read under the shorter of
-    /// the two delays ends such a send for both.
+    /// sets a delay. The limit ends a send whatever the delay. The
+    /// profiles of a document that set the same limit and the same delay
+    /// read one count, under the name of the first of them that reads it,
+    /// in the order of their names. A new document's count takes over the
+    /// sends the standing count under the same name holds and shares them:
+    /// a read under the shorter of the two delays ends such a send for
+    /// both. A count under a name with no standing count starts empty: a
+    /// document that drops that first profile, or groups it apart from the
+    /// others, starts the count of the others empty, once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub sent_report_delay_ms: Option<u32>,
