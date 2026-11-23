@@ -201,6 +201,16 @@ impl Bed {
     /// Files the single's lease `id` ([`single`]) over its pick
     /// ([`single_targets`]), as a decider files it for the request `id`.
     fn file_single(&self, id: u64) {
+        self.file(id, false);
+    }
+
+    /// [`Self::file_single`] for a request its sessions rule keeps from
+    /// the profile: the record says so ([`LeaseRecord::untold`]).
+    fn file_kept(&self, id: u64) {
+        self.file(id, true);
+    }
+
+    fn file(&self, id: u64, untold: bool) {
         let lease = single(id);
         let record = LeaseRecord {
             lease,
@@ -209,12 +219,20 @@ impl Bed {
             target: lease.booked,
             picked: PickRecord::of(&single_targets()),
             decode: None,
+            untold,
             term: 0,
             issued_at: self.now,
             dispatch_deadline: self.now + DISPATCH_TTL,
             state: LeaseState::ISSUED,
         };
         LeasesStore::issue(&self.store, record).expect("the key is free");
+    }
+
+    /// The worker the session of every lease here is pinned on first, in
+    /// the table of the standing generation's engine.
+    fn pinned(&self) -> Option<WorkerId> {
+        let pins = |world: &StoreSnapshot| world.spec().engine().sessions().pins(KEY);
+        self.store.deciding(pins).map(|pins| pins[0])
     }
 
     /// Both parts of the lease `id` as the file holds them.
@@ -335,6 +353,38 @@ fn a_singles_words_with_no_dispatch_carry_the_lease_as_issued() {
             Event::Released(single(1), ReleaseReason::ClientGone),
             Event::Completed(single(2), ended(2, WorkerId(7))),
             Event::Completed(single(3), ended(3, WorkerId(7))),
+        ]
+    );
+}
+
+/// A single's lease whose request its sessions rule keeps from the profile
+/// tells no stage its dispatch, told either way: the store's own word reads
+/// the record ([`LeaseRecord::untold`]), and the lease as lent carries a
+/// pick that says the same. The session table hears the dispatch, and the
+/// session's pin follows the worker it took. The end and the release are
+/// told as any lease's.
+#[test]
+fn a_kept_singles_dispatch_moves_its_pin_and_reaches_no_stage() {
+    let told = told_both_ways(|bed| {
+        bed.file_kept(1);
+        assert_eq!(bed.pinned(), None);
+        bed.dispatched(1, 1);
+        assert_eq!(bed.pinned(), Some(WorkerId(9)));
+        bed.completed(1, WorkerId(9));
+        bed.file_kept(2);
+        bed.dispatched(2, 0);
+        bed.released(2);
+    });
+    let moved = Lease {
+        target_index: 1,
+        booked: WorkerId(9),
+        ..single(1)
+    };
+    assert_eq!(
+        told,
+        [
+            Event::Completed(moved, ended(1, WorkerId(9))),
+            Event::Released(single(2), ReleaseReason::ClientGone),
         ]
     );
 }

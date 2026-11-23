@@ -376,6 +376,7 @@ async fn a_gateway_gone_past_its_grace_period_is_let_go_by_the_run_loop() {
                 target: WorkerId(7),
                 picked: PickRecord::default(),
                 decode: None,
+                untold: false,
                 term: 1,
                 issued_at: now,
                 dispatch_deadline: now + Duration::from_secs(600),

@@ -92,6 +92,7 @@ fn lease(gateway: GatewayId, id: u64, term: u64, now: Instant) -> LeaseRecord {
         target: WorkerId(7),
         picked: PickRecord::default(),
         decode: None,
+        untold: false,
         term,
         issued_at: now,
         dispatch_deadline: now + Duration::from_secs(1),

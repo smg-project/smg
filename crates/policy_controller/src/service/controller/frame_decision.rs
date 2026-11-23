@@ -50,6 +50,7 @@ use crate::{
         decision::{shed, Decision, Pair, Pick, ShedReason, Target},
         decision_engine::{DecisionRefused, DecodeRefused, WorkerLists},
         framework::release,
+        lease_events,
         policy_engine::PolicyEngine,
         shadow::Shadowed,
         view::{fingerprint, Phase, RequestFacts, Role, Session, WorkerId},
@@ -405,6 +406,9 @@ fn record_of(
         target: first.id,
         picked: PickRecord::of(&pick.targets),
         decode: None,
+        // A single's issue states the word of a pick its sessions rule
+        // keeps from the profile. A pair's record states none.
+        untold: false,
         term,
         issued_at: taken.now,
         dispatch_deadline: taken.due(),
@@ -431,6 +435,11 @@ fn record_of(
 /// The binding's shadow is counted behind a filing that stands, and behind
 /// a shed all the same. A filing the store refuses counts none.
 ///
+/// A pick the binding's sessions rule keeps from the profile is filed under
+/// that word ([`LeaseRecord::untold`]), read off the decision in hand
+/// ([`lease_events::stages_hear`]). No stage hears its issue, and the store
+/// reads the word where it tells the lease's dispatch.
+///
 /// # Errors
 ///
 /// The store's refusal: it stands under another term, or mints no id
@@ -456,8 +465,18 @@ pub(crate) fn issue(
     };
     let stages = front.spec().engine();
     let sized = (session, tokens);
-    let record = record_of(front, taken, term, (pick, first), Side::Single, sized);
-    let told = |lease: &Lease| stages.on_decision_issued(lease, decision);
+    // The stages hear of every pick but one the binding's sessions rule
+    // keeps from the profile: that one's lease is filed under the word.
+    let hears = lease_events::stages_hear(decision);
+    let record = LeaseRecord {
+        untold: !hears,
+        ..record_of(front, taken, term, (pick, first), Side::Single, sized)
+    };
+    let told = |lease: &Lease| {
+        if hears {
+            stages.on_decision_issued(lease, decision);
+        }
+    };
     // The slot of the pick's count, as the decision's world names it. A
     // member the worker objects list ahead of that world, inside its
     // registration window, is read in the table its write filed it in:

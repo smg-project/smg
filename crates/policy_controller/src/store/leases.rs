@@ -192,6 +192,19 @@ pub struct LeaseRecord {
     /// side: its worker, its state and its booking are the side's own
     /// word ([`Sides`]).
     pub decode: Option<DecodeMark>,
+    /// The lease's request is kept from its profile: the binding's sessions
+    /// rule placed it alone, and the rule says such a request is none of
+    /// the profile's own ([`RulePlaced::Untold`]). The decider that files
+    /// the lease writes the word from the decision in hand
+    /// (`lease_events::stages_hear`), and tells no stage the issue. The
+    /// store's teller reads it at the dispatch: the session table hears,
+    /// and no stage and no count of sends does. An end and a release are
+    /// told as any lease's. `false` on every other record, a pair's among
+    /// them: each side of a pair keeps a verdict of its own, and a pick's
+    /// one word does not say which side the rule placed.
+    ///
+    /// [`RulePlaced::Untold`]: crate::document::spec::RulePlaced::Untold
+    pub untold: bool,
     /// The term of the leader that issued the lease.
     pub term: u64,
     pub issued_at: Instant,
@@ -308,7 +321,9 @@ impl Sides {
     ///   by its frame's index. An end and a release name the one the lease
     ///   books.
     /// - **The pick** is one of no target: no word of a single carries its
-    ///   pick to a stage.
+    ///   pick to a stage. It says what the record says of who is told
+    ///   ([`LeaseRecord::untold`]), the one word of a pick a single's
+    ///   telling reads.
     /// - **The decode side** is a single's, as a guard lends it: no
     ///   session, the lease's own three sizes, never chosen.
     ///
@@ -343,7 +358,11 @@ impl Sides {
             ..Target::default()
         };
         Some(told(&HeldDecision {
-            decision: &EMPTY_PICK,
+            decision: if record.untold {
+                &UNTOLD_PICK
+            } else {
+                &EMPTY_PICK
+            },
             lease: &lease,
             index,
             target: &target,
@@ -362,19 +381,29 @@ impl Sides {
 /// target, under no trace. A file keeps of a single's pick the workers a
 /// dispatch names by its index, and lists none of them for a word: no word
 /// of a single carries its pick to a stage.
-static EMPTY_PICK: Decision = Decision::Pick(Pick {
-    targets: Targets::new(),
-    trace: Trace {
-        profile: Trace::NO_PROFILE,
-        survivors: Survivors::counted(0),
-        top: [(WorkerId(0), 0.0); TRACE_TOP],
-        top_len: 0,
-        seed: 0,
-        generation: 0,
-        lifted: LiftedVeto::None,
-    },
-    session_verdict: SessionVerdict::None,
-});
+static EMPTY_PICK: Decision = lent_pick(Targets::new());
+
+/// [`EMPTY_PICK`] for a lease whose request is kept from its profile
+/// ([`LeaseRecord::untold`]): the pick says so, as the one a host that held
+/// the decision lends.
+static UNTOLD_PICK: Decision = lent_pick(Targets::untold());
+
+/// A pick of `targets` under no trace, with no verdict on a session key.
+const fn lent_pick(targets: Targets) -> Decision {
+    Decision::Pick(Pick {
+        targets,
+        trace: Trace {
+            profile: Trace::NO_PROFILE,
+            survivors: Survivors::counted(0),
+            top: [(WorkerId(0), 0.0); TRACE_TOP],
+            top_len: 0,
+            seed: 0,
+            generation: 0,
+            lifted: LiftedVeto::None,
+        },
+        session_verdict: SessionVerdict::None,
+    })
+}
 
 /// Why a lease was not recorded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

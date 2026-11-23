@@ -2136,6 +2136,215 @@ pub(crate) mod tests {
         );
     }
 
+    /// The service tells no stage the issue of a request its sessions rule
+    /// keeps from the profile. A key's first request is placed by the
+    /// profile's picker, which hears its issue. The key's next request
+    /// follows its pin: under `untold` its lease is filed as kept, and the
+    /// picker hears nothing of it ahead of its release. Under `told`, the
+    /// default, the picker hears that issue as any other.
+    #[tokio::test]
+    async fn the_service_tells_no_stage_the_issue_of_a_request_its_rule_keeps() {
+        use crate::{
+            document::{Assignment, RulePlaced},
+            service::controller::lifecycle::tests::{a_dispatched, a_released},
+        };
+        for kept in [RulePlaced::Untold, RulePlaced::Told] {
+            let told = Arc::new(Mutex::new(Calls::new()));
+            let hears = Arc::clone(&told);
+            let mut catalog = StageRegistry::builtin();
+            catalog
+                .picker("told", move || Box::new(Told(Arc::clone(&hears))))
+                .expect("a free name");
+            // The manual preset's rule over a profile that picks through
+            // the case's stage: a new key is the profile's to place.
+            let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+            document.generation = 1;
+            let profile = document.profiles.get_mut("manual");
+            profile.expect("the preset's profile").pick = "told".into();
+            let rule = document.bindings[0].sessions.as_mut();
+            let rule = rule.expect("the preset's rule");
+            (rule.assignment, rule.rule_placed) = (Assignment::Delegate, kept);
+            let digest = document.digest().expect("the document digests");
+            let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])
+                .expect("the catalog holds the stage");
+            let mut bed = bed(Some(spec), true, (1, 8), []);
+            let at = bed.script.taken;
+            let untold = |bed: &Bed, answer: &proto::DecideAnswer| {
+                let id = LeaseId(lease_of(answer).id);
+                let filed = LeasesStore::get(&*bed.store, GATEWAY, id);
+                filed.expect("the lease is on file").untold
+            };
+            let first = bed.ask(keyed(1, 1_001)).await;
+            assert!(!untold(&bed, &first), "{kept:?}: a new key");
+            let hand = Hand::new(GATEWAY);
+            lifecycle::dispatched(&bed.store, &hand, &a_dispatched(lease_of(&first).id), at)
+                .expect("the frame reads");
+            let pinned = bed.ask(keyed(1, 1_002)).await;
+            assert_eq!(picked(&pinned), picked(&first), "{kept:?}: its pin");
+            assert_eq!(untold(&bed, &pinned), kept == RulePlaced::Untold);
+            let (first, pinned) = (lease_of(&first).id, lease_of(&pinned).id);
+            lifecycle::released(&bed.store, &hand, &a_released(pinned)).expect("the frame reads");
+            let mut heard = vec![(first, None)];
+            if kept == RulePlaced::Told {
+                heard.push((pinned, None));
+            }
+            heard.push((pinned, Some(ReleaseReason::ClientGone)));
+            assert_eq!(*told.lock(), heard, "{kept:?}");
+        }
+    }
+
+    /// A pinned request is none of the requests its policy sent, through
+    /// the service as in a gateway's own process: the case of the same name
+    /// in `tests/classic/sticky_override.rs`, asked by frames, with its
+    /// counts. Two workers each hold one request, a lease on file, and the
+    /// second reports 5,000 tokens waiting. A key's first request of 1,000
+    /// tokens goes to the first worker, placed by the policy, and its next
+    /// request of 10,000 tokens follows the pin: its lease is filed as kept
+    /// from the profile. The policy then prices the first worker at the
+    /// 1,000 tokens it placed there and at two requests more on file, at
+    /// the mean prompt of 1,024 tokens: 3,048, under the second worker's
+    /// 6,024. So a request with no key goes to the first worker. Counted as
+    /// a send of the policy's, the pinned request would price that worker
+    /// at 12,024.
+    ///
+    /// The pinned request still weighs what a lease on file weighs: with
+    /// 1,500 tokens waiting on the second worker, 2,524 in all, the request
+    /// with no key goes there. Once the pinned request ends it weighs
+    /// nothing: the first worker stands at 2,024, and the request with no
+    /// key goes back to it.
+    #[tokio::test]
+    async fn a_served_pinned_request_is_none_of_the_requests_its_policy_sent() {
+        use crate::{
+            document::{
+                Assignment, LoadMetricSetting, PolicySettings, RoutingKeyOverrideSettings,
+                RoutingSettings,
+            },
+            engine::sticky_sessions::SessionVerdict,
+            service::controller::lifecycle::tests::{a_completed, a_dispatched, a_released},
+            store::{LeaseRecord, PickRecord},
+        };
+        let policies = [
+            PolicySettings::LeastLoad {
+                kv_pressure_weight: 0.15,
+                mean_prefill_tokens: 1024,
+                default_throughput: 2000.0,
+            },
+            PolicySettings::PowerOfTwo {
+                load_metric: LoadMetricSetting::ExpectedWait,
+            },
+        ];
+        for policy in policies {
+            let name = policy.name();
+            // The settings' document for the policy under the sticky
+            // override: its rule keeps what it places from the profile.
+            let settings = RoutingSettings {
+                policy,
+                routing_key_override: RoutingKeyOverrideSettings {
+                    enabled: true,
+                    headers: vec!["x-smg-routing-key".into()],
+                    eviction_interval_secs: 60,
+                    max_idle_secs: 14_400,
+                    assignment_mode: Assignment::Delegate,
+                },
+                ..RoutingSettings::default()
+            };
+            let mut document = settings.policy_document().expect("the settings' document");
+            document.generation = 1;
+            let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
+            let at = bed.script.taken;
+            let (near, far, aside) = (bed.workers[0], bed.workers[1], bed.workers[2]);
+            // Two workers take requests: the third is set not ready.
+            let row = WorkersStore::get(&*bed.store, aside).expect("the row");
+            let set = bed
+                .store
+                .set_status(aside, WorkerStatus::NotReady, row.revision);
+            set.expect("the row stands");
+            // One request on each of the two, held by a lease on file that
+            // no decision of the policy's filed.
+            for (id, target) in [(1, near), (2, far)] {
+                let held = LeaseRecord {
+                    lease: Lease {
+                        id: LeaseId(1 << 63 | id),
+                        ..Lease::default()
+                    },
+                    gateway: GATEWAY,
+                    request: id,
+                    target,
+                    picked: PickRecord::default(),
+                    decode: None,
+                    untold: false,
+                    term: 1,
+                    issued_at: at,
+                    dispatch_deadline: at + DISPATCH_TTL,
+                    state: LeaseState::ISSUED,
+                };
+                assert_eq!(LeasesStore::issue(&*bed.store, held), Ok(()));
+            }
+            // The two workers' reports, the second with `waiting` tokens in
+            // its queue, sampled ahead of every send: none reflects one.
+            let reports = |waiting: i32| {
+                let loads = [("w0", 0), ("w1", waiting)].map(|(worker, waiting)| {
+                    let mut report = one_rank_load(waiting, 0.1, 1_000.0);
+                    report.sampled_at = Some(at - Duration::from_millis(1));
+                    (format!("http://{worker}:8000"), report)
+                });
+                LoadSnapshot::from_loads_for_test(loads.into_iter().collect())
+            };
+            let sized = |mut frame: proto::DecideRequest, tokens: u32| {
+                let facts = frame.facts.as_mut().expect("the case's frame has facts");
+                facts.prompt_tokens = tokens;
+                frame
+            };
+            let filed = |bed: &Bed, answer: &proto::DecideAnswer| {
+                let id = LeaseId(lease_of(answer).id);
+                let filed = LeasesStore::get(&*bed.store, GATEWAY, id);
+                let filed = filed.expect("the lease is on file");
+                (filed.lease.session_verdict, filed.untold)
+            };
+            let hand = Hand::new(GATEWAY);
+            let sent = |bed: &Bed, answer: &proto::DecideAnswer| {
+                let frame = a_dispatched(lease_of(answer).id);
+                lifecycle::dispatched(&bed.store, &hand, &frame, at).expect("the frame reads");
+            };
+            let given_up = |bed: &Bed, answer: &proto::DecideAnswer| {
+                let frame = a_released(lease_of(answer).id);
+                lifecycle::released(&bed.store, &hand, &frame).expect("the frame reads");
+            };
+            bed.loads.send_replace(reports(5_000));
+            let first = bed.ask(sized(keyed(1, 1_001), 1_000)).await;
+            assert_eq!(picked(&first), near, "{name}: a new key");
+            assert_eq!(filed(&bed, &first), (SessionVerdict::Claimed(near), false));
+            sent(&bed, &first);
+            let pinned = bed.ask(sized(keyed(1, 1_002), 10_000)).await;
+            assert_eq!(picked(&pinned), near, "{name}: its pin");
+            assert_eq!(filed(&bed, &pinned), (SessionVerdict::Pinned, true));
+            sent(&bed, &pinned);
+            let plain = bed.ask(sized(frame(3, 1_003), 1_000)).await;
+            assert_eq!(
+                picked(&plain),
+                near,
+                "{name}: the pinned request is no send of the policy's"
+            );
+            given_up(&bed, &plain);
+            bed.loads.send_replace(reports(1_500));
+            let plain = bed.ask(sized(frame(4, 1_004), 1_000)).await;
+            assert_eq!(
+                picked(&plain),
+                far,
+                "{name}: the pinned request weighs as one on file"
+            );
+            given_up(&bed, &plain);
+            let ended = a_completed(lease_of(&pinned).id, near);
+            lifecycle::completed(&bed.store, &hand, &ended, at).expect("the frame reads");
+            let plain = bed.ask(sized(frame(5, 1_005), 1_000)).await;
+            assert_eq!(
+                picked(&plain),
+                near,
+                "{name}: an ended pinned request weighs nothing"
+            );
+        }
+    }
+
     /// A decision reads a worker's status on its object, and the object's
     /// follows its record's. A worker whose record is marked draining, and
     /// one set not ready by hand, are passed by at the next decision, and
@@ -3936,6 +4145,7 @@ pub(crate) mod tests {
                 target: member,
                 picked: crate::store::PickRecord::default(),
                 decode: None,
+                untold: false,
                 term: 1,
                 issued_at: now,
                 dispatch_deadline: now + DISPATCH_TTL,
@@ -5247,6 +5457,7 @@ pub(crate) mod tests {
             target,
             picked: crate::store::PickRecord::default(),
             decode: None,
+            untold: false,
             term: 1,
             issued_at: now,
             dispatch_deadline: now + DISPATCH_TTL,
