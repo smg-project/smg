@@ -2,9 +2,7 @@
 //! reader of one gateway's standing vetoes ([`veto_reader`]). Every
 //! instant is handed in, none is slept.
 
-use std::time::Instant;
-
-use super::{StoreSnapshot, ViewBuffers, ViewQuery};
+use super::StoreSnapshot;
 use crate::{
     engine::view::{LoadRow, Role, WorkerId},
     store::{GatewayId, MemoryStore, WorkerFacts, WorkersStore},
@@ -45,15 +43,5 @@ fn load(running: u32, age_ms: u32) -> LoadRow {
         running,
         report_age_ms: age_ms,
         ..LoadRow::default()
-    }
-}
-
-fn ask(now: Instant) -> ViewQuery {
-    ViewQuery {
-        gateway: ASKER,
-        now,
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
     }
 }

@@ -921,7 +921,7 @@ pub(crate) mod tests {
         },
         store::{
             GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord,
-            ViewBuffers, ViewQuery, WorkersStore,
+            WorkersStore,
         },
         tracking::lease::{Lease, LeaseId},
     };
@@ -1796,31 +1796,22 @@ pub(crate) mod tests {
         assert!(!store.vetoed(A, w, t0));
     }
 
-    /// What a view built for `gateway` at `now` reads of the worker: the
-    /// breaker bit and the stalled bit of its row.
+    /// What the published world's veto reader hands `gateway` of the worker
+    /// at `now`: whether a hold stands on it, and whether a veto does.
     fn bits(
         store: &MemoryStore,
         gateway: GatewayId,
         worker: WorkerId,
         now: Instant,
     ) -> (bool, bool) {
-        let ask = ViewQuery {
-            gateway,
-            now,
-            pinned: None,
-            affinity: false,
-            signal_cells: false,
-        };
-        let mut out = ViewBuffers::default();
         // A registration is in force at its window's publication: the case
         // asks for one.
         store.publish_now();
-        store
-            .build_view("m", Role::Single, &ask, &mut out)
-            .expect("the pool");
-        let row = out.candidates.iter().find(|row| row.id == worker);
-        let health = row.expect("the worker's row").health;
-        (health.breaker_open, health.stalled)
+        let world = store.snapshot();
+        assert!(world.first_row_of(worker).is_some(), "the worker's row");
+        let vetoes = world.gateway_vetoes("m", Role::Single, gateway);
+        let veto = vetoes.standing_at(now).find(|veto| veto.id == worker);
+        veto.map_or((false, false), |veto| (veto.held, true))
     }
 
     /// The store reads no kind: the note says which ends hold. Every kind

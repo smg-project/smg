@@ -1533,7 +1533,7 @@ pub(crate) fn indexed_under(row: &WorkerRow) -> Option<&String> {
 /// The store's KV tables: the lanes, the indexes they write, the records
 /// of sent prefixes and the block sizes of record.
 #[derive(Default)]
-pub(super) struct KvTables {
+pub(crate) struct KvTables {
     table: Mutex<Table>,
     resyncs: [AtomicU64; REASONS],
 }
@@ -1960,7 +1960,7 @@ impl KvTables {
     /// index, each with the leading blocks it holds, by id: every holder
     /// listed, for the cases.
     #[cfg(test)]
-    pub(super) fn overlaps(&self, model: &str, hashes: &[u64]) -> Vec<(WorkerId, u32)> {
+    pub(crate) fn overlaps(&self, model: &str, hashes: &[u64]) -> Vec<(WorkerId, u32)> {
         let (index, rows) = {
             let table = self.table.lock();
             let Some(ModelIndex { index, .. }) = table.indexes.get(model) else {
