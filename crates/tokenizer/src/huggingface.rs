@@ -483,8 +483,13 @@ struct EncoderCore {
     /// read on first use (see [`Self::matches_after_normalization`]).
     matches_after_normalization: OnceLock<bool>,
     /// The largest id of the vocabulary, added tokens included, read on
-    /// first use (see `max_token_id`): a walk of the whole vocabulary.
+    /// first use (see `max_token_id`): the model's part from
+    /// [`Self::model_max_id`] where the load read it, else a walk of the
+    /// whole vocabulary.
     max_token_id: OnceLock<Option<TokenIdType>>,
+    /// The model's largest id as the load's one-pass read of the file saw
+    /// it (`ReadBpe::max_id`); `None` for a tokenizer built elsewhere.
+    model_max_id: Option<TokenIdType>,
     /// What answers for the model of `tokenizer` where the load built none:
     /// that model is then empty.
     vocabulary: Option<Vocabulary>,
@@ -514,6 +519,7 @@ impl EncoderCore {
         wordpiece: Option<WordPieceEncoder>,
         unigram: Option<UnigramEncoder>,
         vocabulary: Option<Vocabulary>,
+        model_max_id: Option<TokenIdType>,
     ) -> Self {
         Self {
             tokenizer,
@@ -525,6 +531,7 @@ impl EncoderCore {
             plain_after_control: OnceLock::new(),
             matches_after_normalization: OnceLock::new(),
             max_token_id: OnceLock::new(),
+            model_max_id,
             vocabulary,
             whole: OnceLock::new(),
         }
@@ -1345,6 +1352,7 @@ impl HuggingFaceTokenizer {
             encoders.wordpiece,
             encoders.unigram,
             vocabulary,
+            model_max_id,
         ));
         let structural_controls = tokenizer_path
             .parent()
@@ -1728,6 +1736,7 @@ impl HuggingFaceTokenizer {
             encoders.native,
             encoders.wordpiece,
             encoders.unigram,
+            None,
             None,
         );
         if let Some(native) = &core.native {
@@ -2991,13 +3000,19 @@ impl TokenizerTrait for HuggingFaceTokenizer {
     /// `vocab_size - 1`): [`Self::vocab_size`] counts the model's entries
     /// and leaves the added tokens out, and a multimodal placeholder is often
     /// one of them, or an id far past a sparse vocabulary's count. Read once,
-    /// on first use. Where the load built no model, the listing stands in
-    /// for it: its ids are `0..len`, so its last is the model's largest.
+    /// on first use. The model's largest id is the one the load's read of
+    /// the file saw, where it read one; where the load built no model, the
+    /// listing stands in for it (its ids are `0..len`, so its last is the
+    /// model's largest). Only a tokenizer built elsewhere walks the whole
+    /// vocabulary.
     fn max_token_id(&self) -> Option<TokenIdType> {
         *self.core.max_token_id.get_or_init(|| {
             let tokenizer = &self.core.tokenizer;
-            if let Some(vocabulary) = &self.core.vocabulary {
-                let model = vocabulary.listing.len().checked_sub(1);
+            let model = self.core.model_max_id.or_else(|| {
+                let vocabulary = self.core.vocabulary.as_ref()?;
+                vocabulary.listing.len().checked_sub(1)
+            });
+            if model.is_some() {
                 return crate::byte_level::max_token_id(tokenizer, model);
             }
             let counted = tokenizer
