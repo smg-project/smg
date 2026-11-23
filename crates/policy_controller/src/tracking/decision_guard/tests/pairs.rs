@@ -164,20 +164,6 @@ impl DecisionEngine for Door<'_> {
         DecisionEngine::decide_decode_under(self.engine, gateway, &listed, held, now)
     }
 
-    fn decide_encode_pair(
-        &self,
-        gateway: GatewayId,
-        request: &Request<'_>,
-        items: EncodeItems<'_>,
-        placed: &mut EncodePlaced,
-        now: Instant,
-    ) -> Result<DecideOutcome, DecisionRefused> {
-        if !self.hears(gateway, None) {
-            return Err(DecisionRefused::Faulted);
-        }
-        DecisionEngine::decide_encode_pair(self.engine, gateway, request, items, placed, now)
-    }
-
     fn say(&self, gateway: GatewayId, held: &HeldDecision<'_>, said: Said, now: Instant) {
         if !self.hears(gateway, Some(held)) {
             return;

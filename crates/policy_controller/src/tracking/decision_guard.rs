@@ -79,7 +79,6 @@ use crate::{
             DecideOutcome, DecisionEngine, DecisionRefused, DecodeRefused, HeldDecision,
             HeldDecode, Leased, Request, RequestMaker,
         },
-        framework::{EncodeItems, EncodePlaced},
         view::WorkerId,
     },
     store::GatewayId,
@@ -230,31 +229,6 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         now: Instant,
     ) -> Self {
         Self::hold(Arm::Engine { door, gateway }, decided, later, now)
-    }
-
-    /// Holds the decision made with the request's encode items
-    /// ([`DecisionEngine::decide_encode_pair`]). For a pair, the handle
-    /// reports the prefill and decode.
-    ///
-    /// # Errors
-    ///
-    /// [`DecisionRefused`]: the door made no decision for the request.
-    pub fn decide_encode_pair(
-        door: D,
-        gateway: GatewayId,
-        request: &Request<'_>,
-        items: EncodeItems<'_>,
-        placed: &mut EncodePlaced,
-        now: Instant,
-    ) -> Result<Self, DecisionRefused> {
-        let decided = door.decide_encode_pair(gateway, request, items, placed, now)?;
-        let later = request.constraints.decode_later;
-        Ok(Self::hold(
-            Arm::Engine { door, gateway },
-            decided,
-            later,
-            now,
-        ))
     }
 
     fn hold(arm: Arm<D>, decided: DecideOutcome, later: bool, now: Instant) -> Self {

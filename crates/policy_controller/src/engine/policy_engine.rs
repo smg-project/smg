@@ -88,10 +88,7 @@ use super::{
         AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Request,
         RequestMaker, SweepOutcome, WorkerLists,
     },
-    framework::{
-        release, AloneProfile, EncodeItems, EncodePlaced, NotAlone, Picker, Place, PoolWord,
-        ShadowRows,
-    },
+    framework::{release, AloneProfile, NotAlone, Picker, Place, PoolWord, ShadowRows},
     lease_events,
     list_cell::LentList,
     prompt_hashes::{HashSeeds, PromptHashes},
@@ -999,21 +996,6 @@ impl DecisionEngine for PolicyEngine {
                 _ => single::issued(self, single::over_none(self, &request), &request, now),
             })
         })
-    }
-
-    // A side sent on its own: a request stated ahead hands no list. A host
-    // of this engine asks with its three lists
-    // (`PolicyEngine::decide_encode_at`).
-    fn decide_encode_pair(
-        &self,
-        _: GatewayId,
-        _: &Request<'_>,
-        _: EncodeItems<'_>,
-        placed: &mut EncodePlaced,
-        _: Instant,
-    ) -> Result<DecideOutcome, DecisionRefused> {
-        placed.clear();
-        Err(DecisionRefused::PairSide)
     }
 
     fn say(&self, _: GatewayId, held: &HeldDecision<'_>, said: Said, _: Instant) {
