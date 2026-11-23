@@ -1392,18 +1392,27 @@ fn a_registered_picker_reads_the_sends_of_its_profile() {
 /// over worker lists.
 #[cfg(feature = "in-process")]
 mod over_lists {
-    use std::{sync::Arc, time::Instant};
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
-    use smg_worker::{identity::basic::Worker, test_support::ready_worker};
+    use smg_worker::{
+        identity::basic::Worker,
+        load::state::{one_rank_load, LoadSnapshot},
+        test_support::ready_worker,
+    };
 
-    use super::{catalog, chosen, clock, document, one, validated, Readers, POOL, TOKENS};
+    use super::{
+        catalog, chosen, clock, document, one, send, validated, Readers, DELAY, POOL, TOKENS,
+    };
     use crate::{
         document::AppliedSpec,
         engine::{
             decision_engine::{Request, RequestMaker, WorkerLists},
             list_cell::tests::PublishedList,
             policy_engine::PolicyEngine,
-            Constraints, RequestFacts,
+            Constraints, Live, RequestFacts,
         },
         store::GatewayId,
         tracking::{decision_guard::DecisionGuard, CreditedDispatches},
@@ -1491,5 +1500,47 @@ mod over_lists {
         first.dispatched(now);
         first.dispatched(now);
         assert_eq!(readers.lock()[0].read(&clock(0), &sent_to), one(TOKENS));
+    }
+
+    /// A report sampled behind a send ends the send's credit. A report
+    /// sampled ahead of the send, read later, leaves the credit ended: no
+    /// older report brings a send back.
+    #[test]
+    fn a_released_send_stays_retired_when_an_older_report_arrives() {
+        let (engine, members, readers) = bed();
+        let sent = Arc::clone(&readers.lock()[0]);
+        let url = "http://first:8000";
+        let time = engine.clock();
+        let records = engine
+            .members_of(members.lent())
+            .records(engine.spec(), time);
+        let stages = engine.spec().engine();
+
+        let issued = Instant::now();
+        let dispatched = issued + Duration::from_micros(u64::from(DELAY));
+        let newer = dispatched + Duration::from_millis(13);
+        let later = newer + Duration::from_millis(1);
+        send(stages, &records.fixed()[0], time.micros(issued), TOKENS);
+
+        // The first worker's report, sampled at `sampled_at` and read at
+        // `now`: what the profile's reader counts for the worker then.
+        let read = |sampled_at, running: u16, now| {
+            let mut report = one_rank_load(0, 0.0, 0.0);
+            report.loads[0].num_running_reqs = i32::from(running);
+            report.sampled_at = Some(sampled_at);
+            let loads = LoadSnapshot::from_loads_for_test(vec![(url.to_owned(), report)]);
+            let live = Live::at(stages, time, now, Some(&loads), None);
+            let row = records
+                .read(members.workers(), &live, 0)
+                .expect("the worker record");
+            assert_eq!(row.load.expect("the report").running, u32::from(running));
+            assert_eq!(row.load_sampled_at_micros, time.micros(sampled_at));
+            sent.read(&clock(live.now_micros()), &row)
+        };
+
+        let empty = CreditedDispatches::default();
+        assert_eq!(read(issued, 19, dispatched), one(TOKENS));
+        assert_eq!(read(newer, 7, newer), empty);
+        assert_eq!(read(issued, 19, later), empty, "the send stays retired");
     }
 }

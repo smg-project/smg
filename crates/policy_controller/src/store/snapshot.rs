@@ -4814,35 +4814,10 @@ impl Writer {
         self.allocations
     }
 
-    /// How many ranks stand unnamed by their engine's last answer.
-    #[cfg(test)]
-    pub(super) fn unnamed_ranks(&self) -> usize {
-        self.unnamed.len()
-    }
-
-    /// Whether a load write is judged ([`Self::recorded`]).
-    #[cfg(test)]
-    pub(super) fn judges_writes(&self) -> bool {
-        self.judging
-    }
-
     /// How many times the pools were built from the membership: a build an
     /// ask or a window's end paid, or a generation of another pairing mode.
     pub(super) fn builds(&self) -> u64 {
         self.builds
-    }
-
-    /// How many rows that left their pool the writer still keeps.
-    #[cfg(test)]
-    pub(super) fn held_rows(&self) -> usize {
-        self.held.len() + self.unlisted.len()
-    }
-
-    /// How many whole derivations made what the writer keeps of `model`'s
-    /// pair classes; `None` where it keeps nothing of them.
-    #[cfg(test)]
-    pub(super) fn whole_derivations(&self, model: &str) -> Option<usize> {
-        self.derivations.get(model).map(Derivation::wholes)
     }
 
     /// How many membership writes walked the pools to stand each in its

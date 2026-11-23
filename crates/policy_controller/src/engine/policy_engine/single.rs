@@ -1257,6 +1257,39 @@ pub(crate) mod tests {
         }
     }
 
+    /// Two callers of one engine ask in strict turn over one list, and each
+    /// is held to the places of the list it may take
+    /// (`Constraints::places`): every record but two. Each caller is held
+    /// away from a record at each parity, so whichever parity its turns
+    /// land on, a record it may not take stands there. Each caller's 112
+    /// requests hand each of its fourteen records eight: a record one
+    /// caller is held away from keeps the other caller's share, and every
+    /// other record is picked sixteen times.
+    #[test]
+    fn two_callers_in_strict_turn_leave_each_others_held_records_their_share() {
+        let away: [[u32; 2]; 2] = [[0, 1], [2, 3]];
+        let places = away.map(|held| {
+            (0..16)
+                .filter(|at| !held.contains(at))
+                .collect::<Vec<u32>>()
+        });
+        let engine = preset("round_robin");
+        let list = pool(16);
+        let members = PublishedList::new(Arc::clone(&list));
+        let mut picked = [0_u32; 16];
+        for turn in 0..224_usize {
+            let mut ask = request();
+            ask.constraints.places = Some(&places[turn % 2]);
+            let asks = Asks::of(ask, Some(&members));
+            let decided = decided(&engine, &asks);
+            let pick = decided.decision.pick().expect("a ready record");
+            picked[pick.targets.first().expect("a target").position as usize] += 1;
+        }
+        let mut want = [16_u32; 16];
+        want[..4].fill(8);
+        assert_eq!(picked, want);
+    }
+
     /// A list of ready workers engine after engine, one engine a number
     /// of `shape`: that many ranks of one data-parallel engine in their
     /// order, or a worker that registered no rank for a `1`. Beside it,

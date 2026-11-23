@@ -903,12 +903,6 @@ impl Derivation {
         self.classes(prefills, decodes, table, refusals)
     }
 
-    /// How many whole derivations made what is kept.
-    #[cfg(test)]
-    pub(super) fn wholes(&self) -> usize {
-        self.wholes
-    }
-
     /// Class the offers as they stand: each slot's class, the table into
     /// the working lists and each side's refusal. Whether a class moved
     /// that a slot had.

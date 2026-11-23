@@ -3824,4 +3824,70 @@ mod tests {
             "the trace names the generation handed to the maker"
         );
     }
+
+    /// A caller held to the decodes it reaches (`decode_places`) is paired
+    /// by the table of the full lists. The first prefill, a partner of
+    /// every decode, takes each decode its caller reaches and no other.
+    /// The second, a partner of the one decode both callers reach, takes
+    /// that one. The decode records are written whole, each with its class.
+    #[test]
+    fn each_gateway_pairs_its_reachable_decodes_by_the_full_lists_table() {
+        let all = [0_u32, 1, 2, 3, 4, 5, 6, 7, 8];
+        let shared = [1];
+        let host = Host::of(2, all.len());
+        let classes = PartnerClasses::number(all.len(), [&all[..], &shared[..]]);
+        let full_records: Vec<_> = host
+            .decodes
+            .iter()
+            .map(|worker| worker_id(worker.as_ref()))
+            .zip(classes.decodes().iter().copied())
+            .collect();
+        let now = Instant::now();
+
+        let partners = |prefill: usize, places: Option<&[u32]>| {
+            let other = worker_id(host.prefills[1 - prefill].as_ref());
+            let mut excluded = vec![other];
+            let mut drawn = Vec::new();
+            loop {
+                let mut ask = host.asks(&classes, false);
+                ask.1.decode_places = places;
+                ask.0.constraints.excluded = &excluded;
+                let (decision, _) = host
+                    .engine
+                    .decide_without_lease(&ask, now)
+                    .expect("a pair decision");
+                let (chosen, decode) = host.picked(&decision);
+                assert_eq!(chosen, prefill, "decode places {places:?}");
+
+                // A soft exclusion allows a repeat once every partner has been drawn.
+                let id = full_records[decode].0;
+                if excluded.contains(&id) {
+                    break;
+                }
+                excluded.push(id);
+                drawn.push(decode as u32);
+            }
+
+            BUFFERS.with_borrow(|buffers| {
+                let written: Vec<_> = buffers.rows[1]
+                    .iter()
+                    .map(|row| (row.id, row.pair_class))
+                    .collect();
+                assert_eq!(written, full_records, "decode classes for {places:?}");
+            });
+            drawn.sort_unstable();
+            drawn
+        };
+
+        assert_eq!(partners(0, None), all);
+        assert_eq!(partners(1, None), shared);
+
+        // Place 1 is shared. Each other place is local to one gateway.
+        let gateway_a = [0, 1, 3, 5, 7];
+        let gateway_b = [1, 2, 4, 6, 8];
+        for places in [gateway_a, gateway_b] {
+            assert_eq!(partners(0, Some(&places)), places, "reachable {places:?}");
+            assert_eq!(partners(1, Some(&places)), shared, "reachable {places:?}");
+        }
+    }
 }
