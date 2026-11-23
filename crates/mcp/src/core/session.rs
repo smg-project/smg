@@ -13,8 +13,8 @@ use futures::stream::{self, StreamExt};
 use super::{
     config::BuiltinToolType,
     orchestrator::{
-        McpOrchestrator, McpRequestContext, ToolExecutionInput, ToolExecutionOutput,
-        ToolExecutionResult,
+        printable_label, McpOrchestrator, McpRequestContext, ToolExecutionInput,
+        ToolExecutionOutput, ToolExecutionResult,
     },
     pool::PoolKey,
     UNKNOWN_SERVER_KEY,
@@ -142,8 +142,10 @@ impl<'a> McpToolSession<'a> {
                     .as_ref()
                     .is_some_and(|key| !orchestrator.is_pooled(key))
             {
-                binding.list_error =
-                    Some(McpError::ServerNotFound(binding.label.clone()).to_string());
+                binding.list_error = Some(
+                    McpError::ServerNotFound(printable_label(&binding.label).to_string())
+                        .to_string(),
+                );
             }
         }
 

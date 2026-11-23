@@ -392,6 +392,16 @@ fn sse_unsupported(server_name: &str) -> McpError {
     ))
 }
 
+/// Responses checks a label at intake; a Messages server `name` is free text:
+/// empty, an address or a line break that would split a log line is `unnamed`.
+pub(super) fn printable_label(label: &str) -> &str {
+    if label.is_empty() || label.contains("://") || label.contains(char::is_control) {
+        "unnamed"
+    } else {
+        label
+    }
+}
+
 /// Type alias for MCP client with handler.
 type McpClientWithHandler = RunningService<RoleClient, SmgClientHandler>;
 
@@ -1107,12 +1117,8 @@ impl McpOrchestrator {
         let arguments_str = input.arguments.to_string();
 
         let qualified = QualifiedToolName::new(server_key, &input.tool_name);
-        let named = if request_ctx.pool_key.is_some()
-            && (server_label.is_empty()
-                || server_label.contains("://")
-                || server_label.contains(char::is_control))
-        {
-            "unnamed"
+        let named = if request_ctx.pool_key.is_some() {
+            printable_label(server_label)
         } else {
             server_label
         };
@@ -3051,7 +3057,7 @@ mod tests {
         };
         let list_error = |binding: &McpServerBinding| {
             McpToolSession::new(orchestrator, vec![binding.clone()], "request")
-                .list_error_for_binding("tools", url)
+                .list_error_for_binding(&binding.label, url)
         };
         assert_eq!(list_error(&binding), None);
 
@@ -3060,6 +3066,11 @@ mod tests {
         assert_eq!(
             list_error(&binding).as_deref(),
             Some("Server not found: tools")
+        );
+        binding.label.clear();
+        assert_eq!(
+            list_error(&binding).as_deref(),
+            Some("Server not found: unnamed")
         );
         // A listing that failed keeps its own error.
         binding.list_error = Some("boom".to_string());
@@ -3283,6 +3294,9 @@ mod tests {
         orchestrator.tool_inventory().insert_entry(tool);
         orchestrator
             .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool(url, create_test_tool("write")));
+        orchestrator
+            .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
                 "conf",
                 create_test_tool("whoami"),
@@ -3447,6 +3461,18 @@ mod tests {
         assert_eq!(
             second.execute_tool(input()).await.error_message.as_deref(),
             Some("Tool call failed: Server disconnected: tools")
+        );
+        let write = ToolExecutionInput {
+            tool_name: "write".to_string(),
+            ..input()
+        };
+        assert_eq!(
+            second.execute_tool(write).await.error_message.as_deref(),
+            Some(
+                "Tool call failed: Tool call outcome unknown: server 'tools' disconnected while \
+                 executing 'write'; the call was not retried because the tool is not marked \
+                 idempotent or read-only"
+            )
         );
         assert_eq!(
             orchestrator
