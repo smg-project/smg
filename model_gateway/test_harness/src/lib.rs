@@ -459,7 +459,10 @@ tokio::task_local! {
 }
 
 /// Runs `test` with `stages` lent to the policy engine of every context it
-/// builds. Where a context's configuration runs the policy controller
+/// builds by [`create_test_context`] or one of its siblings in this file,
+/// which [`AppTestContext`] and the gRPC harness call. The builders of
+/// `test_app` start no engine and read no table. Where a context's
+/// configuration runs the policy controller
 /// (`policy_controller: true`), this harness starts the engine by the
 /// gateway's own start, over the document in force (a supplied one,
 /// `policy_spec`, too) validated against `stages`. It is the table a host
@@ -473,14 +476,20 @@ pub async fn with_policy_stages<T>(stages: StageRegistry, test: impl Future<Outp
     POLICY_STAGES.scope(stages, test).await
 }
 
-/// The environment value that runs every context of a test run under the
-/// policy controller, whatever its configuration says:
-/// `SMG_TEST_POLICY_CONTROLLER=on`. A whole test binary runs on the policy
-/// engine by it, with no change to its tests.
+/// The environment value that runs a test run's contexts under the policy
+/// controller, whatever their configuration says:
+/// `SMG_TEST_POLICY_CONTROLLER=on`. It reaches the contexts built by
+/// [`create_test_context`] or one of its siblings in this file, which
+/// [`AppTestContext`] and the gRPC harness call: a test binary built on
+/// them runs on the policy engine with no change to its tests. The
+/// builders of `test_app` (`create_test_app`, `create_test_app_context`
+/// and `create_test_app_context_with_config`) do not read it and start
+/// no engine: a case built on them runs on the classic policies under
+/// the value too.
 pub const POLICY_CONTROLLER_ENV: &str = "SMG_TEST_POLICY_CONTROLLER";
 
-/// Whether this run turns the policy controller on for every context
-/// ([`POLICY_CONTROLLER_ENV`]).
+/// Whether this run turns the policy controller on for the contexts the
+/// value reaches ([`POLICY_CONTROLLER_ENV`]).
 pub fn policy_controller_forced() -> bool {
     std::env::var(POLICY_CONTROLLER_ENV).is_ok_and(|value| value == "on")
 }

@@ -1561,10 +1561,13 @@ impl CliArgs {
 
     /// The answer of `--print-policy-spec`: the policy document this command
     /// line means, as YAML, checked as the gateway checks a document it
-    /// hosts ([`RouterConfig::hosted_policy`]), over the stock stages: the
-    /// print runs ahead of any code of a host's own, so no other table is
-    /// at hand. The routing part of the line is read alone
-    /// ([`Self::routing_config`]). Nothing is bound or spawned.
+    /// hosts ([`RouterConfig::hosted_policy`]), over the stock stages. The
+    /// document is the one the routing flags mean, which names stock
+    /// stages alone: a supplied document is refused beside the print. A
+    /// host's table holds every stock stage beside the host's own, so it
+    /// answers this document as the stock table does. The routing part of
+    /// the line is read alone ([`Self::routing_config`]). Nothing is bound
+    /// or spawned.
     pub(crate) fn policy_spec_print(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
