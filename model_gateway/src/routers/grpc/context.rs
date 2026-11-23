@@ -61,7 +61,7 @@ use crate::{
     policies::CacheNamespace,
     routers::{
         common::{
-            attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard,
+            attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard, placement::Placed,
             prefill_admission::PrefillLoadGuard, snapshot::WorkerRegistry, sse::SseSender,
         },
         error::internal_error,
@@ -1004,9 +1004,9 @@ pub(crate) struct EncodeWorkerAssignment {
 
 /// Worker selection (Step 2)
 pub(crate) enum WorkerSelection {
-    Single {
-        worker: Arc<dyn Worker>,
-    },
+    /// The one worker of a single request, as its placement answered it: the
+    /// request's load guard is made from the answer ([`LoadGuards::new`]).
+    Single { worker: Placed },
     /// Disaggregated prefill/decode selection. EPD layers per-item encode
     /// assignments on top; plain PD leaves `encode_assignments` unset.
     Disaggregated {
@@ -1088,7 +1088,7 @@ impl LoadGuards {
     pub fn new(selection: &WorkerSelection, routing_key: Option<&str>) -> Self {
         match selection {
             WorkerSelection::Single { worker } => LoadGuards::Single {
-                _guard: WorkerLoadGuard::with_key(worker.clone(), routing_key),
+                _guard: worker.guard(routing_key),
             },
             WorkerSelection::Disaggregated { decode, .. } => LoadGuards::Disaggregated {
                 _decode: WorkerLoadGuard::with_key(decode.clone(), routing_key),
@@ -1557,7 +1557,7 @@ fn expected_shape(shape: &str) -> ! {
 impl WorkerSelection {
     pub fn single(&self) -> Option<&Arc<dyn Worker>> {
         match self {
-            Self::Single { worker } => Some(worker),
+            Self::Single { worker } => Some(worker.worker()),
             Self::Disaggregated { .. } => None,
         }
     }
@@ -1566,7 +1566,7 @@ impl WorkerSelection {
     /// prefill and decode sides.
     pub fn workers(&self) -> impl Iterator<Item = &Arc<dyn Worker>> {
         let (first, second) = match self {
-            Self::Single { worker } => (worker, None),
+            Self::Single { worker } => (worker.worker(), None),
             Self::Disaggregated {
                 prefill, decode, ..
             } => (prefill, Some(decode)),
@@ -1584,7 +1584,7 @@ impl WorkerSelection {
     /// the request's ledger (one failure charge per request per worker).
     pub fn record_outcome(&self, ledger: &AttemptLedger, status_code: u16) {
         match self {
-            Self::Single { worker } => ledger.record_outcome(worker.as_ref(), status_code),
+            Self::Single { worker } => ledger.record_outcome(&**worker, status_code),
             Self::Disaggregated {
                 prefill, decode, ..
             } => {
@@ -2537,7 +2537,7 @@ mod tests {
         // The regular gRPC path: one guard, one completion when the stream ends.
         drop(LoadGuards::new(
             &WorkerSelection::Single {
-                worker: Arc::clone(&single),
+                worker: Arc::clone(&single).into(),
             },
             None,
         ));
@@ -2564,7 +2564,7 @@ mod tests {
         let before = spy.0.lock().unwrap().len();
         drop(LoadGuards::scaled(
             &WorkerSelection::Single {
-                worker: Arc::clone(&single),
+                worker: Arc::clone(&single).into(),
             },
             None,
             3,

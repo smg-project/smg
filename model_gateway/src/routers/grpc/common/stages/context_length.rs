@@ -533,7 +533,7 @@ mod tests {
 
     fn single(context_length: Option<u32>) -> WorkerSelection {
         WorkerSelection::Single {
-            worker: worker(WorkerType::Regular, context_length),
+            worker: worker(WorkerType::Regular, context_length).into(),
         }
     }
 
@@ -873,7 +873,9 @@ mod tests {
                 })
                 .build(),
         );
-        let selection = WorkerSelection::Single { worker };
+        let selection = WorkerSelection::Single {
+            worker: worker.into(),
+        };
         assert!(enforce_context_length(&input(10), &selection, "wide").is_ok());
         assert_rejected(enforce_context_length(&input(10), &selection, "narrow"));
         // An id no card matches falls back to the primary (first) card.

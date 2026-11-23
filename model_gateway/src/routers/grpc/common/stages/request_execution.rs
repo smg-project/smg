@@ -5925,7 +5925,8 @@ pub(crate) mod tests {
                     .connection_mode(ConnectionMode::Zmq)
                     .zmq_engine_group(size)
                     .build(),
-            ),
+            )
+            .into(),
         }
     }
 
@@ -6056,7 +6057,8 @@ pub(crate) mod tests {
                     .runtime_type(RuntimeType::TokenSpeed)
                     .connection_mode(ConnectionMode::Zmq)
                     .build(),
-            ),
+            )
+            .into(),
         };
         let hash = |ranks: usize, key: &str| {
             attempt_on(GroupedDpSticky::Hash, &workers, Some(ranks), Some(key))
@@ -6075,7 +6077,7 @@ pub(crate) mod tests {
     #[test]
     fn only_a_grouped_worker_is_pinned() {
         let single = |builder: BasicWorkerBuilder| WorkerSelection::Single {
-            worker: Arc::new(builder.connection_mode(ConnectionMode::Zmq).build()),
+            worker: Arc::new(builder.connection_mode(ConnectionMode::Zmq).build()).into(),
         };
         for workers in [
             single(BasicWorkerBuilder::new("ipc:///tmp/ranked.ipc").dp_config(1, 2)),

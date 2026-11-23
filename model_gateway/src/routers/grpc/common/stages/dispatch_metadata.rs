@@ -16,7 +16,7 @@ pub(crate) fn prepare_dispatch_metadata(
 ) -> DispatchMetadata {
     let weight_version = workers
         .map(|w| match w {
-            WorkerSelection::Single { worker } => worker,
+            WorkerSelection::Single { worker } => worker.worker(),
             WorkerSelection::Disaggregated { decode, .. } => decode,
         })
         .and_then(|w| w.metadata().spec.labels.get("weight_version").cloned())

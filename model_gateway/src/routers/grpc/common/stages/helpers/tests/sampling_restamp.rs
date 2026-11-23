@@ -24,7 +24,7 @@ fn worker_with_defaults(url: &str, defaults_json: Option<&str>) -> WorkerSelecti
         builder = builder.label(DEFAULT_SAMPLING_PARAMS_LABEL, json);
     }
     WorkerSelection::Single {
-        worker: Arc::new(builder.build()),
+        worker: Arc::new(builder.build()).into(),
     }
 }
 

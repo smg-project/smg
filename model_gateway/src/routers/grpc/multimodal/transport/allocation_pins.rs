@@ -46,7 +46,7 @@ fn worker(url: &str, runtime: RuntimeType, labels: &[(&str, &str)]) -> Arc<dyn W
 
 fn selection(url: &str, labels: &[(&str, &str)]) -> WorkerSelection {
     WorkerSelection::Single {
-        worker: worker(url, RuntimeType::TokenSpeed, labels),
+        worker: worker(url, RuntimeType::TokenSpeed, labels).into(),
     }
 }
 

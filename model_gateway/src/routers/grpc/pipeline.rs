@@ -902,7 +902,7 @@ impl RequestPipeline {
         }
         if let Some(workers) = ctx.workers.as_ref() {
             let worker = match workers {
-                WorkerSelection::Single { worker } => worker,
+                WorkerSelection::Single { worker } => worker.worker(),
                 WorkerSelection::Disaggregated { decode, .. } => decode,
             };
             insert_routed_worker_id(response.headers_mut(), worker.redacted_url());

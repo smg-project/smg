@@ -629,7 +629,7 @@ pub(crate) fn ensure_selection_supports_media_refs(
 ) -> Result<(), MmRefsError> {
     let needs_pipeline = pin == PipelinePin::Only;
     let workers: Vec<&dyn Worker> = match workers {
-        WorkerSelection::Single { worker } => vec![worker.as_ref()],
+        WorkerSelection::Single { worker } => vec![&**worker],
         WorkerSelection::Disaggregated {
             encode_assignments: Some(assignments),
             ..
@@ -1965,7 +1965,7 @@ mod tests {
     fn selection_check_requires_every_worker_and_scheme() {
         let plan_https = plan(vec![image_url("https://a/1.png")]);
         let single = WorkerSelection::Single {
-            worker: capable("grpc://127.0.0.1:9600"),
+            worker: capable("grpc://127.0.0.1:9600").into(),
         };
         ensure_selection_supports_media_refs(&single, &plan_https, PipelinePin::Any)
             .expect("capable single");
@@ -1976,7 +1976,8 @@ mod tests {
                 RuntimeType::Vllm,
                 ConnectionMode::Grpc,
                 &[],
-            ),
+            )
+            .into(),
         };
         assert_eq!(
             ensure_selection_supports_media_refs(&plain, &plan_https, PipelinePin::Any),
@@ -2230,10 +2231,10 @@ mod tests {
             uuid: None,
         }]);
         let pipeline_single = WorkerSelection::Single {
-            worker: pipeline_worker("grpc://127.0.0.1:9730"),
+            worker: pipeline_worker("grpc://127.0.0.1:9730").into(),
         };
         let engine_single = WorkerSelection::Single {
-            worker: capable("grpc://127.0.0.1:9731"),
+            worker: capable("grpc://127.0.0.1:9731").into(),
         };
         ensure_selection_supports_media_refs(&pipeline_single, &image, PipelinePin::Only)
             .expect("the pipeline worker takes the unopted model");

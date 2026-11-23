@@ -718,7 +718,7 @@ pub struct WorkerDecoding {
 impl WorkerDecoding {
     pub fn of(workers: Option<&WorkerSelection>) -> Self {
         match workers {
-            Some(WorkerSelection::Single { worker }) => Self::of_worker(worker.as_ref()),
+            Some(WorkerSelection::Single { worker }) => Self::of_worker(&**worker),
             Some(WorkerSelection::Disaggregated { decode, .. }) => Self::of_worker(decode.as_ref()),
             None => Self {
                 policy: ConstrainedDecoding::Requested,
@@ -1057,7 +1057,7 @@ mod tests {
             .build();
         assert_eq!(
             WorkerDecoding::of(Some(&WorkerSelection::Single {
-                worker: Arc::new(spec_wins),
+                worker: Arc::new(spec_wins).into(),
             }))
             .policy,
             ConstrainedDecoding::Always
@@ -1122,7 +1122,7 @@ mod tests {
             let decided_on = WorkerDecoding::of(Some(&worker(first_labels)));
             for (other, other_labels) in labels.iter().enumerate() {
                 assert_eq!(
-                    decided_on.decides_alike(engine(other_labels).as_ref()),
+                    decided_on.decides_alike(&*engine(other_labels)),
                     alike[first] == alike[other],
                     "decided on {first_labels:?}, retried on {other_labels:?}"
                 );

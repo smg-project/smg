@@ -29,6 +29,7 @@ pub(crate) async fn acquire_clients(
 ) -> Result<ClientSelection, Response> {
     match workers {
         WorkerSelection::Single { worker } => {
+            let worker = worker.worker();
             if let Some(shed) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id, shed)
             {
                 return Err(shed);

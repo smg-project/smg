@@ -435,6 +435,16 @@ impl From<Arc<dyn Worker>> for Placed {
     }
 }
 
+/// A worker a case holds by its own type, as [`Placed`] answers a worker
+/// picked with no policy at all.
+#[cfg(test)]
+impl<W: Worker + 'static> From<Arc<W>> for Placed {
+    fn from(worker: Arc<W>) -> Self {
+        let worker: Arc<dyn Worker> = worker;
+        Self::from(worker)
+    }
+}
+
 impl Deref for Placed {
     type Target = dyn Worker;
 
@@ -1887,7 +1897,7 @@ pub(crate) fn retain_decodes_with_a_room(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
         sync::Mutex,
@@ -5722,7 +5732,7 @@ mod tests {
     // ---- the policy engine ------------------------------------------------------------------
 
     /// What a stage heard of the leases it was told, in order.
-    type Heard = Arc<Mutex<Vec<String>>>;
+    pub(crate) type Heard = Arc<Mutex<Vec<String>>>;
 
     /// A scorer that ranks every worker alike and takes every word of a
     /// lease, so the engine leases each pick under it.
@@ -5776,7 +5786,7 @@ mod tests {
 
     /// Hands `policies` an engine for the life of the test process, as the
     /// gateway's start hands one.
-    fn engine_on(policies: &PolicyRegistry, spec: AppliedSpec) {
+    pub(crate) fn engine_on(policies: &PolicyRegistry, spec: AppliedSpec) {
         policies.set_engine(Box::leak(Box::new(PolicyEngine::new(spec))));
     }
 
@@ -5791,7 +5801,7 @@ mod tests {
 
     /// Hands `policies` an engine whose one profile ranks by [`Hears`], and
     /// what that stage heard.
-    fn hearing_engine_on(policies: &PolicyRegistry) -> Heard {
+    pub(crate) fn hearing_engine_on(policies: &PolicyRegistry) -> Heard {
         let heard = Heard::default();
         let kept = Arc::clone(&heard);
         let mut stages = StageRegistry::builtin();

@@ -34,8 +34,8 @@ use crate::{
         common::{
             pair_index::{PdPairIndex, PdWire},
             placement::{
-                self, CandidateFilter, PairFailure, PipelinePin, PlacementFailure, PlacementInputs,
-                RefusalSite,
+                self, CandidateFilter, PairFailure, PipelinePin, Placed, PlacementFailure,
+                PlacementInputs, RefusalSite,
             },
             prefill_admission::{
                 acquire_prefill, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
@@ -350,9 +350,9 @@ struct SelectionInputs<'a> {
     ids: &'a [u32],
     headers: Option<&'a HeaderMap>,
     rid_key: Option<String>,
-    /// The body's `rid`, where the routing snapshot keeps it for the
-    /// retries: the sticky key derives from it. Elsewhere no retry reads it
-    /// and none is copied.
+    /// The body's `rid` as the request states it: the placement is handed
+    /// it. The routing snapshot keeps it for the retries where the sticky
+    /// key derives from it. Elsewhere no retry reads it and none is copied.
     rid: Option<&'a str>,
     /// Whether the routing snapshot keeps a copy of the text: always without
     /// token ids, and with them only for a policy that reads text next to
@@ -403,7 +403,6 @@ impl<'a> SelectionInputs<'a> {
             .policy_registry
             .derive_rid_key(rid)
             .map(str::to_string);
-        let rid = rid.filter(|_| rid_key.is_some());
 
         // Text is copied only when a configured policy would actually read it
         // (see the `keep_text` field).
@@ -481,7 +480,10 @@ impl<'a> SelectionInputs<'a> {
                 .keep_text
                 .then(|| self.text.map(str::to_string))
                 .flatten(),
-            rid: self.rid.map(str::to_string),
+            rid: self
+                .rid
+                .filter(|_| self.rid_key.is_some())
+                .map(str::to_string),
             cache_namespace: self.cache_namespace,
             needs_vision: self.needs_vision,
             decode_needs_vision: self.demand.decode,
@@ -612,6 +614,7 @@ impl WorkerSelectionStage {
                     inputs.tokens(),
                     inputs.headers,
                     inputs.rid_key.as_deref(),
+                    inputs.rid,
                     inputs.cache_namespace,
                     wire,
                     &[],
@@ -793,6 +796,7 @@ impl WorkerSelectionStage {
                     tokens,
                     headers,
                     rid_key,
+                    ctx.routing.rid.as_deref(),
                     cache_namespace,
                     wire,
                     &ctx.tried,
@@ -1808,10 +1812,11 @@ impl WorkerSelectionStage {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
+        rid: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
         tried: &[String],
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Option<Placed> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let context = context.left_by(&snapshot, &[RoutingPool::GrpcPipelineRegular], model_id);
         let accepts = |worker: &dyn Worker| {
@@ -1832,6 +1837,7 @@ impl WorkerSelectionStage {
             tokens,
             headers,
             rid_key,
+            rid,
             cache_namespace,
             wire,
             candidate_filter,
@@ -1864,11 +1870,13 @@ impl WorkerSelectionStage {
             tokens,
             headers,
             rid_key,
+            None,
             cache_namespace,
             wire,
             candidate_filter,
             &[],
         )
+        .map(Placed::into_worker)
     }
 
     /// One attempt's single worker from the regular pool of `snapshot`, the
@@ -1888,11 +1896,12 @@ impl WorkerSelectionStage {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
+        rid: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
         candidate_filter: Option<CandidateFilter<'_>>,
         tried: &[String],
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Option<Placed> {
         // A retry pins the retained wire, and with it the media pin and the
         // pipeline pin, on top of whatever the caller excludes.
         let pipeline = wire.map_or(PipelinePin::Any, |w| w.pipeline);
@@ -1923,14 +1932,12 @@ impl WorkerSelectionStage {
                 tokens,
                 headers,
                 rid_key,
-                // The regular stage hands its selection the key alone.
-                rid: None,
+                rid,
                 cache_namespace,
                 candidate_filter,
                 tried,
             },
         )
-        .map(placement::Placed::worker_alone_for_now)
     }
 
     /// Workers from one role pool of `snapshot` that also pass the live
@@ -2440,19 +2447,22 @@ impl SelectionBench {
     /// One regular placement of a request carrying `tokens`, as the stage
     /// runs a first attempt's.
     pub fn place(&self, tokens: Option<&[u32]>) -> Option<Arc<dyn Worker>> {
-        self.stage.select_regular(
-            &self.model,
-            self.context,
-            MediaDemands::NONE,
-            None,
-            None,
-            tokens,
-            None,
-            None,
-            None,
-            None,
-            &[],
-        )
+        self.stage
+            .select_regular(
+                &self.model,
+                self.context,
+                MediaDemands::NONE,
+                None,
+                None,
+                tokens,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .map(Placed::into_worker)
     }
 
     /// One pair placement of a request carrying `tokens`, as the stage runs
@@ -3479,6 +3489,137 @@ mod tests {
         );
     }
 
+    /// A stage over `workers` regular gRPC workers of `model_id`, with the
+    /// registry of policies it reads: a case hands that registry an engine.
+    fn stage_and_policies(
+        model_id: &str,
+        workers: u16,
+    ) -> (WorkerSelectionStage, Arc<PolicyRegistry>) {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for i in 0..workers {
+            worker_registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{}", 8360 + i))
+                        .model(ModelCard::new(model_id))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        }
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            Arc::clone(&policy_registry),
+            WorkerSelectionMode::Regular,
+            None,
+        );
+        (stage, policy_registry)
+    }
+
+    /// A first attempt's regular selection of a request that states `rid`.
+    fn regular_pick(stage: &WorkerSelectionStage, model_id: &str, rid: Option<&str>) -> Placed {
+        stage
+            .select_regular(
+                model_id,
+                ContextRequirements::default(),
+                MediaDemands::NONE,
+                None,
+                None,
+                None,
+                None,
+                None,
+                rid,
+                None,
+                None,
+                &[],
+            )
+            .expect("a worker")
+    }
+
+    /// Where the gateway started the policy engine, the regular stage's pick
+    /// keeps the engine's placement for its load guards. The engine hears
+    /// the dispatch where the first guard is made and the end where that
+    /// guard is dropped. A batch's other guards and the selection's own drop
+    /// tell it nothing more.
+    #[test]
+    fn the_regular_stages_load_guards_tell_the_engine_the_dispatch_and_the_end() {
+        use crate::routers::{
+            common::placement::tests::hearing_engine_on, grpc::context::LoadGuards,
+        };
+
+        let model_id = "test-model-engine-guards";
+        let (stage, policies) = stage_and_policies(model_id, 2);
+        let heard = hearing_engine_on(&policies);
+        let said = || heard.lock().expect("the stage heard").clone();
+
+        let selection = WorkerSelection::Single {
+            worker: regular_pick(&stage, model_id, None),
+        };
+        assert_eq!(said(), ["issued"]);
+        let guards = LoadGuards::scaled(&selection, Some("the route's own key"), 3);
+        assert_eq!(said(), ["issued", "dispatched Single"]);
+        drop(selection);
+        assert_eq!(said(), ["issued", "dispatched Single"]);
+        drop(guards);
+        assert_eq!(
+            said(),
+            ["issued", "dispatched Single", "completed Cancelled"]
+        );
+
+        // A selection no guard was made from gives its lease up.
+        drop(regular_pick(&stage, model_id, None));
+        assert_eq!(said()[3..], ["issued", "released Abandoned"]);
+    }
+
+    /// The regular stage hands the engine the body's `rid` as the request
+    /// states it. Under a document that reads the routing value from that
+    /// id, the request is counted under the value on its worker and keeps
+    /// that worker. A request that states no id has no value to count under.
+    #[test]
+    fn the_regular_stage_hands_the_engine_the_bodys_id() {
+        use smg_policy_controller::document::{
+            AppliedSpec, KeySourceSpec, PolicySpec, RoutingKeySpec,
+        };
+
+        use crate::routers::{common::placement::tests::engine_on, grpc::context::LoadGuards};
+
+        let model_id = "test-model-engine-rid";
+        let (stage, policies) = stage_and_policies(model_id, 3);
+        let mut document = PolicySpec::preset("consistent_hashing").expect("a stock preset");
+        document.bindings[0].routing_key = Some(RoutingKeySpec {
+            sources: vec![KeySourceSpec {
+                rid: true,
+                ..KeySourceSpec::default()
+            }],
+            strip_lineage: false,
+        });
+        let spec = AppliedSpec::validate(&document);
+        engine_on(&policies, spec.expect("a valid document"));
+
+        let keyed = WorkerSelection::Single {
+            worker: regular_pick(&stage, model_id, Some("conversation-1")),
+        };
+        let worker = Arc::clone(keyed.single().expect("a single selection"));
+        let guards = LoadGuards::new(&keyed, None);
+        assert_eq!((worker.load(), worker.routing_key_load()), (1, 1));
+        for _ in 0..4 {
+            let again = regular_pick(&stage, model_id, Some("conversation-1"));
+            assert_eq!(again.url(), worker.url());
+        }
+        drop(guards);
+        assert_eq!((worker.load(), worker.routing_key_load()), (0, 0));
+
+        let plain = WorkerSelection::Single {
+            worker: regular_pick(&stage, model_id, None),
+        };
+        let worker = Arc::clone(plain.single().expect("a single selection"));
+        let guards = LoadGuards::new(&plain, None);
+        assert_eq!((worker.load(), worker.routing_key_load()), (1, 0));
+        drop(guards);
+    }
+
     /// The gRPC transport must shed an all-overloaded model with the same
     /// distinct overload 503 the HTTP router uses. Its usual empty-pool answer
     /// is a 404, which would both misreport pressure as model absence and skip
@@ -3836,7 +3977,7 @@ mod tests {
         let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::TokenSpeed));
         let decided_on = |worker: &Arc<dyn Worker>| {
             utils::WorkerDecoding::of(Some(&WorkerSelection::Single {
-                worker: Arc::clone(worker),
+                worker: Arc::clone(worker).into(),
             }))
         };
         let selected = |ctx: &DispatchContext| match ctx.workers.as_ref().unwrap() {
@@ -3935,7 +4076,7 @@ mod tests {
             let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::TokenSpeed));
             ctx.constraint_decided_on =
                 Some(utils::WorkerDecoding::of(Some(&WorkerSelection::Single {
-                    worker: Arc::clone(&workers[2]),
+                    worker: Arc::clone(&workers[2]).into(),
                 })));
             let request = RequestType::Generate(Arc::new(
                 serde_json::from_value(serde_json::json!({"text":"Hello"})).unwrap(),
@@ -3953,7 +4094,7 @@ mod tests {
                     .await
                     .unwrap();
                 let selected = match ctx.workers.as_ref().unwrap() {
-                    WorkerSelection::Single { worker } => worker,
+                    WorkerSelection::Single { worker } => worker.worker(),
                     WorkerSelection::Disaggregated { decode, .. } => decode,
                 };
                 assert_eq!(selected.url(), workers[2].url());
@@ -4091,7 +4232,7 @@ mod tests {
         headers.insert("x-smg-routing-key", "session-42".parse().unwrap());
         ctx.headers = Some(headers);
         let selected = |ctx: &DispatchContext| match ctx.workers.as_ref().unwrap() {
-            WorkerSelection::Single { worker } => Arc::clone(worker),
+            WorkerSelection::Single { worker } => Arc::clone(worker.worker()),
             WorkerSelection::Disaggregated { .. } => panic!("expected single selection"),
         };
 
