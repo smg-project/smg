@@ -3355,19 +3355,27 @@ fn side_reads_another_column(
 /// pools those two would share. A profile counts as a reader where its
 /// pool keeps the record for it ([`Engine::reads_sent_for`]).
 ///
-/// A pair's decode profile counts in the decode pool whichever binding
-/// covers the decode phase first. A pair found by its prefill decides
-/// its decode side under its own binding, and the pool keeps the record
-/// for that side where the first binding's profile reads none.
+/// A pair's decode profile counts wherever the pair is found by its
+/// prefill, whichever binding's phase list covers the decode phase. The
+/// pair decides its decode side under its own binding, and the decode
+/// pool keeps the record for that side where the profile a decode
+/// request asked alone resolves to reads none.
 fn live_reader_beside(bindings: &[Binding], at: usize, named_by: &[NamedBy]) -> bool {
     let Some(own) = bindings.get(at) else {
         return false;
     };
-    let reads = |other: &Binding, phase: Phase| {
-        other.covers(phase)
-            && profile_index(other, phase)
-                .and_then(|index| named_by.get(usize::from(index)))
-                .is_some_and(|by| by.sent)
+    let sent = |other: &Binding, phase: Phase| {
+        profile_index(other, phase)
+            .and_then(|index| named_by.get(usize::from(index)))
+            .is_some_and(|by| by.sent)
+    };
+    let reads = |other: &Binding, phase: Phase| other.covers(phase) && sent(other, phase);
+    // A pair is found by its prefill alone, and its decode side reads
+    // the decode pool whatever its own phase list says of that phase.
+    let side = |other: &Binding| {
+        matches!(other.plan, Plan::PdPair | Plan::Epd { .. })
+            && other.covers(Phase::Prefill)
+            && sent(other, Phase::Decode)
     };
     bindings.iter().enumerate().any(|(other_at, other)| {
         if other_at == at || !own.shares_a_model(other) {
@@ -3380,16 +3388,14 @@ fn live_reader_beside(bindings: &[Binding], at: usize, named_by: &[NamedBy]) -> 
             let takes = PHASES
                 .iter()
                 .all(|&phase| !own.covers(phase) || other.covers(phase));
-            !takes && PHASES.iter().any(|&phase| reads(other, phase))
+            !takes && (side(other) || PHASES.iter().any(|&phase| reads(other, phase)))
         } else {
             // This binding is found first: the other decides a pool of
             // a model of its own only in a phase this one leaves. A pair
             // left the prefill lookup decides its decode side too, in
             // the decode pool, whether or not this one covers that phase.
-            let pairs = matches!(other.plan, Plan::PdPair | Plan::Epd { .. });
-            let side = pairs && !own.covers(Phase::Prefill) && reads(other, Phase::Decode);
             let left = |&phase: &Phase| !own.covers(phase) && reads(other, phase);
-            side || PHASES.iter().any(left)
+            (!own.covers(Phase::Prefill) && side(other)) || PHASES.iter().any(left)
         }
     })
 }
@@ -9975,6 +9981,47 @@ mod tests {
         // either: one rule for every reading.
         let same = shadowed("cache_aware", aware);
         assert_eq!(word(&same), (Some(apart), Some(false)));
+    }
+
+    /// A pair is found by its prefill, whatever its own phase list says
+    /// of the decode phase: a binding built in code may name the prefill
+    /// alone. Its decode profile counts as a reader beside a binding of
+    /// the decode phase all the same, in either order. A pair whose
+    /// decode profile reads no record does not count.
+    #[test]
+    fn a_pairs_decode_side_is_a_reader_by_its_prefill_alone() {
+        let named = |sent: bool| NamedBy {
+            cap: u32::from(sent) * 16,
+            rule: None,
+            sent,
+            sent_alone: false,
+            held: Held::Unasked,
+        };
+        // Profile 0 reads no record and profile 1 reads it.
+        let named_by = [named(false), named(true)];
+        let alone = || Binding {
+            phases: vec![Phase::Decode],
+            ..single_binding()
+        };
+        let pair = |phases: &[Phase], decode: u16| Binding {
+            phases: phases.to_vec(),
+            decode_profile: Some(decode),
+            ..pair_binding()
+        };
+        let beside = |bindings: [Binding; 2], at| live_reader_beside(&bindings, at, &named_by);
+        let both: &[Phase] = &[Phase::Prefill, Phase::Decode];
+        let (each, prefill): (&[Phase], &[Phase]) = (&[], &[Phase::Prefill]);
+        // The decode binding first: the pair is left the prefill lookup.
+        for phases in [both, each, prefill] {
+            assert!(beside([alone(), pair(phases, 1)], 0), "{phases:?}");
+            assert!(!beside([alone(), pair(phases, 0)], 0), "{phases:?}");
+        }
+        // The pair first: it takes the decode pool where its list covers
+        // the phase, and the decode binding decides none of the model.
+        assert!(!beside([pair(both, 1), alone()], 1));
+        assert!(!beside([pair(each, 1), alone()], 1));
+        assert!(beside([pair(prefill, 1), alone()], 1));
+        assert!(!beside([pair(prefill, 0), alone()], 1));
     }
 
     /// Two bindings share a model where one id matches both patterns, as
