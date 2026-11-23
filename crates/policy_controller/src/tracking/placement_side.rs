@@ -47,15 +47,17 @@
 //!
 //! **The order of a pair's words** is kept here, in whatever order its
 //! host lets the two sides go. A decode that still stands chosen leaves
-//! with its prefill's end
-//! ([`DecisionGuard::completed`](super::DecisionGuard::completed)), and
-//! its send would then say nothing. So a prefill side that ends behind its
-//! send, while the decode still stands chosen, holds its end back until
-//! the decode side speaks: at its dispatch, at the call that takes its
-//! decode again, or at its own end. The end is said then as it stood when
-//! it was held: with the outcome a handle reported, or with the instant
-//! the prefill side was dropped at, so the span a stage reads is the
-//! prefill's own.
+//! with its prefill's last word: the prefill's end
+//! ([`DecisionGuard::completed`](super::DecisionGuard::completed)), or its
+//! release where it never went out. The decode's send would then say
+//! nothing. So a prefill side let go while the decode still stands chosen
+//! holds its word back until the decode side speaks: at its dispatch, at
+//! the call that takes its decode again, or at its own end. The word is
+//! said then as it stood when it was held. An end is said with the outcome
+//! a handle reported, or with the instant the prefill side was dropped at,
+//! so the span a stage reads is the prefill's own. A prefill that never
+//! went out is released then: a host that sends a pair's decode and no
+//! prefill lets the prefill side go when it will.
 //!
 //! **A decode decided again** is asked of the pair's decode side
 //! ([`PlacementSide::decode_again`]), behind its prefill's answer. Its host
@@ -86,10 +88,10 @@ use crate::engine::{
 /// nothing and reads no clock.
 ///
 /// A pair's sides say two of those words otherwise (the module's words on
-/// the order). A prefill side that ends behind its send, while the decode
-/// still stands chosen, says its end later: behind the decode side's word.
-/// A decode side that stands chosen and never went out says nothing at its
-/// drop: nothing was booked for it.
+/// the order). A prefill side let go while the decode still stands chosen
+/// says its word later, behind the decode side's: its end where it went
+/// out, its release where it never did. A decode side that stands chosen
+/// and never went out says nothing at its drop: nothing was booked for it.
 pub struct PlacementSide {
     side: Side,
     /// The label of the profile that picked this side.
@@ -124,8 +126,8 @@ enum Of {
 /// A pair's one placement, as its two sides share it.
 struct Pair {
     placement: Placement<'static>,
-    /// The prefill side's end, where it is held back for the decode side's
-    /// word.
+    /// The prefill side's last word, where it is held back for the decode
+    /// side's: its end, or the release of a prefill that never went out.
     held_end: Option<End>,
 }
 
@@ -169,7 +171,7 @@ fn say(placement: &mut Placement<'static>, side: Side, end: End) {
 }
 
 impl Pair {
-    /// Says the prefill's end where it is held back, as it stood when it
+    /// Says the prefill's word where it is held back, as it stood when it
     /// was held.
     fn end_held_prefill(&mut self) {
         if let Some(end) = self.held_end.take() {
@@ -179,7 +181,8 @@ impl Pair {
 
     /// `side`'s end. A prefill's is held back where saying it now would
     /// take the chosen decode with it, and one that waited is said behind
-    /// the decode's.
+    /// the decode's. The release of a prefill that never went out takes a
+    /// chosen decode as an end does, and is held back the same.
     ///
     /// An outcome says that its side went out: a send never said is said
     /// here first, at the report's instant, as a placement's own end says
@@ -212,8 +215,8 @@ impl Of {
             Self::Shared(pair) => {
                 let mut pair = pair.lock();
                 pair.placement.sent(side);
-                // The decode no longer stands chosen: a prefill's end that
-                // waited for this word is said behind it.
+                // The decode no longer stands chosen: a prefill's end or
+                // release that waited for this word is said behind it.
                 if side == Side::Decode {
                     pair.end_held_prefill();
                 }
@@ -962,9 +965,9 @@ mod tests {
     /// behind a prefill's held end: a chosen decode was booked nowhere and
     /// says nothing, and the prefill's end is said then, with the span to
     /// the prefill side's drop. Let go first, it leaves the prefill's end
-    /// to its own drop. A prefill that never went out is released at once,
-    /// and the chosen decode leaves with it: the placement owes nothing
-    /// more.
+    /// to its own drop. A prefill that never went out holds its release
+    /// the same way: the chosen decode stays, and the release is said at
+    /// the decode side's drop, one issue and one release in all.
     #[test]
     fn a_decode_side_dropped_unsent_ends_the_pair_behind_a_held_prefill() {
         let host = Host::of_pairs();
@@ -989,10 +992,30 @@ mod tests {
 
         let (prefill, decode) = host.pair(true);
         drop(prefill);
-        assert_eq!(host.words(), [("issued", P), ("released", P)]);
-        assert!(!owes(&decode), "the chosen decode left with its prefill");
+        assert_eq!(host.words(), [("issued", P)], "the release waits");
+        assert!(owes(&decode), "the chosen decode stays with its side");
         drop(decode);
-        assert!(host.words().is_empty());
+        assert_eq!(host.words(), [("released", P)]);
+    }
+
+    /// A prefill side dropped with its prefill never sent, while the decode
+    /// still stands chosen, holds its release back for the decode side's
+    /// word, as one that went out holds its end: the release would take
+    /// the chosen decode with it. So a host that sends a pair's decode and
+    /// no prefill is heard whole, whichever side it lets go first: the
+    /// decode's issue and its dispatch, then the prefill's release, then
+    /// the decode's end.
+    #[test]
+    fn a_prefill_side_dropped_unsent_holds_its_release_for_the_decodes_word() {
+        let host = Host::of_pairs();
+        let (prefill, mut decode) = host.pair(true);
+        drop(prefill);
+        assert_eq!(host.words(), [("issued", P)], "the release waits");
+        decode.sent();
+        let told = [("issued", D), ("sent", D), ("released", P)];
+        assert_eq!(host.words(), told);
+        drop(decode);
+        assert_eq!(host.words(), [("ended", D)]);
     }
 
     /// A pair's request that asks its decode again, over `lists`.
@@ -1072,6 +1095,30 @@ mod tests {
         assert!(host.words().is_empty(), "the held end still waits");
         decode.sent();
         assert_eq!(host.words(), [("issued", D), ("sent", D), ("ended", P)]);
+        drop(decode);
+        assert_eq!(host.words(), [("ended", D)]);
+    }
+
+    /// A decode asked again behind a prefill that never went out is refused
+    /// by name, with nothing said: the ask comes once the prefill's send was
+    /// said. The release that prefill side holds back still waits, and is
+    /// said behind the dispatch of the first decision's decode.
+    #[test]
+    fn a_refused_second_ask_leaves_an_unsent_prefills_release_waiting() {
+        let host = Host::of_later_pairs();
+        let classes = PartnerClasses::number(1, [&[0_u32][..]]);
+        let request = later(host.lists(&classes));
+        let (prefill, mut decode) = sides_of(&host, &request);
+        drop(prefill);
+        assert_eq!(host.words(), [("issued", P)], "the release waits");
+
+        let refused = DecisionRefused::Decode(DecodeRefused::PrefillNotHeld);
+        let answer = decode.decode_again(&request).err();
+        assert_eq!(answer, Some(Unplaced::Refused(refused)));
+        assert!(host.words().is_empty(), "the held release still waits");
+        decode.sent();
+        let told = [("issued", D), ("sent", D), ("released", P)];
+        assert_eq!(host.words(), told);
         drop(decode);
         assert_eq!(host.words(), [("ended", D)]);
     }
@@ -1265,13 +1312,15 @@ mod tests {
     /// still hears the ends it did not name.
     #[test]
     fn a_pairs_words_stand_where_no_stage_takes_an_end() {
-        let cases: [fn(); 7] = [
+        let cases: [fn(); 9] = [
             each_side_of_a_pair_says_its_dispatch_and_its_end_at_its_drop,
             a_side_dropped_unsent_is_released_by_name,
             a_prefill_side_dropped_first_holds_its_end_for_the_decodes_word,
             a_decode_side_dropped_unsent_ends_the_pair_behind_a_held_prefill,
+            a_prefill_side_dropped_unsent_holds_its_release_for_the_decodes_word,
             a_decode_side_asks_its_decode_again_behind_its_prefills_send,
             a_second_ask_that_takes_no_decode_leaves_a_held_end_waiting,
+            a_refused_second_ask_leaves_an_unsent_prefills_release_waiting,
             a_pairs_two_sides_speak_from_two_threads,
         ];
         for case in cases {
