@@ -615,7 +615,7 @@ fn test_concurrent_operations_with_eviction() {
             let tenant_id: TenantId = Arc::from(format!("tenant{t}"));
             for _ in 0..10 {
                 tree.evict_tenant(&tenant_id, 50);
-                thread::sleep(std::time::Duration::from_millis(1));
+                thread::sleep(Duration::from_millis(1));
             }
         }));
     }
