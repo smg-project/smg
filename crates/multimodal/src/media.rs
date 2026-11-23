@@ -4030,13 +4030,13 @@ async fn decode_video_with_ffmpeg_seek(
     };
     drop(active_decode);
 
+    let joined_bytes = expected_bytes.saturating_add(selection.unique_count().saturating_mul(64));
     let mut data = Vec::new();
-    data.try_reserve(expected_bytes.saturating_add(selection.unique_count().saturating_mul(64)))
-        .map_err(|e| {
-            out_of_memory(format!(
-                "failed to reserve {expected_bytes} bytes for the decoded video frames: {e}"
-            ))
-        })?;
+    data.try_reserve(joined_bytes).map_err(|e| {
+        out_of_memory(format!(
+            "failed to reserve {joined_bytes} bytes for the decoded video frames: {e}"
+        ))
+    })?;
     let mut frames = Vec::with_capacity(selection.unique_count());
     for (stdout, run_frames) in outputs {
         let base = data.len();
