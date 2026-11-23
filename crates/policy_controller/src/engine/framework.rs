@@ -748,8 +748,9 @@ pub trait Picker: Lifecycle + Debug {
     /// health on the worker and holds every other rule of a placement
     /// itself asks such a picker for one pick and nothing else of a
     /// decision ([`Engine::place_for`]). The default is no. The engine reads
-    /// it where such a caller asks for a place's profile, not at a
-    /// decision.
+    /// it where such a caller asks for a place's profile, and at a pair's
+    /// decode decided again under a scorer ([`Engine::decide_decode`]): at
+    /// no other decision.
     fn picks_alone(&self) -> bool {
         false
     }
@@ -761,7 +762,7 @@ pub trait Picker: Lifecycle + Debug {
     /// request's own seed and asserts in a debug build that none was read.
     /// The default is no. The engine reads it at a pair's decode decided
     /// again, handed the decode of the pair's first decision
-    /// ([`Profile::keeps_its_pick`]), and once at its build, for a profile
+    /// ([`Engine::decide_decode`]), and once at its build, for a profile
     /// that draws for every request. The row such a picker's draw lands on
     /// is its rule's answer, so the draw is asked at every pool size over a
     /// pool that lends its own word ([`PoolFacts::word`]), and a session a
@@ -880,8 +881,11 @@ impl Profile {
     /// ([`Picker::takes_turns`]). Decided again, such a profile would spend
     /// a second turn for one request, and move the request by nothing its
     /// workers show. So a pair's decode decided again keeps the decode of
-    /// its first decision ([`Engine::decide_decode`]). Every other profile
-    /// decides again, on the workers as they stand at that call.
+    /// its first decision ([`Engine::decide_decode`]). The engine keeps it
+    /// too under a scorer the picker does not read
+    /// ([`Picker::picks_alone`]): this answer is the unscored profile's
+    /// alone. Every other profile decides again, on the workers as they
+    /// stand at that call.
     #[must_use]
     pub fn keeps_its_pick(&self) -> bool {
         self.scorers.is_empty() && self.picker.takes_turns()
@@ -2313,9 +2317,10 @@ fn vision_fits(facts: &RequestFacts<'_>, c: &Candidate) -> bool {
 /// the trace. A picker that pushes no target declined. A pair's decode
 /// decided again hands `first`, the decode its first decision named: where
 /// that decode is a survivor it leads the targets and the picker is not
-/// asked ([`keep_first`]). Inlined: each of its callers is one profile's
-/// run, as it was before the halves had names, and one that hands no
-/// `first` holds no test of it.
+/// asked ([`keep_first`]), while the profile's scorers still read the
+/// survivors. Inlined: each of its callers is one profile's run, as it was
+/// before the halves had names, and one that hands no `first` holds no
+/// test of it.
 #[inline(always)]
 fn score_survivors(
     profile: &Profile,
@@ -2329,6 +2334,17 @@ fn score_survivors(
     let mut targets = Targets::new();
     if !first.is_some_and(|first| keep_first(candidates, buf, first, &mut targets)) {
         score_and_pick(profile, facts, candidates, buf, &mut targets);
+    } else if !profile.scorers.is_empty() {
+        // A kept decode spares the picker's turn alone: the scorers read
+        // the survivors as ahead of a pick, and the trace holds their scores.
+        combine(
+            profile,
+            facts,
+            candidates,
+            &buf.kept,
+            &mut buf.scores,
+            &mut buf.stage,
+        );
     }
     // The trace counts every survivor of the filters; its top rows are of
     // the compared set, which leads the survivors and alone holds scores.
@@ -2364,8 +2380,9 @@ fn run_profile(
 
 /// The body of [`run_profile`], which hands no `first`. A pair's decode
 /// decided again enters here with the decode its first decision named,
-/// where its profile keeps its pick ([`Engine::decide_decode`]): the scoring
-/// half keeps that decode where it is a survivor ([`score_survivors`]).
+/// where its picker takes turns, under no scorer or one it does not read
+/// ([`Engine::decide_decode`]): the scoring half keeps that decode where it
+/// is a survivor ([`score_survivors`]).
 /// Inlined into the two, so a run that hands none is the code it was.
 #[inline(always)]
 #[expect(
@@ -7442,10 +7459,14 @@ impl Engine {
     /// answers that decode first while the profile's filters keep it, the
     /// decodes they keep behind it as its alternates, and the picker is not
     /// asked: a second pick would turn a rotation a second time for one
-    /// request, and move the request for no reason. Where a filter refuses
-    /// that decode, or none of the partners is that worker, the picker
-    /// picks among the decodes the filters keep. So it does under every
-    /// other profile, and for a caller that hands none.
+    /// request, and move the request for no reason. A scorer moves no pick
+    /// of a picker that takes turns and reads no score
+    /// ([`Picker::picks_alone`]): a profile that holds one beside such a
+    /// picker keeps that decode as well. Its scorers read the decodes the
+    /// filters keep, as ahead of a pick, and the trace holds their scores.
+    /// Where a filter refuses that decode, or none of the partners is that
+    /// worker, the picker picks among the decodes the filters keep. So it
+    /// does under every other profile, and for a caller that hands none.
     #[expect(
         clippy::too_many_arguments,
         reason = "the request and the pair's pools, beside the pair the call is held by"
@@ -7507,7 +7528,10 @@ impl Engine {
             partners.ruled(entry.vetoed),
             decode_cx,
             &mut scratch.decode,
-            first_decode.filter(|_| profile.keeps_its_pick()),
+            first_decode.filter(|_| {
+                profile.picker.takes_turns()
+                    && (profile.scorers.is_empty() || profile.picker.picks_alone())
+            }),
         );
         // Each target names the held prefill with one decode, as the
         // targets of a pair's first decision do. They are turned where the
@@ -12473,6 +12497,9 @@ mod tests {
     /// decode, and every second the other, which then serves every request.
     /// The two decodes are two workers, or one worker's two ranks: a first
     /// decode is kept at its rank, and one at a rank no row holds is not.
+    /// A scorer beside the picker changes none of it: the picker reads no
+    /// score. The scorer still reads the decodes of a kept answer: behind a
+    /// busy first decode the idle one tops the trace.
     #[test]
     fn a_decode_decided_again_under_round_robin_keeps_its_first_decode() {
         type Held = fn((WorkerId, u16)) -> Option<(WorkerId, u16)>;
@@ -12482,8 +12509,13 @@ mod tests {
             (false, |_| None, false),
             (true, |(worker, rank)| Some((worker, rank + 2)), false),
         ];
-        for (ranks, held, kept) in cases {
-            let engine = pair_engine(round_robin_profile());
+        let cases = cases.map(|case| [(false, case), (true, case)]);
+        for (scored, (ranks, held, kept)) in cases.into_iter().flatten() {
+            let mut profile = round_robin_profile();
+            if scored {
+                profile.scorers = least_requests_profile().scorers;
+            }
+            let engine = pair_engine(profile);
             let mut decodes = classed_rows(&[1, 1]);
             if ranks {
                 (decodes[1].id, decodes[1].dp_rank) = (decodes[0].id, 1);
@@ -12491,12 +12523,33 @@ mod tests {
             let mut sent = [0; 2];
             for _ in 0..8 {
                 let (first, again) = decided_twice(&engine, &mut decodes, held, |_, _| {});
-                assert_eq!(again[0] == first, kept);
+                assert_eq!(again[0] == first, kept, "{ranks} {scored}");
                 sent[again[0] as usize] += 1;
             }
             sent.sort_unstable();
-            assert_eq!(sent, if kept { [4, 4] } else { [0, 8] }, "{ranks}");
+            assert_eq!(sent, if kept { [4, 4] } else { [0, 8] }, "{ranks} {scored}");
         }
+        let engine = pair_engine(Profile {
+            scorers: least_requests_profile().scorers,
+            ..round_robin_profile()
+        });
+        let (prefills, mut decodes) = (classed_rows(&[1]), classed_rows(&[1, 1]));
+        decodes[0].in_flight = 5;
+        let kept = engine.decide_decode(
+            &request(7),
+            &PoolFacts::default(),
+            PairPools {
+                prefills: &prefills,
+                decodes: &decodes,
+                ..PairPools::default()
+            },
+            prefills[0].id,
+            Some((decodes[0].id, 0)),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        assert_eq!(first_decode(&kept), Some(0));
+        assert_eq!(kept.trace().top[0].0, decodes[1].id);
     }
 
     /// The kept answer names what a pick names over the same survivors:
@@ -12543,7 +12596,7 @@ mod tests {
         assert_eq!((firsts, seconds), ([2; 3], [2; 3]));
     }
 
-    /// A profile that scores its workers decides again, whatever it is
+    /// A profile whose picker reads its scores decides again, whatever it is
     /// handed. Under least requests the second answer is the first while
     /// nothing moved, and it follows the counts of its own instant away
     /// from a first decode that is still healthy.
