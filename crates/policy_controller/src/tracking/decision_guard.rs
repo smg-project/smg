@@ -552,6 +552,13 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     /// The engine of this process the handle decides by. `None` for a
     /// handle over a link.
     #[cfg(feature = "in-process")]
+    #[cfg_attr(
+        not(feature = "client"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "a handle over a link alone has no engine"
+        )
+    )]
     #[must_use]
     pub(crate) fn door(&self) -> Option<&D> {
         match &self.arm {
