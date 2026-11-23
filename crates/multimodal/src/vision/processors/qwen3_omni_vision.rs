@@ -22,15 +22,15 @@ use crate::{
     },
 };
 
-pub const QWEN3_OMNI_MEAN: [f64; 3] = [0.5; 3];
-pub const QWEN3_OMNI_STD: [f64; 3] = [0.5; 3];
-pub const DEFAULT_IMAGE_MIN_PIXELS: usize = 3_136;
-pub const DEFAULT_IMAGE_MAX_PIXELS: usize = 12_845_056;
-pub const DEFAULT_VIDEO_MIN_PIXELS: usize = 128 * 32 * 32;
-pub const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 32 * 32;
-pub const DEFAULT_PATCH_SIZE: usize = 16;
-pub const DEFAULT_MERGE_SIZE: usize = 2;
-pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
+pub(crate) const QWEN3_OMNI_MEAN: [f64; 3] = [0.5; 3];
+pub(crate) const QWEN3_OMNI_STD: [f64; 3] = [0.5; 3];
+pub(crate) const DEFAULT_IMAGE_MIN_PIXELS: usize = 3_136;
+pub(crate) const DEFAULT_IMAGE_MAX_PIXELS: usize = 12_845_056;
+pub(crate) const DEFAULT_VIDEO_MIN_PIXELS: usize = 128 * 32 * 32;
+pub(crate) const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 32 * 32;
+pub(crate) const DEFAULT_PATCH_SIZE: usize = 16;
+pub(crate) const DEFAULT_MERGE_SIZE: usize = 2;
+pub(crate) const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
 
 /// The `fps` argument of the checkpoint's processor. It computes a clip's
 /// `video_second_per_grid`, the time one temporal patch spans in the
@@ -51,7 +51,7 @@ impl Default for Qwen3OmniVisionProcessor {
 }
 
 impl Qwen3OmniVisionProcessor {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_limits(
             DEFAULT_IMAGE_MIN_PIXELS,
             DEFAULT_IMAGE_MAX_PIXELS,
@@ -135,7 +135,7 @@ impl Qwen3OmniVisionProcessor {
     }
 
     /// Build a processor for a resolved image or video configuration.
-    pub fn from_config_for(config: &PreProcessorConfig, modality: Modality) -> Self {
+    pub(crate) fn from_config_for(config: &PreProcessorConfig, modality: Modality) -> Self {
         if modality == Modality::Video && !config.is_image_only_processor_type() {
             Self::from_video_preprocessor_config(config)
         } else {

@@ -51,7 +51,7 @@ use crate::{
 
 /// Configuration for a Qwen VL processor variant.
 #[derive(Debug, Clone)]
-pub struct QwenVLConfig {
+pub(crate) struct QwenVLConfig {
     /// Vision encoder patch size
     pub patch_size: usize,
     /// Merge size for token reduction
@@ -86,7 +86,7 @@ impl QwenVLConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QwenVideoResizeMode {
+pub(crate) enum QwenVideoResizeMode {
     TotalVolume,
     PerFrame,
 }
@@ -94,7 +94,7 @@ pub enum QwenVideoResizeMode {
 /// What a clip's `video_second_per_grid`, the time one temporal patch spans
 /// in the position ids, divides the temporal patch size by.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum QwenVideoTiming {
+pub(crate) enum QwenVideoTiming {
     /// The rate the clip was sampled at, which the Qwen2-VL line's
     /// processors read from the video metadata.
     SampledRate,
@@ -398,14 +398,17 @@ impl QwenTransforms {
 impl QwenVLProcessorBase {
     /// Create a new processor with the given configuration and the default
     /// preprocessor config's transforms.
-    pub fn new(config: QwenVLConfig) -> Self {
+    pub(crate) fn new(config: QwenVLConfig) -> Self {
         Self::from_configs(config, &PreProcessorConfig::default())
     }
 
     /// Create a processor with the given configuration and the transforms
     /// `preprocessor_config` sets (resize filter, resize switch,
     /// normalization).
-    pub fn from_configs(config: QwenVLConfig, preprocessor_config: &PreProcessorConfig) -> Self {
+    pub(crate) fn from_configs(
+        config: QwenVLConfig,
+        preprocessor_config: &PreProcessorConfig,
+    ) -> Self {
         Self {
             transforms: QwenTransforms::resolve(&config, preprocessor_config),
             config,
@@ -417,7 +420,7 @@ impl QwenVLProcessorBase {
 
     /// Resolve the transforms from `config`, keeping this processor's
     /// geometry.
-    pub fn with_preprocessor_config(mut self, config: &PreProcessorConfig) -> Self {
+    pub(crate) fn with_preprocessor_config(mut self, config: &PreProcessorConfig) -> Self {
         self.transforms = QwenTransforms::resolve(&self.config, config);
         self
     }
@@ -466,7 +469,7 @@ impl QwenVLProcessorBase {
     /// Some model families upscale these inputs to the minimum aligned size,
     /// while Qwen processors reject them. This opt-in preserves the Qwen
     /// default and lets wrappers select the model-specific behavior.
-    pub fn allow_video_dimensions_below_factor(mut self) -> Self {
+    pub(crate) fn allow_video_dimensions_below_factor(mut self) -> Self {
         self.allow_video_dimensions_below_factor = true;
         self
     }
@@ -480,7 +483,7 @@ impl QwenVLProcessorBase {
     /// MiniMax-M3 reference takes `max(factor, round(...))` on each side first,
     /// so such an image keeps its rounded long side (28x112) and skips the
     /// scale-up. This opt-in selects the latter; the default is the Qwen rule.
-    pub fn raise_rounded_sides_to_factor(mut self) -> Self {
+    pub(crate) fn raise_rounded_sides_to_factor(mut self) -> Self {
         self.raise_rounded_sides_to_factor = true;
         self
     }
@@ -510,7 +513,7 @@ impl QwenVLProcessorBase {
         self.config.video_min_pixels
     }
 
-    pub fn video_max_pixels(&self) -> usize {
+    pub(crate) fn video_max_pixels(&self) -> usize {
         self.config.video_max_pixels
     }
 
@@ -535,7 +538,7 @@ impl QwenVLProcessorBase {
 
     /// Divide a clip's temporal patch size by `timing`'s rate for its
     /// `video_second_per_grid`, rather than by the rate it was sampled at.
-    pub fn with_video_timing(mut self, timing: QwenVideoTiming) -> Self {
+    pub(crate) fn with_video_timing(mut self, timing: QwenVideoTiming) -> Self {
         self.video_timing = timing;
         self
     }
@@ -668,7 +671,7 @@ impl QwenVLProcessorBase {
     /// # Errors
     /// - If height or width is zero
     /// - If aspect ratio exceeds 200:1
-    pub fn smart_resize(
+    pub(crate) fn smart_resize(
         &self,
         height: usize,
         width: usize,
@@ -741,7 +744,7 @@ impl QwenVLProcessorBase {
     /// `TotalVolume` applies the pixel budget to the padded sampled video
     /// volume (`T * H * W`), while `PerFrame` applies it to each frame's
     /// spatial area (`H * W`).
-    pub fn smart_resize_video(
+    pub(crate) fn smart_resize_video(
         &self,
         num_frames: usize,
         height: usize,

@@ -35,7 +35,7 @@ use crate::{
 
 /// MoonViT resize/patchify/normalize parameters for a single model.
 #[derive(Debug, Clone, Copy)]
-pub struct MoonVitParams {
+pub(crate) struct MoonVitParams {
     pub patch_size: usize,
     pub merge_size: usize,
     /// Maximum total patches before merge (`in_patch_limit`).
@@ -50,7 +50,7 @@ pub struct MoonVitParams {
 
 impl MoonVitParams {
     #[inline]
-    pub fn factor(&self) -> usize {
+    pub(crate) fn factor(&self) -> usize {
         self.patch_size * self.merge_size
     }
 
@@ -60,7 +60,7 @@ impl MoonVitParams {
     /// its compiled-in defaults. K2.5 and K3 ship different `in_patch_limit`
     /// values (16384 vs 65536), which is exactly the kind of divergence that
     /// silently caps resolution if the defaults win.
-    pub fn resolved(self, config: &PreProcessorConfig) -> Self {
+    pub(crate) fn resolved(self, config: &PreProcessorConfig) -> Self {
         Self {
             // A zero patch or merge size would divide by zero downstream.
             patch_size: config.get_patch_size(self.patch_size).max(1),
@@ -81,7 +81,7 @@ impl MoonVitParams {
     /// Compute resize dimensions and padding, matching HF `navit_resize_image`.
     ///
     /// Never upscales (scale capped at 1.0). Pads with zeros to align to factor.
-    pub fn compute_resize_config(&self, width: usize, height: usize) -> ResizeConfig {
+    pub(crate) fn compute_resize_config(&self, width: usize, height: usize) -> ResizeConfig {
         let ps = self.patch_size;
         let patches_w = (width / ps).max(1) as f64;
         let patches_h = (height / ps).max(1) as f64;
@@ -115,7 +115,7 @@ impl MoonVitParams {
 }
 
 /// MoonViT resize configuration for a single image.
-pub struct ResizeConfig {
+pub(crate) struct ResizeConfig {
     pub new_width: usize,
     pub new_height: usize,
     pub pad_width: usize,
@@ -295,7 +295,7 @@ fn write_wire_patches(
 }
 
 /// Run the full MoonViT pipeline over a batch of images.
-pub fn preprocess(
+pub(crate) fn preprocess(
     params: MoonVitParams,
     images: &[&DynamicImage],
     transparent_bg: Option<TransparentBg>,

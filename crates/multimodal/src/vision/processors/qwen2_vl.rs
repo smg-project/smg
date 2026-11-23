@@ -33,33 +33,33 @@ use crate::{
 };
 
 /// CLIP normalization mean values used by Qwen2-VL models.
-pub const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
+pub(crate) const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 
 /// CLIP normalization std values used by Qwen2-VL models.
-pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
+pub(crate) const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 
 /// Default minimum pixels (256 * 28 * 28 = 200,704)
-pub const DEFAULT_MIN_PIXELS: usize = 256 * 28 * 28;
+pub(crate) const DEFAULT_MIN_PIXELS: usize = 256 * 28 * 28;
 
 /// Default maximum pixels (1280 * 28 * 28 = 1,003,520)
-pub const DEFAULT_MAX_PIXELS: usize = 1280 * 28 * 28;
+pub(crate) const DEFAULT_MAX_PIXELS: usize = 1280 * 28 * 28;
 
 /// Default patch size
-pub const DEFAULT_PATCH_SIZE: usize = 14;
+pub(crate) const DEFAULT_PATCH_SIZE: usize = 14;
 
 /// Default merge size for token reduction
-pub const DEFAULT_MERGE_SIZE: usize = 2;
+pub(crate) const DEFAULT_MERGE_SIZE: usize = 2;
 
 /// Default temporal patch size (for video frames)
-pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
+pub(crate) const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
 
 /// The video processor's own minimum pixels per frame, for a config that
 /// names none (128 * 28 * 28 = 100,352).
-pub const DEFAULT_VIDEO_MIN_PIXELS: usize = 128 * 28 * 28;
+pub(crate) const DEFAULT_VIDEO_MIN_PIXELS: usize = 128 * 28 * 28;
 
 /// The video processor's own maximum pixels per frame, for a config that
 /// names none (768 * 28 * 28 = 602,112).
-pub const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 28 * 28;
+pub(crate) const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 28 * 28;
 
 /// Qwen2-VL image processor.
 ///
@@ -173,7 +173,7 @@ impl Qwen2VLProcessor {
     /// shared with the image processor, which is what a checkpoint shipping
     /// one `preprocessor_config.json` gives both, else its `size` edges, else
     /// that processor's own defaults); for an image the image processor's.
-    pub fn from_config_for(config: &PreProcessorConfig, modality: Modality) -> Self {
+    pub(crate) fn from_config_for(config: &PreProcessorConfig, modality: Modality) -> Self {
         if modality == Modality::Video {
             Self::from_video_preprocessor_config(config)
         } else {
