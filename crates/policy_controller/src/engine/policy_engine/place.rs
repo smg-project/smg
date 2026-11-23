@@ -276,8 +276,9 @@ pub struct PlaceRequest<'a> {
     /// answer. Where the document picks the decode after the prefill, such
     /// a request's first decision books the prefill alone. A caller that
     /// sends both sides at once states nothing here and keeps one decision
-    /// under every document. The word is a pair's: over one list it asks
-    /// nothing, and a first attempt that carries it is plain still. An
+    /// under every document. The word is a pair's: over one list, or over
+    /// none, it asks nothing. The request made states no later decode
+    /// then, and a first attempt that carries it is plain still. An
     /// encode request whose decode is held to the workers that take images
     /// ([`EncodeItems::decode_images`], or references beside an image or a
     /// video) books its decode with its prefill whatever it states here: a
@@ -375,6 +376,14 @@ impl<'a> PlaceRequest<'a> {
             WorkerLists::Pair(_) | WorkerLists::Encode(_) => Phase::Prefill,
             WorkerLists::None | WorkerLists::Single(_) => Phase::Single,
         }
+    }
+
+    /// Whether the request asks a pair's decode again
+    /// ([`Self::decode_again`]). The word is a pair's, over its two lists
+    /// or an encode request's three: over one list, and over none, it asks
+    /// nothing. The request made and its plain test both read this.
+    const fn asks_decode_again(&self) -> bool {
+        self.decode_again && matches!(self.lists, WorkerLists::Pair(_) | WorkerLists::Encode(_))
     }
 }
 
@@ -748,12 +757,14 @@ impl RequestMaker for Made<'_, '_> {
             hashes.write_to(&mut facts);
         }
         // The document's word, like the keys: read from the generation
-        // that decides. An encode request whose decode is held to the ones
-        // that take images, by its demand or by the preference of
-        // references beside pixels, states no later decode: a decode asked
+        // that decides. A request over one list, or over none, states no
+        // later decode whatever its caller says: the word is a pair's, as
+        // the plain test reads it. An encode request whose decode is held
+        // to the ones that take images, by its demand or by the preference
+        // of references beside pixels, states none either: a decode asked
         // again reads no image fact. The hold is read last, so a request
         // that asks no decode again reads none of it.
-        let later = request.decode_again
+        let later = request.asks_decode_again()
             && spec.decode_pick() == DecodePick::AfterPrefill
             && !request
                 .encode
@@ -773,16 +784,13 @@ impl RequestMaker for Made<'_, '_> {
 
     // A first attempt that names nothing tried or missed, is held to no
     // place of its list, demands nothing, carries no encode item and asks
-    // no decode again is plain. Its size
-    // is the one the request made would state. A decode asked again is a
-    // pair's word, over its two lists or an encode request's three: over
-    // one list it asks nothing, and the request is plain still.
+    // no decode again ([`PlaceRequest::asks_decode_again`]) is plain. Its
+    // size is the one the request made would state.
     fn plain(&self) -> Option<Plain> {
         let request = self.request;
         let first = request.attempt == 0 && request.tried.is_empty() && self.missed.is_empty();
         let first = first && self.places.is_none();
-        let pair = matches!(request.lists, WorkerLists::Pair(_) | WorkerLists::Encode(_));
-        let again = request.decode_again && pair;
+        let again = request.asks_decode_again();
         let asks_more = !request.demands.is_none() || request.encode.is_some() || again;
         (first && !asks_more).then(|| Plain {
             phase: request.phase(),
