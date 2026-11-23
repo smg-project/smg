@@ -4914,10 +4914,14 @@ fn check_binding(
             }
         }
     }
-    // A host that makes some lifecycle calls only keeps one session verdict
-    // for a pair's lease: its decode side's dispatch would settle that
-    // side's claim by the prefill side's word. A rule under the pair plan
-    // is not in such a host's build.
+    // The store's file of leases keeps no session verdict of a pair's
+    // decode side: that side's lease states the prefill side's
+    // (`store::DecodeSide::lease`). A controller that serves from the file
+    // would settle a decode side's claim by the prefill side's word, so a
+    // rule under the pair plan is not in its build. The catalog's word is
+    // how the validator knows such a controller today: it makes some
+    // lifecycle calls only. The change that makes the file keep that
+    // verdict takes this refusal out.
     if b.sessions.is_some() && b.plan.unwrap_or_default() == PlanName::PdPair && !cx.lifecycle {
         deferred.note(
             at.field("sessions"),

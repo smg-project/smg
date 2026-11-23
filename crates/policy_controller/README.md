@@ -1204,8 +1204,7 @@ Each removal write has one attempt. A worker that an `Upsert` job finds again wh
 - A binding that matches on a tenant, a priority, a header, a prompt size or labels. The fields are in the schema. A document that writes one is refused as not in this build.
 - A pair's shadows through a served controller, shadow maps by side, and plugin stages in a shadow profile.
 - `canary`, `override: allowed` and `admission` on a binding, and `issue_session_id` in a sessions rule.
-- A sessions rule under `epd`. Under `pd-pair` a rule runs on both sides where it states no cap (`inflight_cap: 65535`) and `rule_placed: told`, and any other is refused.
-- A sessions rule under `pd-pair` in the stock controller. The library runs it. The stock controller refuses a document that binds one, because a pair's lease there keeps one session verdict for its two sides.
+- A sessions rule under `epd`, and under `pd-pair` through a served controller. The library runs a rule under `pd-pair` on both sides where it states no cap (`inflight_cap: 65535`) and `rule_placed: told`, and refuses any other. The stock controller refuses a document that binds one, because its file of leases keeps one session verdict for a pair's two sides.
 - The `best-with-temperature` picker, and three settings of `prefix-affinity`: `decay`, `accounting_ttl_ms` and `spill.uncached_credit`.
 - The `bucket` scorer in the stock controller. The library runs it. The stock controller refuses a document that names it, because it does not yet report every request's end to a stage.
 - The record of sent prefixes at an encode request's first decision and on a standby. An encode request's first decision records nothing, and a standby starts with an empty record.

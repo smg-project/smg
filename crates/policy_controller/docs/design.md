@@ -2190,7 +2190,9 @@ Five things follow, and they are the first work of section 16.
    (decision 3). The other measures which tokens are in a prompt's head, which is then the
    caller's recipe: it is proven at stage 3, by a gateway test of classic's own function. The
    1 of `manual` replays as classic recorded now: a sessions rule with no cap runs on the two
-   sides of a pair, each side by its own session. Each
+   sides of a pair, each side by its own session, where the host decides in process. A served
+   controller refuses the rule under a pair: its file of leases keeps one session verdict for
+   a pair's two sides. Each
    of the 23 is made equal to classic or named as an accepted difference: two in stage 1, one
    at stage 3, the 20 in stage 4.
 3. **Five policies have no sheet over a healthy pool**: `round_robin`, `random`, `passthrough`,
