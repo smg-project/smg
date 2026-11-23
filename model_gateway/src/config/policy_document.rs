@@ -467,40 +467,19 @@ mod tests {
         }
     }
 
-    /// The policy crate's tests of the translation run over two literals of
-    /// this gateway's defaults: `defaults()` and `cache_aware()` in its
-    /// `document/routing_settings.rs`. The two literals below are those. A
-    /// default that moves here fails this case, and the crate's literal
-    /// moves with it.
+    /// The policy crate says the settings of a gateway whose configuration
+    /// sets none ([`RoutingSettings::default`]). Its tests of the
+    /// translation run over them, and over a literal of the cache-aware
+    /// policy at its flags' defaults: `cache_aware()` in its
+    /// `document/routing_settings.rs`. This gateway's default configuration
+    /// means the first, and the literal below is the second. A default that
+    /// moves on either side fails this case. The usage threshold is
+    /// compared in 64 bits here: the crate's own cases compare it in 32.
     #[test]
     fn the_gateways_defaults_are_the_policy_crates_fixtures_of_them() {
         assert_eq!(
             RouterConfig::default().routing_settings(),
-            RoutingSettings {
-                mode: ModeSettings::Regular,
-                policy: PolicySettings::Random,
-                enable_igw: false,
-                policy_spec: None,
-                grouped_dp_sticky: None,
-                dp_minimum_tokens_scheduler: false,
-                pd_pairing_mode: Pairing::Lenient,
-                worker_warmup_secs: 60,
-                worker_warmup_share: 0.25,
-                worker_warmup_blocks: 1024,
-                worker_warmup_thin_ratio: 0.5,
-                worker_warmup_divert_every: 8,
-                routing_key_override: RoutingKeyOverrideSettings {
-                    enabled: false,
-                    headers: vec!["x-smg-routing-key".to_owned()],
-                    eviction_interval_secs: 60,
-                    max_idle_secs: 14_400,
-                    assignment_mode: Assignment::Delegate,
-                },
-                worker_overload_protection: true,
-                worker_overload_waiting_requests: Some(8),
-                worker_overload_token_usage: Some(0.8),
-                worker_overload_shed: false,
-            }
+            RoutingSettings::default()
         );
         assert_eq!(
             policy_settings(&PolicyConfig::cache_aware(0.3, 64, 1.5, 120, 67_108_864)),
