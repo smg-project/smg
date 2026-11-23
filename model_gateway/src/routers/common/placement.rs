@@ -521,20 +521,16 @@ impl Deref for Placed {
 }
 
 impl Placed {
-    /// The answer for a request the policy engine placed. The routing value
-    /// is copied out of the request's own text. The engine's side of the
-    /// request is kept only where the engine is owed the request's events:
-    /// of every other answer the engine hears nothing more. An answer that
-    /// keeps neither is the answer of a classic pick.
-    fn by_engine(placement: Placement<'_>) -> Self {
-        let routing_key = placement.routing_key.map(Box::from);
-        let placement = placement.kept();
-        let (worker, side) = if placement.owes_events() {
-            let worker = Arc::clone(&placement.worker);
-            (worker, Some(Box::new(placement.sides().0)))
-        } else {
-            (placement.worker, None)
-        };
+    /// The answer for a request the policy engine placed: its worker, the
+    /// engine's side of the request where the engine is owed the request's
+    /// events, and the routing value, copied out of the request's own
+    /// text. An answer that keeps neither is the answer of a classic pick.
+    fn by_engine(
+        worker: Arc<dyn Worker>,
+        side: Option<Box<PlacementSide>>,
+        routing_key: Option<&str>,
+    ) -> Self {
+        let routing_key = routing_key.map(Box::from);
         if side.is_none() && routing_key.is_none() {
             return Self::from(worker);
         }
@@ -899,25 +895,41 @@ fn placed_by_engine(
     tried_ids(lent.workers, inputs.tried, &mut tried);
     let mut request = place_request(model_id, WorkerLists::Single(lent), inputs, &tried);
     request.ring = ring;
-    match engine.place(&request) {
-        Ok(placement) => {
-            let counted_under = if placement.profile.is_empty() {
-                policies.policy_name()
-            } else {
-                placement.profile
-            };
-            Metrics::record_worker_selection(
-                metrics_labels::WORKER_REGULAR,
-                placement.worker.connection_mode().as_metric_label(),
-                model_id,
-                counted_under,
-            );
-            Some(Placed::by_engine(placement))
-        }
+    let answer = engine.place(&request);
+    let placement = match &answer {
+        Ok(placement) => placement,
         Err(unplaced) => {
-            report_unplaced(model_id, &unplaced, "The policy engine placed no worker");
-            None
+            report_unplaced(model_id, unplaced, "The policy engine placed no worker");
+            return None;
         }
+    };
+    let counted_under = if placement.profile.is_empty() {
+        policies.policy_name()
+    } else {
+        placement.profile
+    };
+    Metrics::record_worker_selection(
+        metrics_labels::WORKER_REGULAR,
+        placement.worker.connection_mode().as_metric_label(),
+        model_id,
+        counted_under,
+    );
+    // A placement is moved whole only where the engine is owed the request's
+    // events and keeps its side: of every other the worker is taken in place.
+    let owed = placement.owes_events();
+    match answer {
+        Ok(placement) if owed => {
+            let (worker, key) = (Arc::clone(&placement.worker), placement.routing_key);
+            let side = Box::new(placement.kept().sides().0);
+            Some(Placed::by_engine(worker, Some(side), key))
+        }
+        Ok(Placement {
+            worker,
+            routing_key,
+            ..
+        }) => Some(Placed::by_engine(worker, None, routing_key)),
+        // Answered above, with its report: this arm only completes the match.
+        Err(_) => None,
     }
 }
 
