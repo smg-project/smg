@@ -686,7 +686,8 @@ workers it admits for the items and reads no place.
 A pair's host states its standing vetoes the same way, the places each list's vetoes mask and those
 a hold stands on (`PairLists::prefill_stalled`, `prefill_held`, `decode_stalled`, `decode_held`).
 Each side reads its own, under an encode request too, and a pair's or an encode request's own mask
-is refused under the name `places`.
+is refused under the name `places`. An encode request's host states the encoders' vetoes beside their
+list as well (`EncodeLists::encoders_stalled`, `encoders_held`), and the encode side reads them.
 
 ### 5.5 The decision **[built]**
 

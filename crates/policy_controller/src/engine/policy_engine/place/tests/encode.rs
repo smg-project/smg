@@ -164,6 +164,8 @@ impl Three {
         EncodeLists {
             pair,
             encoders: encoders.lent(),
+            encoders_stalled: &[],
+            encoders_held: &[],
             facts: said.0,
             prefill_classes: said.1,
         }
