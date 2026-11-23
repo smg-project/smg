@@ -199,6 +199,9 @@ pub struct MetricsSnapshot {
     pub approvals_granted: u64,
     pub approvals_denied: u64,
     pub connection_errors: u64,
+    /// As the orchestrator records it: connects of configured servers, less
+    /// one at shutdown for each that connected; a reconnect adds one more. A
+    /// server a request names by `server_url` is pooled and not counted here.
     pub active_connections: u64,
     pub active_executions: u64,
 }
