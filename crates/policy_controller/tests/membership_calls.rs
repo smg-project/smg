@@ -6,7 +6,7 @@
 //! No stub server: the client is the generated one and the server is the
 //! binary. The one engine that answers is the mock worker's, in the case's
 //! process: the leader is given its address through the door and nothing
-//! else, and its own load driver's counter says it polled it.
+//! else, and its own load monitor's counter says it polled it.
 //!
 //! The door opens to a caller with a principal: the control listener is one
 //! its operator named, and every call states the caller's name. The
@@ -499,8 +499,8 @@ async fn the_leader_takes_a_fleet_through_the_door_and_polls_the_engine_it_was_g
         .expect_err("the retry names a registration that left");
     assert_eq!(retried.code(), Code::NotFound);
 
-    // The leader's own driver polls the one ready engine it was given: its
-    // counter moves within two of its poll periods. The follower was given
+    // The leader's own load monitor polls the one ready engine it was given:
+    // its counter moves within two of its poll periods. The follower was given
     // nothing and polls nothing.
     let started = Instant::now();
     let polled = loop {

@@ -5,6 +5,12 @@
 //! The helpers return `Result`s and the tests expect them: a helper is not a
 //! test to the lints.
 
+#[expect(
+    dead_code,
+    reason = "this binary serves one mock engine and waits by its own bounds; the process's CPU time is another binary's measurement"
+)]
+#[path = "common/engines.rs"]
+mod engines;
 #[path = "common/net.rs"]
 mod net;
 
@@ -15,14 +21,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+use axum::{routing::get, Router};
+use engines::mock_engine;
 use net::{http_get, loopback, vm_rss_kib};
+use openai_protocol::worker::RuntimeType;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
-    engine::{fingerprint, LoadRow, Role, WorkerId},
+    engine::{fingerprint, LoadRow, Role, WireModes, WorkerId},
     service::{
         controller::{
             Config, ConfigError, Controller, ElectionConfig, Error, LeasePlace, Listener, Scope,
@@ -37,14 +46,15 @@ use smg_policy_controller::{
         },
     },
     store::{
-        GatewayId, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, PickRecord,
-        WorkerFacts, WorkerStatus, WorkersStore,
+        GatewayId, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore,
+        Overload, PickRecord, WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::{Lease, LeaseId},
 };
 use tokio::{
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot},
+    task::JoinSet,
     time::timeout,
 };
 use tonic::{
@@ -1709,5 +1719,151 @@ async fn a_served_dispatch_feeds_a_registered_scorer_without_lifecycle_hooks() {
             stop.send(()).expect("the serve is listening for the stop");
         }
     );
+    served.expect("a clean stop");
+}
+
+/// A metrics body of the first gauge family: three requests running, five
+/// waiting, three quarters of the KV cache in use.
+const METRICS_TEXT: &str = "# HELP vllm:num_requests_running Requests running.\n\
+                            vllm:num_requests_running{model_name=\"m\"} 3\n\
+                            vllm:num_requests_waiting{model_name=\"m\"} 5\n\
+                            vllm:kv_cache_usage_perc{model_name=\"m\"} 0.75\n";
+
+/// An HTTP server answering `/metrics` with `body`, served until the
+/// returned sender drops. Returns its base URL.
+async fn metrics_server(
+    body: &'static str,
+) -> Result<(String, oneshot::Sender<()>), std::io::Error> {
+    let listener = TcpListener::bind(loopback()).await?;
+    let addr = listener.local_addr()?;
+    let app = Router::new().route("/metrics", get(move || async move { body }));
+    let (stop, stopped) = oneshot::channel::<()>();
+    let mut served = JoinSet::new();
+    served.spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = stopped.await;
+            })
+            .await;
+    });
+    served.detach_all();
+    Ok((format!("http://{addr}"), stop))
+}
+
+/// A ready row at `key` on `wires`, of the first gauge family's engine
+/// kind, with the queue bound `waiting` where the row states one.
+fn ready_row(
+    store: &MemoryStore,
+    key: &str,
+    wires: WireModes,
+    waiting: Option<u32>,
+) -> Option<WorkerId> {
+    let id = store
+        .upsert(WorkerFacts {
+            key: key.to_owned(),
+            engine: key.to_owned(),
+            incarnation: 1,
+            role: Role::Single,
+            wire_modes: wires,
+            engine_kind: RuntimeType::Vllm.as_str().to_owned(),
+            models: vec!["m".to_owned()],
+            dp_size: 1,
+            overload: Overload {
+                waiting_requests: waiting,
+                ..Overload::default()
+            },
+            ..WorkerFacts::default()
+        })
+        .id();
+    let revision = WorkersStore::get(store, id)?.revision;
+    store.set_status(id, WorkerStatus::Ready, revision);
+    Some(id)
+}
+
+/// The value of the controller's series `name` on a metrics `page`.
+fn series(page: &str, name: &str) -> Option<u64> {
+    let line = format!("smg_policy_controller_{name} ");
+    let value = page.lines().find_map(|read| read.strip_prefix(&line))?;
+    value.trim().parse().ok()
+}
+
+/// The serve runs the load monitor while the replica leads, and the admin
+/// page's load series read the monitor's counts. A worker on a connection
+/// is polled and a worker with a gauge page alone is read over HTTP. The
+/// monitor publishes a report of each. The second's states its page's
+/// gauges, over the queue bound its row states: one overload verdict moves,
+/// once. The store holds no load row: the serve writes none.
+#[tokio::test]
+async fn the_serve_runs_the_load_monitor_and_renders_its_counts() {
+    const PATIENCE: Duration = Duration::from_secs(30);
+
+    let (addr, _engine) = mock_engine(1).await.expect("a mock engine");
+    let (read, _server) = metrics_server(METRICS_TEXT)
+        .await
+        .expect("a metrics server");
+    let polled = format!("http://{addr}");
+    let controller = Controller::bind(Config {
+        load_poll_interval: Duration::from_secs(1),
+        ..config()
+    })
+    .await
+    .expect("the controller binds");
+    let admin = controller.addresses().admin;
+    let (store, loads) = (controller.store(), controller.loads());
+    let rows = [
+        ready_row(&store, &polled, WireModes::GRPC, None).expect("the polled row"),
+        ready_row(&store, &read, WireModes::HTTP, Some(4)).expect("the read row"),
+    ];
+    let (stop, stopped) = oneshot::channel::<()>();
+    let serve = controller.serve(async {
+        let _ = stopped.await;
+    });
+    let probe = async {
+        // Both reports are published, and the page has counted them.
+        let started = Instant::now();
+        let page = loop {
+            let (status, page) = http_get(admin, "/metrics").await.expect("the metrics page");
+            assert_eq!(status, 200);
+            let reported = {
+                let reports = loads.borrow();
+                reports.report(&polled).is_some() && reports.report(&read).is_some()
+            };
+            let counted = [
+                ("load_polls_total{mode=\"poll\"}", 1),
+                ("load_scrapes_total", 1),
+                ("load_rows_total", 2),
+                ("overload_flips_total", 1),
+            ]
+            .iter()
+            .all(|&(name, least)| series(&page, name).is_some_and(|count| count >= least));
+            if reported && counted {
+                break page;
+            }
+            assert!(
+                started.elapsed() < PATIENCE,
+                "the load monitor polls both workers from the serve: {page}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(
+            series(&page, "load_scrape_failures_total{reason=\"no_load\"}"),
+            Some(0),
+            "{page}"
+        );
+        // The read worker stays over its bound: its verdict moved once,
+        // however many reports followed.
+        assert_eq!(series(&page, "overload_flips_total"), Some(1), "{page}");
+        let gauges = loads.borrow().report(&read).and_then(|(report, _)| {
+            let rank = report.loads.first()?;
+            Some((rank.num_running_reqs, rank.num_waiting_reqs))
+        });
+        assert_eq!(gauges, Some((3, 5)), "the report states the page's gauges");
+        assert!(
+            rows.iter().all(|row| store.load(*row, 0).is_none()),
+            "the serve writes no load row"
+        );
+        stop.send(()).expect("the serve is listening for the stop");
+    };
+    let (served, ()) = tokio::join!(serve, probe);
     served.expect("a clean stop");
 }

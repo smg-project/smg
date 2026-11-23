@@ -2,11 +2,17 @@
 
 use std::{sync::Arc, time::Duration};
 
-use smg_worker::load::{monitor::WorkerMonitor, state::LoadReceiver};
+use smg_worker::{
+    load::{monitor::WorkerMonitor, state::LoadReceiver},
+    registry::WorkerRegistry,
+};
 use tokio::sync::watch;
 
 use super::WorkerObjects;
-use crate::worker_host::{load_monitor, Members};
+use crate::{
+    service::controller::metrics::LoadTotals,
+    worker_host::{load_monitor, Members},
+};
 
 /// The load reports of the replica's workers while it leads: the worker
 /// crate's own load monitor over the holder's registry, one for the
@@ -24,6 +30,9 @@ use crate::worker_host::{load_monitor, Members};
 /// snapshot on it, where its document reads reports and keeps none.
 pub(crate) struct LoadMonitor {
     monitor: Arc<WorkerMonitor<Members>>,
+    /// The holder's registry, which writes the monitor's overload verdicts
+    /// on the objects and counts each one that changes.
+    registry: Arc<WorkerRegistry<Members>>,
 }
 
 impl LoadMonitor {
@@ -31,8 +40,10 @@ impl LoadMonitor {
     /// while this replica leads. It is built stopped: [`Self::run`] starts
     /// it.
     pub(crate) fn new(workers: &WorkerObjects, every: Duration) -> Self {
+        let holder = workers.holder();
         Self {
-            monitor: load_monitor(&workers.holder(), every),
+            monitor: load_monitor(&holder, every),
+            registry: Arc::clone(holder.registry()),
         }
     }
 
@@ -41,6 +52,20 @@ impl LoadMonitor {
     /// lead, and publishes it empty at each lead's end.
     pub(crate) fn loads(&self) -> LoadReceiver {
         self.monitor.subscribe()
+    }
+
+    /// The reader of what the monitor's polls did and of how often an
+    /// overload verdict of a worker changed, for the metrics render: the
+    /// worker crate's own counts, read at each call. The counts are the
+    /// replica's: they stand through every stop and start of the monitor,
+    /// and a lead's end, which takes every verdict off, counts each one it
+    /// takes.
+    pub(crate) fn counts(&self) -> impl Fn() -> LoadTotals + Send + Sync + 'static {
+        let (monitor, registry) = (Arc::clone(&self.monitor), Arc::clone(&self.registry));
+        move || LoadTotals {
+            polls: monitor.poll_totals(),
+            overload_flips: registry.overload_edges(),
+        }
     }
 
     /// Runs the load monitor while this replica leads and stops it while it
@@ -279,6 +304,8 @@ mod tests {
         engine: Arc<Engine>,
         /// The monitor's channel, taken once ahead of the task's start.
         loads: LoadReceiver,
+        /// The reader of the monitor's counts, taken as the channel is.
+        counts: Box<dyn Fn() -> LoadTotals>,
         role: watch::Sender<Option<u64>>,
         stop: watch::Sender<bool>,
         task: JoinSet<()>,
@@ -297,6 +324,7 @@ mod tests {
             ));
             let monitor = LoadMonitor::new(&workers, EVERY);
             let loads = monitor.loads();
+            let counts = Box::new(monitor.counts());
             let (role, led) = watch::channel(None);
             let (stop, stopped) = watch::channel(false);
             let mut task = JoinSet::new();
@@ -306,6 +334,7 @@ mod tests {
                 workers,
                 engine,
                 loads,
+                counts,
                 role,
                 stop,
                 task,
@@ -361,6 +390,33 @@ mod tests {
             time::sleep(Duration::from_millis(1)).await;
         }
         holds()
+    }
+
+    /// The reader of the monitor's counts answers what the replica's polls
+    /// did and how often an overload verdict of a worker changed: nothing
+    /// before a lead, then the lead's poll, its row and the verdict it
+    /// wrote. The lead's end takes the verdict off, a flip more, and the
+    /// counts stand through it: they are the replica's, not one lead's.
+    #[tokio::test(start_paused = true)]
+    async fn the_counts_read_a_leads_polls_and_each_verdict_that_changed() {
+        let mut replica = Replica::new();
+        replica.register(facts(A));
+        assert_eq!((replica.counts)(), LoadTotals::default(), "no lead yet");
+
+        // Nine wait: over the eight of the program's default.
+        replica.engine.waiting.store(9, SeqCst);
+        replica.role.send_replace(Some(1));
+        assert!(comes(|| replica.overloaded(A)).await);
+        let led = (replica.counts)();
+        assert_eq!((led.polls.polls, led.polls.rows), (1, 1));
+        assert_eq!(led.overload_flips, 1, "the poll's verdict");
+
+        replica.role.send_replace(None);
+        assert!(comes(|| !replica.overloaded(A)).await);
+        let behind = (replica.counts)();
+        assert_eq!(behind.polls, led.polls, "the counts stand through the stop");
+        assert_eq!(behind.overload_flips, 2, "the lead's end took it off");
+        assert!(replica.stopped().await, "the task ends at the stop");
     }
 
     /// A replica that does not lead dials no engine for its load.
