@@ -3076,10 +3076,11 @@ mod tests {
     }
 
     /// A pooled connection whose transport closed is no hit at the connect:
-    /// it leaves the pool, and the caller connects anew.
+    /// it leaves the pool with its address's tools, and the caller connects
+    /// anew.
     #[tokio::test]
     async fn a_closed_pooled_connection_leaves_the_pool_at_the_next_connect() {
-        let orchestrator = McpOrchestrator::new_test();
+        let orchestrator = McpOrchestrator::new(McpConfig::default()).await.unwrap();
         // A dead local port: a new connect fails at once.
         let url = "http://127.0.0.1:1/mcp";
         let config = McpServerConfig {
@@ -3100,7 +3101,11 @@ mod tests {
             })
             .await
             .unwrap();
-        pool.set_listing(&key, &client, Listing::Listed, || {});
+        pool.set_listing(&key, &client, Listing::Listed, || {
+            orchestrator
+                .tool_inventory
+                .insert_entry(ToolEntry::from_server_tool(url, create_test_tool("find")));
+        });
 
         // The server's end closes.
         drop(server_io);
@@ -3117,6 +3122,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, McpError::ConnectionFailed(_)), "{err:?}");
         assert!(pool.is_empty());
+        // No other pooled connection holds the address: its tools left too.
+        assert!(orchestrator.tool_inventory.get_entry(url, "find").is_none());
     }
 
     /// A dynamic server's tool call uses the connection pooled under its own
