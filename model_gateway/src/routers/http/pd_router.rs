@@ -443,7 +443,9 @@ impl PDRouter {
                         *response.headers_mut() = response_headers;
                         response
                     }
-                    Err(BodyReadError::TooLarge) => worker_body_too_large(max_payload_size),
+                    Err(BodyReadError::TooLarge) => {
+                        worker_body_too_large(max_payload_size, worker.url())
+                    }
                     // The request's own timeout running out mid-body ends the
                     // request as it does on every other body read of these
                     // routers (504 under its code), never as the worker's
@@ -2313,7 +2315,7 @@ impl PDRouter {
                     metrics_labels::WORKER_PREFILL,
                     StatusCode::BAD_GATEWAY,
                 );
-                Err(worker_body_too_large(max_payload_size))
+                Err(worker_body_too_large(max_payload_size, prefill.url()))
             }
             Err(BodyReadError::Transport(e)) => Err(Self::prefill_read_failed(ledger, prefill, &e)),
         }
@@ -2401,7 +2403,7 @@ impl PDRouter {
                         response
                     }
                     Err(BodyReadError::TooLarge) => {
-                        let mut answer = worker_body_too_large(self.max_payload_size);
+                        let mut answer = worker_body_too_large(self.max_payload_size, decode.url());
                         answer.extensions_mut().insert(OwnFailure(PdSide::Decode));
                         answer
                     }
@@ -2656,7 +2658,7 @@ impl PDRouter {
         let decode_body = match response {
             Ok(decode_body) => decode_body,
             Err(BodyReadError::TooLarge) => {
-                let mut answer = worker_body_too_large(self.max_payload_size);
+                let mut answer = worker_body_too_large(self.max_payload_size, decode.url());
                 answer.extensions_mut().insert(OwnFailure(PdSide::Decode));
                 return answer;
             }
@@ -2741,14 +2743,12 @@ impl PDRouter {
         let prefill_body = if return_logprob {
             match read_body_capped(prefill_response.bytes_stream(), self.max_payload_size).await {
                 Ok(body) => Some(body),
-                // Over the limit as cut short: the merge is skipped.
+                // This body is the prefill side's part of the answer: over
+                // the limit it is the 502, as the handoff read answers it.
                 Err(BodyReadError::TooLarge) => {
-                    warn!(
-                        worker = Endpoint::redacted_str(prefill_url),
-                        limit = self.max_payload_size,
-                        "Prefill response body for logprobs exceeded the body limit"
-                    );
-                    None
+                    let mut answer = worker_body_too_large(self.max_payload_size, prefill_url);
+                    answer.extensions_mut().insert(OwnFailure(PdSide::Prefill));
+                    return Err(answer);
                 }
                 Err(BodyReadError::Transport(e)) => {
                     warn!(
@@ -3353,7 +3353,7 @@ impl RouterTrait for PDRouter {
             }
             Err(BodyReadError::TooLarge) => {
                 worker.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
-                worker_body_too_large(self.max_payload_size)
+                worker_body_too_large(self.max_payload_size, worker.url())
             }
             Err(BodyReadError::Transport(e)) if is_request_timeout(&e) => {
                 error!(
@@ -4942,31 +4942,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_decode_answer_above_the_payload_limit_reads_502() {
-        // The limit fits the request and the prefill answer, not the decode's.
-        let (prefill_url, _) = spawn_recording_stub("{}").await;
-        let (decode_url, _) = spawn_recording_stub(
-            r#"{"object":"response","output":"a decode answer above the payload limit"}"#,
-        )
-        .await;
-        let router = PDRouter {
-            max_payload_size: 64,
-            ..single_attempt_router()
-        };
-        register_pd_pair(&router, prefill_url, decode_url);
-        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+    async fn a_side_answer_above_the_payload_limit_reads_502() {
+        const OVER: &str =
+            r#"{"object":"response","output":"one side's answer above the payload limit"}"#;
+        // The limit fits one side's answer, not the other's. The prefill
+        // answer is part of the client's only when logprobs are asked.
+        let mut read = Vec::new();
+        for (prefill, decode, logprobs, stream) in [
+            ("{}", OVER, false, false),
+            (OVER, "{}", true, false),
+            (OVER, "{}", true, true),
+        ] {
+            let (prefill_url, _) = spawn_recording_stub(prefill).await;
+            let (decode_url, _) = spawn_recording_stub(decode).await;
+            let router = PDRouter {
+                max_payload_size: 64,
+                ..single_attempt_router()
+            };
+            register_pd_pair(&router, prefill_url, decode_url);
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
-        let responses: ResponsesRequest = serde_json::from_value(json!({
-            "model": "m",
-            "input": "hi",
-        }))
-        .expect("valid responses request");
-        let response = router
-            .route_responses(None, &tenant, responses, UNKNOWN_MODEL_ID)
-            .await;
+            let chat: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "logprobs": logprobs,
+                "stream": stream,
+            }))
+            .expect("valid chat request");
+            let response = router
+                .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+                .await;
+            read.push((response.status(), error_code(&response).map(str::to_owned)));
+        }
 
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(error_code(&response), Some("upstream_response_too_large"));
+        let refused = (
+            StatusCode::BAD_GATEWAY,
+            Some("upstream_response_too_large".to_owned()),
+        );
+        assert_eq!(read, vec![refused; 3]);
     }
 
     #[tokio::test]
