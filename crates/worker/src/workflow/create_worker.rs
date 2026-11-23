@@ -11,6 +11,7 @@ use super::{
     data::{DpInfo, WorkerKind, WorkerRegistrationWorkflowData},
     host::{require_host, WorkflowHost},
     runtimes::{zmq_runtime, zmq_runtime_names, DEFAULT_RUNTIME},
+    select::find_workers_by_url,
 };
 use crate::{
     connection::engine::EngineConnectionCache,
@@ -155,15 +156,48 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
         let health_endpoint = &settings.health_endpoint;
 
         let dp_ranks = dp_rank_expansion(context.data.dp_info.as_ref());
-        // Rank workers register at `{base}@{rank}`, which the base address
-        // checked above does not find.
-        if create_only
-            && dp_ranks
-                .iter()
-                .flatten()
-                .any(|(rank, _)| registry.get_by_url(&format!("{url}@{rank}")).is_some())
-        {
+        // The workers that stand for this address, read from the registry:
+        // the plain one, and the rank workers at `{base}@{rank}`, which the
+        // base address checked above does not find.
+        let standing = find_workers_by_url(registry, &url);
+        // A create is refused by any of them, whatever shape this
+        // registration read.
+        if create_only && !standing.is_empty() {
             return Err(already_exists(&config.url));
+        }
+        // Any other registration replaces every worker that stands, rank by
+        // rank, or changes nothing. One that read another shape would leave
+        // a worker beside its own, and the registry would hold the engine
+        // twice: a plain worker beside rank workers, where a server info
+        // failed to read on either registration, or a rank above the size
+        // read now.
+        let replaces = |standing: &Arc<dyn Worker>| {
+            dp_ranks
+                .iter()
+                .any(|dp| dp.map(|(rank, _)| rank) == standing.dp_rank())
+        };
+        if !standing.iter().all(replaces) {
+            let standing_ranks = standing
+                .iter()
+                .filter(|worker| worker.dp_rank().is_some())
+                .count();
+            let stands = match (standing.len() - standing_ranks, standing_ranks) {
+                (_, 0) => "one worker".to_string(),
+                (0, ranks) => format!("{ranks} rank workers"),
+                (_, ranks) => format!("one worker and {ranks} rank workers"),
+            };
+            let read = match dp_ranks.as_slice() {
+                [None] => "no data-parallel size".to_string(),
+                ranks => format!("{} data-parallel ranks", ranks.len()),
+            };
+            return Err(WorkflowError::StepFailed {
+                step_id: StepId::new("create_worker"),
+                message: format!(
+                    "Worker {} stands as {stands} and this registration read {read}; nothing is \
+                     changed (remove what stands at the address to register it again)",
+                    Endpoint::redacted_str(&config.url)
+                ),
+            });
         }
 
         // Keep the spec's other fields. Set the resolved address, model,

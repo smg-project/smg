@@ -846,6 +846,124 @@ async fn create_only_refuses_a_group_whose_rank_workers_are_registered() {
     assert!(second.data.actual_workers.is_none());
 }
 
+/// A registration that read no shape, where the address's rank workers
+/// stand: a server info that failed to read leaves none, and the rank
+/// workers are at `{base}@{rank}`, where the base address finds no worker.
+/// A create is refused as a duplicate and any other registration by name.
+/// Neither builds a plain worker beside the ranks.
+#[tokio::test]
+async fn a_registration_with_no_shape_builds_no_plain_worker_beside_standing_ranks() {
+    let base = "http://worker:8000";
+    let host = ordinary_host();
+    for rank in 0..2 {
+        let worker = BasicWorkerBuilder::new(base)
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("m"))
+            .dp_config(rank, 2)
+            .build();
+        host.worker_registry().register(Arc::new(worker)).unwrap();
+    }
+    let shapeless = |mode: WorkerRegistrationMode| {
+        let mut spec = WorkerSpec::new(base);
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+        let mut data = local_data(spec, ConnectionMode::Http, Arc::clone(&host));
+        data.registration_mode = mode;
+        WorkflowContext::new(WorkflowInstanceId::new(), data)
+    };
+
+    let mut create = shapeless(WorkerRegistrationMode::CreateOnly);
+    let error = CreateLocalWorkerStep
+        .execute(&mut create)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Step failed: create_worker - Worker http://worker:8000 already exists"
+    );
+    assert!(create.data.actual_workers.is_none());
+
+    let mut upsert = shapeless(WorkerRegistrationMode::Upsert);
+    let error = CreateLocalWorkerStep
+        .execute(&mut upsert)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("stands as 2 rank workers and this registration read no data-parallel size"),
+        "{error}"
+    );
+    assert!(upsert.data.actual_workers.is_none());
+}
+
+/// A registration over what stands replaces every worker of the address or
+/// changes nothing. One that reads two ranks where a plain worker stands
+/// (its first server info failed to read) is refused by name, and so is one
+/// that reads two ranks where four stand: each would leave a worker beside
+/// its own. One that reads four where two stand replaces both and adds two.
+#[tokio::test]
+async fn a_registration_over_what_stands_leaves_no_worker_beside_its_own() {
+    let base = "http://worker:8000";
+    let standing_ranks = |size: usize| {
+        let host = ordinary_host();
+        for rank in 0..size {
+            let worker = BasicWorkerBuilder::new(base)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("m"))
+                .dp_config(rank, size)
+                .build();
+            host.worker_registry().register(Arc::new(worker)).unwrap();
+        }
+        host
+    };
+    let plain = ordinary_host();
+    let worker = BasicWorkerBuilder::new(base)
+        .worker_type(WorkerType::Regular)
+        .model(ModelCard::new("m"))
+        .build();
+    plain.worker_registry().register(Arc::new(worker)).unwrap();
+
+    for (host, read, said) in [
+        (
+            plain,
+            2,
+            Some("stands as one worker and this registration read 2 data-parallel ranks"),
+        ),
+        (
+            standing_ranks(4),
+            2,
+            Some("stands as 4 rank workers and this registration read 2 data-parallel ranks"),
+        ),
+        (standing_ranks(2), 4, None),
+    ] {
+        let mut spec = WorkerSpec::new(base);
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+        let mut data = local_data(spec, ConnectionMode::Http, host);
+        data.dp_info = Some(DpInfo {
+            dp_size: read,
+            model_id: "m".to_string(),
+        });
+        data.registration_mode = WorkerRegistrationMode::Upsert;
+        let mut upsert = WorkflowContext::new(WorkflowInstanceId::new(), data);
+
+        let result = CreateLocalWorkerStep.execute(&mut upsert).await;
+
+        let built = upsert.data.actual_workers.as_ref().map(Vec::len);
+        match said {
+            Some(said) => {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(said), "{error}");
+                assert!(error.contains("nothing is changed"), "{error}");
+                assert_eq!(built, None, "{said}");
+            }
+            None => {
+                assert_eq!(result.unwrap(), StepResult::Success);
+                assert_eq!(built, Some(read), "a wider engine replaces what stands");
+            }
+        }
+    }
+}
+
 #[test]
 fn model_alias_map_does_not_duplicate_user_provided_alias() {
     // POST /workers can already carry aliases in the spec; the router map
