@@ -601,10 +601,16 @@ impl Glm53FlashProcessor {
             }
         };
         let params = Params::from_config(config, video)?;
+        let pixels = Pixels::from_config(config, params)?;
+        // With resizing on, the smallest canvas is one aligned patch: a
+        // budget under it takes no input, whatever its size.
+        if pixels.do_resize && params.max_pixels < params.factor * params.factor * params.temporal {
+            return Err(shape("GLM max_pixels is smaller than one aligned patch"));
+        }
         Ok(Self {
             modality,
             params,
-            pixels: Pixels::from_config(config, params)?,
+            pixels,
         })
     }
 
@@ -1358,6 +1364,9 @@ mod tests {
         let params = Params::from_config(&tiny, false).unwrap();
         let err = params.geometry(1, 100, 100).unwrap_err();
         assert!(err.to_string().contains("aligned patch"), "{err}");
+        // With resizing on, such a budget builds no processor.
+        assert!(Glm53FlashProcessor::from_config_for(&tiny, Modality::Image)
+            .is_err_and(|err| err.to_string().contains("aligned patch")));
 
         // do_resize=false hands the canvas alignment burden to the caller.
         let mut no_resize = config(MAX_IMAGE_TOKENS);
