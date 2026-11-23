@@ -281,10 +281,14 @@ impl Picker for RoundRobin {
     /// finds: its model, the request's phase, its membership epoch, the
     /// list the host names and its size.
     ///
-    /// A retry takes no turn of the pool. The workers it may take are the
-    /// ones it has not tried, a part of the list, and the turn is a request's
-    /// whose workers are the list whole: the whole pass turns the rotation
-    /// of the workers the retry is left.
+    /// A retry takes no turn of the pool: a request whose attempt is not its
+    /// first ([`RequestFacts::attempt`]), or that names a worker it tried
+    /// ([`RequestFacts::tried`]). The workers it may take are the ones it
+    /// has not tried, and the turn is a first attempt's, whose workers are
+    /// the list whole: the whole pass turns the rotation of the workers the
+    /// retry is left. Either sign says so: a retry whose tried worker has
+    /// left the list names none and states its number alone, and a host
+    /// that states no number names the worker.
     fn draw_first(
         &self,
         facts: &RequestFacts<'_>,
@@ -295,7 +299,7 @@ impl Picker for RoundRobin {
         _: &mut Draw,
     ) -> bool {
         let rows = candidates.len();
-        if rows == 0 || !facts.tried.is_empty() {
+        if rows == 0 || facts.attempt != 0 || !facts.tried.is_empty() {
             return false;
         }
         let turn = match pool.word {

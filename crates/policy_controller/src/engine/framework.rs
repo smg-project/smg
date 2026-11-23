@@ -487,12 +487,14 @@ impl Shortlist {
 /// counts none: its own draws, twice the sample, bound what it asks.
 pub const DRAW_BOUND: u32 = 8;
 
-/// The smallest pool at which a decision draws first, set by run. A draw
-/// pays more than the whole pass for each row it asks about, so a small
-/// pool is read whole. With every row ready the draw reads faster than the
-/// pass from eight rows on, and with one row in seventeen not ready from
-/// sixteen, for every built-in that draws: sixteen is the first size the
-/// `draw` bench reads at which it wins on both. Rows refused do not move
+/// The smallest pool at which a decision draws first for speed, set by
+/// run. A draw pays more than the whole pass for each row it asks about, so
+/// a small pool is read whole where the two place a request by one rule
+/// (the last paragraph names the picker whose draw is asked under it). With
+/// every row ready the draw reads faster than the pass from eight rows on,
+/// and with one row in seventeen not ready from sixteen, for every built-in
+/// that draws: sixteen is the first size the `draw` bench reads at which it
+/// wins on both. Rows refused do not move
 /// this size, and under twice this size they can cost more than the draw
 /// gains: with every second row refused, a pool under 32 rows can pay more
 /// than its whole pass: under a picker that draws two rows, and under
@@ -500,11 +502,10 @@ pub const DRAW_BOUND: u32 = 8;
 /// cells `power_of_two/half/16` and `power_of_two/half/32` hold that shape
 /// and where it ends.
 ///
-/// The size is a matter of speed where a draw and the whole pass place a
-/// request by one rule. A picker that takes turns ([`Picker::takes_turns`])
-/// is asked to draw under it too, over a pool that lends its own word
+/// A picker that takes turns ([`Picker::takes_turns`]) is asked to draw
+/// under this size too, over a pool that lends its own word
 /// ([`PoolFacts::word`]): its draw takes the list's own turn, which the
-/// whole pass does not.
+/// whole pass does not, so there the size is no matter of speed.
 pub const DRAW_FROM: usize = 16;
 
 /// The pool size from which a profile whose leading stages are ranks is
@@ -5616,7 +5617,9 @@ impl Engine {
     /// to that rule is placed by its assignment. Every other request of a
     /// profile whose picker draws first ([`Picker::draw_first`]) is decided
     /// by the rows it draws where the pool is large enough, and by the whole
-    /// pass under that size or when the draw keeps nobody. A picker the rows
+    /// pass under that size or when the draw keeps nobody. A picker that
+    /// takes turns ([`Picker::takes_turns`]) draws under that size too, over
+    /// a pool that lends its own word ([`PoolFacts::word`]). A picker the rows
     /// named join ([`Picker::joined_by_named`]) draws for a request that
     /// names rows and for no other. A pass the overload veto leaves nobody is
     /// put to the binding's all-vetoed rule: the request goes to the

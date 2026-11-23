@@ -1388,16 +1388,20 @@ pub(crate) mod tests {
     /// `:1277`), and its policy takes the list's turn for a list named
     /// whole alone (`model_gateway/src/policies/round_robin.rs:145`), a set's
     /// rotation for any other (`:158-167`).
+    ///
+    /// A request that names a worker it tried is a retry whatever number it
+    /// states: a host that states none is answered as one that does.
     #[test]
     fn a_retry_turns_the_untried_workers_rotation_and_no_turn_of_the_list() {
-        for workers in [4, DRAW_FROM, 64] {
+        let sizes = [4, DRAW_FROM, 64];
+        for (workers, attempt) in sizes.into_iter().flat_map(|n| [(n, 1), (n, 0)]) {
             let engine = preset("round_robin");
             let list = pool(workers);
             let members = PublishedList::new(Arc::clone(&list));
             let tried = [worker_id(list[0].as_ref())];
             let mut retry = request();
             retry.facts.tried = &tried;
-            retry.facts.attempt = 1;
+            retry.facts.attempt = attempt;
             let (first, retry) = (
                 Asks::of(request(), Some(&members)),
                 Asks::of(retry, Some(&members)),
@@ -1416,10 +1420,11 @@ pub(crate) mod tests {
             let in_turn: Vec<usize> = (0..requests)
                 .map(|turn| (firsts[0] + turn) % workers)
                 .collect();
-            assert_eq!(firsts, in_turn, "{workers} workers: the first attempts");
+            let said = format!("{workers} workers, a retry that states attempt {attempt}");
+            assert_eq!(firsts, in_turn, "{said}: the first attempts");
             let mut shares = vec![workers; workers];
             shares[0] = 0;
-            assert_eq!(retries, shares, "{workers} workers: the retries");
+            assert_eq!(retries, shares, "{said}: the retries");
         }
     }
 
