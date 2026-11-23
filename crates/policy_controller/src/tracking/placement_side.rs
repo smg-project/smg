@@ -300,6 +300,17 @@ impl Placement<'static> {
             .and_then(|held| held.door())
             .is_some_and(|engine| engine.loaded().takes(EventKind::Completed));
         if !pair {
+            if !told {
+                // One expression, so that a build can write the side where
+                // it is returned. Behind the two arms of `new` it copies
+                // the placement at each step on the way.
+                let whole = PlacementSide {
+                    side: Side::Single,
+                    profile,
+                    kept: Kept::Own(Of::Whole(self)),
+                };
+                return (whole, None);
+            }
             let whole = PlacementSide::new(Side::Single, profile, Of::Whole(self), told);
             return (whole, None);
         }
@@ -318,6 +329,10 @@ impl Placement<'static> {
 impl PlacementSide {
     /// `side` of the placement `of`, shared with the handles on its end
     /// where a report through one is `told` to a stage.
+    ///
+    /// A single request's side kept by itself is built in
+    /// [`Placement::sides`] directly, so its placement is not moved
+    /// through here.
     fn new(side: Side, profile: &'static str, of: Of, told: bool) -> Self {
         let kept = if told {
             Kept::Told(Arc::new(Mutex::new(Told {

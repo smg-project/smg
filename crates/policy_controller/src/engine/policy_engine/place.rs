@@ -1348,17 +1348,25 @@ fn single<'a>(
                     Some(worker) if sendable => Ok((Arc::clone(worker), None)),
                     _ => Err([Some(target.id), None]),
                 }
-            })?;
-            let Some(mut placement) = taken else {
-                // The walk gave the decision up: the rule is asked of the
-                // list while the call holds none.
-                if refused.get() {
-                    hold_to_rule(request, list, call)?;
+            });
+            // One match takes the placement out of the walk's answer. A
+            // `?` ahead of a `let else` takes it out in two steps, and a
+            // build copies it at each.
+            match taken {
+                Ok(Some(mut placement)) => {
+                    placement.routing_key = key;
+                    Ok(placement)
                 }
-                return call.again(|call| single(engine, request, list, call));
-            };
-            placement.routing_key = key;
-            Ok(placement)
+                Ok(None) => {
+                    // The walk gave the decision up: the rule is asked of
+                    // the list while the call holds none.
+                    if refused.get() {
+                        hold_to_rule(request, list, call)?;
+                    }
+                    call.again(|call| single(engine, request, list, call))
+                }
+                Err(unplaced) => Err(unplaced),
+            }
         }
     }
 }
