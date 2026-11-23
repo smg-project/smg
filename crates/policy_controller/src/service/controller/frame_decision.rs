@@ -240,3 +240,6 @@ pub(crate) fn issue(
     front.count_shadow(said);
     Ok(Some(lease))
 }
+
+#[cfg(test)]
+mod tests;
