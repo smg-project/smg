@@ -76,9 +76,6 @@
 //! and for every object where a collector starts. A host that runs the
 //! collector calls no projection of its own.
 //!
-//! [`LoadAdapter`] writes load records and poll answers to the store. The
-//! store decides when the collector polls and keeps the overload verdict.
-//!
 //! [`load_monitor`] is the worker crate's own load monitor over the
 //! holder's registry, with no adapter under it. It publishes the workers'
 //! reports as its snapshot, which an engine that decides over its host's
@@ -141,7 +138,7 @@ pub use health::HealthAdapter;
 pub use kv::{KvAdapter, KvHost, SkipReason, SkippedSubscriptions};
 pub use kv_feed::KvFeed;
 pub use lead::{Lead, SoleLead};
-pub use loads::{load_monitor, LoadAdapter};
+pub use loads::load_monitor;
 pub use members::Members;
 #[cfg(feature = "in-process")]
 pub use members::OpenAdmission;

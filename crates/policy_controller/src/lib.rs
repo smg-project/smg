@@ -81,8 +81,8 @@
 //! - Behind the `ingest` feature, the ingestion drivers (`ingest`): the load
 //!   path (the `GetLoads` poll per engine under the store's poll
 //!   arbitration, the metrics scrape of an engine without a servicer) and
-//!   the metrics parser. The load driver and the worker host's load adapter
-//!   share the `load_report` conversion.
+//!   the metrics parser. The load driver and a worker list's records share
+//!   the `load_report` conversion.
 //!
 //! - Behind the `operator` feature, `document::operator::DocumentManager`
 //!   applies a host's start document and serves its status, document and dry

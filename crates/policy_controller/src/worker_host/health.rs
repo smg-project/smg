@@ -209,7 +209,7 @@ mod tests {
     use super::*;
     use crate::{
         store::{
-            membership::life, HealthPolicy, MemoryStore, WorkerFacts, WorkerPatch,
+            membership::life, HealthPolicy, MemoryStore, StoreSnapshot, WorkerFacts, WorkerPatch,
             WorkerStatus as RowStatus, WorkersStore,
         },
         worker_host::{object, Members, SoleLead},
@@ -265,6 +265,18 @@ mod tests {
         fn object(&self) -> Arc<dyn Worker> {
             let registry = self.objects.registry();
             registry.get(&self.id).expect("a worker")
+        }
+
+        /// Whether the store holds the leader's doubt of the worker: the
+        /// stalled bit of its record, as the store's world holds it.
+        fn doubted(&self) -> bool {
+            // A registration is in force at its window's publication: the
+            // case asks for one.
+            self.store.publish_now();
+            let id = self.store.by_key(URL).expect("a stored worker").id;
+            let stalled =
+                |world: &StoreSnapshot| world.first_row_of(id).map(|row| row.health.stalled);
+            self.store.deciding(stalled).expect("the worker's record")
         }
 
         #[track_caller]
@@ -383,6 +395,28 @@ mod tests {
             (replica.id, ObjectStatus::Pending, ObjectStatus::Ready)
         );
         assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn a_projection_writes_the_objects_veto_onto_its_row_and_clears_it() {
+        let replica = Replica::new(1, true).expect("a laid worker");
+        let adapter = replica.adapter();
+        let stood = HealthWrite::Stood(RowStatus::Pending);
+        // No veto stands on the object: its projection writes no doubt.
+        assert_eq!(adapter.project(&replica.id), stood);
+        assert!(!replica.doubted());
+        // The veto alone moves no record. The projection writes it, and
+        // moves no status of the record or of the object.
+        assert!(replica.object().set_stall(Some(StallReason::Unreachable)));
+        assert!(!replica.doubted());
+        assert_eq!(adapter.project(&replica.id), stood);
+        assert!(replica.doubted());
+        replica.assert_statuses(Some(RowStatus::Pending), ObjectStatus::Pending);
+        // The object is read at the write: the veto it dropped is gone
+        // from the record at the next projection.
+        assert!(replica.object().set_stall(None));
+        assert_eq!(adapter.project(&replica.id), stood);
+        assert!(!replica.doubted());
     }
 
     #[test]
