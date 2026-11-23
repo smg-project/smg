@@ -31,7 +31,7 @@ use smg_policy_controller::{
         Target, WeightedScorer, WorkerId,
     },
     plugins::{
-        shared::{BreakerSpec, Failure, OpenDecisions, Reveal},
+        shared::{BreakerSpec, Failure, FrameBudget, OpenDecisions, Reveal},
         wasm::{
             Abi, LoadError, Plugin, PluginBinding, PluginSpec, Runtime, WasmFilter, WasmPicker,
             WasmScorer, World,
@@ -1038,6 +1038,56 @@ fn an_exhausted_budget_is_a_fuel_fault_and_the_scorer_falls_back_in_a_try(made: 
     the_close_rebuilt(CASE, &plugin, held, made)
 }
 
+/// A guest that states no budget takes the default frame, under a request
+/// that states none too: a stage is shown the widest budget there, and the
+/// guest's spin is cut at the default frame's fuel, not at the request's.
+/// The fallback scorer decides.
+#[test]
+fn a_guest_with_no_budget_is_cut_at_the_default_frame_under_a_request_with_none() {
+    tried(a_guest_with_no_budget_is_cut_at_the_default_frame_in_a_try);
+}
+
+/// One try of the case above, told its number: whether it stood.
+fn a_guest_with_no_budget_is_cut_at_the_default_frame_in_a_try(made: u32) -> bool {
+    const CASE: &str = "a guest with no budget";
+    let runtime = runtime();
+    // The slow calibration, as for an exhausted budget: the fuel ends the
+    // spin long before the frame's bound on the clock.
+    let mut unset = spec("unbudgeted", guest::record_guest(), mode::SPIN_IN_SCORE);
+    unset.fuel_per_micro = SLOW_CALIBRATION;
+    unset.budget_micros = 0;
+    let plugin = loaded(&runtime, unset);
+    let engine = single_engine(plugin_profile(
+        &plugin,
+        None,
+        Some(Box::new(LeastRequests)),
+        None,
+    ));
+    let candidates = pool(4);
+    // What a stage is shown for a request that states no budget.
+    let widest = RequestFacts {
+        budget_micros: u32::MAX,
+        ..facts(1)
+    };
+    let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+    let decision = decide_with(&engine, &candidates, &widest);
+    let held = off_cpu_since(wall, cpu);
+    assert_eq!(
+        pick_ids(&decision).first().copied(),
+        Some(103),
+        "the fallback scorer decided"
+    );
+    let stats = plugin.stats();
+    assert_eq!(stats.fuel_exhausted, 1);
+    assert_eq!(stats.traps, 0);
+    let frame = u64::from(FrameBudget::DEFAULT_MICROS) * SLOW_CALIBRATION;
+    assert!(
+        (frame..2 * frame).contains(&stats.fuel_used),
+        "the spin used the default frame's fuel and no more: {stats:?}"
+    );
+    the_close_rebuilt(CASE, &plugin, held, made)
+}
+
 #[test]
 fn an_invalid_answer_is_a_fault_of_the_plugin() {
     let runtime = runtime();
@@ -1877,8 +1927,9 @@ fn the_decisions_budget_bounds_the_sum_of_its_calls() {
     tried(|made| {
         let runtime = runtime();
         let mut burner = spec("burner", guest::record_guest(), mode::BURN_IN_STAGES);
-        // The frame is the request's: each call may take all of what is left.
-        burner.budget_micros = 0;
+        // A frame wider than any budget below: each call may take all of
+        // what is left of the request's.
+        burner.budget_micros = u32::MAX;
         // The budgets below are burns of fuel: at the slow calibration a call
         // held off its core is still charged its fuel.
         burner.fuel_per_micro = SLOW_CALIBRATION;
@@ -2212,7 +2263,9 @@ fn a_bulk_memory_loop_meets_the_frames_bound_on_the_clock_in_a_try(made: u32) ->
 fn a_pair_shares_one_decision_budget() {
     let runtime = runtime();
     let mut burner = spec("pair-burner", guest::record_guest(), mode::BURN_IN_STAGES);
-    burner.budget_micros = 0;
+    // A frame wider than any budget below: the request's alone bounds a
+    // call.
+    burner.budget_micros = u32::MAX;
     // Budgets in burns of fuel, at the slow calibration.
     burner.fuel_per_micro = SLOW_CALIBRATION;
     let fuel_per_micro = burner.fuel_per_micro;
@@ -2781,7 +2834,9 @@ fn the_first_open_seeds_the_budget_and_later_opens_draw_on_it_in_a_try(made: u32
         guest::record_guest(),
         mode::BURN_IN_CONSTRUCTOR,
     );
-    spec.budget_micros = 0;
+    // A frame wider than any budget below: the request's alone bounds a
+    // call.
+    spec.budget_micros = u32::MAX;
     // Budgets in burns of fuel, at the slow calibration.
     spec.fuel_per_micro = SLOW_CALIBRATION;
     let fuel_per_micro = spec.fuel_per_micro;
@@ -7587,9 +7642,9 @@ fn a_destructors_bound_is_its_own_not_the_decisions_frame() {
     tried(|made| {
         let (runtime, born) = runtime_and_the_threads_born_with_it();
         let mut filler = spec("fill-dtor", guest::record_guest(), mode::FILL_IN_DESTRUCTOR);
-        // The frame is the request's 100 ms, and the calibration makes the
-        // destructor's fuel frame outlast it: only its bound on the clock
-        // ends the fill.
+        // The frame is 100 ms, the default of a plugin that states none and
+        // the request's too, and the calibration makes the destructor's
+        // fuel frame outlast it: only its bound on the clock ends the fill.
         filler.budget_micros = 0;
         filler.fuel_per_micro = 100_000_000;
         let plugin = loaded(&runtime, filler);
