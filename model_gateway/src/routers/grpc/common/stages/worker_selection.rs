@@ -2773,6 +2773,7 @@ impl SelectionBench {
 #[cfg(test)]
 mod tests {
     mod lora;
+    mod rank;
 
     use std::{
         collections::HashMap,
