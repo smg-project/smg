@@ -48,6 +48,7 @@
 use std::{
     cell::RefCell,
     fmt,
+    panic::{catch_unwind, AssertUnwindSafe},
     sync::{atomic::Ordering, Arc},
     time::Instant,
 };
@@ -60,7 +61,7 @@ use crate::{
     engine::{
         decision::{shed, Decision, ShedReason, Target, SUBSET_HINT, WIRES},
         decision_engine::{DecideOutcome, HeldDecision, Leased, Request},
-        framework::{Engine, PairPools, Scratch},
+        framework::{release, Engine, PairPools, Scratch},
         lease_events,
         pair_classes::PartnerClasses,
         records::{DecisionClock, Live},
@@ -413,17 +414,54 @@ pub(super) fn issue_decode(
     prefill: &Lease,
     now_micros: u64,
 ) -> Option<Lease> {
-    let first = decision.pick()?.targets.first()?;
-    let decode = Lease {
-        tokens: facts.prompt_tokens,
-        ..lease_events::decode_as_issued(prefill, first, decode_session(facts))?
-    };
+    let decode = decode_side(facts, decision, prefill)?;
     let issued = Lease {
         issued_micros: now_micros,
         ..decode
     };
     engine.on_decision_issued(&issued, decision);
     Some(decode)
+}
+
+/// The decode side's lease for a pick of the decode decided again, as
+/// [`issue_decode`] hands it back, and no word to a stage: under the id and
+/// the generation of `prefill`, with the size the call states.
+///
+/// `None` for a decision that picks no pair.
+fn decode_side(facts: &RequestFacts<'_>, decision: &Decision, prefill: &Lease) -> Option<Lease> {
+    let first = decision.pick()?.targets.first()?;
+    Some(Lease {
+        tokens: facts.prompt_tokens,
+        ..lease_events::decode_as_issued(prefill, first, decode_session(facts))?
+    })
+}
+
+/// [`issue_decode`] for the decode call of `own`, dated at the call, under
+/// a catch of its own. A stage that panics at the side's issue is held and
+/// counted ([`PolicyEngine::unheard`]), as at a later word of the lease, and
+/// the stages behind it do not hear the issue. The pick stands: the call
+/// answers the side's lease all the same, so its guard holds the side as
+/// issued and tells its dispatch and its end. A stage that heard the issue
+/// then hears the side end.
+///
+/// A panic in the decision itself is not held here: it costs the call its
+/// decision, as a first decision's does.
+fn issue_decode_caught(
+    own: &PolicyEngine,
+    facts: &RequestFacts<'_>,
+    decision: &Decision,
+    prefill: &Lease,
+) -> Option<Lease> {
+    let engine = own.spec.engine();
+    let told = || issue_decode(engine, facts, decision, prefill, facts.now_micros);
+    match catch_unwind(AssertUnwindSafe(told)) {
+        Ok(decode) => decode,
+        Err(payload) => {
+            release(payload);
+            own.unheard.fetch_add(1, Ordering::Relaxed);
+            decode_side(facts, decision, prefill)
+        }
+    }
 }
 
 /// One decision of a pair by `own` over the `lists` its host handed, and
@@ -502,7 +540,7 @@ pub(super) fn issued(
             let id = LeaseId(own.leases.0.fetch_add(1, Ordering::Relaxed) + 1);
             issue(engine, facts, &decision, id, later)
         }),
-        Some(held) => issue_decode(engine, facts, &decision, held.lease, facts.now_micros)
+        Some(held) => issue_decode_caught(own, facts, &decision, held.lease)
             .map(|decode| (decode, decode.session)),
     };
     DecideOutcome {
@@ -2507,6 +2545,105 @@ mod tests {
                 ("completed", Side::Decode, decode, at),
             ]
         );
+    }
+
+    /// A picker that picks as [`Best`] and panics at a decode side's issue.
+    #[derive(Debug)]
+    struct StopsAtDecode;
+
+    impl Lifecycle for StopsAtDecode {
+        fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
+            assert!(lease.side != Side::Decode, "this stage panics there");
+        }
+    }
+
+    impl Picker for StopsAtDecode {
+        fn name(&self) -> &'static str {
+            "stops-at-decode"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            rows: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Best.pick(facts, rows, kept, scores, band, out);
+        }
+    }
+
+    /// [`hearing`] with a prefill side that picks through [`StopsAtDecode`].
+    /// The decode profile's stage, which keeps what it hears, is told each
+    /// word ahead of it.
+    fn stopping() -> (AppliedSpec, Arc<Mutex<Vec<Word>>>) {
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&heard);
+        let mut catalog = StageRegistry::builtin();
+        catalog
+            .picker("hears", move || Box::new(Hears(Arc::clone(&kept))))
+            .expect("a free picker name");
+        catalog
+            .picker("stops-at-decode", || Box::new(StopsAtDecode))
+            .expect("a free picker name");
+        let mut document =
+            PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets");
+        document.generation = 3;
+        for (side, pick) in [("decode", "hears"), ("prefill", "stops-at-decode")] {
+            let profile = document.profiles.get_mut(side);
+            profile.expect("the side's profile").pick = pick.into();
+        }
+        let digest = document.digest().expect("a digest");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
+        (spec.expect("a valid document"), heard)
+    }
+
+    /// A stage that panics at the issue of a decode decided again is held
+    /// and counted with the words a stage did not hear. The call answers
+    /// its pick and its guard holds the side as issued, so the stage that
+    /// heard the issue ahead of the panic hears the side's dispatch and its
+    /// end. Before, the call answered a fault, its guard kept the first
+    /// decode as chosen, and no word ended the issue that stage had heard.
+    ///
+    /// The gateway's own routing picks a pair's decode with its prefill and
+    /// has no stage that hears an issue
+    /// (`model_gateway/src/routers/common/placement.rs:1227`). The engine
+    /// over stored records holds such a panic and hands back the pick its
+    /// file holds (`engine/store_backed_engine.rs`, `issue_decode`).
+    #[test]
+    fn a_stage_that_panics_at_a_decode_calls_issue_costs_the_call_nothing() {
+        let host = Host::under(stopping(), 1, 2);
+        let classes = every(1, 2);
+        let (asks, now) = (host.asks(&classes, true), Instant::now());
+        let mut guard = DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &asks, now)
+            .expect("a decision");
+        assert!(guard.decode_chosen());
+        let first = target_at(guard.decision(), 0);
+        let at = guard.lease().expect("a lease").lease.issued_micros;
+        guard.dispatched(now);
+        let call = now + Duration::from_millis(1);
+        let again = *guard.decide_decode_under(&asks, call).expect("a decision");
+        let decode = target_at(&again, 0).pair.expect("a pair").decode_id;
+        assert!(!guard.decode_chosen(), "the call's pick issued the side");
+        assert_eq!((host.engine.faults(), host.engine.unheard()), (0, 1));
+        guard.dispatched_decode(call);
+        guard.completed(&outcome(Side::Prefill, first.id), call);
+        guard.completed(&outcome(Side::Decode, decode), call);
+        drop(guard);
+        assert_eq!(
+            host.words(),
+            [
+                ("issued", Side::Prefill, first.id, at),
+                ("dispatched", Side::Prefill, first.id, at),
+                ("issued", Side::Decode, decode, at + 1_000),
+                ("dispatched", Side::Decode, decode, at),
+                ("completed", Side::Prefill, first.id, at),
+                ("completed", Side::Decode, decode, at),
+            ]
+        );
+        assert_eq!((host.engine.faults(), host.engine.unheard()), (0, 1));
     }
 
     /// The prompt size each word of a pair states to a stage, through a

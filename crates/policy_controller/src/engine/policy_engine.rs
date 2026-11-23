@@ -423,6 +423,10 @@ impl PolicyEngine {
     /// stands as said: the request, the registration or the removal it is
     /// of goes on, and the stages after the one that panicked did not hear
     /// it.
+    ///
+    /// The issue of a decode at its own call is such a word too: the call
+    /// answers its pick all the same
+    /// ([`DecisionEngine::decide_decode_under`]).
     #[must_use]
     pub fn unheard(&self) -> u64 {
         self.unheard.load(Ordering::Relaxed)
