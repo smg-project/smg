@@ -5643,23 +5643,183 @@ pub(crate) mod tests {
         assert_eq!(verdict(&bed, &fourth), SessionVerdict::Pinned);
     }
 
-    /// The service counts a key's requests under a rule with an in-flight
-    /// cap, and under no other: the lease of a keyed request whose rule
-    /// has none counts for no key, and no worker object counts a request
-    /// of it. The stock rule's cap is disabled.
+    /// The keys the bed's worker objects count, over all of them: a key
+    /// counts once on each worker that carries a request of it.
+    fn keys_counted(bed: &Bed) -> usize {
+        let objects = bed.reads.objects.registry().get_all();
+        let keys = objects.iter().map(|object| object.routing_key_load());
+        keys.sum()
+    }
+
+    /// Writes `status` into the record of the bed's worker `worker`.
+    fn set_status(bed: &Bed, worker: WorkerId, status: WorkerStatus) {
+        let row = WorkersStore::get(&*bed.store, worker).expect("the row");
+        let moved = bed.store.set_status(worker, status, row.revision);
+        moved.expect("the row stands");
+    }
+
+    /// The service counts a keyed single request for its key under any
+    /// sessions rule and under none: its lease counts on the worker object
+    /// it books, as a gateway's load guard counts every request that
+    /// carries a key (`crates/worker/src/load/inflight.rs:196-199` at main
+    /// `5e609dc2d`). The stock rule's cap is disabled, and the `random`
+    /// preset has no sessions rule. A request with no key counts for none.
     #[tokio::test]
-    async fn the_service_counts_a_key_under_a_rule_with_a_cap_alone() {
-        for (cap, counted) in [(None, 0), (Some(2), 1)] {
+    async fn the_service_counts_a_keyed_request_under_any_rule_and_under_none() {
+        let capped = {
             let mut document = PolicySpec::preset("manual").expect("a preset of this build");
-            if let Some(cap) = cap {
-                let rule = document.bindings[0].sessions.as_mut();
-                rule.expect("the preset's rule").inflight_cap = cap;
-            }
-            let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
+            let rule = document.bindings[0].sessions.as_mut();
+            rule.expect("the preset's rule").inflight_cap = 2;
+            applied(&document)
+        };
+        let ruleless = PolicySpec::preset("random").expect("a preset of this build");
+        assert!(ruleless
+            .bindings
+            .iter()
+            .all(|binding| binding.sessions.is_none()));
+        let documents = [
+            ("a rule with no cap", preset("manual", 1)),
+            ("a rule with a cap", capped),
+            ("no rule", applied(&ruleless)),
+        ];
+        for (under, document) in documents {
+            let mut bed = bed(Some(document), true, (1, 8), []);
+            bed.ask(frame(1, 1_000)).await;
+            assert_eq!(keys_counted(&bed), 0, "{under}: a request with no key");
             bed.ask(keyed(1, 1_001)).await;
-            let objects = bed.reads.objects.registry().get_all();
-            let keys = objects.iter().map(|object| object.routing_key_load());
-            assert_eq!(keys.sum::<usize>(), counted, "a cap of {cap:?}");
+            assert_eq!(keys_counted(&bed), 1, "{under}: a keyed request");
         }
+    }
+
+    /// A rule that places a new key on the worker with the fewest keys
+    /// reads the keys of the leases the service holds, under no cap. One
+    /// worker carries three keys' requests and the others none: no new key
+    /// takes it. Each new key's count leaves at its lease's release, so
+    /// the others stay at none. The gateway's classic sticky policy
+    /// answers the same: a new key takes a worker with the fewest keys in
+    /// flight (`model_gateway/src/policies/manual.rs:479-480` at main
+    /// `5e609dc2d`), which its load guard counts for every request that
+    /// carries a key (`crates/worker/src/load/inflight.rs:196-199`).
+    #[tokio::test]
+    async fn the_service_places_a_new_key_by_the_keys_its_leases_count_under_no_cap() {
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        let rule = document.bindings[0].sessions.as_mut();
+        rule.expect("the preset's rule").assignment = crate::document::Assignment::MinGroup;
+        let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
+        let (busy, others) = (bed.workers[0], [bed.workers[1], bed.workers[2]]);
+        // Three keys' requests on one worker, the only one ready.
+        for other in others {
+            set_status(&bed, other, WorkerStatus::NotReady);
+        }
+        for key in 1..=3 {
+            let answer = bed.ask(keyed(key, 1_000 + key)).await;
+            assert_eq!(picked(&answer), busy);
+        }
+        for other in others {
+            set_status(&bed, other, WorkerStatus::Ready);
+        }
+        // Each new key takes a worker that carries no key, and its request
+        // ends before the next key's.
+        for key in 4..=27 {
+            let answer = bed.ask(keyed(key, 1_000 + key)).await;
+            assert_ne!(picked(&answer), busy, "key {key}");
+            let ended = LeaseId(lease_of(&answer).id);
+            let gone = ReleaseReason::ClientGone;
+            let store: &dyn LeasesStore = bed.store.as_ref();
+            assert!(store.released(GATEWAY, ended, None, gone));
+        }
+        // The three keys of the first worker alone: each new key's count
+        // left with its lease.
+        assert_eq!(keys_counted(&bed), 3);
+    }
+
+    /// Under a rule with no cap a key's count leaves its worker's object
+    /// with the key's lease, at a release.
+    #[tokio::test]
+    async fn a_key_under_a_rule_with_no_cap_is_counted_until_its_lease_is_released() {
+        let mut bed = bed(Some(preset("manual", 1)), true, (1, 8), []);
+        let answer = bed.ask(keyed(1, 1_001)).await;
+        assert_eq!(keys_counted(&bed), 1);
+        let ended = LeaseId(lease_of(&answer).id);
+        let store: &dyn LeasesStore = bed.store.as_ref();
+        assert!(store.released(GATEWAY, ended, None, ReleaseReason::ClientGone));
+        assert_eq!(keys_counted(&bed), 0);
+    }
+
+    /// Under a rule with no cap a key's count leaves its worker's object
+    /// where no dispatch names its lease: a decision past the lease's
+    /// dispatch deadline ends it as abandoned.
+    #[tokio::test]
+    async fn a_key_under_a_rule_with_no_cap_is_counted_until_its_dispatch_deadline() {
+        let mut bed = bed(Some(preset("manual", 1)), true, (1, 8), []);
+        bed.ask(keyed(1, 1_001)).await;
+        assert_eq!(keys_counted(&bed), 1);
+        // A request with no key, decided past that deadline.
+        let late = DISPATCH_TTL + Duration::from_secs(1);
+        bed.script.steps.lock().push_back(Step::At(late));
+        assert_eq!(bed.submit_at(frame(2, 1_002), GATEWAY, late), None);
+        bed.answer().await;
+        let store: &dyn LeasesStore = bed.store.as_ref();
+        assert_eq!(store.live(GATEWAY), 1, "the late request's lease alone");
+        assert_eq!(keys_counted(&bed), 0);
+    }
+
+    /// A cap that a new document sets counts the key's requests that stood
+    /// before it. Two requests of a key stand on its worker, decided under
+    /// a rule with no cap, and a third is decided and dispatched there
+    /// under the document that sets a cap of two. The key's next request
+    /// finds three on its pin and is placed again, on another worker.
+    #[tokio::test]
+    async fn a_cap_a_new_document_sets_counts_the_requests_that_stood_before_it() {
+        use crate::{
+            engine::sticky_sessions::SessionVerdict,
+            service::controller::lifecycle::{self, tests::a_dispatched},
+        };
+        let ruled = |cap: Option<u16>, generation: u64| {
+            let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+            document.generation = generation;
+            let rule = document.bindings[0].sessions.as_mut();
+            let rule = rule.expect("the preset's rule");
+            // A request placed again at the cap leaves the key's worker.
+            rule.assignment = crate::document::Assignment::MinLoad;
+            if let Some(cap) = cap {
+                rule.inflight_cap = cap;
+            }
+            applied(&document)
+        };
+        let mut bed = bed(Some(ruled(None, 1)), true, (1, 8), []);
+        let at = bed.script.taken;
+        let (owner, others) = (bed.workers[0], [bed.workers[1], bed.workers[2]]);
+        let dispatched = |bed: &Bed, answer: &proto::DecideAnswer| {
+            let (hand, frame) = (Hand::new(GATEWAY), a_dispatched(lease_of(answer).id));
+            lifecycle::dispatched(&bed.store, &hand, &frame, at).expect("the frame reads");
+        };
+        // The key's worker is the only one ready until its last request.
+        for other in others {
+            set_status(&bed, other, WorkerStatus::NotReady);
+        }
+        // Two requests of the key under the rule with no cap.
+        for seed in [1_001, 1_002] {
+            let answer = bed.ask(keyed(1, seed)).await;
+            assert_eq!(picked(&answer), owner);
+            dispatched(&bed, &answer);
+        }
+        // The cap, and the key's third request under it: its dispatch pins
+        // the key on its worker under the new document.
+        bed.store
+            .apply(ruled(Some(2), 2))
+            .expect("a later generation");
+        let third = bed.ask(keyed(1, 1_003)).await;
+        assert_eq!(picked(&third), owner);
+        dispatched(&bed, &third);
+        for other in others {
+            set_status(&bed, other, WorkerStatus::Ready);
+        }
+        // Three of the key's requests on its pin, two from before the cap.
+        let fourth = bed.ask(keyed(1, 1_004)).await;
+        assert_ne!(picked(&fourth), owner);
+        let filed = LeasesStore::get(&*bed.store, GATEWAY, LeaseId(lease_of(&fourth).id));
+        let verdict = filed.expect("the lease is on file").lease.session_verdict;
+        assert_eq!(verdict, SessionVerdict::Respill);
     }
 }

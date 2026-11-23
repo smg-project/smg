@@ -3262,10 +3262,10 @@ struct Held {
     /// ([`Decodes`]), read where the record carries the mark of a pair's
     /// lease. A single's entry names no place of its own.
     decode: u32,
-    /// Whether the lease's sides book their keys' requests in flight
-    /// ([`SessionTables`]): said once, where the lease is filed, so an end
-    /// frees what the filing booked. A decision's lease counts where its
-    /// decision read the key's count. A
+    /// Whether the lease's sides book their keys' requests in flight, each
+    /// on its worker's count ([`InFlightCounts::book`]): said once, where
+    /// the lease is filed, so an end frees what the filing booked. A
+    /// decision's lease counts where [`MemoryStore::issue_keyed`] files it. A
     /// record filed whole carries no such word and counts wherever it has
     /// a key: more than a cap reads, never less.
     keyed: bool,
@@ -4252,8 +4252,8 @@ impl MemoryStore {
         Ok((lease, issue))
     }
 
-    /// [`Self::issue_decided`] for a keyed decision made under a sessions
-    /// rule with an in-flight cap: the lease books one request of its key
+    /// [`Self::issue_decided`] for a keyed single decision, under any
+    /// sessions rule and under none: the lease books one request of its key
     /// on its worker until it leaves the file, whatever the decision did
     /// with the key's pin, and the worker's count of the key's requests
     /// steps with the lease's own ([`InFlightCounts::book`]). The lease of

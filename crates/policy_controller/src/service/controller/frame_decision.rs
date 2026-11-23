@@ -409,13 +409,14 @@ fn record_of(
 /// the store's hold of the file's turn. `None` for a shed, which files
 /// none.
 ///
-/// A keyed pick under a sessions rule with an in-flight cap files a lease
-/// that counts for its key ([`MemoryStore::issue_keyed`]): one request
-/// more of its session stands on its target until the lease leaves the
-/// file. The store moves that count onto the target's worker object,
-/// where the next decision of the key reads it. The rule is the one of
-/// the binding that decided, under which the live profile and a shadow
-/// are decided alike.
+/// A keyed pick files a lease that counts for its key
+/// ([`MemoryStore::issue_keyed`]), under any sessions rule and under
+/// none: one request more of its session stands on its target until the
+/// lease leaves the file. The store moves that count onto the target's
+/// worker object, as a gateway's load guard counts every request that
+/// carries a key. A decision reads it there: the key's own requests under
+/// an in-flight cap, and the keys with a request in flight where a rule
+/// or a scorer places by the fewest.
 ///
 /// The binding's shadow is counted behind a filing that stands, and behind
 /// a shed all the same. A filing the store refuses counts none.
@@ -454,21 +455,13 @@ pub(crate) fn issue(
     let booked = world
         .booked_of(first.id)
         .or_else(|| store.filed_slot(first.id));
-    // The sessions rule of the binding that decided, in the document the
-    // pick was made under: read for a pick that carries a key.
-    let binding =
-        (!session.is_none()).then(|| stages.binding(taken.request.model(), Phase::Single));
-    let rule = binding
-        .flatten()
-        .and_then(|binding| binding.sessions.as_ref());
-    // Under a rule with an in-flight cap the lease counts for its key,
-    // whatever the rule did with the pin: a request placed past the cap is
-    // one more of the key's requests on the worker it lands on.
-    let counted = rule.is_some_and(|rule| rule.inflight_cap != 0);
-    let lease = if counted {
-        store.issue_keyed(record, booked, told)
-    } else {
+    // A keyed pick's lease counts for its key, whatever rule placed it and
+    // whatever the rule did with the pin: one more of the key's requests
+    // on the worker it lands on. A pick with no key reads no session.
+    let lease = if session.is_none() {
         store.issue_decided(record, booked, told)
+    } else {
+        store.issue_keyed(record, booked, told)
     }?;
     front.count_shadow(said);
     Ok(Some(lease))
