@@ -9,7 +9,9 @@
 //! behind the prefill's dispatch (`pair_round_robin_later`).
 //!
 //! Every worker has a load report, and a prefill states its rate as its
-//! measured input rate too: the one drain a prefill's record reads.
+//! measured input rate too: the one drain a prefill's record reads. Under
+//! a document that declares the signal of the `signal_cost` cells, each
+//! decode's report states a value of it (`pair_signal_cost`).
 //! `--overloaded 1` puts a pair's decodes alone over their thresholds: the
 //! rule for such a list steers a pair's decode side. A pair whose prefills
 //! are all over theirs goes to the pair's default, which no cell runs. The
@@ -34,7 +36,9 @@ use smg_worker::{
 };
 use tokio::runtime::Builder;
 
-use super::{measure, plain, reports, Cell, Host, Published, Run, Shadowed, Stated, MODEL};
+use super::{
+    measure, plain, reports, signals, Cell, Host, Published, Run, Shadowed, Stated, MODEL,
+};
 
 /// The pair document of the preset `name` on both sides.
 pub(super) fn of(name: &str) -> PolicySpec {
@@ -258,6 +262,7 @@ pub(super) fn runs(run: &Run) -> bool {
         }
     }
     loads.extend(reports(&decodes));
+    let loads = signals::stated(&document, &decodes, loads);
     feed.publish(&loads);
     // What a host does once, as for one list: it hands its load monitor's
     // channel and spawns the engine's task.

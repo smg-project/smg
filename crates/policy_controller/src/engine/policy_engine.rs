@@ -212,11 +212,14 @@ pub(crate) struct PoolMembers {
     /// a case makes without them ([`PolicyEngine::pool_members`]) makes
     /// them at its first whole decision.
     records: OnceLock<PoolRecords>,
-    /// The model of the list's first single request under a document a
-    /// stage of which reads a named signal, and whether a decision of that
-    /// model reads one ([`Self::reads_signal`]): such a decision reads the
-    /// list's signal cells beside its records.
-    signal: OnceLock<(Box<str>, bool)>,
+    /// The model and the phase the list was first asked for under a
+    /// document a stage of which reads a named signal, and whether a
+    /// decision of that model at that phase reads one
+    /// ([`Self::reads_signal`]): such a decision reads the list's signal
+    /// cells beside its records. A single request's list is asked for the
+    /// single phase, a pair's prefills for the prefill phase and its
+    /// decodes for the decode phase.
+    signal: OnceLock<(Box<str>, Phase, bool)>,
     /// The wires the list's workers are dialed on ([`Self::wires`]): read
     /// of their registrations at the first whole decision over the list.
     wires: OnceLock<WireModes>,
@@ -834,7 +837,7 @@ impl PolicyEngine {
         let loads = read.snapshot();
         // Under a document a stage of which reads a named signal the
         // list's word says whether this request's profile reads one.
-        if self.signals && members.reads_signal(&self.spec, request.facts.model) {
+        if self.signals && members.reads_signal(&self.spec, request.facts.model, Phase::Single) {
             return signals::decide(self, request, members, maker, loads, now, said);
         }
         self.decide_with_loads(request, members, maker, loads, now, said)

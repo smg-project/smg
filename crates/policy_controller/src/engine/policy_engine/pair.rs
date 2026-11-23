@@ -49,6 +49,13 @@
 //! ([`PoolRecords::write`](crate::engine::records::PoolRecords::write)). A
 //! stage takes what it takes of its own state, where it scores a record by
 //! its report and where it hears a word.
+//!
+//! **Named signals.** Under a document a stage of which reads a named
+//! signal, a side whose profile reads one is lent its own list's signal
+//! cells, of the snapshot the decision holds ([`signals::sides`]). They are
+//! made by the conversion above. A decision that was not the one to
+//! convert writes its own into a buffer of the calling thread, and where
+//! both sides do, the second side's are allocated.
 
 use std::{
     cell::RefCell,
@@ -60,7 +67,7 @@ use std::{
 
 use smg_worker::load::state::LoadSnapshot;
 
-use super::{single, PolicyEngine, PoolMembers};
+use super::{signals, single, PolicyEngine, PoolMembers};
 use crate::{
     engine::{
         decision::{shed, Decision, ShedReason, Target, SUBSET_HINT, WIRES},
@@ -69,7 +76,7 @@ use crate::{
         lease_events,
         list_cell::LentList,
         pair_classes::PartnerClasses,
-        records::{vetoes, Live},
+        records::{vetoes, HeldCells, Live},
         view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, Session},
     },
     stages::Lifecycle,
@@ -247,6 +254,13 @@ impl<'a> PairLists<'a> {
     /// This call's instant is written into its facts: `now` on the engine's
     /// clock, the clock the records' sample instants stand on.
     ///
+    /// A side whose profile reads a named signal reads each worker's value
+    /// in `loads`, by the worker's place in that side's list: its stages
+    /// find their list's signal cells in their facts
+    /// ([`RequestFacts::signal_cells`]). The decode decided again reads
+    /// the values of this call's snapshot. Cells on `request` are read by
+    /// neither side, and under no snapshot every worker reads no value.
+    ///
     /// Prefills that are all at their admission limit shed a first
     /// decision, which reads as a request that waits ([`prefills_full`]).
     ///
@@ -316,9 +330,23 @@ impl<'a> PairLists<'a> {
                 None => prefill_side.written(engine, facts.model, Phase::Prefill, prefills),
                 Some(_) => prefill_side,
             };
+            // Under a document a stage of which reads a named signal, each
+            // side that reads one is lent its list's cells for this call.
+            let lent = spec.needs().signal_cells.then(|| {
+                let first = held.is_none();
+                signals::sides([prefill, decode], spec, clock, &live, facts.model, first)
+            });
+            let [prefill_signal_cells, decode_signal_cells] = match &lent {
+                Some(lent) => lent
+                    .each_ref()
+                    .map(|side| side.as_ref().and_then(HeldCells::cells)),
+                None => [None; 2],
+            };
             let pools = PairPools {
                 prefills,
                 decodes,
+                prefill_signal_cells,
+                decode_signal_cells,
                 table: self.classes.table(),
                 ..PairPools::default()
             };
