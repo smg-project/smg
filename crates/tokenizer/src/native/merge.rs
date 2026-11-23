@@ -84,27 +84,33 @@ const SHORT_PIECE_SYMBOLS: usize = 128;
 const SHORT_PIECE_SMALL: usize = 32;
 /// The smallest arrays of a short merge: a word.
 const SHORT_PIECE_TINY: usize = 16;
-/// Bits of a position in a short merge's key, `rank << SHORT_KEY_BITS |
-/// position`: a minimum over the keys is the least rank and, among its
-/// repeats, the leftmost position. A key is a signed word that is never
-/// negative ([`MAX_RANKS`] leaves the sign bit clear): the baseline vector
-/// instructions have no minimum of words and compare them signed only, so
-/// a signed minimum is a compare and a blend and an unsigned one paid two
-/// sign flips more for every eight keys.
+/// Bits of a position in a short merge's key, the pair's [`Merge`] word over
+/// its position (`merge << SHORT_KEY_BITS | position`: rank, product,
+/// position). A minimum over the keys is the least rank and, among its
+/// repeats, the leftmost position (pairs of one rank have one product), and
+/// the key it picks carries the product. The key is one 64-bit word because
+/// the next merge waits on that minimum: a tree of scalar minima over eight
+/// keys is three deep, where 32-bit keys cost a vector compare and blend per
+/// group and a fold of the lanes on the baseline instruction set.
 const SHORT_KEY_BITS: u32 = SHORT_PIECE_SYMBOLS.trailing_zeros();
 /// The position bits of a short merge's key.
 const SHORT_KEY_MASK: u32 = (1 << SHORT_KEY_BITS) - 1;
-/// The key of a live symbol whose pair is no merge, past every packed key.
-const NO_KEY: i32 = i32::MAX;
-/// Ranks a short merge's key carries with its sign bit clear; a model with
+/// The key of a slot without a pair (padding, a dead symbol), past every key.
+const NO_KEY: u64 = u64::MAX;
+/// The least key that reads as no merge: the top bit, which [`Merge::NONE`]
+/// keeps under the shift and no merge's rank reaches (see [`MAX_RANKS`]).
+const NO_MERGE: u64 = 1 << (u64::BITS - 1);
+/// Ranks a short merge's key carries with its top bit clear; a model with
 /// more merges declines the table (a vocabulary has some hundred thousand).
-const MAX_RANKS: usize = 1 << (i32::BITS - 1 - SHORT_KEY_BITS);
-// The greatest key a table makes is under `NO_KEY`: a table's last rank is
+const MAX_RANKS: usize = 1 << (u32::BITS - 1 - SHORT_KEY_BITS);
+// The greatest key a table makes is under `NO_MERGE`: a table's last rank is
 // `MAX_RANKS - 2` at the most (`from_model` declines a model of `MAX_RANKS`
 // merges, and the ranks of a byte-level table end under `MAX_RANKS`, by the
 // assertion in `from_ranks`), and that rank at the last position is under it.
-const _: () =
-    assert!(((MAX_RANKS as u64 - 2) << SHORT_KEY_BITS | SHORT_KEY_MASK as u64) < NO_KEY as u64);
+const _: () = assert!(
+    (((MAX_RANKS as u64 - 2) << 32 | u32::MAX as u64) << SHORT_KEY_BITS | SHORT_KEY_MASK as u64)
+        < NO_MERGE
+);
 /// The rank of a pair that is no merge.
 const NO_RANK: u32 = u32::MAX;
 /// The id of a byte the vocabulary has no token for. On the byte-level path
@@ -1207,22 +1213,21 @@ fn push_symbol(
 /// The merge of a short piece: the live symbols as a linked list over arrays
 /// of `N` (a multiple of eight, at most [`SHORT_PIECE_SYMBOLS`]), and for
 /// each live symbol the key of the pair it starts with its right neighbour,
-/// its rank over its position ([`NO_KEY`] for no merge), so that the least
+/// its merge over its position (no merge from [`NO_MERGE`]), so that the least
 /// key names the next merge: the least rank and, among its repeats, the
 /// leftmost position (the rule of the module documentation). A merge unlinks
 /// the right symbol, writes the product, looks up the two pairs the product
 /// now forms, and takes the minimum over the other keys while those lookups
 /// are in flight (their latency is the merge's critical path otherwise); the
-/// minimum runs eight lanes wide, vector instructions without a branch per
+/// minimum of eight keys is a tree of seven minima, without a branch per
 /// key. This replaces a scan over the ranks of arrays of sixteen that moved
 /// the symbols past each merge down by one: a run of six CJK ideographs or
 /// a word of a script without word spaces took the heap path, with its two
 /// allocations.
 struct ShortMerge<const N: usize> {
     symbols: [u32; N],
-    /// The id the pair each live symbol starts produces, when it is a merge.
-    products: [u32; N],
-    keys: [i32; N],
+    /// The key of the pair each live symbol starts (see [`Self::set_pair`]).
+    keys: [u64; N],
     /// The live neighbours by position: `next` of the last symbol is `n`,
     /// `prev` of the first is 255, both past every position.
     next: [u8; N],
@@ -1239,7 +1244,6 @@ impl<const N: usize> ShortMerge<N> {
         debug_assert!(0 < n && n <= N);
         let mut merge = Self {
             symbols: [0; N],
-            products: [0; N],
             keys: [NO_KEY; N],
             next: [0; N],
             prev: [0; N],
@@ -1269,9 +1273,9 @@ impl<const N: usize> ShortMerge<N> {
     /// pair is a merge, and appends the ids to `ids`. It borrows the state:
     /// taken by value it is copied here, even with both functions inlined.
     #[inline(always)]
-    fn settle(&mut self, table: &MergeTable, mut best: i32, ids: &mut Vec<u32>) {
-        while best != NO_KEY {
-            best = self.merge_at(table, (best as u32 & SHORT_KEY_MASK) as usize);
+    fn settle(&mut self, table: &MergeTable, mut best: u64, ids: &mut Vec<u32>) {
+        while best < NO_MERGE {
+            best = self.merge_at(table, best);
         }
         let mut at = 0;
         while at < self.n {
@@ -1280,11 +1284,12 @@ impl<const N: usize> ShortMerge<N> {
         }
     }
 
-    /// Merges the pair the symbol at `at` starts, and answers the least key
-    /// after it.
+    /// Merges the pair `key` names, by its position and its product, and
+    /// answers the least key after it.
     #[inline(always)]
-    fn merge_at(&mut self, table: &MergeTable, at: usize) -> i32 {
-        self.symbols[at] = self.products[at];
+    fn merge_at(&mut self, table: &MergeTable, key: u64) -> u64 {
+        let at = (key & u64::from(SHORT_KEY_MASK)) as usize;
+        self.symbols[at] = (key >> SHORT_KEY_BITS) as u32;
         let dead = self.next[at] as usize;
         let right = self.next[dead] as usize;
         self.next[at] = right as u8;
@@ -1315,34 +1320,35 @@ impl<const N: usize> ShortMerge<N> {
         others.min(key_at).min(key_left)
     }
 
-    /// Records the pair the symbol at `at` starts as `merge` (its key and
-    /// its product; no key for [`Merge::NONE`]) and answers the key.
+    /// Records the pair the symbol at `at` starts as `merge` over `at`, a
+    /// key from [`NO_MERGE`] up for [`Merge::NONE`], and answers the key.
     #[inline(always)]
-    fn set_pair(&mut self, at: usize, merge: Merge) -> i32 {
-        let key = if merge == Merge::NONE {
-            NO_KEY
-        } else {
-            self.products[at] = merge.product();
-            (merge.rank() << SHORT_KEY_BITS | at as u32) as i32
-        };
+    fn set_pair(&mut self, at: usize, merge: Merge) -> u64 {
+        let key = merge.0 << SHORT_KEY_BITS | at as u64;
         self.keys[at] = key;
         key
     }
 
-    /// The least of the first `len` keys, eight lanes at a time (the keys
-    /// past the live pairs are [`NO_KEY`], so the lanes may run on to the
-    /// next eight).
+    /// The least of the first `len` keys, a group of eight at a time (the
+    /// slots from `len` on stay [`NO_KEY`], so a group is read whole).
+    /// The first group stands before the loop: most pieces have no second.
     #[inline(always)]
-    fn least(&self, len: usize) -> i32 {
-        let lim = (len + 7) & !7;
-        let mut lanes = [NO_KEY; 8];
-        for chunk in self.keys[..lim].as_chunks::<8>().0 {
-            for (lane, &key) in lanes.iter_mut().zip(chunk) {
-                *lane = (*lane).min(key);
+    fn least(&self, len: usize) -> u64 {
+        let (first, rest) = self.keys.as_chunks::<8>().0.split_at(1);
+        let mut best = least_of_eight(&first[0]);
+        if len > 8 {
+            for chunk in &rest[..(len - 1) / 8] {
+                best = best.min(least_of_eight(chunk));
             }
         }
-        lanes.into_iter().min().unwrap_or(NO_KEY)
+        best
     }
+}
+
+#[inline(always)]
+fn least_of_eight(keys: &[u64; 8]) -> u64 {
+    let [a, b, c, d, e, f, g, h] = *keys;
+    a.min(b).min(c.min(d)).min(e.min(f).min(g.min(h)))
 }
 
 /// One symbol of a long piece's merge: its token id ([`NONE`] once merged
