@@ -686,6 +686,53 @@ async fn a_responses_input_the_conversion_refuses_is_one_warn_and_marked() {
     );
 }
 
+/// A generate input only the request can put right is refused with one WARN that carries the
+/// cause, the answer marked, no ERROR.
+#[tokio::test]
+async fn a_generate_input_the_request_gets_wrong_is_one_warn_and_marked() {
+    // Past the mock's vocabulary and none of its added tokens; no worker reports a table.
+    let unknown = MockTokenizer::new().vocab_size() as u32 + 7;
+    for body in [
+        serde_json::json!({"model": MODEL, "input_ids": [[1, 2], [3]]}),
+        serde_json::json!({"model": MODEL, "input_ids": [1, -2, 3]}),
+        serde_json::json!({"model": MODEL, "input_ids": [1, unknown]}),
+        serde_json::json!({"model": MODEL}),
+    ] {
+        let input = body.to_string();
+        // The chat door's pipeline is the generate route's too.
+        let (pipeline, _, components) = both_doors_over(Arc::new(MockTokenizer::new())).await;
+        let request: Arc<GenerateRequest> =
+            Arc::new(serde_json::from_value(body).expect("generate request"));
+        let lines = LinesAtWarnOrAbove::default();
+        let _subscriber = test_subscriber(lines.clone());
+
+        let response = pipeline
+            .execute_generate(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST, "{input}");
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "resolve_input_failed",
+            "{input}"
+        );
+        assert!(marked(&response), "{input}");
+        assert_eq!(
+            lines.lines(),
+            [(Level::WARN, "Failed to resolve generate input".to_string())],
+            "{input}"
+        );
+    }
+}
+
 /// A failure in the server's class keeps its ERROR lines, the pipeline's among them: a served
 /// model with no tokenizer on a gateway that loads none itself.
 #[tokio::test]
