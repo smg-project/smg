@@ -10,13 +10,13 @@
 //!
 //! The sheets live beside this target, in `tests/classic/sheets`, with the
 //! notes on their rows, and each recorder is a test module of the gateway
-//! crate beside the code it runs. Every run of the suite with the `ingest`,
+//! crate beside the code it runs. Every run of the suite with the
 //! `in-process` and `worker-host` features replays every row of each sheet
 //! that has a
 //! module here. A few rows of each form are copied into the policy's module
 //! from its sheet as well, and the replay holds every copied row to the
 //! sheet's row of its name. A row's reports reach the view through the
-//! `ingest` feature's row builder, and the three hard-demand modules decide
+//! crate's row builder, and the three hard-demand modules decide
 //! over worker objects, which `in-process` brings: a bare test run of the
 //! crate builds no part of this target and replays no recorded row.
 //!

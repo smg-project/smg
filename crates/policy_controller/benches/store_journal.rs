@@ -2,11 +2,9 @@
 //! of one pool, each cell beside its twin on a store with no journal, in
 //! one binary:
 //!
-//! - `policy_store_journal/load_write/<plain|watched|journaled>/<n>`: one
-//!   load record's write inside the publication window, which a journal is
-//!   told nothing of. `watched` and `journaled` are one journaled store:
-//!   the hosted gate lists both names, and both stay until its filter
-//!   names one;
+//! - `policy_store_journal/load_write/<plain|journaled>/<n>`: one load
+//!   record's write inside the publication window, which a journal is told
+//!   nothing of;
 //! - `policy_store_journal/status_write/<plain|journaled|told>/<n>`: one
 //!   status flip of a member, published at once; `told` is the journaled
 //!   write on a log with a listener of the watched kinds, as a controller
@@ -150,7 +148,7 @@ const KINDS: [(&str, bool); 2] = [("plain", false), ("journaled", true)];
 
 fn load_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_store_journal/load_write");
-    for (kind, journaled) in [KINDS[0], ("watched", true), KINDS[1]] {
+    for (kind, journaled) in KINDS {
         for n in SIZES {
             let pool = pool_of(n, journaled);
             let before = pool.log.as_ref().map(|log| log.head());

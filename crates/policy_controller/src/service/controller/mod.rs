@@ -1376,7 +1376,6 @@ mod tests {
         decision_slots::{tests as bed, TERM_MARK},
         election::{self, ElectionObservation},
         following,
-        membership::tests::Logged,
         principal::Layer,
         readiness::{self, tests::fenced, Phase},
         standby::Lag,
@@ -1384,10 +1383,6 @@ mod tests {
         Scope,
     };
     use crate::{
-        load::ingest::{
-            loads::{LoadProbe, ReadError},
-            probe::{unbuildable, EngineProbe},
-        },
         service::elector::{
             ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, LeaseBackend,
             LeaseRecord, MemoryLease, TickOutcome,
@@ -1420,31 +1415,6 @@ mod tests {
         fn place(&self) -> String {
             self.lease.place()
         }
-    }
-
-    /// A probe whose client cannot be built says so once, as a warning
-    /// that names the controller's own client and no engine.
-    #[tokio::test]
-    async fn a_client_that_cannot_be_built_is_said_once_as_the_controllers_own() {
-        let lines = Logged::default();
-        let writer = lines.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        let _kept = tracing::subscriber::set_default(subscriber);
-        let probe = EngineProbe::building(unbuildable);
-        for _ in 0..3 {
-            let read = probe
-                .scrape("http://127.0.0.1:9", Duration::from_secs(1))
-                .await;
-            assert!(matches!(read, Err(ReadError::Client(_))), "{read:?}");
-        }
-        let said = String::from_utf8(lines.0.lock().clone()).expect("the lines");
-        assert_eq!(said.matches("could not be built").count(), 1, "{said}");
-        assert!(said.contains("WARN"), "{said}");
-        assert!(!said.contains("127.0.0.1"), "no engine is named: {said}");
     }
 
     /// Every socket the controller accepts sends at once, read from the

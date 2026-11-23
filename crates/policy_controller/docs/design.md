@@ -137,7 +137,7 @@ Later changes do not update these counts.
 | `store/` | 29,896 | 28 | The controller's in-memory store: worker records, loads, cache index, leases. |
 | `service/` | 80,546 | 59 | The controller: the gRPC service, election, replication, discovery. |
 | `worker_host/` | 18,895 | 19 | What lets a controller hold worker objects of the worker crate. |
-| `load/` | 5,842 | 10 | A worker's load report as a stage reads it, and the controller's own load poller. |
+| `load/` | 5,842 | 10 | A worker's load report as a stage reads it. The controller's own load poller, counted here, has left since. |
 | `plugins/` | 16,296 | 21 | Runtimes for user stages in WebAssembly and over gRPC. |
 | other | 498 | 4 | `lib.rs`, the binary's `main`, two small files. |
 | **Total** | **286,662** | **255** | |
@@ -1782,8 +1782,8 @@ worker that only it can reach, and it would forward what that worker's stream br
 call is served, and this design names no use for them.
 
 What leaves the crate with that switch: the store's copies of the worker data that a worker
-object holds, the crate's own load poller, and the adapters that write worker state into the
-store. Some facts of a worker are not carried to its worker object today, and some stand there in
+object holds, and the adapters that write worker state into the
+store. The crate's own load poller has left. Some facts of a worker are not carried to its worker object today, and some stand there in
 a narrower form than a registration states: 10.3 names them and where they are kept.
 
 **The first step, on main.** A single request's decision reads the model's single workers in the
