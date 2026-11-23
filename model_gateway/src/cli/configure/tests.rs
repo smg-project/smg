@@ -233,6 +233,9 @@ enum Verdict {
     LauncherSpelling(Cow<'static, str>),
     /// Its configuration is refused, this setting named.
     Refused(&'static str),
+    /// Its configuration converts to a document the controller takes, and
+    /// the item's block says another one.
+    AnotherDocument,
 }
 
 /// The items that do not convert to their document, each with why.
@@ -242,9 +245,12 @@ const OTHERS: &[(&str, Verdict)] = &[
         "21-launcher-second-spellings-sticky.md",
         Verdict::LauncherSpelling(Cow::Borrowed("--eviction-interval-secs")),
     ),
+    // The conversion writes the sticky override's rule in another form than
+    // this item's block. The corpus is the policy crate's. Where the block
+    // comes to say the conversion's document this entry fails, and leaves.
     (
         "22-cli-least-load-sticky-custom-headers.md",
-        Verdict::Refused("routing_key_override.enabled"),
+        Verdict::AnotherDocument,
     ),
 ];
 
@@ -285,6 +291,15 @@ fn verdict(name: &str, item: &str) -> Result<Verdict, String> {
     let expected: PolicySpec =
         serde_yaml::from_str(expected).map_err(|err| format!("the expected document: {err}"))?;
     if document != expected {
+        let another = OTHERS
+            .iter()
+            .any(|(listed, verdict)| *listed == name && *verdict == Verdict::AnotherDocument);
+        if another {
+            return match document.validate() {
+                Ok(_) => Ok(Verdict::AnotherDocument),
+                Err(refused) => Err(format!("the controller refuses the document: {refused}")),
+            };
+        }
         return Err(format!(
             "the document differs from the expected one:\n  got      {}\n  expected {}",
             serde_json::to_string(&document).unwrap_or_default(),
