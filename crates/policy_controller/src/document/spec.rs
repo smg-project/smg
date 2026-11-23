@@ -62,7 +62,9 @@ use crate::{
         cost_terms::{signal_named, CostTerm, SIGNAL_FAMILY},
         filters::{has_room_rule, HasRoomRule, HasRoomSignals},
         pickers::SampledBest,
-        registry::{profile_sent, FilterFactory, Found, PickerFactory, StageBuild, StageRegistry},
+        registry::{
+            profile_sent, FilterFactory, Found, PickerFactory, SentSlot, StageBuild, StageRegistry,
+        },
         scorers::{
             with_load_report_age_limit, FewestSessions, LeastCost, LeastCostSignals,
             LeastCostWithDispatches, LeastRequests, ResidentWork, SessionAffinity,
@@ -3603,7 +3605,7 @@ fn picker_of(
     at: &At,
     from: StageInputs<'_>,
     settings: SentSettings,
-    sent: &mut Option<Arc<DispatchCredit>>,
+    sent: &mut SentSlot,
 ) -> Result<Resolved<Box<dyn Picker>>, SpecError> {
     let named = pick.name();
     let path = || format!("{}.pick.{named}", at.0);
@@ -3611,7 +3613,7 @@ fn picker_of(
     // picker has no weight: the map is the factory's whole.
     let made = |build: &PickerFactory,
                 mut params: serde_json::Map<String, serde_json::Value>,
-                sent: &mut Option<Arc<DispatchCredit>>| {
+                sent: &mut SentSlot| {
         in_key_order(&mut params);
         let picker = StageBuild::built(
             &params,
@@ -3750,7 +3752,7 @@ fn filtered<'a>(
     index: usize,
     from: StageInputs<'_>,
     settings: SentSettings,
-    sent: &mut Option<Arc<DispatchCredit>>,
+    sent: &mut SentSlot,
 ) -> Result<Filtered<'a>, SpecError> {
     let name = entry.name();
     let path = || format!("{}.filter[{index}].{name}", at.0);
@@ -3758,7 +3760,7 @@ fn filtered<'a>(
     // A filter has no weight: the map is the factory's whole.
     let made = |build: &FilterFactory,
                 mut params: serde_json::Map<String, serde_json::Value>,
-                sent: &mut Option<Arc<DispatchCredit>>| {
+                sent: &mut SentSlot| {
         in_key_order(&mut params);
         let filter = StageBuild::built(
             &params,
@@ -3962,7 +3964,7 @@ fn scored(
     at: &At,
     from: StageInputs<'_>,
     settings: SentSettings,
-    sent: &mut Option<Arc<DispatchCredit>>,
+    sent: &mut SentSlot,
 ) -> Result<Scored, SpecError> {
     let name = entry.name();
     let Some(found) = from.catalog.find_scorer(name) else {
@@ -4165,8 +4167,15 @@ fn check_profile(
         report_delay_ms: p.sent_report_delay_ms,
     };
     // The profile's count of sends, made where a stage's factory first
-    // asks for it: a filter's may, ahead of any scorer's.
-    let mut sent = None;
+    // asks for it: a filter's may, ahead of any scorer's. An earlier
+    // profile's count under the same two settings is the one handed.
+    let mut sent = SentSlot {
+        asked: None,
+        shared: sent_credits
+            .iter()
+            .find(|count| count.settings == settings)
+            .cloned(),
+    };
     let mut filters = Vec::with_capacity(p.filter.len());
     for (index, entry) in p.filter.iter().enumerate() {
         let filter = match filtered(entry, name, &at, index, from, settings, &mut sent)? {
@@ -4223,10 +4232,10 @@ fn check_profile(
             None
         }
     };
-    if let Some(ms) = p.sent_ttl_ms.filter(|_| sent.is_none()) {
+    if let Some(ms) = p.sent_ttl_ms.filter(|_| sent.asked.is_none()) {
         return Err(at.bad("sent_ttl_ms", ms, "a limit any stage of this profile reads"));
     }
-    if let Some(ms) = p.sent_report_delay_ms.filter(|_| sent.is_none()) {
+    if let Some(ms) = p.sent_report_delay_ms.filter(|_| sent.asked.is_none()) {
         return Err(at.bad(
             "sent_report_delay_ms",
             ms,
@@ -4296,7 +4305,11 @@ fn check_profile(
     }
     Ok(match picker {
         Some(picker) if complete => {
-            sent_credits.extend(sent);
+            // A shared count stands in the list under the profile that
+            // made it.
+            if sent.shared.is_none() {
+                sent_credits.extend(sent.asked);
+            }
             // A filter and a picker name no depth of their own.
             let unkeyed = filters.iter().map(|filter| filter.needs());
             depth.deepen(HashDepth::of(unkeyed.fold(picker.needs(), Needs::or)));
@@ -5259,7 +5272,8 @@ impl PolicySpec {
         needs.headers |= !self.view.headers.is_empty();
         let mut engine = Engine::new(profiles, bindings, self.generation, needs);
         // In the order of the profiles' names, as the map walks them: a
-        // later engine finds a profile's count by its name.
+        // later engine finds a count by the name of the profile that made
+        // it.
         debug_assert!(sent_credits
             .windows(2)
             .all(|pair| pair[0].profile < pair[1].profile));
@@ -7714,7 +7728,7 @@ mod tests {
             &At::new("profiles.p.score[0]"),
             from,
             SentSettings::default(),
-            &mut None,
+            &mut SentSlot::default(),
         )
         .expect("a built-in scorer") else {
             panic!("a typed scorer");
@@ -7762,6 +7776,27 @@ mod tests {
                 want.map_err(str::to_owned),
                 "{term} under {limit:?}"
             );
+        }
+    }
+
+    /// Profiles under one time limit and one report delay read one count
+    /// of sends. A profile under another limit keeps a count of its own.
+    #[test]
+    fn profiles_under_one_sent_setting_read_one_count_of_sends() {
+        for (limit, want) in [(None, 1), (Some(43), 2)] {
+            let mut spec = doc(
+                r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["least-load"],"pick":"best"},"q":{"score":["least-load"],"pick":"best"}},"bindings":[{"match":{"model":"m"},"profile":"p"},{"match":{"model":"*"},"profile":"q"}]}"#,
+            );
+            spec.profiles.get_mut("q").expect("the profile").sent_ttl_ms = limit;
+            let engine = spec.validate().expect("a valid document");
+            assert_eq!(engine.sent_credits.len(), want, "q under {limit:?}");
+            // Both scorers hold a count of the list, the ones the engine
+            // feeds: the list holds each count once beside its readers.
+            let readers = engine
+                .sent_credits
+                .iter()
+                .map(|count| Arc::strong_count(count) - 1);
+            assert_eq!(readers.sum::<usize>(), 2, "q under {limit:?}");
         }
     }
 

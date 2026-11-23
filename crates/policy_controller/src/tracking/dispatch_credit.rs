@@ -42,7 +42,7 @@ pub struct DispatchCounts {
 
 /// A profile's two settings on its count of sends, as its document writes
 /// them: an unset one is `None`.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SentSettings {
     /// `sent_ttl_ms`: how long a send counts.
     pub(crate) ttl_ms: Option<u32>,
@@ -56,9 +56,13 @@ pub(crate) struct SentSettings {
 /// feeds it and stages read it: a registered stage, `least-cost` through
 /// its `sent.` terms, and `least-load` for its credit. Under a standalone
 /// controller it counts sends from every gateway through that controller.
+/// The profiles of a document that set the same time limit and report
+/// delay read one count: the engine records a send in every count, and
+/// only a decision's read lets one go, so a count of its own would keep
+/// the sends of a profile that decides no request.
 ///
 /// A new document's count takes over the rows' entries of the standing
-/// profile of the same name and shares them with it
+/// count that a profile of the same name made, and shares them with it
 /// ([`Engine::succeed`](crate::engine::Engine::succeed)). Each count reads them
 /// under its own time limit and its own report delay, and a send that one
 /// read releases has left the other count too: of two report delays, a
@@ -87,8 +91,12 @@ pub struct DispatchCredit {
     /// Whether the profile sets either of the two: what a pass asks once
     /// ([`Self::limited`]).
     limited: bool,
-    /// The profile's name: the count of a later document's profile of
-    /// this name takes over this one's entries.
+    /// The two settings as the document writes them: a later profile of
+    /// the document that writes the same two reads this count.
+    pub(crate) settings: SentSettings,
+    /// The name of the profile that made the count, the first of its
+    /// readers: the count a later document's profile of this name makes
+    /// takes over this one's entries.
     pub(crate) profile: String,
 }
 
@@ -100,6 +108,7 @@ impl DispatchCredit {
             ttl_micros: settings.ttl_ms.map_or(u64::MAX, micros),
             report_delay_micros: settings.report_delay_ms.map_or(0, micros),
             limited: settings.ttl_ms.is_some() || settings.report_delay_ms.is_some(),
+            settings,
             profile: profile.to_owned(),
         }
     }
