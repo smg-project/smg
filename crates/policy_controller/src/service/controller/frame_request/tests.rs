@@ -11,6 +11,7 @@ use std::{
 
 use smg_worker::{
     identity::{basic::Worker, builder::BasicWorkerBuilder},
+    load::state::{one_rank_load, LoadSnapshot},
     test_support::{no_health_check, ready_worker},
     worker::{WorkerSpec, WorkerStatus, WorkerType},
 };
@@ -720,6 +721,43 @@ fn a_frames_decision_names_its_alternates() {
 
     let alone = places(&decided(&engine, &SaysPlain(maker), now));
     assert_eq!(alone.len(), 1, "{alone:?}");
+}
+
+/// A request told the load snapshot its decision reads is decided by that
+/// snapshot's reports: under the least-load preset every pick names the
+/// worker that reports no queue. The same frames told no snapshot read the
+/// one their engine keeps, which holds no report here, and the worker with
+/// the queue is a pick among them.
+#[test]
+fn a_request_told_a_load_snapshot_is_decided_by_its_reports() {
+    let engine = engine("least_load");
+    let list = pool(2);
+    let members = PublishedList::new(Arc::clone(&list));
+    let loads = LoadSnapshot::from_loads_for_test(vec![
+        (
+            "http://worker-0:8000".to_owned(),
+            one_rank_load(900_000, 0.9, 10.0),
+        ),
+        (
+            "http://worker-1:8000".to_owned(),
+            one_rank_load(0, 0.1, 10.0),
+        ),
+    ]);
+    let now = Instant::now();
+    let mut buffers = Lists::default();
+    let (mut told, mut untold) = (Vec::new(), Vec::new());
+    for seed in 0..32 {
+        let frame = frame_of(seed, |_| {});
+        let lists = buffers.of(&frame);
+        let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::Single(members.lent()));
+        assert!(maker.loads().is_none());
+        untold.push(places(&decided(&engine, &maker, now))[0]);
+        let maker = maker.reading(&loads);
+        assert!(maker.loads().is_some_and(|read| Arc::ptr_eq(read, &loads)));
+        told.push(places(&decided(&engine, &maker, now))[0]);
+    }
+    assert!(told.iter().all(|place| *place == 1), "{told:?}");
+    assert!(untold.contains(&0), "{untold:?}");
 }
 
 /// The hashes past what the deciding document reads are cut where the

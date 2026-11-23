@@ -508,7 +508,7 @@ it lends in the same type **[planned]**.
 |---|---|---|---|
 | a model's worker list | the registry, at each membership change | yes | yes, the same list |
 | the worker object's state | health checker, load monitor, load guard (on a controller, the leases on file), outcomes | yes | yes, once for each decision |
-| `LoadSnapshot` | the load monitor | `least_load`, `cache_aware`, `power_of_two` | yes, the latest snapshot; a controller's engine is lent none yet |
+| `LoadSnapshot` | the load monitor | `least_load`, `cache_aware`, `power_of_two` | yes, the latest snapshot; a controller's deciding thread gives it with each request, where the document keeps no report |
 | the index of cache events | the workers' event streams | `cache_aware` | yes, through `CacheIndex`; a controller's engine is lent none yet |
 | the two trees | the deciding policy: classic's, or the engine inside the tree's walk | `cache_aware` | the host's own trees, lent: the token tree **[built]**, the string tree **[planned]** |
 
@@ -1421,7 +1421,7 @@ the worker crate's structures, and the one engine.
 | workers | records in the store, and worker objects kept in step with them | worker objects in a worker-crate registry; beside each, the code that keeps the objects holds what a registration stated and the object does not hold as stated (10.3); the membership log that watchers and standbys read stays |
 | lists | the store's published copy; a single request's decision reads the registry's published list of the model's single workers | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
 | health | the worker crate's health checker over the worker objects, on the leader; each outcome is copied into the store's record, an object's status follows its record's, and a single request's decision reads the object's | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
-| loads | the crate's own poller and table; a single request's decision reads no report and no overload verdict yet | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic, whose gateway hands every worker the same two defaults |
+| loads | the worker crate's load monitor over the worker objects, while the replica leads: a single request's decision is given its snapshot where the document reads reports and keeps none, and reads the overload verdict on the object; the crate's own poller and table still run, and no decision reads them | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic, whose gateway hands every worker the same two defaults |
 | cache events | an index of the store's own; a single request's decision reads none yet | the kv-index crate's index, filled by the worker crate's collector |
 | sessions | the engine's session table for a single request, one for each document; the store's tables are still written, and no decision reads them | the engine's session table |
 | leases | the store's lease tables, in memory, one for each deciding thread | stay: a controller must remember what it issued to gateways |
@@ -1736,7 +1736,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The crate's bench of the kept engine | **[planned]** | |
 | The gateway as a host | **[planned]** | section 9; the earlier integration, still on main, is taken out first (stage 0) |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |
-| The controller on the one engine and the worker crate's structures | **[partly]** | a single request is decided by `PolicyEngine` over the registry's list; a pair's phases are answered `Busy`; a decision reads no load report, no overload verdict and no cache event, and a sessions rule's cap counts nothing (section 10.2) |
+| The controller on the one engine and the worker crate's structures | **[partly]** | a single request is decided by `PolicyEngine` over the registry's list; a pair's phases are answered `Busy`; a decision reads no cache event, and no load report under a document that holds a stage that keeps reports, and a sessions rule's cap counts nothing (section 10.2) |
 | The controller finding its own workers | **[partly]** | discovery registers nothing yet |
 | A gateway under a controller | **[planned]** | section 11 |
 | User stages in WebAssembly and over gRPC | **[partly]** | library code that no document reaches |

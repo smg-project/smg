@@ -45,7 +45,9 @@
 //! the store's ids: a frame names the workers it tried and the ones it
 //! excludes by them.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
+
+use smg_worker::load::state::LoadSnapshot;
 
 use super::wire::{Checked, FrameLists};
 use crate::{
@@ -67,6 +69,9 @@ pub(crate) struct FrameRequest<'a> {
     /// What is left of the frame's budget at the decision, in microseconds.
     budget_micros: u32,
     workers: WorkerLists<'a>,
+    /// The load snapshot the request's decision reads; `None` for the one
+    /// its engine keeps.
+    loads: Option<&'a Arc<LoadSnapshot>>,
     /// The places of its list the request may take; `None` for every place.
     places: Option<&'a [u32]>,
     /// The positions a standing veto of the asking gateway holds back.
@@ -84,7 +89,8 @@ impl<'a> FrameRequest<'a> {
     /// frame's lists bears that frame's headers and exclusions.
     ///
     /// The request may take every place of its list, and no position is
-    /// held back ([`Self::held_to`]).
+    /// held back ([`Self::held_to`]). Its decision reads the load snapshot
+    /// its engine keeps ([`Self::reading`]).
     ///
     /// `left` is a microsecond or more. A frame with less left is answered
     /// where its decider takes it, and no request is made of it: a request
@@ -102,6 +108,7 @@ impl<'a> FrameRequest<'a> {
             // than the field holds reads as its widest.
             budget_micros: u32::try_from(left.as_micros()).unwrap_or(u32::MAX),
             workers,
+            loads: None,
             places: None,
             stalled: &[],
             held: &[],
@@ -129,11 +136,20 @@ impl<'a> FrameRequest<'a> {
             ..self
         }
     }
+
+    /// The request with the load snapshot its decision reads: the newest
+    /// its deciding thread holds of the replica's load monitor
+    /// ([`FrameLoads::newest`](super::frame_loads::FrameLoads::newest)).
+    #[must_use]
+    pub(crate) fn reading(self, loads: &'a Arc<LoadSnapshot>) -> Self {
+        Self {
+            loads: Some(loads),
+            ..self
+        }
+    }
 }
 
 // `plain` keeps the trait's answer: a controller's request is never plain.
-// `loads` keeps it too: the engine reads the newest snapshot its own task
-// keeps.
 impl RequestMaker for FrameRequest<'_> {
     fn model(&self) -> &str {
         self.frame.model()
@@ -161,6 +177,10 @@ impl RequestMaker for FrameRequest<'_> {
 
     fn workers(&self) -> WorkerLists<'_> {
         self.workers
+    }
+
+    fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
+        self.loads
     }
 }
 

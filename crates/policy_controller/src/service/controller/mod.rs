@@ -45,6 +45,7 @@ mod discovery;
 pub(crate) mod election;
 mod floor;
 mod frame_decision;
+mod frame_loads;
 mod frame_request;
 mod gateway_places;
 mod gateways;
@@ -75,6 +76,7 @@ use std::{
 };
 
 use axum::serve::{ListenerExt as _, TapIo};
+use smg_worker::load::state::LoadReceiver;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
@@ -168,6 +170,11 @@ pub struct Controller {
     /// The health probes of the replica's workers: one task of the serve,
     /// which probes while this replica leads.
     prober: worker_objects::Prober,
+    /// The load reports of the replica's workers: one task of the serve,
+    /// which polls while this replica leads. The deciding threads hold its
+    /// channel from the bind.
+    #[cfg(feature = "worker-host")]
+    monitor: worker_objects::LoadMonitor,
     /// Worker discovery, where the configuration names a provider: one task
     /// of the serve, which runs the provider while this replica leads.
     #[cfg(feature = "discovery")]
@@ -466,12 +473,15 @@ impl Controller {
         ));
         let kv_feed = KvFeed::new(Arc::clone(&journal.0), workers.holder());
         let prober = worker_objects::Prober::new(Arc::clone(&workers), elector.fence());
+        // The load monitor is built stopped, ahead of the deciding threads:
+        // each takes its channel at its start, and the serve runs its task.
+        let monitor = worker_objects::LoadMonitor::new(&workers, config.load_poll_interval);
         let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
             &elector,
             stood,
-            (journal.0, journal.1, workers.holder()),
+            (journal.0, journal.1, workers.holder(), monitor.loads()),
             Arc::clone(&catalog),
             config.decide_shards,
         )
@@ -510,6 +520,8 @@ impl Controller {
             workers,
             kv_feed,
             prober,
+            #[cfg(feature = "worker-host")]
+            monitor,
             #[cfg(feature = "discovery")]
             discovery,
         })
@@ -763,6 +775,14 @@ impl Controller {
         Arc::clone(&self.shared.fence)
     }
 
+    /// The load reports of this replica's workers as its decisions are
+    /// given them: the channel its load monitor publishes on, valid across
+    /// [`Self::serve`]. The monitor publishes a snapshot at each poll while
+    /// the replica leads, and an empty one at each lead's end.
+    pub fn loads(&self) -> LoadReceiver {
+        self.monitor.loads()
+    }
+
     /// Serves until `shutdown` resolves, then drains. The listeners answer
     /// from the start; the load driver polls the store's engines from the
     /// first tick (idle while the store has no rows); the election thread
@@ -830,6 +850,8 @@ impl Controller {
             workers,
             kv_feed,
             prober,
+            #[cfg(feature = "worker-host")]
+            monitor,
             #[cfg(feature = "discovery")]
             discovery,
             ..
@@ -961,6 +983,15 @@ impl Controller {
             let (probes_stop, led) = (stop.subscribe(), shared.role.subscribe());
             tasks.spawn(async move {
                 prober.run(probes_stop, led).await;
+                Ok(())
+            });
+            // The load monitor runs under the same word: a replica that
+            // does not lead asks no engine for its load either. Its stop
+            // publishes the snapshot empty for the deciding threads, but
+            // for the one loop `LoadMonitor::run` names.
+            let (loads_stop, led) = (stop.subscribe(), shared.role.subscribe());
+            tasks.spawn(async move {
+                monitor.run(loads_stop, led).await;
                 Ok(())
             });
         }

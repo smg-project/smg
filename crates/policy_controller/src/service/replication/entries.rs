@@ -96,8 +96,7 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ),
     ("LoadSink", "load", EntryReplication::Read),
     ("LoadSink", "ranks", EntryReplication::Read),
-    // The load driver drops a replica's rows at each turn of its role, and
-    // a host's load adapter drops a worker's where its reports stop: each
+    // The load driver drops a replica's rows at each turn of its role: each
     // replica's own rows, and a standby holds none.
     (
         "LoadSink",
