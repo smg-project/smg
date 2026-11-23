@@ -1093,6 +1093,8 @@ impl LoadGuards {
     /// The guards of an attempt whose every side goes out with the dispatch
     /// that follows: each is made from its placement's answer, which says
     /// the dispatch where the policy engine placed the request.
+    // Always in line: on every request's path, and the call cost more than the body.
+    #[inline(always)]
     pub fn new(selection: &WorkerSelection, routing_key: Option<&str>) -> Self {
         match selection {
             WorkerSelection::Single { worker } => LoadGuards::Single {
@@ -1174,6 +1176,8 @@ impl LoadGuards {
     /// Bind an admission claim to the dispatch's guards, so the rooms it
     /// reserved outlive nothing else. `None` (the engine reports no window)
     /// returns the guards untouched.
+    // Always in line: on every request's path, and the call cost more than the body.
+    #[inline(always)]
     pub fn admitted(admission: Option<PdAdmissionGuard>, guards: Self) -> Self {
         match admission {
             Some(admission) => Self::Admitted {
