@@ -444,7 +444,7 @@ fn tile_blocks(
 
 /// The request's error for a patch output that cannot be reserved.
 fn refused(reason: impl std::fmt::Display) -> TransformError {
-    TransformError::ShapeError(format!("cannot reserve Llama 4 patch output: {reason}"))
+    TransformError::ReserveRefused(format!("cannot reserve Llama 4 patch output: {reason}"))
 }
 
 /// The product of `factors`, the size of a patch output, or the request's
@@ -879,7 +879,7 @@ mod tests {
             processor.preprocess(&[&image]),
         ] {
             assert!(
-                matches!(&result, Err(TransformError::ShapeError(message))
+                matches!(&result, Err(TransformError::ReserveRefused(message))
                     if message
                         .strip_prefix("cannot reserve Llama 4 patch output: ")
                         .is_some_and(|cause| !cause.is_empty())),

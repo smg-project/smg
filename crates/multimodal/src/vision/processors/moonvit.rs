@@ -410,7 +410,7 @@ fn covered(wire: Vec<u8>, written: usize) -> Result<Vec<u8>, TransformError> {
 
 /// The request's error for a patch output that cannot be reserved.
 fn refused(error: TryReserveError) -> TransformError {
-    TransformError::ShapeError(format!("cannot reserve MoonViT patch output: {error}"))
+    TransformError::ReserveRefused(format!("cannot reserve MoonViT patch output: {error}"))
 }
 
 /// The pipeline over a batch of images, for either form of the encoder input:
@@ -1057,7 +1057,7 @@ mod tests {
             preprocess(params, &[&image], None),
         ] {
             assert!(
-                matches!(&result, Err(TransformError::ShapeError(message))
+                matches!(&result, Err(TransformError::ReserveRefused(message))
                     if message
                         .strip_prefix("cannot reserve MoonViT patch output: ")
                         .is_some_and(|cause| !cause.is_empty())),
