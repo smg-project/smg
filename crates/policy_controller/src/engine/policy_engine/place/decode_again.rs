@@ -8,13 +8,14 @@
 //! prefill that was sent, and a decode by its place in the decode list its
 //! caller hands at this call. The targets are walked best first, and a
 //! decode is read once, by the one read a worker gets at a first placement
-//! ([`ready`]).
+//! ([`sendable`]): ready, and admitted by the route's own rule as the
+//! request states it at this call.
 
 use std::{sync::Arc, time::Instant};
 
 use smg_worker::identity::basic::Worker;
 
-use super::{picked, ready, Made, PlaceRequest, Unplaced};
+use super::{picked, sendable, Made, PlaceRequest, Unplaced};
 use crate::{
     engine::{
         decision_engine::{DecisionRefused, DecodeRefused, WorkerLists},
@@ -66,7 +67,9 @@ impl PolicyEngine {
                 worker.and(target.pair).map(|pair| pair.decode_id),
                 "the decode stands at the target's position"
             );
-            taken = worker.filter(|worker| ready(worker.as_ref())).cloned();
+            taken = worker
+                .filter(|worker| sendable(request, worker.as_ref()))
+                .cloned();
             taken.is_some()
         });
         match placed.map_err(Unplaced::Refused)? {

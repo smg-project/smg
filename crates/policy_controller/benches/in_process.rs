@@ -53,6 +53,8 @@ mod counting_alloc;
 mod pair;
 #[path = "in_process/place.rs"]
 mod place;
+#[path = "in_process/ruled.rs"]
+mod ruled;
 #[path = "in_process/signals.rs"]
 mod signals;
 
@@ -521,8 +523,9 @@ fn main() {
     let (publish, converted) = (|| feed.publish(&loads), || host.members.conversions());
     // The one call a host makes for a request, where the run asks it.
     if place::asked(&run, &host) {
+        let rule = ruled::stated(&run);
         measure(&run, engine, upkeep, publish, converted, |_| {
-            place::one(&host)
+            place::one(&host, rule)
         });
         return;
     }

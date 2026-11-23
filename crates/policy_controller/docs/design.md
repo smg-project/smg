@@ -1029,8 +1029,10 @@ pub struct PlaceRequest<'a> {
     pub budget_micros: u32,           // time left for the decision
     pub decode_again: bool,           // the caller asks a pair's decode again behind its prefill
     pub ring: Option<&'a dyn LentRing>, // the hash ring the caller keeps of the model's workers
-    // planned: `admits`, the route's own rule, asked of the pick
+    pub admits: Option<WorkerRule<'a>>, // the route's own rule, asked of the pick
 }
+
+pub type WorkerRule<'a> = &'a dyn Fn(&dyn Worker) -> bool;
 
 impl PolicyEngine {
     pub fn place<'a>(&'static self, request: &PlaceRequest<'a>) -> Result<Placement<'a>, Unplaced>;
@@ -1059,13 +1061,21 @@ targets best first: health and circuit breaker are read again, and the route's r
 the picked worker. If none holds, it decides again over what is left. The host sees a worker or a
 reason.
 
-Built so far, for a single request and for a pair over its two lists: the key, the hashes, one decision, and its targets tried
-best first by health and circuit breaker. Where none holds the request has no worker
-(`NoWorkers`), and a lease the pick was issued is given up at once. Planned: the route's rule,
-the decision made again over what is left and an encode request. `place`
+Built so far, for a single request and for a pair over its two lists: the key, the hashes, the decision, and its targets tried
+best first by health, circuit breaker and the route's rule. Where none holds, a lease the pick was issued is given up at once and the decision is made again, told to leave out the workers that could not be sent to, three decisions a call at most; then the request has no worker
+(`NoWorkers`). Planned: the later decisions held to the workers the rule takes
+and an encode request. `place`
 declines the last by name until then.
 
 A pair's target holds where both its workers can be sent to.
+
+A profile's `not-tried` filter leaves those workers out while another worker remains, and a
+profile that lists no such filter decides over the whole list again. Of a pair's target they are
+the sides that could not be sent to: a side that held stays a candidate. A worker the rule
+refuses is left out like one that is not ready. Until the later decisions are held to the
+workers the rule takes, a request whose rule takes few workers can have no worker though its list
+holds one the rule takes: where three decisions' picks are all refused, where that worker is
+overloaded and a refused one is not, and where an earlier attempt tried it.
 
 A retry stays on its wire by its demand alone. The host gives one number to each runtime and
 transport it dials. It writes that number as each worker's fact and as the retry's demand, and
@@ -1581,7 +1591,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) is replayed by nothing |
 | Encode-prefill-decode on that engine | **[partly]** | `PolicyEngine::decide_encode_at` decides it over a host's three lists and issues the pair's lease; it declines a request held to a wire that one worker of the three lists is not dialed on, and one that asks images of its decode and states the later decode; `place` does not take it |
 | The lease and its events; the guard | **[built]** | |
-| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request and for a pair with one decision; `place` for an encode request, the decision made again over what is left and the start call are not |
+| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request and for a pair, with the route's rule and the decision made again, three decisions a call at most; `place` for an encode request, the later decisions held to the workers the route's rule takes and the start call are not |
 | The crate's bench of the kept engine | **[planned]** | |
 | The gateway as a host | **[planned]** | section 9; the earlier integration, still on main, is taken out first (stage 0) |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |

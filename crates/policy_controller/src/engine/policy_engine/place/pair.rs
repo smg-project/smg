@@ -1,12 +1,15 @@
-//! A pair's request placed: one decision over its caller's two lists, and
-//! the first of its targets both of whose workers can be sent to.
+//! A pair's request placed: a decision over its caller's two lists, and
+//! the first of its targets both of whose workers can be sent to. Where no
+//! target holds, the call decides again as a single request's does
+//! ([`place`]).
 //!
 //! A pair's target names a prefill by its place in the prefill list and a
 //! decode by its place in the decode list ([`PairLists`]). The targets are
 //! walked as a single request's are ([`walk`]), over two workers a target:
 //! each side is read once, by the one read a single request's worker gets
-//! ([`ready`]). A target one of whose sides cannot be sent to is passed
-//! over whole, and the next is asked.
+//! ([`sendable`]): ready, and admitted by the route's own rule. A target
+//! one of whose sides cannot be sent to is passed over whole, and the next
+//! is asked.
 //!
 //! Which workers pair is the caller's word: the classes its lists carry
 //! ([`PartnerClasses`](crate::engine::PartnerClasses)). A decision names no
@@ -14,13 +17,13 @@
 
 use std::{sync::Arc, time::Instant};
 
-use super::{decide, ready, walk, Made, PlaceRequest, Unplaced};
+use super::{decide, sendable, walk, Call, Made, PlaceRequest, Unplaced};
 use crate::{
     engine::{
-        decision_engine::Decided,
+        decision_engine::{Decided, DecisionRefused},
         policy_engine::{PolicyEngine, PoolMembers},
         prefills_full,
-        view::{Phase, WorkerId},
+        view::Phase,
         PairLists,
     },
     tracking::Placement,
@@ -36,36 +39,40 @@ fn decode_label(engine: &PolicyEngine, model: &str) -> &'static str {
     position.map_or("", |position| engine.label_at(position))
 }
 
-/// One ask for a pair over `lists`, the two lists its caller handed with
-/// their pair classes: one decision told to leave `missed` out, and the
-/// first of its targets both of whose workers can be sent to.
+/// One ask of `call` for a pair over `lists`, the two lists its caller
+/// handed with their pair classes: one decision told to leave out the
+/// workers the call missed so far ([`Call::missed`]), and the first of its
+/// targets both of whose workers can be sent to.
 ///
 /// The placement names the request's routing value, and the profile of its
 /// decode side by its label ([`decode_label`]).
 ///
 /// `None` where no target holds. The decision is then given up by name,
-/// and each side that could not be sent to joins `missed` by its own id: a
-/// prefill's or a decode's, never the pair as a whole. The side that held
-/// stays a candidate of the next ask.
+/// and each side that could not be sent to joins the call's missed
+/// workers by its own id: a prefill's or a decode's, never the pair as a
+/// whole. The side that held stays a candidate of the next ask.
 ///
 /// # Errors
 ///
 /// The decision's shed, its queue or its refusal. Prefills that are all at
 /// the caller's admission limit shed the decision under the capacity
 /// filter's name ([`prefills_full`]): that is no refusal, and the answer is
-/// [`Unplaced::PrefillsFull`], on which the caller waits for room.
+/// [`Unplaced::PrefillsFull`], on which the caller waits for room. A place
+/// answered for a pair is the engine's fault
+/// ([`DecisionRefused::Faulted`]): no ask after it would leave anything
+/// new out.
 pub(super) fn ask<'a>(
     engine: &'static PolicyEngine,
     request: &PlaceRequest<'a>,
     lists: &PairLists<'_>,
-    missed: &mut Vec<WorkerId>,
+    call: &mut Call,
 ) -> Result<Option<Placement<'a>>, Unplaced> {
-    let made = Made::new(engine, request, missed);
+    let made = Made::asked(engine, request, call);
     let (decided, dated) = decide(engine, &made).map_err(Unplaced::Refused)?;
     let key = made.key();
     // A pair's decision is whole: no one pick decides a place of two lists.
     let Decided::Whole(decided, later) = decided else {
-        return Ok(None);
+        return Err(Unplaced::Refused(DecisionRefused::Faulted));
     };
     if prefills_full(&decided.decision) {
         return Err(Unplaced::PrefillsFull);
@@ -73,9 +80,9 @@ pub(super) fn ask<'a>(
     let now = dated.unwrap_or_else(Instant::now);
     let side = |list: &PoolMembers, place: u32| {
         let worker = list.workers().get(place as usize)?;
-        ready(worker.as_ref()).then(|| Arc::clone(worker))
+        sendable(request, worker.as_ref()).then(|| Arc::clone(worker))
     };
-    let placement = walk(engine, decided, later, now, missed, |target| {
+    let placement = walk(engine, decided, later, now, &mut call.missed, |target| {
         // A target with no decode side is no pair: it names nobody.
         let pair = target.pair.ok_or([None; 2])?;
         let prefill = side(lists.prefill, target.position);
@@ -93,4 +100,25 @@ pub(super) fn ask<'a>(
         placement.decode_profile = Some(decode_label(engine, request.model));
         placement
     }))
+}
+
+/// The asks of one call for a pair over `lists` ([`ask`]): where no target
+/// of an ask holds, the call's next ask answers in its place, three asks a
+/// call at most ([`Call::again`]), and no worker for the request behind the
+/// last.
+///
+/// # Errors
+///
+/// What an ask answers, and [`Unplaced::NoWorkers`] where no target of the
+/// call's last ask holds.
+pub(super) fn place<'a>(
+    engine: &'static PolicyEngine,
+    request: &PlaceRequest<'a>,
+    lists: &PairLists<'_>,
+    call: &mut Call,
+) -> Result<Placement<'a>, Unplaced> {
+    match ask(engine, request, lists, call)? {
+        Some(placement) => Ok(placement),
+        None => call.again(|call| place(engine, request, lists, call)),
+    }
 }
