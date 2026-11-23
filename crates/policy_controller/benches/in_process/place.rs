@@ -17,15 +17,17 @@ use smg_policy_controller::{
     tracking::{Outcome, Placement, Side, TransportClass},
 };
 
-use super::{Host, Run, MODEL};
+use super::{ruled, Host, Run, MODEL};
 
 /// The prompt a request by the one call states: 1,024 token ids, the size
 /// the plain request states.
 static PROMPT: [u32; 1_024] = [0; 1_024];
 
-/// The entry `value` names: `decide_at`, the engine's entry, or `place`.
+/// The entry `value` names: `decide_at`, the engine's entry, `place`, or
+/// `place` with a rule ([`ruled::ENTRY`]).
 pub(super) fn named(value: &str) -> String {
-    assert!(matches!(value, "decide_at" | "place"), "no entry {value}");
+    let known = matches!(value, "decide_at" | "place" | ruled::ENTRY);
+    assert!(known, "no entry {value}");
     value.to_owned()
 }
 
@@ -37,7 +39,7 @@ static ASKED: AtomicBool = AtomicBool::new(false);
 /// model, a list and a prompt's size: a cell whose request carries a key is
 /// not asked through it, and the run stops on one.
 pub(super) fn asked(run: &Run, host: &Host) -> bool {
-    if run.entry != "place" {
+    if run.entry != "place" && run.entry != ruled::ENTRY {
         return false;
     }
     let keyed = (host.request)(0).facts.session_key != Identity::NONE;
@@ -53,13 +55,15 @@ pub(super) fn asked(run: &Run, host: &Host) -> bool {
 /// plain request's size, and the dispatch and the end said of a placement
 /// that owes them. The answer stays where the call wrote it: a placement
 /// is not moved. The call answers a worker and no place of the list, so
-/// the place this says is the first.
-pub(super) fn one(host: &Host) -> Option<u32> {
+/// the place this says is the first. With `rule` the request states a
+/// route's rule ([`ruled::admits`]).
+pub(super) fn one(host: &Host, rule: bool) -> Option<u32> {
     let request = PlaceRequest {
         prompt: Prompt {
             tokens: Some(&PROMPT),
             ..Prompt::NONE
         },
+        admits: ruled::admits(rule),
         ..PlaceRequest::of(MODEL, WorkerLists::Single(&host.members))
     };
     let mut answer = host.engine.place(&request);
@@ -92,7 +96,7 @@ fn said(placement: &mut Placement<'_>) {
 /// the run's requests went through.
 pub(super) fn word() -> &'static str {
     if ASKED.load(Ordering::Relaxed) {
-        " entry=place"
+        ruled::word().unwrap_or(" entry=place")
     } else {
         " entry=decide_at"
     }

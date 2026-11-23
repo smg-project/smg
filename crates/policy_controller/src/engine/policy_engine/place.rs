@@ -19,8 +19,12 @@
 //!   ([`RequestMaker::plain`]): such a request is not made at all.
 //!
 //! The engine then decides, and takes the first target of the decision that
-//! can be sent to ([`ready`]). The caller is answered a [`Placement`], which
-//! it keeps with the request, or the reason there is none ([`Unplaced`]).
+//! can be sent to: ready ([`ready`]), and admitted by its route's own rule
+//! ([`PlaceRequest::admits`]). Where no target of a decision can be sent
+//! to, the engine decides again with the workers it could not send to
+//! excluded, three decisions a call at most ([`ASKS`]). The caller is
+//! answered a [`Placement`], which it keeps with the request, or the reason
+//! there is none ([`Unplaced`]).
 //!
 //! A request with a pair's two lists is placed the same way, a target at a
 //! time over both its workers ([`pair`]).
@@ -39,6 +43,7 @@ use std::{
     collections::hash_map::RandomState,
     fmt,
     hash::BuildHasher,
+    panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     sync::Arc,
     thread,
     time::Instant,
@@ -144,12 +149,21 @@ impl fmt::Debug for Prompt<'_> {
     }
 }
 
+/// A route's own rule for a worker: whether the worker can take the
+/// request, by what the route alone knows of the two
+/// ([`PlaceRequest::admits`]).
+pub type WorkerRule<'a> = &'a dyn Fn(&dyn Worker) -> bool;
+
 /// What a caller states of one request.
 ///
 /// Every field is the caller's own reading of its request. A caller names
 /// the fields it holds over [`PlaceRequest::of`], which states nothing
 /// else:
 /// `PlaceRequest { streaming: true, tried: &tried, ..PlaceRequest::of(model, lists) }`.
+///
+/// A request is not [`Send`]: its headers and its route's rule are borrowed
+/// as their caller holds them, and neither is asked to be [`Sync`]. A
+/// caller makes one for each call, between two awaits.
 pub struct PlaceRequest<'a> {
     /// The model the request is for, as its caller resolved it.
     pub model: &'a str,
@@ -203,13 +217,21 @@ pub struct PlaceRequest<'a> {
     /// keys. Under any other document the ring is asked nothing. `None`
     /// from a caller that keeps no ring: the stage places by its own.
     pub ring: Option<&'a dyn LentRing>,
+    /// The route's own rule for a worker its request may be sent to, and
+    /// `None` for a route that has none. It is asked of a worker the engine
+    /// picked and never of the list: a request whose first pick it admits
+    /// pays one call of it, and a pair's request one for each of its two
+    /// workers. A worker it refuses is passed over like one that is not
+    /// ready. A rule that holds for every request of a route belongs to the
+    /// list its caller hands.
+    pub admits: Option<WorkerRule<'a>>,
 }
 
 impl<'a> PlaceRequest<'a> {
     /// A first attempt for `model` over `lists` that states no other fact:
     /// no prompt, no header, no id, no tenant, no media, no demand, no
-    /// encode item, nothing tried, no budget, no second ask of a decode
-    /// and no ring.
+    /// encode item, nothing tried, no budget, no second ask of a decode, no
+    /// ring and no rule of its route.
     #[must_use]
     pub fn of(model: &'a str, lists: WorkerLists<'a>) -> Self {
         Self {
@@ -230,6 +252,7 @@ impl<'a> PlaceRequest<'a> {
             budget_micros: 0,
             decode_again: false,
             ring: None,
+            admits: None,
         }
     }
 
@@ -276,6 +299,9 @@ pub(super) struct Made<'r, 'a> {
     /// The prompt's block hashes, made at the request's first making and
     /// borrowed by each one after it.
     hashes: OnceCell<PromptHashes>,
+    /// The cell of the call the request is asked in ([`Call`]): the hashes
+    /// are then made in it, once a call, and `hashes` stays empty.
+    of_call: Option<&'r OnceCell<PromptHashes>>,
     /// The headers of the document's view that the request carries, made
     /// at the request's first making like the hashes.
     headers: OnceCell<Vec<Header<'a>>>,
@@ -300,9 +326,26 @@ impl<'r, 'a> Made<'r, 'a> {
             request,
             missed,
             hashes: OnceCell::new(),
+            of_call: None,
             headers: OnceCell::new(),
             key: Cell::new(None),
             place: OnceCell::new(),
+        }
+    }
+
+    /// `request` for one ask of `call`: its decision leaves out the targets
+    /// the call missed so far, and borrows the prompt's hashes where an
+    /// earlier ask of the call made them. The headers of the document's
+    /// view and the key's place on a lent ring are made again by each ask
+    /// that makes the request: a later ask is the call's cold path.
+    pub(super) fn asked(
+        engine: &'a PolicyEngine,
+        request: &'r PlaceRequest<'a>,
+        call: &'r Call,
+    ) -> Self {
+        Self {
+            of_call: Some(&call.hashes),
+            ..Self::new(engine, request, call.missed.as_slice())
         }
     }
 
@@ -399,7 +442,7 @@ impl RequestMaker for Made<'_, '_> {
         };
         let (tokens, text) = (request.prompt.tokens, request.prompt.text);
         if tokens.is_some() || text.is_some() {
-            let hashes = self.hashes.get_or_init(|| {
+            let hashes = self.of_call.unwrap_or(&self.hashes).get_or_init(|| {
                 self.engine
                     .prompt_hashes(request.model, tokens, text, request.prompt.seeds)
             });
@@ -474,13 +517,18 @@ pub enum Unplaced {
     /// is not refused: its caller waits for a prefill's room and places
     /// it again. A document with no capacity filter never answers this.
     PrefillsFull,
-    /// The decision named workers and none of its targets can be sent to
-    /// now: a target holds where its worker, and a pair's decode beside
-    /// it, is ready and let through by its circuit breaker. A caller
-    /// answers that it has no worker for the request.
+    /// The call's decisions named workers and none of their targets can be
+    /// sent to now: a target holds where its worker, and a pair's decode
+    /// beside it, is ready, let through by its circuit breaker and admitted
+    /// by its route's rule. A caller answers that it has no worker for the
+    /// request. The answer does not say whether the rule refused the picks
+    /// or they were not ready: a caller that answers the two apart reads
+    /// its list itself.
     NoWorkers,
-    /// The engine made no decision, for the reason it carries. A caller
-    /// answers that it cannot place the request now.
+    /// The engine refused the call's last decision, for the reason it
+    /// carries: it made none in its place. Where the call decided again,
+    /// the decisions it gave up stand behind this one. A caller answers
+    /// that it cannot place the request now.
     Refused(DecisionRefused),
 }
 
@@ -491,6 +539,19 @@ pub enum Unplaced {
 pub(super) fn ready(worker: &dyn Worker) -> bool {
     let state = worker.routing_state();
     state.healthy && state.can_execute
+}
+
+/// Whether the route's own rule admits `worker` ([`PlaceRequest::admits`]):
+/// every worker, for a request that states none.
+fn admitted(request: &PlaceRequest<'_>, worker: &dyn Worker) -> bool {
+    request.admits.is_none_or(|admits| admits(worker))
+}
+
+/// Whether `request` can be sent to `worker` now: the worker is ready
+/// ([`ready`]) and its route's own rule admits it. The rule is asked of a
+/// worker that is ready, and of no other.
+pub(super) fn sendable(request: &PlaceRequest<'_>, worker: &dyn Worker) -> bool {
+    ready(worker) && admitted(request, worker)
 }
 
 /// What a request that carries encode items is declined under.
@@ -558,9 +619,15 @@ pub(super) type Sides = (Arc<dyn Worker>, Option<Arc<dyn Worker>>);
 /// filter does so while another worker is left, and steps aside where
 /// none is.
 ///
+/// What `sides` asks can panic, a route's own rule among it. A decision
+/// that is leased is then given up by name, and the panic goes on to the
+/// caller: a walk leaves no lease behind. A decision that is not leased
+/// owes nothing, and its targets are asked with nothing between.
+///
 /// # Errors
 ///
 /// The decision's shed or its queue ([`picked`]).
+#[inline]
 pub(super) fn walk<'a>(
     engine: &'static PolicyEngine,
     decided: DecideOutcome,
@@ -571,16 +638,26 @@ pub(super) fn walk<'a>(
 ) -> Result<Option<Placement<'a>>, Unplaced> {
     let pick = picked(&decided.decision)?;
     let mut failed = [[None; 2]; MAX_TARGETS];
-    let mut held = None;
-    for (index, target) in pick.targets.iter().enumerate() {
-        match sides(target) {
-            Ok(sides) => {
-                held = Some((index, sides));
-                break;
+    let mut ask = || {
+        for (index, target) in pick.targets.iter().enumerate() {
+            match sides(target) {
+                Ok(sides) => return Some((index, sides)),
+                Err(ids) => failed[index] = ids,
             }
-            Err(ids) => failed[index] = ids,
         }
-    }
+        None
+    };
+    let held = if decided.lease.is_some() {
+        match catch_unwind(AssertUnwindSafe(ask)) {
+            Ok(held) => held,
+            Err(panic) => {
+                give_up(engine, decided, later, now);
+                resume_unwind(panic)
+            }
+        }
+    } else {
+        ask()
+    };
     let Some((index, (worker, decode))) = held else {
         give_up(engine, decided, later, now);
         for id in failed.into_iter().flatten().flatten() {
@@ -610,19 +687,78 @@ pub(super) fn give_up(
     }
 }
 
-/// One decision for a single request over `members`, the list its caller
-/// handed, and the first of its targets that can be sent to.
+/// The asks of one call at most: the first, and two more that leave out the
+/// workers the call could not send to. An ask is one decision of the call
+/// and the walk of its targets.
+const ASKS: usize = 3;
+
+/// What one ask of a call hands on to the next.
+#[derive(Default)]
+pub(super) struct Call {
+    /// The workers the call's asks named that could not be sent to, each
+    /// once, by the id the list's records name it by: a single request's
+    /// targets, and each side of a pair's by its own. The next ask's
+    /// decision excludes them ([`Constraints::excluded`]): the profile's
+    /// `not-tried` filter passes them over while another worker remains.
+    pub(super) missed: Vec<WorkerId>,
+    /// The prompt's block hashes, made at the call's first making: a prompt
+    /// is hashed once a call, however many asks the call takes.
+    hashes: OnceCell<PromptHashes>,
+    /// The asks of the call that took no target.
+    spent: usize,
+}
+
+impl Call {
+    /// What an ask answers where no target of its decision can be sent to:
+    /// the answer of `ask`, the call's next ask, while the call has an ask
+    /// left, and no worker for the request ([`Unplaced::NoWorkers`]) behind
+    /// its last, [`ASKS`] asks a call at most. The next ask answers in this
+    /// one's place, and a request whose first ask takes a target pays for no
+    /// other.
+    #[cold]
+    pub(super) fn again<'a>(
+        &mut self,
+        ask: impl FnOnce(&mut Self) -> Result<Placement<'a>, Unplaced>,
+    ) -> Result<Placement<'a>, Unplaced> {
+        self.spent += 1;
+        if self.spent < ASKS {
+            ask(self)
+        } else {
+            Err(Unplaced::NoWorkers)
+        }
+    }
+}
+
+/// The id the list's records name the worker at `place` by
+/// ([`PoolMembers::records`]): the id a decision's filters compare. A list
+/// no decision made records of yet gets them here, once a list, as the
+/// call's next decision would make them.
+fn named(engine: &PolicyEngine, members: Option<&PoolMembers>, place: u32) -> Option<WorkerId> {
+    let records = members?.records(&engine.spec, &engine.clock);
+    records.ids().get(place as usize).copied()
+}
+
+/// One ask for a single request over `members`, the list its caller handed:
+/// one decision, and the first of its targets that can be sent to
+/// ([`walk`], by [`sendable`]). Where none can, the decision is given up by
+/// name, its targets join the ones the call's next ask leaves out
+/// ([`Call::missed`]), and the call's next ask answers ([`Call::again`]).
 fn single<'a>(
     engine: &'static PolicyEngine,
     request: &PlaceRequest<'a>,
     members: Option<&PoolMembers>,
+    call: &mut Call,
 ) -> Result<Placement<'a>, Unplaced> {
-    let made = Made::new(engine, request, &[]);
+    let made = Made::asked(engine, request, call);
     let (decided, dated) = decide(engine, &made).map_err(Unplaced::Refused)?;
+    let key = made.key();
     let at = |place: u32| members?.workers().get(place as usize);
-    let mut placement = match decided {
+    // Each arm answers its own placement: a place's holds no decision, and
+    // is written without the room of one.
+    match decided {
         // The engine picked the place on the read of the worker that
-        // found it eligible: the worker is read no second time.
+        // found it eligible: the worker is read no second time, and its
+        // route's rule is asked of it.
         Decided::Alone(pick) => {
             let worker = at(pick.place).ok_or(Unplaced::NoWorkers)?;
             // A caller of this call states no worker id of its own: where
@@ -633,42 +769,87 @@ fn single<'a>(
                 stated.is_none_or(|rows| rows.ids()[pick.place as usize] == worker_id(&**worker)),
                 "a caller of `place` states no worker id of its own"
             );
-            Placement::alone(Arc::clone(worker), engine.label_at(pick.profile))
+            if !admitted(request, worker.as_ref()) {
+                let id = named(engine, members, pick.place).ok_or(Unplaced::NoWorkers)?;
+                call.missed.push(id);
+                return call.again(|call| single(engine, request, members, call));
+            }
+            let mut placement = Placement::alone(Arc::clone(worker), engine.label_at(pick.profile));
+            placement.routing_key = key;
+            Ok(placement)
         }
         Decided::Whole(decided, later) => {
             let now = dated.unwrap_or_else(Instant::now);
-            let pick = picked(&decided.decision)?;
-            let taken = pick.targets.iter().enumerate().find_map(|(index, target)| {
-                let worker = at(target.position)?;
-                ready(worker.as_ref()).then(|| (index, Arc::clone(worker)))
-            });
-            let Some((index, worker)) = taken else {
-                give_up(engine, decided, later, now);
-                return Err(Unplaced::NoWorkers);
+            let taken = walk(
+                engine,
+                decided,
+                later,
+                now,
+                &mut call.missed,
+                |target| match at(target.position) {
+                    Some(worker) if sendable(request, worker.as_ref()) => {
+                        Ok((Arc::clone(worker), None))
+                    }
+                    _ => Err([Some(target.id), None]),
+                },
+            )?;
+            let Some(mut placement) = taken else {
+                return call.again(|call| single(engine, request, members, call));
             };
-            Placement::taken(engine, decided, later, now, index, worker, None)
-                .ok_or(Unplaced::NoWorkers)?
+            placement.routing_key = key;
+            Ok(placement)
         }
-    };
-    placement.routing_key = made.key();
-    Ok(placement)
+    }
 }
 
 impl PolicyEngine {
     /// Places one request: decides it, and answers the worker it goes to
     /// as a [`Placement`] its caller keeps with the request.
     ///
-    /// The engine makes the request of what `request` states, decides it
-    /// once, and takes the first target of the decision that can be sent
-    /// to: ready, and let through by its circuit breaker. A request a
-    /// place answers is placed on the worker at that place, which the pick
-    /// itself read. The placement names the request's routing value where
-    /// the document derived one that leaves in the clear, and none for a
-    /// request a place answers: no fact of such a request is made.
+    /// The engine makes the request of what `request` states, decides it,
+    /// and takes the first target of the decision that can be sent to:
+    /// ready, let through by its circuit breaker, and admitted by its
+    /// route's own rule ([`PlaceRequest::admits`]). A request a place
+    /// answers is placed on the worker at that place, which the pick itself
+    /// read: the rule alone is asked of it. The placement names the
+    /// request's routing value where the document derived one that leaves
+    /// in the clear, and none for a request a place answers: no fact of
+    /// such a request is made.
     ///
-    /// A request with a pair's two lists is decided once over both, and the
-    /// first target both of whose workers can be sent to is taken: the
-    /// placement names the prefill as its worker and the decode beside it.
+    /// Where no target of a decision can be sent to, the engine decides
+    /// again with their workers excluded ([`Constraints::excluded`], which
+    /// a profile's `not-tried` filter honours while another worker
+    /// remains), three decisions a call at most, each given the request's
+    /// whole budget ([`PlaceRequest::budget_micros`]). Once the excluded
+    /// workers and the tried ones cover the list, the filter keeps them
+    /// all, and a later decision can name an excluded worker again.
+    ///
+    /// A worker the rule refuses is left out like one that is not ready.
+    /// The rule is asked of a decision's picks and never of the list, so a
+    /// request can be answered no worker while its list holds a worker the
+    /// rule takes: where three decisions' picks are all refused, where
+    /// that worker is overloaded and a worker the rule refuses is not, and
+    /// where an earlier attempt of the request tried it.
+    ///
+    /// A decision that is given up has written what its stages write as
+    /// they decide, and its release takes none of that back: the tokens a
+    /// `bucket` profile books on a worker a prefill decision listed, the
+    /// prompt's holder a `cache_aware` profile records, a new session's
+    /// claim of its worker.
+    ///
+    /// A decision whose later target is taken has written for its first
+    /// target all the same. A `cache_aware` profile records the prompt's
+    /// holder inside the decision, as the worker it picked first. A
+    /// placement on a later target tells that record nothing, and the next
+    /// decision does not learn that the rule refused the first: the
+    /// prompt's next request is drawn to the refused worker again.
+    ///
+    /// A request with a pair's two lists is placed the same way over both.
+    /// The first target both of whose workers can be sent to is taken, the
+    /// rule asked of each of the two: the placement names the prefill as
+    /// its worker and the decode beside it. Where no target holds, the
+    /// sides that could not be sent to are excluded, each by its own id,
+    /// and a side that held stays a candidate of the next decision.
     /// Which workers pair is the caller's word, in the classes its lists
     /// carry: no pair is tested here again. Prefills that are all at the
     /// caller's limit answer [`Unplaced::PrefillsFull`], on which the
@@ -715,19 +896,21 @@ impl PolicyEngine {
     ///
     /// # Errors
     ///
-    /// [`Unplaced`]: why the request has no worker. Where the decision
+    /// [`Unplaced`]: why the request has no worker. Where a decision
     /// named workers and none can be sent to, a lease it was issued is
-    /// given up at once, and the stages that take a release hear it.
+    /// given up at once, and the stages that take a release hear it, once
+    /// a decision. A route's rule that panics passes its panic to the
+    /// caller, behind the same release.
     pub fn place<'a>(&'static self, request: &PlaceRequest<'a>) -> Result<Placement<'a>, Unplaced> {
         if request.encode.is_some() {
             return Err(declined(ENCODE_ITEMS));
         }
         match request.lists {
-            WorkerLists::Pair(lists) => {
-                pair::ask(self, request, &lists, &mut Vec::new())?.ok_or(Unplaced::NoWorkers)
+            WorkerLists::Pair(lists) => pair::place(self, request, &lists, &mut Call::default()),
+            WorkerLists::Single(members) => {
+                single(self, request, Some(members), &mut Call::default())
             }
-            WorkerLists::Single(members) => single(self, request, Some(members)),
-            WorkerLists::None => single(self, request, None),
+            WorkerLists::None => single(self, request, None, &mut Call::default()),
             WorkerLists::Encode(_) => Err(declined(ENCODE_LISTS)),
         }
     }

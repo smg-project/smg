@@ -1,7 +1,7 @@
 mod pair;
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{BTreeSet, HashMap},
     ptr,
     time::{Duration, Instant},
@@ -851,10 +851,12 @@ fn the_first_target_that_can_be_sent_to_is_taken() {
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 
-/// Where none of the decision's targets can be sent to, the request has no
-/// worker, and the lease its pick was issued is given up by name at once.
-/// Under a document none of whose stages takes a word, no lease was issued
-/// and nothing is said.
+/// Where none of a decision's targets can be sent to, the lease its pick
+/// was issued is given up by name at once, and the call decides again.
+/// Over a list that holds no other worker the next decision names the same
+/// workers, and after three decisions, each given up by name, the request
+/// has no worker. Under a document none of whose stages takes a word, no
+/// lease was issued and nothing is said.
 ///
 /// The classic router answers no worker there too: its selection misses
 /// where no candidate is available
@@ -872,10 +874,7 @@ fn a_decision_no_target_of_which_can_be_sent_to_is_given_up_by_name() {
     let first = worker_id(list[0].as_ref());
     assert_eq!(
         heard.lock().as_slice(),
-        [
-            ("issued at 0".to_owned(), first),
-            ("released CommitFailed".to_owned(), first)
-        ]
+        [given_up(first), given_up(first), given_up(first)].concat()
     );
 
     let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
@@ -887,6 +886,239 @@ fn a_decision_no_target_of_which_can_be_sent_to_is_given_up_by_name() {
     let request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
     assert_eq!(quiet.place(&request).err(), Some(Unplaced::NoWorkers));
     assert_eq!((quiet.faults(), quiet.unheard()), (0, 0));
+}
+
+/// What a picker hears of a decision none of whose targets can be sent to:
+/// its issue and its release by name, on the decision's first target.
+fn given_up(first: WorkerId) -> [(String, WorkerId); 2] {
+    [
+        ("issued at 0".to_owned(), first),
+        ("released CommitFailed".to_owned(), first),
+    ]
+}
+
+/// Where no target of a decision can be sent to, the call decides again and
+/// leaves those targets out: the second decision names the workers behind
+/// the first one's, the third the workers behind the second's, and the
+/// first target that can be sent to is taken. A decision that takes no
+/// target is given up by name before the next is made. A worker the
+/// request's failed attempt was sent to is left out beside them.
+///
+/// The classic router has no pick to take back: it narrows a request's
+/// workers to the available ones ahead of its policy
+/// (`model_gateway/src/routers/common/placement.rs:536-539`, `:549-553`),
+/// and runs its selection once more where a worker came free (`:457-482`).
+#[test]
+fn a_call_decides_again_past_the_targets_it_could_not_send_to() {
+    let (engine, heard) = in_order(false);
+    let list = pool(14);
+    for worker in &list[..8] {
+        worker.set_status(WorkerStatus::NotReady);
+    }
+    let members = engine.pool_members(&list);
+    let id = |at: usize| worker_id(list[at].as_ref());
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+    let mut placement = engine.place(&request).expect("a placement");
+    assert!(Arc::ptr_eq(&placement.worker, &list[8]));
+    placement.sent(Side::Single);
+    let mut said = [given_up(id(0)), given_up(id(4))].concat();
+    said.push(("issued at 0".to_owned(), id(8)));
+    said.push(("dispatched at 0".to_owned(), id(8)));
+    assert_eq!(heard.lock().as_slice(), said);
+    drop(placement);
+    heard.lock().clear();
+
+    // A retry that tried the ninth worker is placed on the tenth.
+    let tried = [id(8)];
+    let retry = PlaceRequest {
+        attempt: 1,
+        tried: &tried,
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+    };
+    let placement = engine.place(&retry).expect("a placement");
+    assert!(Arc::ptr_eq(&placement.worker, &list[9]));
+    assert_eq!(
+        heard.lock()[..4],
+        [given_up(id(0)), given_up(id(4))].concat()
+    );
+    drop(placement);
+    assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+}
+
+/// A call makes three decisions at most. Over a list none of whose first
+/// twelve workers can be sent to, the three decisions name them four by
+/// four, each is given up by name, and the request has no worker. No fourth
+/// decision names the workers behind them.
+///
+/// The classic router bounds its selection too: one pass, and one more
+/// where a worker came free
+/// (`model_gateway/src/routers/common/placement.rs:457-482`).
+#[test]
+fn a_call_makes_three_decisions_at_most() {
+    let (engine, heard) = in_order(false);
+    let list = pool(16);
+    for worker in &list[..12] {
+        worker.set_status(WorkerStatus::NotReady);
+    }
+    let members = engine.pool_members(&list);
+    let id = |at: usize| worker_id(list[at].as_ref());
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+    assert_eq!(engine.place(&request).err(), Some(Unplaced::NoWorkers));
+    assert_eq!(
+        heard.lock().as_slice(),
+        [given_up(id(0)), given_up(id(4)), given_up(id(8))].concat()
+    );
+    assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+}
+
+/// The route's own rule is asked of the worker picked, and never of the
+/// list: a request whose first pick it admits pays one call of it, on the
+/// worker the request is placed on.
+///
+/// The classic router asks a request's rule of the candidates ahead of its
+/// policy (`model_gateway/src/routers/common/placement.rs:504-509`, over
+/// `:361-370`). Both send to no worker the rule refuses.
+#[test]
+fn the_routes_rule_is_asked_of_the_pick_and_never_of_the_list() {
+    let engine = hosted(preset("round_robin"));
+    let list = pool(8);
+    let members = engine.pool_members(&list);
+    let asked = RefCell::new(Vec::new());
+    let admits = |worker: &dyn Worker| {
+        asked.borrow_mut().push(worker_id(worker));
+        true
+    };
+    let request = PlaceRequest {
+        admits: Some(&admits),
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+    };
+    for turn in 1..=8 {
+        let placement = engine.place(&request).expect("a placement");
+        assert_eq!(asked.borrow().len(), turn, "one call a request");
+        assert_eq!(asked.borrow().last(), Some(&placement.id()));
+    }
+}
+
+/// A worker the route's rule refuses is passed over like one that is not
+/// ready, and no request is placed on it. A place's worker the rule refuses
+/// is left out of the call's next decision, by the id the list's records
+/// name it by, and the rule is asked of it no second time while the list
+/// holds a worker the call has not named. A whole decision's targets are
+/// asked best first, the rule of a worker that is ready and of no other,
+/// and where the rule refuses them all the call decides again past them.
+///
+/// The classic router sends to no worker its request's rule refuses either:
+/// it narrows the candidates by the rule ahead of its policy
+/// (`model_gateway/src/routers/common/placement.rs:504-509`).
+#[test]
+fn a_worker_the_routes_rule_refuses_is_passed_over() {
+    // A place: the list's first worker is the pick of every plain request,
+    // and the rule takes the sixth alone. The refused place is left out of
+    // the call's next decision, a whole one that names the four workers
+    // behind it; the third names the sixth. Were the place not left out,
+    // the second decision would name it first again.
+    let engine = hosted(preset("passthrough"));
+    let list = pool(6);
+    let members = engine.pool_members(&list);
+    let id = |at: usize| worker_id(list[at].as_ref());
+    let sixth = id(5);
+    let asked = RefCell::new(Vec::new());
+    let admits = |worker: &dyn Worker| {
+        asked.borrow_mut().push(worker_id(worker));
+        worker_id(worker) == sixth
+    };
+    let request = PlaceRequest {
+        admits: Some(&admits),
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+    };
+    let placement = engine.place(&request).expect("a placement");
+    assert!(Arc::ptr_eq(&placement.worker, &list[5]));
+    assert_eq!(*asked.borrow(), [id(0), id(1), id(2), id(3), id(4), id(5)]);
+
+    // A whole decision: the first worker is not ready, and the rule takes
+    // the sixth alone.
+    let (engine, heard) = in_order(false);
+    let list = pool(8);
+    list[0].set_status(WorkerStatus::NotReady);
+    let members = engine.pool_members(&list);
+    let id = |at: usize| worker_id(list[at].as_ref());
+    let sixth = id(5);
+    let asked = RefCell::new(Vec::new());
+    let admits = |worker: &dyn Worker| {
+        asked.borrow_mut().push(worker_id(worker));
+        worker_id(worker) == sixth
+    };
+    let request = PlaceRequest {
+        admits: Some(&admits),
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+    };
+    let mut placement = engine.place(&request).expect("a placement");
+    assert!(Arc::ptr_eq(&placement.worker, &list[5]));
+    assert_eq!(*asked.borrow(), [id(1), id(2), id(3), id(4), id(5)]);
+    placement.sent(Side::Single);
+    let mut said = given_up(id(0)).to_vec();
+    said.push(("issued at 0".to_owned(), id(4)));
+    said.push(("dispatched at 1".to_owned(), id(5)));
+    assert_eq!(heard.lock().as_slice(), said);
+}
+
+/// What this call does not do yet: read the list by the route's rule. Where
+/// the rule takes one worker and three decisions name twelve others ahead
+/// of it, the request has no worker, though its list holds one the rule
+/// takes. The classic router places such a request: it narrows the list by
+/// the rule ahead of its policy
+/// (`model_gateway/src/routers/common/placement.rs:504-509`).
+#[test]
+fn a_worker_the_rule_takes_behind_three_decisions_picks_is_not_found_yet() {
+    let (engine, heard) = in_order(false);
+    let list = pool(16);
+    let members = engine.pool_members(&list);
+    let id = |at: usize| worker_id(list[at].as_ref());
+    let far = id(14);
+    let admits = |worker: &dyn Worker| worker_id(worker) == far;
+    let request = PlaceRequest {
+        admits: Some(&admits),
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+    };
+    assert_eq!(engine.place(&request).err(), Some(Unplaced::NoWorkers));
+    assert_eq!(
+        heard.lock().as_slice(),
+        [given_up(id(0)), given_up(id(4)), given_up(id(8))].concat()
+    );
+}
+
+/// An ask is made of what its call's earlier asks handed on: the targets
+/// they could not send to are left out of its decision, so it is not plain,
+/// and the prompt's blocks are the ones the call's first making hashed.
+#[test]
+fn an_ask_is_made_of_what_its_call_handed_on() {
+    let engine = preset("cache_aware");
+    let tokens = (0..600).collect::<Vec<u32>>();
+    let request = PlaceRequest {
+        prompt: Prompt {
+            tokens: Some(&tokens),
+            ..Prompt::NONE
+        },
+        ..PlaceRequest::of(MODEL, WorkerLists::None)
+    };
+    let mut call = Call::default();
+    let blocks = {
+        let first = Made::asked(&engine, &request, &call);
+        assert!(first.plain().is_some());
+        let facts = first.make(engine.spec()).facts;
+        assert!(!facts.block_hashes.is_empty());
+        facts.block_hashes.as_ptr()
+    };
+    assert!(call.hashes.get().is_some(), "hashed in the call's cell");
+    call.missed.push(WorkerId(3));
+    let again = Made::asked(&engine, &request, &call);
+    assert_eq!(again.plain(), None, "a missed target");
+    let made = again.make(engine.spec());
+    assert_eq!(made.constraints.excluded, [WorkerId(3)]);
+    assert!(
+        ptr::eq(made.facts.block_hashes.as_ptr(), blocks),
+        "hashed once a call"
+    );
 }
 
 /// A request with no worker is answered why. A decision's shed keeps its
