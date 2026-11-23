@@ -269,6 +269,10 @@ impl GenerationRequest for CompletionRequest {
         self.rid.as_deref()
     }
 
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.max_tokens
+    }
+
     fn is_stream(&self) -> bool {
         self.stream
     }

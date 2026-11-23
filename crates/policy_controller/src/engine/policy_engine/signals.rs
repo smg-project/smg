@@ -45,18 +45,25 @@
 //!
 //! [`SchedulerLoadSnapshot::named_values`]: smg_worker::worker::SchedulerLoadSnapshot::named_values
 //!
-//! **A limit: a worker object that stands for several ranks.** Its report
-//! states one sample instant for all its ranks. Where it pushes, the report
-//! lists each rank at that rank's latest record under the newest record's
-//! instant: a rank that stopped reporting would keep its last values under
-//! a new date for as long as another rank reports, and no maximum age would
-//! end them. Where it is polled, the answer carries the entries of the
-//! ranks that pushed meanwhile. A snapshot states no instant a rank. So the
-//! engine reads no named value of a report of several ranks: the worker
-//! reads as one with no value, and the signal's rule across ranks has
-//! nothing to make one. Where each rank is a row of the list, a worker
-//! object of its own, the row's report holds its rank alone: each rank's
-//! row reads its own values, however they arrive.
+//! **A worker object that stands for several ranks.** Its report lists
+//! each rank at that rank's latest record, and each rank's entry states its
+//! own sample instant
+//! ([`SchedulerLoadSnapshot::sampled_at`](smg_worker::worker::SchedulerLoadSnapshot::sampled_at)).
+//! The engine reads one value a name of such a report: its ranks' values
+//! made one as the signal declares across ranks, under the oldest sample
+//! among them. A rank that stopped reporting keeps its last values under
+//! its own last sample, so the signal's maximum age ends the worker's
+//! value there, whatever its other ranks report. The report is read where
+//! it lists as many ranks as the object's registration states it stands
+//! for: its width, with no rank of its own. A worker's pushed report counts
+//! the rows it holds, so the object's word is what says a rank is still to
+//! report. A report of several ranks is read of no other object, and a
+//! report that lists fewer ranks than it counts gives no value: the ranks
+//! it leaves out state nothing. A report of one rank is read as the
+//! worker's whole, so the first record of an object of several ranks
+//! stands for it until a second rank's record. Where each rank is a row of
+//! the list, a worker object of its own, the row's report holds its rank
+//! alone: each rank's row reads its own values, however they arrive.
 //!
 //! [`PoolRecords::cells`]: crate::engine::records::PoolRecords::cells
 

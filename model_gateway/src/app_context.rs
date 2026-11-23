@@ -1667,7 +1667,7 @@ mod tests {
         use openai_protocol::worker::RuntimeType;
 
         use crate::routers::common::{
-            placement::{select_single, PlacementInputs},
+            placement::{select_single, PlacementInputs, Stated},
             snapshot::{test_support::grpc_worker, RoutingPool},
         };
 
@@ -1702,6 +1702,7 @@ mod tests {
                 RoutingPool::GrpcPipelineRegular,
                 None,
                 inputs,
+                Stated::nothing,
             );
             placed.expect("a worker").into_worker().url().to_owned()
         };

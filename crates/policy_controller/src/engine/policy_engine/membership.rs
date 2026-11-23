@@ -78,7 +78,7 @@ use tokio::sync::broadcast::{
 use super::PolicyEngine;
 use crate::{
     engine::{
-        records::{stated_rank, stated_role, worker_id},
+        records::{stated_rank, stated_ranks, stated_role, worker_id},
         view::{FixedFacts, Role, WorkerId},
     },
     stages::Lifecycle,
@@ -187,8 +187,9 @@ struct Held {
 }
 
 /// What a telling of load reports reads of a joined worker
-/// ([`Follow::joined`]): its address, and its role and its rank as a list's
-/// record states them. Read off the worker's object where the follow takes
+/// ([`Follow::joined`]): its address, and its role, its rank and how many
+/// ranks it stands for, as a list's record states them. Read off the
+/// worker's object where the follow takes
 /// it, at the word of its join and again at a replacement and at a whole
 /// read. So a telling reads through no pointer the follow keeps: a host
 /// may hand the follow an object it keeps no longer than the call.
@@ -197,6 +198,10 @@ pub(super) struct Joined {
     pub(super) address: Box<str>,
     pub(super) role: Role,
     pub(super) dp_rank: u16,
+    /// How many ranks the worker object stands for ([`stated_ranks`]): a
+    /// report of several rows is told its named values where it lists
+    /// that many.
+    pub(super) ranks: usize,
     /// The sample instant of the report the stages were told last of this
     /// record: none until its first.
     pub(super) told_at: Cell<Option<Instant>>,
@@ -209,6 +214,7 @@ impl Joined {
             address: worker.url().into(),
             role: stated_role(spec),
             dp_rank: stated_rank(spec),
+            ranks: stated_ranks(spec),
             told_at: Cell::new(None),
         }
     }

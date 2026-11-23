@@ -2,9 +2,6 @@
 //! own list. Each decides through the engine's own entries, over two lists
 //! of worker objects and a load snapshot, and hands no cell.
 
-use smg_worker::{load::monitor::poll_group_once_for_test, worker::WorkerGroupKey};
-use tokio::{net::TcpListener, task::JoinSet};
-
 use super::*;
 use crate::engine::{
     pair_classes::PartnerClasses,
@@ -425,19 +422,6 @@ async fn each_rank_that_is_a_row_of_the_decode_list_reads_its_own_value() {
 const TWO_RANKS: &str = r#"{"loads":[
     {"dp_rank":0,"values":[{"name":"held","unit":"tokens","value":5.0}]},
     {"dp_rank":1,"values":[{"name":"held","unit":"tokens","value":7.0,"age_ms":200}]}]}"#;
-
-/// A polled engine at an address of its own, served for as long as the
-/// set that comes with the address is held: its load route answers
-/// `answer`, and it serves no other route.
-async fn polled_engine(answer: &'static str) -> (String, JoinSet<std::io::Result<()>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
-    let url = format!("http://{}", listener.local_addr().expect("its address"));
-    let route = axum::routing::get(move || async move { answer });
-    let routes = axum::Router::new().route("/v1/loads", route);
-    let mut served = JoinSet::new();
-    served.spawn(async move { axum::serve(listener, routes).await });
-    (url, served)
-}
 
 /// Each rank of a polled data-parallel engine that is a row of its own
 /// reads its own rank's values, on a single request's list and on a pair's

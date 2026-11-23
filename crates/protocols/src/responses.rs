@@ -4227,6 +4227,10 @@ impl GenerationRequest for ResponsesRequest {
         self.stream.unwrap_or(false)
     }
 
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.max_output_tokens
+    }
+
     fn get_model(&self) -> Option<&str> {
         Some(self.model.as_str())
     }

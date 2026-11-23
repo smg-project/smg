@@ -63,8 +63,11 @@
 //! document's names ([`ReportSignals`]), as a list's cells state them
 //! ([`stated_signals`]): one conversion, the signal's own unit, a value in
 //! range, and each value's own sample instant on the engine's decision
-//! clock. A name the report does not state reads none, and a report of
-//! several ranks states no named value, as a list's cells hold none of it.
+//! clock. A name the report does not state reads none. A report that is
+//! not the whole of its worker object states no named value, as a list's
+//! cells hold none of it: one that lists fewer ranks than it counts, and
+//! one of several rows that does not list as many as the object stands
+//! for.
 //! No age is tested here: a telling has no request's clock. Under any other
 //! document a report states none, and nothing is converted for it. The
 //! values stand in one row the task keeps, written again at each report:
@@ -180,7 +183,7 @@ impl PolicyEngine {
             let (row, sampled_at_micros) = stated_report(report, sampled_at, worker.role, clock);
             let signals = if self.document.signals {
                 let columns = self.document.spec.signal_columns();
-                stated_signals(report, sampled_at, columns, clock, cells)
+                stated_signals(report, sampled_at, worker.ranks, columns, clock, cells)
             } else {
                 ReportSignals::NONE
             };

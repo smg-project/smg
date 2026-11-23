@@ -113,16 +113,19 @@ fn narrow(count: i64) -> u32 {
 /// one rank, as a rank's own record and a scoped answer are, hands that
 /// rank's values as they are and allocates nothing.
 ///
-/// The report is read as one sample. A pushed record of a worker over
-/// several ranks is not one: its report lists each rank at its latest
-/// record.
+/// Each rank's entry is read as one sample. An entry that states its own
+/// sample instant is read at it
+/// ([`SchedulerLoadSnapshot::sampled_at`](smg_worker::worker::SchedulerLoadSnapshot::sampled_at)):
+/// the report a worker over several ranks pushes lists each rank at its
+/// latest record, and its one instant is its last record's, of whatever
+/// rank. An entry that states none is as old as its report.
 ///
-/// `sampled_at` is the sample instant of the report's row: a record's
-/// own, a polled answer's stamp, else the poll's start. A value is
-/// sampled then, less its own age where the report states one: the age
-/// is the engine's, as of the report it made. A polled value with no
-/// stamp is so never dated after its poll began, as its row is not. A
-/// stamped one is dated no later than its answer's receipt.
+/// `sampled_at` is the sample instant of the report: a record's own, a
+/// polled answer's stamp, else the poll's start. A value is sampled at
+/// its entry's instant, less its own age where the report states one:
+/// the age is the engine's, as of the report it made. A polled value
+/// with no stamp is so never dated after its poll began, as its row is
+/// not. A stamped one is dated no later than its answer's receipt.
 pub fn signal_values(
     report: &WorkerLoadResponse,
     columns: &[SignalColumn],
@@ -137,6 +140,7 @@ pub fn signal_values(
         // One rank: nothing is kept. Each declared name has a bit, set at
         // the name's first statement.
         [rank] if columns.len() <= u64::BITS as usize => {
+            let own = rank.sampled_at.unwrap_or(sampled_at);
             let mut read = 0u64;
             for stated in rank.named_values() {
                 let Some(at) = column_of(columns, &stated.name) else {
@@ -145,7 +149,7 @@ pub fn signal_values(
                 let bit = 1u64 << at;
                 if read & bit == 0 {
                     read |= bit;
-                    let sampled = sampled(&stated, sampled_at);
+                    let sampled = sampled(&stated, own);
                     each(&columns[at], &stated.unit, stated.value, sampled);
                 }
             }
@@ -155,11 +159,12 @@ pub fn signal_values(
     };
     let mut made: Vec<Option<Made>> = vec![None; columns.len()];
     for (nth, rank) in (0u32..).zip(ranks) {
+        let own = rank.sampled_at.unwrap_or(sampled_at);
         for stated in rank.named_values() {
             let Some(at) = column_of(columns, &stated.name) else {
                 continue;
             };
-            let sampled = sampled(&stated, sampled_at);
+            let sampled = sampled(&stated, own);
             let across = columns[at].across_ranks();
             Made::join(
                 &mut made[at],
@@ -181,7 +186,7 @@ fn column_of(columns: &[SignalColumn], name: &str) -> Option<usize> {
     found.ok()
 }
 
-/// When `stated` was sampled, by a report sampled at `sampled_at`: then,
+/// When `stated` was sampled, by an entry sampled at `sampled_at`: then,
 /// less the value's own age where the report states one.
 fn sampled(stated: &NamedValue, sampled_at: Instant) -> Instant {
     stated.age_ms.map_or(sampled_at, |age| {
@@ -518,6 +523,36 @@ mod tests {
         let scoped = scoped.expect("a report with ranks");
         let alone = made(&scoped, &columns, received);
         assert_eq!(alone, names.map(|name| value(name, "ms", 2.0, 50)));
+    }
+
+    /// Each rank's values are dated by the rank's own sample where its
+    /// entry states one, and by the report's where it states none: the
+    /// report here is sampled 50 ms before the receipt. A value's own age
+    /// counts back from its entry's sample. The worker's value stands
+    /// under the oldest of its ranks' samples. An entry's sample is not
+    /// held to its report's: one that is newer is read as it is.
+    #[test]
+    fn a_ranks_values_are_dated_by_its_own_sample_where_its_entry_states_one() {
+        let received = Instant::now() + Duration::from_secs(5);
+        let columns = columns(&[("total", "ms", AcrossRanks::Sum)]);
+        let own = |value, sampled_ago: Option<u64>, age| {
+            let mut rank = stating(vec![stated("total", "ms", value, age)]);
+            rank.sampled_at = sampled_ago.map(|ms| received - Duration::from_millis(ms));
+            rank
+        };
+        let total = |sum, age| [value("total", "ms", sum, age)];
+        // One rank, sampled 400 ms ago, its value 30 ms older.
+        let alone = report(vec![own(2.0, Some(400), Some(30))]);
+        assert_eq!(made(&alone, &columns, received), total(2.0, 430));
+        // One rank whose own sample is newer than its report's.
+        let newer = report(vec![own(2.0, Some(10), None)]);
+        assert_eq!(made(&newer, &columns, received), total(2.0, 10));
+        // Two ranks: the first sampled 400 ms ago, the second as old as the
+        // report. Then the second states the older sample.
+        let both = report(vec![own(2.0, Some(400), None), own(5.0, None, None)]);
+        assert_eq!(made(&both, &columns, received), total(7.0, 400));
+        let turned = report(vec![own(2.0, Some(10), None), own(5.0, Some(900), None)]);
+        assert_eq!(made(&turned, &columns, received), total(7.0, 900));
     }
 
     #[test]

@@ -250,6 +250,7 @@ impl Bed {
             RoutingPool::HttpRegular,
             None,
             inputs,
+            placement::Stated::nothing,
         );
         match picked {
             Some(worker) => {

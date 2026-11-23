@@ -52,7 +52,7 @@ use smg_worker::{
 };
 
 use super::{
-    placement::{select_pair, PairFailure, PlacedPair, PlacementFailure, PlacementInputs},
+    placement::{select_pair, PairFailure, PlacedPair, PlacementFailure, PlacementInputs, Stated},
     prefill_admission::{PrefillAdmission, PrefillAdmissionAttempt, PrefillSelectionContext},
 };
 use crate::{
@@ -322,6 +322,7 @@ impl Bed {
                 None,
                 None,
                 PlacementInputs::default(),
+                Stated::nothing,
             ));
         };
         let mut answer = None;
@@ -340,6 +341,7 @@ impl Bed {
                     None,
                     Some(capacity),
                     PlacementInputs::default(),
+                    Stated::nothing,
                 );
                 answer = Some(self.answer(&placed));
                 match placed {
