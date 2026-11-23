@@ -1500,7 +1500,8 @@ pub struct ResilienceUpdate {
     pub cb_success_threshold: Option<u32>,
     /// Seconds to wait before attempting half-open.
     pub cb_timeout_secs: Option<u64>,
-    /// Time window in seconds for failure counting.
+    /// A closed circuit's failure more than this many seconds after the last
+    /// one starts a new streak; 0 is no window.
     pub cb_window_secs: Option<u64>,
     /// Disable circuit breaker entirely for this worker.
     pub disable_circuit_breaker: Option<bool>,
