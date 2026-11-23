@@ -932,13 +932,18 @@ At start:
 
 | The host does | With |
 |---|---|
-| builds the engine from the document | `PolicyEngine::new(spec)` |
-| hands its index of cache events | `engine.affinity().set_indexes(indexes)`; the host implements `CacheIndexes` and `CacheIndex`. The same hand-over also lends the token tree, where the host keeps one (`CacheIndexes::token_tree`) |
+| starts the engine with its own data, once | `PolicyEngine::start(spec, WorkerData { registry, loads, cache_indexes })`. It builds the engine from the document and takes the host's worker registry (the host implements `Members`, and the worker crate's registry is one), its load monitor's channel and its indexes of cache events (the host implements `CacheIndexes` and `CacheIndex`). The same hand-over also lends the token tree, where the host keeps one (`CacheIndexes::token_tree`). A host with no load monitor or no index says `None`. It answers the engine, which lives as long as the process, and the engine's own task |
+| spawns the task the start answered, once | on a runtime of its choice, which needs its timer on: the upkeep once a second, the newest load snapshot kept at hand, and the follow of the registry, which tells the policies a worker that joined or was removed (the table below) |
 | keeps the engine's value beside each published worker list | `engine.pool_members(list)`, or `engine.pool_members_with_fixed_facts(list, facts_of)` where the host knows a fact of its workers that their objects do not hold |
-| hands its worker registry, once | `engine.set_registry(registry)`; the host implements `Members`, and the worker crate's registry is one. The engine's task then tells the policies a worker that joined or was removed, by the registry's events (the table below) |
-| or, where it hands no registry, tells the engine itself | `engine.forget(address)` when a worker is removed and `engine.joined(address)` when one joins; a removal and a registration at one address in that order |
-| hands its load monitor's channel | `engine.set_loads(channel)`, and again where it builds another monitor; an engine whose document reads no load report and no named signal keeps none |
-| spawns the engine's own task, once | `engine.run()`: the upkeep once a second, the newest load snapshot kept at hand, and the follow of the registry |
+| hands its load monitor's channel again where it builds another monitor | `engine.set_loads(channel)`; an engine whose document reads no load report and no named signal keeps none |
+
+A caller that builds its engine with `PolicyEngine::new(spec)`, as the crate's own cases and bench
+do over lists made by hand, makes each hand-over itself: `engine.set_registry(registry)`, or with
+no registry `engine.forget(address)` when a worker is removed and `engine.joined(address)` when
+one joins, a removal and a registration at one address in that order;
+`engine.affinity().set_indexes(indexes)`; `engine.set_loads(channel)`; and it spawns
+`engine.run()`. A host makes none of these calls but `engine.set_loads`, where it builds another
+load monitor.
 
 What the engine's task tells the policies at each event of the registry. It names a worker by the
 id the host states of it (`Members::facts_of`), which is the id the host's lists name it by; a
@@ -1024,23 +1029,26 @@ three things. The names below may change; the contract may not.
 **1. At start, hand over what it already has, once.**
 
 ```rust
-// planned
-let engine: &'static PolicyEngine = PolicyEngine::start(document, HostData {
-    lists: registry_lists,           // a small trait: for a model, its worker lists and the cell
-                                     // beside each list where the engine keeps its value
-    events: registry.subscribe(),    // membership events
-    loads: load_monitor.subscribe(), // the load monitor's channel
-    cache_indexes: kv_monitor,       // the host's indexes of cache events, as today
+// engine/policy_engine/start.rs
+let (engine, task) = PolicyEngine::start(spec, WorkerData {
+    registry,                              // the worker registry: the engine's task follows its events
+    loads: Some(load_monitor.subscribe()), // the load monitor's channel
+    cache_indexes: Some(kv_monitor),       // the host's indexes of cache events
 });
-runtime.spawn(engine.run());         // the engine's own background task
+runtime.spawn(task);                       // the engine's own background task
 ```
 
 The engine lives as long as the process, so a placement holds a plain reference to it.
 
+The start answers the task and the host spawns it on a runtime of its choice: the start spawns
+nothing. The call is marked `#[must_use]`, with the reason that the task does nothing until it is
+spawned. The start takes no worker lists: each request gives its own, and the engine's task reads
+none.
+
 The engine's background task does what a host did by hand. Three of its jobs are built
 (`PolicyEngine::run`): the upkeep once a second, and the newest load snapshot kept at hand,
 swapped when the monitor publishes one, so that a decision reads it without touching the
-channel. The third is a worker that joined or was removed told to the policies, read from the events of the registry the host hands (`engine.set_registry`, section 8.1). A host that
+channel. The third is a worker that joined or was removed told to the policies, read from the events of the registry the host hands at the start (section 8.1). A host that
 builds another load monitor hands its channel again (`engine.set_loads`): a channel ends with
 its monitor.
 
@@ -1269,7 +1277,7 @@ request ──> route (HTTP or gRPC, any family)
 ```
 
 - **Start.** One function builds the engine from the routing settings or a supplied document and
-  hands it the registry's events, the load monitor's channel and the cache-event monitor. With
+  hands it the worker registry, the load monitor's channel and the cache-event monitor. With
   the engine on, no classic policy object is built. So the start function owns the trees the
   engine is lent **[planned]**: it keeps them, runs their size pass on a timer and tells them a
   worker that left.
@@ -1649,7 +1657,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; five of its 40 lines are held to an answer of the crate's own |
 | Encode-prefill-decode on that engine | **[partly]** | `PolicyEngine::decide_encode_at` decides it over a host's three lists and issues the pair's lease; it declines a request held to a wire that one worker of the three lists is not dialed on, and one that asks images of its decode and states the later decode; `place` does not take it |
 | The lease and its events; the guard | **[built]** | |
-| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request and for a pair, with the route's rule and the decision made again, three decisions a call at most or a single request's fourth where the third found the workers the route's rule takes, and a single request's later decisions held to those workers; `place` for an encode request, a pair's later decisions held to them and the start call are not |
+| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request and for a pair, with the route's rule and the decision made again, three decisions a call at most or a single request's fourth where the third found the workers the route's rule takes, and a single request's later decisions held to those workers; `place` for an encode request and a pair's later decisions held to them are not |
 | The crate's bench of the kept engine | **[planned]** | |
 | The gateway as a host | **[planned]** | section 9; the earlier integration, still on main, is taken out first (stage 0) |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |
