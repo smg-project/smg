@@ -28,9 +28,9 @@
 //! the shutdown future resolves, then gives the lease up, settles, drains
 //! and returns.
 //!
-//! Every replica runs the same loop, the load driver included: a follower
-//! that waited for a leader's log nobody writes yet would be cold at its
-//! promotion. The standby turns a follower's polls into that log.
+//! Every replica runs the same loop, the load driver included. A follower
+//! polls no engine and is sent no load row: its first poll goes out at its
+//! promotion, and its decisions read no load report until that poll lands.
 //!
 //! Every socket a listener accepts is set to send at once: a small answer
 //! never waits for the peer's acknowledgement of the write before it.
@@ -920,11 +920,10 @@ impl Controller {
         ));
         let loads = driver.stats();
         let driver_stop = stop.subscribe();
-        // A replica that follows polls no engine: its applier is the load
-        // table's one writer then, and a poll's row between two of the
-        // leader's would take the place of the log the leader's next event
-        // needs. The loop itself runs on every replica: it pays the store's
-        // publications, so a followed row reaches the published world.
+        // A replica that follows polls no engine: it decides no request, and
+        // it is sent no load row. The loop itself runs on every replica: it
+        // pays the store's publications, so a followed row reaches the
+        // published world.
         let polls = follows.map(|_| shared.role.subscribe());
         tasks.spawn(async move {
             match polls {

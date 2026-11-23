@@ -314,9 +314,9 @@ impl Replication {
         ))
     }
 
-    /// The cut a standby is restored from, admitted under `term`: the rows,
-    /// the load rows and the log's place, read as one, shared with every
-    /// stream restored at that place ([`Kept`]). The place is `term`'s own:
+    /// The cut a standby is restored from, admitted under `term`: the rows
+    /// and the log's place, read as one, shared with every stream restored
+    /// at that place ([`Kept`]). The place is `term`'s own:
     /// where the term moved between the admission and the read, the stream
     /// ends `UNAVAILABLE`.
     pub(super) fn cut(&self, term: u64) -> Result<Arc<StoreCheckpoint>, Status> {
@@ -393,7 +393,7 @@ impl Replication {
     }
 }
 
-/// The cut of every kind at one place of the log: taken by the first stream
+/// The watched kinds' cut at one place of the log: taken by the first stream
 /// that is restored there, under the store's locks for the copy of its
 /// rows, and shared by every stream restored at that place while one still
 /// sends it. A cut is a place's, never a standby's, as a watch's is
@@ -1107,7 +1107,7 @@ mod tests {
     const STANDBY: &str = "controller-1";
 
     /// A replica that took a free lease of its own at `at`, and a store
-    /// that journals every kind.
+    /// that journals as a run's does under a shared lease.
     struct Leader {
         elector: Elector,
         store: Arc<MemoryStore>,

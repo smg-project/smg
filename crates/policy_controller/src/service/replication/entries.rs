@@ -76,13 +76,16 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         EntryReplication::Rebuilt("the gateways' reports of the last probe interval"),
     ),
     ("HealthSink", "completed_ok_since", EntryReplication::Read),
-    ("LoadSink", "record", EntryReplication::Journaled),
-    // A report's rows are journaled. Its word that no report came, which
-    // clears an engine's overload verdict, is in no entry and no cut: a
-    // standby holds the verdict of the engine's last rows until its own
-    // first poll.
-    ("LoadSink", "report", EntryReplication::Journaled),
-    ("LoadSink", "report_sampled", EntryReplication::Journaled),
+    // No log the controller builds carries a load row: a standby holds none
+    // of its leader's and no overload verdict. Its first poll goes out at
+    // its take.
+    ("LoadSink", "record", EntryReplication::Rebuilt(REPORTED)),
+    ("LoadSink", "report", EntryReplication::Rebuilt(REPORTED)),
+    (
+        "LoadSink",
+        "report_sampled",
+        EntryReplication::Rebuilt(REPORTED),
+    ),
     ("LoadSink", "poll_mode", EntryReplication::Read),
     // The report period is the load driver's own setting, told where the
     // driver is built: every replica builds its own.

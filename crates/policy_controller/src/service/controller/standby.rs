@@ -434,9 +434,9 @@ impl Lag {
     }
 }
 
-/// The lag a standby reads synced under: one load poll interval, the
-/// period its load rows are no staler than then, and never under two of
-/// the leader's heartbeats, which an idle stream's lag reaches by itself.
+/// The lag a standby reads synced under: one load poll interval, and never
+/// under two of the leader's heartbeats, which an idle stream's lag reaches
+/// by itself.
 /// The lag is the first of the counts synced reads (design 5.4): the live
 /// ranks and the generation narrow the same bit with their steps.
 pub(crate) fn synced_within(load_poll_interval: Duration) -> Duration {

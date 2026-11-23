@@ -26,14 +26,14 @@
 //! event joins them.
 //!
 //! Two readers follow the log, and each asks for its kinds
-//! ([`JournalKinds`](crate::store::JournalKinds)): a standby reads every kind,
-//! a watcher of the rows the watched kinds alone (membership, status, a term's
-//! start). The log keeps the watched kinds apart from the load rows, in a ring
-//! of their own in the one order of positions, so the load rows' churn lets no
-//! membership event go, and it tells one listener when the watched kinds grew,
-//! once the store that wrote has let its locks go ([`Log::on_watched`]). A log
-//! may carry the watched kinds alone: where no standby is served, a load write
-//! tells nothing.
+//! ([`JournalKinds`](crate::store::JournalKinds)): the controller's standby
+//! and a watcher of the rows both read the watched kinds alone (membership,
+//! status, a term's start). The log keeps the watched kinds apart from the
+//! load rows, in a ring of their own in the one order of positions, so the
+//! load rows' churn lets no membership event go, and it tells one listener
+//! when the watched kinds grew, once the store that wrote has let its locks
+//! go ([`Log::on_watched`]). A log may carry the watched kinds alone, as
+//! every log the controller builds does: a load write tells nothing there.
 //!
 //! What is here: the bounded log ([`Log`]) and the reads made of it
 //! ([`Log::holds`] for the place a reader brings from another connection or

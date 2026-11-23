@@ -3532,7 +3532,7 @@ mod hosted {
 
 /// A pair's case in this harness: a standby takes the fleet when its leader
 /// stops. Two controllers stand over one lease. The fleet registers at the
-/// leader, and the standby holds every rank ready with its load row, under
+/// leader, and the standby holds every rank ready and no load row, under
 /// the id the leader gave it, by the leader's log alone. The leader stops
 /// and the standby leads under a higher term. A gateway that turns to it
 /// is answered over the same rows: each routing key is back on the worker
@@ -3577,7 +3577,7 @@ async fn a_standby_takes_the_fleet_when_its_leader_stops() {
         .expect("the fleet turns ready");
 
         // The standby follows: the leader's log alone brings it every rank,
-        // ready, with a load row, under the id the leader gave it.
+        // ready, under the id the leader gave it, and no load row.
         within("the standby holds every rank of the fleet", ROOM, || {
             harness.followed(&standby) == Ok(ranks)
         })
