@@ -213,6 +213,8 @@ fn stores() -> Stores {
 ///
 /// The same persist handed its response copies none of the items' content:
 /// its bytes stay under half the content. (With the tree copied: once.)
+/// Handed spare room in its `output` and `tools` arrays, it makes one call
+/// more an array: each is moved to its length before the record keeps it.
 ///
 /// Linking a turn's items into a conversation copies each item's content
 /// twice more and not a third time: the output list the item records are
@@ -246,9 +248,14 @@ fn linking_a_turns_items_stores_each_once() {
     stored.expect("the response is stored");
 
     let (conversations, items, responses) = stores();
-    let owned = response("resp_owned");
+    let mut owned = response("resp_owned");
+    owned["tools"] = json!([{"type": "function", "name": "f"}]);
+    let mut roomy = owned.clone();
+    for array in ["output", "tools"] {
+        roomy[array].as_array_mut().expect("an array").reserve(8);
+    }
     let record_store = responses.clone();
-    let (stored, _, bytes_owned) = allocations_during(|| {
+    let (stored, calls_owned, bytes_owned) = allocations_during(|| {
         runtime.block_on(persist_conversation_items_owned(
             conversations,
             items,
@@ -261,6 +268,25 @@ fn linking_a_turns_items_stores_each_once() {
     });
     stored.expect("the response is stored");
     assert_eq!(record_store.stored_record_count(), Some(1));
+
+    let (conversations, items, responses) = stores();
+    let (stored, calls_roomy, _) = allocations_during(|| {
+        runtime.block_on(persist_conversation_items_owned(
+            conversations,
+            items,
+            responses,
+            roomy,
+            &request,
+            None,
+            None,
+        ))
+    });
+    stored.expect("the response is stored");
+    assert_eq!(
+        calls_roomy,
+        calls_owned + 2,
+        "allocation calls of the same persist handed spare room in `output` and `tools`"
+    );
 
     let (conversations, items, responses) = stores();
     let conversation = runtime

@@ -684,6 +684,13 @@ async fn persist_conversation_items_inner(
         // (at most one move of its slots, where the copy moved every node).
         outputs.shrink_to_fit();
     }
+    // The tool relay filters `tools` too (its hidden tools): drop that room as well.
+    if let Some(tools) = response_json
+        .get_mut("tools")
+        .and_then(|v| v.as_array_mut())
+    {
+        tools.shrink_to_fit();
+    }
 
     // Extract the response ID and read the (already-compacted) output array
     // in place before handing `response_json` to `build_stored_response`,

@@ -690,6 +690,10 @@ pub(crate) async fn persist_response_if_needed(
             .await
         } else {
             // Only a background persist comes round again: the store takes the tree.
+            debug_assert!(
+                !response_json.is_null(),
+                "a foreground persist runs once; its tree is taken"
+            );
             persist_conversation_items_owned(
                 conversation_storage.clone(),
                 conversation_item_storage.clone(),
