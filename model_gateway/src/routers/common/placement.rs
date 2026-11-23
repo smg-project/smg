@@ -23,7 +23,7 @@ use rand::RngExt;
 use smg_policy_controller::{
     engine::{PolicyEngine, PoolMembers, WorkerLists},
     policies::consistent_hashing::LentRing,
-    tracking::{Placement, Side},
+    tracking::{Placement, PlacementSide},
 };
 use smg_worker::{
     health::overload::{
@@ -400,39 +400,42 @@ pub(crate) fn accepted_by(
 /// none. It keeps the engine's placement to the request's end: the engine
 /// hears the dispatch where the guard is made and the end where the guard
 /// is dropped. It is told no outcome: the worker object has it.
+///
+/// A classic answer is the worker's handle and one empty word: that word is
+/// all a classic placement pays for the engine's side of this type.
 #[derive(Debug)]
 pub(crate) struct Placed {
     worker: Arc<dyn Worker>,
-    by: PickedBy,
+    /// What the request's load guard takes where the policy engine placed
+    /// the request. `None` for a worker a classic policy picked, or no
+    /// policy at all. `None` too for an answer of the engine whose guard is
+    /// the classic one: the engine names no routing value for the request
+    /// and is owed none of its events.
+    engine: Option<Box<ByEngine>>,
 }
 
-/// Who placed a request, and what its load guard takes from the answer.
+/// What a load guard takes from an answer of the policy engine.
 #[derive(Debug)]
-enum PickedBy {
-    /// A classic policy, or no policy at all. The guard counts the request
-    /// under its route's key.
-    Classic,
-    /// The policy engine.
-    Engine {
-        /// The engine's placement, where the engine is owed the request's
-        /// events, until the request's load guard takes it. One that no
-        /// guard took tells the engine a release where this answer is
-        /// dropped.
-        placement: Mutex<Option<Box<Placement<'static>>>>,
-        /// The routing value the engine names for the request, which the
-        /// guard counts it under. `None` where the engine names none: a
-        /// value it keeps as a fingerprint alone, a document that reads no
-        /// value. The guard then counts under its route's key.
-        routing_key: Option<Box<str>>,
-    },
+struct ByEngine {
+    /// The engine's side of the request, where the engine is owed the
+    /// request's events, until the request's load guard takes it. One that
+    /// no guard took tells the engine a release where the answer is
+    /// dropped.
+    side: Mutex<Option<Box<PlacementSide>>>,
+    /// The routing value the engine names for the request, which the guard
+    /// counts it under. `None` where the engine names none: a value it
+    /// keeps as a fingerprint alone, a document that reads no value. The
+    /// guard then counts under its route's key.
+    routing_key: Option<Box<str>>,
 }
 
 impl From<Arc<dyn Worker>> for Placed {
     /// A worker picked by a classic policy, or with no policy at all.
+    #[inline]
     fn from(worker: Arc<dyn Worker>) -> Self {
         Self {
             worker,
-            by: PickedBy::Classic,
+            engine: None,
         }
     }
 }
@@ -450,6 +453,7 @@ impl<W: Worker + 'static> From<Arc<W>> for Placed {
 impl Deref for Placed {
     type Target = dyn Worker;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         self.worker.as_ref()
     }
@@ -457,29 +461,35 @@ impl Deref for Placed {
 
 impl Placed {
     /// The answer for a request the policy engine placed. The routing value
-    /// is copied out of the request's own text. The placement is kept only
-    /// where the engine is owed the request's events: of every other answer
-    /// the engine hears nothing more.
+    /// is copied out of the request's own text. The engine's side of the
+    /// request is kept only where the engine is owed the request's events:
+    /// of every other answer the engine hears nothing more. An answer that
+    /// keeps neither is the answer of a classic pick.
     fn by_engine(placement: Placement<'_>) -> Self {
         let routing_key = placement.routing_key.map(Box::from);
         let placement = placement.kept();
-        let (worker, kept) = if placement.owes_events() {
-            (Arc::clone(&placement.worker), Some(Box::new(placement)))
+        let (worker, side) = if placement.owes_events() {
+            let worker = Arc::clone(&placement.worker);
+            (worker, Some(Box::new(placement.sides().0)))
         } else {
             (placement.worker, None)
         };
+        if side.is_none() && routing_key.is_none() {
+            return Self::from(worker);
+        }
         Self {
             worker,
-            by: PickedBy::Engine {
-                placement: Mutex::new(kept),
+            engine: Some(Box::new(ByEngine {
+                side: Mutex::new(side),
                 routing_key,
-            },
+            })),
         }
     }
 
     /// The placed worker's shared handle: the one call that hands it. A
     /// load guard made from the handle keeps no placement: the request's
     /// guard is made by [`Self::guard`].
+    #[inline]
     pub(crate) fn worker(&self) -> &Arc<dyn Worker> {
         &self.worker
     }
@@ -492,48 +502,47 @@ impl Placed {
     /// counted under the routing value the engine names, and under `key`
     /// where the engine names none: the count a classic policy that names
     /// no key leaves on the worker. The first guard made from an engine's
-    /// answer takes the engine's placement and tells the engine the
-    /// dispatch. A later one is a plain guard under the same value.
+    /// answer takes the engine's side of the request and tells the engine
+    /// the dispatch. A later one is a plain guard under the same value.
+    #[inline]
     pub(crate) fn guard(&self, key: Option<&str>) -> WorkerLoadGuard {
-        self.by.guard(Arc::clone(&self.worker), key)
+        let worker = Arc::clone(&self.worker);
+        match &self.engine {
+            None => WorkerLoadGuard::with_key(worker, key),
+            Some(engine) => engine.guard(worker, key),
+        }
     }
 
     /// [`Self::guard`] for a caller that keeps nothing else of the answer:
     /// the worker's handle moves into the guard.
+    #[inline]
     pub(crate) fn into_guard(self, key: Option<&str>) -> WorkerLoadGuard {
-        self.by.guard(self.worker, key)
+        match self.engine {
+            None => WorkerLoadGuard::with_key(self.worker, key),
+            Some(engine) => engine.guard(self.worker, key),
+        }
     }
 
     /// The worker alone, for a caller that sends it no request: a bench's
-    /// placement, a test. An engine's placement is let go here, which the
-    /// engine hears as a release. A route never calls this: it makes its
-    /// guard by [`Self::guard`].
+    /// placement, a test. An engine's side of the request is let go here,
+    /// which the engine hears as a release. A route never calls this: it
+    /// makes its guard by [`Self::guard`].
+    #[inline]
     pub(crate) fn into_worker(self) -> Arc<dyn Worker> {
         self.worker
     }
-
-    /// NOT FOR MAIN: [`Self::into_worker`] for a route that does not make
-    /// its load guard from the answer yet. The call leaves with its last
-    /// caller.
-    pub(crate) fn worker_alone_for_now(self) -> Arc<dyn Worker> {
-        self.into_worker()
-    }
 }
 
-impl PickedBy {
+impl ByEngine {
+    /// The load guard of a request the policy engine placed, out of line:
+    /// a classic placement never comes here.
+    #[inline(never)]
     fn guard(&self, worker: Arc<dyn Worker>, key: Option<&str>) -> WorkerLoadGuard {
-        let Self::Engine {
-            placement,
-            routing_key,
-        } = self
-        else {
-            return WorkerLoadGuard::with_key(worker, key);
-        };
-        let guard = WorkerLoadGuard::with_key(worker, routing_key.as_deref().or(key));
-        match placement.lock().take() {
-            Some(mut placement) => {
-                placement.sent(Side::Single);
-                guard.keeping(placement)
+        let guard = WorkerLoadGuard::with_key(worker, self.routing_key.as_deref().or(key));
+        match self.side.lock().take() {
+            Some(mut side) => {
+                side.sent();
+                guard.keeping(side)
             }
             None => guard,
         }
@@ -680,10 +689,12 @@ fn placed_over_unnamed(
     placed_by_engine(engine, policies, model_id, &members, ring, inputs)
 }
 
-/// Pick one worker for `model_id` from `pool`, or `None` when nothing is
-/// selectable. Records the selection metric under the chosen worker's own
-/// transport label.
-pub(crate) fn select_single(
+/// [`select_single`] where the gateway started the policy engine, out of
+/// line: the engine places the request over the pool's list of the model's
+/// snapshot as it stands now.
+#[inline(never)]
+fn single_by_engine(
+    engine: &'static PolicyEngine,
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
     model_id: &str,
@@ -692,7 +703,87 @@ pub(crate) fn select_single(
     inputs: PlacementInputs<'_>,
 ) -> Option<Placed> {
     let snapshot = registry.get_routing_snapshot(model_id);
-    select_single_of(registry, policies, model_id, &snapshot, pool, wire, inputs)
+    single_of_by_engine(engine, policies, model_id, &snapshot, pool, wire, inputs)
+}
+
+/// [`select_single_of`] where the gateway started the policy engine, out of
+/// line: the engine places the request over the pool's list as the snapshot
+/// lends it ([`ModelWorkerSnapshot::lent`]), on the hash ring of that
+/// snapshot ([`ModelRing::of`]). A retry pinned to its retained plan's wire
+/// is placed over a list of its own, which nobody names.
+#[inline(never)]
+fn single_of_by_engine(
+    engine: &'static PolicyEngine,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    snapshot: &ModelWorkerSnapshot,
+    pool: RoutingPool,
+    wire: Option<WireConstraint>,
+    inputs: PlacementInputs<'_>,
+) -> Option<Placed> {
+    let ring = ModelRing::of(engine, policies, model_id, snapshot);
+    let ring = ring.lent();
+    if wire.is_none() {
+        let members = engine.members_of(snapshot.lent(pool));
+        return placed_by_engine(engine, policies, model_id, members, ring, inputs);
+    }
+    let pinned = Candidates::of(Arc::clone(snapshot.pool(pool)), wire);
+    let pinned = pinned.as_slice();
+    placed_over_unnamed(engine, policies, model_id, pinned, ring, inputs)
+}
+
+/// [`select_from`] where the gateway started the policy engine, out of
+/// line: the engine places the request over the caller's slice, on the hash
+/// ring the registry answers for the model now ([`ModelRing::read`]).
+#[inline(never)]
+fn from_by_engine(
+    engine: &'static PolicyEngine,
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    candidates: &[Arc<dyn Worker>],
+    inputs: PlacementInputs<'_>,
+) -> Option<Placed> {
+    let ring = ModelRing::read(engine, policies, registry, model_id);
+    let ring = ring.lent();
+    placed_over_unnamed(engine, policies, model_id, candidates, ring, inputs)
+}
+
+/// Pick one worker for `model_id` from `pool`, or `None` when nothing is
+/// selectable. Records the selection metric under the chosen worker's own
+/// transport label.
+///
+/// This function and its two siblings are thin fronts, inlined where a
+/// route calls them. Each reads the registry's engine once. Where the
+/// gateway started none it runs the classic selection, which stands as it
+/// did before the engine and answers the worker's handle alone. Where it
+/// started one the engine places the request, out of line.
+#[inline]
+pub(crate) fn select_single(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    pool: RoutingPool,
+    wire: Option<WireConstraint>,
+    inputs: PlacementInputs<'_>,
+) -> Option<Placed> {
+    if let Some(engine) = policies.engine() {
+        return single_by_engine(engine, registry, policies, model_id, pool, wire, inputs);
+    }
+    classic_single(registry, policies, model_id, pool, wire, inputs).map(Placed::from)
+}
+
+/// [`select_single`] by the classic policies.
+fn classic_single(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    pool: RoutingPool,
+    wire: Option<WireConstraint>,
+    inputs: PlacementInputs<'_>,
+) -> Option<Arc<dyn Worker>> {
+    let snapshot = registry.get_routing_snapshot(model_id);
+    classic_single_of(registry, policies, model_id, &snapshot, pool, wire, inputs)
 }
 
 /// [`select_single`] over `pool` of a snapshot the caller read something
@@ -700,11 +791,7 @@ pub(crate) fn select_single(
 /// membership generation. The pool is borrowed from the snapshot: the
 /// selection takes no count of the list. It keeps its name on the way to
 /// the policy.
-///
-/// Where the gateway started the policy engine, the engine places the
-/// request over the pool's list as the snapshot lends it
-/// ([`ModelWorkerSnapshot::lent`]), on the hash ring of that snapshot
-/// ([`ModelRing::of`]).
+#[inline]
 pub(crate) fn select_single_of(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -714,25 +801,29 @@ pub(crate) fn select_single_of(
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
 ) -> Option<Placed> {
-    let list = snapshot.pool(pool);
     if let Some(engine) = policies.engine() {
-        let ring = ModelRing::of(engine, policies, model_id, snapshot);
-        let ring = ring.lent();
-        if wire.is_none() {
-            let members = engine.members_of(snapshot.lent(pool));
-            return placed_by_engine(engine, policies, model_id, members, ring, inputs);
-        }
-        let pinned = Candidates::of(Arc::clone(list), wire);
-        let pinned = pinned.as_slice();
-        return placed_over_unnamed(engine, policies, model_id, pinned, ring, inputs);
+        return single_of_by_engine(engine, policies, model_id, snapshot, pool, wire, inputs);
     }
+    classic_single_of(registry, policies, model_id, snapshot, pool, wire, inputs).map(Placed::from)
+}
+
+/// [`select_single_of`] by the classic policies.
+fn classic_single_of(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    snapshot: &ModelWorkerSnapshot,
+    pool: RoutingPool,
+    wire: Option<WireConstraint>,
+    inputs: PlacementInputs<'_>,
+) -> Option<Arc<dyn Worker>> {
+    let list = snapshot.pool(pool);
     if wire.is_none() {
         let whole = NamedList {
             list,
             positions: None,
         };
-        return select_among(registry, policies, model_id, list, Some(whole), inputs)
-            .map(Placed::from);
+        return select_among(registry, policies, model_id, list, Some(whole), inputs);
     }
     // A retry pinned to its retained plan's wire: a list of its own, which
     // nobody names.
@@ -745,12 +836,12 @@ pub(crate) fn select_single_of(
         None,
         inputs,
     )
-    .map(Placed::from)
 }
 
 /// [`select_single`] over an explicit candidate slice: the entry for a caller
 /// with a candidate rule the pools cannot express, such as dropping DP-aware
 /// workers from a path that cannot pin a rank. Nobody names such a list.
+#[inline]
 pub(crate) fn select_from(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -759,9 +850,7 @@ pub(crate) fn select_from(
     inputs: PlacementInputs<'_>,
 ) -> Option<Placed> {
     if let Some(engine) = policies.engine() {
-        let ring = ModelRing::read(engine, policies, registry, model_id);
-        let ring = ring.lent();
-        return placed_over_unnamed(engine, policies, model_id, candidates, ring, inputs);
+        return from_by_engine(engine, registry, policies, model_id, candidates, inputs);
     }
     select_among(registry, policies, model_id, candidates, None, inputs).map(Placed::from)
 }
@@ -2003,7 +2092,7 @@ pub(crate) mod tests {
         document::{AppliedSpec, KeySourceSpec, PolicySpec, RoutingKeySpec},
         engine::{Candidate, Decision, RequestFacts, Scorer, Target, TieBand},
         stages::{Lifecycle, StageRegistry},
-        tracking::{EventSet, Lease, Outcome, ReleaseReason},
+        tracking::{EventSet, Lease, Outcome, ReleaseReason, Side},
     };
     use smg_worker::{
         connection::engine::EngineConnection,
@@ -6051,7 +6140,7 @@ pub(crate) mod tests {
         assert!(urls(from_slice).iter().all(|url| url != "http://v:1"));
         assert!(urls(on_wire).iter().all(|url| url != "http://s:1"));
 
-        for worker in registry.get_all().iter() {
+        for worker in &registry.get_all() {
             worker.set_status(WorkerStatus::NotReady);
         }
         let pool = RoutingPool::HttpRegular;
