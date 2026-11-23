@@ -7074,17 +7074,26 @@ impl Engine {
             }
         }
         // The prefill buffer's mark of a lifted veto is cleared for this
-        // decision. The pair's default alone writes it again
-        // ([`vetoed::paired`]), and the prefill's shadow reads it
+        // decision. The pair's default writes it again
+        // ([`vetoed::paired`]), and so does a pick the weighing lift alone
+        // made possible, below: the prefill's shadow reads it
         // ([`Self::shadow_side`]).
         scratch.single.lifted = LiftedVeto::None;
+        // A prefill profile that weighs load against affinity runs with the
+        // overload veto lifted ([`Self::weighing_lift`]): its run and the
+        // count of its routable prefills read `run_cx`. The lifted
+        // constraints are a second value beside the stated ones, which the
+        // pair's default still reads: it judges the pool as it stands with
+        // no lift.
+        let lifted_run = self.weighing_lift(binding.profile, vetoed, cx);
+        let run_cx = lifted_run.as_ref().unwrap_or(cx);
         let prefill = run_profile(
             prefill_profile,
             binding.profile,
             &prefill_facts,
             pool,
             Set::side(prefills, None, Some(&scratch.classes)),
-            cx,
+            run_cx,
             &mut scratch.single,
         );
         // The prefill's pick is read where its decision stands: a pick is
@@ -7117,13 +7126,15 @@ impl Engine {
                     let mut routable = 0usize;
                     scratch.classes.clear();
                     // Of the prefills the request may take: one outside
-                    // its side's places is no routable prefill of it.
-                    for c in places::rows(prefills, cx).filter(|c| {
+                    // its side's places is no routable prefill of it. A
+                    // prefill is routable under the constraints the run
+                    // itself read.
+                    for c in places::rows(prefills, run_cx).filter(|c| {
                         prefill_profile
                             .filters
                             .iter()
                             .filter(|f| !f.soft())
-                            .all(|f| f.keep(&prefill_facts, c, cx))
+                            .all(|f| f.keep(&prefill_facts, c, run_cx))
                     }) {
                         routable += 1;
                         if c.pair_class != 0 {
@@ -7136,7 +7147,7 @@ impl Engine {
                         let stage = filter(
                             prefill_profile,
                             &prefill_facts,
-                            cx,
+                            run_cx,
                             &mut scratch.single,
                             Set::side(prefills, None, None),
                         )
@@ -7166,6 +7177,21 @@ impl Engine {
             }
             return prefill;
         };
+        // A pick the weighing lift alone made possible says so, as a kept
+        // key's pick does ([`Self::keep`]): where the veto as it stands
+        // leaves the prefills nobody, the pair's trace names the lifted
+        // overload veto. The prefill buffer takes the mark too, so the
+        // prefill's shadow says none beside such a pair
+        // ([`Self::shadow_side`]). A pick beside a prefill under its
+        // thresholds carries no mark.
+        let lift_placed = lifted_run.is_some() && {
+            let shown = Set::side(prefills, None, Some(&scratch.classes));
+            let buf = &mut scratch.single;
+            vetoed::all_vetoed(prefill_profile, &prefill_facts, shown, cx, buf)
+        };
+        if lift_placed {
+            scratch.single.lifted = LiftedVeto::Overload;
+        }
         let mut last_shed: Option<Shed> = None;
         for prefill_target in prefill_pick.targets.iter() {
             // A target's position is the host's; a row outside the slice
@@ -7204,10 +7230,15 @@ impl Engine {
                     } = paired;
                     targets.pair_under(prefill_target);
                     // The pair's trace is the prefill's, with the mark of
-                    // the veto the rule lifted for the decode side.
+                    // the veto the rule lifted for the decode side, or of
+                    // the overload veto the prefill's own run was placed
+                    // past.
                     let lifted = trace.lifted;
                     *trace = prefill_pick.trace;
-                    trace.lifted = lifted;
+                    trace.lifted = match lifted {
+                        LiftedVeto::None if lift_placed => LiftedVeto::Overload,
+                        lifted => lifted,
+                    };
                     *session_verdict = SessionVerdict::None;
                     return decision;
                 }
@@ -7219,6 +7250,41 @@ impl Engine {
             Some(last) => Decision::Shed(last),
             None => shed(ShedReason::NoEndpoints, "partners", prefill_pick.trace),
         }
+    }
+
+    /// The constraints a pair's prefill profile at `index` runs under where
+    /// it weighs load against affinity: `cx` with the overload veto lifted.
+    /// `None` where the stated ones stand: under a binding that sheds
+    /// (`rule`), and under a profile none of whose stages reads affinity.
+    ///
+    /// A profile whose stages read affinity is taken to weigh load against
+    /// it itself: its own gate moves a request off a holder loaded well
+    /// past the pool. The veto would move a session off the prefill that
+    /// holds its prefix each time that prefill crosses a threshold, and
+    /// under sustained load the prefills cross them in turn. So such a
+    /// profile places among the prefills over their thresholds too, as the
+    /// gateway's own pair selection leaves the veto off a prefill pool
+    /// whose policy weighs so
+    /// (`model_gateway/src/routers/common/placement.rs:2375-2394`, at main
+    /// `55c35100d`). The lift is the constraint a kept key's run is given
+    /// ([`Self::keep`]). A profile that reads no affinity keeps the veto.
+    fn weighing_lift<'a>(
+        &self,
+        index: u16,
+        rule: AllVetoed,
+        cx: &Constraints<'a>,
+    ) -> Option<Constraints<'a>> {
+        let needs = self.profile_needs.get(usize::from(index));
+        let weighs = rule == AllVetoed::Steer && needs.is_some_and(|needs| needs.affinity);
+        // Every pair's decision asks, so the copy is made only where the
+        // lift stands.
+        if !weighs {
+            return None;
+        }
+        Some(Constraints {
+            overload_lifted: true,
+            ..*cx
+        })
     }
 
     /// Whether the pair binding at `at` names a shadow for `side` that
@@ -7309,14 +7375,18 @@ impl Engine {
                 // pair's decision left them ([`Self::decide_pair`]). No
                 // stage of a live profile is asked again. Its decision's
                 // scope closed with it, and a stage asked behind it
-                // answers by its fallback.
+                // answers by its fallback. The shadow's run is lifted by
+                // its own profile's word, as the live run is by the live
+                // profile's ([`Self::weighing_lift`]).
+                let rule = self.bindings.get(at as usize)?.vetoed;
+                let lifted_run = self.weighing_lift(index, rule, cx);
                 run_profile(
                     profile,
                     index,
                     &prefill_facts,
                     pool,
                     Set::side(prefills, None, Some(&scratch.classes)),
-                    cx,
+                    lifted_run.as_ref().unwrap_or(cx),
                     &mut scratch.single,
                 )
             }
