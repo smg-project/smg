@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use axum::response::Response;
 use openai_protocol::responses::{
-    from_turn_boundary, generate_id, normalize_input_item, without_outputs_of_missing_calls,
-    McpToolCallError, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-    ResponsesRequest, StringOrContentParts,
+    from_turn_boundary, generate_id, normalize_input_item, without_calls_answered_by,
+    without_outputs_of_missing_calls, McpToolCallError, ResponseContentPart, ResponseInput,
+    ResponseInputOutputItem, ResponsesRequest, StringOrContentParts,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -466,20 +466,24 @@ async fn conversation_items(
         stored.drain(..stored.len() - MAX_CONVERSATION_HISTORY_ITEMS);
     }
     let mut hidden = false;
+    // The rows the rule hid, converted: the call of an output among them is
+    // not replayed either.
+    let mut skipped = Vec::new();
     // A row a stored response wrote was answered without the parts the
     // pipeline never carried; a row the client added to the conversation
     // itself (no response id) was answered by nobody and keeps every part,
     // so the conversion refuses it as it would the request's own.
     let items: Vec<ResponseInputOutputItem> = stored
         .into_iter()
-        .filter(|row| {
+        .filter_map(|row| {
             let visible = row.is_visible_to(tenant);
             hidden |= !visible;
-            visible
-        })
-        .filter_map(|row| {
             let answered = row.response_id.is_some();
             let item = conversation_item_as_input(row).filter(replays)?;
+            if !visible {
+                skipped.push(item);
+                return None;
+            }
             Some(if answered {
                 replayed_parts(item, into)
             } else {
@@ -487,6 +491,7 @@ async fn conversation_items(
             })
         })
         .collect();
+    let items = without_calls_answered_by(items, &skipped);
     if !cut {
         // The output of a call the rule hid is no history, as after a cut.
         return Ok(if hidden {
@@ -1323,20 +1328,24 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// A call the caller may not see is not replayed, and its output goes
-    /// with it, as the output of a call before a cut window does.
+    /// A call and its output replay together or not at all: when the caller
+    /// may not see one of the two, the other goes with it, as the output of
+    /// a call before a cut window does.
     #[tokio::test]
-    async fn a_call_the_caller_may_not_see_takes_its_output_out_of_the_replay() {
-        let stores = Stores::with_conversation().await;
-        let mut call = call_row("call_other");
-        call.tenant = Some("other".to_string());
-        link_rows(
-            &stores,
-            vec![message_row(1), call, output_row("call_other")],
-        )
-        .await;
-        let items = replayed_items(&stores, "item 2").await;
-        assert_eq!(shape(&items), ["message:user", "message:user"]);
+    async fn a_tool_row_the_caller_may_not_see_takes_its_pair_out_of_the_replay() {
+        for hide_call in [true, false] {
+            let stores = Stores::with_conversation().await;
+            let (mut call, mut output) = (call_row("call_other"), output_row("call_other"));
+            let hidden = if hide_call { &mut call } else { &mut output };
+            hidden.tenant = Some("other".to_string());
+            link_rows(&stores, vec![message_row(1), call, output]).await;
+            let items = replayed_items(&stores, "item 2").await;
+            assert_eq!(
+                shape(&items),
+                ["message:user", "message:user"],
+                "hide_call {hide_call}"
+            );
+        }
     }
 
     /// A conversation of 120 items replays its newest 100, oldest first,

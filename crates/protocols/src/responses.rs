@@ -5047,6 +5047,24 @@ pub fn without_outputs_of_missing_calls(
         .collect()
 }
 
+/// `items` without the tool calls whose output is among `skipped`, items of
+/// the same history that are not replayed: a call replays only with its
+/// output, as an output only with its call. A call that no output answers
+/// stays: the request may bring its output.
+pub fn without_calls_answered_by(
+    items: Vec<ResponseInputOutputItem>,
+    skipped: &[ResponseInputOutputItem],
+) -> Vec<ResponseInputOutputItem> {
+    let answered: HashSet<&str> = skipped.iter().filter_map(tool_output_call_id).collect();
+    if answered.is_empty() {
+        return items;
+    }
+    items
+        .into_iter()
+        .filter(|item| tool_call_id(item).is_none_or(|call_id| !answered.contains(call_id)))
+        .collect()
+}
+
 /// `items` from their first turn boundary on: the first message the client
 /// sent (a user, developer or system message), or, when no client message is
 /// among them (one long turn of the model's calls), the first tool call with

@@ -435,27 +435,39 @@ pub async fn list_conversation_items(
         _ => SortOrder::Desc,
     };
 
-    let params = ListParams {
-        limit,
-        order,
-        after: after.map(String::from),
+    // A page of the rows the caller may read: a row the item's own rule
+    // refuses is read past, a further page of the store at a time, so the
+    // paging fields below describe the rows in `data`.
+    let mut after = after.map(String::from);
+    let mut visible = Vec::new();
+    let listed = loop {
+        let params = ListParams {
+            limit,
+            order,
+            after: after.take(),
+        };
+        let page = match item_storage.list_items(&conversation_id, params).await {
+            Ok(page) => page,
+            Err(e) => break Err(e),
+        };
+        let last_page = page.len() < limit;
+        after = page.last().map(|item| item.id.0.clone());
+        visible.extend(page.into_iter().filter(|item| item.is_visible_to(tenant)));
+        if last_page || visible.len() >= limit {
+            visible.truncate(limit);
+            break Ok(visible);
+        }
     };
 
-    match item_storage.list_items(&conversation_id, params).await {
+    match listed {
         Ok(items) => {
             let has_more = items.len() == limit;
             let first_id = items.first().map(|item| item.id.0.clone());
             let last_id = items.last().map(|item| item.id.0.clone());
             // The item objects as the public API lists them: each item's own
             // fields, the same object the single-item GET answers; the page is
-            // this answer's own, so each item moves into its object. A row is
-            // listed only for an owner its own rule allows; the paging fields
-            // above are the store's.
-            let item_values: Vec<Value> = items
-                .into_iter()
-                .filter(|item| item.is_visible_to(tenant))
-                .map(item_to_json)
-                .collect();
+            // this answer's own, so each item moves into its object.
+            let item_values: Vec<Value> = items.into_iter().map(item_to_json).collect();
 
             (
                 StatusCode::OK,
@@ -2697,6 +2709,51 @@ mod tests {
             (&listed["data"], reads[0].0, &reads[0]),
             (&json!([]), StatusCode::NOT_FOUND, &reads[1]),
             "{listed}"
+        );
+    }
+
+    /// A page is filled from the rows the caller may read: the list reads
+    /// past a row the item's rule refuses, and its paging fields name rows
+    /// in `data`.
+    #[tokio::test]
+    async fn a_page_reads_past_a_row_the_caller_may_not_read() {
+        let (conversations, items, _, item_of_a) = conversation_of_a().await;
+        let created =
+            json_of(create_conversation(&conversations, &items, B, json!({})).await).await;
+        let conv_of_b = created["id"].as_str().unwrap();
+        let added = json_of(
+            create_conversation_items(
+                &conversations,
+                &items,
+                B,
+                conv_of_b,
+                json!({"items": [{"type": "message", "role": "user", "content": "own"}]}),
+            )
+            .await,
+        )
+        .await;
+        // the newest row of the conversation is one its caller may not read
+        items
+            .link_items(
+                &ConversationId::from(conv_of_b),
+                &[(
+                    ConversationItemId::from(item_of_a.as_str()),
+                    chrono::Utc::now(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        let page = json_of(
+            list_conversation_items(&conversations, &items, B, conv_of_b, Some(1), None, None)
+                .await,
+        )
+        .await;
+        let own = &added["data"][0]["id"];
+        assert_eq!(
+            (&page["data"][0]["id"], &page["first_id"], &page["last_id"]),
+            (own, own, own),
+            "{page}"
         );
     }
 }

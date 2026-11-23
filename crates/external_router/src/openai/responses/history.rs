@@ -9,8 +9,8 @@ use axum::response::Response;
 use openai_protocol::{
     event_types::ItemType,
     responses::{
-        from_turn_boundary, without_outputs_of_missing_calls, ResponseContentPart, ResponseInput,
-        ResponseInputOutputItem, ResponsesRequest,
+        from_turn_boundary, without_calls_answered_by, without_outputs_of_missing_calls,
+        ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesRequest,
     },
 };
 use serde::Deserialize;
@@ -248,15 +248,23 @@ async fn conversation_window_items(
         stored_items.drain(..stored_items.len() - MAX_CONVERSATION_HISTORY_ITEMS);
     }
     let mut hidden = false;
-    let mut items: Vec<ResponseInputOutputItem> = stored_items
+    // The rows the rule hid, converted: the call of an output among them is
+    // not replayed either.
+    let mut skipped = Vec::new();
+    let items: Vec<ResponseInputOutputItem> = stored_items
         .into_iter()
-        .filter(|row| {
+        .filter_map(|row| {
             let visible = row.is_visible_to(tenant);
             hidden |= !visible;
-            visible
+            let item = stored_item_as_input(row)?;
+            if !visible {
+                skipped.push(item);
+                return None;
+            }
+            Some(item)
         })
-        .filter_map(stored_item_as_input)
         .collect();
+    let mut items = without_calls_answered_by(items, &skipped);
     if cut {
         items = without_outputs_of_missing_calls(from_turn_boundary(items));
     } else if hidden {
@@ -570,6 +578,24 @@ mod tests {
     /// inside a turn whose request is before the window. The window replays
     /// from its first client message; the output of the call before it and
     /// the call with its output after it go with the turn the cut split.
+    /// A call and its output replay together or not at all: when the caller
+    /// may not see one of the two, the other goes with it.
+    #[tokio::test]
+    async fn a_tool_row_the_caller_may_not_see_takes_its_pair_out_of_the_replay() {
+        for hide_call in [true, false] {
+            let components = components().await;
+            let (mut call, mut output) = (call_row("call_other"), output_row("call_other"));
+            let hidden = if hide_call { &mut call } else { &mut output };
+            hidden.tenant = Some("other".into());
+            link_rows(&components, vec![message_row(1), call, output]).await;
+            assert_eq!(
+                shape(&loaded_input(&components, "item 2").await),
+                ["user:item 1", "user:item 2"],
+                "hide_call {hide_call}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_cut_window_begins_at_its_first_client_message() {
         let components = components().await;
