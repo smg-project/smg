@@ -553,13 +553,6 @@ pub(crate) enum Beside {
     /// The session key of the decode side's lease of a pair's pick. That
     /// lease is the prefill side's under this key: one id, one record, and
     /// at the answer one index and one count of tokens.
-    #[cfg_attr(
-        not(all(test, feature = "client")),
-        expect(
-            dead_code,
-            reason = "a pair's lease is handed over again once a pair is decided over worker lists"
-        )
-    )]
     Decode(Session),
     /// The issue of a decode call's pick. Where the answer does not leave,
     /// its sender takes this one issue back: the prefill that runs under
@@ -670,7 +663,8 @@ impl Decided {
 /// The answer that carries `decision`, made under `term`, with the lease
 /// the store filed for it where it is a pick that was issued one, and
 /// what that lease's dispatch span has left where the answer is sent. A pair's pick
-/// carries two leases of one id, the prefill side's first.
+/// carries two leases of one id, the prefill side's first, or the prefill
+/// side's alone where its decode side was not issued.
 pub(crate) fn decided(
     id: Vec<u8>,
     term: u64,

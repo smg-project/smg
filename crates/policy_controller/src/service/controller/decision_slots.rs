@@ -28,13 +28,18 @@
 //!    engine, the list of the model's single workers as the replica's
 //!    worker objects lend it, and the places of that list the asking
 //!    gateway may take by its reach, its wires and its standing vetoes
-//!    ([`frame_decision::decide`]);
+//!    ([`frame_decision::decide`]). A pair at its prefill is read its
+//!    model's two lists, its prefills and its decodes, each with its own
+//!    places ([`frame_decision::decide_pair`]);
 //! 5. the engine's decision over that list, at its entry that issues no
 //!    lease, told what is left of the budget;
 //! 6. the lease, for a pick: one a decision, a credit on the pick's first
 //!    target, minted and filed by the store under the term the first read
 //!    showed, at that read's instant ([`MemoryStore::issue_decided`]). The
-//!    engine that decided is told of it, and the answer carries it;
+//!    engine that decided is told of it, and the answer carries it. A
+//!    pair's pick is filed a lease a side under one id
+//!    ([`MemoryStore::issue_decided_pair`]), and its answer carries both,
+//!    or the prefill side's alone where its frame stated the later decode;
 //! 7. the fence again, and the budget at the same read, before sampling
 //!    and handing the answer over: a decision whose budget ended while it was
 //!    made, its lease's filing and the stages' hearing of it included,
@@ -89,9 +94,10 @@
 //! refuses it and takes its file's turn behind the hand, so its next
 //! decision reads no count of that lease.
 //!
-//! A single request alone is decided here. A pair at its prefill, a decode
-//! call behind it and an encode request have no decision over worker lists
-//! yet: each is answered `Busy` with no reason, and its gateway decides it.
+//! A single request and a pair at its prefill are decided here. A decode
+//! call behind a pair, an encode request and a prefill whose model's plan
+//! pairs no side have no decision over worker lists yet: each is answered
+//! `Busy` with no reason, and its gateway decides it.
 //!
 //! One lease stands for a request its gateway asks again. A gateway whose
 //! stream ended with a request unanswered sends it again and says so
@@ -138,8 +144,8 @@
 //! What this build has no decision for is answered `Busy` with no reason,
 //! and its gateway decides it locally at once: a shed is a policy's word
 //! and reaches the client, and no policy spoke. Four arms, each counted
-//! by its cause ([`DecideStats`]): a decision that panics, a request of a
-//! prefill, a decode or an encode phase, a
+//! by its cause ([`DecideStats`]): a decision that panics, a decode call,
+//! an encode request or a prefill whose model's plan pairs no side, a
 //! request that carries its prompt as text
 //! (the controller is to hash it, and a decision made as if the request
 //! carried no prefix would be another request's), and a pick the store
@@ -164,8 +170,9 @@
 //! and counts that request as one its own catch held.
 //!
 //! What this step leaves to the next ones. A decision reads no session pin
-//! of the store's and no load report, and a request of a pair's phases has
-//! no decision.
+//! of the store's, and no load report under a document with a stage that
+//! keeps reports. A decode call, an encode request and a prefill whose
+//! model's plan pairs no side have no decision.
 
 use std::{
     io, mem,
@@ -180,7 +187,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use smg_worker::load::state::LoadReceiver;
+use smg_worker::load::state::{LoadReceiver, LoadSnapshot};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
@@ -293,9 +300,9 @@ pub(crate) struct DecideStats {
     pub(crate) busy: [AtomicU64; 9],
     /// Decisions that panicked.
     pub(crate) faults: AtomicU64,
-    /// Requests of a prefill, a decode or an encode phase: a pair at its
-    /// prefill, a decode call and an encode request have no decision over
-    /// worker lists yet.
+    /// Requests whose phase has no decision over worker lists yet: a
+    /// decode call, an encode request, and a prefill whose model's plan
+    /// pairs no side.
     pub(crate) pair_sides: AtomicU64,
     /// Requests that carried their prompt as text.
     pub(crate) texts: AtomicU64,
@@ -1070,14 +1077,18 @@ impl Deciding {
             at_work.apply();
         }
         let (term, taken) = judged?;
-        // A single request alone has a decision over worker lists yet. A
-        // pair at its prefill, a decode call and an encode request are
-        // answered `Busy` with no reason before anything is read for them:
-        // their gateway decides them locally.
-        if request.phase() != Phase::Single {
-            counts.pair_sides.fetch_add(1, Ordering::Relaxed);
-            return Err(Reason::Unspecified);
-        }
+        // A single request and a pair at its prefill have a decision over
+        // worker lists. A decode call and an encode request have none yet:
+        // they are answered `Busy` with no reason before anything is read
+        // for them, and their gateway decides them locally.
+        let pairs = match request.phase() {
+            Phase::Single => false,
+            Phase::Prefill => true,
+            Phase::Decode | Phase::Encode => {
+                counts.pair_sides.fetch_add(1, Ordering::Relaxed);
+                return Err(Reason::Unspecified);
+            }
+        };
         let taken = taken.placed(self.working.as_ref());
         let (frames, own) = (&mut self.frames, counts.part(self.index));
         let caught = &mut self.caught;
@@ -1095,28 +1106,17 @@ impl Deciding {
             // The lease, for a pick: filed under the first read's term and
             // at its instant, and the stages told, before the read that
             // lets the answer leave. That read judges the store's write
-            // and a stage's call with the decision before them.
-            let decided = frame_decision::decide(world, objects, &taken, frames, loads, own);
-            let (decision, booked) = match decided {
-                Ok(decided) => decided,
-                // The engine caught a panic of the decision and counted
-                // it: the request is answered as one the decider caught.
-                Err(DecisionRefused::Faulted) => {
-                    *caught = true;
-                    return Err(Reason::Unspecified);
-                }
-                // No other refusal reaches a single request here yet: one
-                // that did would be no panic, and is counted as none.
-                Err(
-                    refused @ (DecisionRefused::PairSide
-                    | DecisionRefused::Unleased
-                    | DecisionRefused::Decode(_)),
-                ) => {
-                    debug_assert!(false, "a single request's decision refused: {refused:?}");
-                    return Err(Reason::Unspecified);
-                }
+            // and a stage's call with the decision before them. A pair's
+            // pick is filed its decode side's lease beside it.
+            let (decision, filed, decode) = if pairs {
+                let theirs = (&mut *frames, loads, own, counts.as_ref());
+                pair(store, world, objects, &taken, term, theirs, caught)?
+            } else {
+                let decided = frame_decision::decide(world, objects, &taken, frames, loads, own);
+                let (decision, booked) = made(decided, caught)?;
+                let filed = frame_decision::issue(store, world, &taken, term, &decision, booked);
+                (decision, filed, None)
             };
-            let filed = frame_decision::issue(store, world, &taken, term, &decision, booked);
             // No pick, while the start's document of a replica under a
             // shared lease waits for its first lead: a shed would say that
             // a document refuses the request, and no document has landed.
@@ -1158,7 +1158,12 @@ impl Deciding {
                         decision,
                         lease.map(|lease| wire::Leased {
                             lease,
-                            beside: wire::Beside::Alone,
+                            // On the wire a pair's decode side differs
+                            // from its prefill's by the side and the key,
+                            // at its issue.
+                            beside: decode.map_or(wire::Beside::Alone, |decode| {
+                                wire::Beside::Decode(decode.session)
+                            }),
                             left,
                             due: taken.due(),
                         }),
@@ -1177,7 +1182,7 @@ impl Deciding {
             // The answer does not leave, and the lease filed for it goes
             // with it.
             if let Ok(Some(lease)) = filed {
-                give_up(store, world, taken.gateway, &lease, ended);
+                give_up(store, world, taken.gateway, &lease, decode.as_ref(), ended);
             }
             Err(busy)
         };
@@ -1241,21 +1246,98 @@ impl<'a> DecisionCall<'a, Checked> {
     }
 }
 
+/// A decision as its deciding thread takes it from the engine, or the
+/// reason its request is answered `Busy`. A panic the engine caught and
+/// counted is written into `caught`: the request is answered as one the
+/// decider caught. No other refusal reaches a single request or a pair at
+/// its prefill: one that did would be no panic, and is counted as none.
+///
+/// Inline in each caller: a single request's decision stays the code it was
+/// before a pair's took the same step.
+#[inline(always)]
+fn made<T>(decided: Result<T, DecisionRefused>, caught: &mut bool) -> Result<T, Reason> {
+    match decided {
+        Ok(decided) => Ok(decided),
+        Err(DecisionRefused::Faulted) => {
+            *caught = true;
+            Err(Reason::Unspecified)
+        }
+        Err(
+            refused @ (DecisionRefused::PairSide
+            | DecisionRefused::Unleased
+            | DecisionRefused::Decode(_)),
+        ) => {
+            debug_assert!(false, "a decision over worker lists refused: {refused:?}");
+            Err(Reason::Unspecified)
+        }
+    }
+}
+
+/// What a pair's deciding thread files: the store's answer for the prefill
+/// side's lease, as a single's.
+type Filed = Result<Option<Lease>, LeaseRefused>;
+
+/// A pair's decision and its leases, for the frame that enters a pair plan
+/// at its prefill: decided for both sides ([`frame_decision::decide_pair`])
+/// and, for a pick, issued a lease a side
+/// ([`frame_decision::issue_pair`]). The prefill side's lease is the one
+/// filed, as a single's is, and the decode side's comes beside it where it
+/// was issued. A decode side its frame asked for later is chosen and not
+/// issued: none comes, and the answer carries the prefill's lease alone.
+///
+/// A prefill whose model's plan pairs no side has no decision here yet: it
+/// is answered `Busy` with no reason and counted with the sides, and its
+/// gateway decides it locally.
+///
+/// Out of line: a single's decision carries no part of a pair's.
+#[inline(never)]
+fn pair(
+    store: &MemoryStore,
+    world: &StoreSnapshot,
+    objects: &Objects<Members>,
+    taken: &DecisionCall<'_, Checked>,
+    term: u64,
+    (frames, loads, own, counts): (&mut FrameBuffers, &Arc<LoadSnapshot>, &Part, &DecideStats),
+    caught: &mut bool,
+) -> Result<(Decision, Filed, Option<Lease>), Reason> {
+    let pairs = world.spec().engine().pair_position(taken.request.model());
+    if pairs.is_none() {
+        counts.pair_sides.fetch_add(1, Ordering::Relaxed);
+        return Err(Reason::Unspecified);
+    }
+    let decided = frame_decision::decide_pair(world, objects, taken, frames, loads, own);
+    let (decision, booked) = made(decided, caught)?;
+    let (filed, decode) =
+        match frame_decision::issue_pair(store, world, taken, term, &decision, booked) {
+            Ok(Some((prefill, decode))) => (Ok(Some(prefill)), decode),
+            Ok(None) => (Ok(None), None),
+            Err(refused) => (Err(refused), None),
+        };
+    Ok((decision, filed, decode))
+}
+
 /// Gives up the lease of a decision whose answer does not leave: the
 /// store's release door first ([`crate::store::LeasesStore::released`],
 /// which applies what is handed ahead of it), then the engine that heard
-/// the issue, told once where the store held the lease. A lease the store
-/// no longer holds was ended by another hand, and nothing is told of it
-/// here.
+/// the issue, told once where the store held the lease: once a side of a
+/// pair's that was issued, which is given up whole. A lease the store no
+/// longer holds was ended by another hand, and nothing is told of it here.
+/// A pair's lease that hand ended one side of still stands, and each of
+/// its issued sides is told here: no gateway names a lease ahead of its
+/// answer.
 fn give_up(
     store: &MemoryStore,
     world: &StoreSnapshot,
     gateway: GatewayId,
     lease: &Lease,
+    decode: Option<&Lease>,
     reason: ReleaseReason,
 ) {
     if crate::store::LeasesStore::released(store, gateway, lease.id, None, reason) {
-        world.spec().engine().on_released(lease, reason);
+        let engine = world.spec().engine();
+        for side in std::iter::once(lease).chain(decode) {
+            engine.on_released(side, reason);
+        }
     }
 }
 
@@ -1313,10 +1395,10 @@ pub(crate) mod tests {
         },
         stages::{lifecycle::Lifecycle, registry::StageRegistry},
         store::{
-            GatewayId, HealthSink, LeaseState, LeasesStore, MemoryStore, WorkerFacts, WorkerStatus,
-            WorkersStore,
+            DecodeMark, GatewayId, HealthSink, LeaseState, LeasesStore, MemoryStore, WorkerFacts,
+            WorkerStatus, WorkersStore,
         },
-        tracking::lease::{Dispatch, Lease, LeaseId, ReleaseReason, Said, DISPATCH_TTL},
+        tracking::lease::{Dispatch, Lease, LeaseId, ReleaseReason, Said, Side, DISPATCH_TTL},
         worker_host::{Members, Objects},
     };
 
@@ -4547,32 +4629,39 @@ pub(crate) mod tests {
         assert!(workers.contains(&picked(&bed.answer().await)));
     }
 
-    /// A controller decides a single request. A request of a prefill, a
-    /// decode or an encode phase has no decision here: `Busy` with no
-    /// reason, counted by its cause, never one side's decision and never a
-    /// shed, which is a policy's word. Its gateway decides it. A prompt
-    /// carried as text is never decided as a request with no prefix.
-    #[tokio::test]
-    async fn a_request_of_no_single_phase_and_a_prompt_as_text_have_no_decision_and_are_counted() {
-        let document: PolicySpec = serde_json::from_str(
-            r#"{
+    /// The pair plan's document of the cases, as generation 1: a request of
+    /// the prefill or the decode phase under one pair binding, each side by
+    /// `pick`, and a single request under the same profile.
+    fn pair_plan(catalog: &StageRegistry, pick: &str) -> AppliedSpec {
+        let document = format!(
+            r#"{{
               "apiVersion": "smg.policy/v1",
               "generation": 1,
-              "profiles": { "p": { "pick": "random" } },
+              "profiles": {{ "p": {{ "pick": "{pick}" }} }},
               "bindings": [
-                { "match": { "phase": ["prefill", "decode"] }, "plan": "pd-pair",
-                  "profiles": { "prefill": "p", "decode": "p" } },
-                { "profile": "p" }
+                {{ "match": {{ "phase": ["prefill", "decode"] }}, "plan": "pd-pair",
+                  "profiles": {{ "prefill": "p", "decode": "p" }} }},
+                {{ "profile": "p" }}
               ]
-            }"#,
-        )
-        .expect("a document of this build");
-        let mut bed = bed(Some(applied(&document)), true, (2, 8), []);
-        let sides = [
-            proto::Phase::Prefill,
-            proto::Phase::Decode,
-            proto::Phase::Encode,
-        ];
+            }}"#
+        );
+        let document: PolicySpec =
+            serde_json::from_str(&document).expect("a document of this build");
+        let digest = document.digest().expect("the document digests");
+        AppliedSpec::validate_digested(&document, digest, catalog, &[])
+            .expect("the catalog holds the stage")
+    }
+
+    /// A controller decides a single request and a pair at its prefill. A
+    /// request of a decode or an encode phase has no decision here: `Busy`
+    /// with no reason, counted by its cause, never one side's decision and
+    /// never a shed, which is a policy's word. Its gateway decides it. A
+    /// prompt carried as text is never decided as a request with no prefix.
+    #[tokio::test]
+    async fn a_request_of_a_decode_or_an_encode_phase_and_a_prompt_as_text_have_no_decision() {
+        let spec = pair_plan(&StageRegistry::builtin(), "random");
+        let mut bed = bed(Some(spec), true, (2, 8), []);
+        let sides = [proto::Phase::Decode, proto::Phase::Encode];
         for (id, phase) in (1..).zip(sides) {
             let answer = bed.ask(phased(frame(id, 77), phase)).await;
             assert_eq!(
@@ -4608,13 +4697,215 @@ pub(crate) mod tests {
                 counted(texts),
                 bed.counts.hashes_cut()
             ),
-            (0, 3, 1, 0)
+            (0, 2, 1, 0)
         );
-        // Each of the four is a `Busy` with no reason, and counted as one.
-        assert_eq!(busies.each_ref().map(counted), [4, 0, 0, 0, 0, 0, 0, 0, 0]);
-        // The same document's single request is decided.
-        let answer = bed.ask(frame(5, 77)).await;
-        assert!(matches!(outcome(&answer), Outcome::Pick(_)), "{answer:?}");
+        // Each of the three is a `Busy` with no reason, and counted as one.
+        assert_eq!(busies.each_ref().map(counted), [3, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // The same document's single request is decided, and so is its
+        // pair at the prefill.
+        for phase in [proto::Phase::Single, proto::Phase::Prefill] {
+            let answer = bed.ask(phased(frame(5, 77), phase)).await;
+            assert!(matches!(outcome(&answer), Outcome::Pick(_)), "{answer:?}");
+        }
+        assert_eq!(counted(&bed.counts.pair_sides), 2);
+    }
+
+    /// The bed's one worker of `role`: its fleet holds one a side.
+    fn side_of(bed: &Bed, role: Role) -> WorkerId {
+        let (_, rows) = bed.store.all_rows();
+        let row = rows.iter().find(|row| row.facts.role == role);
+        row.expect("the fleet holds one worker a side").id
+    }
+
+    /// The leases a decision's answer carries, as the wire states each: its
+    /// id, its side and its session key.
+    fn leases_of(answer: &proto::DecideAnswer) -> Vec<(u64, proto::Side, u64)> {
+        match &answer.answer {
+            Some(Answer::Decision(decision)) => {
+                let leases = decision.leases.iter();
+                let stated = leases.map(|lease| (lease.id, lease.side(), lease.session_key));
+                stated.collect()
+            }
+            other => panic!("a decision: {other:?}"),
+        }
+    }
+
+    /// A pair at its prefill is decided once, for both sides, over its
+    /// model's prefills and decodes, and answered a lease a side under one
+    /// id, the prefill side's first, each under the session key of a
+    /// request of its side's phase: one record on file with its decode
+    /// side issued. A frame that states the later decode is answered the
+    /// prefill side's lease alone, and its decode side stands chosen.
+    #[tokio::test]
+    async fn a_pair_at_its_prefill_is_answered_a_lease_a_side_under_one_id() {
+        let spec = pair_plan(&StageRegistry::builtin(), "random");
+        let mut bed = bed(Some(spec), true, (2, 8), []);
+        let (prefill, decode) = (side_of(&bed, Role::Prefill), side_of(&bed, Role::Decode));
+        let id = |count: u64| 1 << 32 | count;
+        let on_file = |bed: &Bed, lease: u64| {
+            let store: &dyn LeasesStore = bed.store.as_ref();
+            let sides = store.sides(GATEWAY, LeaseId(lease)).expect("on file");
+            (sides.record.decode, sides.decode.map(|side| side.state))
+        };
+        // The case's frame at `phase` under one plain key, and the session
+        // key the frame's own reader states of it for that phase.
+        let keyed = |phase: proto::Phase| {
+            let mut keyed = phased(frame(1, 1), phase);
+            let facts = keyed.facts.as_mut().expect("the case's frame has facts");
+            facts.session_key = Some(proto::Identity {
+                form: Some(proto::identity::Form::Plain("conversation-7".to_owned())),
+            });
+            keyed
+        };
+        let key_at = |phase: proto::Phase| {
+            let request = checked(keyed(phase));
+            let mut lists = wire::Lists::default();
+            let read = lists.of(&request);
+            request.facts(&read, 0, 0).session().get()
+        };
+
+        let answer = bed.ask(keyed(proto::Phase::Prefill)).await;
+        let Outcome::Pick(pick) = outcome(&answer) else {
+            panic!("a pick: {answer:?}");
+        };
+        let first = pick.targets.first().expect("a target");
+        let pair = first
+            .pair
+            .as_ref()
+            .expect("a pair's target names its decode");
+        assert_eq!(
+            (WorkerId(first.id), WorkerId(pair.decode_id)),
+            (prefill, decode)
+        );
+        let keys = [proto::Phase::Prefill, proto::Phase::Decode].map(key_at);
+        assert!(
+            keys[0] != 0 && keys[1] != 0 && keys[0] != keys[1],
+            "{keys:?}"
+        );
+        let sides = [
+            (id(1), proto::Side::Prefill, keys[0]),
+            (id(1), proto::Side::Decode, keys[1]),
+        ];
+        assert_eq!(leases_of(&answer), sides, "the prefill side's first");
+        assert_eq!(
+            on_file(&bed, id(1)),
+            (Some(DecodeMark), Some(LeaseState::ISSUED))
+        );
+        assert_eq!(bed.store.live(GATEWAY), 1, "one record for both sides");
+
+        let mut later = phased(frame(2, 2), proto::Phase::Prefill);
+        later.decode_later = true;
+        let answer = bed.ask(later).await;
+        assert_eq!(leases_of(&answer), [(id(2), proto::Side::Prefill, 0)]);
+        assert_eq!(
+            on_file(&bed, id(2)),
+            (Some(DecodeMark), Some(LeaseState::Chosen))
+        );
+    }
+
+    /// A pair's frame is counted as a single's: the workers its gateway's
+    /// wires take, on both sides, and a frame with more block hashes than
+    /// its document reads. The fleet's two sides state no wire, so a
+    /// gateway that states one takes both workers, and the frame is shed
+    /// under the wires' stage.
+    #[tokio::test]
+    async fn a_pairs_frame_counts_the_workers_its_wires_take_on_both_sides_and_its_cut_hashes() {
+        let spec = pair_plan(&StageRegistry::builtin(), "random");
+        let mut bed = bed(Some(spec), true, (2, 8), []);
+        let mut wired = constrained(phased(frame(1, 1), proto::Phase::Prefill), 0b010, None);
+        let facts = wired.facts.as_mut().expect("the case's frame has facts");
+        facts.block_hashes = vec![1, 2];
+        let answer = bed.ask(wired).await;
+        let shed = declined(proto::ShedReason::NoEndpoints, "wires");
+        assert_eq!(outcome(&answer), &shed);
+        assert_eq!((bed.counts.undialed(), bed.counts.hashes_cut()), (2, 1));
+    }
+
+    /// A prefill whose model's plan pairs no side has no decision here yet:
+    /// `Busy` with no reason, counted with the sides, never a shed. Its
+    /// gateway decides it locally, as it does a decode call.
+    #[tokio::test]
+    async fn a_prefill_whose_plan_pairs_no_side_has_no_decision_and_is_counted() {
+        let mut bed = leading([]);
+        let answer = bed.ask(phased(frame(1, 1), proto::Phase::Prefill)).await;
+        assert_eq!(busy(&answer), Reason::Unspecified);
+        assert_eq!(bed.counts.pair_sides.load(Ordering::Relaxed), 1);
+        assert_eq!(bed.store.live(GATEWAY), 0);
+    }
+
+    /// What the engine told a stage of a lease's sides: an issue and a
+    /// release, each by the side and the worker its lease books.
+    type SideCalls = Vec<(Side, WorkerId, Option<ReleaseReason>)>;
+
+    /// The `random` picker, keeping what the engine tells it of each side.
+    #[derive(Debug)]
+    struct Sided(Arc<Mutex<SideCalls>>);
+
+    impl Lifecycle for Sided {
+        fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
+            self.0.lock().push((lease.side, lease.booked, None));
+        }
+
+        fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+            self.0.lock().push((lease.side, lease.booked, Some(reason)));
+        }
+    }
+
+    impl Picker for Sided {
+        fn name(&self) -> &'static str {
+            "sided"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Random.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// A pair's answer that does not leave gives its lease up whole: the
+    /// record leaves the file with its decode side, and the engine that
+    /// heard each side's issue hears each side's release. A decode side
+    /// its frame asked for later was told no issue, and is told no
+    /// release. Here the decision's last read of the clock shows its
+    /// budget gone.
+    #[tokio::test]
+    async fn a_pairs_answer_that_does_not_leave_gives_up_both_sides_of_its_lease() {
+        let late = Some(ReleaseReason::LateDecision);
+        for later in [false, true] {
+            let told = Arc::new(Mutex::new(Vec::new()));
+            let kept = Arc::clone(&told);
+            let mut catalog = StageRegistry::builtin();
+            catalog
+                .picker("sided", move || Box::new(Sided(Arc::clone(&kept))))
+                .expect("a free name");
+            let steps = [Duration::ZERO, BUDGET].map(Step::At);
+            let mut bed = bed(Some(pair_plan(&catalog, "sided")), true, (2, 8), steps);
+            let (prefill, decode) = (side_of(&bed, Role::Prefill), side_of(&bed, Role::Decode));
+            let mut ask = phased(frame(1, 1), proto::Phase::Prefill);
+            ask.decode_later = later;
+            let answer = bed.ask(ask).await;
+            assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
+            assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 1);
+            assert_eq!(bed.store.live(GATEWAY), 0);
+            let both = [
+                (Side::Prefill, prefill, None),
+                (Side::Decode, decode, None),
+                (Side::Prefill, prefill, late),
+                (Side::Decode, decode, late),
+            ];
+            let heard = both
+                .into_iter()
+                .filter(|(side, ..)| !later || *side == Side::Prefill);
+            let heard: SideCalls = heard.collect();
+            assert_eq!(*told.lock(), heard, "a later decode: {later}");
+        }
     }
 
     /// A replica that does not lead says so for a request it has no
