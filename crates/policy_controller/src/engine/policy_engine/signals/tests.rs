@@ -1219,3 +1219,41 @@ fn rows_a_demand_leaves_read_their_own_signal_values() {
     read.sort_by_key(|&(place, _)| place);
     assert_eq!(read, [(1, Some(11.0)), (3, Some(13.0))]);
 }
+
+/// A request that stands alone is asked its list's signal word at its own
+/// phase. Here the binding of the prefill phase names the profile that
+/// reads `held`, and the binding behind it names one that reads no signal.
+/// A prefill over one list reads each worker's stated value at both
+/// entries, and a single request over a list of its own reads none.
+#[test]
+fn a_request_that_stands_alone_reads_the_signal_of_its_own_phases_binding() {
+    use crate::engine::view::Phase;
+
+    let document = r#"{"apiVersion":"smg.policy/v1","generation":1,
+        "signals":{"held":{"unit":"tokens"}},
+        "profiles":{"p":{"score":["reads-held"],"pick":"best"},
+                    "q":{"pick":"round-robin"}},
+        "bindings":[
+            {"match":{"model":"*","phase":["prefill"]},"profile":"p"},
+            {"match":{"model":"*","phase":[]},"profile":"q"}]}"#;
+    let built = built(document);
+    let list = pool(4);
+    let loads = stepped(4, 10.0);
+    let prefills = PublishedList::new(Arc::clone(&list));
+    let mut alone = asks(7, &prefills, Some(&loads));
+    alone.request.facts.phase = Phase::Prefill;
+    let now = Instant::now();
+    assert_eq!(read_at(&built, &alone, now), stepped_values(10.0));
+    // The entry that issues no lease asks the same word.
+    built.read.lock().clear();
+    let bare = built.engine.decide_without_lease(&alone, now);
+    assert!(bare.expect("a decision").0.pick().is_some());
+    let mut read = mem::take(&mut *built.read.lock());
+    read.sort_by_key(|&(place, _)| place);
+    assert_eq!(read, stepped_values(10.0));
+    // A single request resolves to the binding behind, whose profile reads
+    // no signal: the stage that reads one is never asked.
+    let singles = PublishedList::new(Arc::clone(&list));
+    let single = asks(7, &singles, Some(&loads));
+    assert_eq!(read_at(&built, &single, now), []);
+}

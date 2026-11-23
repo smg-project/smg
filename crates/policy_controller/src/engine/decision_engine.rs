@@ -279,7 +279,8 @@ pub enum WorkerLists<'a> {
     /// The host hands no list.
     #[default]
     None,
-    /// A single request's list.
+    /// A single request's list, and the one list of a request of another
+    /// phase that stands alone.
     Single(super::list_cell::LentList<'a>),
     /// A pair's two lists, its prefills and its decodes, with the pair
     /// classes of their workers and the host's reads of its admission.

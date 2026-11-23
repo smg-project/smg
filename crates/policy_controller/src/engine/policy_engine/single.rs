@@ -282,7 +282,7 @@ pub(super) fn decide(
     let cx = if cx.demands.is_none() {
         &cx
     } else {
-        match held(records, cx, &mut meeting) {
+        match held(records, cx, request.facts.phase, &mut meeting) {
             Ok(held) => {
                 narrowed = held;
                 &narrowed
@@ -471,12 +471,26 @@ fn retried(
 /// ([`held_in`]). The places stand in `meeting`, the calling thread's own
 /// list, taken here: its caller puts it back ([`MEETING`]). Out of line:
 /// its code stays off the path of a request that states no demand.
+///
+/// A request stands alone here, so its list is held to what a worker of
+/// its `phase`'s role holds of the demands ([`Demands::held_by`]). A
+/// prefill worker holds the input alone, with no decode beside it to hold
+/// the rest: a host states both bounds whatever the phase.
+///
+/// [`Demands::held_by`]: crate::engine::demands::Demands::held_by
 #[inline(never)]
 fn held<'a>(
     records: &PoolRecords,
     cx: Constraints<'a>,
+    phase: Phase,
     meeting: &'a mut Option<Vec<u32>>,
 ) -> Result<Constraints<'a>, UnmetDemand> {
+    let demands = cx.demands.held_by(phase.role());
+    let cx = Constraints { demands, ..cx };
+    // Where the role holds none of them, no row is judged.
+    if demands.is_none() {
+        return Ok(cx);
+    }
     held_in(records, cx, meeting.insert(MEETING.take()))
 }
 
@@ -1869,8 +1883,7 @@ pub(crate) mod tests {
     }
 
     /// A request that hands no list is decided over no worker. One that
-    /// states what no stage here runs is declined under that stage's name,
-    /// and a side sent on its own has no decision.
+    /// states what no stage here runs is declined under that stage's name.
     #[test]
     fn what_no_stage_runs_is_answered_by_name() {
         let engine = preset("round_robin");
@@ -1900,19 +1913,11 @@ pub(crate) mod tests {
         dialed.constraints.wire_modes = WireModes::HTTP.union(WireModes::GRPC);
         let asks = Asks::of(dialed, Some(&members));
         assert!(matches!(answered(&engine, &asks), Decided::Alone(_)));
-        let mut side = request();
-        side.facts.phase = Phase::Decode;
-        let asks = Asks::of(side, Some(&members));
-        assert_eq!(
-            engine
-                .decide_under(GatewayId::LOCAL, &asks, Instant::now())
-                .err(),
-            Some(DecisionRefused::PairSide)
-        );
     }
 
     /// A list's cell is asked where the engine decides over the list, and
-    /// nowhere else. A request the engine refuses by its phase asks no
+    /// nowhere else. A request the engine refuses by its phase, a pair's
+    /// decode sent on its own, asks no
     /// cell, plain or not, at either entry: its list's cell stays empty. A
     /// maker that names its list while it makes the request is decided over
     /// that list. So is a plain maker that lends one list ahead of its
@@ -1970,22 +1975,26 @@ pub(crate) mod tests {
         let list = pool(2);
         let members = PublishedList::new(Arc::clone(&list));
         let now = Instant::now();
-        for phase in [Phase::Decode, Phase::Encode] {
-            let mut side = request();
-            side.facts.phase = phase;
-            // A plain request, and the same one from a maker that does not
-            // say so.
-            let plain = Asks::of(side, Some(&members));
-            assert!(plain.plain().is_some());
-            let leased = engine.decide_under(GatewayId::LOCAL, &plain, now);
-            assert_eq!(leased.err(), Some(DecisionRefused::PairSide), "{phase:?}");
-            let whole = Whole(Asks::of(side, Some(&members)));
-            let leased = engine.decide_under(GatewayId::LOCAL, &whole, now);
-            assert_eq!(leased.err(), Some(DecisionRefused::PairSide), "{phase:?}");
-            let bare = engine.decide_without_lease(&whole, now);
-            assert_eq!(bare.err(), Some(DecisionRefused::PairSide), "{phase:?}");
-        }
-        assert_eq!(engine.values_made(), 0, "no cell was asked");
+        // Under a pair plan a decode is its pair's side: sent on its own
+        // over one list it is refused, and the list's cell is not asked.
+        let document =
+            PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets");
+        let paired = PolicyEngine::new(AppliedSpec::validate(&document).expect("a valid document"));
+        let mut side = request();
+        side.facts.phase = Phase::Decode;
+        // A plain request, and the same one from a maker that does not say
+        // so.
+        let plain = Asks::of(side, Some(&members));
+        assert!(plain.plain().is_some());
+        let leased = paired.decide_under(GatewayId::LOCAL, &plain, now);
+        assert_eq!(leased.err(), Some(DecisionRefused::PairSide));
+        let whole = Whole(Asks::of(side, Some(&members)));
+        let leased = paired.decide_under(GatewayId::LOCAL, &whole, now);
+        assert_eq!(leased.err(), Some(DecisionRefused::PairSide));
+        let bare = paired.decide_without_lease(&whole, now);
+        assert_eq!(bare.err(), Some(DecisionRefused::PairSide));
+        assert_eq!(paired.values_made(), 0, "no cell was asked");
+        assert!(!members.filled(), "the list's cell stays empty");
 
         let late = Late(request(), &members, Cell::new(false));
         let leased = engine.decide_under(GatewayId::LOCAL, &late, now);
@@ -2633,9 +2642,10 @@ pub(crate) mod tests {
 
     /// A request that hands no list of its kind is decided over no worker,
     /// as the one entry decides it: a single with no list, a pair's prefill
-    /// with none, and a prefill over a single's list. A single over a pair's
-    /// two lists or an encode request's three is shed too. A decode or an
-    /// encode request sent on its own is refused.
+    /// with none, and a pair's prefill over a single's list. A single over a
+    /// pair's two lists or an encode request's three is shed too. So is a
+    /// decode or an encode request that stands alone and hands no list. A
+    /// pair's decode sent on its own is refused.
     #[test]
     fn a_decision_without_a_lease_over_no_list_names_no_worker() {
         use smg_worker::{test_support::worker_with_model_aliases, worker::WorkerType};
@@ -2704,7 +2714,9 @@ pub(crate) mod tests {
         for (phase, over, members, engine) in [
             (Phase::Single, "no list", WorkerLists::None, &engine),
             (Phase::Prefill, "no list", WorkerLists::None, &engine),
-            (Phase::Prefill, "a single's list", single, &engine),
+            (Phase::Decode, "no list", WorkerLists::None, &engine),
+            (Phase::Encode, "no list", WorkerLists::None, &engine),
+            (Phase::Prefill, "a single's list", single, &paired),
             (Phase::Single, "a pair's lists", both, &paired),
             (Phase::Single, "an encode request's lists", three, &paired),
         ] {
@@ -2725,11 +2737,9 @@ pub(crate) mod tests {
             };
             assert_eq!((theirs.reason, theirs.emptied_by), none);
         }
-        for phase in [Phase::Decode, Phase::Encode] {
-            let asks = stating(phase, WorkerLists::None);
-            let refused = engine.decide_without_lease(&asks, Instant::now());
-            assert_eq!(refused.err(), Some(DecisionRefused::PairSide), "{phase:?}");
-        }
+        let asks = stating(Phase::Decode, WorkerLists::None);
+        let refused = paired.decide_without_lease(&asks, Instant::now());
+        assert_eq!(refused.err(), Some(DecisionRefused::PairSide));
     }
 
     /// A request its sessions rule places alone says so on its pick, and its

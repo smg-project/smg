@@ -158,10 +158,6 @@ use tonic::{transport::Endpoint, Code};
 /// one.
 const READS_KEPT_LOADS: bool = false;
 
-/// A controller decides no prefill whose plan pairs no side, no decode frame
-/// that names no lease and no encode request yet.
-const DECIDES_PHASES: bool = false;
-
 /// A new document's engine starts with no session pin yet: a pinned key is
 /// placed anew at its first request behind an apply.
 const KEEPS_PINS_ACROSS_AN_APPLY: bool = false;
@@ -1857,66 +1853,64 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         // rule no booking reaches, eight asks of one size name one row
         // whatever their seeds, and a size from each third of the span
         // names a row of its own.
-        if DECIDES_PHASES {
-            within("the prefill pool's rows read healthy", ROOM, || {
-                harness
-                    .pool(SIZED, Role::Prefill)
-                    .is_ok_and(|pool| pool.len() == 3 && pool.iter().all(|row| row.healthy))
-            })
-            .await
-            .expect("the prefill pool turns ready");
+        within("the prefill pool's rows read healthy", ROOM, || {
             harness
-                .apply_document(by_size().expect("a form of this build's preset"))
-                .expect("a form of this build's preset applies");
-            let third = bucket::SPAN / 3;
-            let mut owners = Vec::new();
-            for part in 0u32..3 {
-                let tokens = part * third + third / 2;
-                let first = u64::from(part) * 8;
-                let owner = picked(&mut harness, sized(nth("sized", first), tokens))
+                .pool(SIZED, Role::Prefill)
+                .is_ok_and(|pool| pool.len() == 3 && pool.iter().all(|row| row.healthy))
+        })
+        .await
+        .expect("the prefill pool turns ready");
+        harness
+            .apply_document(by_size().expect("a form of this build's preset"))
+            .expect("a form of this build's preset applies");
+        let third = bucket::SPAN / 3;
+        let mut owners = Vec::new();
+        for part in 0u32..3 {
+            let tokens = part * third + third / 2;
+            let first = u64::from(part) * 8;
+            let owner = picked(&mut harness, sized(nth("sized", first), tokens))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            for n in 1..8 {
+                let again = picked(&mut harness, sized(nth("sized", first + n), tokens))
                     .await
                     .expect("a pick answers an ask over a ready fleet");
-                for n in 1..8 {
-                    let again = picked(&mut harness, sized(nth("sized", first + n), tokens))
-                        .await
-                        .expect("a pick answers an ask over a ready fleet");
-                    assert_eq!(again, owner, "requests of like size meet on one engine");
-                }
-                owners.push(owner);
+                assert_eq!(again, owner, "requests of like size meet on one engine");
             }
-            let apart: HashSet<Picked> = owners.iter().copied().collect();
-            assert!(
+            owners.push(owner);
+        }
+        let apart: HashSet<Picked> = owners.iter().copied().collect();
+        assert!(
             apart.len() == 3 && owners.iter().all(|row| engines[7..].contains(&row.engine)),
             "a size from each third of the span has an engine of the pool to itself: {owners:?}"
         );
 
-            // The balance rule spills on what the decisions booked. Under the
-            // preset as the catalog spells it an idle pool places a size on
-            // its owner, and the tokens of that decision are booked on the
-            // engine: the next two asks of the same size go to the two engines
-            // that booked nothing.
-            harness
-                .apply("bucket")
-                .expect("a preset of this build applies");
-            let mut round = Vec::new();
-            for n in 0..3 {
-                let pick = picked(&mut harness, sized(nth("spill", n), third / 2))
-                    .await
-                    .expect("a pick answers an ask over a ready fleet");
-                round.push(pick);
-            }
-            assert_eq!(
-                round.first(),
-                owners.first(),
-                "an idle pool places a size on its owner"
-            );
-            let spilled: HashSet<Picked> = round.iter().copied().collect();
-            assert_eq!(
-                spilled.len(),
-                3,
-                "an engine a decision booked gives way to one that booked nothing: {round:?}"
-            );
+        // The balance rule spills on what the decisions booked. Under the
+        // preset as the catalog spells it an idle pool places a size on
+        // its owner, and the tokens of that decision are booked on the
+        // engine: the next two asks of the same size go to the two engines
+        // that booked nothing.
+        harness
+            .apply("bucket")
+            .expect("a preset of this build applies");
+        let mut round = Vec::new();
+        for n in 0..3 {
+            let pick = picked(&mut harness, sized(nth("spill", n), third / 2))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            round.push(pick);
         }
+        assert_eq!(
+            round.first(),
+            owners.first(),
+            "an idle pool places a size on its owner"
+        );
+        let spilled: HashSet<Picked> = round.iter().copied().collect();
+        assert_eq!(
+            spilled.len(),
+            3,
+            "an engine a decision booked gives way to one that booked nothing: {round:?}"
+        );
 
         // The death. The kill waits for a pool that reads its engine
         // healthy, so the death alone moves its rows. Its promise is held

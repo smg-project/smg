@@ -3019,6 +3019,20 @@ pub enum Plan {
     },
 }
 
+impl Plan {
+    /// Whether `phase` is one of the sides this plan decides together, at
+    /// the pair's prefill. A request of any other phase stands alone: one
+    /// profile over the one list of its phase.
+    #[cfg(feature = "in-process")]
+    pub(crate) const fn pairs(self, phase: Phase) -> bool {
+        match self {
+            Self::Single => false,
+            Self::PdPair => matches!(phase, Phase::Prefill | Phase::Decode),
+            Self::Epd { .. } => !matches!(phase, Phase::Single),
+        }
+    }
+}
+
 /// The profile a binding resolves a phase to, by position; `None` when the
 /// binding's plan has no side for the phase: a single or an encode request
 /// under the pair plan, a single request under `epd`. The host and the spec
@@ -5362,6 +5376,19 @@ impl Engine {
         let at = self.binding_position(model, Phase::Prefill)?;
         let pairs = matches!(self.binding_at(at)?.plan, Plan::PdPair | Plan::Epd { .. });
         pairs.then_some(at)
+    }
+
+    /// Whether a request of `model` at `phase` is a side of a pair: the
+    /// first binding that matches, by the phase's own lookup, states a plan
+    /// that decides the phase with its pair ([`Plan::pairs`]). Any other
+    /// request stands alone, and one that no binding matches does too: one
+    /// profile decides it over the one list of its phase. A binding of one
+    /// profile listed ahead of the pair's for the decode phase so decides
+    /// a decode asked alone.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn pairs(&self, model: &str, phase: Phase) -> bool {
+        self.binding(model, phase)
+            .is_some_and(|binding| binding.plan.pairs(phase))
     }
 
     /// The shadow word of the binding at `at`, where its shadow is asked

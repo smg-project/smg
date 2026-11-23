@@ -1206,7 +1206,7 @@ pub trait RequestMaker {
 
 pub enum WorkerLists<'a> {
     None,
-    Single(LentList<'a>),    // one list for a single request, lent with its cell
+    Single(LentList<'a>),    // one list, for a single request or one that stands alone, lent with its cell
     Pair(PairLists<'a>),     // a pair's prefill list and decode list
     Encode(EncodeLists<'a>), // an encode request's three lists: its pair's two and its encoders
 }
@@ -1744,9 +1744,14 @@ that the worker objects' registry publishes. A pair's request at its prefill is 
 too, over the registry's two lists of its model. Its answer carries a lease a side, or the
 prefill side's alone where its frame stated the later decode. A decode call that names the
 pair's lease is decided behind the prefill that lease holds, by
-`PolicyEngine::decide_decode_without_lease`, and its pick is issued under that lease. An encode
-request, a decode request that names no lease and a prefill whose plan pairs no side are
-answered `Busy`, and their gateway decides them.
+`PolicyEngine::decide_decode_without_lease`, and its pick is issued under that lease. A prefill
+request, or a decode request that names no lease, stands alone where its plan pairs no side of
+its phase: it is decided as a single request is, over the registry's list of its own phase's
+workers, and its lease is a single's. The token count of a prefill-decode mode (section 3.3) is
+not decided this way: it is a single request over the prefill workers, the wire cannot say so,
+and a controller reads the single workers' list for it, which such a fleet does not have. An
+encode request, and a decode request that names no lease under a pair plan, are answered `Busy`,
+and their gateway decides them.
 
 ### 10.2 As designed **[partly]**
 
@@ -1756,13 +1761,13 @@ the worker crate's structures, and the one engine.
 | Data | On main | As designed |
 |---|---|---|
 | workers | records in the store, and worker objects kept in step with them | worker objects in a worker-crate registry; beside each, the code that keeps the objects holds what a registration stated and the object does not hold as stated (10.3); the membership log that watchers and standbys read stays |
-| lists | the store's published copy; a single request's decision reads the registry's published list of the model's single workers, and a pair's, at its prefill and at its decode call, the lists of its two sides | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
+| lists | the store's published copy; a single request's decision reads the registry's published list of the model's single workers, a pair's, at its prefill and at its decode call, the lists of its two sides, and a prefill or a decode request that stands alone the list of its own phase's workers | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
 | health | the worker crate's health checker over the worker objects, on the leader; each outcome is copied into the store's record, an object's status follows its record's, and a decision reads the object's | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
 | loads | the worker crate's load monitor over the worker objects, while the replica leads: a decision is given its snapshot where the document reads reports and keeps none, and reads the overload verdict on the object; the crate's own poller and table still run, and no decision reads them | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic, whose gateway hands every worker the same two defaults |
 | cache events | an index of the store's own; a decision reads none yet | the kv-index crate's index, filled by the worker crate's collector |
 | sessions | the engine's session table for a single request, one for each document | the engine's session table |
 | leases | the store's lease tables, in memory, one for each deciding thread | stay: a controller must remember what it issued to gateways |
-| decisions | a single request, a pair at its prefill and its decode call: `PolicyEngine` over the registry's lists; an encode request: none, the request is answered `Busy` | `PolicyEngine::decide_without_lease` over the registry's lists |
+| decisions | a single request, a pair at its prefill, its decode call, and a prefill or a decode request that stands alone: `PolicyEngine` over the registry's lists; an encode request, and a decode request that names no lease under a pair plan: none, the request is answered `Busy` | `PolicyEngine::decide_without_lease` over the registry's lists |
 | discovery | not registering | the discovery crate through its host interface, registering through the worker crate's job queue |
 
 **Who sends a worker's data.** Nothing changes for a worker. It pushes its load records and its
