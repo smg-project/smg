@@ -1903,7 +1903,6 @@ impl McpOrchestrator {
                 pool_key,
             });
         }
-        let opened = pooled.is_none();
 
         // Connect via the pool
         let inventory_clone = Arc::clone(&self.tool_inventory);
@@ -1978,9 +1977,6 @@ impl McpOrchestrator {
             );
         }
 
-        if opened {
-            self.metrics.record_connection_opened();
-        }
         Ok(ConnectedServer {
             server_key,
             list_error,
