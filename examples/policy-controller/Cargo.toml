@@ -28,8 +28,9 @@ tikv-jemallocator = { workspace = true }
 # through the generated client and ask decisions through the crate's
 # reference client, a feature the tests alone turn on.
 #
-# `own-repository.sh` writes this list into the manifest of the copy it
-# makes: a dependency added here is added there.
+# `own-repository.sh` holds its own copy of this list and writes it into the
+# manifest of the copy it makes: a dependency added here must be added there
+# as well, or `cargo test` in that copy stops building.
 [dev-dependencies]
 mock-worker = { path = "../../crates/mock_worker" }
 serde_yaml = { workspace = true }

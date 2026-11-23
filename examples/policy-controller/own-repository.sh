@@ -93,6 +93,8 @@ cp -R "${here}/src" "${here}/tests" "${here}/policy.yaml" "${dest}/"
 cp "${root}/Cargo.lock" "${root}/rust-toolchain.toml" "${dest}/"
 mkdir "${dest}/.cargo"
 printf '[env]\n%s\n' "${page}" > "${dest}/.cargo/config.toml"
+# The test-only dependencies below are the example's own list (the manifest
+# beside this script), kept here by hand: one added there is added here.
 cat > "${dest}/Cargo.toml" <<TOML
 [package]
 name = "policy-controller-example"

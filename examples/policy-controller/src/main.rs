@@ -136,7 +136,10 @@ mod tests {
 
     use smg_policy_controller::{
         document::{operator::SpecRejected, AppliedSpec, PolicySpec, SpecError},
-        engine::{LentList, ListCell, PlaceRequest, PolicyEngine, WorkerLists, WorkerRule},
+        engine::{
+            Candidate, LentList, ListCell, LoadRow, PlaceRequest, PolicyEngine, RequestFacts,
+            Scorer, TieBand, Unplaced, WorkerLists, WorkerRule,
+        },
         service::controller::{Config, Controller, ElectionConfig, Error, Listener, Scope},
         stages::StageRegistry,
     };
@@ -147,7 +150,7 @@ mod tests {
         worker::{WorkerLoadResponse, WorkerStatus},
     };
 
-    use super::stages;
+    use super::{stages, Pack};
 
     /// The document the example ships.
     const POLICY: &str = include_str!("../policy.yaml");
@@ -265,6 +268,12 @@ mod tests {
         /// [`Self::pick`] for a request whose route states a rule of its
         /// own for a worker it may be sent to.
         fn pick_where(&self, admits: Option<WorkerRule<'_>>) -> Option<String> {
+            self.place(admits).ok()
+        }
+
+        /// The engine's one call for a request over the list as it stands:
+        /// the address of the worker it is placed on, or why it has none.
+        fn place(&self, admits: Option<WorkerRule<'_>>) -> Result<String, Unplaced> {
             let lent = LentList {
                 workers: &self.workers,
                 cell: &self.cell,
@@ -274,8 +283,8 @@ mod tests {
                 admits,
                 ..PlaceRequest::of(MODEL, WorkerLists::Single(lent))
             };
-            let placement = self.engine.place(&request).ok()?;
-            Some(placement.worker.url().to_owned())
+            let placement = self.engine.place(&request)?;
+            Ok(placement.worker.url().to_owned())
         }
     }
 
@@ -308,12 +317,48 @@ mod tests {
             seen().await;
             // The engines' own reports say which worker is busy.
             assert!(fleet.fills(&fleet.busy));
-            // The profile's filters read a worker's health: a worker taken
-            // out of rotation is not picked, however busy.
+            // A worker taken out of rotation is not picked, however busy.
             fleet.busy.set_status(WorkerStatus::NotReady);
             assert_eq!(fleet.pick().as_deref(), Some(fleet.idle.url()));
+            // With no worker in rotation the request is shed, and by the
+            // document's own filter: the profile lists `healthy`, so its
+            // decision holds no worker that is out of rotation. A profile
+            // that listed no such filter would name one, and the call would
+            // answer that it has no worker to send to.
+            fleet.idle.set_status(WorkerStatus::NotReady);
+            match fleet.place(None) {
+                Err(Unplaced::Shed { emptied_by, .. }) => assert_eq!(emptied_by, "healthy"),
+                other => panic!("the request was answered {other:?}"),
+            }
         };
         beside_its_task(fleet.engine, case).await;
+    }
+
+    /// The scorer alone, over rows made by hand. A worker scores its share
+    /// of the busiest worker's running requests. Where nothing runs no
+    /// worker is the busiest, and each takes the whole score: an idle fleet
+    /// ties.
+    #[test]
+    fn the_scorer_scores_a_workers_share_of_the_busiest_and_ties_an_idle_fleet() {
+        let row = |running: Option<u32>| Candidate {
+            load: running.map(|running| LoadRow {
+                running,
+                ..LoadRow::default()
+            }),
+            ..Candidate::default()
+        };
+        let scores = |rows: &[Candidate]| {
+            let kept: Vec<u32> = (0..).take(rows.len()).collect();
+            let mut out = vec![0.0_f32; rows.len()];
+            let band = Pack.score(&RequestFacts::default(), rows, &kept, &mut out);
+            assert_eq!(band, TieBand::NORMALIZED);
+            out
+        };
+        // A worker with no report counts as idle beside the busy ones.
+        let busy = [row(Some(4)), row(Some(1)), row(None)];
+        assert_eq!(scores(&busy), [1.0, 0.25, 0.0]);
+        let idle = [row(Some(0)), row(None), row(Some(0))];
+        assert_eq!(scores(&idle), [1.0, 1.0, 1.0]);
     }
 
     #[tokio::test(start_paused = true)]
