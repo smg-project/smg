@@ -1164,23 +1164,23 @@ pub struct RequestFacts<'a> {
     /// frame keeps `0` under every exposure.
     pub client_key: u64,
     /// The hash ring the request's caller keeps of the model's workers,
-    /// lent to this decision ([`LentRing`]): the plain ring stage with no
-    /// bounded-load rule places the request's key where this ring's walk
-    /// reaches, and its own ring learns nothing of the decision. The rows
-    /// of such a decision carry the ids of their workers' addresses
-    /// ([`WorkerId::from_address`]): a program that states ids of its own
-    /// lends none ([`FixedFacts::id`]). A caller that keeps rings lends one
-    /// with every such request, an empty one for a model whose ring it
-    /// has not built: a key its walk hands to no kept worker goes to the
-    /// kept worker at the key's position modulo their count. `None` from a
-    /// caller that keeps no ring, as a controller: the stage places by its
-    /// own. Both sides of a pair take the one ring, each over its own
-    /// list: a side takes a worker of the ring only where its list keeps
-    /// that worker, and a key no kept worker of the side takes goes to the
-    /// side's kept worker at the key's position modulo their count. An
-    /// encode request's items take none: the place stated is the request's
-    /// routing value's, and an item is placed by its own key on the stage's
-    /// ring. In-process only.
+    /// lent to this decision ([`LentRing`]): the ring stage places the
+    /// request where this ring's walk reaches, and its own ring learns
+    /// nothing of the decision. The rows of such a decision carry the ids
+    /// of their workers' addresses ([`WorkerId::from_address`]): a program
+    /// that states ids of its own lends none ([`FixedFacts::id`]). A caller
+    /// that keeps rings lends one with every such request, an empty one
+    /// for a model whose ring it has not built: a key its walk hands to no
+    /// kept worker goes to the kept worker at the key's position modulo
+    /// their count, and under the prefix form to the worker the stages
+    /// behind the ring take. `None` from a caller that keeps no ring, as a
+    /// controller: the stage places by its own. Both sides of a pair take
+    /// the one ring, each over its own list: a side takes a worker of the
+    /// ring only where its list keeps that worker, and a key no kept
+    /// worker of the side takes goes by the same rule over that side's
+    /// kept workers. An encode request's items take none: the place stated
+    /// is the request's routing value's, and an item is placed by its own
+    /// key on the stage's ring. In-process only.
     pub ring: Option<&'a dyn LentRing>,
     /// Where the request stands on the lent ring, as its caller states it:
     /// the position of the value it is placed by ([`LentRing::position`]).
@@ -1190,7 +1190,12 @@ pub struct RequestFacts<'a> {
     /// too. The list stands as long as the request does: a caller that
     /// finds a position while it makes the request, with the request's
     /// keys ([`KeySources::derive_keys`](crate::document::KeySources::derive_keys)),
-    /// keeps it beside the request. In-process only: no frame carries it.
+    /// keeps it beside the request. A prompt gives one entry for each of
+    /// its heads the caller's ring places it by, the deepest first: a stage
+    /// under a bounded-load rule tries the entries in that order, and any
+    /// other reads the first. The one call states a routing value's entry
+    /// alone: a prompt's entries are stated by a host that writes the
+    /// request's facts itself. In-process only: no frame carries it.
     pub ring_positions: &'a [u64],
 }
 

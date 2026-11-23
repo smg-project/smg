@@ -761,3 +761,49 @@ fn a_decode_decided_again_is_asked_the_routes_rule() {
     assert_eq!(placement.decode_again(&request), Ok(()));
     assert_eq!(lists.places(&placement), (0, 1), "past the refused decode");
 }
+
+/// A pair whose caller lends its ring has each side placed on the first
+/// worker of its own list that the ring's walk reaches from where the
+/// routing value stands, as the gateway's own policy takes each side from
+/// the pair's one ring (`model_gateway/src/routers/common/placement.rs`,
+/// lines 1498 to 1583 at 882be6f4f).
+#[test]
+fn a_pair_that_lends_its_ring_has_each_side_placed_where_its_walk_reaches() {
+    let document = PolicySpec::pair_presets("consistent_hashing", "consistent_hashing");
+    let engine = hosted(engine_of(&document.expect("the pair presets")));
+    let lists = Lists::of(engine, 3, 3);
+    let classes = lists.every();
+    // The ring names the six workers, the two lists mixed: a prefill or a
+    // decode, by its place in its list.
+    let order = [
+        (false, 1),
+        (true, 2),
+        (false, 0),
+        (true, 0),
+        (true, 1),
+        (false, 2),
+    ];
+    let address = |&(prefill, at): &(bool, usize)| {
+        let list = if prefill {
+            &lists.prefills
+        } else {
+            &lists.decodes
+        };
+        list[at].url().to_owned()
+    };
+    let ring = Lent(order.iter().map(address).collect());
+    let headers = [("x-smg-routing-key", "conv-1")];
+    let request = PlaceRequest {
+        headers: &headers,
+        ring: Some(&ring),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
+    };
+    let placement = engine.place(&request).expect("a placement");
+    // Each side's first worker along the ring from where the key stands.
+    let start = (ring.position("conv-1") % 6) as usize;
+    let first = |prefill: bool| {
+        let mut along = order.iter().cycle().skip(start).take(6);
+        along.find(|side| side.0 == prefill).expect("a worker").1
+    };
+    assert_eq!(lists.places(&placement), (first(true), first(false)));
+}

@@ -243,6 +243,12 @@ const CELLS: &[Cell] = &[
         ..Cell::PLAIN
     },
     Cell {
+        name: "prefix_hash",
+        document: || preset("prefix_hash"),
+        request: keyed,
+        ..Cell::PLAIN
+    },
+    Cell {
         name: "random",
         document: || preset("random"),
         ..Cell::PLAIN

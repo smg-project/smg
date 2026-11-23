@@ -271,10 +271,11 @@ impl KeySources {
     /// ([`RequestFacts::ring`](crate::engine::RequestFacts::ring)): the
     /// position is that ring's own hash of the key's text, so the key has
     /// the owner the caller's own walk finds where that walk starts from
-    /// the key's text too. A caller hands it for a
-    /// request a ring places, under a profile whose stages read one
-    /// ([`Needs::ring`](crate::document::Needs::ring)), and `None` for any
-    /// other: nothing is hashed then.
+    /// the key's text too. A caller hands it for a request a ring places,
+    /// where
+    /// [`Engine::states_key_place`](crate::engine::Engine::states_key_place)
+    /// answers `true` for the request's model and phase, and `None` for any
+    /// other: the ring is asked nothing then.
     pub fn derive_keys<'a>(
         &'a self,
         header: impl Fn(&str) -> Option<&'a [u8]>,

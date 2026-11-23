@@ -2029,6 +2029,38 @@ mod tests {
         assert_eq!(placed(&no_decode, 4), (1, 0));
     }
 
+    /// Under the prefix form each side of a pair is placed on the lent ring
+    /// too, from the first place its caller states whose owner is within
+    /// the bound: the first eligible worker of its own list that the walk
+    /// reaches there, as the gateway's own policy takes it from the pair's
+    /// one ring (`model_gateway/src/policies/prefix_hash.rs`, lines 291 to
+    /// 315 at 882be6f4f). Every worker here is idle: the first place is
+    /// the one taken.
+    #[test]
+    fn each_side_of_a_pair_under_the_prefix_form_places_on_the_lent_ring() {
+        let document = PolicySpec::pair_presets("prefix_hash", "prefix_hash");
+        let spec = AppliedSpec::validate(&document.expect("the pair presets"));
+        let host = Host::under((spec.expect("a valid document"), Arc::default()), 3, 3);
+        let address = |at: &str| format!("grpc://{at}:9000");
+        let model = "decode-1 prefill-2 decode-0 prefill-0 prefill-1 decode-2";
+        let ring = InOrder(model.split(' ').map(address).collect());
+        let placed = |position: u64| {
+            let classes = every(3, 3);
+            let positions = [position];
+            // The host's own request over its two lists, every pair open.
+            let Asks(mut request, lists, _) = host.asks(&classes, false);
+            request.facts = RequestFacts {
+                ring: Some(&ring),
+                ring_positions: &positions,
+                ..keyed()
+            };
+            let (spec, now) = (host.engine.spec(), Instant::now());
+            host.picked(&lists.decide(spec, None, &host.clock, now, &mut request, None))
+        };
+        assert_eq!(placed(0), (2, 1));
+        assert_eq!(placed(3), (0, 2));
+    }
+
     /// The stock presets of a pair as a document in force, round robin for
     /// its prefills and `decode` for its decodes, with the list its stages'
     /// words would be kept in.
