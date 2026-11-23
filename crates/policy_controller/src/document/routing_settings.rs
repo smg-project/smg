@@ -206,8 +206,8 @@ impl Default for RoutingSettings {
 impl RoutingSettings {
     /// The provider's name, where every router of the gateway is that
     /// provider's: a provider mode of a gateway that does not run many routers.
-    /// Such a gateway places its requests by no routing policy.
-    fn provider_alone(&self) -> Option<&'static str> {
+    /// It places by no routing policy: a host asks here ahead of the document.
+    pub fn provider_alone(&self) -> Option<&'static str> {
         match self.mode {
             ModeSettings::Provider(provider) => (!self.enable_igw).then_some(provider),
             ModeSettings::Regular
@@ -2902,6 +2902,39 @@ mod tests {
             (selection, "selection_policy", "another"),
         ] {
             assert_eq!(refusal(&refused), (setting, value.to_string()));
+        }
+    }
+
+    /// What a host asks ahead of the document: a provider mode of a gateway
+    /// of one router is named, and no other configuration is.
+    #[test]
+    fn a_provider_mode_of_one_router_is_named_alone() {
+        let named = |mode: ModeSettings, enable_igw: bool| {
+            RoutingSettings {
+                mode,
+                enable_igw,
+                ..config(PolicySettings::RoundRobin)
+            }
+            .provider_alone()
+        };
+        let provider = || ModeSettings::Provider("a_provider");
+        assert_eq!(named(provider(), false), Some("a_provider"));
+        // Under the multi-router setting the document plans the gateway's
+        // self-hosted workers.
+        assert_eq!(named(provider(), true), None);
+        for many in [false, true] {
+            let pair = ModeSettings::PrefillDecode {
+                prefill_policy: None,
+                decode_policy: None,
+            };
+            let encode = ModeSettings::EncodePrefillDecode {
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            };
+            for mode in [ModeSettings::Regular, pair, encode] {
+                assert_eq!(named(mode, many), None);
+            }
         }
     }
 

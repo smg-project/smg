@@ -1945,7 +1945,7 @@ impl ConfigValidator {
         // A launcher gives the document's path, and a host may hand the
         // document itself. Either one, with the switch off, would be dropped
         // and the classic policies would serve.
-        if !config.policy_controller
+        if !config.policy_engine_decides()
             && (config.policy_spec_path.is_some() || config.policy_spec.is_some())
         {
             return Err(ConfigError::invalid_value(
