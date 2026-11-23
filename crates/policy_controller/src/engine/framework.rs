@@ -17,7 +17,6 @@ use crate::{
             Decision, LiftedVeto, Overlap, Pick, Shed, ShedReason, Survivors, Target, Targets,
             Trace, MAX_TARGETS, TRACE_TOP,
         },
-        prefix_pass::forget_prefix_pass,
         sticky_sessions::{self, Claim, SessionRule, SessionTable, SessionVerdict},
         view::{
             mean_in_flight, AffinityFacts, AffinityRows, Candidate, Constraints, LoadReportCutoff,
@@ -378,10 +377,8 @@ pub trait Scorer: Lifecycle + Debug {
     }
 
     /// Whether this scorer says what a pick's first target holds of its
-    /// request ([`Self::said`]); the default is no. The engine reads it
-    /// once per profile when it is built, and asks the profile's first
-    /// such scorer behind a decision whose overlap it states
-    /// ([`Engine::decide_stated`]).
+    /// request ([`Self::said`]); the default is no. No entry of the engine
+    /// reads it: none states a pick's overlap.
     fn states_overlap(&self) -> bool {
         false
     }
@@ -391,6 +388,9 @@ pub trait Scorer: Lifecycle + Debug {
     /// a decision: a stage may spend what its pass judged by on the first
     /// call, so a second row asked of the same decision may read no margin
     /// held. The default says nothing.
+    ///
+    /// No entry of the engine asks it: a pick's overlap reads as not stated
+    /// ([`Pick::overlap`]).
     fn said(&self, _facts: &RequestFacts<'_>, _candidates: &[Candidate], _row: u32) -> Overlap {
         Overlap::default()
     }
@@ -3458,12 +3458,6 @@ pub struct Engine {
     /// ([`Lifecycle::keeps_loads`]), each by its place: listed once at the
     /// build, so a publication asks no stage whether it keeps them.
     keepers: Vec<Keeper>,
-    /// Per profile, the place among its scorers of the first that states a
-    /// pick's overlap ([`Scorer::states_overlap`]), `None` where the
-    /// profile holds none. A decision reads it where its host asks the
-    /// overlap stated ([`Engine::decide_stated`]), and no other does. The
-    /// place is kept whole: a profile is as long as its document makes it.
-    stating: Vec<Option<usize>>,
     /// One tally per profile that reads sends, in the order of the
     /// profiles' names: a later engine finds a profile's by its name
     /// ([`Engine::succeed`]).
@@ -4691,13 +4685,6 @@ impl Engine {
                 draws_first(profile) && DRAWS_BY_ITS_TEST.contains(&profile.picker.name())
             })
             .collect();
-        let stating = profiles
-            .iter()
-            .map(|profile| {
-                let stated = |weighted: &WeightedScorer| weighted.scorer.states_overlap();
-                profile.scorers.iter().position(stated)
-            })
-            .collect();
         let row_tests: Vec<Option<RowTests>> = profiles
             .iter()
             .map(|profile| RowTests::of(&profile.filters))
@@ -4826,7 +4813,6 @@ impl Engine {
             explain_sample: 0,
             max_report_age_ms: None,
             keepers,
-            stating,
             sent_credits: Vec::new(),
             hears,
         }
@@ -5913,69 +5899,6 @@ impl Engine {
         run_whole(self, index, facts, pool, set, cx, buf)
     }
 
-    /// [`Self::decide`], with what the pick's first target holds of the
-    /// request stated in the pick ([`Overlap`]): the word of the deciding
-    /// profile's first scorer that states one ([`Scorer::said`]), and
-    /// nothing where the profile holds none. A host calls it for a
-    /// decision it fed the rows' holdings for, and [`Self::decide`] for
-    /// any other: that entry asks no stage a thing more and states
-    /// nothing.
-    pub fn decide_stated(
-        &self,
-        facts: &RequestFacts<'_>,
-        pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
-        cx: &Constraints<'_>,
-        scratch: &mut Scratch,
-    ) -> Decision {
-        // What a pass of an earlier decision judged by is no word of this
-        // one's pick.
-        forget_prefix_pass();
-        let mut decision = self.decide(facts, pool, candidates, cx, scratch);
-        if let Decision::Pick(pick) = &mut decision {
-            let overlap = self.overlap_of(facts, candidates, pick);
-            pick.targets.state(overlap);
-        }
-        decision
-    }
-
-    /// [`Self::decide_stated`] for a request whose shadow will be asked
-    /// ([`Self::shadow`]): the decision of [`Self::decide_keeping`], with
-    /// the same word stated in the pick.
-    pub fn decide_stated_keeping(
-        &self,
-        facts: &RequestFacts<'_>,
-        pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
-        cx: &Constraints<'_>,
-        scratch: &mut Scratch,
-    ) -> Decision {
-        forget_prefix_pass();
-        let mut decision = self.decide_keeping(facts, pool, candidates, cx, scratch);
-        if let Decision::Pick(pick) = &mut decision {
-            let overlap = self.overlap_of(facts, candidates, pick);
-            pick.targets.state(overlap);
-        }
-        decision
-    }
-
-    /// What `pick`'s first target holds of the request, by the first
-    /// scorer of the profile that decided that states it.
-    fn overlap_of(
-        &self,
-        facts: &RequestFacts<'_>,
-        candidates: &[Candidate],
-        pick: &Pick,
-    ) -> Overlap {
-        let profile = usize::from(pick.trace.profile);
-        let stage = self.stating.get(profile).copied().flatten();
-        let stage = stage.and_then(|at| self.profiles.get(profile)?.scorers.get(at));
-        match (stage, pick.targets.first()) {
-            (Some(stage), Some(target)) => stage.scorer.said(facts, candidates, target.position),
-            _ => Overlap::default(),
-        }
-    }
-
     /// Make the binding's decision with its shadow profile on the same
     /// rows. The run only updates the shadow's stages and scratch. It
     /// claims and renews no session pin, and it is lent no word of the pool
@@ -5999,8 +5922,8 @@ impl Engine {
     /// decides by the sessions as the live decision found them, whether
     /// or not that decision is committed first: a commit moves the pins.
     /// With no keeping decision of the request on this scratch (behind
-    /// [`Self::decide`] or [`Self::decide_stated`] alone, or with another
-    /// scratch), the shadow reads the pins as they stand.
+    /// [`Self::decide`] alone, or with another scratch), the shadow reads
+    /// the pins as they stand.
     ///
     /// A host that shadows a request decides it through the keeping
     /// entry, each time it decides it. Behind a plain decision the
@@ -7729,15 +7652,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        document::spec::{
-            self, PolicySpec, PrefixAffinityParams, Recovery, RulePlaced, SpillParams,
-        },
+        document::spec::{self, PolicySpec, Recovery, RulePlaced},
         engine::{
             decision::{self, Pair},
             view::{self, Health, Identity, MediaCounts, Role, Session, WorkerId},
         },
         policies::{
-            cache_aware::{Gates, PrefixAffinity},
             manual::Manual,
             passthrough::Passthrough,
             power_of_two::{PowerOfTwo, PowerOfTwoCountFirst, PowerOfTwoMetric},
@@ -8541,63 +8461,6 @@ mod tests {
         assert!(scratch.sessions_found.is_of(key, &facts));
     }
 
-    /// The stated keeping entry makes the stated entry's decision, word
-    /// and all, and keeps what it read of the key as the keeping entry
-    /// does.
-    #[test]
-    fn shadow_reading_is_kept_by_the_stated_keeping_entry_with_its_word() {
-        let params = PrefixAffinityParams::default();
-        let cache = || Profile {
-            name: "cache".into(),
-            filters: vec![Box::new(Healthy)],
-            scorers: vec![WeightedScorer {
-                scorer: Box::new(PrefixAffinity::new(
-                    &params,
-                    Gates::of(Some(&params), None, Some(16)),
-                )),
-                weight: 1.0,
-            }],
-            picker: Box::new(Best),
-        };
-        // A decision claims its key in its engine's table: each entry
-        // decides on an engine of its own.
-        let engine = || {
-            Engine::new(
-                vec![cache(), by_sessions()],
-                vec![Binding {
-                    shadow: Some(1),
-                    sessions: Some(SESSIONS),
-                    ..single_binding()
-                }],
-                23,
-                Needs::default(),
-            )
-        };
-        // Every row holds eight of the request's sixteen blocks.
-        let column = [AffinityFacts {
-            overlap_blocks: 8,
-            admitted_age_ms: u32::MAX,
-            ..AffinityFacts::default()
-        }; 2];
-        let hashes = [0u64; 16];
-        let facts = RequestFacts {
-            block_hashes: &hashes,
-            prompt_tokens: 256,
-            affinity: &column,
-            ..keyed_at(61, 71)
-        };
-        let key = facts.session().get();
-        let rows = [candidate(0, 13), candidate(1, 3)];
-        let (pool, cx) = (PoolFacts::default(), Constraints::default());
-        let mut scratch = Scratch::new();
-        let stated = engine().decide_stated(&facts, &pool, &rows, &cx, &mut scratch);
-        assert_eq!(stated.pick().map(|pick| pick.overlap().blocks), Some(8));
-        assert!(!scratch.sessions_found.is_of(key, &facts));
-        let keeping = engine().decide_stated_keeping(&facts, &pool, &rows, &cx, &mut scratch);
-        assert_eq!(keeping, stated);
-        assert!(scratch.sessions_found.is_of(key, &facts));
-    }
-
     /// A keeping decision that answers before it reads its key leaves no
     /// reading of an earlier one. The same request is decided again, and
     /// the live filters keep nobody. Its shadow, whose filters keep the
@@ -8639,11 +8502,13 @@ mod tests {
 
     /// A host that shadows a request decides it through the keeping entry.
     /// Here one mixes the two: a keeping decision is committed, and the
-    /// same request is decided again through an entry that keeps none.
+    /// same request is decided again through the entry that keeps none.
     /// The scratch still holds the first decision's reading, and a debug
     /// build stops where the shadow would take it.
     #[cfg(debug_assertions)]
-    fn shadow_behind_a_mix_of_the_entries(stated: bool) {
+    #[test]
+    #[should_panic(expected = "the shadow takes a reading behind a plain decision")]
+    fn shadow_behind_a_plain_decision_of_a_kept_request_stops_a_debug_build() {
         let engine = with_shadow(least_requests_profile(), Some(SESSIONS));
         let mut rows = [candidate(0, 1), candidate(1, 3)];
         let facts = keyed_at(61, 71);
@@ -8652,27 +8517,9 @@ mod tests {
         let live = engine.decide_keeping(&facts, &pool, &rows, &cx, &mut scratch);
         assert_eq!(commit(&engine, &facts, &live, 0), rows[0].id);
         rows[0].in_flight = 9;
-        let again = if stated {
-            engine.decide_stated(&facts, &pool, &rows, &cx, &mut scratch)
-        } else {
-            engine.decide(&facts, &pool, &rows, &cx, &mut scratch)
-        };
+        let again = engine.decide(&facts, &pool, &rows, &cx, &mut scratch);
         assert_eq!(first_of(&again), Some(rows[0].id));
         let _ = engine.shadow(&facts, &pool, &rows, &cx, &mut scratch);
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "the shadow takes a reading behind a plain decision")]
-    fn shadow_behind_a_plain_decision_of_a_kept_request_stops_a_debug_build() {
-        shadow_behind_a_mix_of_the_entries(false);
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "the shadow takes a reading behind a plain decision")]
-    fn shadow_behind_a_stated_decision_of_a_kept_request_stops_a_debug_build() {
-        shadow_behind_a_mix_of_the_entries(true);
     }
 
     /// The order a host that shadows keeps: each decision of the request
@@ -9948,255 +9795,6 @@ mod tests {
         assert_eq!(pick.trace.survivors.get(), Some(3));
         assert_eq!(pick.trace.top[0].0, WorkerId(101));
         assert_eq!(pick.trace.top_len, 3);
-    }
-
-    /// A profile's first prefix stage keeps its word behind a second. The
-    /// engine asks the first, and the second's pass does not take the slot
-    /// from it: the price that kept the busy holder in front is said.
-    #[test]
-    fn a_profiles_first_prefix_stage_keeps_its_word_behind_a_second() {
-        let params = PrefixAffinityParams {
-            spill: Some(SpillParams {
-                rel: Some(1.1),
-                prefix_margin_tokens: Some(8),
-                ..SpillParams::default()
-            }),
-            ..PrefixAffinityParams::default()
-        };
-        let stage = || WeightedScorer {
-            scorer: Box::new(PrefixAffinity::new(
-                &params,
-                Gates::of(Some(&params), None, Some(16)),
-            )),
-            weight: 1.0,
-        };
-        let engine = Engine::new(
-            vec![Profile {
-                name: "cache".into(),
-                filters: vec![Box::new(Healthy)],
-                scorers: vec![stage(), stage()],
-                picker: Box::new(Best),
-            }],
-            vec![Binding {
-                model: "*".into(),
-                phases: vec![],
-                plan: Plan::Single,
-                profile: 0,
-                decode_profile: None,
-                shadow: None,
-                decode_shadow: None,
-                sessions: None,
-                overload: None,
-            }],
-            1,
-            Needs::default(),
-        );
-        // Row 0 holds eight of the request's sixteen blocks.
-        let mut column = [AffinityFacts::default(); 4];
-        column[0] = AffinityFacts {
-            overlap_blocks: 8,
-            admitted_age_ms: u32::MAX,
-            ..AffinityFacts::default()
-        };
-        let hashes = [0u64; 16];
-        let facts = RequestFacts {
-            model: "m",
-            block_hashes: &hashes,
-            prompt_tokens: 256,
-            seed: 7,
-            affinity: &column,
-            ..RequestFacts::default()
-        };
-        let busy = [
-            candidate(0, 10),
-            candidate(1, 0),
-            candidate(2, 0),
-            candidate(3, 0),
-        ];
-        let decision = engine.decide_stated(
-            &facts,
-            &PoolFacts::default(),
-            &busy,
-            &Constraints::default(),
-            &mut Scratch::new(),
-        );
-        let pick = decision.pick().expect("a pick");
-        assert_eq!(pick.targets.first().map(|target| target.position), Some(0));
-        assert!(pick.overlap().margin_held);
-    }
-
-    /// The first stating scorer is asked wherever it stands in its profile:
-    /// at the front, and behind more scorers than a byte counts. Every row
-    /// holds eight of the request's sixteen blocks, so the pick's overlap
-    /// reads the same whichever row the other scorers leave in front.
-    #[test]
-    fn a_profile_states_its_overlap_by_a_scorer_at_any_place() {
-        let params = PrefixAffinityParams::default();
-        for ahead in [0usize, 1, 255, 256, 300] {
-            let mut scorers: Vec<WeightedScorer> = (0..ahead)
-                .map(|_| WeightedScorer {
-                    scorer: Box::new(LeastRequests),
-                    weight: 1.0,
-                })
-                .collect();
-            scorers.push(WeightedScorer {
-                scorer: Box::new(PrefixAffinity::new(
-                    &params,
-                    Gates::of(Some(&params), None, Some(16)),
-                )),
-                weight: 1.0,
-            });
-            let engine = Engine::new(
-                vec![Profile {
-                    name: "cache".into(),
-                    filters: vec![Box::new(Healthy)],
-                    scorers,
-                    picker: Box::new(Best),
-                }],
-                vec![Binding {
-                    model: "*".into(),
-                    phases: vec![],
-                    plan: Plan::Single,
-                    profile: 0,
-                    decode_profile: None,
-                    shadow: None,
-                    decode_shadow: None,
-                    sessions: None,
-                    overload: None,
-                }],
-                1,
-                Needs::default(),
-            );
-            let column = [AffinityFacts {
-                overlap_blocks: 8,
-                admitted_age_ms: u32::MAX,
-                ..AffinityFacts::default()
-            }; 4];
-            let hashes = [0u64; 16];
-            let facts = RequestFacts {
-                model: "m",
-                block_hashes: &hashes,
-                prompt_tokens: 256,
-                seed: 7,
-                affinity: &column,
-                ..RequestFacts::default()
-            };
-            let rows = [
-                candidate(0, 0),
-                candidate(1, 0),
-                candidate(2, 0),
-                candidate(3, 0),
-            ];
-            let decision = engine.decide_stated(
-                &facts,
-                &PoolFacts::default(),
-                &rows,
-                &Constraints::default(),
-                &mut Scratch::new(),
-            );
-            let overlap = decision.pick().expect("a pick").overlap();
-            assert_eq!(
-                (overlap.blocks, overlap.of),
-                (8, 16),
-                "{ahead} scorers stand ahead of the stating one"
-            );
-        }
-    }
-
-    /// A stated decision begins with no word of an earlier pass. The plain
-    /// entry asks no stage what it judged, so the word of its priced pass
-    /// stays on the thread. The next stated decision is a decode phase's
-    /// and prices nothing: the word it finds is not its own, and it says
-    /// no margin.
-    #[test]
-    fn a_stated_decision_begins_with_no_word_of_an_earlier_pass() {
-        let params = PrefixAffinityParams {
-            spill: Some(SpillParams {
-                rel: Some(1.1),
-                prefix_margin_tokens: Some(8),
-                ..SpillParams::default()
-            }),
-            ..PrefixAffinityParams::default()
-        };
-        let stage = PrefixAffinity::new(&params, Gates::of(Some(&params), None, Some(16)));
-        let engine = Engine::new(
-            vec![Profile {
-                name: "cache".into(),
-                filters: vec![Box::new(Healthy)],
-                scorers: vec![WeightedScorer {
-                    scorer: Box::new(stage),
-                    weight: 1.0,
-                }],
-                picker: Box::new(Best),
-            }],
-            vec![Binding {
-                model: "*".into(),
-                phases: vec![],
-                plan: Plan::Single,
-                profile: 0,
-                decode_profile: None,
-                shadow: None,
-                decode_shadow: None,
-                sessions: None,
-                overload: None,
-            }],
-            1,
-            Needs::default(),
-        );
-        // Row 0 holds eight of the request's sixteen blocks.
-        let mut column = [AffinityFacts::default(); 4];
-        column[0] = AffinityFacts {
-            overlap_blocks: 8,
-            admitted_age_ms: u32::MAX,
-            ..AffinityFacts::default()
-        };
-        let hashes = [0u64; 16];
-        let facts = |phase| RequestFacts {
-            model: "m",
-            block_hashes: &hashes,
-            prompt_tokens: 256,
-            seed: 7,
-            affinity: &column,
-            phase,
-            ..RequestFacts::default()
-        };
-        let (prefill, decode) = (facts(Phase::Single), facts(Phase::Decode));
-        let busy = [
-            candidate(0, 10),
-            candidate(1, 0),
-            candidate(2, 0),
-            candidate(3, 0),
-        ];
-        let level = [
-            candidate(0, 10),
-            candidate(1, 10),
-            candidate(2, 10),
-            candidate(3, 10),
-        ];
-        let mut scratch = Scratch::new();
-        let stated = |facts: &RequestFacts<'_>, pool: &[Candidate], scratch: &mut Scratch| {
-            let decision = engine.decide_stated(
-                facts,
-                &PoolFacts::default(),
-                pool,
-                &Constraints::default(),
-                scratch,
-            );
-            let pick = decision.pick().expect("a pick");
-            let first = pick.targets.first().map(|target| target.position);
-            (first, pick.overlap().blocks, pick.overlap().margin_held)
-        };
-        // The price alone keeps the busy holder in front.
-        assert_eq!(stated(&prefill, &busy, &mut scratch), (Some(0), 8, true));
-        // The plain entry's pass leaves its word on the thread.
-        engine.decide(
-            &prefill,
-            &PoolFacts::default(),
-            &busy,
-            &Constraints::default(),
-            &mut scratch,
-        );
-        assert_eq!(stated(&decode, &level, &mut scratch), (Some(0), 8, false));
     }
 
     #[test]

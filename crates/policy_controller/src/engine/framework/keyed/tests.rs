@@ -683,12 +683,12 @@ fn a_pin_is_followed_under_a_scorer_that_states_its_picks_holding() {
     }
 }
 
-/// A walk is the whole decision's under a scorer that states what its pick
-/// holds of the request: that decision reads the rows for the word. A keyed
-/// request no rule pins is not placed here then, and no row is read. The
-/// same scorer with nothing to state places it by the one row it reads.
+/// A scorer that could state what its pick holds of the request walks like
+/// any other: no entry of the engine asks that word now, so the whole
+/// decision would read no row more for it. A keyed request no rule pins is
+/// placed here by the one row it reads, whether its scorer states or not.
 #[test]
-fn a_walk_under_a_scorer_that_states_its_picks_holding_is_left_to_the_whole_decision() {
+fn a_walk_under_a_scorer_that_states_its_picks_holding_reads_its_one_row() {
     let mut rows = pool(16, 61, 0, 0);
     let ring = ringed(&mut rows, 61);
     let listed = Listed::of(&rows);
@@ -713,8 +713,8 @@ fn a_walk_under_a_scorer_that_states_its_picks_holding_is_left_to_the_whole_deci
             .as_ref()
             .and_then(Decision::pick)
             .map(|pick| pick.targets.iter().map(|target| target.position).collect());
-        assert_eq!(places, (!states).then(|| vec![0]), "states: {states}");
-        assert_eq!(listed.read(), u32::from(!states), "states: {states}");
+        assert_eq!(places, Some(vec![0]), "states: {states}");
+        assert_eq!(listed.read(), 1, "states: {states}");
     }
 }
 
