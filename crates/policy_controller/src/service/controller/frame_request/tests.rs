@@ -25,14 +25,17 @@ use crate::{
         pair_classes::PartnerClasses,
         policy_engine::PolicyEngine,
         view::{
-            fingerprint, Constraints, FixedFacts, HashKind, Header, Identity, MediaCounts, Phase,
-            RequestFacts, WireModes, WorkerId,
+            fingerprint, Constraints, FixedFacts, HashKind, Header, Identity, MediaCounts,
+            ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
         },
         PairAdmission, PairLists,
     },
     service::{
-        controller::wire::{tests::full, Checked, Lists},
-        proto,
+        controller::wire::{
+            tests::{full, kept, made},
+            Checked, Lists, Refusal,
+        },
+        proto::{self, identity::Form},
     },
 };
 
@@ -100,6 +103,24 @@ fn frame_of(seed: u64, edit: impl FnOnce(&mut proto::DecideRequest)) -> Checked 
     };
     edit(&mut frame);
     Checked::new(frame).expect("a frame the record holds")
+}
+
+/// The frame whose every field holds a value of its own ([`full`]), with
+/// its facts edited.
+fn edited(edit: impl FnOnce(&mut proto::RequestFacts)) -> proto::DecideRequest {
+    let mut frame = full();
+    edit(frame.facts.as_mut().expect("the full frame has facts"));
+    frame
+}
+
+/// The request a controller's maker makes of `frame`, a frame the record
+/// holds, handed to `check` as its facts and its constraints ([`made`]).
+fn making<R>(
+    frame: proto::DecideRequest,
+    check: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
+) -> R {
+    let frame = Checked::new(frame).expect("a frame the record holds");
+    made(&frame, &mut Lists::default(), LEFT, check)
 }
 
 /// A request stated ahead with the list its caller hands for it, decided
@@ -182,13 +203,21 @@ fn shed_of(decided: Decided) -> (ShedReason, &'static str) {
 /// cases). Three things are a controller's own and not the frame's: the
 /// budget is what is left, the wires are not stated, and the places and
 /// held-back positions are the ones the maker was handed. Of the subset
-/// hint a 0 alone is stated.
+/// hint a 0 alone is stated. The frame's whole budget and the wires its
+/// gateway states are read on the frame, where it was checked: no request
+/// states them. The frame gives its id whole for its answer.
 #[test]
 fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
     // A ring keyed by the prompt reads a text's hashes: the frame's three
     // are inside its depth.
     let spec = applied(&preset("prefix_hash"));
     let frame = Checked::new(full()).expect("a frame the record holds");
+    assert_eq!(
+        (frame.model(), frame.phase(), frame.seed()),
+        ("model-a", Phase::Decode, 24)
+    );
+    assert_eq!(frame.budget().as_micros(), 2_000);
+    assert_eq!(frame.wires(), Some(WireModes::GRPC.union(WireModes::ZMQ)));
     let mut buffers = Lists::default();
     let lists = buffers.of(&frame);
     let (may_take, stalled, held) = ([0_u32, 1, 3], [1_u32, 3], [3_u32]);
@@ -238,6 +267,9 @@ fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
     assert_eq!((facts.budget_micros, facts.now_micros), (1_500, 0));
     assert!(facts.affinity.is_empty() && facts.named.is_none());
     assert!(facts.lent_in_flight.is_none() && facts.signal_cells.is_none());
+    // The frame carries its model's name and no fingerprint of it: each
+    // read of the request's session fingerprints the name.
+    assert_eq!(facts.model_fingerprint, ModelFingerprint::NONE);
 
     assert_eq!(
         constraints.excluded,
@@ -278,6 +310,9 @@ fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
         WorkerLists::None,
     );
     assert_eq!(part.make(&spec).facts.budget_micros, 1);
+    // The id goes back whole on the frame's answer.
+    let answered = Checked::new(full()).expect("a frame the record holds");
+    assert_eq!(answered.into_id(), [7, 8, 9]);
 }
 
 /// A decider reads frame after frame onto the same buffers: a later frame's
@@ -319,6 +354,343 @@ fn a_later_frames_request_holds_nothing_of_an_earlier_frames_lists() {
     } = maker.make(&spec);
     assert!(facts.tried.is_empty() && facts.headers.is_empty());
     assert_eq!(constraints.excluded, [WorkerId(5)]);
+}
+
+/// A decider makes request after request on the same buffers. A frame's
+/// headers end with its request, and the buffer they leave is the one the
+/// next frame's take, emptied: a frame with shorter lists makes its own,
+/// nothing of the last, and gives no buffer up
+/// (`a_decider_reads_frame_after_frame_on_the_same_buffers` in the wire's
+/// own cases).
+#[test]
+fn a_decider_makes_request_after_request_on_the_same_buffers() {
+    let spec = applied(&preset("random"));
+    let mut buffers = Lists::default();
+    // The lists of `frame`'s request, made on a decider's buffers.
+    let lists_of = |buffers: &mut Lists, frame: proto::DecideRequest| {
+        let frame = Checked::new(frame).expect("a frame the record holds");
+        let lists = buffers.of(&frame);
+        let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::None);
+        let Request {
+            facts, constraints, ..
+        } = maker.make(&spec);
+        let headers = facts.headers.iter();
+        let headers: Vec<(u8, String)> = headers
+            .map(|header| (header.name, header.value.to_owned()))
+            .collect();
+        (facts.tried.to_vec(), headers, constraints.excluded.to_vec())
+    };
+    // Eight headers: a buffer made anew for a shorter list holds fewer.
+    let long = edited(|facts| {
+        facts.headers = (0..8)
+            .map(|name| proto::Header {
+                name,
+                value: "long".to_owned(),
+            })
+            .collect();
+    });
+    let (tried, headers, excluded) = lists_of(&mut buffers, long);
+    assert_eq!((tried.len(), headers.len(), excluded.len()), (2, 8, 3));
+    let (room, standing) = kept(&buffers);
+    assert!(room[0] >= 2 && room[1] >= 3 && room[2] >= 8, "{room:?}");
+    assert_eq!(standing, 0, "a frame's headers end with its request");
+    // A frame with shorter lists makes its own, and nothing of the last.
+    let shorter = edited(|facts| {
+        facts.tried = vec![1];
+        facts.headers.truncate(1);
+    });
+    let (tried, headers, _) = lists_of(&mut buffers, shorter);
+    assert_eq!(tried, [WorkerId(1)]);
+    assert_eq!(headers, [(0, "first".to_owned())]);
+    assert_eq!(kept(&buffers), (room, 0), "the buffers are kept");
+    // A frame with no list at all leaves each buffer its room too.
+    let bare = proto::DecideRequest {
+        request_id: vec![1],
+        ..proto::DecideRequest::default()
+    };
+    let (tried, headers, excluded) = lists_of(&mut buffers, bare);
+    assert!(tried.is_empty() && headers.is_empty() && excluded.is_empty());
+    assert_eq!(kept(&buffers), (room, 0), "the buffers are kept");
+}
+
+/// A frame with nothing set but its id makes a request of the record's
+/// defaults: no model, a single request of token hashes, no key, no count
+/// and no list, and neither a wire nor a hint
+/// (`a_frame_with_nothing_set_reads_as_the_records_defaults` in the wire's
+/// own cases).
+#[test]
+fn a_frame_with_nothing_set_makes_a_request_of_the_records_defaults() {
+    // Nothing but its id, which the contract's range asks of every frame.
+    let bare = proto::DecideRequest {
+        request_id: vec![1],
+        ..proto::DecideRequest::default()
+    };
+    let bare = Checked::new(bare).expect("a frame of its id alone");
+    assert_eq!(
+        (bare.model(), bare.phase(), bare.seed()),
+        ("", Phase::Single, 0)
+    );
+    assert!(bare.budget().is_zero());
+    assert_eq!((bare.wires(), bare.subset()), (None, None));
+    made(&bare, &mut Lists::default(), LEFT, |facts, constraints| {
+        assert_eq!(facts.model, "");
+        assert_eq!(
+            (facts.phase, facts.hash_kind),
+            (Phase::Single, HashKind::Token)
+        );
+        assert_eq!(
+            (facts.tenant, facts.session_key),
+            (Identity::NONE, Identity::NONE)
+        );
+        assert_eq!(facts.media, MediaCounts::default());
+        assert_eq!((facts.seed, facts.block_size), (0, 0));
+        assert!(facts.headers.is_empty() && facts.tried.is_empty());
+        assert!(facts.block_hashes.is_empty());
+        assert!(constraints.excluded.is_empty());
+        assert_eq!(constraints.wire_modes, WireModes::NONE);
+        assert_eq!(constraints.subset_hint, None);
+    });
+}
+
+/// An enum reaches the request by its number, and a number that names no
+/// value is refused by its field where the frame is checked, so no request
+/// is made of it
+/// (`an_enum_reads_by_its_number_and_a_number_that_names_no_value_is_refused_by_its_field`
+/// in the wire's own cases).
+#[test]
+fn an_enum_is_made_by_its_number_and_a_number_that_names_no_value_is_refused_by_its_field() {
+    for (wire, record) in [
+        (proto::Phase::Unspecified, Phase::Single),
+        (proto::Phase::Single, Phase::Single),
+        (proto::Phase::Prefill, Phase::Prefill),
+        (proto::Phase::Decode, Phase::Decode),
+        (proto::Phase::Encode, Phase::Encode),
+    ] {
+        let frame = edited(|facts| facts.phase = wire.into());
+        let read = making(frame, |facts, _| facts.phase);
+        assert_eq!(read, record, "{wire:?}");
+    }
+    for (wire, record) in [
+        (proto::HashKind::Unspecified, HashKind::Token),
+        (proto::HashKind::Token, HashKind::Token),
+        (proto::HashKind::Text, HashKind::Text),
+    ] {
+        let frame = edited(|facts| facts.hash_kind = wire.into());
+        let read = making(frame, |facts, _| facts.hash_kind);
+        assert_eq!(read, record, "{wire:?}");
+    }
+    let refused = |frame| Checked::new(frame).expect_err("refused");
+    assert_eq!(
+        refused(edited(|facts| facts.phase = 5)),
+        Refusal::OutOfRange("facts.phase")
+    );
+    assert_eq!(
+        refused(edited(|facts| facts.hash_kind = 3)),
+        Refusal::OutOfRange("facts.hash_kind")
+    );
+    assert_eq!(
+        refused(edited(|facts| facts.phase = 5)).to_string(),
+        "facts.phase is out of its range in this protocol version"
+    );
+}
+
+/// A text frame states its window, in bytes. One that carries hashes and
+/// states none is refused by its field where it is checked: the view's
+/// block size is in tokens, and read as a window it would count the
+/// request's blocks at another size than its host hashed them. A text
+/// frame with no hash prices nothing, and its request is made. A token
+/// frame that states no size makes a request that states none: its hashes
+/// are cut in the view's
+/// (`a_text_request_that_states_no_window_is_refused_by_its_field` in the
+/// wire's own cases).
+#[test]
+fn a_text_frame_that_states_no_window_is_refused_by_its_field() {
+    let refused = |frame| Checked::new(frame).expect_err("refused");
+    assert_eq!(
+        refused(edited(|facts| facts.block_size = 0)),
+        Refusal::OutOfRange("facts.block_size")
+    );
+    let bare = edited(|facts| {
+        facts.block_size = 0;
+        facts.block_hashes.clear();
+    });
+    let read = making(bare, |facts, _| {
+        (facts.hash_kind, facts.block_size, facts.block_hashes.len())
+    });
+    assert_eq!(read, (HashKind::Text, 0, 0), "no hash to price");
+    for kind in [proto::HashKind::Token, proto::HashKind::Unspecified] {
+        let frame = edited(|facts| {
+            facts.hash_kind = kind.into();
+            facts.block_size = 0;
+        });
+        let read = making(frame, |facts, _| (facts.hash_kind, facts.block_size));
+        assert_eq!(read, (HashKind::Token, 0), "{kind:?}");
+    }
+    let stated = edited(|facts| facts.block_size = 64);
+    let read = making(stated, |facts, _| (facts.hash_kind, facts.block_size));
+    assert_eq!(read, (HashKind::Text, 64));
+}
+
+/// A tenant reaches the request in the form its frame carries it: a
+/// fingerprint as it was sent, and a plain name with the fingerprint made
+/// of it at the read. No form, a fingerprint of zero and an empty name are
+/// no key, and a frame that sets no session key makes a request with none
+/// (`a_key_is_read_in_the_form_its_frame_carries` in the wire's own cases).
+#[test]
+fn a_key_is_made_in_the_form_its_frame_carries() {
+    let tenant = |form: Option<Form>| {
+        let frame = edited(|facts| facts.tenant = Some(proto::Identity { form }));
+        making(frame, |facts, _| {
+            (facts.tenant.hash, facts.tenant.plain.map(str::to_owned))
+        })
+    };
+    assert_eq!(tenant(Some(Form::Hash(5))), (5, None));
+    assert_eq!(
+        tenant(Some(Form::Plain("a".to_owned()))),
+        (fingerprint(b"a"), Some("a".to_owned()))
+    );
+    // No form, a fingerprint of zero and an empty name are no key.
+    for absent in [None, Some(Form::Hash(0)), Some(Form::Plain(String::new()))] {
+        assert_eq!(tenant(absent.clone()), (0, None), "{absent:?}");
+    }
+    let unset = edited(|facts| facts.session_key = None);
+    assert_eq!(making(unset, |facts, _| facts.session_key.hash), 0);
+}
+
+/// The contract's own numbers: the key "conversation-7" under the model
+/// "model-a" names one session a phase, and names it in either form. The
+/// hash form is the session's value: it is never read as a key's
+/// fingerprint and scoped again
+/// (`a_session_key_names_the_contracts_session_in_its_plain_form_and_in_its_hash_form`
+/// in the wire's own cases).
+#[test]
+fn a_frames_session_key_names_the_contracts_session_in_either_form() {
+    let sessions: [(proto::Phase, u64); 4] = [
+        (proto::Phase::Single, 0x6e88_ff71_cc98_2a42),
+        (proto::Phase::Prefill, 0x619f_dbb0_c262_9a55),
+        (proto::Phase::Decode, 0x3e92_fbbd_183d_f4b6),
+        (proto::Phase::Encode, 0x3780_ba54_336a_57d0),
+    ];
+    let named = |phase: proto::Phase, form: Option<Form>| {
+        let frame = edited(|facts| {
+            facts.phase = phase.into();
+            facts.session_key = Some(proto::Identity { form });
+        });
+        making(frame, |facts, _| {
+            let key = facts.session_key;
+            (
+                facts.session().get(),
+                key.hash,
+                key.plain.map(str::to_owned),
+            )
+        })
+    };
+    let key = fingerprint(b"conversation-7");
+    for (phase, session) in sessions {
+        let plain = "conversation-7".to_owned();
+        assert_eq!(
+            named(phase, Some(Form::Plain(plain.clone()))),
+            (session, key, Some(plain)),
+            "{phase:?}"
+        );
+        // The same session, and the same key for a stage that reads it.
+        assert_eq!(
+            named(phase, Some(Form::Hash(session))),
+            (session, key, None),
+            "{phase:?}"
+        );
+    }
+    // No form, a value of zero and an empty key are no session.
+    for absent in [None, Some(Form::Hash(0)), Some(Form::Plain(String::new()))] {
+        let read = named(proto::Phase::Single, absent.clone());
+        assert_eq!(read, (0, 0, None), "{absent:?}");
+    }
+    // The one value that would give the fingerprint no key has is no key's
+    // session: its frame is refused where it is checked.
+    let keyless = edited(|facts| {
+        facts.phase = proto::Phase::Single.into();
+        facts.session_key = Some(proto::Identity {
+            form: Some(Form::Hash(0xc771_96d2_b9cf_9497)),
+        });
+    });
+    let refused = Checked::new(keyless).expect_err("no key's session");
+    assert_eq!(refused, Refusal::OutOfRange("facts.session_key.hash"));
+}
+
+/// A count past its record's width is made at the record's widest. A
+/// frame's headers are held to the 256 names a view has: a name past them
+/// and a 257th header are refused where the frame is checked. A wire bit
+/// this build does not know is dropped where the frame's wires are read,
+/// and the request says no wire, whatever its frame states: its maker's
+/// caller states the gateway's wires as places
+/// (`a_count_past_its_records_width_saturates_and_a_header_past_256_names_is_refused`
+/// in the wire's own cases).
+#[test]
+fn a_count_past_its_records_width_is_made_at_its_widest_and_a_header_past_256_names_is_refused() {
+    let frame = edited(|facts| {
+        facts.attempt = 256;
+        facts.media = Some(proto::MediaCounts {
+            images: 65_536,
+            audio: u32::MAX,
+            video: 65_535,
+            bytes: u32::MAX,
+        });
+    });
+    let (attempt, media) = making(frame, |facts, _| (facts.attempt, facts.media));
+    assert_eq!(attempt, u8::MAX);
+    let widest = MediaCounts {
+        images: u16::MAX,
+        audio: u16::MAX,
+        video: 65_535,
+        bytes: u32::MAX,
+    };
+    assert_eq!(media, widest);
+    let frame = edited(|facts| facts.headers[1].name = 256);
+    assert_eq!(
+        Checked::new(frame).expect_err("a name past the record's"),
+        Refusal::OutOfRange("facts.headers.name")
+    );
+    // A frame's headers by their count: 256 reach the request, each a
+    // record of its own, and one more is refused by the list's path. An
+    // empty header is two bytes as encoded.
+    let headers = |count| edited(|facts| facts.headers = vec![proto::Header::default(); count]);
+    let read = making(headers(256), |facts, _| facts.headers.len());
+    assert_eq!(read, 256);
+    assert_eq!(
+        Checked::new(headers(257)).expect_err("a header past a view's names"),
+        Refusal::OutOfRange("facts.headers")
+    );
+    let size = |count| {
+        let facts = headers(count).facts.expect("the full frame has facts");
+        prost::Message::encoded_len(&facts)
+    };
+    assert_eq!(size(257) - size(0), 2 * 257);
+    // A wire bit this build does not know is dropped, wherever in the
+    // wire's 32 it stands. A gateway that states such bits alone still
+    // states wires: none this build knows. The request says none in each
+    // case.
+    let stating = |bits: u32| {
+        let mut frame = full();
+        frame
+            .constraints
+            .as_mut()
+            .expect("the full frame has constraints")
+            .wire_modes = bits;
+        let frame = Checked::new(frame).expect("a frame the record holds");
+        let said = made(&frame, &mut Lists::default(), LEFT, |_, constraints| {
+            constraints.wire_modes
+        });
+        (frame.wires(), said)
+    };
+    assert_eq!(
+        stating(0b1_0000_1001),
+        (Some(WireModes::HTTP), WireModes::NONE)
+    );
+    assert_eq!(
+        stating(0b1_0000_0000),
+        (Some(WireModes::NONE), WireModes::NONE)
+    );
+    assert_eq!(stating(0), (None, WireModes::NONE));
 }
 
 /// A frame's decision is a whole one and names its alternates, up to four

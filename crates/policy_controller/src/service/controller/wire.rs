@@ -1029,20 +1029,22 @@ const fn role(phase: Phase) -> proto::Role {
 pub(crate) mod tests {
     use super::{busy, credit, decided, emptied, Checked, Lists, Refusal, Viewed, MAX_FRAME};
     use crate::{
-        document::spec::MAX_BLOCK_HASHES,
+        document::spec::{AppliedSpec, MAX_BLOCK_HASHES},
         engine::{
             decision::{
                 self, Decision, LiftedVeto, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target,
                 Targets, Trace,
             },
+            decision_engine::{Request, RequestMaker, WorkerLists},
             store_backed_engine::unnamed,
             view::{
                 fingerprint, AffinityFacts, Constraints, HashKind, Header, Identity, MediaCounts,
                 ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
             },
         },
-        service::proto::{
-            self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form,
+        service::{
+            controller::frame_request::FrameRequest,
+            proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
         },
     };
 
@@ -1393,6 +1395,43 @@ pub(crate) mod tests {
             again: false,
             ..Default::default()
         }
+    }
+
+    /// The room of `lists`' three buffers, and how many headers stand in
+    /// theirs: what a case reads of a decider's buffers between two frames.
+    pub(crate) fn kept(lists: &Lists) -> ([usize; 3], usize) {
+        let room = [
+            lists.tried.capacity(),
+            lists.excluded.capacity(),
+            lists.headers.capacity(),
+        ];
+        (room, lists.headers.len())
+    }
+
+    /// Makes `frame`'s request as a controller's maker makes it
+    /// ([`FrameRequest`]), on `lists` and with `left` of the frame's
+    /// budget, and hands `check` its facts and its constraints. The
+    /// request bears the frame's id whole: that is held here, for every
+    /// frame a case makes a request of. The document it is made under has
+    /// a ring keyed by the prompt: it reads a prompt's hashes of either
+    /// kind 256 tokens deep, past the three a case's frame carries.
+    pub(crate) fn made<R>(
+        frame: &Checked,
+        lists: &mut Lists,
+        left: std::time::Duration,
+        check: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
+    ) -> R {
+        let document = PolicySpec::preset("prefix_hash").expect("a built-in preset");
+        let spec = AppliedSpec::validate(&document).expect("the preset validates");
+        let lists = lists.of(frame);
+        let maker = FrameRequest::new(frame, &lists, left, WorkerLists::None);
+        let Request {
+            id,
+            facts,
+            constraints,
+        } = maker.make(&spec);
+        assert_eq!(id, frame.id(), "a request bears its frame's id whole");
+        check(&facts, &constraints)
     }
 
     /// The full frame with its facts edited.
