@@ -769,6 +769,36 @@ impl<'a> ModelRing<'a> {
     }
 }
 
+/// The lines that say the policy engine refused a decision, a model at a
+/// time under the refusal lines' own allowance: an engine that refuses one
+/// request may refuse the next ones alike.
+static ENGINE_REFUSED_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+    REFUSAL_LINES_PER_SECOND,
+    Duration::from_secs(1),
+    REFUSAL_LOG_MODELS,
+);
+
+/// Writes why the policy engine placed nothing for a request. A decision
+/// the engine refused ([`Unplaced::Refused`]) is the engine's own fault and
+/// not the fleet's state, a stage that panicked among them: its line is
+/// written at `warn`. Every other answer says what the fleet could not
+/// take, which the route's own refusal line reports, and is written at
+/// `debug` under `placed_none`.
+fn report_unplaced(model_id: &str, unplaced: &Unplaced, placed_none: &'static str) {
+    if let Unplaced::Refused(refused) = unplaced {
+        if let Some(admitted) = ENGINE_REFUSED_LOG.admit(model_id) {
+            warn!(
+                model_id,
+                ?refused,
+                suppressed = admitted.suppressed,
+                "The policy engine refused a decision"
+            );
+        }
+    } else {
+        debug!(model_id, ?unplaced, "{placed_none}");
+    }
+}
+
 /// The policy engine's answer for a single request over `members`, the
 /// engine's value of the request's list: what `inputs` state of the request
 /// is handed as the engine reads it ([`place_request`]), with `ring`, the
@@ -809,7 +839,7 @@ fn placed_by_engine(
             Some(Placed::by_engine(placement))
         }
         Err(unplaced) => {
-            debug!(model_id, ?unplaced, "The policy engine placed no worker");
+            report_unplaced(model_id, &unplaced, "The policy engine placed no worker");
             None
         }
     }
@@ -2068,7 +2098,7 @@ fn pair_by_engine(
             ));
         }
         Err(unplaced) => {
-            debug!(model_id, ?unplaced, "The policy engine placed no pair");
+            report_unplaced(model_id, &unplaced, "The policy engine placed no pair");
             let admitted = |worker: &Arc<dyn Worker>| {
                 WireConstraint::admits(wire, worker.as_ref())
                     && inputs
@@ -6471,6 +6501,78 @@ pub(crate) mod tests {
             *heard.lock().expect("the stage heard"),
             ["issued", "released Abandoned"]
         );
+    }
+
+    /// A scorer that panics where the engine asks it: the engine refuses
+    /// that decision as its own fault.
+    #[derive(Debug)]
+    struct Faults;
+
+    impl Lifecycle for Faults {
+        fn hears(&self) -> EventSet {
+            EventSet::LEASE
+        }
+    }
+
+    impl Scorer for Faults {
+        fn name(&self) -> &'static str {
+            "faults"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            _: &mut [f32],
+        ) -> TieBand {
+            panic!("the test's own stage fails")
+        }
+    }
+
+    /// A decision the engine refuses is the engine's own fault, not the
+    /// fleet's state. The placement answers no worker, as for every request
+    /// the engine does not place, and writes the refusal at `warn` with the
+    /// model and the engine's reason.
+    #[test]
+    fn a_decision_the_engine_refuses_is_written_at_warn() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = test_subscriber(EventLines(tracing::Level::WARN, Arc::clone(&lines)));
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let mut stages = StageRegistry::builtin();
+        stages
+            .scorer("faults", || Box::new(Faults))
+            .expect("a free name");
+        let document: PolicySpec = serde_json::from_str(
+            r#"{"apiVersion":"smg.policy/v1","generation":1,"profiles":{"p":{"score":["faults"],"pick":"best"}}}"#,
+        )
+        .expect("a policy document");
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        engine_on(&policies, spec.expect("the stages hold the scorer"));
+
+        let placed = select_single(
+            &registry,
+            &policies,
+            MODEL,
+            RoutingPool::HttpRegular,
+            None,
+            PlacementInputs::default(),
+        );
+        assert!(placed.is_none(), "a refused decision places no worker");
+        let lines = lines.lock().unwrap();
+        let refused: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("message=The policy engine refused a decision"))
+            .collect();
+        assert_eq!(refused.len(), 1, "{lines:?}");
+        for expected in ["model_id=\"m\"", "refused=Faulted", "suppressed=0"] {
+            assert!(
+                refused[0].contains(expected),
+                "{expected} missing from {:?}",
+                refused[0]
+            );
+        }
     }
 
     /// The guard of an engine's answer counts the request under the routing
