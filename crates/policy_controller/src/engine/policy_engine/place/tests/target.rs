@@ -221,6 +221,108 @@ fn the_number_counts_among_the_workers_the_routes_rule_takes() {
     assert_eq!(asked.borrow().len(), 6, "each worker once, and no pick");
 }
 
+/// The number counts among the workers that meet the request's hard
+/// demands: a worker that states another runtime than the request stays
+/// on takes no number and is asked nothing, and a number past the workers
+/// that meet the demand is shed. A worker that meets it and is not
+/// available is passed over as any other. Where no worker of the list
+/// meets the demand there is none to count, and the request is shed under
+/// the demand's own stage.
+///
+/// The classic router narrows a pinned request's workers to its wire
+/// ahead of its policy, which counts in what is left (`candidates` in
+/// `model_gateway/src/routers/common/placement.rs`).
+#[test]
+fn the_number_counts_among_the_workers_that_meet_the_requests_demands() {
+    let engine = hosted(preset("consistent_hashing"));
+    let list = pool(6);
+    // The workers at 1, 3 and 4 state the runtime 2, the others 1.
+    let members = PublishedList::with_facts(Arc::clone(&list), |worker| {
+        let at = list.iter().position(|held| Arc::ptr_eq(held, worker));
+        let mut facts = FixedFacts::default();
+        facts.demands.runtime = if matches!(at, Some(1 | 3 | 4)) { 2 } else { 1 };
+        facts
+    });
+    let id = |at: usize| worker_id(list[at].as_ref());
+    let asked = RefCell::new(Vec::new());
+    let admits = |worker: &dyn Worker| {
+        asked.borrow_mut().push(worker_id(worker));
+        true
+    };
+    let placed = |number: &str, runtime: u32| {
+        asked.borrow_mut().clear();
+        let headers = [(TARGET, number)];
+        let request = PlaceRequest {
+            headers: &headers,
+            admits: Some(&admits),
+            demands: Demands {
+                runtime,
+                ..Demands::default()
+            },
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        engine.place(&request).map(|placement| placement.id())
+    };
+    assert_eq!(placed("0", 2), Ok(id(1)), "the first of the runtime");
+    let calls: Vec<_> = [1, 1].map(id).to_vec();
+    assert_eq!(*asked.borrow(), calls, "the count, then the pick");
+    assert_eq!(placed("2", 2), Ok(id(4)));
+    assert_eq!(placed("3", 2), Err(MISSED), "three state the runtime");
+    assert_eq!(placed("1", 1), Ok(id(2)), "the others, by theirs");
+    assert_eq!(placed("1", 0), Ok(id(1)), "no demand: every worker");
+
+    list[3].set_status(WorkerStatus::NotReady);
+    assert_eq!(placed("1", 2), Ok(id(4)), "the next that is available");
+    assert_eq!(placed("2", 2), Err(MISSED), "two can be sent to");
+    list[3].set_status(WorkerStatus::Ready);
+
+    let none = placed("0", 3);
+    let wires = Unplaced::Shed {
+        reason: ShedReason::NoEndpoints,
+        emptied_by: "wires",
+        retry_after_secs: 1,
+    };
+    assert_eq!(none, Err(wires), "no worker states the runtime 3");
+    assert_eq!(*asked.borrow(), [], "and the rule is asked of none");
+}
+
+/// The count's read of a list's records may be the list's first, and so
+/// the fill of its cell. A list lent with facts of another count than
+/// its workers is refused at that fill by a panic, and the engine holds
+/// it there as it holds one under a decision: the request is answered a
+/// fault, the fault is counted, and nothing unwinds into the caller. The
+/// same list is answered so with no named worker, by its decision.
+#[test]
+fn a_list_refused_at_the_count_is_answered_a_fault() {
+    use crate::engine::list_cell::ListCell;
+
+    let engine = hosted(preset("consistent_hashing"));
+    let list = pool(3);
+    let short = [FixedFacts::default(); 2];
+    let placed = |headers: &dyn HeaderRead| {
+        let cell = ListCell::default();
+        let lent = LentList {
+            workers: &list,
+            cell: &cell,
+            facts: Some(&short),
+        };
+        let request = PlaceRequest {
+            headers,
+            demands: Demands {
+                runtime: 1,
+                ..Demands::default()
+            },
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(lent))
+        };
+        engine.place(&request).map(|placement| placement.id())
+    };
+    let faulted = Err(Unplaced::Refused(DecisionRefused::Faulted));
+    assert_eq!(placed(&[(TARGET, "0")]), faulted, "the count's fill");
+    assert_eq!(engine.faults(), 1);
+    assert_eq!(placed(&()), faulted, "a decision's fill");
+    assert_eq!(engine.faults(), 2);
+}
+
 /// A request whose header's text is no number, or whose number is past
 /// the workers it can be sent to, is shed with no endpoint under
 /// `target-worker`, and no decision is made for it: the picker hears

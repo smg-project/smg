@@ -1579,7 +1579,9 @@ that name reads it, and the routing settings write the same source for that poli
 one call reads the header once, ahead of its decision. The number counts, from 0 and in the
 list's order, the workers that are available by the worker's own test and that the route's rule
 takes, as classic counts them (`model_gateway/src/routers/common/placement.rs:1187-1188`,
-`:1225-1234`; `model_gateway/src/policies/consistent_hashing.rs:154-160`, `:262-264`). The call's
+`:1225-1234`; `model_gateway/src/policies/consistent_hashing.rs:154-160`, `:262-264`). A worker
+that fails a hard demand of the request takes no number: classic counts over the pool it
+narrowed to a pinned request's wire (`candidates` in `placement.rs`). The call's
 one decision is held to the place of the worker the number reaches (`Constraints::places`): a
 retry is handed that worker again, and the request goes to that worker or to none. Where the
 text is no number, fewer workers can be sent to, or the worker cannot take the request after
@@ -1819,7 +1821,7 @@ request ──> route (HTTP or gRPC, any family)
 
   Where the document asks a pair's decode again, the two pair routes make one more call between the prefill's answer and the decode's dispatch (section 8.2).
 
-  A retry held to its wire is placed over the pool's whole list: the gateway holds it there by the route's own rule for a worker, and a pair's retry by the places of each pool on that wire. It does not yet give each runtime and transport it dials a number, as a worker's fact and as the retry's demand (section 8.2) **[planned]**.
+  A retry held to its wire is placed over the pool's whole list and stays on the wire by its demand (section 8.2) **[built]**. The gateway gives each runtime and transport it dials one number. It states that number of each worker where a list is first lent to the engine, and a retry states its wire's number as its demand, as does a first attempt its route pins to a wire. A request pinned to no wire states none. A caller's own slice is still held to by the route's own rule for a worker. An encode request that states a demand is shed, since its three lists are held to none: the gateway hands the engine no such request yet, and the entry that does judges a retry's wire first **[planned]**.
 
 - **The request's end.** The placement stays with the request's load guard, which every route
   already keeps to the end of the response, streamed or not (decision 4).
