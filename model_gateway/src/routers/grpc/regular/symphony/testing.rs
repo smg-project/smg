@@ -12,7 +12,6 @@ pub(super) use openai_protocol::{
 };
 pub(super) use serde_json::{json, Value};
 pub(super) use symphony::{formats::qwen3, CallSyntax, EngineFinish, Event, Events, Format};
-pub(super) use tool_parser::ToolConstraint;
 
 pub(super) use super::{
     constraint::*, names::*, reader::*, telemetry::Who, template::Templates, *,
@@ -273,7 +272,7 @@ pub(super) fn read_with(format: Format) -> Vec<Event<'static>> {
     let assignment = Assignment {
         format: Arc::new(format),
         prompt: "<|im_start|>assistant\n".to_string(),
-        forbids_calls: false,
+        forbids_calls: Forbids::Nothing,
         past_the_end: false,
         forcing: None,
         opener: None,

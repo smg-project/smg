@@ -8,12 +8,16 @@
 //! so installing the global Prometheus recorder here does not collide with
 //! other suites.
 
-use smg::observability::{
-    metrics::{init_startup_series, start_prometheus, PrometheusConfig},
-    metrics_server::start_metrics_server,
+use std::sync::Arc;
+
+use smg::{
+    observability::{
+        metrics::{init_startup_series, start_prometheus, PrometheusConfig},
+        metrics_server::start_metrics_server,
+    },
+    routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
 };
 use smg_test_harness::test_app::scrape;
-use smg_worker::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 
 /// The rendered sample of `family` whose label set contains every pair in
 /// `labels`, as `(line, value)`.
@@ -86,10 +90,12 @@ async fn protection_retry_and_breaker_families_start_at_zero() {
     }
 
     // A breaker trips long after start-up; its transition counters still
-    // exist from the moment its worker is built.
+    // exist from the moment its worker registers.
     let worker = "grpc://worker-a:50051";
-    let _breaker =
-        CircuitBreaker::with_config_and_label(CircuitBreakerConfig::default(), worker.to_string());
+    let registry = WorkerRegistry::new();
+    registry
+        .register(Arc::new(BasicWorkerBuilder::new(worker).build()))
+        .expect("a fresh URL registers");
     let body = scrape(addr).await;
     for (from, to) in [
         ("closed", "open"),

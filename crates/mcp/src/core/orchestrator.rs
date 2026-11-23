@@ -392,6 +392,16 @@ fn sse_unsupported(server_name: &str) -> McpError {
     ))
 }
 
+/// Responses checks a label at intake; a Messages server `name` is free text:
+/// empty, an address or a line break that would split a log line is `unnamed`.
+pub(super) fn printable_label(label: &str) -> &str {
+    if label.is_empty() || label.contains("://") || label.contains(char::is_control) {
+        "unnamed"
+    } else {
+        label
+    }
+}
+
 /// Type alias for MCP client with handler.
 type McpClientWithHandler = RunningService<RoleClient, SmgClientHandler>;
 
@@ -406,14 +416,18 @@ struct ServerEntry {
     list_error: Option<String>,
 }
 
-/// A dynamic server as its connect leaves it: the key (its URL) that names
-/// the connection, and why its tools could not be listed (`None` when they
+/// A dynamic server as its connect leaves it: its URL (`server_key`, the
+/// name its tools are listed under), the key its connection is pooled under
+/// (`pool_key`), and why its tools could not be listed (`None` when they
 /// were). The caller keeps the outcome with its binding; the pool keeps it
 /// with the connection for a later hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectedServer {
     pub server_key: String,
     pub list_error: Option<String>,
+    /// The key the connection is pooled under. A binding of this server
+    /// carries it, and a tool call takes its connection by it.
+    pub pool_key: PoolKey,
 }
 
 /// Internal result type for approval-checked execution.
@@ -1054,6 +1068,12 @@ impl McpOrchestrator {
                 .any(|server| server.builtin_type.is_some() && server.name == name)
     }
 
+    /// Whether the pool holds a connection under `key`: the request's own, or
+    /// one pooled since under the same key.
+    pub(crate) fn is_pooled(&self, key: &PoolKey) -> bool {
+        self.connection_pool.contains(key)
+    }
+
     /// Execute a single tool using an already-resolved qualified binding.
     ///
     /// This path does not perform tool-name reverse lookup. Callers must provide
@@ -1078,11 +1098,30 @@ impl McpOrchestrator {
         server_label: &str,
         request_ctx: &McpRequestContext<'_>,
     ) -> ToolExecutionResult {
+        let entry = self.tool_inventory.get_entry(server_key, &input.tool_name);
+        self.execute_resolved_entry_result(entry, input, server_key, server_label, request_ctx)
+            .await
+    }
+
+    /// The same for the entry a caller read under `server_key` and the
+    /// tool's name: the entry it checked is the entry that runs.
+    pub(crate) async fn execute_resolved_entry_result(
+        &self,
+        entry: Option<ToolEntry>,
+        input: ToolExecutionInput,
+        server_key: &str,
+        server_label: &str,
+        request_ctx: &McpRequestContext<'_>,
+    ) -> ToolExecutionResult {
         let start = Instant::now();
         let arguments_str = input.arguments.to_string();
 
         let qualified = QualifiedToolName::new(server_key, &input.tool_name);
-        let entry = self.tool_inventory.get_entry(server_key, &input.tool_name);
+        let named = if request_ctx.pool_key.is_some() {
+            printable_label(server_label)
+        } else {
+            server_label
+        };
 
         match entry {
             Some(entry) => match self
@@ -1091,6 +1130,7 @@ impl McpOrchestrator {
                     qualified,
                     &input.call_id,
                     input.arguments,
+                    named,
                     request_ctx,
                 )
                 .await
@@ -1113,9 +1153,13 @@ impl McpOrchestrator {
                 }
             },
             None => {
+                let server = match &request_ctx.pool_key {
+                    Some(key) if key.url == server_key => named,
+                    _ => server_key,
+                };
                 let err = format!(
                     "Tool '{}' not found on server '{}'",
-                    input.tool_name, server_key
+                    input.tool_name, server
                 );
                 ToolExecutionResult::Executed(ToolExecutionOutput {
                     call_id: input.call_id,
@@ -1138,6 +1182,7 @@ impl McpOrchestrator {
         qualified: QualifiedToolName,
         call_id: &str,
         arguments: Value,
+        server_label: &str,
         request_ctx: &McpRequestContext<'_>,
     ) -> ToolExecutionResult {
         self.active_executions.fetch_add(1, Ordering::SeqCst);
@@ -1148,7 +1193,13 @@ impl McpOrchestrator {
         let call_start_time = Instant::now();
 
         let result = match self
-            .execute_tool_with_approval_raw_internal(entry, call_id, arguments, request_ctx)
+            .execute_tool_with_approval_raw_internal(
+                entry,
+                call_id,
+                arguments,
+                server_label,
+                request_ctx,
+            )
             .await
         {
             Ok(ApprovalExecutionResult::Success(raw_result)) => {
@@ -1206,6 +1257,7 @@ impl McpOrchestrator {
         entry: &ToolEntry,
         call_id: &str,
         arguments: Value,
+        server_label: &str,
         request_ctx: &McpRequestContext<'_>,
     ) -> McpResult<ApprovalExecutionResult> {
         let elicitation_id = Self::approval_elicitation_id(entry.tool_name(), call_id);
@@ -1231,7 +1283,14 @@ impl McpOrchestrator {
                     return Err(McpError::ToolDenied(entry.tool_name().to_string()));
                 }
                 self.metrics.record_approval_granted();
-                let result = self.execute_tool_with_reconnect(entry, arguments).await?;
+                let result = self
+                    .execute_tool_with_reconnect(
+                        entry,
+                        arguments,
+                        server_label,
+                        request_ctx.pool_key.as_ref(),
+                    )
+                    .await?;
                 Ok(ApprovalExecutionResult::Success(result))
             }
             ApprovalOutcome::Pending {
@@ -1250,7 +1309,14 @@ impl McpOrchestrator {
                 match rx.await {
                     Ok(ApprovalDecision::Approved) => {
                         self.metrics.record_approval_granted();
-                        let result = self.execute_tool_with_reconnect(entry, arguments).await?;
+                        let result = self
+                            .execute_tool_with_reconnect(
+                                entry,
+                                arguments,
+                                server_label,
+                                request_ctx.pool_key.as_ref(),
+                            )
+                            .await?;
                         Ok(ApprovalExecutionResult::Success(result))
                     }
                     Ok(ApprovalDecision::Denied { reason }) => {
@@ -1266,7 +1332,14 @@ impl McpOrchestrator {
         &self,
         entry: &ToolEntry,
         arguments: Value,
+        server_label: &str,
+        pool_key: Option<&PoolKey>,
     ) -> McpResult<CallToolResult> {
+        // A pool key is its own address's: a tool that targets another server
+        // by now (an alias retargeted since its session was made) is called
+        // without it.
+        let pool_key = pool_key.filter(|key| key.url == Self::target_server_key(entry));
+
         // One deadline for the whole call: the first attempt and a replay
         // after reconnection share the configured bound instead of each
         // starting a fresh one. Reconnection itself runs under the
@@ -1284,7 +1357,13 @@ impl McpOrchestrator {
             .map(|e| Arc::clone(&e.client));
 
         match self
-            .execute_tool_impl(entry, arguments.clone(), Self::remaining(deadline))
+            .execute_tool_impl(
+                entry,
+                arguments.clone(),
+                Self::remaining(deadline),
+                server_label,
+                pool_key,
+            )
             .await
         {
             Ok(result) => Ok(result),
@@ -1293,10 +1372,21 @@ impl McpOrchestrator {
                 // with side effects gets an unknown outcome whether or not
                 // the connection comes back.
                 let replayable = Self::replayable(entry);
-                let recovery = self.recover_after_disconnect(&name, initial_client).await;
+                // A pooled connection is not recovered: the reconnection is
+                // the configured servers'.
+                let recovery = match pool_key {
+                    Some(_) => Err(McpError::ServerDisconnected(name.clone())),
+                    None => self.recover_after_disconnect(&name, initial_client).await,
+                };
                 Self::after_recovery(replayable, recovery, &name, entry.tool_name())?;
-                self.execute_tool_impl(entry, arguments, Self::remaining(deadline))
-                    .await
+                self.execute_tool_impl(
+                    entry,
+                    arguments,
+                    Self::remaining(deadline),
+                    server_label,
+                    pool_key,
+                )
+                .await
             }
             Err(e) => Err(e),
         }
@@ -1514,6 +1604,8 @@ impl McpOrchestrator {
         entry: &ToolEntry,
         mut arguments: Value,
         bound: Option<Duration>,
+        server_label: &str,
+        pool_key: Option<&PoolKey>,
     ) -> McpResult<CallToolResult> {
         // The server the call reaches is the one the recovery is keyed by;
         // the tool and the argument mapping come from the alias's target or
@@ -1539,7 +1631,8 @@ impl McpOrchestrator {
         }
 
         // Execute on server
-        self.execute_on_server(target_server, request, bound).await
+        self.execute_on_server(target_server, request, bound, server_label, pool_key)
+            .await
     }
 
     /// Coerce argument types based on tool schema.
@@ -1613,6 +1706,8 @@ impl McpOrchestrator {
         server_key: &str,
         request: CallToolRequestParams,
         bound: Option<Duration>,
+        server_label: &str,
+        pool_key: Option<&PoolKey>,
     ) -> McpResult<CallToolResult> {
         // Every call is bounded: a hung server must not hold a tool loop open
         // forever, and a call that outlives the bound is reported as unknown
@@ -1620,6 +1715,37 @@ impl McpOrchestrator {
         // budget; the message reports the configured value.
         let configured_secs = self.config.pool.call_timeout;
         let tool = request.name.to_string();
+
+        // A call made for a binding with a pool key uses the connection
+        // pooled under that key (made with its own caller's credentials) and
+        // no other, whatever is held under the server's name; when the pool
+        // holds none under the key, the call reads the server as not found.
+        if let Some(key) = pool_key {
+            // The tools of an address are one list for every key pooled
+            // under it, so a call on an address pooled under more than one
+            // key stays refused.
+            if matches!(
+                self.connection_pool.get_unique_by_url(server_key),
+                UrlLookup::Ambiguous
+            ) {
+                warn!(
+                    "Refusing tool execution on '{}': multiple pooled connections share this \
+                     URL with different credentials/tenants; cannot select one safely",
+                    server_label
+                );
+                return Err(McpError::ServerAccessDenied(format!(
+                    "ambiguous MCP connection for '{server_label}': multiple credentials or \
+                     tenants are pooled for this URL"
+                )));
+            }
+            let Some(client) = self.connection_pool.get(key) else {
+                return Err(McpError::ServerNotFound(server_label.to_string()));
+            };
+            // Note: Pooled connections trigger Disconnected but
+            // recovery logic is currently scoped to static servers.
+            let result = Self::bounded(bound, client.call_tool(request)).await;
+            return Self::map_call_result(server_label, &tool, configured_secs, result);
+        }
 
         // Clone the client out of the map so no shard guard is held across
         // the call: reconnection removes entries from the same map.
@@ -1630,30 +1756,6 @@ impl McpOrchestrator {
         if let Some(client) = static_client {
             let result = Self::bounded(bound, client.call_tool(request)).await;
             return Self::map_call_result(server_key, &tool, configured_secs, result);
-        }
-
-        match self.connection_pool.get_unique_by_url(server_key) {
-            UrlLookup::Found(client) => {
-                // Note: Pooled connections trigger Disconnected but
-                // recovery logic is currently scoped to static servers.
-                let result = Self::bounded(bound, client.call_tool(request)).await;
-                return Self::map_call_result(server_key, &tool, configured_secs, result);
-            }
-            UrlLookup::Ambiguous => {
-                // Multiple pooled connections share this URL under different
-                // credentials/tenants. Picking one would run the call over
-                // another caller's authenticated connection, so fail closed.
-                warn!(
-                    "Refusing tool execution on '{}': multiple pooled connections share this \
-                     URL with different credentials/tenants; cannot select one safely",
-                    server_key
-                );
-                return Err(McpError::ServerAccessDenied(format!(
-                    "ambiguous MCP connection for '{server_key}': multiple credentials or \
-                     tenants are pooled for this URL"
-                )));
-            }
-            UrlLookup::NotFound => {}
         }
 
         Err(McpError::ServerNotFound(server_key.to_string()))
@@ -1788,14 +1890,19 @@ impl McpOrchestrator {
         // transient refusal does not stand until eviction, and a caller
         // arriving during another's listing takes no pending listing for a
         // success.
-        let pooled = self.connection_pool.get(&pool_key);
+        let mut pooled = self.connection_pool.get(&pool_key);
+        // A pooled connection whose transport is closed answers no call: it
+        // leaves the pool, and this caller connects anew.
+        if let Some(closed) = pooled.take_if(|client| client.is_transport_closed()) {
+            self.connection_pool.remove(&pool_key, &closed);
+        }
         if pooled.is_some() && self.connection_pool.is_listed(&pool_key) {
             return Ok(ConnectedServer {
                 server_key,
                 list_error: None,
+                pool_key,
             });
         }
-        let opened = pooled.is_none();
 
         // Connect via the pool
         let inventory_clone = Arc::clone(&self.tool_inventory);
@@ -1841,32 +1948,39 @@ impl McpOrchestrator {
             }
         };
 
-        // The tools go to the inventory by URL; the listing's outcome stays
-        // with this connection (its pool key) and goes to the caller's binding.
-        let list_error = match tools_of(client.as_ref(), &server_key, ToolCategory::Dynamic).await {
-            Ok(entries) => {
-                for entry in entries {
-                    inventory_clone.insert_entry(entry);
-                }
-                None
-            }
-            Err(message) => Some(message),
-        };
-        self.connection_pool.set_listing(
+        // The tools go to the inventory by URL, while this connection is
+        // still pooled under its key; the listing's outcome stays with this
+        // connection (its pool key) and goes to the caller's binding.
+        let (entries, list_error) =
+            match tools_of(client.as_ref(), &server_key, ToolCategory::Dynamic).await {
+                Ok(entries) => (entries, None),
+                Err(message) => (Vec::new(), Some(message)),
+            };
+        let still_pooled = self.connection_pool.set_listing(
             &pool_key,
             &client,
             match &list_error {
                 Some(message) => Listing::Failed(message.clone()),
                 None => Listing::Listed,
             },
+            || {
+                for entry in entries {
+                    inventory_clone.insert_entry(entry);
+                }
+            },
         );
-
-        if opened {
-            self.metrics.record_connection_opened();
+        if !still_pooled {
+            debug!(
+                "Dynamic server '{}' (tenant: {:?}) left the pool during its listing - its \
+                 tools stay out of the inventory",
+                pool_key.url, pool_key.tenant_id
+            );
         }
+
         Ok(ConnectedServer {
             server_key,
             list_error,
+            pool_key,
         })
     }
 
@@ -2059,6 +2173,10 @@ pub struct McpRequestContext<'a> {
     pub tenant_ctx: TenantContext,
     pub approval_mode: ApprovalMode,
     pub forwarded_headers: HashMap<String, String>,
+    /// The pool key a call is made with: a server named by `server_url` is
+    /// called on the connection pooled under it (`ConnectedServer::pool_key`).
+    /// A session sets it from its binding; `None` calls a configured server.
+    pub pool_key: Option<PoolKey>,
     /// Dynamic tools added for this request only.
     dynamic_tools: DashMap<QualifiedToolName, ToolEntry>,
     /// Dynamic server clients for this request.
@@ -2079,6 +2197,7 @@ impl<'a> McpRequestContext<'a> {
             tenant_ctx,
             approval_mode,
             forwarded_headers,
+            pool_key: None,
             dynamic_tools: DashMap::new(),
             dynamic_clients: DashMap::new(),
         }
@@ -2807,6 +2926,153 @@ mod tests {
         );
     }
 
+    /// A tool listing that ends after its connection left the pool puts no
+    /// tool into the inventory: no pooled connection is left to clear it.
+    #[tokio::test]
+    async fn a_listing_that_ends_after_its_connection_left_the_pool_lists_nothing() {
+        use rmcp::{
+            model::{ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig},
+            service::RequestContext,
+            RoleServer, ServerHandler, ServiceExt,
+        };
+        use tokio::sync::Notify;
+
+        /// A server whose listing says it was asked, then waits to be let go.
+        struct Slow {
+            asked: Arc<Notify>,
+            go: Arc<Notify>,
+        }
+        impl ServerHandler for Slow {
+            fn get_info(&self) -> ServerConfig {
+                ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            }
+
+            async fn list_tools(
+                &self,
+                _request: Option<PaginatedRequestParams>,
+                _context: RequestContext<RoleServer>,
+            ) -> Result<ListToolsResult, rmcp::ErrorData> {
+                self.asked.notify_one();
+                self.go.notified().await;
+                Ok(ListToolsResult::with_all_items(vec![create_test_tool(
+                    "late",
+                )]))
+            }
+        }
+
+        let mut config = McpConfig::default();
+        config.pool.max_connections = 1;
+        let orchestrator = &McpOrchestrator::new(config).await.unwrap();
+        let (asked, go) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let server_at = |url: &str| McpServerConfig {
+            transport: McpTransport::Streamable {
+                url: url.to_string(),
+                token: None,
+                headers: HashMap::new(),
+            },
+            ..sse_server("tools", url)
+        };
+        let pool = |url: &str, client| {
+            orchestrator.connection_pool.get_or_create(
+                PoolKey::from_config(&server_at(url), None),
+                server_at(url),
+                |_, _| std::future::ready(Ok(client)),
+            )
+        };
+        let slow = Slow {
+            asked: Arc::clone(&asked),
+            go: Arc::clone(&go),
+        };
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let (_server, client) = tokio::join!(slow.serve(server_io), ().serve(client_io));
+        let url = "http://slow.example/mcp";
+        pool(url, client.unwrap()).await.unwrap();
+        // The connection that takes the pool's one place is never asked.
+        let (_idle_io, client_io) = tokio::io::duplex(64);
+        let other = pool(
+            "http://other.example/mcp",
+            rmcp::service::serve_directly((), client_io, None),
+        );
+        let (listed, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(orchestrator.connect_dynamic_server(server_at(url)), async {
+                asked.notified().await;
+                other.await.unwrap();
+                go.notify_one();
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(listed.unwrap().list_error, None);
+
+        let key = PoolKey::from_config(&server_at(url), None);
+        assert!(orchestrator.connection_pool.get(&key).is_none());
+        assert!(orchestrator
+            .tool_inventory()
+            .get_entry(url, "late")
+            .is_none());
+    }
+
+    /// A request's own server whose connection left the pool before the
+    /// session is built lists with an error, not as a server of no tools.
+    #[tokio::test]
+    async fn a_server_whose_connection_left_the_pool_lists_with_an_error() {
+        use crate::core::session::{McpServerBinding, McpToolSession};
+
+        let mut config = McpConfig::default();
+        config.pool.max_connections = 1;
+        let orchestrator = &McpOrchestrator::new(config).await.unwrap();
+        // Pools a connection that is never asked and answers its key.
+        let pool = |url: &str| {
+            let config = McpServerConfig {
+                transport: McpTransport::Streamable {
+                    url: url.to_string(),
+                    token: None,
+                    headers: HashMap::new(),
+                },
+                ..sse_server("tools", url)
+            };
+            let key = PoolKey::from_config(&config, None);
+            let (_, client_io) = tokio::io::duplex(64);
+            let client = rmcp::service::serve_directly((), client_io, None);
+            let pooling =
+                orchestrator
+                    .connection_pool
+                    .get_or_create(key.clone(), config, |_, _| std::future::ready(Ok(client)));
+            async move {
+                pooling.await.unwrap();
+                key
+            }
+        };
+        let url = "http://tools.example/mcp";
+        let mut binding = McpServerBinding {
+            label: "tools".to_string(),
+            server_key: url.to_string(),
+            allowed_tools: None,
+            list_error: None,
+            pool_key: Some(pool(url).await),
+        };
+        let list_error = |binding: &McpServerBinding| {
+            McpToolSession::new(orchestrator, vec![binding.clone()], "request")
+                .list_error_for_binding(&binding.label, url)
+        };
+        assert_eq!(list_error(&binding), None);
+
+        // Another server's connection takes the pool's one place.
+        pool("http://other.example/mcp").await;
+        assert_eq!(
+            list_error(&binding).as_deref(),
+            Some("Server not found: tools")
+        );
+        binding.label.clear();
+        assert_eq!(
+            list_error(&binding).as_deref(),
+            Some("Server not found: unnamed")
+        );
+        // A listing that failed keeps its own error.
+        binding.list_error = Some("boom".to_string());
+        assert_eq!(list_error(&binding).as_deref(), Some("boom"));
+    }
+
     #[test]
     fn test_metrics_access() {
         let orchestrator = McpOrchestrator::new_test();
@@ -2928,6 +3194,290 @@ mod tests {
             "{err:?}"
         );
         assert!(orchestrator.reconnection_locks.is_empty());
+    }
+
+    /// A pooled connection whose transport closed is no hit at the connect:
+    /// it leaves the pool with its address's tools, and the caller connects
+    /// anew.
+    #[tokio::test]
+    async fn a_closed_pooled_connection_leaves_the_pool_at_the_next_connect() {
+        let orchestrator = McpOrchestrator::new(McpConfig::default()).await.unwrap();
+        // A dead local port: a new connect fails at once.
+        let url = "http://127.0.0.1:1/mcp";
+        let config = McpServerConfig {
+            transport: McpTransport::Streamable {
+                url: url.to_string(),
+                token: None,
+                headers: HashMap::new(),
+            },
+            ..sse_server("tools", url)
+        };
+        let key = PoolKey::from_config(&config, None);
+        let pool = &orchestrator.connection_pool;
+        let (server_io, client_io) = tokio::io::duplex(64);
+        let client = rmcp::service::serve_directly((), client_io, None);
+        let client = pool
+            .get_or_create(key.clone(), config.clone(), |_, _| {
+                std::future::ready(Ok(client))
+            })
+            .await
+            .unwrap();
+        pool.set_listing(&key, &client, Listing::Listed, || {
+            orchestrator
+                .tool_inventory
+                .insert_entry(ToolEntry::from_server_tool(url, create_test_tool("find")));
+        });
+
+        // The server's end closes.
+        drop(server_io);
+        timeout(Duration::from_secs(5), async {
+            while !client.is_transport_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the client reads its transport closed");
+        let err = orchestrator
+            .connect_dynamic_server(config)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::ConnectionFailed(_)), "{err:?}");
+        assert!(pool.is_empty());
+        // No other pooled connection holds the address: its tools left too.
+        assert!(orchestrator.tool_inventory.get_entry(url, "find").is_none());
+    }
+
+    /// A dynamic server's tool call uses the connection pooled under its own
+    /// key, through a session and made directly with the key on the caller's
+    /// context; while its address is pooled under two keys it stays refused;
+    /// a call whose key the pool holds no more reads the server as not found
+    /// while its tool is still listed; a pooled connection that drops starts
+    /// no reconnection.
+    #[tokio::test]
+    async fn a_dynamic_call_uses_the_connection_its_own_caller_made() {
+        use rmcp::{
+            model::{CallToolResponse, ContentBlock, ServerCapabilities, ServerConfig},
+            service::RequestContext,
+            RoleServer, ServerHandler, ServiceExt,
+        };
+
+        use crate::core::session::{McpServerBinding, McpToolSession};
+
+        /// A server that answers every call with its own name.
+        struct Named(&'static str);
+        impl ServerHandler for Named {
+            fn get_info(&self) -> ServerConfig {
+                ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            }
+
+            async fn call_tool(
+                &self,
+                _request: CallToolRequestParams,
+                _context: RequestContext<RoleServer>,
+            ) -> Result<CallToolResponse, rmcp::ErrorData> {
+                Ok(CallToolResult::success(vec![ContentBlock::text(self.0)]).into())
+            }
+        }
+
+        let url = "http://tools.example/mcp";
+        let mut config = McpConfig::default();
+        config.pool.max_connections = 2;
+        let orchestrator = &McpOrchestrator::new(config).await.unwrap();
+        // Read-only, so that the dropped call reads the disconnect: a call
+        // that may not be replayed reads an unknown outcome.
+        let mut tool = ToolEntry::from_server_tool(url, create_test_tool("whoami"));
+        tool.annotations.read_only = true;
+        orchestrator.tool_inventory().insert_entry(tool);
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool(url, create_test_tool("write")));
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool(
+                "conf",
+                create_test_tool("whoami"),
+            ));
+        orchestrator
+            .register_alias("who", "conf", "whoami", None)
+            .unwrap();
+
+        // One connection for each token; its server answers with the token.
+        let mut servers = Vec::new();
+        let mut clients = Vec::new();
+        for token in ["three", "two", "one"] {
+            let (server_io, client_io) = tokio::io::duplex(4096);
+            let (server, client) = tokio::join!(Named(token).serve(server_io), ().serve(client_io));
+            servers.push(server.unwrap());
+            clients.push(client.unwrap());
+        }
+        // A configured server held under the address as its name, and under a
+        // name of its own: a call made for a binding with a pool key still
+        // uses its own connection.
+        let handler = Arc::new(SmgClientHandler::new(
+            url,
+            Arc::clone(&orchestrator.approval_manager),
+        ));
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let (server, client) = tokio::join!(
+            Named("configured").serve(server_io),
+            (*handler).clone().serve(client_io)
+        );
+        servers.push(server.unwrap());
+        let configured = Arc::new(client.unwrap());
+        for name in [url, "conf"] {
+            orchestrator.static_servers.insert(
+                name.to_string(),
+                ServerEntry {
+                    client: Arc::clone(&configured),
+                    handler: Arc::clone(&handler),
+                    config: sse_server(name, url),
+                    list_error: None,
+                },
+            );
+        }
+        // Pools the next connection as the one `token` made to `url`; the
+        // binding holds that connection's key.
+        let mut connect = |url: &str, token: &str| {
+            let config = McpServerConfig {
+                transport: McpTransport::Streamable {
+                    url: url.to_string(),
+                    token: Some(token.to_string()),
+                    headers: HashMap::new(),
+                },
+                ..sse_server("tools", url)
+            };
+            let key = PoolKey::from_config(&config, None);
+            let client = clients.pop().unwrap();
+            let pooling =
+                orchestrator
+                    .connection_pool
+                    .get_or_create(key.clone(), config, |_, _| std::future::ready(Ok(client)));
+            let binding = McpServerBinding {
+                label: "tools".to_string(),
+                server_key: url.to_string(),
+                allowed_tools: None,
+                list_error: None,
+                pool_key: Some(key),
+            };
+            async move {
+                pooling.await.unwrap();
+                binding
+            }
+        };
+        let session = |bindings| McpToolSession::new(orchestrator, bindings, "request");
+        let input = || ToolExecutionInput {
+            call_id: "call".to_string(),
+            tool_name: "whoami".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        // What a call reads: the text of its answer, or its error.
+        let read = |output: ToolExecutionOutput| match output.error_message {
+            Some(error) => error,
+            None => output.output[0]["text"].as_str().unwrap().to_string(),
+        };
+
+        let one = connect(url, "one").await;
+        let first = session(vec![one.clone()]);
+        assert_eq!(read(first.execute_tool(input()).await), "one");
+
+        // The address pooled under a second key: a call on it is refused.
+        let two = connect(url, "two").await;
+        assert_eq!(
+            first.execute_tool(input()).await.error_message.as_deref(),
+            Some(
+                "Tool call failed: Server access denied: ambiguous MCP connection for 'tools': \
+                 multiple credentials or tenants are pooled for this URL"
+            )
+        );
+        // Two bindings of the label, of which only the second admits the
+        // tool: the call uses the second's connection.
+        let narrowed = McpServerBinding {
+            allowed_tools: Some(vec!["other".to_string()]),
+            ..one
+        };
+        let second = session(vec![narrowed, two.clone()]);
+
+        // A third connection takes the first one's place in the pool of two.
+        connect("http://other.example/mcp", "three").await;
+        assert_eq!(
+            first.execute_tool(input()).await.error_message.as_deref(),
+            Some("Tool call failed: Server not found: tools")
+        );
+        assert_eq!(read(second.execute_tool(input()).await), "two");
+        // The same call made directly: the key goes on the caller's context.
+        let mut ctx = orchestrator.create_request_context(
+            "request",
+            TenantContext::new("tenant"),
+            ApprovalMode::PolicyOnly,
+        );
+        ctx.pool_key = two.pool_key;
+        assert_eq!(
+            read(
+                orchestrator
+                    .execute_tool_resolved(input(), url, "tools", &ctx)
+                    .await
+            ),
+            "two"
+        );
+        for (server, label, named) in [
+            (url, "tools", "tools"),
+            (url, url, "unnamed"),
+            (url, "two\nlines", "unnamed"),
+            ("conf", "tools", "conf"),
+        ] {
+            let missing = ToolExecutionInput {
+                tool_name: "missing".to_string(),
+                ..input()
+            };
+            let output = orchestrator
+                .execute_tool_resolved(missing, server, label, &ctx)
+                .await;
+            assert_eq!(
+                output.error_message,
+                Some(format!("Tool 'missing' not found on server '{named}'"))
+            );
+        }
+        // A key serves its own address alone: an alias whose target is
+        // another server is called there, without the key.
+        let who = ToolExecutionInput {
+            tool_name: "who".to_string(),
+            ..input()
+        };
+        assert_eq!(
+            read(
+                orchestrator
+                    .execute_tool_resolved(who, ALIAS_SERVER_KEY, "tools", &ctx)
+                    .await
+            ),
+            "configured"
+        );
+
+        // The second one's server goes away.
+        servers.remove(1).cancel().await.unwrap();
+        assert_eq!(
+            second.execute_tool(input()).await.error_message.as_deref(),
+            Some("Tool call failed: Server disconnected: tools")
+        );
+        let write = ToolExecutionInput {
+            tool_name: "write".to_string(),
+            ..input()
+        };
+        assert_eq!(
+            second.execute_tool(write).await.error_message.as_deref(),
+            Some(
+                "Tool call failed: Tool call outcome unknown: server 'tools' disconnected while \
+                 executing 'write'; the call was not retried because the tool is not marked \
+                 idempotent or read-only"
+            )
+        );
+        assert_eq!(
+            orchestrator
+                .execute_tool_resolved(input(), url, "", &ctx)
+                .await
+                .error_message
+                .as_deref(),
+            Some("Tool call failed: Server disconnected: unnamed")
+        );
     }
 
     /// A static server's reconnection lock leaves the map with the last

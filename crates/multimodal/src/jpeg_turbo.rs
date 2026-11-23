@@ -446,7 +446,7 @@ impl TurboJpegPolicy {
     }
 
     /// Canonical lowercase name.
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Prefer => "prefer",
             Self::Require => "require",

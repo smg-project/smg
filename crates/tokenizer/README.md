@@ -50,7 +50,9 @@ as of `tokenizer/src/*`.
 
 ## Backend Implementations
 ### HuggingFaceTokenizer (`huggingface.rs`)
-- Loads `tokenizer.json` (or similar) using `tokenizers::Tokenizer::from_file`.
+- Reads `tokenizer.json` (or similar) into memory and deserializes it there (the two steps of
+  `tokenizers::Tokenizer::from_file`), keeping the text so a Unigram model section can be read
+  a second time for the scores the reference reads.
 - Caches vocab forward and reverse maps for `token_to_id`/`id_to_token` support.
 - Extracts special tokens using common patterns (e.g. `<s>`, `[CLS]`).
 - Adds special tokens on request the way the checkpoint's configuration prescribes: `encode(text, true)`
@@ -212,8 +214,8 @@ gateway's request schema.
 - Supports both token-level stops (visible or hidden) and arbitrary string sequences. When a string
   stop is configured, the decoder emits only the safe prefix and keeps a suffix jailed until it can
   decide whether it completes a stop sequence.
-- Provides `StopSequenceDecoderBuilder` for ergonomic configuration and exposes `process_token`,
-  `process_tokens`, `flush`, `reset`, and `is_stopped` helpers.
+- Takes a `StopSequenceConfig`, whose `with_*` setters add the stops, and exposes `process_token`,
+  `process_tokens`, `flush`, `finish`, `reset`, and `is_stopped` helpers.
 
 ## Caching (`cache/`)
 The caching subsystem provides multi-level caching for tokenizer results:
@@ -292,6 +294,11 @@ Corpus: 33 texts per size class of about 256, 2,000, 32,000, 128,000, 500,000 an
 DeepSeek V4.1 vocabulary; a 1M text is two 500k texts joined), assembled from public text: XL-Sum news articles in Arabic, Chinese, English, Hindi, Japanese,
 Korean, Russian and Thai, and open-source code and configuration (Rust, Python, Go, shell, C, Jinja templates, TOML and YAML,
 protobuf, JSON) with generated tool-call payloads; 17 to 39 % of the bytes of a size class are outside ASCII.
+A warm cell encodes one text, the first of its size class, again and again: a warm figure is the speed of that one
+text with hot caches, not the speed of mixed traffic. Those six texts are 1,548 bytes (256), 8,873 (2k), 151,173 (32k),
+599,401 (128k), 2,289,914 (500k) and 4,613,798 (1M), with 90.1, 41.2, 50.1, 42.3, 39.4 and 40.9 % of their bytes
+outside ASCII, where their classes hold 17.1, 31.1, 37.6, 38.3, 38.7 and 38.7 %. Such a text can read slower warm
+than its class reads cold, as some cells from the 32k class up do in `benches/compare/encode-rounds.csv`.
 
 Families: the tokenizer files of sixteen public checkpoints. Ten byte-level BPE vocabularies (DeepSeek V4.1 Flash,
 DeepSeek V3.2, Llama 3.2, Llama 4 Scout, gpt-oss, Qwen3.6, GLM-5.3 Flash, MiniMax M3, MiMo V2.6, and Ministral 3 through
@@ -469,8 +476,8 @@ difference between implementations.
 ```rust
 use std::sync::Arc;
 use llm_tokenizer::{
-    create_tokenizer_from_file, create_tokenizer, SequenceDecoderOutput, Tokenizer,
-    stop::StopSequenceDecoderBuilder,
+    create_tokenizer_from_file, create_tokenizer, SequenceDecoderOutput, StopSequenceConfig,
+    StopSequenceDecoder, Tokenizer,
 };
 
 // Load a tokenizer from disk (Hugging Face JSON)
@@ -484,22 +491,28 @@ assert!(!encoding.token_ids().is_empty());
 let openai = Tokenizer::from_arc(create_tokenizer("gpt-4")?);
 let text = openai.decode(&[1, 2, 3], true)?;
 
-// Incremental decoding with stop sequences
-let mut stream = tokenizer.decode_stream(&[], true);
-let mut stop = StopSequenceDecoderBuilder::new(Arc::clone(&inner))
-    .stop_sequence("\nHuman:")
-    .build();
+// Incremental decoding with stop sequences: the stop decoder takes every
+// token id and decodes incrementally itself
+let mut stop = StopSequenceDecoder::new(
+    Arc::clone(&inner),
+    StopSequenceConfig::default().with_stop_sequence("\nHuman:"),
+    true, // skip special tokens
+);
 for &token in encoding.token_ids() {
-    if let Some(chunk) = stream.step(token)? {
-        match stop.process_token(token)? {
-            SequenceDecoderOutput::Text(t) => println!("{}", t),
-            SequenceDecoderOutput::StoppedWithText(t) => {
-                println!("{}", t);
-                break;
-            }
-            SequenceDecoderOutput::Held | SequenceDecoderOutput::Stopped => {}
+    match stop.process_token(token)? {
+        SequenceDecoderOutput::Text(t) => print!("{t}"),
+        SequenceDecoderOutput::StoppedWithText(t) => {
+            print!("{t}");
+            break;
         }
+        SequenceDecoderOutput::Stopped => break,
+        SequenceDecoderOutput::Held => {}
     }
+}
+// End of input: release the text still held as a possible start of a stop
+match stop.finish()? {
+    SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) => println!("{t}"),
+    SequenceDecoderOutput::Held | SequenceDecoderOutput::Stopped => println!(),
 }
 ```
 

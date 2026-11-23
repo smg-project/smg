@@ -12,7 +12,10 @@ use tokenizers::{
         byte_fallback::ByteFallback, fuse::Fuse, sequence::Sequence as DecoderSequence,
         strip::Strip, DecoderWrapper,
     },
-    models::{bpe::BPE, ModelWrapper},
+    models::{
+        bpe::{Vocab, BPE},
+        ModelWrapper,
+    },
     normalizers::{unicode::NFC, NormalizerWrapper, Replace},
     pre_tokenizers::{
         byte_level::ByteLevel,
@@ -23,7 +26,7 @@ use tokenizers::{
     },
     processors::template::TemplateProcessing,
     tokenizer::{SplitDelimiterBehavior, Tokenizer as HfTokenizer},
-    AddedToken, AddedVocabulary, Model,
+    AddedToken, AddedVocabulary, Decoder as _, Model,
 };
 use tracing::{debug, info, warn};
 
@@ -31,7 +34,10 @@ use tracing::{debug, info, warn};
 use crate::v1::V1Encoder;
 use crate::{
     byte_fallback::{byte_token, PieceTable},
-    byte_level::{cut_start, decoder_kind, ByteLevelIncremental, ByteLevelTable, UnknownId},
+    byte_level::{
+        cut_start, decoder_kind, push_token_bytes, ByteLevelIncremental, ByteLevelTable, TextIndex,
+        UnknownId,
+    },
     chat_template::{
         load_chat_template_from_file, wrap_string_content_in_place, ChatTemplateContentFormat,
         ChatTemplateParams, ChatTemplateState, ConfigChatTemplates, ThinkingKeyName,
@@ -190,6 +196,39 @@ fn has_byte_fallback(decoder: &DecoderWrapper) -> bool {
     }
 }
 
+fn has_byte_level(decoder: &DecoderWrapper) -> bool {
+    match decoder {
+        DecoderWrapper::ByteLevel(_) => true,
+        DecoderWrapper::Sequence(sequence) => sequence.get_decoders().iter().any(has_byte_level),
+        _ => false,
+    }
+}
+
+/// Decode a chain at end of input, dropping bytes after its last complete
+/// character before the byte-level decoder turns them into U+FFFD.
+fn finish_byte_level_chain(
+    decoder: &DecoderWrapper,
+    mut tokens: Vec<String>,
+) -> tokenizers::Result<Vec<String>> {
+    match decoder {
+        DecoderWrapper::Sequence(sequence) => {
+            for decoder in sequence.get_decoders() {
+                tokens = finish_byte_level_chain(decoder, tokens)?;
+            }
+            Ok(tokens)
+        }
+        DecoderWrapper::ByteLevel(_) => {
+            let mut bytes = Vec::new();
+            for token in tokens {
+                push_token_bytes(&token, &mut bytes);
+            }
+            let end = cut_start(&bytes);
+            Ok(vec![String::from_utf8_lossy(&bytes[..end]).into_owned()])
+        }
+        _ => decoder.decode_chain(tokens),
+    }
+}
+
 /// The byte each `<0xHH>` token of a ByteFallback vocabulary stands for,
 /// indexed by id: the streaming step reads it per token, so it is a table
 /// rather than a vocabulary lookup and a parse. Empty for other vocabularies.
@@ -198,7 +237,10 @@ fn has_byte_fallback(decoder: &DecoderWrapper) -> bool {
 /// than by walking the vocabulary: the loader keeps no copy of it, and the
 /// table reaches the last byte token's id wherever the file put it (past a
 /// gap in the ids, or among the added tokens past the model's size).
-fn byte_fallback_values(tokenizer: &HfTokenizer, has_byte_fallback: bool) -> Vec<Option<u8>> {
+fn byte_fallback_values<M: Model>(
+    tokenizer: &TokenizerOf<M>,
+    has_byte_fallback: bool,
+) -> Vec<Option<u8>> {
     if !has_byte_fallback {
         return Vec::new();
     }
@@ -241,6 +283,43 @@ struct AddedTokenConfig {
     normalized: Option<bool>,
     #[serde(default)]
     special: bool,
+}
+
+/// The model of `settings` over a listed vocabulary and its merges' operands
+/// in rank order, as the crate's builder makes it of the file, with a cache
+/// of `words` words: the model of a section whose read listed the vocabulary
+/// and built none.
+fn bpe_of(
+    settings: &BPE,
+    listing: &Listing,
+    merges: impl Iterator<Item = [u32; 2]>,
+    words: usize,
+) -> Option<BPE> {
+    let text = |id: u32| listing.get(id).unwrap_or_default().to_owned();
+    let vocab: Vocab = (0..listing.len()).map(|id| (text(id), id)).collect();
+    let merges: Vec<(String, String)> = merges.map(|[a, b]| (text(a), text(b))).collect();
+    let mut builder = BPE::builder()
+        .fuse_unk(settings.fuse_unk)
+        .byte_fallback(settings.byte_fallback)
+        .ignore_merges(settings.ignore_merges)
+        .vocab_and_merges(vocab, merges);
+    if let Some(dropout) = settings.dropout {
+        builder = builder.dropout(dropout);
+    }
+    if let Some(token) = &settings.unk_token {
+        builder = builder.unk_token(token.clone());
+    }
+    if let Some(prefix) = &settings.continuing_subword_prefix {
+        builder = builder.continuing_subword_prefix(prefix.clone());
+    }
+    if let Some(suffix) = &settings.end_of_word_suffix {
+        builder = builder.end_of_word_suffix(suffix.clone());
+    }
+    let mut model = builder.build().ok()?;
+    // A builder told zero words makes a model with no cache; the model read
+    // from a file has one a caller may resize, so the bound is set as there.
+    model.resize_cache(words);
+    Some(model)
 }
 
 /// The encoders a tokenizer may serve an encode with before `tokenizers`
@@ -406,6 +485,26 @@ struct EncoderCore {
     /// The largest id of the vocabulary, added tokens included, read on
     /// first use (see `max_token_id`): a walk of the whole vocabulary.
     max_token_id: OnceLock<Option<TokenIdType>>,
+    /// What answers for the model of `tokenizer` where the load built none:
+    /// that model is then empty.
+    vocabulary: Option<Vocabulary>,
+    /// `tokenizer` with its model built, at the first ask of
+    /// [`Self::pipeline`] where the load built none. Boxed: a tokenizer
+    /// nobody asks holds a pointer for it.
+    whole: OnceLock<Box<HfTokenizer>>,
+}
+
+/// The vocabulary of a BPE section whose model the load did not build (one
+/// that says `byte_fallback`, on the sentencepiece path, whose encode and
+/// decode read the crate's own tables): the read's listing and the ids by
+/// their text.
+struct Vocabulary {
+    listing: Arc<Listing>,
+    index: Arc<TextIndex>,
+    /// The added tokens the index does not answer with their own id (one
+    /// past the listing, one on a model id of another text): looked up
+    /// first, as the added vocabulary is. Empty as a rule.
+    shadow: HashMap<String, u32>,
 }
 
 impl EncoderCore {
@@ -414,6 +513,7 @@ impl EncoderCore {
         native: Option<NativeEncoder>,
         wordpiece: Option<WordPieceEncoder>,
         unigram: Option<UnigramEncoder>,
+        vocabulary: Option<Vocabulary>,
     ) -> Self {
         Self {
             tokenizer,
@@ -425,7 +525,55 @@ impl EncoderCore {
             plain_after_control: OnceLock::new(),
             matches_after_normalization: OnceLock::new(),
             max_token_id: OnceLock::new(),
+            vocabulary,
+            whole: OnceLock::new(),
         }
+    }
+
+    /// The id of `token`, an added token first, as the pipeline looks it up.
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        let Some(vocabulary) = &self.vocabulary else {
+            return self.tokenizer.token_to_id(token);
+        };
+        if let Some(&id) = vocabulary.shadow.get(token) {
+            return Some(id);
+        }
+        vocabulary.index.get(&*vocabulary.listing, token.as_bytes())
+    }
+
+    /// The pipeline with its model: the one held, or, where the load built
+    /// no model, a copy with the model built of the listing and the direct
+    /// path's merges, once, at the first ask.
+    fn pipeline(&self) -> &HfTokenizer {
+        let Some(vocabulary) = &self.vocabulary else {
+            return &self.tokenizer;
+        };
+        self.whole.get_or_init(|| {
+            // The load keeps a vocabulary in the model's place on the
+            // sentencepiece path alone, whose merges resolve in its listing:
+            // a model that does not build here is a broken load, and says so.
+            let built = match (
+                self.tokenizer.get_model(),
+                self.native
+                    .as_ref()
+                    .and_then(NativeEncoder::sentencepiece_pairs_by_rank),
+            ) {
+                (ModelWrapper::BPE(settings), Some(merges)) => {
+                    bpe_of(settings, &vocabulary.listing, merges.into_iter(), 0)
+                }
+                _ => None,
+            };
+            let mut whole = Box::new(self.tokenizer.clone());
+            match built {
+                Some(model) => {
+                    whole.with_model(model);
+                }
+                None => tracing::error!(
+                    "a listed vocabulary's model does not build: the pipeline holds an empty one"
+                ),
+            }
+            whole
+        })
     }
 
     /// Whether `text` is one added token of the vocabulary, special or not:
@@ -561,7 +709,7 @@ impl EncoderCore {
         for segment in segments {
             let control = segment
                 .allow_special
-                .then(|| self.tokenizer.token_to_id(&segment.text))
+                .then(|| self.token_to_id(&segment.text))
                 .flatten();
             match control {
                 Some(id) => {
@@ -617,7 +765,7 @@ impl EncoderCore {
     /// that does not start the text.
     fn plain_tokenizer(&self, at_start: bool) -> &HfTokenizer {
         let plain_of = || {
-            let mut plain = self.tokenizer.clone();
+            let mut plain = self.pipeline().clone();
             plain.with_added_vocabulary(AddedVocabulary::new());
             plain
         };
@@ -678,8 +826,37 @@ impl HuggingFaceTokenizer {
     /// request, or with `add_special_tokens` off, where it and
     /// `tokenizer.json` read alone agree once that file's blocks are cleared
     /// too.
+    ///
+    /// A BPE section that says `byte_fallback` is loaded without the model
+    /// of the `tokenizers` crate where the crate's own tables run every
+    /// encode and decode. There the first call builds that model (its
+    /// vocabulary maps and its merge map, a good part of what a load costs),
+    /// once, and the tokenizer holds it from then on. On a file that lists
+    /// a merge twice, the model built there numbers its merges without the
+    /// gap; every encode and its written form are those of the file's model.
     pub fn tokenizers_pipeline(&self) -> &HfTokenizer {
-        &self.core.tokenizer
+        self.core.pipeline()
+    }
+
+    /// The vocabulary's size with the added tokens, as `get_vocab_size(true)`
+    /// of [`Self::tokenizers_pipeline`]: the model's size and the added
+    /// tokens whose text is no token of the model. The tokenizer's own
+    /// tables answer; nothing is built.
+    pub fn vocab_size_with_added_tokens(&self) -> usize {
+        let Some(vocabulary) = &self.core.vocabulary else {
+            return self.core.tokenizer.get_vocab_size(true);
+        };
+        let added = self.core.tokenizer.get_added_vocabulary().get_vocab();
+        let outside = added
+            .keys()
+            .filter(|text| {
+                vocabulary
+                    .index
+                    .get(&*vocabulary.listing, text.as_bytes())
+                    .is_none()
+            })
+            .count();
+        vocabulary.listing.len() as usize + outside
     }
 
     /// Create a tokenizer from a HuggingFace tokenizer JSON file.
@@ -1054,18 +1231,49 @@ impl HuggingFaceTokenizer {
         }
 
         let mut encoders = DirectEncoders::choose(&tokenizer);
-        // The bound rides on the file's model into the built tokenizer: no
-        // copy of the model (see `word_cache`).
-        tokenizer.get_model().bound(encoders.bpe_words_cached());
         let model_max_id = tokenizer.get_model().read().and_then(|read| read.max_id);
         let listing = tokenizer
             .get_model()
             .read()
             .and_then(|read| read.tokens.clone());
-        let tokenizer = HfTokenizer::from(tokenizer);
-        encoders.seed_native(tokenizer.get_model(), listing.as_deref());
+        // The ids by their text where the section read listed the vocabulary
+        // and built no model (`word_cache`). A path other than the
+        // sentencepiece one runs the model: it is built here, of the listing
+        // and the read's merges.
+        let mut unbuilt = tokenizer
+            .get_model()
+            .read()
+            .and_then(|read| read.index.clone());
+        let sentencepiece = encoders
+            .native
+            .as_ref()
+            .is_some_and(NativeEncoder::is_sentencepiece);
+        if unbuilt.is_some() && !sentencepiece {
+            let model = tokenizer.get_model();
+            let built = match (
+                model.wrapper(),
+                listing.as_deref(),
+                model.read().and_then(|read| read.pairs.as_deref()),
+            ) {
+                (ModelWrapper::BPE(settings), Some(listing), Some(pairs)) => bpe_of(
+                    settings,
+                    listing,
+                    pairs.iter().map(|&[a, b, _]| [a, b]),
+                    HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD,
+                ),
+                _ => None,
+            };
+            let built = built.ok_or_else(|| anyhow::anyhow!("the model does not build"))?;
+            tokenizer.with_model(LateBoundModel::from(ModelWrapper::BPE(built)));
+            unbuilt = None;
+        }
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
         let byte_fallback_values = byte_fallback_values(&tokenizer, has_byte_fallback);
+        // The bound rides on the file's model into the built tokenizer: no
+        // copy of the model (see `word_cache`).
+        tokenizer.get_model().bound(encoders.bpe_words_cached());
+        let tokenizer = HfTokenizer::from(tokenizer);
+        encoders.seed_native(tokenizer.get_model(), listing.as_deref());
         let glm = tokenizer_path.parent().and_then(glm::Checkpoint::load);
         let renderer = glm
             .as_ref()
@@ -1098,11 +1306,45 @@ impl HuggingFaceTokenizer {
             pieces.is_some(),
             token_texts.is_some(),
         );
+        // On the sentencepiece path with a piece table, a model that was not
+        // built is never built: the listing and its index answer in its
+        // place. Anywhere else a decode runs the model, and it is built here.
+        let mut tokenizer = tokenizer;
+        let mut vocabulary = None;
+        if let (Some(listing), Some(index)) = (&listing, unbuilt) {
+            if pieces.is_some() && !tokenizer.get_decoder().is_some_and(has_byte_level) {
+                let shadow = tokenizer
+                    .get_added_vocabulary()
+                    .get_vocab()
+                    .iter()
+                    .filter(|(text, &id)| index.get(&**listing, text.as_bytes()) != Some(id))
+                    .map(|(text, &id)| (text.clone(), id))
+                    .collect();
+                vocabulary = Some(Vocabulary {
+                    listing: Arc::clone(listing),
+                    index,
+                    shadow,
+                });
+            } else {
+                let merges = encoders
+                    .native
+                    .as_ref()
+                    .and_then(NativeEncoder::sentencepiece_pairs_by_rank)
+                    .unwrap_or_default();
+                let built = match tokenizer.get_model() {
+                    ModelWrapper::BPE(settings) => bpe_of(settings, listing, merges.into_iter(), 0),
+                    _ => None,
+                };
+                tokenizer
+                    .with_model(built.ok_or_else(|| anyhow::anyhow!("the model does not build"))?);
+            }
+        }
         let core = Arc::new(EncoderCore::new(
             tokenizer,
             encoders.native,
             encoders.wordpiece,
             encoders.unigram,
+            vocabulary,
         ));
         let structural_controls = tokenizer_path
             .parent()
@@ -1129,6 +1371,9 @@ impl HuggingFaceTokenizer {
                     marks::marked_special_tokens(&special_tokens)
                 })
         };
+        if let Some(native) = &core.native {
+            native.rehearse(Some(core.tokenizer.get_model()));
+        }
         Ok(HuggingFaceTokenizer {
             byte_level,
             pieces,
@@ -1165,6 +1410,34 @@ impl HuggingFaceTokenizer {
             return Ok(table.render(ids, skip_special_tokens));
         }
         self.decode(ids, skip_special_tokens)
+    }
+
+    /// The window's end through a decoder chain that contains ByteLevel: the
+    /// same chain as `decode`, except that its incomplete final bytes are
+    /// removed before their lossy conversion. Other decoder kinds use the
+    /// regular window decode.
+    fn finish_window_decode(
+        &self,
+        ids: &[TokenIdType],
+        skip_special_tokens: bool,
+    ) -> Result<String> {
+        let Some(decoder) = self
+            .core
+            .tokenizer
+            .get_decoder()
+            .filter(|decoder| has_byte_level(decoder))
+        else {
+            return self.window_decode(ids, skip_special_tokens);
+        };
+        let added = self.core.tokenizer.get_added_vocabulary();
+        let tokens: Vec<String> = ids
+            .iter()
+            .filter_map(|&id| self.core.pipeline().id_to_token(id))
+            .filter(|token| !skip_special_tokens || !added.is_special_token(token))
+            .collect();
+        finish_byte_level_chain(decoder, tokens)
+            .map(|tokens| tokens.concat())
+            .map_err(|error| Error::msg(format!("Decoding failed: {error}")))
     }
 
     /// The token-text table (see `token_text`); `None` for a decoder it does
@@ -1254,7 +1527,10 @@ impl HuggingFaceTokenizer {
             .get_added_tokens_decoder()
             .get(&id)
             .map(|token| token.content.clone())
-            .or_else(|| self.core.tokenizer.get_model().id_to_token(id))
+            .or_else(|| match &self.core.vocabulary {
+                None => self.core.tokenizer.get_model().id_to_token(id),
+                Some(vocabulary) => vocabulary.listing.get(id).map(str::to_owned),
+            })
     }
 
     /// Encodes a Llama-class checkpoint as its reference class does.
@@ -1447,18 +1723,23 @@ impl HuggingFaceTokenizer {
             pieces.is_some(),
             token_texts.is_some(),
         );
+        let core = EncoderCore::new(
+            tokenizer,
+            encoders.native,
+            encoders.wordpiece,
+            encoders.unigram,
+            None,
+        );
+        if let Some(native) = &core.native {
+            native.rehearse(Some(core.tokenizer.get_model()));
+        }
         HuggingFaceTokenizer {
             byte_level,
             pieces,
             token_texts,
             #[cfg(feature = "tokenizers-v1")]
             v1: encoders.v1,
-            core: Arc::new(EncoderCore::new(
-                tokenizer,
-                encoders.native,
-                encoders.wordpiece,
-                encoders.unigram,
-            )),
+            core: Arc::new(core),
             special_tokens,
             chat_template: ChatTemplateState::empty(),
             response_template: None,
@@ -1916,7 +2197,7 @@ impl Encoder for HuggingFaceTokenizer {
             }
         }
         self.core
-            .tokenizer
+            .pipeline()
             .encode_fast(input, add_special_tokens)
             .map_err(|e| Error::msg(format!("Encoding failed: {e}")))
             .map(|encoding| Encoding::Hf(Box::new(encoding)))
@@ -1944,7 +2225,7 @@ impl Encoder for HuggingFaceTokenizer {
                 .collect();
         }
         self.core
-            .tokenizer
+            .pipeline()
             .encode_batch_fast(inputs.to_vec(), add_special_tokens)
             .map_err(|e| Error::msg(format!("Batch encoding failed: {e}")))
             .map(|encodings| {
@@ -2324,8 +2605,8 @@ impl Decoder for HuggingFaceTokenizer {
 
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
         // A byte-level vocabulary decodes through the table its streams use:
-        // every id's bytes concatenated and one UTF-8 conversion, in place of
-        // the `tokenizers` decoder chain over every piece.
+        // whole tokens appended as text and the other bytes converted per
+        // run, in place of the `tokenizers` decoder chain over every piece.
         if let Some(table) = &self.byte_level {
             return Ok(table.decode(token_ids, skip_special_tokens));
         }
@@ -2343,7 +2624,7 @@ impl Decoder for HuggingFaceTokenizer {
             return Ok(table.render(token_ids, skip_special_tokens));
         }
         self.core
-            .tokenizer
+            .pipeline()
             .decode(token_ids, skip_special_tokens)
             .map_err(|e| Error::msg(format!("Decoding failed: {e}")))
     }
@@ -2498,15 +2779,15 @@ impl Decoder for HuggingFaceTokenizer {
         if self.has_byte_fallback {
             // The byte tokens of a character the end cut short come off the
             // window: the end releases the text before them and nothing for
-            // the character, where the window's decode would render the
-            // whole byte run around them as replacement characters,
-            // rewriting text already sent (the one end that differs from
-            // `decode`, see `IncrementalDecoder::finish_into`).
+            // the character, as every stream end drops an incomplete
+            // trailing character (see `IncrementalDecoder::finish_into`);
+            // the window's decode would render the whole byte run around
+            // them as replacement characters, rewriting text already sent.
             let held = (*prefix_index).min(ids.len());
             let cut = self.cut_tail(&ids[held..], skip_special_tokens);
             ids.truncate(ids.len() - cut);
         }
-        let decoded = self.window_decode(ids, skip_special_tokens)?;
+        let decoded = self.finish_window_decode(ids, skip_special_tokens)?;
         let (pending, prefix_mismatch) = match decoded.strip_prefix(prefix.as_str()) {
             Some(pending) => (pending.to_string(), false),
             None => {
@@ -2683,7 +2964,10 @@ impl HuggingFaceTokenizer {
 
 impl TokenizerTrait for HuggingFaceTokenizer {
     fn vocab_size(&self) -> usize {
-        self.core.tokenizer.get_vocab_size(false)
+        match &self.core.vocabulary {
+            None => self.core.tokenizer.get_vocab_size(false),
+            Some(vocabulary) => vocabulary.listing.len() as usize,
+        }
     }
 
     fn get_special_tokens(&self) -> &SpecialTokens {
@@ -2693,7 +2977,7 @@ impl TokenizerTrait for HuggingFaceTokenizer {
     /// The pipeline's own tables answer (the added vocabulary, then the
     /// model); the loader keeps no copy of the vocabulary.
     fn token_to_id(&self, token: &str) -> Option<TokenIdType> {
-        self.core.tokenizer.token_to_id(token)
+        self.core.token_to_id(token)
     }
 
     /// The file's spelling of the id's token (an added token's content, else
@@ -2707,10 +2991,15 @@ impl TokenizerTrait for HuggingFaceTokenizer {
     /// `vocab_size - 1`): [`Self::vocab_size`] counts the model's entries
     /// and leaves the added tokens out, and a multimodal placeholder is often
     /// one of them, or an id far past a sparse vocabulary's count. Read once,
-    /// on first use.
+    /// on first use. Where the load built no model, the listing stands in
+    /// for it: its ids are `0..len`, so its last is the model's largest.
     fn max_token_id(&self) -> Option<TokenIdType> {
         *self.core.max_token_id.get_or_init(|| {
             let tokenizer = &self.core.tokenizer;
+            if let Some(vocabulary) = &self.core.vocabulary {
+                let model = vocabulary.listing.len().checked_sub(1);
+                return crate::byte_level::max_token_id(tokenizer, model);
+            }
             let counted = tokenizer
                 .get_vocab_size(false)
                 .checked_sub(1)
@@ -2982,7 +3271,11 @@ fn detect_renderer_from_config(dir: &Path, has_chat_template: bool) -> Renderer 
     // Checked before the V4 arm below: V4.1 ships its own architecture name,
     // but some checkpoints identify themselves only via `model_type`.
     let model_type = value.get("model_type").and_then(|v| v.as_str());
-    if arch_strs.contains(&"Inkling2ForConditionalGeneration") || model_type == Some("inkling2") {
+    // Looped checkpoints (`inkling2_loop`) render the same chats.
+    if arch_strs.contains(&"Inkling2ForConditionalGeneration")
+        || arch_strs.contains(&"Inkling2LoopForConditionalGeneration")
+        || matches!(model_type, Some("inkling2" | "inkling2_loop"))
+    {
         debug!(?path, "selected Inkling2 typed renderer");
         return Renderer::Inkling2;
     }

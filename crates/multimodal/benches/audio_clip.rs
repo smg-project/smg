@@ -14,22 +14,18 @@
 //! Run:  cargo bench -p llm-multimodal --bench audio_clip
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-#![expect(
-    unsafe_code,
-    reason = "a counting global allocator reports the allocation calls of a clip beside its time"
-)]
+
+#[path = "../tests/common/counting_alloc.rs"]
+mod counting_alloc;
 
 use std::{
-    alloc::{GlobalAlloc, Layout, System},
     hint::black_box,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::{atomic::Ordering, Arc},
     time::Duration,
 };
 
 use bytes::Bytes;
+use counting_alloc::{Counting, CALLS};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use llm_multimodal::{
     audio::{
@@ -38,30 +34,6 @@ use llm_multimodal::{
     },
     AudioClip, AudioSource, PreprocessedEncoderInputs,
 };
-
-/// Allocation and reallocation calls made through the global allocator so far.
-static CALLS: AtomicUsize = AtomicUsize::new(0);
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        CALLS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: the layout is the caller's, handed to the system allocator unchanged.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: `ptr` came from `alloc` or `realloc` above with this layout.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        CALLS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: `ptr` came from `alloc` or `realloc` above with this layout.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
 
 #[global_allocator]
 static GLOBAL: Counting = Counting;

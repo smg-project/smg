@@ -148,6 +148,7 @@ def repo(tmp_path, mod):
     put(root, "moved/src/lib.rs", "// moved\n")
     put(root, "model_gateway/Cargo.toml", manifest("smg", "1.0.0"))
     put(root, "model_gateway/src/main.rs", "fn main() {}\n")
+    put(root, "model_gateway/src/cli/mod.rs", "fn read_args() {}\n")
     put(root, "pkg/pyproject.toml", '[project]\nname = "pkg"\nversion = "0.1.0"\n')
     put(root, "pkg/pkg.py", "x = 1\n")
     put(root, "quiet/pyproject.toml", '[project]\nname = "quiet"\nversion = "0.1.0"\n')
@@ -193,7 +194,7 @@ def repo(tmp_path, mod):
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "feat(delta): new crate")
     # the gateway: a breaking change, not bumped
-    put(root, "model_gateway/src/main.rs", "fn main() { println!(); }\n")
+    put(root, "model_gateway/src/cli/mod.rs", "fn read_args() { println!(); }\n")
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "feat(gateway)!: a new wire")
     # pkg: a feat and then a fix, not bumped (the older feat still decides); quiet: untouched

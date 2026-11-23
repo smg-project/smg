@@ -113,6 +113,15 @@ impl CacheNamespace {
         self.event_seed
     }
 
+    /// The partition's whole identity as an XXH3 seed, the extra key
+    /// included. A host names a request's prefix under it, so two requests
+    /// share a named prefix only where their partitions are one, as they
+    /// share an engine's cache. A text request's windows are hashed under
+    /// it too: no engine hashes text, so that seed need match none.
+    pub fn partition_seed(self) -> u64 {
+        self.marker
+    }
+
     /// The namespace as token ids for the token tree and hash mode: two ids
     /// with the reserved high bit set, so they never match prompt tokens.
     pub fn token_marker(self) -> [u32; TOKEN_MARKER_LEN] {
@@ -209,6 +218,25 @@ mod tests {
         assert_ne!(a, extra);
         assert_ne!(a, lora);
         assert_ne!(extra, lora);
+    }
+
+    #[test]
+    fn partition_seed_follows_every_field() {
+        let seed = |salt, extra, lora| {
+            CacheNamespace::derive(&partition(salt, extra, lora))
+                .expect("a partition")
+                .partition_seed()
+        };
+        // The extra key moves it, where the event seed stays the plain one.
+        let extra_only = seed(None, Some("k"), None);
+        assert_ne!(extra_only, kv_index::XXH3_SEED);
+        assert_ne!(extra_only, seed(None, Some("other"), None));
+        // One value in another field is another partition.
+        assert_ne!(
+            seed(Some("tenant"), None, None),
+            seed(None, None, Some("tenant"))
+        );
+        assert_eq!(extra_only, seed(None, Some("k"), None));
     }
 
     #[test]

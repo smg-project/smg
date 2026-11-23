@@ -34,14 +34,17 @@ use common::{build_view, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use served::{Behaviour, TestPlugin, ALL, FILTER, PICK, SCORE};
 use smg_policy_controller::{
-    builtins::{Best, Healthy, LeastRequests},
-    grpc::{
-        BreakerSpec, EventSet, GrpcFilter, GrpcPicker, GrpcPluginSpec, GrpcScorer, Plugin, Runtime,
-        Transport,
+    document::Needs,
+    engine::{
+        Binding, Constraints, Engine, Filter, Picker, Plan, PoolFacts, Profile, RequestFacts,
+        Scorer, Scratch, Target, WeightedScorer,
     },
-    plugins::OpenDecisions,
-    Binding, Constraints, Engine, Filter, Lease, Lifecycle, Needs, Picker, Plan, PoolFacts,
-    Profile, RequestFacts, Scorer, Scratch, Side, Target, Weighted,
+    plugins::{
+        grpc::{GrpcFilter, GrpcPicker, GrpcPluginSpec, GrpcScorer, Plugin, Runtime, Transport},
+        shared::{BreakerSpec, OpenDecisions},
+    },
+    stages::{Best, Healthy, LeastRequests, Lifecycle},
+    tracking::{EventSet, Lease, Side},
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -49,8 +52,9 @@ const SIZES: [usize; 3] = [8, 64, 512];
 /// A prompt's block hashes: the view's default cap and the contract's most.
 const HASHES: [usize; 2] = [256, 8_190];
 
-/// A budget of one second per decision: no honest round trip meets it, so
-/// every cell is an answered decision.
+/// A budget of one second per decision, which the plugin states as its own
+/// frame too: no honest round trip meets it, so every cell is an answered
+/// decision.
 const BUDGET_MICROS: u32 = 1_000_000;
 
 /// A served plugin that keeps none of the frames and events it is sent.
@@ -69,6 +73,9 @@ fn spec(served: &TestPlugin, name: &str) -> GrpcPluginSpec {
         },
     );
     spec.connect_micros = 5_000_000;
+    // A plugin that states no budget is cut at the default frame, a tenth
+    // of a decision's budget here.
+    spec.budget_micros = BUDGET_MICROS;
     spec.max_candidates = 512;
     // Every kind of event, as the `observe` cell tells one.
     spec.observes = EventSet::ALL;
@@ -97,7 +104,7 @@ fn plugin_engine(plugin: &Arc<Plugin>, stages: u32) -> Engine {
     engine_of(Profile {
         name: "plugin".into(),
         filters: vec![filter],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer,
             weight: 1.0,
         }],
@@ -110,7 +117,7 @@ fn native_engine() -> Engine {
     engine_of(Profile {
         name: "native".into(),
         filters: vec![Box::new(Healthy)],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -127,6 +134,8 @@ fn engine_of(profile: Profile) -> Engine {
             plan: Plan::Single,
             profile: 0,
             decode_profile: None,
+            shadow: None,
+            decode_shadow: None,
             sessions: None,
             overload: None,
         }],
@@ -272,7 +281,7 @@ fn bypassed(c: &mut Criterion) {
             Arc::clone(&bound),
             Some(Box::new(Healthy)),
         ))],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(GrpcScorer::new(
                 Arc::clone(&bound),
                 Some(Box::new(LeastRequests)),

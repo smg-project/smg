@@ -16,9 +16,10 @@
 //! task a worker and runs it (the slots, connecting, reconnecting, the
 //! stream read loop, the pushed load records, the worker's departure);
 //! `admission.rs` keeps one stream's state (per-rank cursors, gap recovery,
-//! relay snapshots, and the metrics around an applied batch); `apply.rs`
-//! takes one event into the index (tiers, cache groups, namespaces, and the
-//! physical copies of a block, counted per worker).
+//! relay snapshots, and the metrics around an applied batch);
+//! [`smg_worker::kv_events::apply`] takes one event into the index (tiers,
+//! cache groups, namespaces, and the physical copies of a block, counted per
+//! worker).
 //!
 //! The task and the index meet at the worker crate's port: the task says
 //! what its stream brought, and `index_sink.rs`, the sink over the models'
@@ -28,6 +29,7 @@
 use std::{fmt, sync::Arc};
 
 use dashmap::{mapref::entry::Entry, DashMap};
+use smg_policy_controller::engine::{CacheIndex, CacheIndexes};
 use smg_worker::{
     identity::{basic::Worker, endpoint::Endpoint},
     load::monitor::WorkerMonitor,
@@ -38,16 +40,14 @@ use smg_worker::{
 use tracing::{error, warn};
 
 use super::index_backend::KvIndex;
+use crate::policies::normalize_model_key;
 
 mod admission;
-mod apply;
 #[cfg(test)]
 mod gateway_tests;
 mod index_sink;
 mod recovery;
 
-#[cfg(any(test, feature = "test-util"))]
-pub(crate) use apply::WorkerIndexState;
 use index_sink::{IndexSink, OpenRow};
 // The worker crate's port, at the path it had here.
 use smg_worker::kv_events::port;
@@ -336,6 +336,21 @@ impl KvEventMonitor {
     }
 }
 
+/// The policy engine's reads of the monitor, where it decides in the
+/// gateway's own process: a model's index and its block size, each read
+/// where the engine reads a list of workers, never once a request.
+impl CacheIndexes for KvEventMonitor {
+    fn index(&self, model: &str) -> Option<Arc<dyn CacheIndex>> {
+        let index = self.get_indexer(normalize_model_key(model))?;
+        Some(index as Arc<dyn CacheIndex>)
+    }
+
+    fn block_size(&self, model: &str) -> Option<u32> {
+        let tokens = Self::block_size(self, normalize_model_key(model))?;
+        u32::try_from(tokens).ok().filter(|&tokens| tokens > 0)
+    }
+}
+
 /// Hooks for benchmarks and integration tests that put an index in front of
 /// the policy and feed it events the way a subscription does, without a
 /// stream: the subscriber's per-worker state and the same apply path.
@@ -345,8 +360,10 @@ pub mod bench_support {
 
     use kv_index::WorkerIdExhausted;
     use smg_grpc_client::common_proto::KvEventBatch;
+    use smg_worker::kv_events::apply::{apply_events, WorkerIndexState};
 
-    use super::{KvEventMonitor, KvIndex, WorkerIndexState};
+    use super::KvEventMonitor;
+    use crate::policies::kv_index::index_backend::{KvIndex, WorkerBlocks};
 
     impl KvEventMonitor {
         /// Make `index` the model's index, as a worker's first subscription
@@ -359,7 +376,7 @@ pub mod bench_support {
     /// One worker's feed into an index.
     pub struct IndexFeed {
         worker: u32,
-        state: WorkerIndexState,
+        state: WorkerIndexState<WorkerBlocks>,
     }
 
     impl IndexFeed {
@@ -377,7 +394,7 @@ pub mod bench_support {
 
         /// Apply every event of `batch`, as an admitted batch is applied.
         pub fn apply(&mut self, index: &KvIndex, batch: &KvEventBatch) {
-            KvEventMonitor::apply_events(&batch.events, self.worker, index, &mut self.state);
+            apply_events(&batch.events, self.worker, index, &mut self.state);
         }
 
         /// The worker leaves: its blocks go with it.
@@ -770,6 +787,62 @@ mod tests {
     async fn an_unknown_model_has_no_index() {
         let monitor = KvEventMonitor::new();
         assert!(monitor.get_indexer("nonexistent").is_none());
+    }
+
+    /// The policy engine's reads of the monitor. A block that a worker's
+    /// event stored in a model's index is what the engine's lookup answers,
+    /// under the index's own number of the worker, and the model's block
+    /// size is the one the monitor holds. The index the engine is handed is
+    /// the monitor's own, not a copy. A model with no index answers none.
+    #[test]
+    fn the_engine_reads_the_index_an_event_wrote() {
+        use kv_index::compute_request_content_hashes;
+        use smg_grpc_client::common_proto::{
+            kv_cache_event::Data, KvBlock, KvBlocksStored, KvCacheEvent, KvEventBatch,
+        };
+
+        let monitor = KvEventMonitor::new();
+        let index = Arc::new(KvIndex::chain());
+        monitor.set_index("llama", Arc::clone(&index));
+        monitor.set_block_size("llama", 4);
+        let tokens = [10, 20, 30, 40];
+        let stored = KvBlocksStored {
+            blocks: vec![KvBlock {
+                block_hash: 1,
+                token_ids: tokens.to_vec(),
+                block_size: 4,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let batch = KvEventBatch {
+            events: vec![KvCacheEvent {
+                event_id: 1,
+                data: Some(Data::Stored(stored)),
+            }],
+            ..Default::default()
+        };
+        let mut feed = bench_support::IndexFeed::new(&index, "grpc://w1:9000").unwrap();
+        feed.apply(&index, &batch);
+
+        let read: &dyn CacheIndexes = &monitor;
+        assert_eq!(read.block_size("llama"), Some(4));
+        let lent = read.index("llama").expect("the model's index");
+        assert!(
+            std::ptr::addr_eq(Arc::as_ptr(&lent), Arc::as_ptr(&index)),
+            "the monitor's own index"
+        );
+        let number = feed.worker_id();
+        assert_eq!(lent.worker_number("grpc://w1:9000"), Some(number));
+        assert_eq!(lent.worker_blocks(number), 1);
+        let hashes = compute_request_content_hashes(&tokens, 4);
+        let request: Vec<u64> = hashes.iter().map(|hash| hash.0).collect();
+        let mut kept = Vec::new();
+        lent.deepest_into(&request, 4, &[1 << number], 16, &mut |_| 0, &mut kept);
+        assert_eq!(kept, [(number, 1)]);
+
+        assert!(read.index("nonexistent").is_none());
+        assert_eq!(read.block_size("nonexistent"), None);
     }
 
     #[test]

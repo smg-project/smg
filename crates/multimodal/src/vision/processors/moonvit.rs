@@ -18,7 +18,7 @@
 //! over a background before patchify — see [`MoonVitParams`] and the
 //! `transparent_bg` argument to [`preprocess`].
 
-use std::{borrow::Cow, cell::Cell, iter::repeat_n};
+use std::{borrow::Cow, cell::Cell, collections::TryReserveError, iter::repeat_n};
 
 use image::{DynamicImage, GenericImageView};
 
@@ -35,7 +35,7 @@ use crate::{
 
 /// MoonViT resize/patchify/normalize parameters for a single model.
 #[derive(Debug, Clone, Copy)]
-pub struct MoonVitParams {
+pub(crate) struct MoonVitParams {
     pub patch_size: usize,
     pub merge_size: usize,
     /// Maximum total patches before merge (`in_patch_limit`).
@@ -50,7 +50,7 @@ pub struct MoonVitParams {
 
 impl MoonVitParams {
     #[inline]
-    pub fn factor(&self) -> usize {
+    pub(crate) fn factor(&self) -> usize {
         self.patch_size * self.merge_size
     }
 
@@ -60,7 +60,7 @@ impl MoonVitParams {
     /// its compiled-in defaults. K2.5 and K3 ship different `in_patch_limit`
     /// values (16384 vs 65536), which is exactly the kind of divergence that
     /// silently caps resolution if the defaults win.
-    pub fn resolved(self, config: &PreProcessorConfig) -> Self {
+    pub(crate) fn resolved(self, config: &PreProcessorConfig) -> Self {
         Self {
             // A zero patch or merge size would divide by zero downstream.
             patch_size: config.get_patch_size(self.patch_size).max(1),
@@ -81,7 +81,7 @@ impl MoonVitParams {
     /// Compute resize dimensions and padding, matching HF `navit_resize_image`.
     ///
     /// Never upscales (scale capped at 1.0). Pads with zeros to align to factor.
-    pub fn compute_resize_config(&self, width: usize, height: usize) -> ResizeConfig {
+    pub(crate) fn compute_resize_config(&self, width: usize, height: usize) -> ResizeConfig {
         let ps = self.patch_size;
         let patches_w = (width / ps).max(1) as f64;
         let patches_h = (height / ps).max(1) as f64;
@@ -115,7 +115,7 @@ impl MoonVitParams {
 }
 
 /// MoonViT resize configuration for a single image.
-pub struct ResizeConfig {
+pub(crate) struct ResizeConfig {
     pub new_width: usize,
     pub new_height: usize,
     pub pad_width: usize,
@@ -295,7 +295,7 @@ fn write_wire_patches(
 }
 
 /// Run the full MoonViT pipeline over a batch of images.
-pub fn preprocess(
+pub(crate) fn preprocess(
     params: MoonVitParams,
     images: &[&DynamicImage],
     transparent_bg: Option<TransparentBg>,
@@ -305,7 +305,13 @@ pub fn preprocess(
         params,
         images,
         transparent_bg,
-        scratch::take_f32_cap,
+        |elements| {
+            // Not `scratch::try_take_f32_cap(..).map_err(..)`: mapped with the
+            // buffer inside, the writer takes up to 1.1 % more instructions.
+            let mut out = scratch::take_f32_cap(0);
+            out.try_reserve(elements).map_err(refused)?;
+            Ok(out)
+        },
         |out, rgb, size, grid| write_patches(rgb, size, grid, params.patch_size, &levels, out),
         |patches, total_patches| {
             ndarray::Array4::from_shape_vec(
@@ -374,7 +380,7 @@ pub(crate) fn preprocess_wire(
         transparent_bg,
         // A buffer of the pool: its bytes are a previous request's until the
         // patches cover it, and `covered` refuses it otherwise.
-        |elements| buffer_pool::take(2 * elements),
+        |elements| buffer_pool::try_take(elements.saturating_mul(2)).map_err(refused),
         |wire: &mut Vec<u8>, rgb, size, grid: (usize, usize)| {
             let elements = grid.0 * grid.1 * 3 * patch * patch;
             let (cells, _) = wire[2 * written.get()..][..2 * elements].as_chunks_mut::<2>();
@@ -402,16 +408,22 @@ fn covered(wire: Vec<u8>, written: usize) -> Result<Vec<u8>, TransformError> {
     }
 }
 
+/// The request's error for a patch output that cannot be reserved.
+fn refused(error: TryReserveError) -> TransformError {
+    TransformError::ReserveRefused(format!("cannot reserve MoonViT patch output: {error}"))
+}
+
 /// The pipeline over a batch of images, for either form of the encoder input:
-/// `take` hands out the batch's buffer for a count of elements, `write` puts
-/// one image's patches into it (from the image's RGB bytes after the resize,
-/// their size and the padded grid), and `wrap` makes the encoder input of the
-/// buffer and the count of patches.
+/// `take` hands out the batch's buffer for a count of elements (or the
+/// request's error when it cannot be reserved), `write` puts one image's
+/// patches into it (from the image's RGB bytes after the resize, their size
+/// and the padded grid), and `wrap` makes the encoder input of the buffer and
+/// the count of patches.
 fn batch<B>(
     params: MoonVitParams,
     images: &[&DynamicImage],
     transparent_bg: Option<TransparentBg>,
-    take: impl FnOnce(usize) -> B,
+    take: impl FnOnce(usize) -> Result<B, TransformError>,
     mut write: impl FnMut(&mut B, &[u8], (usize, usize), (usize, usize)),
     wrap: impl FnOnce(B, usize) -> Result<EncoderInput, TransformError>,
 ) -> Result<PreprocessedEncoderInputs, TransformError> {
@@ -420,17 +432,20 @@ fn batch<B>(
     let item_sizes: Vec<(u32, u32)> = images.iter().map(|img| img.dimensions()).collect();
 
     // Pre-size the pooled batch buffer exactly (patch_features per patch =
-    // 3 * patch_size^2; this is the data plane's hottest allocation).
-    let patch_features = 3 * params.patch_size * params.patch_size;
+    // 3 * patch_size^2; this is the data plane's hottest allocation). A size
+    // `usize` cannot count saturates, here and where the wire doubles it, and
+    // the take refuses it.
+    let patch_features = (3 * params.patch_size).saturating_mul(params.patch_size);
     let mut estimated_total = 0usize;
     for image in images {
         let (w, h) = image.dimensions();
         let cfg = params.compute_resize_config(w as usize, h as usize);
         let grid_h = (cfg.new_height + cfg.pad_height) / params.patch_size;
         let grid_w = (cfg.new_width + cfg.pad_width) / params.patch_size;
-        estimated_total += grid_h * grid_w * patch_features;
+        estimated_total =
+            estimated_total.saturating_add((grid_h * grid_w).saturating_mul(patch_features));
     }
-    let mut all_patches = take(estimated_total);
+    let mut all_patches = take(estimated_total)?;
     let mut patches_per_image: Vec<i64> = Vec::with_capacity(images.len());
     let mut grid_thw_data = Vec::with_capacity(images.len() * 3);
     let mut feature_token_counts = Vec::with_capacity(images.len());
@@ -977,13 +992,30 @@ mod tests {
             let wire = preprocess_wire(params, &[&image], None, dtype)
                 .expect("offered with three tables")
                 .unwrap();
-            let floats = preprocess(params, &[&image], None).unwrap();
+            assert!(
+                matches!(&wire.encoder_input, EncoderInput::Wire { .. }),
+                "{dtype}: offered input is not a wire"
+            );
             assert_eq!(
-                wire.encoder_input.write_as(dtype),
-                floats.encoder_input.write_as(dtype),
+                wire.encoder_input.pixel_norm(),
+                Some(wire_norm(&params)),
+                "{dtype}: wire norm"
+            );
+            let floats = preprocess(params, &[&image], None).unwrap();
+            let wire_bytes = wire
+                .encoder_input
+                .view()
+                .try_write_as(dtype)
+                .expect("wire writes");
+            let float_bytes = floats
+                .encoder_input
+                .view()
+                .try_write_as(dtype)
+                .expect("float tensor writes");
+            assert_eq!(
+                wire_bytes, float_bytes,
                 "{dtype}: mean {:?}, std {:?}",
-                params.mean,
-                params.std
+                params.mean, params.std
             );
         }
     }
@@ -1000,6 +1032,36 @@ mod tests {
                     .to_string()
                     .contains(&format!("{written} of 8 bytes written")),
                 "{error}"
+            );
+        }
+    }
+
+    /// A patch too large for any allocation, and a batch of them too large
+    /// for `usize` to count: the request reads an error in both forms of the
+    /// output.
+    #[test]
+    fn a_patch_output_that_cannot_be_reserved_is_an_error() {
+        let params = MoonVitParams {
+            patch_size: 1 << 30,
+            merge_size: 1,
+            ..params_with_a_budget_of_three_patches()
+        };
+        let image = DynamicImage::ImageRgb8(RgbImage::new(1, 1));
+        let wire = |images: &[&DynamicImage]| {
+            preprocess_wire(params, images, None, EncoderDtype::BFloat16).expect("a narrow wire")
+        };
+
+        for result in [
+            wire(&[&image]),
+            wire(&[&image; 6]),
+            preprocess(params, &[&image], None),
+        ] {
+            assert!(
+                matches!(&result, Err(TransformError::ReserveRefused(message))
+                    if message
+                        .strip_prefix("cannot reserve MoonViT patch output: ")
+                        .is_some_and(|cause| !cause.is_empty())),
+                "{result:?}"
             );
         }
     }

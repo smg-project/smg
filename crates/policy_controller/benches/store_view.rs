@@ -1,29 +1,12 @@
-//! The cost of a decision's view built from the store, at 8, 64 and 512
-//! members of one pool, and of the writes that feed it:
+//! The cost of the store's writes, at 8, 64 and 512 members of one pool:
 //!
-//! - `policy_store/view_build/<n>`: one decision's build: the pool's
-//!   published rows copied, the position and the report's age written;
-//! - `policy_store/view_build_column/<n>`: the same under a profile that
-//!   declares the affinity column;
 //! - `policy_store/load_write/<n>`: one load record's write inside the
 //!   publication window: on file and folded into the writer's rows;
 //! - `policy_store/publish/<n>`: one window's publication of the pool: one
 //!   copy, one pointer swap;
 //! - `policy_store/floor/<n>`: the decision benches' gated build, rows
-//!   written from facts in hand, in this binary, so that one job reads a
-//!   build from the store beside it. No check holds a build to the floor:
-//!   the gate compares each id with its own base alone, and the design's
-//!   bound (a build within twice the floor) is for a reader of the two
-//!   rows. A build may read under the floor;
-//! - `policy_store/view_build_veto1/<n>` and `view_build_veto8/<n>`: the
-//!   build with one and with eight standing vetoes of the asking gateway;
-//! - `policy_store/view_build_foreign64/8`: the build in the pool of eight
-//!   beside sixty-four vetoes of other gateways, none the asking one's;
-//! - `policy_store/view_build_gateways8/8`, `view_build_gateways64/8` and
-//!   `view_build_gateways512/8`: the build in the pool of eight with one
-//!   member vetoed by the asking gateway and by eight, by sixty-four and
-//!   by 512 others, one veto each: the first two reach the asking
-//!   gateway's vetoes by a walk, the third by a search;
+//!   written from facts in hand, in this binary: a cell that asks the store
+//!   nothing, so one job reads it beside the store's writes;
 //! - `policy_store/veto_write/512` and `policy_store/member_write/512`: one
 //!   veto's write and one membership write beside 512 standing vetoes of
 //!   eight other gateways;
@@ -34,19 +17,12 @@
 //!   generation that declares the view's three lists: the worker written
 //!   is read under them and the 512 members' fields are carried.
 //!
-//! `policy_store_vetoes/*` are the veto cells outside the gate: `k3/<n>`
-//! with three vetoes of the asking gateway, `foreign8/<n>` with eight other
-//! gateways' vetoes on one member and `foreign64/<n>` with eight gateways'
-//! on each of eight members, none of them the asking one's: what a build
-//! pays to pass over a veto that is not its own.
-//!
 //! `policy_store_held/publish/<n>` is the publication beside a reader that
 //! holds the world listing the rows it would write over: the publication
 //! leaves those rows whole and writes over rows the reader let go. Outside
 //! the gate.
 //!
-//! The pair door's cells are a bench target of their own (`store_pair`):
-//! this binary is built on the base branch with the pull request's bench
+//! This binary is built on the base branch with the pull request's bench
 //! sources, so a row here calls nothing the base's store lacks.
 //!
 //! `policy_store_pairs/kept/<n>` and `policy_store_pairs/moved/<n>` are
@@ -61,21 +37,10 @@
 //! written again as it stands, in a store of eight workers of one model and
 //! one worker of `ids` models of its own. The gate reads it at 1,024.
 //!
-//! `policy_store_cadence/*` reads the build beside a writer on another
-//! core, for a run pinned to two cores (both threads spin, so each keeps
-//! its core): `quiet/<n>` with the writer idle, `busy/<n>` with it writing
-//! ten records per member per second through the store's own window, and
-//! `after_publish/<n>`, the first build after a publication made on the
-//! writer's core. Outside the `policy_store/` ids, so a filter on those
-//! starts no thread. These cells run on a store of their own: the cells
-//! before them move the shared store's window ahead of the host's clock,
-//! which the busy writer stamps its records with. The busy cell is held to
-//! what it claims: a build reads a record the writer wrote while busy.
-//!
-//! Every member is ready with a record on file. A timed view is written
-//! into buffers on a page's start (`placed`), one placement per size for
-//! the whole binary: the helper walks its earlier rejects first, and a size
-//! placed a fifth time stops at its bound.
+//! Every member is ready with a record on file. The floor's rows are
+//! written into a buffer on a page's start (`placed`), one placement per
+//! size for the whole binary: the helper walks its earlier rejects first,
+//! and a size placed a fifth time stops at its bound.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer"
@@ -94,22 +59,19 @@ mod placed;
 use std::{
     cell::Cell,
     hint::black_box,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
-    },
-    thread,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use placed::page_start_buffer;
 use smg_policy_controller::{
+    document::{AppliedSpec, PolicySpec},
+    engine::{Candidate, LoadRow, Role, SignalSource, WorkerId},
     store::{
-        Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts,
-        WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus,
+        WorkersStore, PUBLISH_WINDOW,
     },
-    AppliedSpec, LoadRow, PolicySpec, Role, SignalSource, WorkerId,
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -132,8 +94,8 @@ fn record_of(index: usize, turn: u64) -> LoadRow {
     }
 }
 
-/// One pool of `n` members in a store, and the buffers its views are timed
-/// in.
+/// One pool of `n` members in a store, and the buffer the floor's rows are
+/// timed in.
 struct Fixture {
     n: usize,
     store: Arc<MemoryStore>,
@@ -141,7 +103,7 @@ struct Fixture {
     /// The instant the store's last window opened; a cell that publishes
     /// moves it.
     window: Cell<Instant>,
-    out: ViewBuffers,
+    rows: Vec<Candidate>,
 }
 
 /// A store with one pool of `n` members, every one registered, ready, with
@@ -180,46 +142,23 @@ fn pool_of(n: usize) -> (Arc<MemoryStore>, Vec<WorkerId>, Instant) {
     (store, ids, opened)
 }
 
-/// The decision every build is timed for: a second after the window that
-/// opened at `opened`.
-fn ask_at(opened: Instant, affinity: bool) -> Ask {
-    Ask {
-        gateway: GatewayId(1),
-        now: opened + Duration::from_secs(1),
-        pinned: None,
-        affinity,
-    }
-}
-
 impl Fixture {
-    fn new(n: usize, out: ViewBuffers) -> Self {
+    fn new(n: usize, rows: Vec<Candidate>) -> Self {
         let (store, ids, opened) = pool_of(n);
         Self {
             n,
             store,
             ids,
             window: Cell::new(opened),
-            out,
+            rows,
         }
     }
-
-    fn ask(&self, affinity: bool) -> Ask {
-        ask_at(self.window.get(), affinity)
-    }
-}
-
-/// One build into the fixture's buffers; the rows it wrote.
-fn build(store: &MemoryStore, ask: &Ask, out: &mut ViewBuffers) -> usize {
-    let built = store.build_view(MODEL, Role::Single, black_box(ask), out);
-    black_box(&out.candidates);
-    black_box(&out.affinity);
-    built.map_or(0, |built| built.pool_size as usize)
 }
 
 /// The gated build's floor in this binary: the rows written from facts in
 /// hand (`policy_engine/view_build`'s own build over the same synthetic
 /// fleet) into the fixture's buffer, so one run on one machine reads the
-/// floor and the build from the store.
+/// floor beside the store's writes.
 fn floor(c: &mut Criterion, fixtures: &mut [Fixture]) {
     let mut group = c.benchmark_group("policy_store/floor");
     for fixture in fixtures.iter_mut() {
@@ -228,130 +167,13 @@ fn floor(c: &mut Criterion, fixtures: &mut [Fixture]) {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
-                common::build_view(black_box(&fleet), &mut fixture.out.candidates);
-                black_box(&fixture.out.candidates);
-                fixture.out.candidates.len()
+                common::build_view(black_box(&fleet), &mut fixture.rows);
+                black_box(&fixture.rows);
+                fixture.rows.len()
             });
         });
     }
     group.finish();
-}
-
-/// The build under standing vetoes, each ending after the decision, on
-/// members spread over the pool; every cell is held to its count of masked
-/// rows and the vetoes are cleared after the last. Of the asking gateway:
-/// `policy_store/view_build_veto1/<n>` and `policy_store/view_build_veto8/<n>`
-/// with one and eight, and `policy_store_vetoes/k3/<n>` with three. Of other
-/// gateways alone, which mask nothing for the asking one:
-/// `policy_store_vetoes/foreign8/<n>` (eight gateways on one member) and
-/// `policy_store_vetoes/foreign64/<n>` (eight gateways on eight members),
-/// which the pool of eight reads again as the gated
-/// `policy_store/view_build_foreign64/8`. Of the asking gateway and of
-/// others on one member, one veto each, which is every gateway vetoing one
-/// sick worker: `policy_store/view_build_gateways8/8`,
-/// `policy_store/view_build_gateways64/8` and
-/// `policy_store/view_build_gateways512/8`, beside eight, sixty-four and
-/// 512 others.
-fn vetoed(c: &mut Criterion, fixtures: &mut [Fixture]) {
-    for fixture in fixtures.iter_mut() {
-        let n = fixture.n;
-        let ask = fixture.ask(false);
-        let until = ask.now + Duration::from_secs(60);
-        let member = |nth: usize| fixture.ids[nth * n / 8];
-        let mut cell = |c: &mut Criterion, group: &str, id: &str, ask: &Ask, masked: usize| {
-            assert_eq!(build(&fixture.store, ask, &mut fixture.out), n);
-            let stalled = fixture
-                .out
-                .candidates
-                .iter()
-                .filter(|row| row.health.stalled)
-                .count();
-            assert_eq!(stalled, masked, "{group}/{id}/{n}");
-            let mut group = c.benchmark_group(group);
-            group.throughput(Throughput::Elements(n as u64));
-            group.bench_with_input(BenchmarkId::new(id, n), &n, |b, _| {
-                b.iter(|| build(&fixture.store, ask, &mut fixture.out));
-            });
-            group.finish();
-        };
-        let mut standing = 0;
-        for (count, group, id) in [
-            (1_usize, "policy_store", "view_build_veto1"),
-            (3, "policy_store_vetoes", "k3"),
-            (8, "policy_store", "view_build_veto8"),
-        ] {
-            while standing < count {
-                fixture
-                    .store
-                    .gateway_veto(ask.gateway, member(standing), Some(until));
-                standing += 1;
-            }
-            cell(c, group, id, &ask, count);
-        }
-        for nth in 0..standing {
-            fixture.store.gateway_veto(ask.gateway, member(nth), None);
-        }
-        // Other gateways' vetoes: on one member, then on eight.
-        let others = (2..10).map(GatewayId);
-        for (members, id) in [(1_usize, "foreign8"), (8, "foreign64")] {
-            for gateway in others.clone() {
-                for nth in 0..members {
-                    fixture
-                        .store
-                        .gateway_veto(gateway, member(nth), Some(until));
-                }
-            }
-            cell(c, "policy_store_vetoes", id, &ask, 0);
-        }
-        // The gate reads the sixty-four in the pool of eight: where a build
-        // that walked another gateway's entries paid most.
-        if n == 8 {
-            cell(c, "policy_store", "view_build_foreign64", &ask, 0);
-        }
-        for gateway in others {
-            for nth in 0..8 {
-                fixture.store.gateway_veto(gateway, member(nth), None);
-            }
-        }
-        // One member vetoed by the asking gateway and by other gateways,
-        // one veto each. The others hold the even ids and the asking
-        // gateway an odd one in their middle: its run is the farthest from
-        // both ends of the pool's runs, the longest way a build has to its
-        // own. Read in the pool of eight, where that way is most of what a
-        // veto adds to a build. Beside 8 and 64 others the way is a walk;
-        // beside 512 the runs are more than a build walks, and the row
-        // holds the search.
-        if n == 8 {
-            let sick = member(0);
-            let mut holders = 0_u64;
-            for (count, id) in [
-                (8_u64, "view_build_gateways8"),
-                (64, "view_build_gateways64"),
-                (512, "view_build_gateways512"),
-            ] {
-                while holders < count {
-                    holders += 1;
-                    fixture
-                        .store
-                        .gateway_veto(GatewayId(2 * holders), sick, Some(until));
-                }
-                let middle = Ask {
-                    gateway: GatewayId(count + 1),
-                    ..ask
-                };
-                fixture
-                    .store
-                    .gateway_veto(middle.gateway, sick, Some(until));
-                cell(c, "policy_store", id, &middle, 1);
-                fixture.store.gateway_veto(middle.gateway, sick, None);
-            }
-            for gateway in (1..=holders).map(|holder| GatewayId(2 * holder)) {
-                fixture.store.gateway_veto(gateway, sick, None);
-            }
-        }
-        assert_eq!(build(&fixture.store, &ask, &mut fixture.out), n);
-        assert!(fixture.out.candidates.iter().all(|row| !row.health.stalled));
-    }
 }
 
 /// One membership write in turn, and the build it leaves owed: the worker
@@ -385,8 +207,10 @@ fn writes_beside_vetoes(c: &mut Criterion, fixtures: &mut [Fixture]) {
         return;
     };
     let (n, store) = (fixture.n, &fixture.store);
-    let ask = fixture.ask(false);
-    let until = ask.now + Duration::from_secs(60);
+    // The gateway whose veto is written, and a veto's end: a minute behind
+    // the second that follows the store's last window.
+    let asking = GatewayId(1);
+    let until = fixture.window.get() + Duration::from_secs(61);
     let others = (2..10).map(GatewayId);
     let vetoed = |nth: usize| fixture.ids[nth * n / 64];
     for gateway in others.clone() {
@@ -402,10 +226,10 @@ fn writes_beside_vetoes(c: &mut Criterion, fixtures: &mut [Fixture]) {
     group.bench_with_input(BenchmarkId::new("veto_write", n), &n, |b, _| {
         b.iter(|| {
             set = !set;
-            store.gateway_veto(ask.gateway, black_box(target), set.then_some(until));
+            store.gateway_veto(asking, black_box(target), set.then_some(until));
         });
     });
-    store.gateway_veto(ask.gateway, target, None);
+    store.gateway_veto(asking, target, None);
     let joining = WorkerFacts {
         key: "http://joining:8000".to_string(),
         engine: "http://joining:8000".to_string(),
@@ -431,8 +255,7 @@ fn writes_beside_vetoes(c: &mut Criterion, fixtures: &mut [Fixture]) {
             store.gateway_veto(gateway, vetoed(nth), None);
         }
     }
-    assert_eq!(build(store, &ask, &mut fixture.out), n);
-    assert!(fixture.out.candidates.iter().all(|row| !row.health.stalled));
+    filled::filled(store, MODEL, Role::Single, n);
 }
 
 /// A membership write beside vetoes spread over pools, in a store of its
@@ -556,32 +379,6 @@ fn member_write_under_lists(c: &mut Criterion) {
     group.finish();
 }
 
-fn view_build(c: &mut Criterion, fixtures: &mut [Fixture]) {
-    for (name, affinity) in [
-        ("policy_store/view_build", false),
-        ("policy_store/view_build_column", true),
-    ] {
-        let mut group = c.benchmark_group(name);
-        for fixture in fixtures.iter_mut() {
-            let n = fixture.n;
-            let ask = fixture.ask(affinity);
-            // Every form is held to what it must build before it is timed.
-            assert_eq!(build(&fixture.store, &ask, &mut fixture.out), n);
-            assert_eq!(fixture.out.affinity.len(), if affinity { n } else { 0 });
-            assert!(fixture
-                .out
-                .candidates
-                .iter()
-                .all(|row| row.health.healthy && row.load.is_some()));
-            group.throughput(Throughput::Elements(n as u64));
-            group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-                b.iter(|| build(&fixture.store, &ask, &mut fixture.out));
-            });
-        }
-        group.finish();
-    }
-}
-
 fn load_write(c: &mut Criterion, fixtures: &mut [Fixture]) {
     let mut group = c.benchmark_group("policy_store/load_write");
     for fixture in fixtures.iter_mut() {
@@ -643,7 +440,7 @@ fn publish(c: &mut Criterion, fixtures: &mut [Fixture]) {
                         if reader {
                             // The last publication's world takes the place
                             // of the one three publications back.
-                            kept[(turn % 2) as usize] = Some(fixture.store.world());
+                            kept[(turn % 2) as usize] = Some(fixture.store.snapshot());
                         }
                         let due = opened + PUBLISH_WINDOW;
                         fixture.window.set(due);
@@ -659,173 +456,6 @@ fn publish(c: &mut Criterion, fixtures: &mut [Fixture]) {
         }
         group.finish();
     }
-}
-
-/// What the bench thread asks of the writer's thread.
-#[derive(Default)]
-struct Remote {
-    /// Write at the busy fleet's rate, through the store's own window.
-    busy: AtomicBool,
-    /// Publications asked for, one record each, and made.
-    asked: AtomicU64,
-    made: AtomicU64,
-    stop: AtomicBool,
-}
-
-impl Remote {
-    /// One more publication, made on the writer's core before this returns.
-    fn publish_one(&self) {
-        let target = self.asked.fetch_add(1, Ordering::Release) + 1;
-        while self.made.load(Ordering::Acquire) < target {
-            std::hint::spin_loop();
-        }
-    }
-}
-
-/// The writer's thread: it spins on its core and writes what it is asked.
-/// Busy, it writes ten records per member per second at the host's clock,
-/// and the store publishes by its window. Asked for a publication, it
-/// writes one record a window after the last, which publishes by itself.
-fn spawn_writer(
-    remote: Arc<Remote>,
-    store: Arc<MemoryStore>,
-    ids: Vec<WorkerId>,
-    opened: Instant,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let n = ids.len();
-        let period = Duration::from_secs(1) / (10 * n as u32);
-        let mut turn = 0u64;
-        let mut made = 0u64;
-        // The asked publications run on a clock of their own, ahead of any
-        // instant the host's clock reaches during the run.
-        let mut window = opened + Duration::from_secs(86_400);
-        let mut next = Instant::now();
-        while !remote.stop.load(Ordering::Relaxed) {
-            if made < remote.asked.load(Ordering::Acquire) {
-                turn += 1;
-                let index = (turn as usize).wrapping_mul(67) % n;
-                window += PUBLISH_WINDOW;
-                store.record(
-                    ids[index],
-                    0,
-                    record_of(index, turn),
-                    window,
-                    LoadSource::Stream,
-                );
-                made += 1;
-                remote.made.store(made, Ordering::Release);
-            } else if remote.busy.load(Ordering::Relaxed) {
-                let now = Instant::now();
-                if now >= next {
-                    turn += 1;
-                    let index = (turn as usize).wrapping_mul(67) % n;
-                    store.record(
-                        ids[index],
-                        0,
-                        record_of(index, turn),
-                        now,
-                        LoadSource::Stream,
-                    );
-                    next = now.max(next + period);
-                }
-            } else {
-                next = Instant::now();
-                std::hint::spin_loop();
-            }
-        }
-    })
-}
-
-/// Hold the busy cell to what it claims: with the writer busy, a build
-/// reads a load that `before` does not hold, which only a publication of
-/// one of the writer's records shows. The store publishes within a window
-/// of a write: two seconds without one is a broken cell.
-fn await_publication(
-    store: &MemoryStore,
-    ask: &Ask,
-    out: &mut ViewBuffers,
-    before: &[Option<LoadRow>],
-) {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        build(store, ask, out);
-        if out
-            .candidates
-            .iter()
-            .map(|row| row.load)
-            .ne(before.iter().copied())
-        {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the busy writer's records reached no build within two seconds"
-        );
-        std::hint::spin_loop();
-    }
-}
-
-fn cadence(c: &mut Criterion, fixtures: &mut [Fixture]) {
-    let mut group = c.benchmark_group("policy_store_cadence");
-    for fixture in fixtures.iter_mut() {
-        let n = fixture.n;
-        // A store of its own, read into the shared buffers: the cells
-        // before these moved the shared store's window ahead of the host's
-        // clock, and a record the busy writer stamps with that clock would
-        // wait there for a window that does not end.
-        let (store, ids, opened) = pool_of(n);
-        let ask = ask_at(opened, false);
-        let remote = Arc::new(Remote::default());
-        // The thread starts with the first cell that runs: a filter that
-        // selects none of them starts none.
-        let writer = Cell::new(None);
-        let start = || {
-            if let Some(started) = writer.take() {
-                writer.set(Some(started));
-            } else {
-                writer.set(Some(spawn_writer(
-                    Arc::clone(&remote),
-                    Arc::clone(&store),
-                    ids.clone(),
-                    opened,
-                )));
-            }
-        };
-        let out = &mut fixture.out;
-        group.throughput(Throughput::Elements(n as u64));
-        for state in ["quiet", "busy"] {
-            let ran = Cell::new(false);
-            group.bench_with_input(BenchmarkId::new(state, n), &n, |b, _| {
-                start();
-                ran.set(true);
-                remote.busy.store(state == "busy", Ordering::Relaxed);
-                b.iter(|| build(&store, &ask, out));
-                remote.busy.store(false, Ordering::Relaxed);
-            });
-            if state == "busy" && ran.get() {
-                build(&store, &ask, out);
-                let before: Vec<Option<LoadRow>> =
-                    out.candidates.iter().map(|row| row.load).collect();
-                remote.busy.store(true, Ordering::Relaxed);
-                await_publication(&store, &ask, out, &before);
-                remote.busy.store(false, Ordering::Relaxed);
-            }
-        }
-        group.bench_with_input(BenchmarkId::new("after_publish", n), &n, |b, _| {
-            start();
-            b.iter_batched(
-                || remote.publish_one(),
-                |()| build(&store, &ask, out),
-                BatchSize::PerIteration,
-            );
-        });
-        remote.stop.store(true, Ordering::Relaxed);
-        if let Some(writer) = writer.take() {
-            writer.join().expect("the writer's thread ends when asked");
-        }
-    }
-    group.finish();
 }
 
 /// One membership write of a fleet of pairs: `n` prefills and `n` decodes
@@ -966,30 +596,19 @@ fn member_write_beside_many_models(c: &mut Criterion) {
 }
 
 fn store_view(c: &mut Criterion) {
-    // Every size's buffers are placed before the first store is built. A
+    // Every size's buffer is placed before the first store is built. A
     // count's runner bounds the program break, and the stores cross that
     // bound: a buffer asked for after them is mapped on its own and never
     // starts a page.
-    let placed: Vec<ViewBuffers> = SIZES
-        .iter()
-        .map(|&n| ViewBuffers {
-            candidates: page_start_buffer(n),
-            affinity: page_start_buffer(n),
-            stalled: Vec::new(),
-            ..ViewBuffers::default()
-        })
-        .collect();
+    let placed: Vec<Vec<Candidate>> = SIZES.iter().map(|&n| page_start_buffer(n)).collect();
     let mut fixtures: Vec<Fixture> = SIZES
         .iter()
         .zip(placed)
-        .map(|(&n, out)| Fixture::new(n, out))
+        .map(|(&n, rows)| Fixture::new(n, rows))
         .collect();
     floor(c, &mut fixtures);
-    view_build(c, &mut fixtures);
     load_write(c, &mut fixtures);
     publish(c, &mut fixtures);
-    cadence(c, &mut fixtures);
-    vetoed(c, &mut fixtures);
     writes_beside_vetoes(c, &mut fixtures);
     member_write_beside_spread_vetoes(c);
     member_write_under_lists(c);

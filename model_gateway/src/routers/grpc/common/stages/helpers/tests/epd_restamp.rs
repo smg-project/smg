@@ -25,7 +25,7 @@ fn tokenspeed_pd_pair(prefill_url: &str, decode_url: &str) -> WorkerSelection {
     WorkerSelection::Disaggregated {
         encode_assignments: None,
         prefill,
-        decode,
+        decode: decode.into(),
         runtime_type: RuntimeType::TokenSpeed,
     }
 }

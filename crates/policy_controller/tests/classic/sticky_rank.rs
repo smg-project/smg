@@ -2,22 +2,32 @@
 //! and the rank the gateway pins each request to by its sticky key. A row
 //! of steps holds the rank each request carried, `null` where the gateway
 //! set none; a counted row holds how many keys kept one rank, or what each
-//! rank took. The replay decides each request over the rows the store
-//! lends, with the worker's engine listed beside them, under the
+//! rank took. The replay lists the worker's ranks as worker objects, one a
+//! rank it registered, and decides each request over that list through the
+//! engine over worker lists ([`PolicyEngine`]) under the
 //! `consistent_hashing` preset, keyed by the request's routing key: the
-//! ring walks from the key and reads the rows it meets.
+//! ring walks from the key and reads the ranks it meets.
 //!
 //! Two hashes place no key alike. A row of steps replays when a request
 //! with no rank there has none here and the requests of one key share one
 //! rank here, as they did there; a pairs row replays count for count and a
 //! spread row share for share. [`APART`] names the rows this crate decides apart.
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use serde::Deserialize;
 use smg_policy_controller::{
-    store::{Ask, GatewayId, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore},
-    AppliedSpec, Constraints, Engine, Identity, PolicySpec, RequestFacts, Role, Scratch,
+    document::{AppliedSpec, PolicySpec},
+    engine::{
+        Constraints, Decision, DecisionEngine, Identity, LentList, ListCell, PolicyEngine, Request,
+        RequestFacts, RequestMaker, WorkerLists,
+    },
+    store::GatewayId,
+};
+use smg_worker::{
+    identity::{basic::Worker, builder::BasicWorkerBuilder},
+    model_card::ModelCard,
+    worker::{HealthCheckConfig, WorkerStatus},
 };
 
 use crate::{same_shares, shares};
@@ -91,14 +101,34 @@ struct Sheet {
     rows: Vec<Row>,
 }
 
-/// The store with the rank rows of the row's worker in it and the engine
-/// that decides over them.
+/// The rank objects of the row's worker in one list, the cell kept beside
+/// the list and the engine that decides over them.
 struct Bed {
-    store: MemoryStore,
-    engine: Engine,
-    out: ViewBuffers,
-    scratch: Scratch,
+    engine: PolicyEngine,
+    list: Arc<[Arc<dyn Worker>]>,
+    cell: ListCell,
+    now: Instant,
     seed: u64,
+}
+
+/// One request of a bed, over the bed's list as it is lent.
+struct Asked<'a> {
+    request: Request<'a>,
+    lent: LentList<'a>,
+}
+
+impl RequestMaker for Asked<'_> {
+    fn model(&self) -> &str {
+        self.request.facts.model
+    }
+
+    fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
+        self.request
+    }
+
+    fn workers(&self) -> WorkerLists<'_> {
+        WorkerLists::Single(self.lent)
+    }
 }
 
 impl Bed {
@@ -108,78 +138,64 @@ impl Bed {
         let mut document =
             PolicySpec::preset("consistent_hashing").map_err(|err| err.to_string())?;
         document.generation = 1;
-        let engine = document.validate().map_err(|err| err.to_string())?;
         let applied = AppliedSpec::validate(&document).map_err(|err| err.to_string())?;
-        let store = MemoryStore::new();
-        for rank in 0..ranks {
-            let key = if ranks == 1 {
-                ENGINE.to_string()
-            } else {
-                format!("{ENGINE}@{rank}")
-            };
-            let id = store
-                .upsert(WorkerFacts {
-                    key,
-                    engine: ENGINE.to_string(),
-                    incarnation: 1,
-                    models: vec![MODEL.to_string()],
-                    dp_rank: rank,
-                    dp_size: ranks,
-                    ..WorkerFacts::default()
-                })
-                .id();
-            let revision = WorkersStore::get(&store, id).expect("the row").revision;
-            store
-                .set_status(id, WorkerStatus::Ready, revision)
-                .expect("ready");
-        }
-        // The bed's host runs no loop: it asks the build its registrations
-        // owe, so the rows stand before the first request.
-        store.publish_now();
-        store.apply(applied).expect("the first generation applies");
+        // A worker object a rank, the ranks of one engine; a worker of one
+        // rank is one object that registered none.
+        let object = |rank: u16| {
+            let mut built = <BasicWorkerBuilder>::new(ENGINE)
+                .model(ModelCard::new(MODEL))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..HealthCheckConfig::default()
+                });
+            if ranks > 1 {
+                built = built.dp_config(usize::from(rank), usize::from(ranks));
+            }
+            let object = built.build();
+            object.set_status(WorkerStatus::Ready);
+            Arc::new(object) as Arc<dyn Worker>
+        };
         Ok(Self {
-            store,
-            engine,
-            out: ViewBuffers::default(),
-            scratch: Scratch::new(),
+            engine: PolicyEngine::new(applied),
+            list: (0..ranks).map(object).collect(),
+            cell: ListCell::default(),
+            now: Instant::now(),
             seed: 0,
         })
     }
 
-    /// One request decided over the rank rows of the worker: the rank of
-    /// its target, or `None` where the decision names no row.
-    fn pick(&mut self, key: Option<&str>) -> Option<u16> {
+    /// One request decided over the rank objects of the worker: the rank of
+    /// its target, or the engine's reason where it picks no worker.
+    fn pick(&mut self, key: Option<&str>) -> Result<u16, String> {
         self.seed += 1;
-        let now = Instant::now();
-        let ask = Ask {
-            gateway: GatewayId(1),
-            now,
-            pinned: None,
-            affinity: false,
+        let asked = Asked {
+            request: Request {
+                id: b"request",
+                facts: RequestFacts {
+                    model: MODEL,
+                    session_key: key.map_or(Identity::NONE, Identity::plain),
+                    seed: self.seed,
+                    ..RequestFacts::default()
+                },
+                constraints: Constraints::default(),
+            },
+            lent: LentList {
+                workers: &self.list,
+                cell: &self.cell,
+                facts: None,
+            },
         };
-        let now_micros = self.store.micros(now);
-        let (engine, out, scratch, seed) =
-            (&self.engine, &mut self.out, &mut self.scratch, self.seed);
-        // The rows as the store lends them, with the pool's engines beside
-        // them: the door a host decides through.
-        self.store.with_world(|world| {
-            let view = world.view(MODEL, Role::Single, &ask, false, out)?;
-            let facts = RequestFacts {
-                model: MODEL,
-                session_key: key.map_or(Identity::NONE, Identity::plain),
-                seed,
-                now_micros,
-                pinned_at: view.pinned_at,
-                ..RequestFacts::default()
-            };
-            let cx = Constraints {
-                stalled: view.stalled,
-                ..Constraints::default()
-            };
-            let pool = view.pool_facts();
-            let decision = engine.decide(&facts, &pool, view.candidates, &cx, scratch);
-            Some(decision.pick()?.targets.first()?.dp_rank)
-        })
+        let decided = self.engine.decide_under(GatewayId::LOCAL, &asked, self.now);
+        let decided = decided.map_err(|refused| format!("no decision: {refused:?}"))?;
+        let (decided, _) = decided.whole().ok_or("a place alone")?;
+        match decided.decision {
+            Decision::Pick(pick) => {
+                let target = pick.targets.first().ok_or("a pick that names no worker")?;
+                Ok(target.dp_rank)
+            }
+            Decision::Shed(shed) => Err(format!("shed under {}", shed.emptied_by)),
+            Decision::Queue(_) => Err("a queue ticket".to_string()),
+        }
     }
 }
 
@@ -223,23 +239,25 @@ const APART: &[Apart] = &[
 fn replay(row: &Row) -> Result<Outcome, String> {
     let mut bed = Bed::new(row.listed())?;
     let Some(keys) = row.keys else {
-        return Ok(Outcome::Sequence(
-            row.steps
-                .iter()
-                .map(|Step::Pick { key }| bed.pick(key.as_deref()))
-                .collect(),
-        ));
+        let picks: Result<Vec<_>, String> = row
+            .steps
+            .iter()
+            .map(|Step::Pick { key }| bed.pick(key.as_deref()).map(Some))
+            .collect();
+        return picks.map(Outcome::Sequence);
     };
     let mut rank = |i: u32| bed.pick(Some(&format!("key-{i}")));
     let counts = if keys.pairs {
-        let together = (0..keys.count)
-            .filter(|&i| rank(i).is_some_and(|first| rank(i) == Some(first)))
-            .count() as u32;
+        let mut together = 0;
+        for i in 0..keys.count {
+            let first = rank(i)?;
+            together += u32::from(rank(i)? == first);
+        }
         vec![together, keys.count - together]
     } else {
         let mut counts = vec![0u32; usize::from(row.listed())];
         for i in 0..keys.count {
-            let rank = rank(i).ok_or("a key took no rank")?;
+            let rank = rank(i)?;
             counts[usize::from(rank)] += 1;
         }
         counts.sort_unstable_by(|a, b| b.cmp(a));

@@ -866,6 +866,15 @@ def test_every_example_renders_arguments_the_launcher_parses(example, tmp_path):
     launcher_args(with_readable_files(router_container(documents)["args"], tmp_path))
 
 
+def launcher_policies() -> list[str]:
+    """The launcher's ``--policy`` choices, read from its own parser."""
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    RouterArgs.add_cli_args(parser)
+    choices = parser._option_string_actions["--policy"].choices
+    assert choices is not None, "the launcher's --policy option holds no choices"
+    return list(choices)
+
+
 @needs_chart
 def test_the_schema_admits_the_policies_the_launcher_takes():
     """``router.policy`` is rendered as the launcher's ``--policy``, so the
@@ -874,13 +883,13 @@ def test_the_schema_admits_the_policies_the_launcher_takes():
     render a pod whose launcher exits at argparse)."""
     schema = json.loads(SCHEMA.read_text())
     policy = schema["properties"]["router"]["properties"]["policy"]
-    assert policy["enum"] == router_args.COMMON_POLICY_CHOICES, (
+    assert policy["enum"] == launcher_policies(), (
         "values.schema.json's router.policy enum differs from the launcher's --policy choices"
     )
 
 
 @needs_helm
-@pytest.mark.parametrize("policy", router_args.COMMON_POLICY_CHOICES)
+@pytest.mark.parametrize("policy", launcher_policies())
 def test_every_launcher_policy_renders_and_reaches_the_launcher(policy):
     _, documents = render(f"router.policy={policy}")
     args = router_container(documents)["args"]
@@ -889,10 +898,50 @@ def test_every_launcher_policy_renders_and_reaches_the_launcher(policy):
 
 
 @needs_helm
-def test_a_prefill_only_policy_is_refused_by_the_schema():
-    """``bucket`` is a ``--prefill-policy`` choice, not a ``--policy`` one; the
-    schema refuses it where the launcher would, at render time."""
-    assert "router.policy must be one of the following" in render_error("router.policy=bucket")
+def test_a_policy_the_launcher_does_not_take_is_refused_by_the_schema():
+    """The schema refuses a name at render time, where the launcher would."""
+    assert "router.policy must be one of the following" in render_error("router.policy=fastest")
+
+
+@needs_helm
+def test_the_default_values_render_the_arguments_in_order():
+    """Keep the default arguments in order so an upgrade does not roll the pods."""
+    _, documents = render()
+    expected = """
+        --host 0.0.0.0
+        --port 30000
+        --policy cache_aware
+        --cache-threshold 0.3
+        --balance-abs-threshold 64
+        --balance-rel-threshold 1.5
+        --eviction-interval-secs 120
+        --max-tree-size 67108864
+        --block-size 16
+        --max-payload-size 536870912
+        --request-timeout-secs 1800
+        --mm-turbojpeg require
+        --shutdown-grace-period-secs 180
+        --max-concurrent-requests -1
+        --queue-size 100
+        --queue-timeout-secs 60
+        --retry-max-retries 5
+        --retry-initial-backoff-ms 50
+        --retry-max-backoff-ms 30000
+        --retry-backoff-multiplier 1.5
+        --retry-jitter-factor 0.2
+        --cb-failure-threshold 10
+        --cb-success-threshold 3
+        --cb-timeout-duration-secs 60
+        --cb-window-duration-secs 120
+        --health-failure-threshold 3
+        --health-success-threshold 2
+        --health-check-timeout-secs 5
+        --health-check-interval-secs 60
+        --health-check-endpoint /health
+        --prometheus-port 29000
+        --log-level info
+    """.split()
+    assert router_container(documents)["args"] == expected
 
 
 # Tags of digits alone, two workers whose tags are filled in as written, and

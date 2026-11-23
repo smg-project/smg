@@ -4,8 +4,8 @@ use axum::response::Response;
 use http::StatusCode;
 use llm_multimodal::MediaErrorCode;
 use smg_grpc_client::{
-    dial_failure_without_peer, is_constraint_failure, is_constraint_refusal, is_request_timeout,
-    is_transport_failure, WorkerMediaFault,
+    dial_failure_without_peer, is_constraint_failure, is_constraint_refusal, is_keep_alive_timeout,
+    is_request_timeout, is_transport_failure, WorkerMediaFault,
 };
 use tonic::Code;
 
@@ -28,6 +28,17 @@ pub(crate) const CONSTRAINT_FAILED_CODE: &str = "constraint_failed";
 /// constraint as one its engine cannot enforce (see
 /// [`TonicStatusExt::constraint_refusal_response`]).
 pub(crate) const UNSUPPORTED_CONSTRAINT_CODE: &str = "unsupported_constraint";
+
+/// The client's words for a media fetch that failed for the reference's own
+/// reason (see [`TonicStatusExt::media_message`]). They name no single
+/// cause: the fault holds every way a reference fails on its own account.
+const MEDIA_FETCH_FAILED_CLIENT: &str =
+    "The media could not be fetched from the reference the request gives: check the reference and what it leads to";
+
+/// The client's words for a media fetch whose host has trouble that may pass
+/// (see [`TonicStatusExt::media_message`]).
+const MEDIA_FETCH_FAILED_TRANSIENT: &str =
+    "The media could not be fetched from its URL for now: its host did not answer in time or failed; a retry may succeed";
 
 /// Extension methods for `tonic::Status`.
 pub(crate) trait TonicStatusExt {
@@ -54,6 +65,11 @@ pub(crate) trait TonicStatusExt {
     /// counts it reads the cause the status named (see
     /// `error_reason_for_response`).
     fn to_http_error(&self, code: &str, msg: String) -> Response;
+
+    /// Whether this status is no answer of the worker's: its connection
+    /// failed under the call, its side ended the call, the dial failed, or
+    /// it answered no keep-alive ping.
+    fn is_no_answer(&self) -> bool;
 
     /// This status's message as an answer to a client carries it: the
     /// message itself, except for a dial that failed. That status names the
@@ -92,6 +108,20 @@ pub(crate) trait TonicStatusExt {
     /// does not know.
     fn media_code(&self) -> MediaErrorCode;
 
+    /// The client's words for a failure of the request's media (see
+    /// [`TonicStatusExt::media_fault`]). A fetch that failed gets the
+    /// gateway's sentence for whose fault it is; the worker's words for it
+    /// stay on the gateway's log line. The sentence stands only where the
+    /// status names a fetch: its `smg-media-code` trailer reads
+    /// `media_fetch_failed`, or it carries no code trailer and its message
+    /// is in the media connector's fetch words ([`names_a_fetch_failure`]).
+    /// Every other media failure keeps the worker's own words, which
+    /// describe the request's payload: media refused as the request sent
+    /// it, a size refusal, a status that names the fault alone in other
+    /// words (a worker that predates the code trailer), and a code this
+    /// router does not know.
+    fn media_message(&self, fault: WorkerMediaFault) -> String;
+
     /// The HTTP status the circuit breaker samples for this failure; `None`
     /// for a failure of the request's media, which says nothing about the
     /// worker that fetched it, and for a constraint the engine could not
@@ -126,7 +156,9 @@ pub(crate) trait TonicStatusExt {
 /// Whether a status message is the media connector's account of a fetch that
 /// failed: a connection that could not be made or broke, or a fetch that ran
 /// out of its budget. A worker that predates the `smg-media-fault` trailer
-/// reports these on `UNAVAILABLE`, in the connector's words.
+/// reports these on `UNAVAILABLE`, in the connector's words. A worker that
+/// predates the `smg-media-code` trailer names the fault alone, and these
+/// words tell its fetch failures from its other refusals of the media.
 fn names_a_fetch_failure(message: &str) -> bool {
     message.contains("HTTP error while fetching media")
         || (message.contains("media fetch") && message.contains("timed out after"))
@@ -229,6 +261,13 @@ impl TonicStatusExt for tonic::Status {
         response
     }
 
+    fn is_no_answer(&self) -> bool {
+        is_transport_failure(self)
+            || self.code() == Code::Cancelled
+            || dial_failure_without_peer(self).is_some()
+            || is_keep_alive_timeout(self)
+    }
+
     fn client_message(&self) -> &str {
         dial_failure_without_peer(self).unwrap_or_else(|| self.message())
     }
@@ -277,6 +316,23 @@ impl TonicStatusExt for tonic::Status {
                     MediaErrorCode::FetchFailed
                 }
             })
+    }
+
+    fn media_message(&self, fault: WorkerMediaFault) -> String {
+        let names_a_fetch = match smg_grpc_client::media_code(self) {
+            Some(code) => MediaErrorCode::parse(code) == Some(MediaErrorCode::FetchFailed),
+            // No code trailer: only the connector's own fetch words say that
+            // the failure was a fetch.
+            None => names_a_fetch_failure(self.message()),
+        };
+        if !names_a_fetch {
+            return self.message().to_string();
+        }
+        match fault {
+            WorkerMediaFault::Client => MEDIA_FETCH_FAILED_CLIENT,
+            WorkerMediaFault::Transient => MEDIA_FETCH_FAILED_TRANSIENT,
+        }
+        .to_string()
     }
 
     fn breaker_status(&self) -> Option<u16> {
@@ -532,6 +588,38 @@ mod tests {
         assert!(plain.extensions().get::<ErrorReason>().is_none());
     }
 
+    /// A status that is no answer of the worker's: an HTTP/2 fault under
+    /// the call, the worker's side cancelling, a dial that failed, a
+    /// keep-alive timeout. A status the worker answered with is one.
+    #[tokio::test]
+    async fn a_status_says_whether_the_worker_answered() {
+        use smg_grpc_client::h2::{Error, Reason};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let closed = format!("grpc://{}", listener.local_addr().expect("its address"));
+        drop(listener);
+        let Err(refused) = smg_grpc_client::connect_channel(&closed).await else {
+            panic!("nothing listens on {closed}");
+        };
+        for (status, no_answer) in [
+            (
+                tonic::Status::from_error(Box::new(Error::from(Reason::PROTOCOL_ERROR))),
+                true,
+            ),
+            (tonic::Status::cancelled("operation was canceled"), true),
+            (tonic::Status::from_error(refused), true),
+            (smg_grpc_client::keep_alive_timeout_status(), true),
+            (tonic::Status::internal("the servicer failed"), false),
+            (tonic::Status::unavailable("draining"), false),
+            (tonic::Status::unimplemented("no"), false),
+            (tonic::Status::deadline_exceeded("too slow"), false),
+            (tonic::Status::invalid_argument("bad"), false),
+            (tonic::Status::resource_exhausted("kv cache full"), false),
+        ] {
+            assert_eq!(status.is_no_answer(), no_answer, "{status:?}");
+        }
+    }
+
     #[test]
     fn invalid_argument_maps_to_400_and_is_not_a_circuit_breaker_failure() {
         for status in [
@@ -602,6 +690,12 @@ mod tests {
         assert_eq!(client.http_status(), StatusCode::BAD_REQUEST);
         assert_eq!(client.media_code(), MediaErrorCode::FetchFailed);
         assert_eq!(client.breaker_status(), None);
+        // The client reads the gateway's sentence for a fetch that failed,
+        // by whose fault it is; the worker's own words stay on the log line.
+        assert_eq!(
+            client.media_message(WorkerMediaFault::Client),
+            MEDIA_FETCH_FAILED_CLIENT
+        );
 
         let transient = WorkerMediaFault::Transient.stamp(tonic::Status::unavailable(
             "media fetch of https://media.example/a.png timed out after 10s",
@@ -609,6 +703,10 @@ mod tests {
         assert_eq!(transient.media_fault(), Some(WorkerMediaFault::Transient));
         assert_eq!(transient.http_status(), StatusCode::BAD_GATEWAY);
         assert_eq!(transient.media_code(), MediaErrorCode::FetchFailed);
+        assert_eq!(
+            transient.media_message(WorkerMediaFault::Transient),
+            MEDIA_FETCH_FAILED_TRANSIENT
+        );
         let result: Result<(), tonic::Status> = Err(transient);
         assert_eq!(result.breaker_status(), None);
 
@@ -623,6 +721,12 @@ mod tests {
         assert_eq!(too_large.http_status(), StatusCode::BAD_REQUEST);
         assert_eq!(too_large.media_code(), MediaErrorCode::TooLarge);
         assert_eq!(too_large.breaker_status(), None);
+        // A size refusal and media refused as sent describe the request's
+        // payload: the worker's words reach the client.
+        assert_eq!(
+            too_large.media_message(WorkerMediaFault::Client),
+            too_large.message()
+        );
 
         let refused = smg_grpc_client::stamp_media_code(
             WorkerMediaFault::Client.stamp(tonic::Status::invalid_argument(
@@ -634,6 +738,24 @@ mod tests {
         assert_eq!(refused.http_status(), StatusCode::BAD_REQUEST);
         assert_eq!(refused.media_code(), MediaErrorCode::InvalidRequest);
         assert_eq!(refused.breaker_status(), None);
+        assert_eq!(
+            refused.media_message(WorkerMediaFault::Client),
+            "data URL parse error: missing comma in data url"
+        );
+
+        // A fetch the worker names by its code reads the sentence, whatever
+        // words the worker has for it.
+        let named = smg_grpc_client::stamp_media_code(
+            WorkerMediaFault::Client.stamp(tonic::Status::invalid_argument(
+                "the reference could not be followed",
+            )),
+            "media_fetch_failed",
+        );
+        assert_eq!(named.media_code(), MediaErrorCode::FetchFailed);
+        assert_eq!(
+            named.media_message(WorkerMediaFault::Client),
+            MEDIA_FETCH_FAILED_CLIENT
+        );
 
         // The gRPC framing's refusal of a message longer than its four-byte
         // length prefix carries (tonic's words; this gateway's own client
@@ -648,6 +770,11 @@ mod tests {
         assert_eq!(framing.http_status(), StatusCode::BAD_REQUEST);
         assert_eq!(framing.media_code(), MediaErrorCode::TooLarge);
         assert_eq!(framing.breaker_status(), None);
+        // The framing's refusal names no fetch: its own words reach the client.
+        assert_eq!(
+            framing.media_message(WorkerMediaFault::Client),
+            framing.message()
+        );
         let pushback = tonic::Status::resource_exhausted("the engine is at capacity");
         assert_eq!(pushback.media_fault(), None);
         assert_eq!(pushback.http_status(), StatusCode::TOO_MANY_REQUESTS);
@@ -671,6 +798,32 @@ mod tests {
             "media_from_the_future",
         );
         assert_eq!(unknown.media_code(), MediaErrorCode::FetchFailed);
+        // A code this router does not know names no fetch: the worker's words
+        // reach the client under the fallback code.
+        assert_eq!(unknown.media_message(WorkerMediaFault::Client), "new words");
+    }
+
+    /// The gateway's sentence stands only for a status that names a fetch. A
+    /// worker that predates the code trailer names the fault alone: where its
+    /// words describe the request's payload they reach the client, as the
+    /// same words do under a code.
+    #[test]
+    fn a_fault_without_a_code_keeps_the_words_that_name_no_fetch() {
+        for message in [
+            "data URL parse error: missing comma in data url",
+            "image decode error: The image format could not be determined",
+            "video input payload exceeds the maximum size of 536870912 bytes",
+        ] {
+            let payload = WorkerMediaFault::Client.stamp(tonic::Status::invalid_argument(message));
+            assert_eq!(payload.media_fault(), Some(WorkerMediaFault::Client));
+            assert_eq!(payload.http_status(), StatusCode::BAD_REQUEST);
+            assert_eq!(payload.breaker_status(), None);
+            assert_eq!(
+                payload.media_message(WorkerMediaFault::Client),
+                message,
+                "{message}"
+            );
+        }
     }
 
     /// A worker that predates the trailer reports a fetch failure on
@@ -694,6 +847,10 @@ mod tests {
             );
             assert_eq!(legacy.http_status(), StatusCode::BAD_GATEWAY);
             assert_eq!(legacy.media_code(), MediaErrorCode::FetchFailed);
+            assert_eq!(
+                legacy.media_message(WorkerMediaFault::Transient),
+                MEDIA_FETCH_FAILED_TRANSIENT
+            );
             assert_eq!(legacy.breaker_status(), None);
         }
         let sidecar = tonic::Status::unavailable("sidecar_timeout: no result");

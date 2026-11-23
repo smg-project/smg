@@ -14,12 +14,16 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
-use smg_policy_controller::store::MemoryStore;
+use smg_policy_controller::{
+    document::AppliedSpec,
+    engine::{CacheIndexes, Members, PolicyEngine, WorkerData},
+    stages::StageRegistry,
+};
 use smg_worker::{
     connection::{
         engine::EngineConnector,
         http_client::{
-            build_client, connect_timeout_secs_below, WorkerHttpClientCache,
+            build_client, connect_timeout_secs_below, pool_idle_timeout, WorkerHttpClientCache,
             DEFAULT_CONNECT_TIMEOUT_SECS,
         },
     },
@@ -37,7 +41,6 @@ use crate::{
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::{kv_index::event_monitor::KvEventMonitor, PolicyRegistry},
-    policy_controller,
     rate_limit::RateLimitManager,
     rl_adapter,
     routers::{
@@ -50,7 +53,7 @@ use crate::{
         },
         gateway::Gateway,
         grpc::{
-            backend_client::BackendConnector,
+            backend_client::{BackendConnector, Fronting},
             multimodal::MultimodalConfigRegistry,
             regular::symphony::{check_names, named_table},
             utils::{Names, ALIASES},
@@ -111,6 +114,7 @@ pub struct AppContext {
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
+    engine_connector: Arc<dyn EngineConnector>,
     pub prefill_admission: Option<Arc<PrefillAdmission>>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub gateway: Option<Arc<Gateway>>,
@@ -133,9 +137,6 @@ pub struct AppContext {
     pub registration_settings: RegistrationSettings,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
-    /// The policy controller's store, where the controller was picked to
-    /// decide for this process; `None` under the classic policies.
-    pub policy_store: Option<Arc<MemoryStore>>,
     /// RL control plane state; `None` unless `router_config.rl.enabled`.
     pub rl: Option<Arc<smg_rl::RlState>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
@@ -215,6 +216,7 @@ pub struct AppContextBuilder {
     reasoning_parser_factory: Option<ReasoningParserFactory>,
     tool_parser_factory: Option<ToolParserFactory>,
     worker_registry: Option<Arc<WorkerRegistry>>,
+    engine_connector: Arc<dyn EngineConnector>,
     policy_registry: Option<Arc<PolicyRegistry>>,
     gateway: Option<Arc<Gateway>>,
     response_storage: Option<Arc<dyn ResponseStorage>>,
@@ -227,7 +229,6 @@ pub struct AppContextBuilder {
     mcp_format_registry: Option<FormatRegistry>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
-    policy_store: Option<Arc<MemoryStore>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
 }
@@ -252,7 +253,7 @@ impl WorkflowHost for AppContext {
     }
 
     fn engine_connector(&self) -> Arc<dyn EngineConnector> {
-        BackendConnector::shared()
+        Arc::clone(&self.engine_connector)
     }
 }
 
@@ -269,12 +270,35 @@ impl AppContext {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
+        Self::from_config_with_extensions(
+            router_config,
+            request_timeout_secs,
+            webrtc_bind_addr,
+            webrtc_stun_server,
+            None,
+            None,
+        )
+    }
+
+    /// [`Self::from_config`] over what a host added: its worker connector,
+    /// and the table of policy stages its policy document may name. With no
+    /// table the document is checked against the stock one.
+    pub(crate) fn from_config_with_extensions(
+        router_config: RouterConfig,
+        request_timeout_secs: u64,
+        webrtc_bind_addr: Option<std::net::IpAddr>,
+        webrtc_stun_server: Option<String>,
+        connector: Option<Arc<dyn EngineConnector>>,
+        policy_stages: Option<StageRegistry>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
         Box::pin(async move {
-            Box::pin(AppContextBuilder::from_config(
+            Box::pin(AppContextBuilder::from_config_with_extensions(
                 router_config,
                 request_timeout_secs,
                 webrtc_bind_addr,
                 webrtc_stun_server,
+                connector,
+                policy_stages,
             ))
             .await?
             .build()
@@ -317,8 +341,19 @@ fn has_https_worker(config: &RouterConfig) -> bool {
     }
 }
 
+/// The whole seconds the overload shed advertises as Retry-After under a
+/// load monitor that polls every `interval`. The header carries no
+/// fraction, so an interval with one is raised to the next second.
+fn shed_retry_after_secs(interval: Duration) -> u64 {
+    interval.as_secs() + u64::from(interval.subsec_nanos() != 0)
+}
+
 impl AppContextBuilder {
     pub fn new() -> Self {
+        Self::new_with_connector(None)
+    }
+
+    fn new_with_connector(connector: Option<Arc<dyn EngineConnector>>) -> Self {
         Self {
             client: None,
             router_config: None,
@@ -328,6 +363,9 @@ impl AppContextBuilder {
             reasoning_parser_factory: None,
             tool_parser_factory: None,
             worker_registry: None,
+            // A host's connector is wrapped once: the gateway fronts each
+            // gRPC connection it makes.
+            engine_connector: connector.map_or_else(BackendConnector::shared, Fronting::around),
             policy_registry: None,
             gateway: None,
             response_storage: None,
@@ -340,7 +378,6 @@ impl AppContextBuilder {
             mcp_format_registry: None,
             wasm_manager: None,
             kv_event_monitor: None,
-            policy_store: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         }
@@ -606,7 +643,6 @@ impl AppContextBuilder {
         );
 
         let rl = rl_adapter::build_rl_state(&worker_registry, &worker_client_cache, &router_config);
-
         Ok(AppContext {
             gateway_auth,
             client: self
@@ -624,6 +660,7 @@ impl AppContextBuilder {
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
+            engine_connector: self.engine_connector,
             prefill_admission,
             policy_registry,
             gateway: self.gateway,
@@ -653,7 +690,6 @@ impl AppContextBuilder {
             registration_settings,
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
-            policy_store: self.policy_store,
             rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
@@ -669,6 +705,31 @@ impl AppContextBuilder {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> Result<Self, String> {
+        Box::pin(Self::from_config_with_extensions(
+            router_config,
+            request_timeout_secs,
+            webrtc_bind_addr,
+            webrtc_stun_server,
+            None,
+            None,
+        ))
+        .await
+    }
+
+    async fn from_config_with_extensions(
+        router_config: RouterConfig,
+        request_timeout_secs: u64,
+        webrtc_bind_addr: Option<std::net::IpAddr>,
+        webrtc_stun_server: Option<String>,
+        connector: Option<Arc<dyn EngineConnector>>,
+        policy_stages: Option<StageRegistry>,
+    ) -> Result<Self, String> {
+        // The policy document comes first, checked against the stages the
+        // host registered: ahead of the stores, the storage hooks and every
+        // listener, so a document that is refused ends the start in its own
+        // words. The engine is started last, from the document that was
+        // checked here.
+        let policy = Self::policy_in_force(&router_config, policy_stages.as_ref())?;
         // A served model aliased under a vendor name keeps that vendor's
         // contract profile after the alias is resolved into the served name.
         ProviderProfile::register_model_aliases(
@@ -681,7 +742,7 @@ impl AppContextBuilder {
         // registry is built below (the first call wins; `build` keeps its
         // call for a context assembled without this constructor).
         liveness::configure_from(router_config.worker_liveness_budgets());
-        Ok(Self::new()
+        Ok(Self::new_with_connector(connector)
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
             .maybe_rate_limit_manager(&router_config)?
@@ -690,7 +751,6 @@ impl AppContextBuilder {
             .with_tool_parser_factory()
             .with_worker_registry()
             .with_policy_registry(&router_config)
-            .with_policy_controller(&router_config)?
             .with_storage(&router_config)
             .await?
             .with_worker_monitor(&router_config)?
@@ -700,6 +760,7 @@ impl AppContextBuilder {
             .await?
             .with_wasm_manager(&router_config)
             .with_kv_event_monitor()
+            .with_policy_engine(policy)?
             .webrtc_bind_addr(
                 webrtc_bind_addr.or_else(|| Some(default_bind_addr(&router_config.host))),
             )
@@ -727,10 +788,7 @@ impl AppContextBuilder {
         // Idle pooled connections must expire before the backend server's
         // keep-alive closes them (the engines' default: 5s), or checkout races
         // the server's FIN and non-idempotent sends fail.
-        let pool_idle_timeout = match config.upstream_pool_idle_timeout_secs {
-            0 => None,
-            secs => Some(Duration::from_secs(secs)),
-        };
+        let pool_idle_timeout = pool_idle_timeout(config.upstream_pool_idle_timeout_secs);
         // mTLS client identity and CA certificates for verifying worker TLS
         // (both loaded during config creation), parsed once: the builder
         // closure runs again if the first build fails for want of a root store.
@@ -862,29 +920,16 @@ impl AppContextBuilder {
     /// Create worker registry
     fn with_worker_registry(mut self) -> Self {
         self.worker_registry = Some(Arc::new(
-            WorkerRegistry::new().with_engine_connector(BackendConnector::shared()),
+            WorkerRegistry::new().with_engine_connector(Arc::clone(&self.engine_connector)),
         ));
         self
     }
 
-    /// Start the policy controller's store where the controller was picked
-    /// to decide for this process. A start it refuses stops this one, by
-    /// name.
-    fn with_policy_controller(mut self, config: &RouterConfig) -> Result<Self, String> {
-        self.policy_store =
-            policy_controller::start(config).map_err(|refusal| refusal.to_string())?;
-        Ok(self)
-    }
-
-    /// Create policy registry
+    /// Create policy registry: the one that makes no classic policy where
+    /// the configuration runs the policy controller
+    /// ([`PolicyRegistry::of_config`]).
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(
-            PolicyRegistry::with_override(
-                config.policy.clone(),
-                config.routing_key_override.clone(),
-            )
-            .with_pd_pairing_mode(config.pd_pairing_mode),
-        ));
+        self.policy_registry = Some(Arc::new(PolicyRegistry::of_config(config)));
         self
     }
 
@@ -933,31 +978,158 @@ impl AppContextBuilder {
             .as_ref()
             .ok_or_else(|| "policy_registry must be set before load monitor".to_string())?
             .clone();
-        let monitor = Arc::new(WorkerMonitor::new(
-            self.worker_registry
-                .as_ref()
-                .ok_or_else(|| "worker_registry must be set before load monitor".to_string())?
-                .clone(),
+        let registry = self
+            .worker_registry
+            .as_ref()
+            .ok_or_else(|| "worker_registry must be set before load monitor".to_string())?
+            .clone();
+        let interval = config.load_monitor_interval_secs;
+        let (engine_metrics, conditional) = (config.engine_metrics, config.disable_load_monitoring);
+        // The monitor's snapshot feeds every policy that consumes it; the
+        // monitor polls every group by default, conditionally under
+        // `--disable-load-monitoring`.
+        let monitor = WorkerMonitor::new(
+            registry,
             Arc::clone(&policy_registry),
-            config.load_monitor_interval_secs,
-            config.engine_metrics,
-            config.disable_load_monitoring,
-        ));
+            interval,
+            engine_metrics,
+            conditional,
+        );
+        // An interval stated in milliseconds takes the place of the seconds.
+        let monitor = Arc::new(match config.load_monitor_interval_ms {
+            Some(millis) => monitor.with_interval(Duration::from_millis(millis)),
+            None => monitor,
+        });
+        policy_registry.set_load_receiver(Some(monitor.subscribe()));
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
-        overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
+        overload::set_shed_retry_after_secs(shed_retry_after_secs(config.load_monitor_interval()));
         if let Some(registry) = self.worker_registry.as_ref() {
             registry.set_overload_shed(config.worker_overload_shed);
         }
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.
         pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
-        // Wire the backend load-snapshot feed into every policy that consumes
-        // it; the monitor polls every group by default, conditionally under
-        // `--disable-load-monitoring`.
-        policy_registry.set_load_receiver(Some(monitor.subscribe()));
         self.worker_monitor = Some(monitor);
         Ok(self)
+    }
+
+    /// The policy document this process runs under the policy controller
+    /// (`policy_controller: on`), checked: the document in force, which is
+    /// the one the routing settings mean or a supplied one, validated
+    /// against `stages`. A host's table holds the stock stages and the
+    /// host's own, so a supplied document may name both. With no table the
+    /// document is validated against the stock one. `None` where the
+    /// configuration leaves the classic policies in place.
+    ///
+    /// A document that is refused ends the start with the refusal's own
+    /// words, before a store is opened and before the gateway listens.
+    fn policy_in_force(
+        config: &RouterConfig,
+        stages: Option<&StageRegistry>,
+    ) -> Result<Option<AppliedSpec>, String> {
+        if !config.policy_controller {
+            return Ok(None);
+        }
+        let document = config
+            .policy_document_in_force()
+            .map_err(|refused| format!("policy controller: {refused}"))?;
+        let checked = match stages {
+            Some(stages) => config.hosted_policy(&document, stages),
+            None => config.hosted_policy(&document, &StageRegistry::builtin()),
+        };
+        checked
+            .map(Some)
+            .map_err(|refused| format!("policy controller: {refused}"))
+    }
+
+    /// Starts the policy engine over `policy`, where the configuration runs
+    /// the policy controller: the checked document [`Self::policy_in_force`]
+    /// answered. It is the last step of the start, so the engine is handed
+    /// where this process keeps its workers' data, each once: the worker
+    /// registry, the load monitor's channel and the cache-event monitor.
+    fn with_policy_engine(self, policy: Option<AppliedSpec>) -> Result<Self, String> {
+        let Some(spec) = policy else {
+            return Ok(self);
+        };
+        let unset = |field: &str| format!("{field} must be set before the policy engine");
+        let policies = self
+            .policy_registry
+            .as_ref()
+            .ok_or_else(|| unset("policy_registry"))?;
+        let registry = self
+            .worker_registry
+            .as_ref()
+            .ok_or_else(|| unset("worker_registry"))?;
+        let monitor = self
+            .worker_monitor
+            .as_ref()
+            .ok_or_else(|| unset("worker_monitor"))?;
+        let cache_events = self
+            .kv_event_monitor
+            .as_ref()
+            .ok_or_else(|| unset("kv_event_monitor"))?;
+        let data = WorkerData {
+            registry: Arc::clone(registry) as Arc<dyn Members>,
+            loads: Some(monitor.subscribe()),
+            cache_indexes: Some(Arc::clone(cache_events) as Arc<dyn CacheIndexes>),
+        };
+        Self::start_policy_engine(spec, data, policies)?;
+        Ok(self)
+    }
+
+    /// Starts the policy engine that places every request of this process:
+    /// one engine, by the policy crate's one start call, over the checked
+    /// document ([`Self::policy_in_force`]) and `data`, where this process
+    /// keeps its workers' data. The engine's task follows the registry's
+    /// events and tells the document's stages a worker that joined or was
+    /// removed, and it keeps the newest load snapshot at hand. It is
+    /// spawned on the runtime this context is built on, and the placement
+    /// functions find the engine through `policies`.
+    fn start_policy_engine(
+        spec: AppliedSpec,
+        data: WorkerData,
+        policies: &PolicyRegistry,
+    ) -> Result<(), String> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+            format!("policy controller: the engine's task needs a Tokio runtime: {error}")
+        })?;
+        // One engine for the life of the process: its placements borrow it.
+        let (engine, task) = PolicyEngine::start(spec, data);
+        // The engine's task keeps nothing a shutdown waits for: its upkeep,
+        // its load snapshot and its follow of the registry end with the
+        // runtime.
+        runtime.spawn(task);
+        policies.set_engine(engine);
+        Ok(())
+    }
+
+    /// The policy engine's start for a context a test builds by hand, field
+    /// by field, where no builder step of this file runs: the start's own
+    /// two steps, in their order and with nothing added (`policy_in_force`,
+    /// then `start_policy_engine`). It is not a second start. `stages` is
+    /// the table a host would bring, where the test brings one, and a
+    /// configuration that leaves the policy controller off starts nothing.
+    /// The engine is handed the test's worker registry and its load
+    /// monitor's channel. Such a context keeps no cache-event monitor, so
+    /// the engine is handed none.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn start_policy_engine_by_hand(
+        config: &RouterConfig,
+        stages: Option<&StageRegistry>,
+        policies: &PolicyRegistry,
+        registry: &Arc<WorkerRegistry>,
+        monitor: &WorkerMonitor,
+    ) -> Result<(), String> {
+        if let Some(spec) = Self::policy_in_force(config, stages)? {
+            let data = WorkerData {
+                registry: Arc::clone(registry) as Arc<dyn Members>,
+                loads: Some(monitor.subscribe()),
+                cache_indexes: None,
+            };
+            Self::start_policy_engine(spec, data, policies)?;
+        }
+        Ok(())
     }
 
     /// Create worker job queue OnceLock container
@@ -1330,6 +1502,46 @@ mod tests {
         assert!(cache_aware.has_load_receiver_for_test());
     }
 
+    /// The load monitor is built with the interval the configuration states
+    /// in milliseconds, over its seconds, and with the seconds where it
+    /// states no milliseconds.
+    #[test]
+    fn the_worker_monitor_takes_its_interval_in_milliseconds_over_the_seconds() {
+        let built_with = |millis: Option<u64>| {
+            let config = RouterConfig {
+                load_monitor_interval_secs: 5,
+                load_monitor_interval_ms: millis,
+                ..config_with_policy(PolicyConfig::RoundRobin)
+            };
+            AppContextBuilder::new()
+                .with_client(&config, 5)
+                .expect("client builds")
+                .with_worker_registry()
+                .with_policy_registry(&config)
+                .with_worker_monitor(&config)
+                .expect("worker monitor builds")
+                .worker_monitor
+                .expect("the worker monitor")
+                .interval()
+        };
+        assert_eq!(built_with(Some(250)), Duration::from_millis(250));
+        assert_eq!(built_with(None), Duration::from_secs(5));
+    }
+
+    /// The shed's Retry-After is the poll interval in whole seconds: an
+    /// interval with a fraction is raised to the next second, and whole
+    /// seconds read as they are.
+    #[test]
+    fn the_sheds_retry_after_raises_a_fraction_to_the_next_second() {
+        for (millis, seconds) in [(100, 1), (250, 1), (1_000, 1), (1_500, 2), (10_000, 10)] {
+            assert_eq!(
+                shed_retry_after_secs(Duration::from_millis(millis)),
+                seconds,
+                "{millis} ms"
+            );
+        }
+    }
+
     /// Every policy gets the monitor: a cache-aware one for its indexes, any
     /// other for the load stream of its gRPC workers, which the policies'
     /// load feed reads in place of the poll.
@@ -1697,7 +1909,7 @@ pub(crate) mod testing {
 
     use smg_worker::connection::http_client::WorkerHttpClientCache;
 
-    use super::{AppContext, ToolParserFactory};
+    use super::{AppContext, BackendConnector, ToolParserFactory};
     use crate::{
         admin::worker_service::WorkerService,
         config::RouterConfig,
@@ -1733,6 +1945,7 @@ pub(crate) mod testing {
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,
             worker_registry: Arc::clone(&worker_registry),
+            engine_connector: BackendConnector::shared(),
             prefill_admission: None,
             policy_registry: Arc::new(
                 PolicyRegistry::with_override(
@@ -1772,7 +1985,6 @@ pub(crate) mod testing {
             )),
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
-            policy_store: None,
             rl: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,

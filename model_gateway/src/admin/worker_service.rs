@@ -24,16 +24,20 @@ use smg_worker::{
         basic::{merge_labels, worker_to_info, Worker, WorkerType},
         endpoint::Endpoint,
     },
+    jobs::{queue::QueueJob, WorkerJobAsker},
+    labels::has_control_character,
     registry::WorkerId,
     workflow::find_workers_by_url,
 };
 use tracing::warn;
 
 use crate::{
-    config::{unused_credentials_warning, validate_worker_url, RouterConfig},
-    observability::log_format::has_control_character,
+    config::{
+        unused_credentials_warning, validate_worker_url, validation::ConfigValidator,
+        CircuitBreakerConfig, RouterConfig,
+    },
     routers::{common::snapshot::WorkerRegistry, provider_support},
-    workflow::{Job, JobQueue, WorkerRegistrationMode},
+    workflow::{job_queue::cancel_registration, Job, JobQueue, WorkerRegistrationMode},
 };
 
 /// Validate the URL of an incoming worker-management request, translating a
@@ -106,8 +110,9 @@ pub(crate) fn control_character_refusal<'a>(
 /// reserved for discovery; the fields the routers rely on (a positive,
 /// finite cost; a KV block size and a data-parallel size of at least 1; a
 /// rank only with a size and below it; a bootstrap port that is a port); a
-/// probe interval and a probe timeout the health schedule can hold. A
-/// violation is a `400 Bad Request` naming the field.
+/// probe interval and a probe timeout the health schedule can hold; breaker
+/// overrides at the floors of the global settings. A violation is a
+/// `400 Bad Request` naming the field.
 fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
     if spec.url.len() > MAX_WORKER_URL_BYTES {
         return Err(bad_request(format!(
@@ -125,6 +130,24 @@ fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
     validate_labels(&spec.labels)?;
     validate_cost(spec.cost)?;
     validate_health(&spec.health)?;
+    // The start checks the effective settings; here a given zero is refused
+    // whatever the breaker's switches say, and an override left out passes.
+    let breaker = &spec.resilience;
+    ConfigValidator::validate_circuit_breaker(
+        [
+            "resilience.cb_failure_threshold",
+            "resilience.cb_success_threshold",
+            "resilience.cb_timeout_secs",
+            "resilience.cb_window_secs",
+        ],
+        &CircuitBreakerConfig {
+            failure_threshold: breaker.cb_failure_threshold.unwrap_or(1),
+            success_threshold: breaker.cb_success_threshold.unwrap_or(1),
+            timeout_duration_secs: breaker.cb_timeout_secs.unwrap_or(1),
+            window_duration_secs: breaker.cb_window_secs.unwrap_or(1),
+        },
+    )
+    .map_err(|e| bad_request(e.to_string()))?;
     if spec.kv_block_size == Some(0) {
         return Err(bad_request(
             "kv_block_size must be at least 1 (tokens per KV block)".to_string(),
@@ -317,7 +340,8 @@ pub enum WorkerServiceError {
     /// Worker with this URL already exists (duplicate POST)
     Conflict { url: String, worker_id: WorkerId },
     /// A worker at this URL is being removed: its removal drains it for
-    /// `drain_secs` before the URL is free (a POST inside that window)
+    /// `drain_secs` before the URL is free (a POST of the URL or a PUT of
+    /// the worker inside that window)
     RemovalInProgress {
         url: String,
         worker_id: WorkerId,
@@ -409,7 +433,8 @@ impl std::fmt::Display for WorkerServiceError {
                     f,
                     "Worker at URL '{url}' with ID {id} is being removed; its removal drains \
                     it for {drain_secs}s, the worker's configured drain, before the URL is \
-                    free. Retry once GET /workers/{id} answers 404."
+                    free. Retry once GET /workers/{id} answers 404 or its job status reads \
+                    failed."
                 )
             }
             Self::CreateInProgress {
@@ -686,6 +711,7 @@ impl WorkerService {
         let job = Job::AddWorker {
             config: Box::new(config),
             registration_mode: WorkerRegistrationMode::CreateOnly,
+            asker: WorkerJobAsker::Api,
         };
 
         // Exactly one create per URL is in flight at a time, so that attempt
@@ -765,11 +791,11 @@ impl WorkerService {
         validate_spec(&config)?;
         Self::require_provider_router(&config)?;
 
-        // A data-parallel router expands one spec into one worker per rank,
-        // each registered under a rank-suffixed URL. Re-running registration
-        // for a single ID cannot express that, so refuse here instead of
-        // answering 202 and failing in the background.
-        if self.router_config.dp_aware {
+        // A data-parallel engine registers as one worker per rank, each
+        // under a rank-suffixed URL. Re-running registration for the ID of
+        // one rank cannot express that, so refuse here instead of answering
+        // 202 and failing in the background.
+        if existing.is_dp_aware() {
             return Err(WorkerServiceError::BadRequest {
                 message: format!(
                     "Worker '{url}' belongs to a data-parallel group. \
@@ -791,6 +817,17 @@ impl WorkerService {
             });
         }
 
+        // A worker that a removal is draining is leaving: a PUT gets the
+        // answer a POST of its URL gets. A replacement would share the
+        // Draining status and be served again inside the drain.
+        if existing.status() == WorkerStatus::Draining {
+            return Err(WorkerServiceError::RemovalInProgress {
+                url,
+                worker_id,
+                drain_secs: existing.metadata().health_config.drain_settle_secs,
+            });
+        }
+
         // Re-run the full registration workflow (model discovery, etc.).
         // The workflow registers with overwrite-then-diff, bound to the ID and
         // revision validated above: the job runs after this call returns 202,
@@ -803,6 +840,7 @@ impl WorkerService {
                 worker_id: worker_id.as_str().to_string(),
                 expected_revision: existing.revision(),
             },
+            asker: WorkerJobAsker::Api,
         };
 
         let job_queue = self.get_job_queue()?;
@@ -880,14 +918,43 @@ impl WorkerService {
             return Ok(GetWorkerResponse(worker_info));
         }
 
-        if let Some(worker_url) = self.worker_registry.get_url_by_id(&worker_id) {
-            if let Some(status) = job_queue.get_status(&worker_url) {
-                return Ok(GetWorkerResponse(WorkerInfo::pending(
-                    worker_id.as_str(),
-                    worker_url,
-                    Some(status),
-                )));
-            }
+        // A registration in flight holds its id. One that failed has released
+        // it: the queue keeps its failed status under the id until its
+        // finished statuses age out.
+        let url = self.worker_registry.get_url_by_id(&worker_id);
+        let in_flight = url
+            .as_deref()
+            .and_then(|worker_url| job_queue.get_status(worker_url));
+        let failed = || {
+            job_queue
+                .get_status(worker_id.as_str())
+                .filter(|status| status.job_type == Job::REGISTRATION_TYPE)
+        };
+        if let Some(mut status) = in_flight.or_else(failed) {
+            // A plain address as registered, any other as the gateway's log
+            // lines write it.
+            status.worker_url = Endpoint::redacted_url(&status.worker_url);
+            return Ok(GetWorkerResponse(WorkerInfo::pending(
+                worker_id.as_str(),
+                status.worker_url.clone(),
+                Some(status),
+            )));
+        }
+
+        // A registered data-parallel group stands under its rank URLs, none
+        // under the id its POST answered. The read of that id answers with
+        // the least ready rank, so a client that polls it reads healthy once
+        // every rank is. Each rank is read once, into its view, so the
+        // health compared is the health answered.
+        let group = url.and_then(|url| {
+            find_workers_by_url(&self.worker_registry, &url)
+                .iter()
+                .map(worker_to_info)
+                .min_by_key(|rank| rank.is_healthy)
+        });
+        if let Some(mut worker_info) = group {
+            worker_info.id = worker_id.as_str().to_string();
+            return Ok(GetWorkerResponse(worker_info));
         }
 
         Err(WorkerServiceError::NotFound {
@@ -921,8 +988,7 @@ impl WorkerService {
         // flight reserves nothing), so no DELETE reaches this path for such a
         // registration before its worker exists.
         if self.worker_registry.get(&worker_id).is_none() {
-            let cancelled = job_queue
-                .cancel_registration(&url, &worker_id)
+            let cancelled = cancel_registration(job_queue, &url, &worker_id)
                 .await
                 .map_err(|message| WorkerServiceError::QueueSubmitFailed { message })?;
             if cancelled > 0 && self.worker_registry.get(&worker_id).is_none() {
@@ -953,6 +1019,7 @@ impl WorkerService {
         let job = Job::RemoveWorker {
             url: url.clone(),
             expected_revisions: Some(entries),
+            asker: WorkerJobAsker::Api,
         };
         // One removal per URL at a time: a registration's own end queues one
         // for the workers it registered and did not finish, and a repeated
@@ -963,11 +1030,8 @@ impl WorkerService {
         // A repeated DELETE's removal finds nothing left then; one behind a
         // guarded cleanup that skipped a worker replaced since the cleanup's
         // snapshot removes that worker, where a DELETE answered by the
-        // cleanup alone removed nothing. The queue keeps one job of each
-        // kind per URL; a label refresh is kept the same way
-        // (`submit_label_refresh`) and runs after a kept removal: the worker
-        // it would refresh may be the one leaving, or the one a guarded
-        // removal leaves standing.
+        // cleanup alone removed nothing. A kept label refresh runs after
+        // the kept removals, on any worker they leave standing.
         job_queue
             .submit_or_defer(job)
             .await
@@ -1004,6 +1068,7 @@ impl WorkerService {
         let job = Job::UpdateWorker {
             url: url.clone(),
             update: Box::new(update),
+            asker: WorkerJobAsker::Api,
         };
         let job_queue = self.get_job_queue()?;
         if worker.is_some() {
@@ -1042,12 +1107,13 @@ impl WorkerService {
 #[cfg(test)]
 mod tests {
     use openai_protocol::model_card::ModelCard;
-    use smg_worker::identity::basic::WorkerType;
+    use smg_worker::{identity::basic::WorkerType, jobs::queue::testing::QueueTest};
 
     use super::*;
     use crate::{
         app_context::testing::app_context_for_tests,
-        routers::grpc::backend_client::BasicWorkerBuilder, workflow::JobQueueConfig,
+        routers::grpc::backend_client::BasicWorkerBuilder,
+        workflow::{job_queue::recording_for_tests, JobQueueConfig},
     };
 
     fn make_service(registry: Arc<WorkerRegistry>) -> WorkerService {
@@ -1122,6 +1188,70 @@ mod tests {
 
     fn worker_spec(url: &str) -> WorkerSpec {
         serde_json::from_value(json!({ "url": url })).expect("worker spec")
+    }
+
+    #[tokio::test]
+    async fn the_worker_api_asks_as_api() {
+        use crate::app_context::testing::create_test_app_context;
+
+        let context = create_test_app_context();
+        let (queue, mut next_job) = recording_for_tests(&context);
+        context.worker_job_queue.set(queue).unwrap();
+        let registry = &context.worker_registry;
+        let registered = |url| {
+            register_worker(registry, url, Some("served"));
+            registry.get_id_by_url(url).unwrap()
+        };
+        let replace_url = "http://replace:8000";
+        let replace = registered(replace_url);
+        let update = registered("http://update:8000");
+        let delete = registered("http://delete:8000");
+        let service = &context.worker_service;
+
+        service
+            .create_worker(worker_spec("http://create:8000"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_job(),
+            Job::AddWorker {
+                registration_mode: WorkerRegistrationMode::CreateOnly,
+                asker: WorkerJobAsker::Api,
+                ..
+            }
+        ));
+        service
+            .replace_worker(replace.as_str(), worker_spec(replace_url))
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_job(),
+            Job::AddWorker {
+                registration_mode: WorkerRegistrationMode::ReplaceById { .. },
+                asker: WorkerJobAsker::Api,
+                ..
+            }
+        ));
+        let request = serde_json::from_value(json!({"priority": 2})).unwrap();
+        service
+            .update_worker(update.as_str(), request)
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_job(),
+            Job::UpdateWorker {
+                asker: WorkerJobAsker::Api,
+                ..
+            }
+        ));
+        service.delete_worker(delete.as_str()).await.unwrap();
+        assert!(matches!(
+            next_job(),
+            Job::RemoveWorker {
+                asker: WorkerJobAsker::Api,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1226,12 +1356,62 @@ mod tests {
         assert!(registry.get_url_by_id(&reserved).is_none());
     }
 
+    /// A registered data-parallel group stands under its rank URLs, none
+    /// under the id its `POST` answered. The read of that id answers from
+    /// the ranks, the least ready one, where it answered 404.
+    #[tokio::test]
+    async fn get_worker_reads_a_registered_data_parallel_group_by_the_id_of_its_post() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let queue = Arc::new(std::sync::OnceLock::new());
+        queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                std::sync::Weak::new(),
+            ))
+            .ok();
+        let service = WorkerService::new(Arc::clone(&registry), queue, RouterConfig::default());
+        let url = "grpc://10.0.0.7:8000";
+        let id = registry.reserve_id_for_url(url);
+        for rank in 0..2 {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("m"))
+                .dp_config(rank, 2)
+                .build();
+            worker.set_status(WorkerStatus::Ready);
+            registry
+                .register(Arc::new(worker))
+                .expect("a rank registers");
+        }
+
+        let GetWorkerResponse(group) = service
+            .get_worker(id.as_str())
+            .expect("the ranks answer for the id of the POST");
+        assert_eq!(group.id, id.as_str());
+        assert!(group.is_healthy, "every rank is ready");
+
+        // The lookup's second rank, so that a read of the first one found
+        // would still say healthy.
+        let not_ready = find_workers_by_url(&registry, url)[1].clone();
+        not_ready.set_status(WorkerStatus::NotReady);
+        let GetWorkerResponse(group) = service
+            .get_worker(id.as_str())
+            .expect("the ranks answer for the id of the POST");
+        assert!(!group.is_healthy, "one rank is not ready");
+        assert_eq!(
+            group.spec.url,
+            not_ready.url(),
+            "the view is the not-ready rank's"
+        );
+    }
+
     /// The job a `POST` of `url` claims the queue with (the claim reads the
     /// job's type and URL, not its registration mode).
     fn registration(url: &str) -> Job {
         Job::AddWorker {
             config: Box::new(worker_spec(url)),
             registration_mode: WorkerRegistrationMode::CreateOnly,
+            asker: WorkerJobAsker::Api,
         }
     }
 
@@ -1489,6 +1669,7 @@ mod tests {
         let cleanup = Job::RemoveWorker {
             url: url.to_string(),
             expected_revisions: Some(HashMap::from([(id.as_str().to_string(), Some(1))])),
+            asker: WorkerJobAsker::Api,
         };
         assert!(queue.claim_if_idle(&cleanup), "the cleanup holds the URL");
         let deleted = service
@@ -1497,7 +1678,7 @@ mod tests {
             .expect("the DELETE is admitted");
         assert_eq!(deleted.worker_id, id);
         assert!(
-            queue.kept_for(url),
+            QueueTest::kept_for(&queue, url),
             "the DELETE's removal is kept for the removal in flight to run on its heels"
         );
     }
@@ -1596,6 +1777,145 @@ mod tests {
             retry_after.as_deref(),
             Some("7"),
             "Retry-After carries the drain window"
+        );
+    }
+
+    /// A PUT re-runs one registration under one id, which a rank of a
+    /// data-parallel engine cannot be: the PUT of a rank worker is refused by
+    /// name, on a gateway given no setting for it. The PUT of a plain worker
+    /// passes that test: here it stops at the next thing it needs, the job
+    /// queue this service was given none of.
+    #[tokio::test]
+    async fn a_put_is_refused_for_a_rank_worker_and_for_no_other() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let service = make_service(Arc::clone(&registry));
+        let plain_url = "http://10.0.0.9:8000";
+        register_worker(&registry, plain_url, Some("m"));
+        let plain = registry.get_id_by_url(plain_url).expect("the plain worker");
+        let engine = "http://10.0.0.10:8000";
+        let rank = registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new(engine)
+                    .worker_type(WorkerType::Regular)
+                    .model(ModelCard::new("m"))
+                    .dp_config(1, 2)
+                    .build(),
+            ))
+            .expect("a rank registers");
+
+        let refused = service
+            .replace_worker(rank.as_str(), worker_spec(engine))
+            .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(WorkerServiceError::BadRequest { message })
+                    if message.contains("belongs to a data-parallel group")
+            ),
+            "a rank worker's PUT was not refused as one: {refused:?}"
+        );
+        let passed = service
+            .replace_worker(plain.as_str(), worker_spec(plain_url))
+            .await;
+        assert!(
+            matches!(&passed, Err(WorkerServiceError::QueueNotInitialized)),
+            "a plain worker's PUT stopped short of the queue: {passed:?}"
+        );
+    }
+
+    /// A worker that a removal is draining is leaving, and a PUT does not
+    /// bring it back to serve inside the drain.
+    #[tokio::test]
+    async fn a_put_does_not_bring_a_draining_worker_back() {
+        use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
+
+        use crate::workflow::{
+            create_worker_workflow_data, ActivateWorkersStep, RegisterWorkersStep,
+        };
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let service = make_service(Arc::clone(&registry));
+        let url = "http://10.0.0.8:8000";
+        let build = || -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .model(ModelCard::new("m"))
+                    .build(),
+            )
+        };
+        let worker = build();
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        // The run of a PUT answered now, bound to the revision it read.
+        let run_of_a_put = |replacement: &Arc<dyn Worker>| {
+            let mut data = create_worker_workflow_data(
+                worker_spec(url),
+                WorkerRegistrationMode::ReplaceById {
+                    worker_id: id.as_str().to_string(),
+                    expected_revision: worker.revision(),
+                },
+                app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None),
+                WorkerJobAsker::Api,
+            );
+            data.actual_workers = Some(vec![Arc::clone(replacement)]);
+            WorkflowContext::new(WorkflowInstanceId::new(), data)
+        };
+
+        let written = build();
+        let mut run = run_of_a_put(&written);
+        RegisterWorkersStep
+            .execute(&mut run)
+            .await
+            .expect("the PUT writes its replacement");
+        // A probe promotes the worker and a removal marks it after the PUT's
+        // activation chose Ready, before it takes the worker's lock.
+        let lost = registry.with_another_write_before_the_lock(
+            |_| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime for the step")
+                    .block_on(ActivateWorkersStep.execute(&mut run))
+            },
+            |registry| {
+                registry.transition_status(&id, WorkerStatus::Ready);
+                registry.transition_status(&id, WorkerStatus::Draining);
+            },
+        );
+        assert!(
+            matches!(&lost, Err(error) if error.to_string().contains("was not activated"))
+                && written.status() == WorkerStatus::Draining,
+            "a removal's mark behind the write of a PUT stands and fails its activation"
+        );
+
+        assert!(
+            matches!(
+                service.replace_worker(id.as_str(), worker_spec(url)).await,
+                Err(WorkerServiceError::RemovalInProgress { .. })
+            ),
+            "a PUT of a draining worker is refused as a POST of its URL is"
+        );
+
+        let dropped = RegisterWorkersStep
+            .execute(&mut run_of_a_put(&build()))
+            .await;
+        assert!(
+            matches!(&dropped, Err(error) if error.to_string().contains("is being removed")),
+            "the registry step of a PUT answered before the removal drops its replacement"
+        );
+
+        // The same revision is written without the Draining test: the refusal
+        // above was the removal's, not a stale revision's.
+        let rebuilt = build();
+        assert!(registry.replace_claiming_local(&id, Arc::clone(&rebuilt), worker.revision()));
+        ActivateWorkersStep
+            .execute(&mut run)
+            .await
+            .expect("a superseded PUT has nothing to activate");
+        assert_eq!(
+            rebuilt.status(),
+            WorkerStatus::Draining,
+            "the activation of a PUT superseded since leaves its successor's status alone"
         );
     }
 
@@ -1699,6 +2019,22 @@ mod tests {
             (json!({"url": url, "dp_rank": 2, "dp_size": 2}), "dp_rank"),
             (json!({"url": url, "bootstrap_port": 0}), "bootstrap_port"),
             (
+                json!({"url": url, "resilience": {"cb_failure_threshold": 0}}),
+                "'resilience.cb_failure_threshold': 0 - Must be >= 1 (set to u32::MAX to effectively disable CB)",
+            ),
+            (
+                json!({"url": url, "resilience": {"cb_success_threshold": 0}}),
+                "'resilience.cb_success_threshold': 0 - Must be >= 1",
+            ),
+            (
+                json!({"url": url, "resilience": {"cb_timeout_secs": 0}}),
+                "'resilience.cb_timeout_secs': 0 - Must be > 0",
+            ),
+            (
+                json!({"url": url, "resilience": {"cb_window_secs": 0}}),
+                "'resilience.cb_window_secs': 0 - Must be > 0",
+            ),
+            (
                 json!({"url": format!("grpc://{}:1", "a".repeat(2049))}),
                 "url",
             ),
@@ -1721,6 +2057,7 @@ mod tests {
         // every dp-aware rank worker; only a discovered one is divided per rank.
         let spec: WorkerSpec = serde_json::from_value(json!({
             "url": url, "cost": 2.5, "kv_block_size": 16, "dp_rank": 1, "dp_size": 2,
+            "resilience": {"cb_failure_threshold": 1, "cb_success_threshold": 1, "cb_timeout_secs": 1, "cb_window_secs": 1},
             "labels": {
                 "max_running_requests": "256", "max_num_seqs": "70000",
                 "supports_vision": "true", "served_model_name": "m"

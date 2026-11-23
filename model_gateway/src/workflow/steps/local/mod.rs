@@ -1,10 +1,11 @@
-mod create_worker;
+mod check_local_worker;
 mod ensure_harmony_encoding;
 mod find_worker_to_update;
+mod forget_cache_events;
 mod rediscover_labels;
 mod release_tokenizer;
 mod remove_from_policy_registry;
-mod submit_tokenizer_job;
+pub(crate) mod submit_tokenizer_job;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod update_policies_for_worker;
@@ -14,16 +15,19 @@ mod zmq_labels;
 
 use std::{sync::Arc, time::Duration};
 
-pub use create_worker::CreateLocalWorkerStep;
+pub(crate) use check_local_worker::{CheckLocalWorkerStep, CHECK_LOCAL_WORKER_STEP};
 pub use ensure_harmony_encoding::EnsureHarmonyEncodingStep;
 pub use find_worker_to_update::FindWorkerToUpdateStep;
 use openai_protocol::worker::WorkerUpdateRequest;
 pub use rediscover_labels::RediscoverLabelsStep;
 pub use release_tokenizer::ReleaseTokenizerStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
-use smg_worker::workflow::{
-    single_attempt, worker_removal_workflow, RemovalOrder, WorkerRemovalRequest,
-    REMOVE_FROM_WORKER_REGISTRY_STEP,
+use smg_worker::{
+    jobs::WorkerJobAsker,
+    workflow::{
+        single_attempt, worker_removal_workflow, RemovalOrder, WorkerRemovalRequest,
+        REMOVE_FROM_WORKER_REGISTRY_STEP,
+    },
 };
 pub use submit_tokenizer_job::SubmitTokenizerJobStep;
 pub use update_policies_for_worker::UpdatePoliciesForWorkerStep;
@@ -150,12 +154,14 @@ pub fn create_worker_removal_workflow_data(
     url: String,
     expected_revisions: Option<std::collections::HashMap<String, Option<u64>>>,
     app_context: Arc<AppContext>,
+    asker: WorkerJobAsker,
 ) -> WorkerRemovalWorkflowData {
     WorkerRemovalWorkflowData {
         config: WorkerRemovalRequest {
             url,
             expected_revisions,
         },
+        asker,
         workers_to_remove: None,
         worker_urls: Vec::new(),
         affected_models: std::collections::HashSet::new(),
@@ -171,9 +177,11 @@ pub fn create_worker_update_workflow_data(
     worker_url: String,
     update_config: WorkerUpdateRequest,
     app_context: Arc<AppContext>,
+    asker: WorkerJobAsker,
 ) -> WorkerUpdateWorkflowData {
     WorkerUpdateWorkflowData {
         config: update_config,
+        asker,
         worker_url,
         app_context: Some(app_context),
         workers_to_update: None,
@@ -255,6 +263,7 @@ mod tests {
                     url.to_string(),
                     None,
                     Arc::clone(&app_context),
+                    WorkerJobAsker::Api,
                 ),
             );
             for step in &workflow.steps {
@@ -411,6 +420,7 @@ mod tests {
                         url.to_string(),
                         None,
                         Arc::clone(&app_context),
+                        WorkerJobAsker::Api,
                     ),
                 )
                 .await

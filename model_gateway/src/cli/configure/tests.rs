@@ -1,5 +1,5 @@
 //! The configuration a command line assembles, as a policy document: the
-//! policy controller's corpus through the binary's own parser.
+//! policy controller's corpus through the command-line parser.
 //!
 //! The corpus (`crates/policy_controller/tests/corpus`) holds one item a
 //! routing configuration of the gateway: its input, and under `## Expected
@@ -9,11 +9,13 @@
 use std::{borrow::Cow, fs, path::Path};
 
 use clap::Parser;
-use smg::config::{PolicyDocumentError, RouterConfig};
-use smg_policy_controller::{PolicySpec, SpecError, PRESETS};
+use smg_policy_controller::document::{PolicySpec, RoutingSettingsError, SpecError, PRESETS};
 
-use super::PolicySpecPrint;
-use crate::{cli::url_port::CommandLine, Cli, CliArgs, Commands};
+use super::{
+    super::{url_port::CommandLine, Cli, CliArgs, Commands},
+    PolicySpecPrint,
+};
+use crate::config::{RouterConfig, RoutingMode};
 
 /// The urls of a side that the binary reads ahead of clap, each with its
 /// bootstrap port.
@@ -47,6 +49,91 @@ fn routed(argv: &[String]) -> Result<Converted, String> {
         .routing_config(prefill_urls, encode_urls)
         .map_err(|refused| format!("the routing part of {argv:?} is refused: {refused}"))?;
     Ok(config.policy_document())
+}
+
+#[test]
+fn every_routing_default_means_the_plain_document_but_the_policy() {
+    for (flags, mode) in [
+        (&[][..], RouterConfig::default().mode),
+        (
+            &["--pd-disaggregation"][..],
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+        ),
+        (
+            &["--epd-disaggregation"][..],
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![],
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            },
+        ),
+        (
+            &["--backend", "openai"][..],
+            RoutingMode::OpenAI {
+                worker_urls: vec![],
+            },
+        ),
+        (
+            &["--backend", "anthropic"][..],
+            RoutingMode::Anthropic {
+                worker_urls: vec![],
+            },
+        ),
+        (
+            &["--backend", "gemini"][..],
+            RoutingMode::Gemini {
+                worker_urls: vec![],
+            },
+        ),
+    ] {
+        let argv: Vec<String> = ["smg", "--policy-spec", "routing.yaml"]
+            .into_iter()
+            .chain(flags.iter().copied())
+            .map(str::to_owned)
+            .collect();
+        let (args, prefill_urls, encode_urls) = parsed(&argv).expect("the binary takes the line");
+        let mut config = args
+            .routing_config(prefill_urls, encode_urls)
+            .expect("the routing configuration");
+        let plain = RouterConfig {
+            mode,
+            ..RouterConfig::default()
+        };
+        assert_eq!(config.mode_type(), plain.mode_type(), "{flags:?}");
+        match plain.policy_document() {
+            Ok(document) => {
+                config.policy_spec = Some(document.clone());
+                assert_eq!(config.policy_document_in_force(), Ok(document), "{flags:?}");
+            }
+            Err(refusal) => assert_eq!(config.policy_document(), Err(refusal), "{flags:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_banner_names_the_document_where_one_decides() {
+    for (flags, line) in [
+        (
+            &["--policy-spec", "routing.yaml"][..],
+            "Policy: document routing.yaml",
+        ),
+        (&[][..], "Policy: cache_aware"),
+    ] {
+        let argv: Vec<String> = std::iter::once("smg")
+            .chain(flags.iter().copied())
+            .map(str::to_owned)
+            .collect();
+        let (args, ..) = parsed(&argv).expect("the binary takes the line");
+        assert_eq!(args.policy_line(), line, "{flags:?}");
+    }
 }
 
 /// Holds the routing part of a command line to the document its whole
@@ -146,6 +233,9 @@ enum Verdict {
     LauncherSpelling(Cow<'static, str>),
     /// Its configuration is refused, this setting named.
     Refused(&'static str),
+    /// Its configuration converts to a document the controller takes, and
+    /// the item's block says another one.
+    AnotherDocument,
 }
 
 /// The items that do not convert to their document, each with why.
@@ -155,9 +245,12 @@ const OTHERS: &[(&str, Verdict)] = &[
         "21-launcher-second-spellings-sticky.md",
         Verdict::LauncherSpelling(Cow::Borrowed("--eviction-interval-secs")),
     ),
+    // The conversion writes the sticky override's rule in another form than
+    // this item's block. The corpus is the policy crate's. Where the block
+    // comes to say the conversion's document this entry fails, and leaves.
     (
         "22-cli-least-load-sticky-custom-headers.md",
-        Verdict::Refused("routing_key_override.enabled"),
+        Verdict::AnotherDocument,
     ),
 ];
 
@@ -189,13 +282,24 @@ fn verdict(name: &str, item: &str) -> Result<Verdict, String> {
     one_routing_part(&argv, &whole)?;
     let document = match whole {
         Ok(document) => document,
-        Err(PolicyDocumentError::Unsaid { setting, .. }) => return Ok(Verdict::Refused(setting)),
+        Err(RoutingSettingsError::UnsupportedSetting { setting, .. }) => {
+            return Ok(Verdict::Refused(setting))
+        }
         Err(other) => return Err(format!("no document: {other}")),
     };
     let (_, expected) = fenced(item, "## Expected spec");
     let expected: PolicySpec =
         serde_yaml::from_str(expected).map_err(|err| format!("the expected document: {err}"))?;
     if document != expected {
+        let another = OTHERS
+            .iter()
+            .any(|(listed, verdict)| *listed == name && *verdict == Verdict::AnotherDocument);
+        if another {
+            return match document.validate() {
+                Ok(_) => Ok(Verdict::AnotherDocument),
+                Err(refused) => Err(format!("the controller refuses the document: {refused}")),
+            };
+        }
         return Err(format!(
             "the document differs from the expected one:\n  got      {}\n  expected {}",
             serde_json::to_string(&document).unwrap_or_default(),
@@ -374,6 +478,8 @@ const HEADINGS: [&str; 2] = ["Routing Policy", "PD Disaggregation"];
 
 const POOLS: &str = "the pools and their addresses are the gateway's";
 const ADMISSION: &str = "the prefill queue and its limits are the gateway's admission";
+const THRESHOLDS: &str =
+    "the gateway builds its worker objects with the two overload thresholds, and no document carries one";
 
 const EPD: &[&str] = &[
     "--epd-disaggregation",
@@ -408,8 +514,8 @@ const ROUTING_FLAGS: &[Row] = &[
         "it says the default, and is kept so that an old command line still parses",
     ),
     lands("disable-worker-overload-protection", &[], &[]),
-    lands("worker-overload-waiting-requests", &[], &["32"]),
-    lands("worker-overload-token-usage", &[], &["0.9"]),
+    kept("worker-overload-waiting-requests", &[], &["32"], THRESHOLDS),
+    kept("worker-overload-token-usage", &[], &["0.9"], THRESHOLDS),
     lands("worker-overload-shed", &[], &[]),
     deferred("overlap-decay", &["0.5"], "the prefix-affinity decay"),
     deferred(
@@ -449,16 +555,16 @@ const ROUTING_FLAGS: &[Row] = &[
         &[],
         "whether a rank is a worker of its own is its registration's, not the document's",
     ),
-    refused("routing-key-override", &[], "routing_key_override.enabled"),
+    lands("routing-key-override", &[], &[]),
     lands("pd-pairing-mode", PAIR, &["strict"]),
     lands("routing-key-headers", MANUAL, &["x-session-id"]),
-    refused("grouped-dp-sticky", &["hash"], "grouped_dp_sticky"),
     kept(
-        "enable-igw",
+        "grouped-dp-sticky",
         &[],
-        &[],
-        "which models a gateway serves is its deployment, not the document's",
+        &["hash"],
+        "the dispatch pins a key to an engine of a grouped worker behind the decision",
     ),
+    lands("enable-igw", &[], &[]),
     refused(
         "dp-minimum-tokens-scheduler",
         &[],
@@ -469,6 +575,12 @@ const ROUTING_FLAGS: &[Row] = &[
     lands("worker-warmup-blocks", &[], &["2048"]),
     lands("worker-warmup-thin-ratio", &[], &["0.25"]),
     lands("worker-warmup-divert-every", &[], &["4"]),
+    kept(
+        "policy-controller",
+        &[],
+        &["on"],
+        "it chooses who runs the policy document and leaves the flags' meaning alone",
+    ),
     kept(
         "print-policy-spec",
         &[],
@@ -507,7 +619,7 @@ fn document(context: &[&str], given: &[String]) -> Result<Converted, String> {
 }
 
 /// A command line's document, or the setting of it that no document says.
-type Converted = Result<PolicySpec, PolicyDocumentError>;
+type Converted = Result<PolicySpec, RoutingSettingsError>;
 
 /// The document a flag's value landed in: one the value moved.
 fn landed<'a>(with: &'a Converted, without: &Converted) -> Result<&'a PolicySpec, String> {
@@ -539,7 +651,9 @@ impl Row {
                 Err(other) => Err(format!("the controller refuses its document: {other}")),
             },
             Fate::Refused(setting) => match &with {
-                Err(PolicyDocumentError::Unsaid { setting: named, .. }) if *named == setting => {
+                Err(RoutingSettingsError::UnsupportedSetting { setting: named, .. })
+                    if *named == setting =>
+                {
                     Ok(())
                 }
                 Ok(_) | Err(_) => Err(format!("it is not refused with {setting} named: {with:?}")),
@@ -565,7 +679,13 @@ fn every_routing_flag_lands_is_refused_by_name_or_is_kept_with_its_reason() {
         })
         .filter_map(|arg| arg.get_long())
         .collect();
-    let mut listed: Vec<&str> = ROUTING_FLAGS.iter().map(|row| row.flag).collect();
+    // The input file supplies a document at start-up. Its own cases check
+    // the loaded document and the conflict with printing.
+    let mut listed: Vec<&str> = ROUTING_FLAGS
+        .iter()
+        .map(|row| row.flag)
+        .chain(["policy-spec"])
+        .collect();
     flags.sort_unstable();
     listed.sort_unstable();
     assert_eq!(
@@ -611,8 +731,6 @@ fn the_print_option_answers_with_the_document_a_command_line_means() {
         "--worker-urls",
         "http://worker-a:8000",
         "http://worker-b:8000",
-        "--policy",
-        "cache_aware",
         "--print-policy-spec",
     ]);
     assert_eq!(answer.refusal(), None);
@@ -622,24 +740,48 @@ fn the_print_option_answers_with_the_document_a_command_line_means() {
     );
 }
 
+/// Whether `sentence` is one line that begins with `head` and says more.
+fn is_one_sentence_headed(sentence: &str, head: &str) -> bool {
+    sentence
+        .strip_prefix(head)
+        .is_some_and(|words| !words.is_empty() && !words.contains('\n'))
+}
+
 #[test]
 fn the_print_option_says_a_refusal_in_one_sentence() {
-    // A setting no document says: no document, and the setting by its name.
-    let sticky = "routing_key_override.enabled = true: the controller holds no recorded form of \
-                  the sticky sessions' rule yet";
-    assert_eq!(
-        printed(&["smg", "--routing-key-override", "--print-policy-spec"]),
-        PolicySpecPrint::Refused(sticky.to_string())
+    // A setting no document says: no document, and one sentence with the
+    // setting by its name at the head. The words behind the head are the
+    // policy crate's, and no case of the gateway holds them. The sticky
+    // override has no document beside the prefix hash ring.
+    let sticky = printed(&[
+        "smg",
+        "--policy",
+        "prefix_hash",
+        "--routing-key-override",
+        "--print-policy-spec",
+    ]);
+    assert_eq!(sticky.document(), None);
+    assert!(
+        sticky
+            .refusal()
+            .is_some_and(|sentence| is_one_sentence_headed(
+                sentence,
+                "routing_key_override.enabled = true: "
+            )),
+        "{sticky:?}"
     );
 
     // A line the binary itself refuses: the configuration's own sentence.
-    let alone = printed(&["smg", "--policy", "power_of_two", "--print-policy-spec"]);
-    assert_eq!(alone.document(), None);
+    let mut line = vec!["smg"];
+    line.extend_from_slice(PAIR);
+    line.extend_from_slice(&["--decode-policy", "bucket", "--print-policy-spec"]);
+    let bucket = printed(&line);
+    assert_eq!(bucket.document(), None);
     assert!(
-        alone
+        bucket
             .refusal()
-            .is_some_and(|sentence| sentence.contains("at least 2 workers")),
-        "{alone:?}"
+            .is_some_and(|sentence| sentence.contains("Decode policy should not be allowed")),
+        "{bucket:?}"
     );
 
     // A document this build's controller does not run yet: it prints, with
@@ -649,12 +791,28 @@ fn the_print_option_says_a_refusal_in_one_sentence() {
         read_back(&decayed),
         PolicySpec::preset("cache_aware").expect("a preset")
     );
-    assert_eq!(
-        decayed.refusal(),
-        Some(
-            "profiles.cache_aware.score[1].prefix-affinity: the prefix-affinity decay is not in \
-             this build"
-        )
+    assert!(
+        decayed
+            .refusal()
+            .is_some_and(|sentence| is_one_sentence_headed(
+                sentence,
+                "profiles.cache_aware.score[1].prefix-affinity: "
+            )),
+        "{decayed:?}"
+    );
+}
+
+/// A policy that compares two workers prints its document with one worker
+/// URL or none: no rule counts the worker URLs a line gives, since a URL
+/// registers one worker per data-parallel rank of its engine.
+#[test]
+fn the_print_counts_no_worker_urls_under_power_of_two() {
+    let alone = printed(&["smg", "--policy", "power_of_two", "--print-policy-spec"]);
+    assert!(
+        alone
+            .document()
+            .is_some_and(|yaml| yaml.contains("pick: power-of-two")),
+        "{alone:?}"
     );
 }
 

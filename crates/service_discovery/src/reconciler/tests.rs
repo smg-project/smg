@@ -1,8 +1,9 @@
 use std::{slice, sync::Arc};
 
-use openai_protocol::worker::WorkerType;
+use openai_protocol::worker::{RuntimeType, WorkerStatus, WorkerType};
 use smg_worker::{
     identity::endpoint::endpoint_key,
+    pd::pairing::{PairingMismatch, PdPairing, PdPairingMode},
     test_support::{assert_metric, render_with_recorder},
 };
 use tokio::runtime::Builder;
@@ -25,6 +26,7 @@ fn published(url: &str, discovery_id: &str) -> DiscoveredWorker {
         kv_connector: None,
         kv_role: None,
         kv_engine_id: None,
+        pairing_protocol: None,
         compat_labels: BTreeMap::new(),
     }
 }
@@ -294,6 +296,36 @@ fn owned_workers_read_back_the_spec_hash() {
     assert!(actions.remove.is_empty());
 }
 
+/// Today's behaviour, held here so that a change of it is a choice and not
+/// an accident: a pass reads no worker state. A worker that left the
+/// published list and is listed again while its removal still drains it
+/// counts as registered, so the pass queues nothing for it. The removal
+/// goes on and removes it, and the first pass after that registers it again.
+#[test]
+fn a_worker_listed_again_while_it_drains_counts_as_registered() {
+    let host = TestHost::without_a_queue();
+    let worker = published("10.0.0.1:8080", "f-1");
+    register_with_labels(
+        &host,
+        "http://10.0.0.1:8080",
+        &[
+            (DISCOVERY_PROVIDER_LABEL, "file"),
+            (DISCOVERY_ID_LABEL, "f-1"),
+            (DISCOVERY_SPEC_HASH_LABEL, &worker.fingerprint()),
+        ],
+    );
+    // What the removal's drain step writes while its window runs.
+    for registered in host.registry.get_all() {
+        registered.set_status(WorkerStatus::Draining);
+    }
+
+    let owned = owned_workers(&*host, DiscoveryKind::File);
+    assert_eq!(owned.len(), 1);
+    let actions = compute_actions(&desired_state_of(&[worker]), &owned);
+    assert!(actions.add.is_empty());
+    assert!(actions.remove.is_empty());
+}
+
 /// An owned worker missing its fingerprint label cannot be shown current,
 /// so it is updated in place and comes back labelled properly.
 #[test]
@@ -382,6 +414,44 @@ fn owned_workers_exclude_mesh_imported_workers() {
     assert!(owned_workers(&*host, DiscoveryKind::Kubernetes).is_empty());
 }
 
+/// Workers published under different pairing protocols never pair under
+/// strict mode, and workers under one protocol do. Nothing else tells the
+/// two rollouts here apart: without the protocol a prefill of one would pair
+/// with a decode of the other.
+#[test]
+fn workers_of_different_pairing_protocols_never_pair_under_strict_mode() {
+    let host = TestHost::without_a_queue();
+    let pairing = |url: &str, worker_type: WorkerType, protocol: Option<&str>| {
+        let worker = DiscoveredWorker {
+            worker_type,
+            kv_connector: Some("NixlConnector".to_string()),
+            pairing_protocol: protocol.map(str::to_string),
+            ..published(url, url)
+        };
+        let mut spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*host);
+        // As registration completes the spec: the runtime its probe detects.
+        spec.runtime_type = RuntimeType::Vllm;
+        PdPairing::derive(&spec)
+    };
+    let prefill = |protocol| pairing("10.0.1.1:8080", WorkerType::Prefill, protocol);
+    let decode = |protocol| pairing("10.0.2.1:8080", WorkerType::Decode, protocol);
+    let strict = PdPairingMode::Strict;
+
+    for same in ["v1", "v2"] {
+        let (prefill, decode) = (prefill(Some(same)), decode(Some(same)));
+        assert_eq!(prefill.mismatch(&decode, strict), None, "{same}");
+    }
+    for (old, new) in [("v1", "v2"), ("v2", "v1")] {
+        let (prefill, decode) = (prefill(Some(old)), decode(Some(new)));
+        assert_eq!(
+            prefill.mismatch(&decode, strict),
+            Some(PairingMismatch::Explicit),
+            "a prefill of {old} and a decode of {new}"
+        );
+    }
+    assert_eq!(prefill(None).mismatch(&decode(None), strict), None);
+}
+
 #[test]
 fn build_worker_spec_carries_the_record_and_stamps_provenance() {
     let host = TestHost::without_a_queue();
@@ -392,6 +462,7 @@ fn build_worker_spec_carries_the_record_and_stamps_provenance() {
         kv_connector: Some("MooncakeConnector".to_string()),
         kv_role: Some("kv_producer".to_string()),
         kv_engine_id: Some("engine-1".to_string()),
+        pairing_protocol: Some("rollout-7".to_string()),
         ..published("10.0.0.1:8081", "uid-1:8081")
     };
     let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*host);
@@ -402,6 +473,7 @@ fn build_worker_spec_carries_the_record_and_stamps_provenance() {
     assert_eq!(spec.kv_connector.as_deref(), Some("MooncakeConnector"));
     assert_eq!(spec.kv_role.as_deref(), Some("kv_producer"));
     assert_eq!(spec.kv_engine_id.as_deref(), Some("engine-1"));
+    assert_eq!(spec.pairing_protocol.as_deref(), Some("rollout-7"));
     assert_eq!(
         spec.labels.get("served_model_name").map(String::as_str),
         Some("llama")
@@ -424,6 +496,38 @@ fn build_worker_spec_carries_the_record_and_stamps_provenance() {
     assert_eq!(
         spec.labels.get(DISCOVERY_SPEC_HASH_LABEL),
         Some(&worker.fingerprint())
+    );
+}
+
+#[test]
+fn build_worker_spec_omits_a_blank_model_override() {
+    let host = TestHost::without_a_queue();
+    for model_id_override in ["", " \t"] {
+        let worker = DiscoveredWorker {
+            model_id_override: Some(model_id_override.to_string()),
+            ..published("10.0.0.1:8081", "uid-1:8081")
+        };
+        let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*host);
+
+        assert!(
+            !spec.labels.contains_key("served_model_name"),
+            "override {model_id_override:?} was stamped as served_model_name"
+        );
+    }
+}
+
+#[test]
+fn build_worker_spec_trims_a_padded_model_override() {
+    let host = TestHost::without_a_queue();
+    let worker = DiscoveredWorker {
+        model_id_override: Some(" llama \t".to_string()),
+        ..published("10.0.0.1:8081", "uid-1:8081")
+    };
+    let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*host);
+
+    assert_eq!(
+        spec.labels.get("served_model_name").map(String::as_str),
+        Some("llama")
     );
 }
 
@@ -542,6 +646,29 @@ fn register_an_unpublished_worker(host: &TestHost, url: &str) {
     );
 }
 
+#[tokio::test]
+async fn the_reconciler_asks_as_discovery() {
+    let (host, jobs) = TestHost::recording();
+    register_an_unpublished_worker(&host, "http://10.0.0.2:8080");
+    let desired = desired_state_of(&[published("http://10.0.0.1:8080", "u1")]);
+
+    pass(&desired, &host).await;
+
+    assert!(matches!(
+        jobs.queued().as_slice(),
+        [
+            Queued::Remove {
+                asker: WorkerJobAsker::Discovery,
+                ..
+            },
+            Queued::Add {
+                asker: WorkerJobAsker::Discovery,
+                ..
+            },
+        ]
+    ));
+}
+
 /// What a pass hands the queue is the spec its host stamped, the credential
 /// and the budget of attempts on it, under an Upsert.
 #[tokio::test]
@@ -551,7 +678,7 @@ async fn a_pass_registers_the_spec_its_host_stamped() {
     pass(&desired_state_of(slice::from_ref(&worker)), &host).await;
 
     let queued = jobs.queued();
-    let [Queued::Add { spec, mode }] = queued.as_slice() else {
+    let [Queued::Add { spec, mode, .. }] = queued.as_slice() else {
         panic!("one addition and nothing else: {queued:?}");
     };
     assert_eq!(*mode, WorkerRegistrationMode::Upsert);
@@ -585,7 +712,7 @@ async fn a_pass_leaves_an_address_whose_job_is_in_flight() {
     jobs.release("http://10.0.0.1:8080");
     pass(&desired, &host).await;
     let queued = jobs.queued();
-    let [Queued::Remove { url, guards }, Queued::Add { spec, .. }] = queued.as_slice() else {
+    let [Queued::Remove { url, guards, .. }, Queued::Add { spec, .. }] = queued.as_slice() else {
         panic!("the removal, then the addition: {queued:?}");
     };
     assert_eq!(url, "10.0.0.2:8080");

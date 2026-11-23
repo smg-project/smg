@@ -2,9 +2,19 @@
 //!
 //! The adapter reads the lead before it takes the object's mutation lock and
 //! again under it. With the lock held, it reads the holder's map, releases
-//! the read lock, and writes the store. The holder writes its map
-//! and the registry under separate locks and reads the store with neither
-//! held.
+//! the read lock, and writes the store. The store asks the lead once more
+//! behind its own locks, as an admitted apply asks its own: a term that
+//! ended while a write waited there writes nothing. The holder writes its
+//! map and the registry under separate locks. Its status mirror reads the
+//! row under the same mutation lock as the adapter and writes through the
+//! registry as the adapter does.
+//!
+//! The store guards a write by the row's id and revision, and a row's id is
+//! its key and incarnation. A URL's next life under another incarnation is
+//! another row: an outcome of the earlier life's object finds no row under
+//! the id it names and writes nothing. So the guard tells lives apart where
+//! the host numbers each life apart, as a registration door does with
+//! [`life`](crate::store::membership::life).
 
 use std::sync::Arc;
 
@@ -15,7 +25,7 @@ use smg_worker::{
     worker::WorkerStatus as ObjectStatus,
 };
 
-use super::{object::status, Lead, Objects, Standing};
+use super::{object::status, Lead, Objects, RowRevision};
 use crate::store::{HealthSink as StoreHealthSink, HealthWrite};
 
 /// The health sink for a replica that keeps its workers in the store.
@@ -28,7 +38,8 @@ pub struct HealthAdapter<G, S: ?Sized> {
 
 impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
     /// An adapter for `term`. Each call checks that `lead` still names it
-    /// before taking the object's lock, and again under the lock.
+    /// before taking the object's lock and again under the lock, and the
+    /// store asks it once more behind its own.
     pub fn new(objects: Arc<Objects<G>>, store: Arc<S>, lead: Arc<dyn Lead>, term: u64) -> Self {
         Self {
             objects,
@@ -42,11 +53,16 @@ impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
         self.lead.term() == Some(self.term)
     }
 
+    /// A verdict's write, run under the fences of a health write: the lead,
+    /// read before the object's mutation lock and again under it, the
+    /// object the holder laid, and the revision that object was built from.
+    /// The status that stands on the row goes back to the registry, which
+    /// sets a lagging object to it.
     fn write(
         &self,
         worker_id: &ObjectId,
         revision: u64,
-        write_row: impl FnOnce(&S, Standing) -> HealthWrite,
+        write_row: impl FnOnce(&S, RowRevision) -> HealthWrite,
     ) -> HealthWrite {
         if !self.leads() {
             return HealthWrite::Stale;
@@ -81,7 +97,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized + 'static> HealthSink for Health
         _launched: ObjectStatus,
     ) -> ProbeAnswer {
         match self.write(worker_id, revision, |store, standing| {
-            store.probe_outcome(standing.row, passed, standing.revision)
+            store.probe_outcome(standing.row, passed, standing.revision, &|| self.leads())
         }) {
             HealthWrite::Moved { from, to } => ProbeAnswer::Moved {
                 old: status(from),
@@ -98,7 +114,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized + 'static> HealthSink for Health
         revision: u64,
     ) -> Option<(ObjectStatus, ObjectStatus)> {
         self.write(worker_id, revision, |store, standing| {
-            store.connected(standing.row, standing.revision)
+            store.connected(standing.row, standing.revision, &|| self.leads())
         })
         .moved()
         .map(|(from, to)| (status(from), status(to)))
@@ -108,19 +124,23 @@ impl<G: Generation, S: StoreHealthSink + ?Sized + 'static> HealthSink for Health
 #[cfg(test)]
 mod tests {
     use parking_lot::Mutex;
-    use smg_worker::registry::{event::WorkerEvent, WorkerRegistry};
+    use smg_worker::{
+        registry::{event::WorkerEvent, WorkerRegistry},
+        runtime::StallReason,
+    };
     use tokio::sync::broadcast::error::TryRecvError;
 
     use super::*;
     use crate::{
         store::{
-            HealthPolicy, LeasesStore, MemoryStore, WorkerFacts, WorkerPatch,
+            membership::life, HealthPolicy, MemoryStore, WorkerFacts, WorkerPatch,
             WorkerStatus as RowStatus, WorkersStore,
         },
         worker_host::{object, Members, SoleLead},
     };
 
     const URL: &str = "http://a:8000";
+    const MODEL: &str = "m";
 
     struct Replica {
         store: Arc<MemoryStore>,
@@ -136,6 +156,7 @@ mod tests {
             let row = store
                 .upsert(WorkerFacts {
                     key: URL.to_string(),
+                    models: vec![MODEL.to_string()],
                     health: HealthPolicy {
                         success_threshold,
                         probes,
@@ -165,6 +186,11 @@ mod tests {
             )
         }
 
+        fn object(&self) -> Arc<dyn Worker> {
+            let registry = self.objects.registry();
+            registry.get(&self.id).expect("a worker")
+        }
+
         #[track_caller]
         fn assert_statuses(&self, row: Option<RowStatus>, object: ObjectStatus) {
             assert_eq!(self.store.by_key(URL).map(|row| row.status), row);
@@ -183,14 +209,27 @@ mod tests {
         }
     }
 
-    /// A lead whose term ends between its first reading and its second.
-    struct TurningLead(Mutex<u32>);
+    /// A lead whose term ends behind a count of its readings. The adapter
+    /// reads it before the object's lock and again under it.
+    struct TurningLead {
+        readings: Mutex<u32>,
+        leads_for: u32,
+    }
+
+    impl TurningLead {
+        fn after(leads_for: u32) -> Arc<Self> {
+            Arc::new(Self {
+                readings: Mutex::new(0),
+                leads_for,
+            })
+        }
+    }
 
     impl Lead for TurningLead {
         fn term(&self) -> Option<u64> {
-            let mut readings = self.0.lock();
+            let mut readings = self.readings.lock();
             *readings += 1;
-            Some(if *readings == 1 { 1 } else { 2 })
+            Some(if *readings <= self.leads_for { 1 } else { 2 })
         }
     }
 
@@ -237,7 +276,7 @@ mod tests {
         let replica = Replica::new(1, true).expect("a laid worker");
         let row = replica.store.by_key(URL).expect("a row");
         assert!(
-            StoreHealthSink::connected(replica.store.as_ref(), row.id, row.revision)
+            StoreHealthSink::connected(replica.store.as_ref(), row.id, row.revision, &|| true)
                 .moved()
                 .is_some()
         );
@@ -268,6 +307,68 @@ mod tests {
             (replica.id, ObjectStatus::Pending, ObjectStatus::Ready)
         );
         assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn an_object_laid_for_a_rows_next_revision_carries_the_veto() {
+        let replica = Replica::new(1, true).expect("a laid worker");
+        let row = replica.store.by_key(URL).expect("a row");
+        let patch = WorkerPatch {
+            priority: Some(1),
+            ..WorkerPatch::default()
+        };
+        assert!(replica.store.patch(row.id, patch, row.revision).is_some());
+        assert!(replica.object().set_stall(Some(StallReason::Wedged)));
+        // The holder lays the row's next revision in the object's place.
+        // The replacement takes its running state, the veto with the rest.
+        replica.objects.follow(replica.store.as_ref());
+        assert_ne!(replica.object().revision(), replica.revision);
+        assert_eq!(replica.object().stall_reason(), Some(StallReason::Wedged));
+    }
+
+    /// The store has the term's last word at a verdict too. A probe's
+    /// outcome and a connect signal that passed the adapter's two readings
+    /// and waited at the store's lock through their term's end write
+    /// nothing there: no status moves, no probe is counted and the journal
+    /// is told nothing.
+    #[test]
+    fn a_verdict_whose_term_ended_at_the_stores_lock_writes_nothing() {
+        let replica = Replica::new(2, true).expect("a laid worker");
+        let turning = || {
+            HealthAdapter::new(
+                Arc::clone(&replica.objects),
+                Arc::clone(&replica.store),
+                TurningLead::after(2),
+                1,
+            )
+        };
+        let epoch = replica.store.epoch();
+        assert_eq!(
+            turning().probe_outcome(&replica.id, true, replica.revision, ObjectStatus::Pending),
+            ProbeAnswer::Stale
+        );
+        assert_eq!(turning().connected(&replica.id, replica.revision), None);
+        replica.assert_statuses(Some(RowStatus::Pending), ObjectStatus::Pending);
+        assert_eq!(
+            replica.store.epoch(),
+            epoch,
+            "a refused verdict moved the store"
+        );
+        // The refused pass was not counted: under a term that stands the
+        // row still owes the two passes its policy asks.
+        let adapter = replica.adapter();
+        assert_eq!(
+            adapter.probe_outcome(&replica.id, true, replica.revision, ObjectStatus::Pending),
+            ProbeAnswer::Stood(ObjectStatus::Pending)
+        );
+        assert_eq!(
+            adapter.probe_outcome(&replica.id, true, replica.revision, ObjectStatus::Pending),
+            ProbeAnswer::Moved {
+                old: ObjectStatus::Pending,
+                new: ObjectStatus::Ready,
+            }
+        );
+        replica.assert_statuses(Some(RowStatus::Ready), ObjectStatus::Ready);
     }
 
     #[test]
@@ -343,6 +444,34 @@ mod tests {
         replica.assert_statuses(None, ObjectStatus::Pending);
     }
 
+    /// A URL's next life, numbered as a registration door numbers one, is
+    /// another row under another id. An outcome of the earlier life's
+    /// object, which the holder has not ended yet, finds no row under the id
+    /// it names and writes nothing on the new one.
+    #[test]
+    fn an_outcome_of_a_urls_earlier_life_writes_nothing_on_its_next() {
+        let replica = Replica::new(1, true).expect("a laid worker");
+        let adapter = replica.adapter();
+        let earlier = replica.store.by_key(URL).expect("a row");
+        assert!(replica.store.remove(earlier.id, earlier.revision).is_some());
+        let next = replica
+            .store
+            .upsert(WorkerFacts {
+                incarnation: life(1, 0, replica.store.epoch()),
+                ..earlier.facts.clone()
+            })
+            .id();
+        assert_ne!(next, earlier.id, "another life takes another id");
+
+        // The holder has not followed: its object is the earlier life's.
+        assert_eq!(
+            adapter.probe_outcome(&replica.id, true, replica.revision, ObjectStatus::Pending),
+            ProbeAnswer::Stale
+        );
+        assert_eq!(adapter.connected(&replica.id, replica.revision), None);
+        replica.assert_statuses(Some(RowStatus::Pending), ObjectStatus::Pending);
+    }
+
     #[test]
     fn a_connect_signal_readies_a_pending_row_and_its_object() {
         let replica = Replica::new(2, false).expect("a laid worker");
@@ -358,7 +487,7 @@ mod tests {
         let replica = Replica::new(2, false).expect("a laid worker");
         let row = replica.store.by_key(URL).expect("a row");
         assert_eq!(
-            StoreHealthSink::connected(replica.store.as_ref(), row.id, row.revision),
+            StoreHealthSink::connected(replica.store.as_ref(), row.id, row.revision, &|| true),
             HealthWrite::Moved {
                 from: RowStatus::Pending,
                 to: RowStatus::Ready,
@@ -396,7 +525,7 @@ mod tests {
             HealthAdapter::new(
                 Arc::clone(&replica.objects),
                 Arc::clone(&replica.store),
-                Arc::new(TurningLead(Mutex::new(0))),
+                TurningLead::after(1),
                 1,
             )
         };
@@ -419,7 +548,6 @@ mod tests {
     #[test]
     fn an_adapter_of_an_earlier_term_writes_nothing() {
         let replica = Replica::new(1, true).expect("a laid worker");
-        replica.store.set_term(1);
         let lead = Arc::new(TestLead(Mutex::new(Some(1))));
         let adapter = HealthAdapter::new(
             Arc::clone(&replica.objects),
@@ -427,7 +555,6 @@ mod tests {
             lead.clone(),
             1,
         );
-        replica.store.set_term(2);
         *lead.0.lock() = Some(2);
         assert_eq!(
             adapter.probe_outcome(&replica.id, true, replica.revision, ObjectStatus::Pending),

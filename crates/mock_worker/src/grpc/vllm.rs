@@ -321,6 +321,7 @@ impl VllmEngine for MockScheduler {
                 utilization: s.token_usage,
                 max_running_requests: s.max_running_requests,
                 num_waiting_uncached_tokens: s.num_waiting_uncached_tokens,
+                values: self.load_values(dp_rank),
             })
             .collect();
         Ok(Response::new(vllm::GetLoadsResponse {

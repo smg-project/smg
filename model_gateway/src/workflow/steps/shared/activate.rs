@@ -4,16 +4,22 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use openai_protocol::worker::WorkerStatus;
-use smg_worker::identity::basic::{ConnectionMode, Worker};
-use tracing::info;
+use smg_worker::{
+    identity::basic::{ConnectionMode, Worker},
+    registry::WorkerId,
+};
+use tracing::{debug, info};
 use wfaas::{
-    StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
+    StepExecutor, StepId, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
 };
 
-use crate::workflow::data::{require_app_context, WorkerRegistrationData};
+use crate::workflow::data::{require_app_context, WorkerRegistrationData, WorkerRegistrationMode};
 
 /// Final step in any worker registration workflow: flip Pending → Ready.
 pub struct ActivateWorkersStep;
+
+/// The step's id in the registration DAGs.
+pub(crate) const ACTIVATE_WORKERS_STEP: &str = "activate_workers";
 
 /// Decide the activation transition for a worker, or `None` to leave it as-is.
 ///
@@ -48,6 +54,49 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
         let registry = &app_context.worker_registry;
         let mut activated = 0;
         for worker in workers {
+            // A PUT's replacement shares the status of the worker it
+            // replaced: a removal's Draining mark behind the PUT's write
+            // stands and fails the step, decided under the worker's lock.
+            if let WorkerRegistrationMode::ReplaceById { worker_id, .. } =
+                context.data.registration_mode()
+            {
+                let worker_id = WorkerId::from_string(worker_id);
+                let status = activation_status(worker);
+                let decide = |held: &Arc<dyn Worker>| {
+                    let mine = Arc::ptr_eq(held, worker);
+                    let leaving = mine && held.status() == WorkerStatus::Draining;
+                    (leaving, status.filter(|_| mine && !leaving))
+                };
+                // The revision is only the call's precondition (`ptr_eq` is
+                // the identity test), and a mesh publication can raise it in
+                // place behind the read: it is read once more.
+                let outcome = registry
+                    .apply_if_revision(&worker_id, worker.revision(), decide)
+                    .or_else(|| registry.apply_if_revision(&worker_id, worker.revision(), decide));
+                match outcome {
+                    Some((true, _)) => {
+                        return Err(WorkflowError::StepFailed {
+                            step_id: StepId::new(ACTIVATE_WORKERS_STEP),
+                            message: format!(
+                                "Worker {} at {} is being removed, so its replacement was not \
+                                 activated",
+                                worker_id.as_str(),
+                                worker.redacted_url()
+                            ),
+                        })
+                    }
+                    Some((false, Some(_))) => activated += 1,
+                    // Nothing to write, or superseded since: the status is
+                    // its successor's.
+                    Some((false, None)) => {}
+                    None => debug!(
+                        worker_id = %worker_id.as_str(),
+                        worker_url = worker.redacted_url(),
+                        "Replacement not activated: the worker is gone or its revision moved behind both reads"
+                    ),
+                }
+                continue;
+            }
             if let Some(status) = activation_status(worker) {
                 // Only the worker this workflow registered: an upsert of the
                 // same URL that raced it (discovery beside an API call) must
@@ -72,7 +121,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
         }
 
         info!(
-            "Activated {activated} of {} worker(s) (others left as-is: already ready or awaiting connect signal)",
+            "Activated {activated} of {} worker(s) (others left as-is: already ready, awaiting connect signal or replaced since)",
             workers.len()
         );
 
@@ -87,7 +136,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::WorkerSpec;
-    use smg_worker::registry::event::WorkerEvent;
+    use smg_worker::{jobs::WorkerJobAsker, registry::event::WorkerEvent};
     use wfaas::WorkflowInstanceId;
 
     use super::*;
@@ -95,7 +144,7 @@ mod tests {
         app_context::{testing::app_context_for_tests, AppContext},
         config::RouterConfig,
         routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
-        workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
+        workflow::steps::create_worker_workflow_data,
     };
 
     #[test]
@@ -171,6 +220,7 @@ mod tests {
             WorkerSpec::new(url),
             WorkerRegistrationMode::Upsert,
             Arc::clone(&app_context),
+            WorkerJobAsker::Api,
         );
         data.actual_workers = Some(vec![Arc::clone(&worker)]);
         let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);

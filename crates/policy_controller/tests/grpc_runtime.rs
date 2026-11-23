@@ -7,7 +7,7 @@
 use std::sync::{Mutex, PoisonError};
 
 use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
-use smg_policy_controller::{grpc::Runtime, plugins::OpenDecisions};
+use smg_policy_controller::plugins::{grpc::Runtime, shared::OpenDecisions};
 
 /// One case at a time lowers a limit of the process.
 static LIMITS: Mutex<()> = Mutex::new(());

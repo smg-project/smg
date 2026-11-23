@@ -4,9 +4,9 @@
 
 use super::{fleet, worker, Worker, MODES};
 use crate::{
-    spec::Pairing,
+    document::spec::Pairing,
+    engine::view::WorkerId,
     store::pairing::{place, Derivation, Member, Numbering, PairClasses},
-    view::WorkerId,
 };
 
 /// A pool's workers, each under its id, in id order.

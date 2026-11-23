@@ -12,26 +12,44 @@
 //! a partner names a class that holds an encoder taking its media. A
 //! request without items reads no encoder.
 //!
-//! The decision's part is every answer whole, through
-//! [`Engine::decide_encode_pair`] over the row's fleet: the pair pick for
-//! pick, whether the items were placed as one key, each key's encoder, and
-//! a refusal by its name. A ring's owner is not one identity in the
-//! gateway's ring and this crate's, so under consistent hashing a key is
-//! held to the encoders it was offered and equal keys to one encoder. The
-//! pair's own refusal is replayed by its name alone.
+//! The decision's part is every answer whole, through the engine's entry
+//! for an encode request ([`PolicyEngine::decide_encode_at`]) over the
+//! row's fleet as a host of the engine keeps it: the prefills, the decodes
+//! and the encoders as three lists of worker objects, each lent with its
+//! cell and with what the host says of its workers. A worker's state and
+//! the requests the router holds on it are its object's own. The pair
+//! replays pick for pick, and with it whether the items were placed as one
+//! key, each key's encoder, and a refusal by its name. A ring's owner is
+//! not one identity in the gateway's ring and this crate's, so under
+//! consistent hashing a key is held to the encoders it was offered and
+//! equal keys to one encoder. The pair's own refusal is replayed by its
+//! name alone.
 //!
 //! A row records the handoff's form on its encoders. The gateway reads a
 //! prefill's form as it reads an encoder's, from the runtime, so a prefill
 //! here states the form its runtime's encoders state in the row.
 
+use std::{sync::Arc, time::Instant};
+
 use serde::Deserialize;
 use smg_policy_controller::{
-    fingerprint,
-    store::encoding::{EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer},
-    Candidate, Constraints, Decision, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine,
-    Health, Identity, MediaCounts, PairPools, PairTable, PolicySpec, PoolFacts, RequestFacts, Role,
-    Scratch, WorkerId,
+    document::{AppliedSpec, PolicySpec},
+    engine::{
+        fingerprint, Constraints, Decision, EncodeItems, EncodeLists, EncodePlaced, EncoderFacts,
+        FixedFacts, Identity, LentList, ListCell, MediaCounts, PairAdmission, PairLists,
+        PartnerClasses, Phase, PolicyEngine, Request as HostRequest, RequestFacts, RequestMaker,
+        WorkerLists,
+    },
+    store::{EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer},
 };
+use smg_worker::{
+    identity::{basic::Worker, builder::BasicWorkerBuilder},
+    model_card::ModelCard,
+    worker::{HealthCheckConfig, WorkerStatus, WorkerType},
+};
+
+/// The model every worker of a row serves.
+const MODEL: &str = "m";
 
 /// The classic policy these rows record, as a sheet's head names it.
 pub const POLICY: &str = "encode_pair";
@@ -285,7 +303,7 @@ fn replay(row: &Row) -> Vec<String> {
             Answer::Refused { .. } => {}
         }
     }
-    found.extend(decided(row, &classes));
+    found.extend(decided(row, &classes, &of_encoders));
     found
 }
 
@@ -293,11 +311,11 @@ fn replay(row: &Row) -> Vec<String> {
 /// picked by where no ring places it.
 const FEWEST: &str = "power_of_two:least_requests";
 
-/// The engine of a row's three policies under the `epd` plan: each side of
-/// the pair takes the worker that holds fewer requests, and so does an
-/// item's encoder unless the row places items on the ring. `None` for a
-/// policy this replay does not build.
-fn engine(row: &Row) -> Option<Engine> {
+/// The engine of a row's three policies under the `epd` plan, as a host of
+/// worker lists holds it: each side of the pair takes the worker that holds
+/// fewer requests, and so does an item's encoder unless the row places
+/// items on the ring. `None` for a policy this replay does not build.
+fn engine(row: &Row) -> Option<PolicyEngine> {
     if row.prefill_policy != FEWEST || row.decode_policy != FEWEST {
         return None;
     }
@@ -312,63 +330,133 @@ fn engine(row: &Row) -> Option<Engine> {
             profile.pick = "count-first".into();
         }
     }
-    spec.validate().ok()
+    let applied = AppliedSpec::validate(&spec).ok()?;
+    Some(PolicyEngine::new(applied))
 }
 
-/// One worker's row in a pool of the replay: ready or not, with the
-/// requests the router holds on it and every admission bit set.
-fn worker(at: usize, first: u64, role: Role, open: bool, in_flight: u32) -> Candidate {
-    let id = first + at as u64;
-    Candidate {
-        position: at as u32,
-        id: WorkerId(id),
-        role,
-        health: Health {
-            healthy: open,
-            ..Health::default()
-        },
-        in_flight,
-        has_capacity: true,
-        has_room: true,
-        key: id as u32,
-        ..Candidate::default()
+/// One worker object of a row's list: ready or not, with the requests the
+/// router holds on it as its object's own count.
+fn object(list: &str, at: usize, role: WorkerType, open: bool, in_flight: u32) -> Arc<dyn Worker> {
+    let object = <BasicWorkerBuilder>::new(format!("http://{list}-{at}:8000"))
+        .worker_type(role)
+        .model(ModelCard::new(MODEL))
+        .health_config(HealthCheckConfig {
+            disable_health_check: true,
+            ..HealthCheckConfig::default()
+        })
+        .build();
+    object.set_status(if open {
+        WorkerStatus::Ready
+    } else {
+        WorkerStatus::NotReady
+    });
+    for _ in 0..in_flight {
+        object.increment_load();
+    }
+    Arc::new(object)
+}
+
+/// What a host says of a worker beside its object: whether it takes images.
+fn takes_images(vision: bool) -> FixedFacts {
+    let mut said = FixedFacts::default();
+    said.vision = vision;
+    said
+}
+
+/// A pair's host with no limit of its own: every prefill has capacity and
+/// every decode a room.
+#[derive(Debug)]
+struct Open;
+
+impl PairAdmission for Open {
+    fn has_capacity(&self, _: usize) -> bool {
+        true
+    }
+
+    fn has_room(&self, _: usize) -> bool {
+        true
     }
 }
 
-/// The pair classes of a row's partner lists: each prefill is a class of
-/// its own, the decodes are numbered as the lists first name them (`0` for
-/// a decode no prefill partners), and the table's two slices follow.
-struct Pairing {
-    decode_classes: Vec<u32>,
-    ends: Vec<u32>,
-    listed: Vec<u32>,
+/// A row's fleet as a host of the engine keeps it: the prefills, the
+/// decodes and the encoders as three lists of worker objects, what the host
+/// says of each list's workers, the cell kept beside each list, and the
+/// pair classes of the row's partner lists.
+struct Fleet {
+    lists: [Arc<[Arc<dyn Worker>]>; 3],
+    said: [Vec<FixedFacts>; 3],
+    cells: [ListCell; 3],
+    partners: PartnerClasses,
 }
 
-fn pairing(row: &Row) -> Pairing {
-    let mut decode_classes = vec![0u32; row.decodes.len()];
-    let mut named = 0u32;
-    let (mut ends, mut listed) = (Vec::new(), Vec::new());
-    for prefill in &row.prefills {
-        let mut list: Vec<u32> = prefill
-            .partners
-            .iter()
-            .filter_map(|&decode| {
-                let class = decode_classes.get_mut(decode as usize)?;
-                if *class == 0 {
-                    named += 1;
-                    *class = named;
-                }
-                Some(*class)
+impl Fleet {
+    fn of(row: &Row) -> Self {
+        let pushes = |runtime: &str| {
+            let mut of_runtime = row.encoders.iter().filter(|w| w.runtime == runtime);
+            of_runtime.any(|w| w.handoff == Some(Form::Push))
+        };
+        let prefills = (row.prefills.iter().enumerate())
+            .map(|(at, w)| object("prefill", at, WorkerType::Prefill, w.open, w.in_flight));
+        let decodes = (row.decodes.iter().enumerate())
+            .map(|(at, w)| object("decode", at, WorkerType::Decode, w.open, w.in_flight));
+        let encoders = (row.encoders.iter().enumerate())
+            .map(|(at, w)| object("encode", at, WorkerType::Encode, w.open, w.in_flight));
+        // The gateway holds the decodes of a pushing runtime to what their
+        // registration says of images, and no other runtime's.
+        let said = [
+            row.prefills.iter().map(|_| takes_images(false)).collect(),
+            (row.decodes.iter())
+                .map(|w| takes_images(w.images || !pushes(&w.runtime)))
+                .collect(),
+            (row.encoders.iter())
+                .map(|w| takes_images(w.images))
+                .collect(),
+        ];
+        // Each prefill's partners as places of the decode list, ascending,
+        // each once.
+        let partners: Vec<Vec<u32>> = (row.prefills.iter())
+            .map(|prefill| {
+                let mut list = prefill.partners.clone();
+                list.sort_unstable();
+                list.dedup();
+                list
             })
             .collect();
-        list.sort_unstable();
-        listed.extend(list);
-        ends.push(listed.len() as u32);
+        Self {
+            lists: [prefills.collect(), decodes.collect(), encoders.collect()],
+            said,
+            cells: Default::default(),
+            partners: PartnerClasses::number(row.decodes.len(), partners.iter().map(Vec::as_slice)),
+        }
     }
-    Pairing {
-        decode_classes,
-        ends,
-        listed,
+
+    /// The list at `list` as its host lends it for one decision.
+    fn lent(&self, list: usize) -> LentList<'_> {
+        LentList {
+            workers: &self.lists[list],
+            cell: &self.cells[list],
+            facts: Some(&self.said[list]),
+        }
+    }
+}
+
+/// One request of a row, over the fleet's three lists as they are lent.
+struct Asked<'a> {
+    request: HostRequest<'a>,
+    lists: EncodeLists<'a>,
+}
+
+impl RequestMaker for Asked<'_> {
+    fn model(&self) -> &str {
+        self.request.facts.model
+    }
+
+    fn make<'w>(&'w self, _: &'w AppliedSpec) -> HostRequest<'w> {
+        self.request
+    }
+
+    fn workers(&self) -> WorkerLists<'_> {
+        WorkerLists::Encode(self.lists)
     }
 }
 
@@ -387,73 +475,39 @@ fn refusal(stage: &str) -> &'static str {
 }
 
 /// What of one row's answers the decision does not replay, request by
-/// request.
-fn decided(row: &Row, classes: &EncodeClasses) -> Vec<String> {
+/// request. `offers` are the ends its encoders state, in the row's order.
+fn decided(row: &Row, classes: &EncodeClasses, offers: &[EncodeOffer]) -> Vec<String> {
     let Some(engine) = engine(row) else {
         return vec!["a policy this replay does not build".to_string()];
     };
     let ring = row.encode_policy != FEWEST;
-    let pushes = |runtime: &str| {
-        let mut of_runtime = row.encoders.iter().filter(|w| w.runtime == runtime);
-        of_runtime.any(|w| w.handoff == Some(Form::Push))
-    };
-    let paired = pairing(row);
-    let prefills: Vec<Candidate> = (row.prefills.iter().enumerate())
-        .map(|(at, w)| Candidate {
-            pair_class: at as u32 + 1,
-            ..worker(at, 1_000, Role::Prefill, w.open, w.in_flight)
-        })
-        .collect();
-    // The gateway holds the decodes of a pushing runtime to what their
-    // registration says of images, and no other runtime's.
-    let decodes: Vec<Candidate> = (row.decodes.iter().enumerate())
-        .map(|(at, w)| Candidate {
-            pair_class: paired.decode_classes.get(at).copied().unwrap_or(0),
-            vision: w.images || !pushes(&w.runtime),
-            ..worker(at, 2_000, Role::Decode, w.open, w.in_flight)
-        })
-        .collect();
-    let encoders: Vec<Candidate> = (row.encoders.iter().enumerate())
-        .map(|(at, w)| Candidate {
-            vision: w.images,
-            ..worker(at, 3_000, Role::Encode, w.open, w.in_flight)
-        })
-        .collect();
-    let stated = classes.encoders().iter().copied();
-    let of_encoders: Vec<EncoderFacts> = (row.encoders.iter())
-        .zip(stated.chain(std::iter::repeat(0)))
-        .map(|(w, class)| EncoderFacts {
-            class,
-            pushes: w.handoff == Some(Form::Push),
-            references: w.references,
-        })
-        .collect();
+    let fleet = Fleet::of(row);
+    // What the decision reads of each encoder, by the rule the store
+    // writes it by.
+    let of_encoders: Vec<EncoderFacts> = classes.encoder_facts(offers);
     let prefill_classes: Vec<u32> = (0..row.prefills.len())
         .map(|at| classes.prefill_class(at))
         .collect();
-    let table = PairTable::new(&paired.ends, &paired.listed);
-    if let Err(clause) = table.validate() {
-        return vec![format!("the row's pair table: {clause}")];
-    }
-    let pools = PairPools {
-        prefills: &prefills,
-        decodes: &decodes,
-        table,
-        ..PairPools::default()
-    };
-    let encode = EncodePool {
-        encoders: &encoders,
+    let lists = EncodeLists {
+        pair: PairLists {
+            prefill: fleet.lent(0),
+            decode: fleet.lent(1),
+            classes: &fleet.partners,
+            admission: &Open,
+            prefill_places: None,
+            decode_places: None,
+            prefill_stalled: &[],
+            prefill_held: &[],
+            decode_stalled: &[],
+            decode_held: &[],
+        },
+        encoders: fleet.lent(2),
+        encoders_stalled: &[],
+        encoders_held: &[],
         facts: &of_encoders,
         prefill_classes: &prefill_classes,
-        affinity: &[],
     };
-    let pool_facts = PoolFacts {
-        pool_size: prefills.len() as u32,
-        generation: 1,
-        ..PoolFacts::default()
-    };
-    let cx = Constraints::default();
-    let mut scratch = Scratch::new();
+    let now = Instant::now();
     let mut placed = EncodePlaced::new();
     let mut found = Vec::new();
     let answered = row.requests.iter().zip(&row.outcome.sequence);
@@ -470,27 +524,34 @@ fn decided(row: &Row, classes: &EncodeClasses) -> Vec<String> {
             references: request.references,
             decode_images: request.decode_images,
         };
-        let facts = RequestFacts {
-            model: "m",
-            media: MediaCounts {
-                images: u16::from(request.images),
-                ..MediaCounts::default()
+        let seed = at as u64 + 1;
+        let id = seed.to_le_bytes();
+        // The request as its host makes it for the prefill phase: held to
+        // no wire, its decode sent with its prefill.
+        let asked = Asked {
+            request: HostRequest {
+                id: &id,
+                facts: RequestFacts {
+                    model: MODEL,
+                    phase: Phase::Prefill,
+                    media: MediaCounts {
+                        images: u16::from(request.images),
+                        ..MediaCounts::default()
+                    },
+                    seed,
+                    ..RequestFacts::default()
+                },
+                constraints: Constraints::default(),
             },
-            seed: at as u64 + 1,
-            ..RequestFacts::default()
+            lists,
         };
-        let decision = engine.decide_encode_pair(
-            &facts,
-            &pool_facts,
-            pools,
-            encode,
-            items,
-            &cx,
-            &cx,
-            &cx,
-            &mut scratch,
-            &mut placed,
-        );
+        let decision = match engine.decide_encode_at(&asked, items, &mut placed, || now) {
+            Ok((decided, _)) => decided.decision,
+            Err(refused) => {
+                found.push(format!("request {at}: no decision: {refused:?}"));
+                continue;
+            }
+        };
         match (answer, &decision) {
             (
                 Answer::Placed {

@@ -29,7 +29,7 @@ use std::{
 };
 
 use replicas::{Lease, Record, Replica, ROOM};
-use smg_policy_controller::{
+use smg_policy_controller::service::{
     elector::ElectionSettings,
     proto::{
         self, policy_controller_client::PolicyControllerClient, register_worker_request::Mode,

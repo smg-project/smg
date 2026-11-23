@@ -146,6 +146,7 @@ pub async fn connect_mcp_servers(
                             server_key,
                             allowed_tools: input.allowed_tools.clone(),
                             list_error: connected.list_error,
+                            pool_key: Some(connected.pool_key),
                         });
                     }
                 }
@@ -170,6 +171,7 @@ pub async fn connect_mcp_servers(
                 server_key: input.label.clone(),
                 allowed_tools: input.allowed_tools.clone(),
                 list_error: mcp_orchestrator.list_error_for_server(&input.label),
+                pool_key: None,
             });
         }
     }
@@ -328,6 +330,7 @@ pub async fn ensure_mcp_servers(
                     server_key: server_name,
                     allowed_tools: None,
                     list_error,
+                    pool_key: None,
                 });
             }
         } else {
@@ -1545,6 +1548,7 @@ mod tests {
             server_key: "conf".to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         };
         McpToolSession::new(orchestrator, vec![conf], "test-request")
             .execute_tool(ToolExecutionInput {

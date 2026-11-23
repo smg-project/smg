@@ -26,10 +26,11 @@ use std::{hint::black_box, sync::mpsc, thread, time::Instant};
 use common::{build_view, engine_of, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
-    elector::{
-        ElectionSettings, Elector, FileLease, LeaseBackend, LeaseRecord, MemoryLease, Tick, Written,
+    engine::{Constraints, PoolFacts, RequestFacts, Scratch},
+    service::elector::{
+        ConditionalWriteOutcome, ElectionSettings, Elector, FileLease, LeaseBackend, LeaseRecord,
+        MemoryLease, TickOutcome,
     },
-    Constraints, PoolFacts, RequestFacts, Scratch,
 };
 
 /// A holder whose fence is open, as a leader's is. It takes a lease that a
@@ -45,13 +46,13 @@ fn holder(mut backend: Box<dyn LeaseBackend>, identity: &str) -> Elector {
     };
     assert_eq!(
         backend.write(None, &released).expect("the release"),
-        Written::Done
+        ConditionalWriteOutcome::Done
     );
     let mut elector =
         Elector::new(backend, identity, ElectionSettings::default()).expect("valid settings");
     let now = Instant::now();
     let take = elector.tick(now).expect("the take");
-    assert!(matches!(take, Tick::Acquired { .. }), "{take:?}");
+    assert!(matches!(take, TickOutcome::Acquired { .. }), "{take:?}");
     assert!(elector.fence().leader_term(now).is_some());
     elector
 }
@@ -185,7 +186,7 @@ mod kubernetes {
     use k8s_openapi::api::coordination::v1::Lease;
     use kube::{client::Body, core::Status, Client};
     use parking_lot::Mutex;
-    use smg_policy_controller::elector::KubernetesLease;
+    use smg_policy_controller::service::elector::KubernetesLease;
 
     /// One `Lease` object and its resource version: a GET answers it, a
     /// POST creates it, a PUT replaces it under the version it names.

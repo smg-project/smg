@@ -224,6 +224,7 @@ mod tests {
     use openai_protocol::model_card::ModelCard;
     use smg_worker::{
         identity::basic::{ConnectionMode, Worker},
+        jobs::WorkerJobAsker,
         workflow::RemoveFromWorkerRegistryStep,
     };
     use tokio::sync::Notify;
@@ -303,8 +304,12 @@ mod tests {
         worker: Arc<dyn Worker>,
     ) -> WorkflowContext<WorkerRemovalWorkflowData> {
         let url = worker.url().to_string();
-        let mut data =
-            create_worker_removal_workflow_data(url.clone(), None, Arc::clone(app_context));
+        let mut data = create_worker_removal_workflow_data(
+            url.clone(),
+            None,
+            Arc::clone(app_context),
+            WorkerJobAsker::Api,
+        );
         data.worker_urls = vec![url];
         data.actual_workers_to_remove = Some(vec![worker]);
         let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);

@@ -3,11 +3,12 @@
 //! (the API-key parsers name only the shape: their value is the credential).
 
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
-use smg::config::{
-    AccessLogField, ConfigError, ConfigResult, PowerOfTwoLoadMetric, TurboJpegPolicy,
-};
 use smg_auth::Role;
 use smg_service_discovery::ModelIdSource;
+
+use crate::config::{
+    AccessLogField, ConfigError, ConfigResult, PowerOfTwoLoadMetric, TurboJpegPolicy,
+};
 
 /// Parse the `--multimodal-tensor-transport` value into a `TransportMode`.
 pub(crate) fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {

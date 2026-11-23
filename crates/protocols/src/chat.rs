@@ -374,6 +374,7 @@ impl MessageContent {
 pub struct ChatCompletionRequest {
     /// A list of messages comprising the conversation so far
     #[validate(custom(function = "validate_messages"))]
+    #[serde(deserialize_with = "crate::message_read::read")]
     pub messages: Vec<ChatMessage>,
 
     /// ID of the model to use
@@ -394,6 +395,7 @@ pub struct ChatCompletionRequest {
     /// Modify the likelihood of specified tokens appearing in the completion:
     /// token id to a bias in -100..=100, applied by the engine's sampler
     #[validate(custom(function = "validate_logit_bias"))]
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub logit_bias: Option<HashMap<String, f32>>,
 
     /// Whether to return log probabilities of the output tokens
@@ -410,6 +412,7 @@ pub struct ChatCompletionRequest {
     pub max_completion_tokens: Option<u32>,
 
     /// Developer-defined tags and values used for filtering completions in the dashboard
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub metadata: Option<HashMap<String, String>>,
 
     /// Output types that you would like the model to generate for this request
@@ -570,6 +573,7 @@ pub struct ChatCompletionRequest {
     pub lora_path: Option<String>,
 
     /// Session parameters for continual prompting
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub session_params: Option<HashMap<String, Value>>,
 
     /// Separate reasoning content from final answer (O1-style models)
@@ -589,6 +593,7 @@ pub struct ChatCompletionRequest {
     pub stream_reasoning: bool,
 
     /// Chat template kwargs
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub chat_template_kwargs: Option<HashMap<String, Value>>,
 
     /// Return model hidden states
@@ -1237,6 +1242,10 @@ impl Normalizable for ChatCompletionRequest {
 impl GenerationRequest for ChatCompletionRequest {
     fn rid(&self) -> Option<&str> {
         self.rid.as_deref()
+    }
+
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.output_token_cap()
     }
 
     fn is_stream(&self) -> bool {

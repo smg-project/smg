@@ -12,7 +12,7 @@ use std::{
 };
 
 use rustls::crypto::ring;
-use smg_policy_controller::proto::{
+use smg_policy_controller::service::proto::{
     self,
     decline::Reason,
     policy_plugin_server::{PolicyPlugin, PolicyPluginServer},

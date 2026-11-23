@@ -73,7 +73,7 @@ fn an_icons_rgb_png_entry_decodes_as_the_png() {
     assert_eq!((image.width(), image.height()), (256, 256));
     assert_eq!(image.to_rgb8().as_raw(), largest.as_raw());
     assert_eq!(
-        encoded_image_size(&ico, None).expect("the icon's header"),
+        encoded_image_size(&ico, None).expect("the icon's header").0,
         ImageSize::new(256, 256)
     );
 }

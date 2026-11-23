@@ -41,11 +41,9 @@
 //! job. The price is a lag on a lull: a frame handed while the file's
 //! decider waits is applied one period later at most, and another file's
 //! decision reads what its apply writes that much later: its worker's
-//! count, high for a lease that ended and low on a target a dispatch
-//! moved a lease to, and what a stage keeps of a lease's events. A
-//! session's pin of record is read by its own model's decisions alone,
-//! which the file's decider makes behind its apply. A look says whether
-//! it applied a frame ([`Watch`]), and its host sets the time to its next
+//! count, high for a lease that ended and low on a target a dispatch moved
+//! a lease to, and what a stage keeps of a lease's events. A look says whether
+//! it applied a frame ([`LookOutcome`]), and its host sets the time to its next
 //! look by that: short while the file's frames flow, longer over a quiet
 //! file. A watch ends where a look finds no lease on file: the decider
 //! takes its word back and looks once more. A frame that look misses was
@@ -76,15 +74,6 @@
 //! the ring full. So a frame of a lease on file waits one period at
 //! most, but behind a thread that left its work by an unwind or rested
 //! on its watch: what it left is the next take's.
-//!
-//! A door in process has no deciding thread ([`crate::door::Door`]): each
-//! caller is at work at its seat's file for its one decision and rests
-//! as it leaves ([`AtWork::rest`]). No caller looks at a file again, so
-//! a door's file shows no watch: what is said of a lease is applied at
-//! once where no caller decides at its file, and by the caller at work
-//! otherwise, as it leaves. A report said through the door does not wait
-//! at a full ring: the door keeps it beside the ring, and the caller at
-//! work hands it on as it leaves.
 //!
 //! The hand-over, where a file shows no watch. A frame handed while the
 //! file's decider leaves its work waits on no lull: the leaver's last
@@ -148,14 +137,18 @@
 //! restore, from its start until it has read the ids on file
 //! ([`MemoryStore::restore_from`]). Under a turn come the world's load
 //! (no lock), a stage's own lock, the engine's sessions table, the store's
-//! pins, the journal's word of a term and the table of the members no
-//! world lists yet, a leaf lock. A standby's restore takes the
+//! session counts, the journal's word of a term, the table of the
+//! members no world lists yet, a leaf lock, and the entry of the worker
+//! objects a host's word to the engine asks, a leaf lock too. A standby's
+//! restore takes the
 //! store's tables under its turns too: the workers', the health's and the
 //! loads', in that order. No path takes one of those and then a turn. A
 //! lifecycle call of a served controller therefore runs under a turn, or
 //! after it where a decision gives its own lease up: it is bounded and
-//! calls no door of the leases. A debug build marks the thread that holds
-//! a turn and refuses a second take of it by that thread.
+//! calls no door of the leases. A registration that takes its key's pins
+//! along holds the workers lock over the engine's sessions table, each
+//! shard a leaf under it. A debug build marks the thread that holds a turn
+//! and refuses a second take of it by that thread.
 
 use std::{
     fmt,
@@ -174,22 +167,26 @@ use std::{
 use arc_swap::Guard;
 use parking_lot::{Mutex, MutexGuard};
 
-use super::{waits, Key, Leases, MemoryStore};
+use super::{takes_dispatch, Key, Leases, MemoryStore};
+#[cfg(feature = "controller")]
+use crate::tracking::lease;
 use crate::{
-    decider::Decider,
-    lease::LeaseId,
+    engine::decision_slot::DecisionSlot,
     store::{
-        leases::{Said, Sides},
-        world::World,
+        leases::{LeaseState, Sides},
+        snapshot::StoreSnapshot,
         GatewayId,
     },
+    tracking::lease::{LeaseId, Said},
 };
 
 /// What tells the engine of a frame applied to a lease on file: the world
 /// the frame is told under, the lease as it stood before the frame, both
 /// its parts, what the frame said, and the decider whose file the lease is
-/// on, where the store's host named its deciders.
-type Teller = fn(&MemoryStore, &World, &Sides, Said, Option<Decider>);
+/// on, where the store's host named its deciders. It holds what its host
+/// gave it: a served controller's holds the replica's worker objects.
+type Teller =
+    Arc<dyn Fn(&MemoryStore, &StoreSnapshot, &Sides, Said, Option<DecisionSlot>) + Send + Sync>;
 
 /// One load of the world for a run of words to the engine: the store's
 /// world, loaded at the run's first word and held to its last. A run is
@@ -205,17 +202,34 @@ type Teller = fn(&MemoryStore, &World, &Sides, Said, Option<Decider>);
 /// None is passed in by a caller: that cost every take a holder's
 /// building and its drop, whatever the take found.
 #[derive(Default)]
-pub(super) struct OneLoad(Option<Guard<Arc<World>>>);
+pub(super) struct OneLoad(Option<Guard<Arc<StoreSnapshot>>>);
 
 impl OneLoad {
     /// The world this run tells under.
-    pub(super) fn world(&mut self, store: &MemoryStore) -> &World {
+    pub(super) fn world(&mut self, store: &MemoryStore) -> &StoreSnapshot {
         self.0.get_or_insert_with(|| store.world.load())
     }
 }
 
-/// What a frame said of a gateway's lease, as it waits in the ring.
-type Handed = (GatewayId, LeaseId, Said);
+/// What waits in a file's ring of a lease: what a frame said of it, or the
+/// served door's own word of a decode call's issue. No frame carries the
+/// second and no host says it: one function of the crate writes it
+/// ([`MemoryStore::hand_taken_back`]).
+#[derive(Clone, Copy)]
+enum Word {
+    /// What a frame said, or a stream's release.
+    Said(Said),
+    /// One issue of a decode call taken back, and the reason.
+    #[cfg(feature = "controller")]
+    TakenBack(super::DecodeIssue, lease::ReleaseReason),
+}
+
+// The door's own word rides the room a frame's word leaves: a slot of the
+// ring is no wider for it.
+const _: () = assert!(size_of::<Word>() == size_of::<Said>());
+
+/// A word of a gateway's lease, as it waits in the ring.
+type Handed = (GatewayId, LeaseId, Word);
 
 /// A file's ring by its two ends. They stand in a module of their own
 /// and the queue is private to it: the turn module writes a frame through
@@ -246,6 +260,11 @@ mod ring {
         /// ([`MemoryStore::hand`]).
         pub(super) fn write(&self, frame: Handed) -> Result<(), Handed> {
             self.0.push(frame)
+        }
+
+        /// Whether a frame waits for the next take.
+        pub(super) fn waits(&self) -> bool {
+            !self.0.is_empty()
         }
     }
 
@@ -310,6 +329,9 @@ pub(super) struct Behind {
 pub(super) struct File {
     /// The turn: its holder writes the file.
     turn: Mutex<Behind>,
+    /// When a sweep next asks the file, written under `turn`
+    /// ([`super::NextDue`]).
+    next_due: Arc<super::NextDue>,
     /// What a hand reads at each frame.
     shown: Shown,
     /// Who is at work at the file: what a hand reads where no watch
@@ -317,17 +339,22 @@ pub(super) struct File {
     working: Working,
     /// The decider whose file this is, where the store's host named its
     /// deciders: a lease's events are told under it.
-    name: Option<Decider>,
+    name: Option<DecisionSlot>,
     /// The thread that holds the turn; 0 for none.
     #[cfg(debug_assertions)]
     holder: AtomicUsize,
+    /// Takes of this file's turn, for cases that assert a path avoided it.
+    #[cfg(test)]
+    takes: AtomicUsize,
 }
 
 impl File {
-    fn new(leases: Leases, name: Option<Decider>) -> Self {
+    fn new(leases: Leases, name: Option<DecisionSlot>) -> Self {
         let (hands, ring) = ring::ends();
+        let next_due = Arc::clone(&leases.next_due);
         Self {
             turn: Mutex::new(Behind { leases, ring }),
+            next_due,
             shown: Shown {
                 hands,
                 watched: AtomicBool::new(false),
@@ -338,12 +365,21 @@ impl File {
             name,
             #[cfg(debug_assertions)]
             holder: AtomicUsize::new(0),
+            #[cfg(test)]
+            takes: AtomicUsize::new(0),
         }
+    }
+
+    /// Whether this file may hold work for a sweep.
+    pub(super) fn sweep_needed(&self, now: std::time::Instant) -> bool {
+        self.next_due.reached(now) || self.shown.hands.waits()
     }
 
     /// Takes the turn and applies nothing: for the term's read, which no
     /// handed frame changes.
     pub(super) fn take(&self) -> Turn<'_> {
+        #[cfg(test)]
+        self.takes.fetch_add(1, SeqCst);
         #[cfg(debug_assertions)]
         assert_ne!(
             self.holder.load(SeqCst),
@@ -364,6 +400,18 @@ impl File {
     #[cfg(test)]
     pub(super) fn free(&self) -> bool {
         self.turn.try_lock().is_some()
+    }
+
+    /// Takes of this file's turn since the test last cleared them.
+    #[cfg(test)]
+    pub(super) fn takes(&self) -> usize {
+        self.takes.load(SeqCst)
+    }
+
+    /// Starts this test's count of turn takes again.
+    #[cfg(test)]
+    pub(super) fn clear_takes(&self) {
+        self.takes.store(0, SeqCst);
     }
 
     /// The turn where it is free, with nothing applied. `None` where a
@@ -419,7 +467,7 @@ impl DerefMut for Turn<'_> {
 /// stands, and whether the look applied a frame. Its host sets the time
 /// to its next look by it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Watch {
+pub enum LookOutcome {
     /// The thread keeps no watch: the file holds no lease, and a watch
     /// it kept has ended, by its word first and one more look behind it.
     /// The hands apply in place, and the thread may wait with no bound.
@@ -432,7 +480,7 @@ pub enum Watch {
     /// [`AtWork::look`] or by its next job.
     Quiet,
     /// A lease stands on the file and the look applied a frame: the
-    /// watch stands as under [`Watch::Quiet`], over a file whose frames
+    /// watch stands as under [`LookOutcome::Quiet`], over a file whose frames
     /// flow.
     Fed,
 }
@@ -449,7 +497,7 @@ pub enum Watch {
 /// keeps and takes the turn once more: what was handed behind its last
 /// take is applied before the thread waits, and the hands apply in place
 /// from there. A thread that rests behind each job never looks, and
-/// keeps no watch: a caller of a door in process.
+/// keeps no watch.
 pub struct AtWork {
     store: Arc<MemoryStore>,
     file: usize,
@@ -529,7 +577,7 @@ impl AtWork {
 
     /// The thread has no job at hand: it leaves its work, applies what
     /// was handed behind its last take and says what stands of its watch
-    /// ([`Watch`]). While its file holds a lease the watch stands, and
+    /// ([`LookOutcome`]). While its file holds a lease the watch stands, and
     /// starts here where the thread kept none: the hands leave their
     /// frames in the ring, and the thread owes the file its next look
     /// within its host's period, by this call or by its next job. Where
@@ -537,7 +585,7 @@ impl AtWork {
     /// more look behind it: the hands apply in place, and the thread may
     /// wait with no bound.
     #[must_use = "a thread that keeps its watch owes its file the next look"]
-    pub fn look(&mut self) -> Watch {
+    pub fn look(&mut self) -> LookOutcome {
         if self.working {
             self.working = false;
             self.store.leave(self.file);
@@ -545,8 +593,8 @@ impl AtWork {
         match self.store.looked(self.file) {
             // A watch ends by its word first and one more look. A thread
             // that kept none has no word to take back.
-            Watch::Ended if self.watching => self.end_watch(),
-            Watch::Ended => Watch::Ended,
+            LookOutcome::Ended if self.watching => self.end_watch(),
+            LookOutcome::Ended => LookOutcome::Ended,
             stands => {
                 if !self.watching {
                     // A hand that read no word read who is at work behind
@@ -568,11 +616,11 @@ impl AtWork {
     /// no lease on file and the frame names none. A lease it finds, laid
     /// by another thread since the first look, keeps the watch: its
     /// frames may wait in the ring.
-    pub(crate) fn end_watch(&mut self) -> Watch {
+    pub(crate) fn end_watch(&mut self) -> LookOutcome {
         self.word().store(false, SeqCst);
         fence(SeqCst);
         let found = self.store.looked(self.file);
-        if found == Watch::Ended {
+        if found == LookOutcome::Ended {
             self.watching = false;
         } else {
             self.word().store(true, SeqCst);
@@ -640,7 +688,7 @@ pub struct Hand {
     gateway: GatewayId,
     /// The files the hand handed to, a bit a file: its stream's end looks
     /// at each once more ([`MemoryStore::hand_back`]).
-    handed: [AtomicU64; Decider::COUNT / 64],
+    handed: [AtomicU64; DecisionSlot::COUNT / 64],
 }
 
 impl Hand {
@@ -703,13 +751,13 @@ impl Files {
     }
 
     /// A file a decider, each over the leases `leases` makes: a host
-    /// names [`Decider::COUNT`] deciders at most. The word to the engine
+    /// names [`DecisionSlot::COUNT`] deciders at most. The word to the engine
     /// and the fault count of the files `before` stay.
     pub(super) fn of(deciders: usize, before: &Self, leases: impl Fn() -> Leases) -> Self {
         let names = 0..=u8::MAX;
         let files = names
             .take(deciders.max(1))
-            .map(|number| File::new(leases(), Some(Decider::new(number))))
+            .map(|number| File::new(leases(), Some(DecisionSlot::new(number))))
             .collect();
         Self {
             files,
@@ -749,7 +797,7 @@ impl MemoryStore {
     /// The file of the decider the calling thread acts as; the first for
     /// a thread that names none and for a name past the files.
     pub(super) fn acting(&self) -> usize {
-        let acting = Decider::acting().map_or(0, |decider| usize::from(decider.number()));
+        let acting = DecisionSlot::acting().map_or(0, |decider| usize::from(decider.number()));
         if acting < self.files.len() {
             acting
         } else {
@@ -759,13 +807,27 @@ impl MemoryStore {
 
     /// Gives the store the controller's word to the engine: what tells it
     /// of a frame applied to a lease on file. Given once: the first stays.
-    pub(crate) fn tell_through(&self, teller: Teller) {
-        self.files.teller.get_or_init(|| teller);
+    #[cfg_attr(
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "called by the served controller alone")
+    )]
+    pub(crate) fn tell_through(
+        &self,
+        teller: impl Fn(&MemoryStore, &StoreSnapshot, &Sides, Said, Option<DecisionSlot>)
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        self.files.teller.get_or_init(|| Arc::new(teller));
     }
 
     /// A lifecycle call the controller made for a lease panicked and was
     /// held: counted. `true` for the first of a streak, the one its caller
     /// writes a line for.
+    #[cfg_attr(
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "called by the served controller alone")
+    )]
     pub(crate) fn call_faulted(&self) -> bool {
         let faults = &self.files.faults;
         let first = faults.fetch_or(STREAK, Relaxed) & STREAK == 0;
@@ -776,6 +838,10 @@ impl MemoryStore {
     /// A lifecycle call the controller made for a lease returned: a
     /// streak of faults ends. One load where none stands, so a call that
     /// returns writes nothing the deciders share.
+    #[cfg_attr(
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "called by the served controller alone")
+    )]
     pub(crate) fn call_returned(&self) {
         let faults = &self.files.faults;
         if faults.load(Relaxed) & STREAK != 0 {
@@ -791,7 +857,7 @@ impl MemoryStore {
 
     /// Tells the engine what `said` did to the lease `found` stood as, on
     /// the file at `at`: under `world` and its decider's name.
-    pub(super) fn tell(&self, at: usize, world: &World, found: &Sides, said: Said) {
+    pub(super) fn tell(&self, at: usize, world: &StoreSnapshot, found: &Sides, said: Said) {
         if let Some(tell) = self.files.teller.get() {
             tell(self, world, found, said, self.files[at].name);
         }
@@ -817,7 +883,7 @@ impl MemoryStore {
 
     /// The calling thread's place at its file, at work: a decider's, from
     /// a job at hand to an empty queue. The file is the one of the
-    /// decider the thread acts as ([`Decider::acting`]), and one thread
+    /// decider the thread acts as ([`DecisionSlot::acting`]), and one thread
     /// at a time works at a file.
     pub fn at_work(self: &Arc<Self>) -> AtWork {
         // The place stands before its thread's mark does: a first take
@@ -882,23 +948,23 @@ impl MemoryStore {
     /// take's, and it counts no frame. A frame handed while the look
     /// applies is applied all the same and not said: the time to the
     /// next look then grows once where it would have fallen.
-    /// [`Watch::Ended`] too where another thread is at work there: what
+    /// [`LookOutcome::Ended`] too where another thread is at work there: what
     /// waits is that thread's.
-    fn looked(&self, at: usize) -> Watch {
+    fn looked(&self, at: usize) -> LookOutcome {
         if !self.may_act(at) {
-            return Watch::Ended;
+            return LookOutcome::Ended;
         }
         let mut turn = self.files[at].take();
         let fed = turn.behind.ring.waits();
         if !self.applied(at, &mut turn) {
-            return Watch::Ended;
+            return LookOutcome::Ended;
         }
         if turn.records.is_empty() {
-            Watch::Ended
+            LookOutcome::Ended
         } else if fed {
-            Watch::Fed
+            LookOutcome::Fed
         } else {
-            Watch::Quiet
+            LookOutcome::Quiet
         }
     }
 
@@ -932,8 +998,15 @@ impl MemoryStore {
         }
         let Behind { leases, ring } = &mut *turn.behind;
         let mut one = OneLoad::default();
-        while let Some((gateway, lease, said)) = ring.take() {
-            self.apply_frame(at, leases, (gateway, lease), said, &mut one);
+        while let Some((gateway, lease, word)) = ring.take() {
+            let key = (gateway, lease);
+            match word {
+                Word::Said(said) => self.apply_frame(at, leases, key, said, &mut one),
+                #[cfg(feature = "controller")]
+                Word::TakenBack(issue, reason) => {
+                    self.apply_taken_back(at, leases, key, issue, reason, &mut one);
+                }
+            }
         }
         true
     }
@@ -983,21 +1056,18 @@ impl MemoryStore {
     }
 
     /// Hands the file a lease's id names what a frame said of `lease`: a
-    /// session's own hand. A host in process says the same through its
-    /// door ([`Door::report`](crate::door::Door::report)), which a full
-    /// ring does not hold. The frame is written into the file's ring.
-    /// Where the file's decider keeps its watch the hand leaves it there:
-    /// the decider applies it at its next take, one period of its host
-    /// away at most. The word is read with no fence behind the ring's
-    /// write, so a hand can read the old word behind a watch's last look:
-    /// its frame then names no lease on file, and waits for the file's
-    /// next take. Where another thread lays that lease behind the look,
-    /// that take is the next hand's, which applies in place, or the
-    /// sweep's next pass. Behind a thread that rested on its watch
-    /// ([`AtWork::rest`]) such a frame may name a lease on file, and
-    /// waits for the same takes. With no watch a frame is applied by
-    /// whoever may act at the file next: a thread at work there, or this
-    /// caller where none is.
+    /// session's own hand. The frame is written into the file's
+    /// ring. Where the file's decider keeps its watch the hand leaves it there:
+    /// the decider applies it at its next take, one period of its host away at
+    /// most. The word is read with no fence behind the ring's write, so a hand
+    /// can read the old word behind a watch's last look: its frame then names
+    /// no lease on file, and waits for the file's next take. Where another
+    /// thread lays that lease behind the look, that take is the next hand's,
+    /// which applies in place, or the sweep's next pass. Behind a thread that
+    /// rested on its watch ([`AtWork::rest`]) such a frame may name a lease on
+    /// file, and waits for the same takes. With no watch a frame is applied by
+    /// whoever may act at the file next: a thread at work there, or this caller
+    /// where none is.
     ///
     /// A full ring stops its caller until a holder applied, so no frame
     /// is dropped: the caller applies where no thread is at work, and
@@ -1008,9 +1078,38 @@ impl MemoryStore {
     /// between its looks, so a slow decision costs its waiting hands no
     /// core.
     pub fn hand(&self, hand: &Hand, lease: LeaseId, said: Said) {
+        self.hand_word(hand, lease, Word::Said(said));
+    }
+
+    /// Hands the file `lease`'s id names the take-back of `issue`, one
+    /// issue of a decode call, under `reason`: the word of a `Decide`
+    /// stream for an answer of that call that does not leave. It goes the
+    /// way of [`Self::hand`], so whoever may act at the file applies it,
+    /// and no stage hears it beside its decider at work. Where that issue
+    /// still stands the side returns to chosen and its engine hears the
+    /// decode side's release. Where the side moved since, by a dispatch, a
+    /// repeat's take-back or a later issue, nothing moves and nothing is
+    /// told.
+    #[cfg(feature = "controller")]
+    #[cold]
+    pub(crate) fn hand_taken_back(
+        &self,
+        hand: &Hand,
+        lease: LeaseId,
+        issue: super::DecodeIssue,
+        reason: lease::ReleaseReason,
+    ) {
+        self.hand_word(hand, lease, Word::TakenBack(issue, reason));
+    }
+
+    /// [`Self::hand`] for either word of the ring, laid into it: a frame's
+    /// word keeps the loop the served hand was, and the door's own word
+    /// pays its copy on a path few answers take.
+    #[inline(always)]
+    fn hand_word(&self, hand: &Hand, lease: LeaseId, word: Word) {
         let at = self.file_of(lease);
         let mut looks = 0_u32;
-        while !self.try_hand(at, hand, lease, said) {
+        while !self.try_hand_word(at, hand, lease, word) {
             looks = looks.saturating_add(1);
             if looks <= FULL_RING_YIELDS {
                 thread::yield_now();
@@ -1020,18 +1119,13 @@ impl MemoryStore {
         }
     }
 
-    /// One look of [`Self::hand`] at the file at `at`, the one `lease`
-    /// names ([`Self::file_of`]), for a caller that must not be held:
-    /// `false` where the file's ring is full and a thread at work there
-    /// has not applied yet. Nothing was written then: the caller keeps
-    /// what was said, and hands it again in the order said.
-    ///
-    /// Always inlined: the served hand is this look in a loop, and the
-    /// door's two callers would otherwise move it out of line under it.
+    /// Writes a word of `lease` into the file's ring and marks the hand.
+    /// `false` where the ring is full and stays so: a thread at work at the
+    /// file keeps what its ring holds.
     #[inline(always)]
-    pub(crate) fn try_hand(&self, at: usize, hand: &Hand, lease: LeaseId, said: Said) -> bool {
+    fn try_hand_word(&self, at: usize, hand: &Hand, lease: LeaseId, word: Word) -> bool {
         let file = &self.files[at];
-        let frame = (hand.gateway, lease, said);
+        let frame = (hand.gateway, lease, word);
         loop {
             match file.shown.hands.write(frame) {
                 Ok(()) => break,
@@ -1065,18 +1159,10 @@ impl MemoryStore {
     /// record held as the frame found it.
     fn apply_frame(&self, at: usize, leases: &mut Leases, key: Key, said: Said, one: &mut OneLoad) {
         let found = match said {
-            Said::Dispatched(dispatch, when) => {
-                let found = leases.found(&key);
-                leases.dispatched(self.slots(), &key, dispatch, when);
-                // The side the frame names is told where it waited for
-                // this dispatch.
-                found.filter(|found| waits(found, dispatch.side))
-            }
-            Said::Completed(outcome) => {
-                let found = leases.found(&key);
-                leases.completed(&key, &outcome);
-                found
-            }
+            Said::Dispatched(dispatch, when) => leases
+                .dispatched(self.slots(), &key, dispatch, when)
+                .filter(|found| takes_dispatch(found, dispatch.side)),
+            Said::Completed(outcome) => leases.end_side(&key, outcome.side, LeaseState::Completed),
             Said::Released(side, reason) => leases.released(&key, side, reason),
         };
         if let Some(found) = found {

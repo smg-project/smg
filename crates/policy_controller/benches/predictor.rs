@@ -1,9 +1,9 @@
-//! The cost of the sent-prefix predictor's two calls, `Predictor::deepest`
-//! and `Predictor::sent`, on a predictor at its bound: a write there takes
-//! out as many old blocks as it adds. One predictor holds 4,096 requests of
-//! 64 blocks, sent to 8 workers, behind a head of 8 blocks they all share.
-//! The `cold` turns run on another, which holds requests that share
-//! nothing.
+//! The cost of the sent-prefix predictor's two calls,
+//! `PrefixPredictor::deepest` and `PrefixPredictor::record`, on a predictor at
+//! its bound: a write there takes out as many old blocks as it adds. One
+//! predictor holds 4,096 requests of 64 blocks, sent to 8 workers, behind a
+//! head of 8 blocks they all share. The `cold` turns run on another, which
+//! holds requests that share nothing.
 //!
 //! - `read/sent_before/64`: the read of a request sent before.
 //! - `read/cold/64`: the read of a request none of whose blocks was sent.
@@ -16,12 +16,15 @@
 //!
 //! Ids: `policy_predictor/<call>/<request>/<blocks>`. The requests go
 //! round in the order they were sent, so the oldest path is always the
-//! request's own or, on a cold turn, the oldest request's.
+//! request's own or, on a cold turn, the oldest request's. A read folds
+//! the request's keys into its caller's buffer and then reads by them, as
+//! a decision does, and the write behind it takes the same keys at a new
+//! tick.
 
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use smg_policy_controller::{predictor::Predictor, WorkerId};
+use smg_policy_controller::{engine::WorkerId, tracking::PrefixPredictor};
 
 /// The namespace of every request.
 const SEED: u64 = 0;
@@ -70,11 +73,26 @@ fn worker(of: usize) -> WorkerId {
     WorkerId(of as u64 % WORKERS)
 }
 
+/// A read as a decision makes it: the request's keys folded into the
+/// caller's buffer, then the read by them.
+fn read(held: &PrefixPredictor, keys: &mut Vec<u64>, request: &[u64]) -> u32 {
+    PrefixPredictor::fold_into(keys, SEED, request);
+    held.deepest(keys).blocks()
+}
+
+/// The write behind a read, by the keys the read folded, at a new tick.
+fn write(held: &mut PrefixPredictor, keys: &[u64], worker: WorkerId, tick: &mut u16) {
+    *tick = tick.wrapping_add(1);
+    held.record(keys, worker, *tick);
+}
+
 /// The predictor that holds every request's first turn, at its bound.
-fn sent_before() -> Predictor {
-    let mut predictor = Predictor::new(usize::MAX);
+fn sent_before() -> PrefixPredictor {
+    let mut predictor = PrefixPredictor::new(usize::MAX);
+    let (mut keys, mut tick) = (Vec::new(), 0);
     for of in 0..REQUESTS {
-        predictor.sent(SEED, &request(of, 1), worker(of));
+        PrefixPredictor::fold_into(&mut keys, SEED, &request(of, 1));
+        write(&mut predictor, &keys, worker(of), &mut tick);
     }
     predictor.set_bound(predictor.len());
     predictor
@@ -82,11 +100,13 @@ fn sent_before() -> Predictor {
 
 /// A predictor at its bound that holds requests of `blocks` blocks which
 /// share nothing; and the number the next such request takes.
-fn cold(blocks: u64) -> (Predictor, u64) {
+fn cold(blocks: u64) -> (PrefixPredictor, u64) {
     let held = COLD_BLOCKS / blocks;
-    let mut predictor = Predictor::new(usize::MAX);
+    let mut predictor = PrefixPredictor::new(usize::MAX);
+    let (mut keys, mut tick) = (Vec::new(), 0);
     for of in 0..held {
-        predictor.sent(SEED, &apart(of, blocks), WorkerId(of % WORKERS));
+        PrefixPredictor::fold_into(&mut keys, SEED, &apart(of, blocks));
+        write(&mut predictor, &keys, WorkerId(of % WORKERS), &mut tick);
     }
     predictor.set_bound(predictor.len());
     (predictor, held)
@@ -100,25 +120,26 @@ fn predictor(c: &mut Criterion) {
         .collect();
     let mut held = sent_before();
     let mut next = 0;
+    let (mut keys, mut tick) = (Vec::new(), 0);
 
     group.bench_function("read/sent_before/64", |b| {
         b.iter(|| {
             next = (next + 1) % REQUESTS;
-            black_box(held.deepest(SEED, black_box(&requests[next])).blocks())
+            black_box(read(&held, &mut keys, black_box(&requests[next])))
         });
     });
     group.bench_function("read/cold/64", |b| {
         b.iter(|| {
             next = (next + 1) % REQUESTS;
-            black_box(held.deepest(SEED, black_box(&never[next])).blocks())
+            black_box(read(&held, &mut keys, black_box(&never[next])))
         });
     });
     next = REQUESTS - 1;
     group.bench_function("turn/sent_before/64", |b| {
         b.iter(|| {
             next = (next + 1) % REQUESTS;
-            let depth = held.deepest(SEED, black_box(&requests[next])).blocks();
-            held.sent(SEED, &requests[next], worker(next));
+            let depth = read(&held, &mut keys, black_box(&requests[next]));
+            write(&mut held, &keys, worker(next), &mut tick);
             black_box(depth)
         });
     });
@@ -132,8 +153,8 @@ fn predictor(c: &mut Criterion) {
                 (request(next, turn), worker(next))
             },
             |(request, worker)| {
-                let depth = held.deepest(SEED, &request).blocks();
-                held.sent(SEED, &request, worker);
+                let depth = read(&held, &mut keys, &request);
+                write(&mut held, &keys, worker, &mut tick);
                 black_box(depth)
             },
             BatchSize::SmallInput,
@@ -148,8 +169,8 @@ fn predictor(c: &mut Criterion) {
                     (apart(of, blocks), WorkerId(of % WORKERS))
                 },
                 |(request, worker)| {
-                    let depth = held.deepest(SEED, &request).blocks();
-                    held.sent(SEED, &request, worker);
+                    let depth = read(&held, &mut keys, &request);
+                    write(&mut held, &keys, worker, &mut tick);
                     black_box(depth)
                 },
                 BatchSize::SmallInput,

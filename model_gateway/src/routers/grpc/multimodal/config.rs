@@ -18,6 +18,7 @@ use tracing::{debug, warn};
 use super::{
     inflight::MultimodalInflight,
     pixel_cache::{pixel_cache_with_budget, PixelCache},
+    plan::DeploymentFault,
     process::preprocessor_config_for,
     settings::MultimodalSettings,
 };
@@ -295,16 +296,37 @@ impl MultimodalConfigRegistry {
             tokenizer_source,
         ))
         .await
-        .with_context(|| {
-            format!("Failed to resolve model config directory for '{tokenizer_source}'")
+        .map_err(|error| {
+            // This sentence is the client's: the source's path stays in the
+            // cause under it, which only the log writes.
+            let sentence = if llm_multimodal::hub::LocalSourceWithoutConfig::is(&error) {
+                "Failed to resolve model config directory: the model's local source has no config.json"
+                    .to_string()
+            } else {
+                format!("Failed to resolve model config directory for '{tokenizer_source}'")
+            };
+            error.context(sentence)
         })?;
 
+        // From here the configuration is one this gateway holds, in the
+        // model's directory or in its hub cache: a failure to read or parse
+        // it is the deployment's own whatever the request holds, and carries
+        // the mark the preparation's stage answers by. Failures to resolve
+        // the directory left above, unmarked.
         let config_path = base_dir.join("config.json");
         let config: serde_json::Value = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read config.json at {}", config_path.display()))
+            .with_context(|| {
+                DeploymentFault(format!(
+                    "Failed to read config.json at {}",
+                    config_path.display()
+                ))
+            })
             .and_then(|s| {
                 serde_json::from_str(&s).with_context(|| {
-                    format!("Failed to parse config.json at {}", config_path.display())
+                    DeploymentFault(format!(
+                        "Failed to parse config.json at {}",
+                        config_path.display()
+                    ))
                 })
             })?;
 
@@ -611,7 +633,7 @@ impl MultimodalComponents {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         fs,
         sync::atomic::{AtomicU16, Ordering},
@@ -710,8 +732,8 @@ mod tests {
     /// A Hub that answers `status` to every file request, so a checkpoint's
     /// processor-config fetches fail or are refused without a network: the
     /// Hub client asks for a file its cache lacks with one GET and reads the
-    /// status before anything else.
-    async fn hub_answering(status: Arc<AtomicU16>) -> String {
+    /// status before anything else. Shared with the pipeline's tests.
+    pub(crate) async fn hub_answering(status: Arc<AtomicU16>) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -769,7 +791,7 @@ mod tests {
     /// back when the test ends, so a failing assertion leaves no other test on
     /// this Hub. The variables are process-wide, so the tests that set them
     /// take turns: the guard holds the turn until the variables are restored.
-    struct HubEnv {
+    pub(crate) struct HubEnv {
         previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
         _turn: tokio::sync::MutexGuard<'static, ()>,
     }
@@ -777,7 +799,7 @@ mod tests {
     static HUB_ENV_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     impl HubEnv {
-        async fn set(home: &Path, endpoint: &str) -> Self {
+        pub(crate) async fn set(home: &Path, endpoint: &str) -> Self {
             let turn = HUB_ENV_TURN.lock().await;
             let previous = ["HF_HOME", "HF_ENDPOINT"]
                 .into_iter()
@@ -938,6 +960,45 @@ mod tests {
             "the error names the file and the Hub's answer: {gated}"
         );
         assert!(reg.get("tok-uuid-gated").is_none(), "nothing is cached");
+    }
+
+    /// A source that names a path and has no `config.json` on this host fails
+    /// where it stands, a path that is not here (a worker's host has it) as a
+    /// directory that is: the client's sentence leaves the path to the chain
+    /// the log writes, and the Hub is not asked. The Hub's address is a
+    /// loopback port with no listener, so a lookup would end as a failed fetch.
+    #[tokio::test]
+    async fn registry_get_or_load_does_not_ask_the_hub_for_a_local_source() {
+        let home = TempDir::new().unwrap();
+        let _env = HubEnv::set(home.path(), "http://127.0.0.1:9").await;
+        let model_dir = TempDir::new().unwrap();
+
+        for (source, said) in [
+            (model_dir.path().join("worker-only"), "is not on this host"),
+            (model_dir.path().to_path_buf(), "no config.json in"),
+        ] {
+            let source = source.to_string_lossy().into_owned();
+            let failed = MultimodalConfigRegistry::new()
+                .get_or_load("tok-uuid-local", &source)
+                .await
+                .expect_err("a local source without config.json fails the request");
+            assert!(
+                !failed.to_string().contains(&source),
+                "the client's sentence names the path: {failed:#}"
+            );
+            assert!(
+                !llm_multimodal::hub::HubFetchError::is(&failed),
+                "the Hub was asked: {failed:#}"
+            );
+            assert!(
+                format!("{failed:#}").contains(&source),
+                "the log's chain names the path: {failed:#}"
+            );
+            assert!(
+                format!("{failed:#}").contains(said),
+                "the log's sentence: {failed:#}"
+            );
+        }
     }
 
     /// A Hub that takes the connection and never answers holds a fetch only

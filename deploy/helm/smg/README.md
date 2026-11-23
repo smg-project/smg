@@ -49,6 +49,8 @@ The gateway image is on Docker Hub, engine images are on GitHub Container Regist
 
 Worker images default to `ghcr.io/smg-project/smg`. Set `workers[].image.tag` to the engine-specific tag; `workers[].image.registry` and `workers[].image.repository` override the path.
 
+The worker images are published for `linux/amd64` only. On a node of another architecture a worker's image pull fails (`ImagePullBackOff`): keep the workers on amd64 nodes with `workers[].nodeSelector` (`kubernetes.io/arch: amd64`), or set `workers[].image` to an image built for that node's architecture.
+
 A tag is text: quote one made of digits alone (`tag: "1.16"`, or `--set-string` on the command line). `global.image.tag` and `workers[].image.tag` written as a number are refused at render, as `policyController.image.tag` is: a number is not rendered as written, and `1.10` would read as `1.1`.
 
 The TRT-LLM image is published, but the chart does not template `engine: trtllm` yet: `engineDefaults` knows `vllm` and `sglang`.
@@ -73,7 +75,9 @@ See [`values.yaml`](values.yaml) for the full list of configurable parameters.
 
 ### Routing Policies
 
-`cache_aware` (default), `round_robin`, `power_of_two`, `least_load`, `passthrough`, `consistent_hashing`, `prefix_hash`, `manual`, `random`: the launcher's `--policy` choices, which `values.schema.json` lists. `bucket` is a prefill-side policy: the launcher takes it for `--prefill-policy` (`router.disaggregation.prefillPolicy`), not for `--policy`.
+The chart's `router.policy` takes `cache_aware` (default), `round_robin`, `power_of_two`, `least_load`, `passthrough`, `consistent_hashing`, `prefix_hash`, `manual`, `random`, and `bucket`: the launcher's `--policy` choices, as listed in `values.schema.json`.
+
+Under a disaggregation mode, a decode role with no `decodePolicy` runs under `router.policy`. The gateway refuses `bucket` for the decode role under `epd`, and under `pd` with `router.enableIgw`: set `router.disaggregation.decodePolicy` beside `router.policy: bucket` there.
 
 ### Disaggregated Serving
 

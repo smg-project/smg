@@ -56,7 +56,7 @@ pub fn set_shed_retry_after_secs(secs: u64) {
 }
 
 /// Ready and permitted by the circuit breaker, before overload/liveness vetoes.
-fn routable_but_for_veto(worker: &dyn Worker) -> bool {
+pub(crate) fn routable_but_for_veto(worker: &dyn Worker) -> bool {
     worker.is_healthy() && worker.circuit_breaker_can_execute()
 }
 

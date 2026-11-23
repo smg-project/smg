@@ -48,13 +48,14 @@ use crate::{
         translate_request_sglang, RankPlacement, SglangGenerateStream, SglangProfileStart,
     },
     sglang_encode::{EncodeDispatchRequest, EncodeNotice, SglangEncodeDispatcher},
+    sglang_v41_items::V41Vision,
     sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake},
     stream::{RequestDeadline, ZmqGenerateStream},
     structured_outputs::{
         refuse_unenforceable_constraint, StructuredOutputsBackendConfig, StructuredOutputsSupport,
     },
     tokenspeed::{
-        constraint_ref as tokenspeed_constraint_ref, fan_out_tokenspeed_requests,
+        constraint_ref as tokenspeed_constraint_ref, fan_out_tokenspeed_requests, loads_by_rank,
         translate_encode_request, translate_request_tokenspeed_for, EncodeRendezvous, GridTensors,
         LogprobColumns, RankIndices, TokenSpeedGenerateStream,
     },
@@ -1284,6 +1285,10 @@ impl ZmqEngineClient {
         } else {
             RankPlacement::RoomResidue
         };
+        // The served DeepSeek-V4.1 model's patch geometry, as every rank
+        // declared it at its handshake: a request without a pin is placed on
+        // a rank at submit, by load, after this translation.
+        let v41_vision = V41Vision::from_handshakes(client.engines());
         let mut streams = Vec::new();
         // Fan-out clones share identical media; cache only within this request.
         let mut shared_hashes = None;
@@ -1295,6 +1300,7 @@ impl ZmqEngineClient {
                 ranks,
                 placement,
                 &self.meta.pin_yield,
+                v41_vision,
             )
             .map_err(tonic::Status::invalid_argument)?;
             request.trace_headers.clone_from(&trace_headers);
@@ -1783,13 +1789,34 @@ impl ZmqEngineClient {
 
     /// Per-rank load from the piggybacked scheduler stats (SMG's DP routing
     /// signal), in the same shape as the gRPC `GetLoads` response. A rank that
-    /// has not reported yet has no entry.
+    /// has not reported yet has no entry. An entry is numbered by its
+    /// engine's index.
     pub fn get_loads(&self) -> WorkerLoadResponse {
         let loads: Vec<SchedulerLoadSnapshot> = self
             .engines()
             .iter()
             .filter_map(|engine| self.rank_load(engine.engine_id.engine_index()?))
             .collect();
+        WorkerLoadResponse {
+            timestamp: String::new(),
+            dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
+            loads,
+            ..Default::default()
+        }
+    }
+
+    /// [`get_loads`](Self::get_loads) with each entry numbered by the rank a
+    /// pin reaches, for a reader that scopes the answer to rank workers. A
+    /// TokenSpeed rank is its engine's index only when the ranks dialled in
+    /// at indices 0..n in rank order; the other dialects place a pin by
+    /// index.
+    pub fn get_loads_by_rank(&self) -> WorkerLoadResponse {
+        let ZmqBackend::TokenSpeed(client) = &self.backend else {
+            return self.get_loads();
+        };
+        let loads = loads_by_rank(&RankIndices::of(client.engines()), |index| {
+            self.rank_load(index)
+        });
         WorkerLoadResponse {
             timestamp: String::new(),
             dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),

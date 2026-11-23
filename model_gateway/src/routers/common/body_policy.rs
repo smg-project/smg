@@ -58,10 +58,11 @@ pub(crate) struct BodyPathInputs {
 /// something must read the body here: routing-key override (body `rid` supplies
 /// the fallback key), a text-routing policy without a valid hint-header
 /// waiver, a registry serving more than one model (content-blind selection
-/// could land the request on the wrong model's worker), a body-mutating
-/// worker, a WASM request hook, a tenant rate limiter (the reservation's
-/// estimate is read from the body), a message-thread turn (the thread layer
-/// reads the body), or a missing/invalid Content-Length.
+/// could land the request on the wrong model's worker) or a model under an
+/// alias (the body may name it, and the worker knows the canonical id
+/// alone), a body-mutating worker, a WASM request hook, a tenant rate limiter
+/// (the reservation's estimate is read from the body), a message-thread turn
+/// (the thread layer reads the body), or a missing/invalid Content-Length.
 /// Otherwise, with router retries enabled, buffer up to
 /// `max_buffered_request_bytes` to keep the request replayable — a larger
 /// body streams and forfeits router retries. Otherwise stream, at any size.

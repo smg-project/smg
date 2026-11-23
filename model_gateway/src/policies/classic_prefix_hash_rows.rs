@@ -333,6 +333,7 @@ impl Bed {
             RoutingPool::HttpRegular,
             None,
             inputs,
+            placement::Stated::nothing,
         )
         .expect("the request is placed");
         let place = self

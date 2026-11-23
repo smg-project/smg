@@ -4,20 +4,19 @@
 use std::{collections::HashMap, time::Duration};
 
 use async_trait::async_trait;
-use openai_protocol::UNKNOWN_MODEL_ID;
+use openai_protocol::{worker::GrammarStart, UNKNOWN_MODEL_ID};
 use smg_worker::{
     identity::{
         basic::ConnectionMode,
         endpoint::Endpoint,
         sampling_defaults::{SamplingDefaults, DEFAULT_SAMPLING_PARAMS_LABEL},
     },
-    workflow::WorkerKind,
+    workflow::{resolve_model_id, WorkerKind},
 };
-use tool_parser::GrammarStart;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowResult};
 
-use crate::workflow::{data::WorkerWorkflowData, steps::local::create_worker::resolve_model_id};
+use crate::workflow::data::WorkerWorkflowData;
 
 /// The id of the step that writes a ZMQ worker's runtime default and labels.
 pub(crate) const ZMQ_LABELS_STEP: &str = "discover_zmq_labels";
@@ -182,6 +181,8 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverZmqLabelsStep {
 
 #[cfg(test)]
 mod tests {
+    use smg_worker::jobs::WorkerJobAsker;
+
     use super::*;
 
     #[tokio::test]
@@ -285,6 +286,7 @@ mod tests {
                 WorkerSpec::new("ipc:///tmp/engine-a.sock"),
                 WorkerRegistrationMode::Upsert,
                 create_test_app_context(),
+                WorkerJobAsker::Api,
             );
             data.worker_kind = Some(WorkerKind::Local);
             data.connection_mode = Some(ConnectionMode::Zmq);

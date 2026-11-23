@@ -14,7 +14,10 @@
 //! backoff, hands the pushed load records to the load monitor, says to the
 //! sink what the stream brought, and says to it that the worker left. What
 //! an events subscription feeds is the host's (`KvEventHost`).
+//! With `runtime`, `apply` also holds the rules that put events into an index.
 
+#[cfg(feature = "runtime")]
+pub mod apply;
 #[cfg(feature = "runtime")]
 mod collector;
 pub mod port;

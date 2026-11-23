@@ -522,15 +522,15 @@ impl EngineConnector for CountingConnector {
     }
 }
 
-/// An engine connection that answers its health call, its model labels and
-/// its server labels as a case scripts them, and refuses every other call as
-/// unimplemented. A
-/// case may change the health answer while a connection is held.
+/// An engine connection with scripted health and label answers.
+/// A case may change the health answer while a connection is held.
 #[derive(Debug)]
 pub struct ScriptedAnswers {
     health: Mutex<Result<HealthAnswer, tonic::Code>>,
     model: Result<HashMap<String, String>, tonic::Code>,
     server: Result<HashMap<String, String>, tonic::Code>,
+    #[cfg(test)]
+    loads: Option<WorkerLoadResponse>,
 }
 
 impl ScriptedAnswers {
@@ -541,6 +541,17 @@ impl ScriptedAnswers {
             health: Mutex::new(health),
             model: Err(tonic::Code::Unimplemented),
             server: Err(tonic::Code::Unimplemented),
+            #[cfg(test)]
+            loads: None,
+        }
+    }
+
+    /// A connection that returns the given load report.
+    #[cfg(test)]
+    pub(crate) fn answering_loads(loads: WorkerLoadResponse) -> Self {
+        Self {
+            loads: Some(loads),
+            ..Self::answering_health(Err(tonic::Code::Unimplemented))
         }
     }
 
@@ -561,6 +572,8 @@ impl ScriptedAnswers {
             health: Mutex::new(Err(tonic::Code::Unimplemented)),
             model: model.map(labels_of),
             server: server.map(labels_of),
+            #[cfg(test)]
+            loads: None,
         }
     }
 
@@ -604,6 +617,10 @@ impl EngineConnection for ScriptedAnswers {
     }
 
     async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
+        #[cfg(test)]
+        if let Some(loads) = &self.loads {
+            return Ok(loads.clone());
+        }
         not_scripted()
     }
 

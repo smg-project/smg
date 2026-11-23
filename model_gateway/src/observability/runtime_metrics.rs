@@ -39,7 +39,7 @@
 //!   (`DYN_ENABLE_POLL_HISTOGRAM`). On tokio 1.52
 //!   `Builder::enable_metrics_poll_time_histogram()` is itself
 //!   `tokio_unstable`-only and would require changing the runtime builder in
-//!   `main.rs`. Revisit behind an `SMG_ENABLE_POLL_HISTOGRAM` env var once
+//!   `cli/mod.rs`. Revisit behind an `SMG_ENABLE_POLL_HISTOGRAM` env var once
 //!   tokio stabilizes the API (it costs ~2x `Instant::now()` per task poll,
 //!   so it must stay opt-in).
 //!

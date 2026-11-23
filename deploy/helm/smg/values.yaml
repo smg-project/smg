@@ -28,9 +28,8 @@ router:
   progressDeadlineSeconds: 1920
 
   # -- Routing policy: random, round_robin, passthrough, cache_aware, power_of_two,
-  #    least_load, manual, consistent_hashing or prefix_hash (the launcher's --policy
-  #    choices; values.schema.json lists them). bucket is a prefill-side policy:
-  #    router.disaggregation.prefillPolicy.
+  #    least_load, manual, consistent_hashing, prefix_hash or bucket (the launcher's
+  #    --policy choices; values.schema.json lists them).
   policy: cache_aware
 
   # -- Disaggregated serving: the roles the gateway's --pd-disaggregation and

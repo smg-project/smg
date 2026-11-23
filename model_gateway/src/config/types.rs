@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use clap::ValueEnum;
 pub use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
@@ -9,6 +9,7 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 pub use smg_data_connector::{
     HistoryBackend, MemoryConfig, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
 };
+use smg_policy_controller::document::PolicySpec;
 use smg_service_discovery::Roles;
 pub use smg_service_discovery::{
     deserialize_discovery, ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig,
@@ -93,9 +94,11 @@ pub struct RouterConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_worker_runtime_type: Option<RuntimeType>,
     /// DP engines per startup ZMQ worker: each `--worker-urls` ZMQ worker
-    /// becomes a grouped worker whose handshake awaits this many engines on
-    /// one socket set (`dp_size` on the worker spec, no rank). `None`/1 keeps
-    /// today's one-engine workers; HTTP/gRPC workers ignore this field.
+    /// given a count above one registers as one worker per engine, which
+    /// share one socket set whose handshake awaits that many engines
+    /// (`dp_size` on the worker spec). `None`/1 keeps one worker per URL: a
+    /// one-engine worker, or a grouped worker where its engines declare
+    /// several at the handshake. HTTP/gRPC workers ignore this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zmq_engine_count: Option<usize>,
     pub policy: PolicyConfig,
@@ -231,6 +234,10 @@ pub struct RouterConfig {
     /// backend HTTP server's keep-alive timeout (the engines default to
     /// 5s), or the pool hands out connections the server has already closed
     /// and non-idempotent sends fail. `0` keeps idle connections forever.
+    /// While a nonzero value is below `load_monitor_interval_secs`, an idle
+    /// HTTP worker is connected anew for every load poll; where the server's
+    /// keep-alive can be raised above that interval, a value between the two
+    /// keeps the connection.
     #[serde(default = "default_upstream_pool_idle_timeout_secs")]
     pub upstream_pool_idle_timeout_secs: u64,
     pub worker_startup_timeout_secs: u64,
@@ -260,6 +267,12 @@ pub struct RouterConfig {
     pub job_queue_concurrency: usize,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// The load monitor's interval in milliseconds, 100 at the least. When
+    /// set it is the interval, and `load_monitor_interval_secs` is not read
+    /// for it. The overload shed's Retry-After stays whole seconds: this
+    /// value raised to the next one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_monitor_interval_ms: Option<u64>,
     /// Seconds without any contact from a worker (a load poll, a health probe,
     /// a KV event, a response) after which a transport failure excludes it
     /// from routing; the first successful contact re-admits it.
@@ -445,6 +458,10 @@ pub struct RouterConfig {
     /// `SMG_LOG_MM_TIMING`.
     #[serde(default)]
     pub log_mm_timing: bool,
+    /// Deprecated, accepted and ignored: every registration reads an
+    /// engine's data-parallel size and registers one worker per rank, with
+    /// this set or not. Start-up warns when it is set.
+    #[serde(default)]
     pub dp_aware: bool,
     #[serde(default)]
     pub dp_minimum_tokens_scheduler: bool,
@@ -651,13 +668,19 @@ pub struct RouterConfig {
     /// When set, wraps all storage backends with hook-based interceptors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_hook_wasm_path: Option<String>,
-    /// Which code decides a request's worker: the classic policies (off, the
-    /// default) or the policy controller in this process (on). One temporary
-    /// setting, whole for a process. At this step it is for tests alone: no
-    /// flag, no binding keyword and no chart value sets it, and it is in no
-    /// serialized form.
-    #[serde(skip)]
+    /// Select the policy controller for this process. The classic policies
+    /// are the default. Written where it is on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub policy_controller: bool,
+    /// Path to the policy document the controller runs in place of the one
+    /// the routing settings mean. Requires the policy controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_spec_path: Option<String>,
+    /// The policy document the controller runs. The builder loads it from
+    /// `policy_spec_path`; a host may set it directly. Requires the policy
+    /// controller.
+    #[serde(skip)]
+    pub policy_spec: Option<PolicySpec>,
 }
 
 /// Capacity threshold for one PD role.
@@ -1300,9 +1323,11 @@ impl Default for RoutingKeyOverrideConfig {
 
 /// How a request with a sticky key is placed on the engines (data-parallel
 /// ranks) of a grouped worker: one worker URL whose socket set several
-/// engines dial (as many as `--zmq-engine-count` above one or `dp_size` on
-/// its spec says, or, given no count, as its engines declare at the
-/// handshake). Routing policies see the group as one worker, and its
+/// engines dial, as many as they declare at the handshake. A group given a
+/// count (`--zmq-engine-count` above one, or `dp_size` on its spec) is
+/// registered as one worker per engine and is not a grouped worker: there
+/// the routing policy's pick is the rank, and this setting does nothing.
+/// Routing policies see the group as one worker, and its
 /// connection otherwise sends each request to its least-loaded engine,
 /// which scatters one conversation's turns over the engines' separate
 /// prefix caches. The key is the one sticky routing reads: the first valid
@@ -1518,7 +1543,7 @@ pub enum PolicyConfig {
     /// with the lower expected wait, scored like `least_load`
     /// (`(queued_tokens + inflight_tokens) / throughput + kv_pressure_weight * k/(1-k)`).
     /// The worker loads it reads are polled at the gateway's one cadence,
-    /// `load_monitor_interval_secs`.
+    /// `load_monitor_interval_secs`, or `load_monitor_interval_ms` where set.
     #[serde(rename = "power_of_two")]
     PowerOfTwo {
         #[serde(default)]
@@ -1700,8 +1725,9 @@ fn default_least_load_throughput() -> f64 {
 }
 
 /// The per-policy poll interval of earlier releases. The load monitor has one
-/// cadence, `load_monitor_interval_secs`; a policy configuration that still
-/// sets this key is refused with that knob named, never silently ignored.
+/// cadence, `load_monitor_interval_secs` or `load_monitor_interval_ms` where
+/// set; a policy configuration that still sets this key is refused with the
+/// seconds knob named, never silently ignored.
 pub const RETIRED_POLICY_INTERVAL_KEY: &str = "load_check_interval_secs";
 
 /// least_load's per-worker waiting-queue cap of earlier releases. The router's
@@ -1983,6 +2009,7 @@ impl Default for RouterConfig {
             job_queue_capacity: default_job_queue_capacity(),
             job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
+            load_monitor_interval_ms: None,
             worker_stall_secs: default_worker_stall_secs(),
             worker_wedge_secs: default_worker_wedge_secs(),
             worker_stale_secs: default_worker_stale_secs(),
@@ -2074,6 +2101,8 @@ impl Default for RouterConfig {
             enable_wasm: false,
             storage_hook_wasm_path: None,
             policy_controller: false,
+            policy_spec_path: None,
+            policy_spec: None,
             server_cert: None,
             server_key: None,
             server_key_path: None,
@@ -2095,6 +2124,15 @@ impl RouterConfig {
     /// Validate the configuration
     pub fn validate(&self) -> ConfigResult<()> {
         ConfigValidator::validate(self)
+    }
+
+    /// The load monitor's interval: `load_monitor_interval_ms` where it is
+    /// set, `load_monitor_interval_secs` where it is not.
+    pub fn load_monitor_interval(&self) -> Duration {
+        match self.load_monitor_interval_ms {
+            Some(millis) => Duration::from_millis(millis),
+            None => Duration::from_secs(self.load_monitor_interval_secs),
+        }
     }
 
     /// Connection attempts per health-check success stamped on a worker
@@ -2182,6 +2220,48 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_switch_is_written_where_it_is_on() {
+        let config = RouterConfig::default();
+        let form = serde_json::to_value(&config).expect("a config serializes");
+        assert!(form.get("policy_controller").is_none());
+        let restored: RouterConfig = serde_json::from_value(form).expect("a config reads back");
+        assert!(!restored.policy_controller);
+
+        let config = RouterConfig {
+            policy_controller: true,
+            ..config
+        };
+        let form = serde_json::to_value(&config).expect("a config serializes");
+        assert_eq!(form["policy_controller"], true);
+        let restored: RouterConfig = serde_json::from_value(form).expect("a config reads back");
+        assert!(restored.policy_controller);
+    }
+
+    #[test]
+    fn a_document_path_round_trips_and_its_document_does_not() {
+        let config = RouterConfig::default();
+        let form = serde_json::to_value(&config).expect("a config serializes");
+        assert!(form.get("policy_spec_path").is_none());
+        let restored: RouterConfig = serde_json::from_value(form).expect("a config without a path");
+        assert!(restored.policy_spec_path.is_none());
+
+        let config = RouterConfig {
+            policy_controller: true,
+            policy_spec_path: Some("routing.yaml".to_owned()),
+            policy_spec: Some(config.policy_document().expect("the default document")),
+            ..config
+        };
+        let mut form = serde_json::to_value(&config).expect("a config with a document serializes");
+        assert_eq!(form["policy_spec_path"], "routing.yaml");
+        assert!(form.get("policy_spec").is_none());
+        form["policy_spec"] =
+            serde_json::to_value(config.policy_spec).expect("a document serializes");
+        let restored: RouterConfig = serde_json::from_value(form).expect("a config with a path");
+        assert_eq!(restored.policy_spec_path.as_deref(), Some("routing.yaml"));
+        assert!(restored.policy_spec.is_none());
+    }
 
     /// The mode is in the gateway's start-up lines: a worker URL's secret is
     /// never written there, the rest of the derive's form is kept.
@@ -2389,6 +2469,42 @@ mod tests {
         assert!(json.contains("health_check_port"));
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.health_check_port, Some(8081));
+    }
+
+    /// The load monitor's interval in milliseconds is unset by default and
+    /// stays out of a serialized configuration, and a configuration written
+    /// before the key reads as unset. Where it is set it is the interval
+    /// over the seconds, which stand beside it. Where it is not, the
+    /// seconds are the interval.
+    #[test]
+    fn the_load_monitor_interval_in_milliseconds_wins_over_the_seconds() {
+        let config = RouterConfig::default();
+        assert_eq!(config.load_monitor_interval_ms, None);
+        assert_eq!(config.load_monitor_interval(), Duration::from_secs(10));
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("load_monitor_interval_ms"));
+        let without: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(without.load_monitor_interval_ms, None);
+
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .load_monitor_interval_secs(5)
+            .load_monitor_interval_ms(Some(250))
+            .build_unchecked();
+        assert_eq!(config.load_monitor_interval(), Duration::from_millis(250));
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.load_monitor_interval_secs, 5);
+        assert_eq!(with.load_monitor_interval_ms, Some(250));
+
+        let seconds_alone = RouterConfig {
+            load_monitor_interval_secs: 5,
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            seconds_alone.load_monitor_interval(),
+            Duration::from_secs(5)
+        );
     }
 
     #[test]
@@ -3257,6 +3373,7 @@ mod tests {
         assert_eq!(config.bootstrap_port_annotation, "sglang.ai/bootstrap-port");
         assert_eq!(config.kv_connector_annotation, "smg.ai/kv-connector");
         assert_eq!(config.kv_engine_id_annotation, "smg.ai/kv-engine-id");
+        assert_eq!(config.pairing_protocol_label, "smg.ai/pairing-protocol");
     }
 
     #[test]
@@ -3277,6 +3394,7 @@ mod tests {
             worker_ports_annotation: "smg.ai/worker-ports".to_string(),
             kv_connector_annotation: "custom.io/kv-connector".to_string(),
             kv_engine_id_annotation: "custom.io/kv-engine-id".to_string(),
+            pairing_protocol_label: "custom.io/pairing-protocol".to_string(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             model_id_source: None,
@@ -3756,6 +3874,7 @@ discovery:
                     worker_ports_annotation: "smg.ai/worker-ports".to_string(),
                     kv_connector_annotation: "smg.ai/kv-connector".to_string(),
                     kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
+                    pairing_protocol_label: "smg.ai/pairing-protocol".to_string(),
                     router_selector: HashMap::new(),
                     router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                     model_id_source: None,

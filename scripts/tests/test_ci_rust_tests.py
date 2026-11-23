@@ -189,6 +189,8 @@ class ShardTableTests(unittest.TestCase):
             for name in sorted(closure(members, script("packages", row["shard"]).split())):
                 crate = members[name]["dir"]
                 probes = ["Cargo.toml", "src/lib.rs", "src/main.rs"]
+                if crate == "model_gateway":
+                    probes.append("src/cli/mod.rs")
                 # The target directories cargo discovers, where the crate has Rust sources in them.
                 probes += [
                     f"{d}/probe.rs"

@@ -1,7 +1,7 @@
 //! The reservation store: prefill slots and decode rooms as leases, exclusive
 //! under one fenced leader (design 4.3 and 5.1, the PD row).
 
-use crate::{lease::LeaseId, store::GatewayId, view::WorkerId};
+use crate::{engine::view::WorkerId, store::GatewayId, tracking::lease::LeaseId};
 
 /// What a reservation holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

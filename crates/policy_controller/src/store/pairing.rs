@@ -46,9 +46,12 @@ use std::{
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::{
-    framework::PairTable,
-    spec::Pairing,
-    view::{WireModes, WorkerId},
+    document::spec::Pairing,
+    engine::{
+        framework::PairTable,
+        view::{WireModes, WorkerId},
+        PartnerClasses,
+    },
 };
 
 #[cfg(test)]
@@ -448,6 +451,35 @@ impl PairClasses {
         Derivation::default().whole(prefills, decodes, mode)
     }
 
+    /// The classes as an engine over worker lists reads them
+    /// ([`PartnerClasses`]): each worker's class by its place in the
+    /// caller's list, with this derivation's table, which they take.
+    ///
+    /// `prefills` and `decodes` say, for each place of the caller's two
+    /// lists in order, whether the worker there was among the members
+    /// derived. The members derived stand in the lists' order, so each
+    /// takes its class as derived. A worker that was not among them takes
+    /// class `0`, which pairs with nobody.
+    #[must_use]
+    pub fn by_place(
+        self,
+        prefills: impl IntoIterator<Item = bool>,
+        decodes: impl IntoIterator<Item = bool>,
+    ) -> PartnerClasses {
+        fn side(derived: &[(WorkerId, u32)], given: impl IntoIterator<Item = bool>) -> Box<[u32]> {
+            let mut derived = derived.iter();
+            let mut next = || derived.next().map_or(0, |&(_, class)| class);
+            let class = |given: bool| if given { next() } else { 0 };
+            given.into_iter().map(class).collect()
+        }
+        PartnerClasses::derived(
+            side(&self.prefills, prefills),
+            side(&self.decodes, decodes),
+            self.ends,
+            self.listed,
+        )
+    }
+
     /// Each prefill with its class, in the order given: `0` for a prefill
     /// no decode pairs with, else a class numbered from `1`.
     pub fn prefills(&self) -> &[(WorkerId, u32)] {
@@ -824,9 +856,6 @@ pub(super) struct Derivation {
     /// The rule's verdict on each prefill slot beside each decode slot.
     verdicts: Vec<Vec<Verdict>>,
     work: Work,
-    /// How many whole derivations made what is kept.
-    #[cfg(test)]
-    wholes: usize,
 }
 
 impl Derivation {
@@ -839,10 +868,6 @@ impl Derivation {
         decodes: &P,
         mode: Pairing,
     ) -> PairClasses {
-        #[cfg(test)]
-        {
-            self.wholes += 1;
-        }
         let Self {
             sides: [prefill, decode],
             verdicts,
@@ -869,12 +894,6 @@ impl Derivation {
         let (refusals, _) = self.class(prefills, decodes);
         let table = (&*self.work.ends, &*self.work.listed);
         self.classes(prefills, decodes, table, refusals)
-    }
-
-    /// How many whole derivations made what is kept.
-    #[cfg(test)]
-    pub(super) fn wholes(&self) -> usize {
-        self.wholes
     }
 
     /// Class the offers as they stand: each slot's class, the table into

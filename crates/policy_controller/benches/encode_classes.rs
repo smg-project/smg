@@ -15,11 +15,7 @@
 //!   derived for that decode and the encode classes are carried;
 //! - `policy_encodes/models_write/apart/<models>`: the moved write over
 //!   that many models, each of the fleet `apart` at 64: one model's
-//!   classes are derived and the others' are carried;
-//! - `policy_encodes/build/pair/<fleet>/<n>` and
-//!   `policy_encodes/build/encode_pair/<fleet>/<n>`: one decision's build
-//!   through the pair's door, and through the encode pair's, which adds
-//!   the encode pool and its two columns.
+//!   classes are derived and the others' are carried.
 //!
 //! The fleets, each of one runtime and one wire:
 //!
@@ -42,15 +38,15 @@
 #[path = "common/filled.rs"]
 mod filled;
 
-use std::{hint::black_box, time::Instant};
+use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use smg_policy_controller::{
+    engine::{Role, WireModes},
     store::{
-        encoding::EncodeMember, Ask, EncodeClasses, EncodeHandoff, EncodeOffer, EncodePairBuffers,
-        GatewayId, MemoryStore, PairBuffers, WorkerFacts, WorkersStore,
+        EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer, MemoryStore, WorkerFacts,
+        WorkersStore,
     },
-    Role, WireModes,
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -231,45 +227,6 @@ fn moved_write(c: &mut Criterion) {
     group.finish();
 }
 
-/// One decision's build through each pair door of a store that holds the
-/// fleet: the pair's door, and the encode pair's, which adds the encode
-/// pool and its two columns.
-fn doors(c: &mut Criterion) {
-    let mut group = c.benchmark_group("policy_encodes/build");
-    for name in FLEETS {
-        for n in SIZES {
-            let store = store_of(&fleet(name, n));
-            let ask = Ask {
-                gateway: GatewayId(1),
-                now: Instant::now(),
-                pinned: None,
-                affinity: false,
-            };
-            let mut pair = PairBuffers::default();
-            assert!(
-                store.build_pair(MODEL, &ask, &mut pair).is_some(),
-                "the fleet holds both sides of a pair"
-            );
-            group.bench_function(BenchmarkId::new(format!("pair/{name}"), n), |b| {
-                b.iter(|| {
-                    store
-                        .build_pair(MODEL, black_box(&ask), &mut pair)
-                        .is_some()
-                });
-            });
-            let mut out = EncodePairBuffers::default();
-            group.bench_function(BenchmarkId::new(format!("encode_pair/{name}"), n), |b| {
-                b.iter(|| {
-                    store
-                        .build_encode_pair(MODEL, black_box(&ask), &mut out)
-                        .is_some()
-                });
-            });
-        }
-    }
-    group.finish();
-}
-
 /// A membership write that moves an offer the encode handoff does not read:
 /// the first decode registers with another runtime each time, so the
 /// model's encode classes are carried.
@@ -363,7 +320,6 @@ criterion_group!(
     membership_write,
     moved_write,
     decode_write,
-    models_write,
-    doors
+    models_write
 );
 criterion_main!(benches);

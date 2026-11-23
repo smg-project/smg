@@ -172,6 +172,9 @@ impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
                 "Cleaned up old workflow states"
             );
         }
+        // A burst of instances grows the table and nothing else shrinks it:
+        // without this an emptied table keeps the burst's size for good.
+        states.shrink_to_fit();
         removed_count
     }
 

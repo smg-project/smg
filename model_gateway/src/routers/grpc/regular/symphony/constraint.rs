@@ -6,10 +6,10 @@ use std::{borrow::Cow, fmt, sync::Arc};
 
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{ResponseFormat, Tool, ToolChoice, ToolChoiceValue},
+    common::{ResponseFormat, Tool, ToolChoice, ToolChoiceValue, ToolReference},
     messages::{CreateMessageRequest, ToolChoice as MessagesToolChoice},
     profile::ProviderProfile,
-    worker::ConstrainedDecoding,
+    worker::{ConstrainedDecoding, GrammarStart as WorkerGrammarStart},
 };
 use serde_json::{json, Value};
 use smg_worker::identity::basic::{Worker, WorkerType};
@@ -17,7 +17,6 @@ use symphony::{
     grammar::{GrammarStart, Options},
     Format, Grammar, GrammarBackend, OutputAnswer, OutputChoice, Spelling, Turn, Unspelled,
 };
-use tool_parser::{GrammarStart as WorkerGrammarStart, ToolConstraint};
 
 #[cfg(test)]
 use super::names::reading;
@@ -129,8 +128,8 @@ pub(super) fn tagged(
 /// worker's grammar compiler takes ([`tagged`]). A registry table's tag that opens with free
 /// text, the prefix an open thought takes on workers that name no one start for the grammar
 /// ([`opens_with_free_text`]), comes marked ([`Prepared::OpensWithFreeText`]): text that owes
-/// nothing at its end does not hold the model to the call, so preparation gives the older
-/// registry's schema in the tag's place where that schema can be built ([`Prepared::held_by`]).
+/// nothing at its end does not hold the model to the call, so preparation gives the call's
+/// JSON schema in the tag's place where that schema can be built ([`Prepared::held_by`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "the table, the request's ask, where the prompt and the engine leave the model, \
@@ -194,14 +193,14 @@ fn opens_with_free_text(grammar: &Grammar) -> bool {
     }
 }
 
-/// Whether `schema`, the older registry's JSON schema for a forced call to `tools`, keeps what
+/// Whether `schema`, the JSON schema preparation builds for a forced call to `tools`, keeps what
 /// every reference in the tools' parameters points at: each is a local one (`#` and a JSON
-/// pointer) whose target in `schema` is its target in the tool's own parameters. The registry
+/// pointer) whose target in `schema` is its target in the tool's own parameters. Preparation
 /// writes a named function's parameters as they are, and for a list of tools one schema that
 /// nests each tool's parameters and lifts their `$defs` to its root, where a reference to
 /// anything else (an entry of `definitions`, the tool's own root) points nowhere or at another
 /// value. A schema that loses a target is not sent in a tag's place ([`Prepared::held_by`]).
-/// A constraint of another kind, which the registry does not give with no parser named, is
+/// A constraint of another kind, which preparation's `forced_call_schema` never gives, is
 /// taken as it is.
 pub(crate) fn keeps_references(schema: &ToolConstraint, tools: &[Tool]) -> bool {
     let ToolConstraint::JsonSchema(schema) = schema else {
@@ -328,7 +327,7 @@ pub(crate) fn grammar_start_from(start: WorkerGrammarStart) -> GrammarStart {
 /// token stands beside one that does not, since no one tag fits both (the answer keeps the
 /// prefix a forced call takes: [`Format::answer_grammar_for`]); unknown when none says, and
 /// when workers that start after their reasoning parser stand beside ones that do not say,
-/// since the unknown start's tags fit both (a forced call's tag, or the older registry's schema
+/// since the unknown start's tags fit both (a forced call's tag, or the call's JSON schema
 /// where the table's tag would open with free text; an answer's schema alone).
 pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
     let mut starts = workers
@@ -591,7 +590,7 @@ impl<'a> Asks<'a> {
     /// provider that reads calls only with them: [`scans_for_tool_calls_for`]; a Messages request
     /// that declares no tools, an empty list being a declaration). A `tool_choice` of `none` is
     /// not this: the table keeps its calls and the reader delivers none of them
-    /// ([`Asks::forbids_calls_for`]). `provider` is the chat model's profile as the request's
+    /// ([`Asks::forbids_for`]). `provider` is the chat model's profile as the request's
     /// preparation derived it once.
     pub(super) fn no_calls_for(self, provider: ProviderProfile) -> bool {
         match self {
@@ -600,23 +599,40 @@ impl<'a> Asks<'a> {
         }
     }
 
-    /// The request forbids the calls its response would be scanned for (`tool_choice: none` over
-    /// declared tools, or over a provider that reads calls without any): the table keeps its
-    /// calls, so a call the model writes anyway is read whole, and the reader drops it, as the
-    /// engine's own server reads such a call and withholds it. The prompt declares the tools as
-    /// under `auto` (`utils::request_as_rendered`), so the model may well write one. `provider`
-    /// is the chat model's profile as the request's preparation derived it once.
-    pub(super) fn forbids_calls_for(self, provider: ProviderProfile) -> bool {
-        match self {
-            Self::Chat(request) => {
-                matches!(
-                    request.tool_choice,
-                    Some(ToolChoice::Value(ToolChoiceValue::None))
-                ) && scans_for_tool_calls_for(request, provider)
+    /// The calls the request's `tool_choice` forbids among those its response would be scanned
+    /// for (over declared tools, or over a provider that reads calls without any): every call
+    /// under `none`; under a named function, an allowed list or `required`, a call to a function
+    /// outside the tools the choice leaves callable ([`callable`]); none under `auto`. The table
+    /// keeps its calls, so a call the model writes anyway is read whole, and the reader drops
+    /// it, as the engine's own server reads a call under `none` and withholds it. Under `none`
+    /// the prompt declares the tools as under `auto` (`utils::request_as_rendered`), so the
+    /// model may well write one. `provider` is the chat model's profile as the request's
+    /// preparation derived it once.
+    pub(super) fn forbids_for(self, provider: ProviderProfile) -> Forbids {
+        let choice = self.choice();
+        let forbids = match choice.as_deref() {
+            None | Some(ToolChoice::Value(ToolChoiceValue::Auto)) => return Forbids::Nothing,
+            Some(ToolChoice::Value(ToolChoiceValue::None)) => Forbids::Every,
+            Some(ToolChoice::Value(ToolChoiceValue::Required)) => Forbids::Undeclared,
+            Some(ToolChoice::Function { function, .. }) => {
+                Forbids::AllBut([function.name.clone()].into())
             }
-            Self::Messages {
-                request, has_tools, ..
-            } => matches!(request.tool_choice, Some(MessagesToolChoice::None)) && has_tools,
+            Some(ToolChoice::AllowedTools { tools, .. }) => Forbids::AllBut(
+                tools
+                    .iter()
+                    .filter_map(ToolReference::function_name)
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+        };
+        let scanned = match self {
+            Self::Chat(request) => scans_for_tool_calls_for(request, provider),
+            Self::Messages { has_tools, .. } => has_tools,
+        };
+        if scanned {
+            forbids
+        } else {
+            Forbids::Nothing
         }
     }
 
@@ -670,6 +686,46 @@ pub(super) fn callable<'t>(choice: Option<&ToolChoice>, declared: &'t [Tool]) ->
             .narrow_tools(declared)
             .map_or(Cow::Borrowed(declared), Cow::Owned),
         None => Cow::Borrowed(declared),
+    }
+}
+
+/// The calls a request's `tool_choice` forbids among those the table reads
+/// ([`Asks::forbids_for`]), which the reader drops: a call is forbidden when its function is
+/// outside the tools the choice leaves callable ([`callable`]). `auto` narrows nothing and
+/// forbids nothing: a call to a function the request did not declare goes out under it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Forbids {
+    /// No call (`auto`, or no choice).
+    Nothing,
+    /// Every call (`none`).
+    Every,
+    /// A call to a function the request did not declare (`required`: every declared tool is
+    /// callable).
+    Undeclared,
+    /// A call to any function but these, the ones the choice names (a named function, an allowed
+    /// list), and a call to one of these the request did not declare.
+    AllBut(Arc<[String]>),
+}
+
+impl Forbids {
+    /// Whether the choice forbids a call to `function`, `declared` saying whether the request
+    /// declares that function.
+    pub(super) fn call_to(&self, function: &str, declared: bool) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::Every => true,
+            Self::Undeclared => !declared,
+            Self::AllBut(named) => !declared || !named.iter().any(|name| name == function),
+        }
+    }
+
+    /// The choice as a reader of the `declared` tools asks it: with no tool declared none is
+    /// callable, so a choice that forbids some calls forbids them all.
+    pub(super) fn over(&self, declared: &[Tool]) -> Self {
+        match self {
+            Self::Undeclared | Self::AllBut(_) if declared.is_empty() => Self::Every,
+            forbids => forbids.clone(),
+        }
     }
 }
 
@@ -832,10 +888,49 @@ pub(super) fn auto_tag(
         .and_then(|grammar| structural_tag(grammar, vocabulary).ok())
 }
 
+/// A constraint an engine decodes under: a JSON schema, or a structural tag. The request builders
+/// take it as its wire pair ([`Self::to_tuple`]).
+#[derive(Debug, Clone)]
+pub(crate) enum ToolConstraint {
+    /// A JSON schema the engine holds the output to, from the first token or once the model's
+    /// thought is over, by where the worker starts the grammar. The kind does not pick the
+    /// reader: a table reads a schema it built, and a forced call's schema it did not build
+    /// where it reads the response; the generic JSON parser reads one only on the legacy path
+    /// (`regular::stages::reading::Prepared::json_schema`, `regular::symphony::assign_for`).
+    JsonSchema(String),
+    /// A structural tag: the answer carries the model's own framing, read by the model's parser.
+    StructuralTag(String),
+}
+
+impl ToolConstraint {
+    /// The kind and the text, as the request builders take them.
+    pub(crate) fn to_tuple(&self) -> (String, String) {
+        match self {
+            Self::JsonSchema(schema) => ("json_schema".to_string(), schema.clone()),
+            Self::StructuralTag(tag) => ("structural_tag".to_string(), tag.clone()),
+        }
+    }
+
+    pub(crate) fn is_json_schema(&self) -> bool {
+        matches!(self, Self::JsonSchema(_))
+    }
+}
+
+impl From<tool_parser::ToolConstraint> for ToolConstraint {
+    /// The older registry's constraint, kind for kind.
+    fn from(constraint: tool_parser::ToolConstraint) -> Self {
+        match constraint {
+            tool_parser::ToolConstraint::JsonSchema(schema) => Self::JsonSchema(schema),
+            tool_parser::ToolConstraint::StructuralTag(tag) => Self::StructuralTag(tag),
+        }
+    }
+}
+
 /// The constraint preparation finds for what a request asks, before its worker is known
-/// ([`constraint_for`]): a forced call's tag, the table's or the older registry's; a JSON answer's
-/// tag as it derives for a worker's start; or why the table cannot constrain the request. Request
-/// building decides on the selected worker ([`worker_constraint`]).
+/// ([`constraint_for`]): a forced call's tag, the table's or the older registry's, or the call's
+/// JSON schema where the table's tag opens with free text; a JSON answer's tag as it derives for
+/// a worker's start; or why the table cannot constrain the request. Request building decides on
+/// the selected worker ([`worker_constraint`]).
 pub(crate) type PreparedConstraint = Result<Prepared, SymphonyError>;
 
 /// What preparation found for a request's constraint, before its worker is known.
@@ -845,22 +940,24 @@ pub(crate) enum Prepared {
     None,
     /// A constraint every worker takes as it is: a forced call's tag, the table's built for the
     /// start the model's workers name together ([`grammar_start_of`]) or the older registry's,
-    /// which request building shapes for the worker (`utils::tool_constraints_for_worker`).
+    /// which request building shapes for the worker (`utils::tool_constraints_for_worker`), or
+    /// the call's JSON schema where the table's tag opens with free text ([`Self::held_by`]).
     Constraint {
         constraint: ToolConstraint,
         /// The table built it for an engine that starts the grammar at the first token (the
         /// thought, closed, ahead of the calls), the start the model's workers name together.
-        /// The older registry's is shaped for the worker at request building, which says then
+        /// One no table built is shaped for the worker at request building, which says then
         /// whether it led the tag; here it is `false` ([`WorkerConstraint::first_token`]).
         first_token: bool,
         /// The table built it (its tag for the forced call, `calls_tag`), so the table reads
         /// the response with its own markers whatever the constraint's kind; `false` for the
-        /// older registry's, whose JSON the table reads with its forced call, and for the
-        /// request's own schema where no table reads ([`WorkerConstraint::table`]).
+        /// older registry's and the forced call's JSON schema, whose JSON the table reads with its
+        /// forced call, and for the request's own schema where no table reads
+        /// ([`WorkerConstraint::table`]).
         table: bool,
     },
     /// A forced call's tag a registry table built that opens with free text ([`calls_tag`]),
-    /// which does not hold the model to the call. Preparation gives the older registry's schema
+    /// which does not hold the model to the call. Preparation gives the call's JSON schema
     /// in its place, or keeps the tag as the table's own where that schema cannot be built
     /// ([`Self::held_by`]).
     OpensWithFreeText {
@@ -879,7 +976,7 @@ pub(crate) enum Prepared {
 
 impl Prepared {
     /// What holds a forced call where the table's tag opens with free text
-    /// ([`Self::OpensWithFreeText`]): the constraint `schema` gives, the older registry's JSON
+    /// ([`Self::OpensWithFreeText`]): the constraint `schema` gives, the forced call's JSON
     /// schema, which holds the model to the call wherever the engine starts the grammar; or the
     /// table's own tag where `schema` gives none, so that a request that schema cannot spell is
     /// served, not refused. Anything else stays as found, and `schema` is not asked.
@@ -921,9 +1018,9 @@ impl Prepared {
 }
 
 impl From<Option<ToolConstraint>> for Prepared {
-    /// The older registry's constraint, as it built it (or the request's own schema where no
-    /// table reads): request building shapes it for the worker and says whether it led the
-    /// tag; no table built it.
+    /// The older registry's constraint, as it built it (or a forced call's JSON schema in a
+    /// tag's place, or the request's own schema where no table reads): request building shapes
+    /// it for the worker and says whether it led the tag; no table built it.
     fn from(constraint: Option<ToolConstraint>) -> Self {
         constraint.map_or(Self::None, |constraint| Self::Constraint {
             constraint,
@@ -1037,15 +1134,15 @@ pub(crate) struct WorkerConstraint {
     /// for a pool that starts there ([`Prepared::Constraint`]). The engine's request says so
     /// where its dialect has a switch for the gate behind a reasoning parser, so an engine that
     /// gates its grammars there starts this one at once; a constraint shaped for another start,
-    /// or none, starts where the engine does. Never the older registry's constraint: request
+    /// or none, starts where the engine does. Never a constraint no table built: request
     /// building shapes that one for the worker and says whether it led the tag.
     pub first_token: bool,
     /// The table built the constraint (the whole turn's grammar, the `auto` tag, a JSON
     /// answer's tag, a forced call's), so the table reads the response whatever the
-    /// constraint's kind, which a backend's spelling may change; `false` for the older
-    /// registry's forced call, which the table reads with its forced call, and where nothing
-    /// constrains.
-    /// Symphony's assignment reads the older registry's by its kind alone
+    /// constraint's kind, which a backend's spelling may change; `false` for a forced call's
+    /// constraint no table built (the older registry's, or the call's JSON schema in a tag's
+    /// place), which the table reads with its forced call, and where nothing constrains.
+    /// Symphony's assignment reads one no table built by its kind alone
     /// (`regular::symphony::assign_for`).
     pub table: bool,
 }
@@ -1214,7 +1311,7 @@ pub(crate) fn worker_constraint(
     let start = grammar_start_from(decoding.start);
     let vocabulary = decoding.vocabulary;
     // A tag derived here is shaped for the selected worker's start; a prepared constraint says
-    // for itself whether the table built it for the first token, and the older registry's is
+    // for itself whether the table built it for the first token, and one no table built is
     // shaped and spoken for at request building (`utils::tool_constraints_for_worker`).
     let derived_for_first_token =
         |tag: &Option<ToolConstraint>| tag.is_some() && start == GrammarStart::FirstToken;
@@ -1346,7 +1443,7 @@ pub(super) fn whole_turn(
 
 #[cfg(test)]
 mod tests {
-    use tool_parser::GrammarStart;
+    use openai_protocol::worker::GrammarStart;
 
     use super::*;
     use crate::routers::grpc::regular::symphony::testing::{assign, constraint, *};
@@ -1487,7 +1584,7 @@ mod tests {
     /// the thought closed first from the first token, the schema alone (the request's own, no
     /// tag) when the worker does not say, and for the calls the free-text prefix, marked as
     /// such, when the model's workers name different starts or none: free text owes the call
-    /// nothing, so preparation gives the older registry's schema in the tag's place. The
+    /// nothing, so preparation gives the call's JSON schema in the tag's place. The
     /// answer's tag derives for the selected worker, whatever start the pool names.
     #[test]
     fn the_workers_grammar_start_shapes_what_precedes_a_tables_answer_and_calls() {
@@ -1690,7 +1787,7 @@ mod tests {
         );
     }
 
-    /// The older registry's schema keeps a reference when its target there is its target in the
+    /// A forced call's JSON schema keeps a reference when its target there is its target in the
     /// tool's own parameters: any local reference of a named function, whose parameters are the
     /// schema; a `$defs` entry under the one schema for a list of tools, which lifts those and
     /// nothing else. A reference to an entry of `definitions` or to the tool's own root under
@@ -2690,7 +2787,7 @@ mod tests {
         .expect("assigned");
         assert_eq!(no_calls.format.name(), "qwen3");
         assert_eq!(no_calls.format.call_syntax(), None);
-        assert!(!no_calls.forbids_calls);
+        assert_eq!(no_calls.forbids_calls, Forbids::Nothing);
         let forbidden = super::super::assign(
             symphony,
             &plain,
@@ -2709,7 +2806,7 @@ mod tests {
             forbidden.format.call_syntax().is_some(),
             "the table keeps its calls under none over declared tools"
         );
-        assert!(forbidden.forbids_calls);
+        assert_eq!(forbidden.forbids_calls, Forbids::Every);
         // Past the route the request's own `tools` reads `None` (the route took them out while it
         // owned the request): the declaration the spec recorded is what the table reads.
         let taken = super::super::assign(
@@ -2730,7 +2827,7 @@ mod tests {
             taken.format.call_syntax().is_some(),
             "the declaration is read from the ask, not from the request's emptied field"
         );
-        assert!(taken.forbids_calls);
+        assert_eq!(taken.forbids_calls, Forbids::Every);
         let constrain = |extra: Value| {
             super::constraint(
                 symphony,
@@ -3721,5 +3818,73 @@ mod tests {
             );
             assert!(!decided.table && !decided.first_token && !decided.by_policy);
         }
+    }
+
+    /// A choice forbids exactly the calls outside the tools it leaves callable ([`callable`]),
+    /// for every form of the choice; `auto` narrows nothing and forbids nothing.
+    #[test]
+    fn a_choice_forbids_exactly_the_calls_outside_its_callable_tools() {
+        let tools = json!([
+            {"type": "function", "function": {"name": "save_note", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "delete_file", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}},
+        ]);
+        let choices = [
+            json!("auto"),
+            json!("none"),
+            json!("required"),
+            json!({"type": "function", "function": {"name": "save_note"}}),
+            json!({"type": "allowed_tools", "mode": "auto", "tools": [
+                {"type": "function", "name": "save_note"}, {"type": "function", "name": "lookup"}]}),
+            json!({"type": "allowed_tools", "mode": "required", "tools": [
+                {"type": "function", "name": "delete_file"}]}),
+        ];
+        for choice in choices {
+            let request = request(json!({"tools": tools.clone(), "tool_choice": choice.clone()}));
+            let declared = request.tools.as_deref().expect("the declared tools");
+            let forbids =
+                Asks::Chat(&request).forbids_for(ProviderProfile::for_model(&request.model));
+            let callable = callable(request.tool_choice.as_ref(), declared);
+            for function in ["save_note", "delete_file", "lookup", "undeclared"] {
+                let is = |tools: &[Tool]| tools.iter().any(|tool| tool.function.name == function);
+                let forbidden = forbids != Forbids::Nothing && !is(&callable);
+                assert_eq!(
+                    forbids.call_to(function, is(declared)),
+                    forbidden,
+                    "{choice}: {function}"
+                );
+            }
+            assert_eq!(
+                forbids.over(declared),
+                forbids,
+                "{choice}: over declared tools"
+            );
+            let over_none = match forbids {
+                Forbids::Nothing => Forbids::Nothing,
+                _ => Forbids::Every,
+            };
+            assert_eq!(forbids.over(&[]), over_none, "{choice}: over no tool");
+        }
+    }
+
+    /// A Messages choice forbids as the chat choice it converts to: `tool` all but the tool it
+    /// names, `any` the tools the request did not declare, `none` every call, `auto` none.
+    #[test]
+    fn a_messages_choice_forbids_as_its_chat_form() {
+        let forbids = |choice: Value| {
+            let request = message_request(json!({
+                "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}],
+                "tool_choice": choice
+            }));
+            Asks::for_messages(&request, false)
+                .forbids_for(ProviderProfile::for_model(&request.model))
+        };
+        assert_eq!(
+            forbids(json!({"type": "tool", "name": "lookup"})),
+            Forbids::AllBut(["lookup".to_string()].into())
+        );
+        assert_eq!(forbids(json!({"type": "any"})), Forbids::Undeclared);
+        assert_eq!(forbids(json!({"type": "none"})), Forbids::Every);
+        assert_eq!(forbids(json!({"type": "auto"})), Forbids::Nothing);
     }
 }

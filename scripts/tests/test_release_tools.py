@@ -366,6 +366,7 @@ class Sandbox:
         )
         self.put("model_gateway/Cargo.toml", versioned("smg", "1.13.0"))
         self.put("model_gateway/src/main.rs", 'fn main() {\n    println!("one");\n}\n')
+        self.put("model_gateway/src/cli/mod.rs", 'fn read_args() {\n    println!("one");\n}\n')
         self.put("crates/tool_parser/Cargo.toml", versioned("tool-parser", "0.5.0"))
         self.put("crates/tool_parser/src/lib.rs", "pub fn parse() {}\n")
         # a crate the checker lists that cargo never publishes (the real one is a generator's scaffold)
@@ -1150,20 +1151,21 @@ def test_pick_refusals(repo: Sandbox) -> None:
 
 
 def test_pick_conflict_stops_with_the_steps_and_pick_pr_finishes(repo: Sandbox) -> None:
+    path = "model_gateway/src/cli/mod.rs"
     repo.cut()
     repo.git("switch", "--quiet", "release/1.14")
-    repo.put("model_gateway/src/main.rs", 'fn main() {\n    println!("branch only");\n}\n')
+    repo.put(path, 'fn read_args() {\n    println!("branch only");\n}\n')
     repo.git("commit", "--quiet", "-am", "fix(router): branch only")
     repo.land_on_release()
     four = repo.commit_main(
         "fix(router): four (#125)",
-        "model_gateway/src/main.rs",
-        'fn main() {\n    println!("four");\n}\n',
+        path,
+        'fn read_args() {\n    println!("four");\n}\n',
     )
     done = repo.tool("pick", "1.14", four, check=False)
     assert done.returncode == 1
     assert f"the pick of {four[:7]} (fix(router): four (#125)) conflicts on:" in done.stdout
-    assert "    model_gateway/src/main.rs" in done.stdout
+    assert f"    {path}" in done.stdout
     assert "git cherry-pick --continue" in done.stdout
     topic = f"pick/1.14-{four[:7]}"
     assert f"make release-pick-pr RELEASE=1.14 PICK={topic}" in done.stdout
@@ -1172,8 +1174,8 @@ def test_pick_conflict_stops_with_the_steps_and_pick_pr_finishes(repo: Sandbox) 
     )
     assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == topic
     assert "still in progress" in repo.tool("pick-pr", "1.14", check=False).stderr
-    repo.put("model_gateway/src/main.rs", 'fn main() {\n    println!("four");\n}\n')
-    repo.git("add", "model_gateway/src/main.rs")
+    repo.put(path, 'fn read_args() {\n    println!("four");\n}\n')
+    repo.git("add", path)
     repo.git("cherry-pick", "--continue")
     assert f"(cherry picked from commit {four})" in repo.git("log", "-1", "--format=%B")
     # finished from main, the branch named: the pick branch may lack the release targets

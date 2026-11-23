@@ -1,11 +1,19 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use futures::{channel::mpsc, FutureExt, SinkExt};
 use k8s_openapi::{
     api::core::v1::{Pod, PodCondition, PodSpec, PodStatus},
     apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time},
 };
-use kube::runtime::watcher::Event;
+use kube::runtime::watcher::{self, Event};
+use openai_protocol::worker::WorkerSpec;
 use smg_worker::{
-    identity::endpoint::{endpoint_key, Endpoint, EndpointKey},
-    registry::WorkerId,
+    identity::{
+        basic::Worker,
+        endpoint::{endpoint_key, Endpoint, EndpointKey},
+    },
+    jobs::WorkerJobs,
+    registry::{WorkerId, WorkerOrigin},
 };
 use tracing_test::traced_test;
 
@@ -97,6 +105,7 @@ fn create_pd_config() -> ServiceDiscoveryConfig {
         worker_ports_annotation: "smg.ai/worker-ports".to_string(),
         kv_connector_annotation: "smg.ai/kv-connector".to_string(),
         kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
+        pairing_protocol_label: "smg.ai/pairing-protocol".to_string(),
         model_id_source: None,
     }
 }
@@ -164,6 +173,7 @@ fn test_service_discovery_config_default() {
     assert_eq!(config.worker_ports_annotation, "smg.ai/worker-ports");
     assert_eq!(config.kv_connector_annotation, "smg.ai/kv-connector");
     assert_eq!(config.kv_engine_id_annotation, "smg.ai/kv-engine-id");
+    assert_eq!(config.pairing_protocol_label, "smg.ai/pairing-protocol");
 }
 
 #[test]
@@ -373,6 +383,7 @@ fn test_pod_info_is_healthy() {
         bootstrap_ports: vec![],
         kv_connector: None,
         kv_engine_ids: vec![],
+        pairing_protocol: None,
         model_id_override: None,
     };
     assert!(healthy_pod.is_healthy());
@@ -388,6 +399,7 @@ fn test_pod_info_is_healthy() {
         bootstrap_ports: vec![],
         kv_connector: None,
         kv_engine_ids: vec![],
+        pairing_protocol: None,
         model_id_override: None,
     };
     assert!(!not_ready_pod.is_healthy());
@@ -403,6 +415,7 @@ fn test_pod_info_is_healthy() {
         bootstrap_ports: vec![],
         kv_connector: None,
         kv_engine_ids: vec![],
+        pairing_protocol: None,
         model_id_override: None,
     };
     assert!(!not_running_pod.is_healthy());
@@ -543,10 +556,192 @@ fn test_from_pod_bootstrap_count_mismatch_ignored() {
     assert_eq!(info.bootstrap_ports, vec![None, None]);
 }
 
+// ========== Pairing protocol label ==========
+
+/// `pod` with one more label.
+fn with_label(mut pod: Pod, key: &str, value: &str) -> Pod {
+    pod.metadata
+        .labels
+        .get_or_insert_with(BTreeMap::new)
+        .insert(key.to_string(), value.to_string());
+    pod
+}
+
+/// A Pod's pairing-protocol label is read as its explicit pairing protocol:
+/// trimmed, and none where the label is absent, empty or blank.
+#[test]
+fn a_pods_pairing_protocol_label_is_read_trimmed_and_an_empty_one_states_none() {
+    let config = create_pd_config();
+    let read = |value: Option<&str>| {
+        let pod = create_pd_k8s_pod("decode-0", "10.0.0.1", "decode", None);
+        let pod = match value {
+            Some(value) => with_label(pod, "smg.ai/pairing-protocol", value),
+            None => pod,
+        };
+        let info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+        info.pairing_protocol
+    };
+    assert_eq!(read(Some("rollout-7")).as_deref(), Some("rollout-7"));
+    assert_eq!(read(Some("  rollout-7 ")).as_deref(), Some("rollout-7"));
+    assert_eq!(read(Some("")), None);
+    assert_eq!(read(Some("   ")), None);
+    assert_eq!(read(None), None);
+}
+
+/// The label's name is the configuration's: a Pod that carries both the
+/// configured label and the default one is read by the configured one.
+#[test]
+fn the_pairing_protocol_is_read_from_the_label_the_configuration_names() {
+    let mut config = create_pd_config();
+    config.pairing_protocol_label = "example.com/rollout".to_string();
+    let pod = create_pd_k8s_pod("decode-0", "10.0.0.1", "decode", None);
+    let pod = with_label(pod, "example.com/rollout", "blue");
+    let pod = with_label(pod, "smg.ai/pairing-protocol", "green");
+    let info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+    assert_eq!(info.pairing_protocol.as_deref(), Some("blue"));
+}
+
+/// Every worker a Pod publishes carries the Pod's pairing protocol. A Pod
+/// that is relabelled publishes the same instances under another
+/// fingerprint, which the reconciler answers with an update in place.
+#[test]
+fn each_worker_of_a_pod_carries_its_pairing_protocol_and_a_relabel_moves_its_fingerprint() {
+    let config = create_pd_config();
+    let published = |protocol: &str| {
+        let pod = create_pd_k8s_pod("decode-0", "10.0.0.1", "decode", None);
+        let mut pod = with_label(pod, "smg.ai/pairing-protocol", protocol);
+        let annotations = pod.metadata.annotations.as_mut().unwrap();
+        annotations.insert("smg.ai/worker-ports".to_string(), "8080,8081".to_string());
+        compute_desired_state(&store_snapshot(vec![pod]), &config)
+    };
+    let (first, relabelled) = (published("v1"), published("v2"));
+    assert_eq!(first.workers.len(), 2);
+    for (endpoint, worker) in &first.workers {
+        assert_eq!(worker.pairing_protocol.as_deref(), Some("v1"));
+        let again = &relabelled.workers[endpoint];
+        assert_eq!(again.discovery_id, worker.discovery_id);
+        assert_eq!(again.pairing_protocol.as_deref(), Some("v2"));
+        assert_ne!(again.fingerprint(), worker.fingerprint());
+    }
+}
+
 // ========== Desired state ==========
 
 fn store_snapshot(pods: Vec<Pod>) -> Vec<Arc<Pod>> {
     pods.into_iter().map(Arc::new).collect()
+}
+
+#[derive(Default)]
+struct ReconcileCountingHost {
+    passes: AtomicUsize,
+}
+
+impl DiscoveryHost for ReconcileCountingHost {
+    fn workers(&self) -> Vec<(WorkerId, Arc<dyn Worker>)> {
+        self.passes.fetch_add(1, Ordering::Relaxed);
+        Vec::new()
+    }
+
+    fn origin_of(&self, _worker_id: &WorkerId) -> Option<WorkerOrigin> {
+        None
+    }
+
+    fn stamp(&self, _spec: &mut WorkerSpec) {}
+
+    fn jobs(&self) -> Option<Arc<dyn WorkerJobs>> {
+        None
+    }
+}
+
+async fn assert_watch_event_wake(
+    events: &mut mpsc::Sender<watcher::Result<Event<Pod>>>,
+    notify: &Notify,
+    event: watcher::Result<Event<Pod>>,
+    expected: bool,
+) {
+    assert!(events.send(event).await.is_ok());
+    task::yield_now().await;
+    assert_eq!(notify.notified().now_or_never().is_some(), expected);
+}
+
+#[tokio::test]
+async fn drive_watch_notifies_only_after_visible_store_changes() {
+    let (mut events, stream) = mpsc::channel(1);
+    let notify = Arc::new(Notify::new());
+    let loop_notify = Arc::clone(&notify);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the finite stream task is joined at the end of the test"
+    )]
+    let handle = task::spawn(async move {
+        drive_watch(stream, loop_notify.as_ref()).await;
+    });
+
+    let pod = Pod::default;
+    assert_watch_event_wake(&mut events, &notify, Ok(Event::Init), false).await;
+    assert_watch_event_wake(&mut events, &notify, Ok(Event::InitApply(pod())), false).await;
+    assert_watch_event_wake(&mut events, &notify, Ok(Event::InitDone), false).await;
+    assert_watch_event_wake(&mut events, &notify, Ok(Event::Apply(pod())), true).await;
+    assert_watch_event_wake(&mut events, &notify, Ok(Event::Delete(pod())), true).await;
+    assert_watch_event_wake(&mut events, &notify, Ok(Event::Init), false).await;
+    assert_watch_event_wake(&mut events, &notify, Ok(Event::InitApply(pod())), false).await;
+    assert_watch_event_wake(&mut events, &notify, Ok(Event::InitDone), true).await;
+    assert_watch_event_wake(
+        &mut events,
+        &notify,
+        Err(watcher::Error::NoResourceVersion),
+        false,
+    )
+    .await;
+
+    drop(events);
+    assert!(handle.await.is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn unchanged_ticks_reuse_the_projected_pod_snapshot() {
+    PROJECTION_PASSES.set(0);
+    let (store, mut writer) = reflector::store::<Pod>();
+    writer.apply_watcher_event(&Event::Init);
+    writer.apply_watcher_event(&Event::InitApply(make_labeled_pod(
+        "worker-0",
+        "10.0.0.1",
+        &[("app", "sglang")],
+    )));
+    writer.apply_watcher_event(&Event::InitDone);
+
+    let notify = Arc::new(Notify::new());
+    let host = Arc::new(ReconcileCountingHost::default());
+    let mut config = make_regular_config();
+    config.check_interval = Duration::from_secs(60);
+    let loop_notify = Arc::clone(&notify);
+    let loop_host = Arc::clone(&host);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the loop under test is aborted at the end of the test"
+    )]
+    let handle = task::spawn(async move {
+        reconcile_on_change(&store, loop_notify.as_ref(), &config, loop_host.as_ref()).await;
+    });
+
+    task::yield_now().await;
+    for _ in 0..2 {
+        time::advance(Duration::from_secs(60)).await;
+        task::yield_now().await;
+    }
+    assert_eq!(host.passes.load(Ordering::Relaxed), 3);
+    assert_eq!(PROJECTION_PASSES.get(), 1);
+
+    let changed = make_labeled_pod("worker-0", "10.0.0.2", &[("app", "sglang")]);
+    writer.apply_watcher_event(&Event::Apply(changed));
+    notify.notify_one();
+    task::yield_now().await;
+    time::advance(Duration::from_secs(1)).await;
+    task::yield_now().await;
+
+    assert_eq!(host.passes.load(Ordering::Relaxed), 4);
+    assert_eq!(PROJECTION_PASSES.get(), 2);
+    handle.abort();
 }
 
 fn key(url: &str) -> EndpointKey {

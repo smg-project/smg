@@ -34,6 +34,7 @@ tracing.workspace = true
 uuid = { workspace = true, features = ["v4", "serde"] }
 # Only used by tokenizer
 aho-corasick = "1.1"
+memchr.workspace = true
 base64 = "0.23"
 # The exact-match cache's key hash: keyed, and one pass at memory speed over the whole text.
 foldhash = "0.2"

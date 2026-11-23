@@ -29,6 +29,9 @@ use crate::{
     fanout::fan_out_n,
     pin_yield::PinYieldNote,
     sglang_encode::EncodeMediaRefs,
+    sglang_v41_items::{
+        deepseek_v41_items, is_v41_batch, V41Vision, MARKER as V41_MARKER, PREFIX as V41_PREFIX,
+    },
     stream::{
         finish, map_slim_output, matched_stop_of, poll_mapped, FinishParts, MappedGenerateStream,
         StreamState,
@@ -416,13 +419,16 @@ pub(crate) fn fan_out_sglang_requests(
 /// engine's own frontend places it ([`routed_dp_rank`]), or, on the prefill
 /// side of a disaggregated pair, by its room's residue
 /// ([`room_residue_rank`]), a pin's yield to the room logged on `yields`, the
-/// connection's note, at WARN once and at DEBUG after.
+/// connection's note, at WARN once and at DEBUG after. `v41_vision` is the
+/// served DeepSeek-V4.1 model's patch geometry, when every scheduler rank
+/// declared the same one.
 pub(crate) fn translate_request_sglang(
     req: sglang_proto::GenerateRequest,
     max_model_len: u64,
     ranks: usize,
     placement: RankPlacement,
     yields: &PinYieldNote,
+    v41_vision: Option<V41Vision>,
 ) -> Result<TokenizedGenerateReqInput, String> {
     let tokenized = req
         .tokenized
@@ -455,6 +461,7 @@ pub(crate) fn translate_request_sglang(
                 *mm,
                 req.extra_mm_inputs,
                 input_ids.len(),
+                v41_vision,
             )?),
             None,
         ),
@@ -526,9 +533,13 @@ pub(crate) fn translate_request_sglang(
 /// worker, see [`crate::sglang_encode`]). A payload carrying tensors takes the
 /// processor-output path whatever references ride beside them (the engine's
 /// frontend processes such a request locally); one naming nothing is not a
-/// dispatch. A borrowing test: the translation's guard, free of copies.
+/// dispatch. Nor is a payload that carries `vit_grid`, the DeepSeek-V4.1 grid,
+/// which describes pixels: without them it takes the tensor path, which
+/// refuses it, as the Python servicer does. A borrowing test: the
+/// translation's guard, free of copies.
 pub(crate) fn names_encode_refs(mm: &sglang_proto::MultimodalInputs) -> bool {
     mm.pixel_values.is_none()
+        && !mm.model_specific_tensors.contains_key(V41_MARKER)
         && !(mm.image_urls.is_empty() && mm.video_urls.is_empty() && mm.audio_urls.is_empty())
 }
 
@@ -553,10 +564,11 @@ pub(crate) fn translate_sglang_multimodal(
     mm: sglang_proto::MultimodalInputs,
     extras: Vec<sglang_proto::MultimodalInputs>,
     prompt_len: usize,
+    v41_vision: Option<V41Vision>,
 ) -> Result<SglangWireMmInputs, String> {
-    let mut output = translate_sglang_batch(mm, prompt_len)?;
+    let mut output = translate_sglang_batch(mm, prompt_len, v41_vision)?;
     for batch in extras {
-        let translated = translate_sglang_batch(batch, prompt_len)?;
+        let translated = translate_sglang_batch(batch, prompt_len, v41_vision)?;
         if output
             .mm_items
             .iter()
@@ -575,9 +587,12 @@ pub(crate) fn translate_sglang_multimodal(
 }
 
 /// Translate one modality with its own tensor storage and absolute prompt offsets.
+/// A DeepSeek-V4.1 image batch becomes one item per image, the shape SGLang's
+/// own processor builds ([`deepseek_v41_items`]).
 fn translate_sglang_batch(
     mm: sglang_proto::MultimodalInputs,
     prompt_len: usize,
+    v41_vision: Option<V41Vision>,
 ) -> Result<SglangWireMmInputs, String> {
     let modality = if mm.modalities.iter().all(|name| name == "image") {
         // Empty metadata and repeated image labels are accepted by the
@@ -647,6 +662,26 @@ fn translate_sglang_batch(
     } else {
         Some(offsets)
     };
+    // Only an image batch is cut into V4.1 items. Under the video label the
+    // batch would go on as a video item, which SGLang's V4.1 model has no
+    // embedder for.
+    if modality != SglangWireModality::Image && is_v41_batch(&model_specific_data) {
+        return Err(format!("{V41_PREFIX} vit_grid on a video batch"));
+    }
+    if modality == SglangWireModality::Image && is_v41_batch(&model_specific_data) {
+        // SGLang pads the image positions only when the id is set. Without it
+        // the model finds no position for the items' embeddings and fails in
+        // the scheduler.
+        if mm.im_token_id.is_none() {
+            return Err(format!("{V41_PREFIX} no im_token_id"));
+        }
+        let offsets = offsets.as_deref().unwrap_or_default();
+        return Ok(SglangWireMmInputs {
+            mm_items: deepseek_v41_items(feature, &model_specific_data, offsets, v41_vision)?,
+            im_token_id: mm.im_token_id,
+            video_token_id: None,
+        });
+    }
     Ok(SglangWireMmInputs {
         mm_items: vec![SglangWireMmItem {
             modality,
@@ -1032,6 +1067,7 @@ mod tests {
             1,
             RankPlacement::Pin,
             &PinYieldNote::default(),
+            None,
         )
     }
 
@@ -1068,6 +1104,43 @@ mod tests {
         }
     }
 
+    /// A payload that carries `vit_grid`, the DeepSeek-V4.1 grid, is never
+    /// the encoders' input. With a reference of any modality in place of its
+    /// pixels it takes the tensor path, which refuses it; the reference path
+    /// would drop the grid and send the request on. The Python servicer
+    /// refuses the same payload.
+    #[test]
+    fn a_v41_grid_beside_a_reference_is_refused_not_dispatched() {
+        let url = || vec!["http://example.test/a".to_string()];
+        let mut marked = media_payload();
+        marked.pixel_values = None;
+        let grid: Vec<u8> = [1i64, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+        marked
+            .model_specific_tensors
+            .insert("vit_grid".to_string(), tensor("int64", vec![1, 2], grid));
+        let by_image = sglang_proto::MultimodalInputs {
+            image_urls: url(),
+            ..marked.clone()
+        };
+        let by_video = sglang_proto::MultimodalInputs {
+            video_urls: url(),
+            ..marked.clone()
+        };
+        let by_audio = sglang_proto::MultimodalInputs {
+            audio_urls: url(),
+            ..marked
+        };
+        for payload in [by_image, by_video, by_audio] {
+            assert!(!names_encode_refs(&payload));
+            assert_eq!(encode_media_refs(&payload), None);
+            let error = translate(media_request(payload)).unwrap_err();
+            assert!(
+                error.contains("media references but no preprocessed tensors"),
+                "{error:?}"
+            );
+        }
+    }
+
     #[test]
     /// Preserve item metadata regardless of which modality is the primary batch.
     fn mixed_media_keeps_each_modality_tensor_offsets_and_token_id() {
@@ -1087,7 +1160,7 @@ mod tests {
             (image.clone(), video.clone()),
             (video.clone(), image.clone()),
         ] {
-            let output = translate_sglang_multimodal(first, vec![second], 9).unwrap();
+            let output = translate_sglang_multimodal(first, vec![second], 9, None).unwrap();
             assert_eq!(output.im_token_id, Some(7));
             assert_eq!(output.video_token_id, Some(8));
             assert_eq!(output.mm_items.len(), 2);
@@ -1102,9 +1175,11 @@ mod tests {
                 assert!(item.model_specific_data.contains_key(key));
             }
         }
-        assert!(translate_sglang_multimodal(image.clone(), vec![image], 9)
-            .unwrap_err()
-            .contains("one batch per modality"));
+        assert!(
+            translate_sglang_multimodal(image.clone(), vec![image], 9, None)
+                .unwrap_err()
+                .contains("one batch per modality")
+        );
     }
 
     fn media_request(mm: sglang_proto::MultimodalInputs) -> sglang_proto::GenerateRequest {
@@ -1169,13 +1244,13 @@ mod tests {
         mm.modalities = vec!["video".to_string()];
         let mut missing_id = mm.clone();
         missing_id.im_token_id = None;
-        assert!(translate_sglang_multimodal(missing_id, Vec::new(), 5)
+        assert!(translate_sglang_multimodal(missing_id, Vec::new(), 5, None)
             .unwrap_err()
             .contains("placeholder token id"));
         let grid = mm.model_specific_tensors.remove("image_grid_thw").unwrap();
         mm.model_specific_tensors
             .insert("video_grid_thw".into(), grid.clone());
-        let output = translate_sglang_multimodal(mm, Vec::new(), 5).unwrap();
+        let output = translate_sglang_multimodal(mm, Vec::new(), 5, None).unwrap();
         let item = &output.mm_items[0];
         assert_eq!(item.modality, SglangWireModality::Video);
         assert_eq!(output.video_token_id, Some(7));
@@ -1210,7 +1285,7 @@ mod tests {
         let mut references = media_payload();
         references.pixel_values = None;
         references.image_urls = vec!["http://example.test/a.png".to_string()];
-        let error = translate_sglang_multimodal(references, Vec::new(), 5).unwrap_err();
+        let error = translate_sglang_multimodal(references, Vec::new(), 5, None).unwrap_err();
         assert!(
             error.contains("media references but no preprocessed tensors"),
             "{error}"
@@ -1646,6 +1721,7 @@ mod tests {
                 ranks,
                 RankPlacement::Pin,
                 &PinYieldNote::default(),
+                None,
             )
         };
         assert_eq!(translate_among(None, 2).unwrap().routed_dp_rank, None);
@@ -1708,6 +1784,7 @@ mod tests {
                 ranks,
                 placement,
                 &PinYieldNote::default(),
+                None,
             )
             .map(|wire| wire.routed_dp_rank)
         };
@@ -1767,6 +1844,7 @@ mod tests {
             2,
             RoomResidue,
             &PinYieldNote::default(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1799,6 +1877,7 @@ mod tests {
                 ranks,
                 placement,
                 &PinYieldNote::default(),
+                None,
             )
             .unwrap();
             (wire.routed_dp_rank, wire.disagg_prefill_dp_rank)
@@ -1896,6 +1975,7 @@ mod tests {
                     1,
                     RankPlacement::Pin,
                     &PinYieldNote::default(),
+                    None,
                 );
                 assert_eq!(
                     result.is_ok(),

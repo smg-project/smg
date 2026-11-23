@@ -15,7 +15,7 @@ use crate::{
     audio::DecodedAudio,
     buffer_pool,
     error::MediaConnectorError,
-    media::{apply_transparency, decode_image_bytes},
+    media::{apply_transparency, decode_frame_bytes},
     minimax_resize::resize_image,
     vision::{execution, transforms::resize_bicubic_pil},
 };
@@ -228,6 +228,9 @@ pub struct ImageFrame {
     /// Decode directly to the M3 source-policy dimensions in `size`.
     minimax_resize: bool,
     minimax_sglang_resize: bool,
+    /// The orientation tag the header read found, for the decode to apply
+    /// without a second parse of the header.
+    pub(crate) header_orientation: Option<image::metadata::Orientation>,
 }
 
 /// Decoded audio payload captured by the media connector.
@@ -317,7 +320,7 @@ impl DecodedRgbVideo {
             .collect()
     }
 
-    pub fn to_dynamic_images(&self) -> Result<Vec<DynamicImage>, String> {
+    pub(crate) fn to_dynamic_images(&self) -> Result<Vec<DynamicImage>, String> {
         let mut images = Vec::with_capacity(self.frames.len());
         for frame in &self.frames {
             let end = frame
@@ -379,7 +382,7 @@ impl VideoClip {
         Self::new_rgb_with_sample_fps(rgb_video, raw_bytes, source, hash, 2.0)
     }
 
-    pub fn new_rgb_with_sample_fps(
+    pub(crate) fn new_rgb_with_sample_fps(
         rgb_video: DecodedRgbVideo,
         raw_bytes: bytes::Bytes,
         source: VideoSource,
@@ -440,14 +443,6 @@ impl VideoClip {
             .ok_or_else(|| "video clip has no decoded frames".to_string())?
             .to_dynamic_images()
             .map(Cow::Owned)
-    }
-
-    pub fn raw_bytes(&self) -> &[u8] {
-        &self.raw_bytes
-    }
-
-    pub fn source(&self) -> &VideoSource {
-        &self.source
     }
 }
 
@@ -511,6 +506,7 @@ impl ImageFrame {
             from_pixels: true,
             minimax_resize: false,
             minimax_sglang_resize: false,
+            header_orientation: None,
         }
     }
 
@@ -536,7 +532,17 @@ impl ImageFrame {
             from_pixels: false,
             minimax_resize: false,
             minimax_sglang_resize: false,
+            header_orientation: None,
         }
+    }
+
+    /// Hand the decode the orientation tag the header read found.
+    pub(crate) fn with_header_orientation(
+        mut self,
+        orientation: Option<image::metadata::Orientation>,
+    ) -> Self {
+        self.header_orientation = orientation;
+        self
     }
 
     /// Mark an encoded frame for one direct resize to its planned dimensions.
@@ -555,10 +561,11 @@ impl ImageFrame {
     /// not vouch for fails here, as the caller's input.
     pub fn image(&self) -> Result<&DynamicImage, MediaConnectorError> {
         self.decoded.get_or_try_init(|| {
-            let image = decode_image_bytes(
+            let image = decode_frame_bytes(
                 &self.raw_bytes,
                 self.max_long_side_pixel,
                 self.transparency(),
+                self.header_orientation,
             )?;
             Ok(if self.minimax_sglang_resize {
                 let resized = resize_bicubic_pil(&image, self.size.width, self.size.height);
@@ -724,7 +731,7 @@ impl EncoderFieldLayouts {
     ///
     /// Existing vision specs use `pixel_values` for the primary encoder input.
     /// New specs should construct [`Self`] directly instead.
-    pub fn from_legacy_fields(mut fields: HashMap<String, FieldLayout>) -> Self {
+    pub(crate) fn from_legacy_fields(mut fields: HashMap<String, FieldLayout>) -> Self {
         let encoder_input = fields
             .remove("pixel_values")
             .unwrap_or(FieldLayout::Batched);
@@ -780,7 +787,7 @@ pub struct PromptReplacement {
 }
 
 impl PromptReplacement {
-    pub fn repeated(
+    pub(crate) fn repeated(
         modality: Modality,
         placeholder_token: &str,
         token_id: TokenId,
@@ -838,7 +845,7 @@ impl PromptReplacement {
     /// placeholder and should be included in its reported range. See
     /// [`Self::structural_prefix`].
     #[must_use]
-    pub fn with_structural_prefix(mut self, n: usize) -> Self {
+    pub(crate) fn with_structural_prefix(mut self, n: usize) -> Self {
         self.structural_prefix = n;
         self
     }
@@ -1073,10 +1080,11 @@ mod tests {
                         for _ in 0..2 {
                             waiting_rx.recv().expect("pool waiter ready");
                         }
-                        decode_image_bytes(
+                        decode_frame_bytes(
                             &frame.raw_bytes,
                             frame.max_long_side_pixel,
                             frame.transparency(),
+                            frame.header_orientation,
                         )
                     })
                     .expect("decode and cap")

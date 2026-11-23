@@ -29,7 +29,7 @@ mod dp_removal_tests {
         routers::{grpc::backend_client::BasicWorkerBuilder, http::router::Router as HttpRouter},
         workflow::create_worker_removal_workflow_data,
     };
-    use smg_worker::identity::basic::Worker;
+    use smg_worker::{identity::basic::Worker, jobs::WorkerJobAsker};
     use wfaas::WorkflowId;
 
     use super::*;
@@ -109,7 +109,6 @@ mod dp_removal_tests {
             (WorkerType::Decode, WorkerType::Prefill),
         ] {
             let context = create_test_context(RouterConfig {
-                dp_aware: true,
                 disable_load_monitoring: true,
                 ..Default::default()
             })
@@ -155,6 +154,7 @@ mod dp_removal_tests {
             url.to_string(),
             expected_revisions,
             Arc::clone(context),
+            WorkerJobAsker::Api,
         );
         let instance = engine
             .start_workflow(WorkflowId::new("worker_removal"), data)
@@ -174,7 +174,6 @@ mod dp_removal_tests {
     #[tokio::test]
     async fn dp_group_removal_skips_only_the_rank_whose_revision_moved() {
         let context = create_test_context(RouterConfig {
-            dp_aware: true,
             disable_load_monitoring: true,
             ..Default::default()
         })
@@ -212,7 +211,6 @@ mod dp_removal_tests {
     #[tokio::test]
     async fn dp_group_removal_leaves_ranks_absent_from_the_snapshot() {
         let context = create_test_context(RouterConfig {
-            dp_aware: true,
             disable_load_monitoring: true,
             ..Default::default()
         })
@@ -277,52 +275,48 @@ mod dp_removal_tests {
 
     #[tokio::test]
     async fn discovery_removal_resolves_plain_and_dp_groups_without_global_dp_setting() {
-        for dp_aware in [false, true] {
-            for scheme in ["http", "grpc"] {
-                let context = create_test_context(RouterConfig {
-                    dp_aware,
-                    disable_load_monitoring: true,
-                    ..Default::default()
-                })
-                .await;
-                let base = format!("{scheme}://worker:30000");
-                let plain = register(&context, &base, WorkerType::Prefill, None);
-                let rank0 = register(&context, &base, WorkerType::Decode, Some(0));
-                let rank1 = register(&context, &base, WorkerType::Decode, Some(1));
-                let other = register(
-                    &context,
-                    &format!("{scheme}://worker:30001"),
-                    WorkerType::Prefill,
-                    None,
-                );
+        for scheme in ["http", "grpc"] {
+            let context = create_test_context(RouterConfig {
+                disable_load_monitoring: true,
+                ..Default::default()
+            })
+            .await;
+            let base = format!("{scheme}://worker:30000");
+            let plain = register(&context, &base, WorkerType::Prefill, None);
+            let rank0 = register(&context, &base, WorkerType::Decode, Some(0));
+            let rank1 = register(&context, &base, WorkerType::Decode, Some(1));
+            let other = register(
+                &context,
+                &format!("{scheme}://worker:30001"),
+                WorkerType::Prefill,
+                None,
+            );
 
-                // A mismatched revision must preserve every current registration.
-                let stale: HashMap<String, Option<u64>> =
-                    guards(&context, &[&plain, &rank0, &rank1])
-                        .into_iter()
-                        .map(|(id, revision)| (id, revision.map(|revision| revision + 1)))
-                        .collect();
-                run_removal(&context, "worker:30000", Some(stale))
-                    .await
-                    .unwrap();
-                assert_eq!(context.worker_registry.len(), 4);
+            // A mismatched revision must preserve every current registration.
+            let stale: HashMap<String, Option<u64>> = guards(&context, &[&plain, &rank0, &rank1])
+                .into_iter()
+                .map(|(id, revision)| (id, revision.map(|revision| revision + 1)))
+                .collect();
+            run_removal(&context, "worker:30000", Some(stale))
+                .await
+                .unwrap();
+            assert_eq!(context.worker_registry.len(), 4);
 
-                let current = guards(&context, &[&plain, &rank0, &rank1]);
-                run_removal(&context, "worker:30000", Some(current))
-                    .await
-                    .unwrap();
-                for removed in [plain, rank0, rank1] {
-                    assert!(context.worker_registry.get_by_url(removed.url()).is_none());
-                }
-                assert!(context.worker_registry.get_by_url(other.url()).is_some());
-                assert_eq!(context.worker_registry.len(), 1);
-
-                // Discovery removal is idempotent; an explicit missing target errors.
-                run_removal(&context, "worker:30000", Some(HashMap::new()))
-                    .await
-                    .unwrap();
-                assert!(run_removal(&context, "worker:30000", None).await.is_err());
+            let current = guards(&context, &[&plain, &rank0, &rank1]);
+            run_removal(&context, "worker:30000", Some(current))
+                .await
+                .unwrap();
+            for removed in [plain, rank0, rank1] {
+                assert!(context.worker_registry.get_by_url(removed.url()).is_none());
             }
+            assert!(context.worker_registry.get_by_url(other.url()).is_some());
+            assert_eq!(context.worker_registry.len(), 1);
+
+            // Discovery removal is idempotent; an explicit missing target errors.
+            run_removal(&context, "worker:30000", Some(HashMap::new()))
+                .await
+                .unwrap();
+            assert!(run_removal(&context, "worker:30000", None).await.is_err());
         }
     }
 }

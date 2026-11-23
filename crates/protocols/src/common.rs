@@ -87,6 +87,30 @@ pub fn is_true(v: &bool) -> bool {
     *v
 }
 
+/// Serializes a request's map with its keys sorted. A standard map iterates in an order of its
+/// own for every map built, so two equal requests would go upstream as two different bodies.
+/// Every `HashMap` field of a request type the typed route writes upstream must name this.
+#[expect(
+    clippy::ref_option,
+    reason = "serde's `serialize_with` hands the field to its serializer by reference"
+)]
+pub(crate) fn serialize_with_sorted_keys<K, V, S>(
+    map: &Option<HashMap<K, V>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    K: Ord + Serialize,
+    V: Serialize,
+    S: serde::Serializer,
+{
+    let Some(map) = map else {
+        return serializer.serialize_none();
+    };
+    let mut entries: Vec<(&K, &V)> = map.iter().collect();
+    entries.sort_unstable_by_key(|&(key, _)| key);
+    serializer.collect_map(entries)
+}
+
 /// Deserialize a bool that also accepts JSON `null` (mapped to `false`).
 ///
 /// Use with `#[serde(default, deserialize_with = "deserialize_null_as_false")]`
@@ -189,6 +213,14 @@ pub trait GenerationRequest: Send + Sync {
     /// Client-provided request id, when the protocol carries one. Routing may
     /// derive a session-affinity key from it; a batch reports its first id.
     fn rid(&self) -> Option<&str> {
+        None
+    }
+
+    /// The most tokens the answer may hold, as the request states the
+    /// limit. `None` where the body states none, and for a protocol that
+    /// generates no text. A request states one limit, whatever its count of
+    /// samples or prompts: the limit of one answer.
+    fn max_output_tokens(&self) -> Option<u32> {
         None
     }
 
@@ -2087,6 +2119,7 @@ impl std::fmt::Debug for Redacted {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ResponsePrompt {
     pub id: String,
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub variables: Option<HashMap<String, PromptVariable>>,
     pub version: Option<String>,
 }
@@ -2218,6 +2251,64 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// Equal requests are written as one body: a request's map goes upstream with its keys
+    /// sorted, where a standard map gave every parse an order of its own.
+    #[test]
+    fn equal_requests_are_written_as_one_body_with_sorted_map_keys() {
+        // A request type, a body with every map out of order, the maps as they are written.
+        fn check<T: de::DeserializeOwned + Serialize>(body: &str, sorted: &[&str]) {
+            let written: HashSet<String> = (0..8)
+                .map(|_| serde_json::to_string(&serde_json::from_str::<T>(body).unwrap()).unwrap())
+                .collect();
+            assert_eq!(
+                written.len(),
+                1,
+                "equal requests are written as one body: {body}"
+            );
+            let written = written.iter().next().unwrap();
+            for map in sorted {
+                assert!(written.contains(map), "{map} is not in {written}");
+            }
+        }
+        check::<crate::chat::ChatCompletionRequest>(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"logit_bias":{"9":1.0,"1":-1.0,"5":2.0,"3":0.5},"metadata":{"zone":"c","tenant":"a","trace":"b","app":"d"},"session_params":{"zone":"c","tenant":"a","trace":"b","app":"d"},"chat_template_kwargs":{"zone":"c","tenant":"a","trace":"b","app":"d"}}"#,
+            &[
+                r#""logit_bias":{"1":-1.0,"3":0.5,"5":2.0,"9":1.0}"#,
+                r#""metadata":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+                r#""session_params":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+                r#""chat_template_kwargs":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+            ],
+        );
+        check::<crate::completion::CompletionRequest>(
+            r#"{"model":"m","prompt":"hi","logit_bias":{"9":1.0,"1":-1.0,"5":2.0,"3":0.5},"session_params":{"zone":"c","tenant":"a","trace":"b","app":"d"}}"#,
+            &[
+                r#""logit_bias":{"1":-1.0,"3":0.5,"5":2.0,"9":1.0}"#,
+                r#""session_params":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+            ],
+        );
+        check::<crate::generate::GenerateRequest>(
+            r#"{"text":"hi","session_params":{"zone":"c","tenant":"a","trace":"b","app":"d"},"custom_labels":{"zone":"c","tenant":"a","trace":"b","app":"d"}}"#,
+            &[
+                r#""session_params":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+                r#""custom_labels":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+            ],
+        );
+        check::<crate::responses::ResponsesRequest>(
+            r#"{"model":"m","input":"hi","metadata":{"zone":"c","tenant":"a","trace":"b","app":"d"},"prompt":{"id":"p","variables":{"zone":"c","tenant":"a","trace":"b","app":"d"}},"tools":[{"type":"mcp","server_label":"docs","server_url":"https://mcp.example/sse","headers":{"zone":"c","tenant":"a","trace":"b","app":"d"}}]}"#,
+            &[
+                r#""metadata":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+                r#""variables":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+                r#""headers":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+            ],
+        );
+        check::<crate::messages::CreateMessageRequest>(
+            r#"{"model":"m","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"mcp_toolset","mcp_server_name":"docs","configs":{"zone":{"enabled":true},"tenant":{"enabled":true},"trace":{"enabled":true},"app":{"enabled":true}}}]}"#,
+            &[
+                r#""configs":{"app":{"enabled":true},"tenant":{"enabled":true},"trace":{"enabled":true},"zone":{"enabled":true}}"#,
+            ],
+        );
+    }
 
     /// A history tool call's `arguments`: the JSON text the API documents,
     /// or the JSON object itself, kept as its text so every reader and a
@@ -3705,6 +3796,53 @@ mod tests {
         assert_eq!(routing_text_of_input(&json!([[1, 2], [3]])), "");
         assert_eq!(routing_text_of_input(&json!({"text": "x"})), "");
         assert_eq!(routing_text_of_input(&json!(7)), "");
+    }
+
+    /// Each body states its output limit under its own field's name, and
+    /// one reader answers them all. A chat body's current field stands
+    /// ahead of its deprecated one. A body that names no limit states none,
+    /// and so does a protocol that generates no text.
+    #[test]
+    fn a_body_states_its_output_limit_through_one_reader() {
+        use crate::{
+            chat::ChatCompletionRequest, completion::CompletionRequest,
+            embedding::EmbeddingRequest, generate::GenerateRequest, messages::CreateMessageRequest,
+            responses::ResponsesRequest,
+        };
+
+        fn limit<T: GenerationRequest + de::DeserializeOwned>(body: Value) -> Option<u32> {
+            let request: T = serde_json::from_value(body).expect("a body of its protocol");
+            request.max_output_tokens()
+        }
+        let chat = |fields: Value| {
+            let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+            let extra = fields.as_object().expect("an object").clone();
+            body.as_object_mut().expect("an object").extend(extra);
+            limit::<ChatCompletionRequest>(body)
+        };
+        assert_eq!(chat(json!({"max_completion_tokens": 64})), Some(64));
+        assert_eq!(chat(json!({"max_tokens": 32})), Some(32));
+        assert_eq!(
+            chat(json!({"max_completion_tokens": 64, "max_tokens": 32})),
+            Some(64),
+            "the current field ahead of the deprecated one"
+        );
+        assert_eq!(chat(json!({})), None);
+
+        let completion = json!({"model": "m", "prompt": "hi", "max_tokens": 16});
+        assert_eq!(limit::<CompletionRequest>(completion), Some(16));
+        let messages = json!({"model": "m", "max_tokens": 8, "messages": []});
+        assert_eq!(limit::<CreateMessageRequest>(messages), Some(8));
+        let responses = json!({"model": "m", "input": "hi", "max_output_tokens": 128});
+        assert_eq!(limit::<ResponsesRequest>(responses), Some(128));
+        let generate =
+            json!({"model": "m", "text": "hi", "sampling_params": {"max_new_tokens": 4}});
+        assert_eq!(limit::<GenerateRequest>(generate), Some(4));
+        let unbounded = json!({"model": "m", "text": "hi"});
+        assert_eq!(limit::<GenerateRequest>(unbounded), None);
+
+        let embedding = json!({"model": "m", "input": "hi"});
+        assert_eq!(limit::<EmbeddingRequest>(embedding), None);
     }
 
     /// The type names the validation messages print, one per JSON shape.

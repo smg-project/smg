@@ -36,7 +36,15 @@ smg-service-discovery = { workspace = true, features = ["kubernetes"] }
 
 A host names the providers it runs as features, and implements
 `DiscoveryHost`. It resolves its settings with
-`RuntimeDiscoveryConfig::from_config`, and hands the result and itself to
+`RuntimeDiscoveryConfig::from_config`, which checks the provider's settings
+for the given worker roles before it resolves runtime inputs such as the
+Consul environment. A host can call `DiscoveryConfig::validate` to check the
+supplied settings on their own. It does not read the Kubernetes model id
+source. The runtime conversion parses that source. It keeps `namespace`,
+`label:<key>` and `annotation:<key>`, and refuses any other form as
+`discovery.model_id_source`. It does not check a key's own syntax.
+
+The host hands the runtime settings and itself to
 `start_service_discovery`, which starts the selected provider's task. The
 crate's top-level docs list its modules.
 

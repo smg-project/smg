@@ -82,17 +82,18 @@ COPY --from=local_src /src /opt/smg
 # with `--build-arg PACKAGE=<package>` a controller of your own built from the
 # crate (a package that depends on smg-policy-controller; its binary carries
 # the package's name and answers `--version`). The features are named with
-# the crate, so the one line builds either: the listeners, the WebAssembly
-# plugin host the crate turns on by default, and the Kubernetes Lease
-# elector. The stock binary elects its leader over a Lease when a flag names
-# one; the plugin host is compiled in for a controller of your own that runs
-# it.
+# the crate, so the one line builds either: the listeners, the cache-event
+# feed, the WebAssembly plugin host the crate turns on by default, and the
+# Kubernetes Lease elector. The stock binary elects its leader over a Lease
+# when a flag names one; the plugin host is compiled in for a controller of
+# your own that runs it. The stock binary requires the listeners and the
+# feed: without either feature cargo builds no binary and the install fails.
 ARG PACKAGE=smg-policy-controller
 # A cross build names its Rust target, and cargo then writes the binary under
 # that name.
 RUN target="$(cat /cross-target 2>/dev/null || true)" \
     && cargo build --release --locked ${target:+--target "${target}"} --package "${PACKAGE}" \
-        --features smg-policy-controller/controller,smg-policy-controller/kubernetes \
+        --features smg-policy-controller/controller,smg-policy-controller/kubernetes,smg-policy-controller/worker-host \
     && install -D "target/${target:+${target}/}release/${PACKAGE}" /out/smg-policy-controller
 
 ######################### CONTROLLER IMAGE #########################

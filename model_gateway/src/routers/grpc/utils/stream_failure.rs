@@ -614,7 +614,7 @@ mod tests {
         let handle = recorder.handle();
         let worker = worker();
         let selection = WorkerSelection::Single {
-            worker: Arc::clone(&worker),
+            worker: Arc::clone(&worker).into(),
         };
         let source =
             StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
@@ -914,7 +914,7 @@ mod tests {
         let handle = recorder.handle();
         let worker = worker();
         let selection = WorkerSelection::Single {
-            worker: Arc::clone(&worker),
+            worker: Arc::clone(&worker).into(),
         };
         let source =
             StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
@@ -956,7 +956,7 @@ mod tests {
         let selection = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: Arc::clone(&prefill),
-            decode: Arc::clone(&decode),
+            decode: Arc::clone(&decode).into(),
             runtime_type: Default::default(),
         };
         let source =
@@ -987,7 +987,7 @@ mod tests {
         let selection = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: worker(),
-            decode: worker(),
+            decode: worker().into(),
             runtime_type: Default::default(),
         };
         let source =
@@ -1050,7 +1050,7 @@ mod tests {
         let selection = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill,
-            decode: Arc::clone(&decode),
+            decode: Arc::clone(&decode).into(),
             runtime_type: Default::default(),
         };
         let source =
@@ -1149,7 +1149,9 @@ mod tests {
         let (live_source, _) = pd_source_with(prefill_on(live));
         let refused = RefusedAddress::reserve();
         let (dead_source, _) = pd_source_with(prefill_on(refused.port()));
-        let single = WorkerSelection::Single { worker: worker() };
+        let single = WorkerSelection::Single {
+            worker: worker().into(),
+        };
         let single_source =
             StreamSource::new(Some(&single), &dispatch(), metrics_labels::ENDPOINT_CHAT);
         let recorder = PrometheusBuilder::new().build_recorder();
@@ -1199,7 +1201,7 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let worker = worker();
         let selection = WorkerSelection::Single {
-            worker: Arc::clone(&worker),
+            worker: Arc::clone(&worker).into(),
         };
         let source =
             StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
@@ -1268,7 +1270,7 @@ mod tests {
         let selection = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: Arc::clone(&prefill),
-            decode: Arc::clone(&decode),
+            decode: Arc::clone(&decode).into(),
             runtime_type: Default::default(),
         };
         let source =
@@ -1306,7 +1308,7 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let worker = worker();
         let selection = WorkerSelection::Single {
-            worker: Arc::clone(&worker),
+            worker: Arc::clone(&worker).into(),
         };
         let source =
             StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
@@ -1445,7 +1447,7 @@ mod tests {
         let handle = recorder.handle();
         let worker = worker();
         let selection = WorkerSelection::Single {
-            worker: Arc::clone(&worker),
+            worker: Arc::clone(&worker).into(),
         };
         let source =
             StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);

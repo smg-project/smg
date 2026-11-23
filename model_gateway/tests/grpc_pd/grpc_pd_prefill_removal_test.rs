@@ -22,7 +22,10 @@ use smg::{
     tenant::TenantKey,
     workflow::Job,
 };
-use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
+use smg_worker::{
+    identity::basic::{RuntimeType, Worker, WorkerType},
+    jobs::WorkerJobAsker,
+};
 
 use super::{completion_request, prefill_worker_for};
 use crate::common;
@@ -152,6 +155,7 @@ async fn submit_removal(bed: &Bed, url: &str) {
         .submit(Job::RemoveWorker {
             url: url.to_string(),
             expected_revisions: None,
+            asker: WorkerJobAsker::Api,
         })
         .await
         .expect("submit the removal");

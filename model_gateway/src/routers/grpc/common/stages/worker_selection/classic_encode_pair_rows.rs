@@ -338,6 +338,9 @@ fn refusal(failure: EpdSelectionFailure) -> Answer {
         EpdSelectionFailure::DecodeVisionUnsupported => named("decode_vision_unsupported"),
         EpdSelectionFailure::EncodeNotSupported => named("encode_not_supported"),
         EpdSelectionFailure::EncodeVisionUnsupported => named("encode_vision_unsupported"),
+        // The recorder starts no policy engine, so no row of its sheet
+        // records this refusal. It has its name all the same.
+        EpdSelectionFailure::EncodeUnderPolicyEngine => named("encode_under_policy_engine"),
         EpdSelectionFailure::Placement(failure) => Answer::Refused {
             name: "placement",
             role: Some(format!("{:?}", failure.role).to_lowercase()),
@@ -399,6 +402,10 @@ impl LoadBalancingPolicy for Watched {
 
     fn name(&self) -> &'static str {
         self.inner.name()
+    }
+
+    fn honors_routing_key(&self) -> bool {
+        self.inner.honors_routing_key()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

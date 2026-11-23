@@ -14,6 +14,9 @@ use crate::{
     },
     header_utils::ApiProvider,
     retry::{is_request_timeout, request_timeout_response},
+    upstream_body::{
+        read_response_body_limited, ReadBodyResult, ERROR_BODY_TOO_LARGE, MAX_ERROR_RESPONSE_SIZE,
+    },
     worker::redacted_url,
 };
 
@@ -96,11 +99,22 @@ pub(crate) async fn non_stream_request_execution(
 
     if !status.is_success() {
         let content_type = response.headers().get(http::header::CONTENT_TYPE).cloned();
-        let body = response.text().await.unwrap_or_else(|e| {
-            tracing::warn!(url = %redacted_url(upstream_url), error = %e.without_url(), "Failed to read upstream error body");
-            String::new()
-        });
-        let body = error::sanitize_error_body(&body);
+        // Within the capped reader's bound, as the crate's other relays read
+        // an error body: one past it is not passed on.
+        let body = match read_response_body_limited(response, MAX_ERROR_RESPONSE_SIZE).await {
+            ReadBodyResult::Ok(body) => error::sanitize_error_body(&body),
+            ReadBodyResult::TooLarge => {
+                return Err(error::create_error(
+                    status,
+                    "upstream_error",
+                    ERROR_BODY_TOO_LARGE,
+                ));
+            }
+            ReadBodyResult::Error(e) => {
+                tracing::warn!(url = %redacted_url(upstream_url), error = %e, "Failed to read upstream error body");
+                String::new()
+            }
+        };
         let mut resp = (status, body).into_response();
         if let Some(content_type) = content_type {
             resp.headers_mut()
@@ -139,18 +153,19 @@ pub(crate) async fn non_stream_request_execution(
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use axum::http::StatusCode;
+    use axum::http::{header::CONTENT_TYPE, StatusCode};
     use openai_protocol::interactions::InteractionsRequest;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::non_stream_request_execution;
     use crate::{
         gemini::context::{RequestContext, SharedComponents},
         tenant::{TenantKey, TenantRequestMeta},
         test_support::{
-            answering, http_client, RefusedAddress, StubWorker, StubWorkers,
+            answering, http_client, text_of, RefusedAddress, StubWorker, StubWorkers,
             CREDENTIALED_WORKER_URL, MASKED_WORKER_URL,
         },
+        upstream_body::{ERROR_BODY_TOO_LARGE, MAX_ERROR_RESPONSE_SIZE},
     };
 
     /// A request context past worker selection and request building, its
@@ -251,5 +266,56 @@ mod tests {
         assert!(logs_contain("Failed to read upstream error body"));
         assert!(logs_contain(&format!("url=http://{addr}")));
         assert!(!logs_contain("s3cret"));
+    }
+
+    /// An upstream's error body is passed on within the bound only. At the
+    /// bound it reaches the caller whole, under the upstream's status and
+    /// content type. One byte past it, the caller reads the gateway's own
+    /// envelope under that status and nothing of the body.
+    #[tokio::test]
+    async fn an_upstream_error_body_is_passed_on_within_the_bound_only() {
+        let at_the_bound: &'static str = "x".repeat(MAX_ERROR_RESPONSE_SIZE).leak();
+        let addr = answering(429, at_the_bound, false).await;
+        let mut ctx = context_for(&format!("http://{addr}"));
+
+        let Err(response) = non_stream_request_execution(&mut ctx).await else {
+            panic!("a refusal");
+        };
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json"),
+            "under the bound: the upstream's content type"
+        );
+        let passed_on = text_of(response).await;
+        assert!(
+            passed_on == at_the_bound,
+            "under the bound: {} bytes came back for the {} the upstream sent",
+            passed_on.len(),
+            at_the_bound.len()
+        );
+
+        let past_the_bound: &'static str = "x".repeat(MAX_ERROR_RESPONSE_SIZE + 1).leak();
+        let addr = answering(429, past_the_bound, false).await;
+        let mut ctx = context_for(&format!("http://{addr}"));
+
+        let Err(response) = non_stream_request_execution(&mut ctx).await else {
+            panic!("a refusal");
+        };
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let answer = text_of(response).await;
+        assert!(
+            answer.len() < 1024,
+            "past the bound: {} bytes of the upstream's error body were passed on",
+            answer.len()
+        );
+        let answer: Value = serde_json::from_str(&answer).expect("the gateway's envelope");
+        assert_eq!(answer["error"]["code"], "upstream_error");
+        assert_eq!(answer["error"]["message"], ERROR_BODY_TOO_LARGE);
     }
 }

@@ -13,10 +13,12 @@ use std::{
 
 use smg_grpc_client::{vllm_engine::AbortOnDropStream, vllm_proto, VllmEngineClient};
 use smg_policy_controller::{
-    client::{Answer, Client},
-    proto::{
-        self, decision, policy_controller_client::PolicyControllerClient,
-        register_worker_request::Mode, worker_event,
+    service::{
+        client::{Answer, Client},
+        proto::{
+            self, decision, policy_controller_client::PolicyControllerClient,
+            register_worker_request::Mode, worker_event,
+        },
     },
     store::PUBLISH_WINDOW,
 };
@@ -471,8 +473,7 @@ async fn the_started_binary_decides_by_its_document_over_the_fleet_its_door_was_
                     budget_micros: 5_000_000,
                     ..Default::default()
                 }),
-                constraints: None,
-                again: false,
+                ..Default::default()
             })
             .await
             .expect("the controller answers the ask");

@@ -358,7 +358,7 @@ fn worker_shm_min_bytes_override(workers: Option<&WorkerSelection>) -> Option<us
 /// otherwise the single/prefill worker that does the encoding itself.
 fn primary_worker(workers: Option<&WorkerSelection>) -> Option<&Arc<dyn Worker>> {
     match workers? {
-        WorkerSelection::Single { worker } => Some(worker),
+        WorkerSelection::Single { worker } => Some(worker.worker()),
         WorkerSelection::Disaggregated {
             encode_assignments,
             prefill,
@@ -832,7 +832,9 @@ fn worker_shares_dev_shm(workers: Option<&WorkerSelection>, skip_pixel_values: b
         return false;
     };
     match workers {
-        Some(WorkerSelection::Single { worker }) => worker_matches_shm_namespace(worker, local),
+        Some(WorkerSelection::Single { worker }) => {
+            worker_matches_shm_namespace(worker.worker(), local)
+        }
         Some(WorkerSelection::Disaggregated {
             encode_assignments,
             prefill,
@@ -851,7 +853,7 @@ fn worker_shares_dev_shm(workers: Option<&WorkerSelection>, skip_pixel_values: b
                 }
             }
             worker_matches_shm_namespace(prefill, local)
-                && worker_matches_shm_namespace(decode, local)
+                && worker_matches_shm_namespace(decode.worker(), local)
         }
         None => false,
     }
@@ -1149,7 +1151,7 @@ mod tests {
             }
             let worker: Arc<dyn Worker> = Arc::new(builder.build());
             let workers = WorkerSelection::Single {
-                worker: Arc::clone(&worker),
+                worker: Arc::clone(&worker).into(),
             };
             assert_eq!(mm_sglang_encoder_input_dtype(Some(&workers)), expected);
             // Retain the snapshot from before initialization while the worker

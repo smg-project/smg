@@ -9,7 +9,10 @@
 //! `recorder()` in the group's `mod.rs`).
 
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
-use smg::observability::metrics_server::start_metrics_server;
+use smg::{
+    observability::metrics_server::start_metrics_server,
+    routers::grpc::backend_client::BasicWorkerBuilder,
+};
 use smg_worker::metrics::writers::Metrics;
 
 use crate::metrics::recorder;
@@ -40,7 +43,8 @@ async fn engine_pd_gauge_appears_on_metrics_endpoint() {
         }],
         ..Default::default()
     };
-    Metrics::record_engine_load(WORKER, "test-model", &response);
+    let worker = BasicWorkerBuilder::new(WORKER).build();
+    Metrics::record_engine_load(&worker, "test-model", "null", &response);
 
     let body = smg::server::http_client()
         .get(format!("http://{addr}/metrics"))

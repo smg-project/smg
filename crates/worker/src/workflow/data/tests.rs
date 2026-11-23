@@ -1,13 +1,16 @@
-//! The registration data's cases.
+//! The registration and removal data's cases.
 
 use std::{collections::HashMap, sync::Arc};
 
 use wfaas::WorkflowError;
 
-use super::{DpInfo, WorkerKind, WorkerList, WorkerRegistrationWorkflowData};
+use super::{
+    DpInfo, WorkerKind, WorkerList, WorkerRegistrationWorkflowData, WorkerRemovalRequest,
+    WorkerRemovalWorkflowData,
+};
 use crate::{
     identity::basic::ConnectionMode,
-    jobs::WorkerRegistrationMode,
+    jobs::{WorkerJobAsker, WorkerRegistrationMode},
     model_card::ModelCard,
     test_support::WorkerRegistry,
     worker::WorkerSpec,
@@ -23,6 +26,7 @@ fn registration() -> WorkerRegistrationWorkflowData<RegistryHost> {
             worker_id: "w-1".to_string(),
             expected_revision: 7,
         },
+        asker: WorkerJobAsker::Api,
         worker_kind: Some(WorkerKind::Local),
         connection_mode: Some(ConnectionMode::Grpc),
         http2: Some(true),
@@ -86,12 +90,10 @@ fn a_registration_with_no_host_and_no_held_client_fails_naming_the_host() {
     assert!(matches!(error, WorkflowError::ContextValueNotFound(name) if name == "host"));
 }
 
-/// A registration as the gateway's own type saved it before the data moved to
-/// this crate: written by that type on main, from the values of
-/// `registration()`.
-const SAVED_BEFORE_THE_MOVE: &str = concat!(
+const SAVED_REGISTRATION: &str = concat!(
     r#"{"config":{"url":"http://worker-a:8000","worker_type":"regular","connection_mode":"http","runtime_type":"unspecified","priority":50,"cost":1.0,"max_connection_attempts":20}"#,
     r#","registration_mode":{"ReplaceById":{"worker_id":"w-1","expected_revision":7}}"#,
+    r#","asker":"Api""#,
     r#","worker_kind":"Local""#,
     r#","connection_mode":"grpc""#,
     r#","http2":true"#,
@@ -104,33 +106,83 @@ const SAVED_BEFORE_THE_MOVE: &str = concat!(
 );
 
 #[test]
-fn a_registration_saved_before_the_move_reads_back_as_it_was_written() {
-    // This type writes what the gateway's type wrote.
+fn a_saved_registration_reads_back_with_its_asker() {
     assert_eq!(
         serde_json::to_string(&registration()).unwrap(),
-        SAVED_BEFORE_THE_MOVE
+        SAVED_REGISTRATION
     );
 
     // What was saved reads back whole, and what is never saved comes back
     // empty.
     let read: WorkerRegistrationWorkflowData<RegistryHost> =
-        serde_json::from_str(SAVED_BEFORE_THE_MOVE).unwrap();
-    assert_eq!(serde_json::to_string(&read).unwrap(), SAVED_BEFORE_THE_MOVE);
+        serde_json::from_str(SAVED_REGISTRATION).unwrap();
+    assert_eq!(serde_json::to_string(&read).unwrap(), SAVED_REGISTRATION);
+    assert_eq!(read.asker, WorkerJobAsker::Api);
+    assert_eq!(read.clone().asker, WorkerJobAsker::Api);
     assert!(read.host.is_none());
     assert!(read.actual_workers.is_none());
     assert!(read.http_client_handle.is_none());
 }
 
-/// A registration enters the workflow with its spec, its mode and its host,
-/// and with nothing found out about its worker.
+const SAVED_REMOVAL: &str = concat!(
+    r#"{"config":{"url":"http://worker-a:8000","expected_revisions":{"w-1":7}},"asker":"Health","#,
+    r#""workers_to_remove":null,"worker_urls":[],"affected_models":[]}"#,
+);
+
 #[test]
-fn a_new_registration_holds_its_spec_its_mode_and_its_host_alone() {
+fn a_saved_removal_reads_back_with_its_asker() {
+    let data: WorkerRemovalWorkflowData<RegistryHost> = WorkerRemovalWorkflowData {
+        config: WorkerRemovalRequest {
+            url: "http://worker-a:8000".to_string(),
+            expected_revisions: Some(HashMap::from([("w-1".to_string(), Some(7))])),
+        },
+        asker: WorkerJobAsker::Health,
+        workers_to_remove: None,
+        worker_urls: Vec::new(),
+        affected_models: Default::default(),
+        host: Some(host()),
+        actual_workers_to_remove: None,
+        drained_workers: Vec::new(),
+        removed_workers: Vec::new(),
+    };
+
+    assert_eq!(serde_json::to_string(&data).unwrap(), SAVED_REMOVAL);
+    let read: WorkerRemovalWorkflowData<RegistryHost> =
+        serde_json::from_str(SAVED_REMOVAL).unwrap();
+    assert_eq!(serde_json::to_string(&read).unwrap(), SAVED_REMOVAL);
+    assert_eq!(read.asker, WorkerJobAsker::Health);
+    assert_eq!(read.clone().asker, WorkerJobAsker::Health);
+    assert!(read.host.is_none());
+}
+
+#[test]
+fn saved_worker_data_without_an_asker_is_refused() {
+    let registration = SAVED_REGISTRATION.replace(r#","asker":"Api""#, "");
+    let removal = SAVED_REMOVAL.replace(r#","asker":"Health""#, "");
+    assert!(
+        serde_json::from_str::<WorkerRegistrationWorkflowData<RegistryHost>>(&registration)
+            .unwrap_err()
+            .to_string()
+            .contains("missing field `asker`")
+    );
+    assert!(
+        serde_json::from_str::<WorkerRemovalWorkflowData<RegistryHost>>(&removal)
+            .unwrap_err()
+            .to_string()
+            .contains("missing field `asker`")
+    );
+}
+
+/// A registration enters the workflow with nothing found out about its worker.
+#[test]
+fn a_new_registration_holds_its_spec_mode_host_and_asker() {
     let host = host();
 
     let data = WorkerRegistrationWorkflowData::new(
         WorkerSpec::new("http://worker-a:8000"),
         WorkerRegistrationMode::Upsert,
         Arc::clone(&host),
+        WorkerJobAsker::Startup,
     );
 
     assert_eq!(data.config.url, "http://worker-a:8000");
@@ -139,6 +191,7 @@ fn a_new_registration_holds_its_spec_its_mode_and_its_host_alone() {
         WorkerRegistrationMode::Upsert
     ));
     assert!(Arc::ptr_eq(data.host.as_ref().unwrap(), &host));
+    assert_eq!(data.asker, WorkerJobAsker::Startup);
     assert!(data.worker_kind.is_none());
     assert!(data.connection_mode.is_none());
     assert!(data.http2.is_none());

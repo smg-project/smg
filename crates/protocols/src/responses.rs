@@ -1207,6 +1207,7 @@ pub struct McpTool {
     pub server_url: Option<String>,
     pub authorization: Option<String>,
     /// Custom headers to send to MCP server (from request payload, not HTTP headers)
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub headers: Option<HashMap<String, String>>,
     pub server_label: String,
     pub server_description: Option<String>,
@@ -3914,6 +3915,7 @@ pub struct ResponsesRequest {
     /// string values up to 512 characters (the public API's limits)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[validate(custom(function = "validate_metadata"))]
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub metadata: Option<HashMap<String, Value>>,
 
     /// Model to use
@@ -4223,6 +4225,10 @@ impl Normalizable for ResponsesRequest {
 impl GenerationRequest for ResponsesRequest {
     fn is_stream(&self) -> bool {
         self.stream.unwrap_or(false)
+    }
+
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.max_output_tokens
     }
 
     fn get_model(&self) -> Option<&str> {
@@ -5042,6 +5048,34 @@ pub fn without_outputs_of_missing_calls(
     items
         .into_iter()
         .filter(|item| tool_output_call_id(item).is_none_or(|call_id| calls.contains(call_id)))
+        .collect()
+}
+
+/// `items` without the tool calls that only an output among `skipped`
+/// answers, items of the same history that are not replayed: a call replays
+/// only with its output, as an output only with its call. A call with its
+/// output among `items` stays, whatever `skipped` holds for it, and so does
+/// a call that no output answers: the request may bring its output.
+pub fn without_calls_answered_by(
+    items: Vec<ResponseInputOutputItem>,
+    skipped: &[ResponseInputOutputItem],
+) -> Vec<ResponseInputOutputItem> {
+    let unreplayed: HashSet<&str> = skipped.iter().filter_map(tool_output_call_id).collect();
+    if unreplayed.is_empty() {
+        return items;
+    }
+    let answered: HashSet<&str> = items.iter().filter_map(tool_output_call_id).collect();
+    let stays: Vec<bool> = items
+        .iter()
+        .map(|item| {
+            is_answered_call(item, &answered)
+                || tool_call_id(item).is_none_or(|call_id| !unreplayed.contains(call_id))
+        })
+        .collect();
+    items
+        .into_iter()
+        .zip(stays)
+        .filter_map(|(item, stays)| stays.then_some(item))
         .collect()
 }
 

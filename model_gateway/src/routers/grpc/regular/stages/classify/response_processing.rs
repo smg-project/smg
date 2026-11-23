@@ -95,7 +95,7 @@ impl ClassifyResponseProcessingStage {
     fn id2label_from_context(ctx: &DispatchContext) -> Option<&HashMap<u32, String>> {
         // Get the selected worker
         let worker = match ctx.workers.as_ref()? {
-            WorkerSelection::Single { worker } => worker,
+            WorkerSelection::Single { worker } => worker.worker(),
             WorkerSelection::Disaggregated { prefill, .. } => prefill, // Use prefill worker for model info
         };
 

@@ -17,6 +17,7 @@ use smg::{
 };
 use smg_worker::{
     identity::basic::{ConnectionMode, Worker, WorkerType},
+    jobs::WorkerJobAsker,
     workflow::WorkerKind,
 };
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowInstanceId};
@@ -43,6 +44,7 @@ fn context(
     WorkflowContext::new(
         WorkflowInstanceId::new(),
         WorkerWorkflowData {
+            asker: WorkerJobAsker::Api,
             config: openai_protocol::worker::WorkerSpec::new("grpc://127.0.0.1:1"),
             registration_mode: WorkerRegistrationMode::Upsert,
             worker_kind: Some(kind),

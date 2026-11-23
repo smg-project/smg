@@ -1200,7 +1200,8 @@ def test_drain_deadline_bounds_active_requests_and_older_bindings(count):
         """Measure that pending requests receive their full grace period."""
         start = asyncio.get_running_loop().time()
         assert await rust_lifecycle.drain_server(server, engine, 0.01, 0.002)
-        assert asyncio.get_running_loop().time() - start >= 0.01
+        # 1e-6: a wait timed on a large monotonic clock can come out a rounding step short.
+        assert asyncio.get_running_loop().time() - start >= 0.01 - 1e-6
 
     asyncio.run(run())
 

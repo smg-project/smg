@@ -15,14 +15,17 @@
 use std::sync::Arc;
 
 use smg_policy_controller::{
-    plugins::OpenDecisions,
-    wasm::{
-        EventKind, EventSet, Failure, LoadError, Plugin, PluginSpec, Runtime, WasmFilter,
-        WasmPicker, WasmScorer, World,
+    document::Needs,
+    engine::{
+        Binding, Candidate, Constraints, Decision, Engine, Health, Plan, PoolFacts, Profile,
+        RequestFacts, Scratch, ShedReason, WeightedScorer, WorkerId,
     },
-    Binding, Candidate, Constraints, Decision, Engine, Health, Lease, Lifecycle, Needs, Outcome,
-    Plan, PoolFacts, Profile, ReleaseReason, RequestFacts, Scratch, ShedReason, Side,
-    TransportClass, Weighted, WorkerId,
+    plugins::{
+        shared::{Failure, OpenDecisions},
+        wasm::{LoadError, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer, World},
+    },
+    stages::Lifecycle,
+    tracking::{EventKind, EventSet, Lease, Outcome, ReleaseReason, Side, TransportClass},
 };
 
 /// What the example's build line writes.
@@ -85,7 +88,7 @@ fn engine_under(spec: PluginSpec) -> (Arc<Plugin>, Engine) {
     let profile = Profile {
         name: "example".into(),
         filters: vec![Box::new(WasmFilter::new(Arc::clone(&bound), None))],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(WasmScorer::new(Arc::clone(&bound), None)),
             weight: 1.0,
         }],
@@ -99,6 +102,8 @@ fn engine_under(spec: PluginSpec) -> (Arc<Plugin>, Engine) {
             plan: Plan::Single,
             profile: 0,
             decode_profile: None,
+            shadow: None,
+            decode_shadow: None,
             sessions: None,
             overload: None,
         }],
@@ -309,16 +314,7 @@ fn the_example_sheds_an_unusable_pool_and_counts_completions() {
     assert_eq!(completed(), 0);
     engine.on_completed(
         &Lease::default(),
-        &Outcome {
-            side: Side::Single,
-            served: WorkerId(102),
-            status: 200,
-            class: TransportClass::Ok,
-            ttft_micros: 0,
-            tokens_in: 0,
-            tokens_out: 0,
-            duration_micros: 0,
-        },
+        &Outcome::reported(200, TransportClass::Ok).with_served(Side::Single, WorkerId(102)),
     );
     assert_eq!(completed(), 1);
     assert_eq!(plugin.stats().observed, 1, "the completion was told");

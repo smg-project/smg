@@ -36,17 +36,25 @@ use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
+#[cfg(feature = "wasm")]
+use smg_policy_controller::plugins::wasm;
 use smg_policy_controller::{
-    builtins::{Best, Healthy, LeastRequests},
-    grpc::{
-        Bound, BreakerSpec, EventKind, EventSet, Exposure, Failure, GrpcFilter, GrpcPicker,
-        GrpcPluginSpec, GrpcScorer, HeaderSet, LoadError, Plugin, Reveal, Runtime, Tls, Transport,
+    document::Needs,
+    engine::{
+        Binding, Candidate, Constraints, Decision, Engine, Filter, Header, Health, Identity,
+        PairPools, Picker, Plan, PoolFacts, Profile, RequestFacts, Scorer, Scratch, ShedReason,
+        Target, Targets, TieBand, WeightedScorer, WorkerId,
     },
-    plugins::OpenDecisions,
-    proto, Binding, Candidate, Constraints, Decision, Engine, Filter, Header, Health, Identity,
-    Lease, Lifecycle, Membership, Needs, PairPools, Picker, Plan, PoolFacts, Profile,
-    ReleaseReason, RequestFacts, Scorer, Scratch, ShedReason, Side, Signal, Target, Targets,
-    TieBand, Weighted, WorkerId,
+    plugins::{
+        grpc::{
+            GrpcFilter, GrpcPicker, GrpcPluginSpec, GrpcScorer, LoadError, Plugin, PluginBinding,
+            Runtime, Tls, Transport,
+        },
+        shared::{BreakerSpec, Exposure, Failure, FrameBudget, HeaderSet, OpenDecisions, Reveal},
+    },
+    service::proto,
+    stages::{Best, Healthy, LeastRequests, Lifecycle},
+    tracking::{EventKind, EventSet, Lease, Membership, ReleaseReason, Side, Signal},
 };
 use support::{
     grpc_plugin::{eventually, Behaviour, Gate, ServerTls, TestPlugin, ALL, FILTER, PICK, SCORE},
@@ -73,6 +81,10 @@ fn unix(served: &TestPlugin) -> Transport {
 fn spec(served: &TestPlugin, name: &str) -> GrpcPluginSpec {
     let mut spec = GrpcPluginSpec::new(name, unix(served));
     spec.connect_micros = BUDGET_MICROS;
+    // The plugin states its frame, as wide as an answered case's budget. A
+    // plugin that states none takes the default frame, which has a case of
+    // its own.
+    spec.budget_micros = BUDGET_MICROS;
     // Every kind of event: the lifecycle's cases tell them, and a decision
     // reads none of it.
     spec.observes = EventSet::ALL;
@@ -107,11 +119,8 @@ const GUEST_LOADS: u32 = 10;
 /// says. The WebAssembly plugin binary's loads that must succeed do the
 /// same.
 #[cfg(feature = "wasm")]
-fn guest_loaded(
-    runtime: &Arc<smg_policy_controller::wasm::Runtime>,
-    spec: &smg_policy_controller::wasm::PluginSpec,
-) -> Arc<smg_policy_controller::wasm::Plugin> {
-    use smg_policy_controller::wasm;
+fn guest_loaded(runtime: &Arc<wasm::Runtime>, spec: &wasm::PluginSpec) -> Arc<wasm::Plugin> {
+    use smg_policy_controller::plugins::wasm;
 
     let mut loads = 0;
     loop {
@@ -139,7 +148,7 @@ fn profile_of(plugin: &Arc<Plugin>, stages: u32, fallbacks: bool) -> Profile {
 }
 
 /// `profile_of` over a bound set the caller took.
-fn bound_profile(bound: Arc<Bound>, stages: u32, fallbacks: bool) -> Profile {
+fn bound_profile(bound: Arc<PluginBinding>, stages: u32, fallbacks: bool) -> Profile {
     let filter: Box<dyn Filter> = if stages & FILTER != 0 {
         let fallback: Option<Box<dyn Filter>> = fallbacks.then(|| Box::new(Healthy) as _);
         Box::new(GrpcFilter::new(Arc::clone(&bound), fallback))
@@ -161,7 +170,7 @@ fn bound_profile(bound: Arc<Bound>, stages: u32, fallbacks: bool) -> Profile {
     Profile {
         name: "plugin".into(),
         filters: vec![filter],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer,
             weight: 1.0,
         }],
@@ -182,7 +191,7 @@ fn filter_then_picker(filter: &Arc<Plugin>, picker: &Arc<Plugin>) -> Profile {
     Profile {
         name: "two-plugins".into(),
         filters: vec![Box::new(GrpcFilter::new(filter.bind(), healthy))],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -197,6 +206,8 @@ fn binding(plan: Plan, decode_profile: Option<u16>) -> Binding {
         plan,
         profile: 0,
         decode_profile,
+        shadow: None,
+        decode_shadow: None,
         sessions: None,
         overload: None,
     }
@@ -1168,7 +1179,7 @@ fn a_pick_only_frame_is_not_sent_once_the_plugin_failed_its_decision() {
 #[cfg(feature = "wasm")]
 #[test]
 fn a_pair_decision_over_both_kinds_is_one_decision_to_every_plugin() {
-    use smg_policy_controller::wasm;
+    use smg_policy_controller::plugins::wasm;
     use support::wasm_guest::{mode, record_guest};
 
     let open = OpenDecisions::new();
@@ -1187,7 +1198,7 @@ fn a_pair_decision_over_both_kinds_is_one_decision_to_every_plugin() {
         vec![Profile {
             name: "both-kinds".into(),
             filters: vec![Box::new(wasm::WasmFilter::new(guest.bind(), healthy))],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(GrpcScorer::new(remote.bind(), least)),
                 weight: 1.0,
             }],
@@ -1575,6 +1586,70 @@ fn a_missed_deadline_under_the_plugins_own_bound_is_one_failure_of_its_decision(
     );
 }
 
+/// A plugin that states no budget takes the default frame, under a request
+/// that states none too: a stage is shown the widest budget there, the
+/// frame names the default as the plugin's deadline, and a plugin that
+/// answers nothing is waited for that long and no longer. The fallbacks
+/// decide, and the missed frame is the plugin's own failure.
+#[test]
+fn a_plugin_with_no_budget_is_waited_for_the_default_frame_under_a_request_with_none() {
+    let served = TestPlugin::serve();
+    served.behave(Behaviour::Silent);
+    let runtime = runtime();
+    let mut unset = spec(&served, "unbudgeted");
+    unset.budget_micros = 0;
+    let plugin = Plugin::load(&runtime, unset).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
+    // What a stage is shown for a request that states no budget.
+    let widest = RequestFacts {
+        budget_micros: u32::MAX,
+        ..facts(1)
+    };
+    let default = FrameBudget::DEFAULT_MICROS;
+    let started = Instant::now();
+    assert_eq!(
+        lead(&decide_with(&engine, &widest, &pool(4))),
+        Some(103),
+        "the fallbacks decide"
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_micros(u64::from(default)),
+        "the first stage waited out the default frame: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_micros(u64::from(BUDGET_MICROS)),
+        "and nothing like a request's budget: {waited:?}"
+    );
+    assert!(eventually(|| served.frames() == 1));
+    let seen = served.seen();
+    let frame = &seen.frames[0];
+    assert_eq!(frame.budget_micros, default, "the deadline the frame named");
+    assert_eq!(
+        frame.request.as_ref().map(|request| request.budget_micros),
+        Some(u32::MAX),
+        "the request's own budget, as a stage is shown it"
+    );
+    // A loaded host can hold the I/O thread under any one frame, and a held
+    // miss is the host's: the next frame that leaves is judged.
+    decide_until_judged(&engine, &plugin, &widest, &pool(4), 1);
+    let stats = plugin.stats();
+    assert_eq!(
+        (
+            stats.missed - stats.stalls,
+            stats.own_misses,
+            stats.unread,
+            stats.answered
+        ),
+        (1, 1, 0, 0),
+        "the missed default frame is the plugin's own: {stats:?}"
+    );
+    assert_eq!(
+        stats.budget_spent, stats.stalls,
+        "no budget of the request's was spent: {stats:?}"
+    );
+}
+
 #[test]
 fn a_plugin_that_misses_every_deadline_opens_its_breaker_through_the_latency_sample() {
     let served = TestPlugin::serve();
@@ -1609,6 +1684,56 @@ fn a_plugin_that_misses_every_deadline_opens_its_breaker_through_the_latency_sam
     );
     assert!(matches!(
         decide_with(&engine, &quick, &candidates),
+        Decision::Pick(_)
+    ));
+    let after = plugin.stats();
+    assert_eq!(
+        (after.missed, after.bypassed),
+        (stats.missed, 1),
+        "inside the cool-down the plugin is not asked"
+    );
+}
+
+/// The same plugin under a request that states no budget, with a budget of
+/// its own that it misses every time: a stage is shown the widest budget
+/// there, and the plugin's time is set against its own frames, not against
+/// that budget. So the ring still judges it, and opens the breaker at its
+/// first window.
+#[test]
+fn a_plugin_that_misses_every_deadline_of_its_own_is_judged_under_a_request_with_no_budget() {
+    let served = TestPlugin::serve();
+    served.behave(Behaviour::Silent);
+    let runtime = runtime();
+    let mut tight = spec(&served, "always-late-of-its-own");
+    // A budget no longer than the I/O thread's promise: no miss of it is
+    // the plugin's failure, so the ring alone can turn the plugin off.
+    tight.budget_micros = 2_000;
+    let plugin = Plugin::load(&runtime, tight).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
+    let candidates = pool(4);
+    // What a stage is shown for a request that states no budget.
+    let widest = RequestFacts {
+        budget_micros: u32::MAX,
+        ..facts(1)
+    };
+    decide_until_judged(&engine, &plugin, &widest, &candidates, 64);
+    let stats = plugin.stats();
+    assert_eq!(
+        (
+            stats.missed - stats.stalls,
+            stats.breaker_opens,
+            stats.bypassed
+        ),
+        (64, 1, 0),
+        "{stats:?}"
+    );
+    assert_eq!(
+        (stats.own_misses, stats.unread),
+        (0, stats.missed - stats.stalls),
+        "the ring alone judged these: {stats:?}"
+    );
+    assert!(matches!(
+        decide_with(&engine, &widest, &candidates),
         Decision::Pick(_)
     ));
     let after = plugin.stats();
@@ -1975,7 +2100,7 @@ fn filters_of(plugins: &[&Arc<Plugin>]) -> Profile {
                 Box::new(GrpcFilter::new(plugin.bind(), healthy)) as Box<dyn Filter>
             })
             .collect(),
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -2001,11 +2126,14 @@ fn a_wait_the_remainder_ended_first_is_the_decisions_spend_at_what_the_frame_was
         .map(|(i, served)| {
             served.behave(Behaviour::Silent);
             // Seven of the decision's twenty milliseconds each, their own
-            // misses never opening them here.
+            // misses never opening them here. Each sample of theirs is a
+            // whole frame, so their windows read slow: under a cool-down of
+            // zero that opening bypasses nothing.
             let mut spec = spec(served, &format!("front-{i}"));
             spec.budget_micros = 7_000;
             spec.breaker = BreakerSpec {
                 failures: u32::MAX,
+                cooldown_micros: 0,
                 ..BreakerSpec::default()
             };
             Plugin::load(&runtime, spec).expect("the plugin loads")
@@ -2055,6 +2183,64 @@ fn a_wait_the_remainder_ended_first_is_the_decisions_spend_at_what_the_frame_was
     assert!(
         stats.own_misses <= 2,
         "a wait the remainder ended is not the plugin's own: {stats:?}"
+    );
+}
+
+/// A frame sent under what a decision had left is read against its plugin's
+/// whole frame. A silent filter draws three quarters of the budget, so the
+/// picker's frame leaves with the last quarter as its deadline and misses
+/// it: the decision's budget spent, whoever spent it, and no failure. Its
+/// sample is a quarter of the plugin's own frame, which no window reads
+/// slow. Read against the frame as sent, every sample would be a whole
+/// frame and the window would open at its first read.
+#[test]
+fn a_frame_sent_under_the_rest_is_read_against_its_plugins_whole_frame() {
+    let silent = TestPlugin::serve();
+    silent.behave(Behaviour::Silent);
+    let mute = TestPlugin::serve();
+    mute.behave(Behaviour::Silent);
+    let runtime = runtime();
+    // The silent filter's own budget is three quarters of the decision's.
+    // Nothing bypasses it here: its misses never count to an opening, and
+    // an opening by its own slow samples lasts no time.
+    let mut front = spec(&silent, "silent-front");
+    front.budget_micros = SHORT_MICROS / 4 * 3;
+    front.breaker = BreakerSpec {
+        failures: u32::MAX,
+        cooldown_micros: 0,
+        ..BreakerSpec::default()
+    };
+    let filter = Plugin::load(&runtime, front).expect("the plugin loads");
+    // The picker's own frame is the whole budget. A round whose filter frame
+    // did not leave asks it under that, and such a miss is its own: its
+    // failures never open it here.
+    let mut rest = spec(&mute, "under-the-rest");
+    rest.breaker = BreakerSpec {
+        failures: u32::MAX,
+        ..BreakerSpec::default()
+    };
+    let picker = Plugin::load(&runtime, rest).expect("the plugin loads");
+    let engine = single_engine(filter_then_picker(&filter, &picker));
+    let short = RequestFacts {
+        budget_micros: SHORT_MICROS,
+        ..facts(1)
+    };
+    // The window's first read is at its 64th sample.
+    decide_until_judged(&engine, &picker, &short, &pool(4), 64);
+    let stats = picker.stats();
+    assert_eq!(
+        (stats.unread, stats.breaker_opens, stats.bypassed),
+        (0, 0, 0),
+        "{stats:?}"
+    );
+    assert_eq!(
+        stats.budget_spent + stats.own_misses,
+        stats.missed,
+        "{stats:?}"
+    );
+    assert!(
+        stats.own_misses <= 2,
+        "a frame the remainder clamped is not the plugin's own: {stats:?}"
     );
 }
 
@@ -2126,13 +2312,18 @@ fn a_miss_under_a_remainder_the_plugin_alone_spent_is_its_own() {
 /// across its deadline leaves no gap for the witness. An honest plugin
 /// under such a budget, the I/O thread held across each deadline for less
 /// than the promise, misses every frame, and nothing says whose the miss
-/// is: each is the decision's budget spent, counted unread, and the breaker
-/// stays shut. Judged as the plugin's own, the fifth would open it.
+/// is: each is the decision's budget spent, counted unread, and no miss is
+/// the plugin's failure. Judged as its own, the fifth would open the
+/// breaker. The latency rule alone judges such frames: a window of them
+/// used up whole reads slow at its first read, whoever was late.
 #[test]
 fn a_miss_too_short_for_the_witness_is_unread_and_the_decisions_budget_spent() {
     // Longer than the plugin's budget, shorter than the promise.
     const HOLD: Duration = Duration::from_millis(3);
     let served = TestPlugin::serve();
+    // The plugin's usual time: inside its budget below, and over half of it.
+    // So a round answered in time is a slow sample too, like a miss.
+    served.script(|s| s.delay = Duration::from_micros(1_200));
     let runtime = runtime();
     // The plugin's own budget: a fifth of the decision's, half the promise.
     let mut spec = spec(&served, "short-frames");
@@ -2144,11 +2335,15 @@ fn a_miss_too_short_for_the_witness_is_unread_and_the_decisions_budget_spent() {
         budget_micros: 10_000,
         ..facts(1)
     };
-    // Past the window's first read, at its 64th sample.
+    // Up to the window's first read, at its 64th sample: an unread miss, or
+    // a round answered in time. A round the I/O thread was seen late in is
+    // charged nothing, answered or missed, so it is no sample.
     let mut rounds = 0_u64;
     let more = |rounds: u64| {
         let stats = plugin.stats();
-        stats.unread < 64 && stats.breaker_opens == 0 && rounds < 192
+        stats.answered + stats.missed - stats.stalls < 64
+            && stats.breaker_opens == 0
+            && rounds < 192
     };
     while more(rounds) {
         rounds += 1;
@@ -2170,14 +2365,17 @@ fn a_miss_too_short_for_the_witness_is_unread_and_the_decisions_budget_spent() {
         );
     }
     let stats = plugin.stats();
+    // The window's sixty-four samples: every one an unread miss, but a
+    // round answered in time, where this thread was held off its send. Each
+    // is past half of the plugin's frame, so the window's first read opens.
     assert_eq!(
         (
-            stats.unread,
+            stats.answered + stats.missed - stats.stalls,
             stats.own_misses,
             stats.breaker_opens,
             stats.bypassed
         ),
-        (64, 0, 0, 0),
+        (64, 0, 1, 0),
         "after {rounds} rounds: {stats:?}"
     );
     assert_eq!(
@@ -2375,7 +2573,7 @@ fn a_frame_past_the_window_is_refused_without_a_fault() {
     let scorers = (0..9)
         .map(|_| {
             let fallback: Option<Box<dyn Scorer>> = Some(Box::new(LeastRequests));
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(GrpcScorer::new(binder.bind(), fallback)) as Box<dyn Scorer>,
                 weight: 1.0,
             }
@@ -3215,7 +3413,7 @@ fn an_adapter_needs_the_lifecycle_where_its_row_or_its_fallback_does() {
         single_engine(Profile {
             name: "adapted".into(),
             filters: vec![],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(adapter(fallback)),
                 weight: 1.0,
             }],
@@ -3249,10 +3447,7 @@ fn the_models_a_worker_left_reach_a_plugin_on_protocol_2_alone() {
         let runtime = runtime();
         let plugin = load(&runtime, &served, "leaver");
         let engine = single_engine(profile(&plugin, ALL));
-        engine.on_membership(&Membership::Left {
-            id: WorkerId(7),
-            models: &models,
-        });
+        engine.on_membership(&Membership::left(WorkerId(7), &models));
         engine.on_membership(&Membership::Relabelled(WorkerId(7)));
         // While a stream stands on 1 the left word is not raised.
         let raised = if version == 2 { 2 } else { 1 };
@@ -3298,10 +3493,7 @@ fn left_words_past_the_queues_bound_cost_a_stream_on_protocol_1_nothing() {
     let models = ["m-chat".to_owned()];
     // The queue holds 1,024 events.
     for _ in 0..2_048 {
-        engine.on_membership(&Membership::Left {
-            id: WorkerId(7),
-            models: &models,
-        });
+        engine.on_membership(&Membership::left(WorkerId(7), &models));
     }
     engine.on_membership(&Membership::Relabelled(WorkerId(7)));
     assert!(
@@ -3347,10 +3539,7 @@ fn a_left_word_that_waited_for_a_stream_is_not_written_on_protocol_1() {
         "the load's stream ended: no stream stands"
     );
     let models = ["m-chat".to_owned()];
-    engine.on_membership(&Membership::Left {
-        id: WorkerId(7),
-        models: &models,
-    });
+    engine.on_membership(&Membership::left(WorkerId(7), &models));
     engine.on_membership(&Membership::Relabelled(WorkerId(7)));
     assert_eq!(
         plugin.stats().observed,
@@ -3391,10 +3580,7 @@ fn the_lifecycle_reaches_the_plugin_once_in_order() {
     engine.on_dispatched(&lease, &Target::default(), Side::Single, 3);
     engine.on_released(&lease, ReleaseReason::ClientGone);
     engine.on_membership(&Membership::Snapshot(&[WorkerId(1), WorkerId(2)]));
-    engine.on_signal(&Signal::GatewayVeto {
-        worker: WorkerId(1),
-        until_micros: 500_000,
-    });
+    engine.on_signal(&Signal::gateway_veto(WorkerId(1), 500_000));
     assert_eq!(plugin.stats().observed, 4);
     assert!(eventually(|| served.seen().events.len() == 4));
     let seen = served.seen();
@@ -3441,14 +3627,12 @@ fn a_plugin_hears_the_kinds_of_event_its_row_lists_and_no_other() {
         engine.on_dispatched(&lease, &Target::default(), Side::Single, 3);
         engine.on_released(&lease, ReleaseReason::ClientGone);
         engine.on_membership(&Membership::Snapshot(&[WorkerId(1), WorkerId(2)]));
-        engine.on_signal(&Signal::GatewayVeto {
-            worker: WorkerId(1),
-            until_micros: 500_000,
-        });
+        engine.on_signal(&Signal::gateway_veto(WorkerId(1), 500_000));
     };
     // The default row lists nothing.
     let mut unlisted = GrpcPluginSpec::new("unlisted", unix(&served));
     unlisted.connect_micros = BUDGET_MICROS;
+    unlisted.budget_micros = BUDGET_MICROS;
     assert_eq!(unlisted.observes, EventSet::NONE);
     let deaf = Plugin::load(&runtime, unlisted).expect("the plugin loads");
     assert_eq!(deaf.observes(), EventSet::NONE);
@@ -4018,15 +4202,9 @@ fn a_frame_carries_block_hashes_to_a_row_that_declares_them_alone() {
         sent("reads-none", Needs::default()).is_empty(),
         "a row that declares no hashes is sent none"
     );
-    let tokens = Needs {
-        token_hashes: true,
-        ..Needs::default()
-    };
+    let tokens = Needs::NONE.with_token_hashes();
     assert_eq!(sent("reads-tokens", tokens), hashes);
-    let text = Needs {
-        text_hashes: true,
-        ..Needs::default()
-    };
+    let text = Needs::NONE.with_text_hashes();
     assert_eq!(sent("reads-text", text), hashes);
 }
 
@@ -4172,6 +4350,7 @@ fn mutual_tls_with_the_pinned_server_name() {
     let runtime = runtime();
     let mut spec = GrpcPluginSpec::new("remote", tls("plugin.test", &client_cert, &client_key));
     spec.connect_micros = BUDGET_MICROS;
+    spec.budget_micros = BUDGET_MICROS;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads over mutual TLS");
     let engine = single_engine(profile(&plugin, ALL));
     assert_eq!(lead(&decide(&engine, &pool(4), 1)), Some(103));

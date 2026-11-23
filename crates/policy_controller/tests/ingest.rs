@@ -20,15 +20,14 @@ use engines::{cpu_seconds, eventually, mock_engine};
 use net::{http_get, loopback, vm_rss_kib};
 use openai_protocol::worker::RuntimeType;
 use smg_policy_controller::{
-    controller::{Config, Controller, Election, Listener, Scope},
-    ingest::{
+    document::{AppliedSpec, BindingSpec, PolicySpec},
+    engine::{Role, SignalSource, WireModes, WorkerId},
+    load::ingest::{
         loads::{LoadDriver, LoadDriverConfig, LoadProbe, ReadError, Target},
         probe::EngineProbe,
     },
-    spec::{BindingSpec, OverloadSpec},
+    service::controller::{Config, Controller, ElectionConfig, Listener, Scope},
     store::{LoadSink, LoadSource, MemoryStore, Signals, WorkerFacts, WorkerStatus, WorkersStore},
-    view::{Role, SignalSource, WireModes, WorkerId},
-    AppliedSpec, PolicySpec,
 };
 use tokio::{
     net::TcpListener,
@@ -36,11 +35,11 @@ use tokio::{
     task::JoinSet,
 };
 
-/// A metrics body of the first gauge family: three requests running, five
+/// A metrics body of the first gauge family: three requests running, eight
 /// waiting, three quarters of the KV cache in use.
 const METRICS_TEXT: &str = "# HELP vllm:num_requests_running Requests running.\n\
                             vllm:num_requests_running{model_name=\"m\"} 3\n\
-                            vllm:num_requests_waiting{model_name=\"m\"} 5\n\
+                            vllm:num_requests_waiting{model_name=\"m\"} 8\n\
                             vllm:kv_cache_usage_perc{model_name=\"m\"} 0.75\n";
 
 /// An HTTP server answering `/metrics` with `body`, served until the
@@ -330,14 +329,16 @@ async fn the_controller_runs_the_driver_and_renders_its_counters() {
         // however slow the host; the first tick polls at once.
         load_poll_interval: Duration::from_secs(10),
         decide_shards: 2,
-        election: Election::default(),
+        election: ElectionConfig::default(),
+        discovery: None,
     })
     .await
     .expect("the controller binds");
     let admin = controller.addresses().admin;
     let store = controller.store();
-    // The standing generation names a queue bound the scraped engine's page
-    // is over: that engine's first row moves its verdict.
+    // The standing generation's binding has its overload block switched on,
+    // and the scraped engine's page is at the crate's count of queued
+    // requests: that engine's first row moves its verdict.
     let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
     document.generation = 1;
     let profile = document
@@ -347,10 +348,6 @@ async fn the_controller_runs_the_driver_and_renders_its_counters() {
         .expect("the preset's profile");
     document.bindings = vec![BindingSpec {
         profile: Some(profile.clone()),
-        overload: Some(OverloadSpec {
-            waiting_requests: Some(4),
-            ..OverloadSpec::default()
-        }),
         ..BindingSpec::default()
     }];
     let bound = AppliedSpec::validate(&document).expect("the document validates");
@@ -382,7 +379,7 @@ async fn the_controller_runs_the_driver_and_renders_its_counters() {
             scrape.row.queued,
             scrape.row.kv_usage_permille
         ),
-        (3, 5, 750)
+        (3, 8, 750)
     );
 
     let (status, body) = http_get(admin, "/metrics").await.expect("the metrics page");

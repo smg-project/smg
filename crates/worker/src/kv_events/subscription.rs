@@ -126,6 +126,23 @@ enum StreamResult {
     Error(tonic::Status),
     /// Detected a gap in sequence numbers.
     GapDetected { expected: u64, received: u64 },
+    /// A snapshot's count or next index did not match its opening chunk.
+    MalformedSnapshot(SnapshotMismatch),
+}
+
+/// The opening chunk's count and the index the snapshot must carry next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SnapshotProgress {
+    count: u32,
+    next_index: u32,
+}
+
+/// What a snapshot chunk was expected to continue and what arrived instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SnapshotMismatch {
+    expected: Option<SnapshotProgress>,
+    index: u32,
+    count: u32,
 }
 
 /// The label a stream error is counted under: its gRPC status code.
@@ -582,15 +599,14 @@ impl Rounds {
             }
         };
 
-        // The chunks still to come of a relay's snapshot the stream is
-        // inside, by this round's own count.
+        // The count and next index of a relay snapshot this stream is inside.
         let mut snapshot = None;
         let (result, applied) =
             match Self::drain_stream(sub, stream, &mut snapshot, shutdown_rx).await {
                 Drained::Ended { result, applied } => (result, applied),
                 Drained::Shutdown => return Round::Shutdown,
             };
-        if applied {
+        if applied && !matches!(&result, StreamResult::MalformedSnapshot(_)) {
             // The stream worked: its failure starts the backoff over.
             backoff.reset();
         }
@@ -655,6 +671,24 @@ impl Rounds {
                 // again the gap is settled instead of retried.
                 Round::Again
             }
+            StreamResult::MalformedSnapshot(SnapshotMismatch {
+                expected,
+                index,
+                count,
+            }) => {
+                warn!(
+                    worker_url = %Endpoint::redacted_str(worker_url),
+                    expected_index = ?expected.map(|progress| progress.next_index),
+                    expected_count = ?expected.map(|progress| progress.count),
+                    received_index = index,
+                    received_count = count,
+                    "KV event stream sent a malformed relay snapshot; abandoning it, the next subscription starts over from zero"
+                );
+                if let Role::Index { sink, id } = sub.role {
+                    sink.resync(id, None, ResyncReason::SnapshotAbandoned);
+                }
+                Round::Backoff
+            }
         }
     }
 
@@ -685,12 +719,12 @@ impl Rounds {
     /// contact with the worker) and each batch's load record is forwarded;
     /// on a loads-only one every batch is the stream working, its record
     /// forwarded and its events, if any, dropped. `snapshot` is left at the
-    /// chunks still to come of a relay's snapshot the stream ended inside.
+    /// opening count and next index of a relay snapshot the stream ended inside.
     /// The worker's removal ends the stream at once.
     async fn drain_stream<S: KvEventSink<Batch = KvEventBatch>>(
         sub: &WorkerSubscription<'_, S>,
         stream: tonic::Streaming<KvEventBatch>,
-        snapshot: &mut Option<u32>,
+        snapshot: &mut Option<SnapshotProgress>,
         shutdown_rx: &mut oneshot::Receiver<()>,
     ) -> Drained {
         let mut applied = false;
@@ -763,7 +797,7 @@ impl Rounds {
         worker_url: &str,
         sink: &S,
         id: S::Id,
-        snapshot: &mut Option<u32>,
+        snapshot: &mut Option<SnapshotProgress>,
         mut on_batch: impl FnMut(),
         mut on_load: impl FnMut(&KvEventBatch, &EngineLoad),
     ) -> StreamResult {
@@ -800,8 +834,13 @@ impl Rounds {
                 continue;
             };
             if let Some(chunk) = &batch.snapshot {
-                if count_snapshot_chunk(snapshot, chunk) {
-                    sink.resync(id, None, ResyncReason::Snapshot);
+                match count_snapshot_chunk(snapshot, chunk) {
+                    Ok(true) => sink.resync(id, None, ResyncReason::Snapshot),
+                    Ok(false) => {}
+                    Err(mismatch) => {
+                        *snapshot = None;
+                        return StreamResult::MalformedSnapshot(mismatch);
+                    }
                 }
             }
             match sink.admit(id, rank, batch_facts(&batch), &batch) {
@@ -844,20 +883,39 @@ pub fn batch_rank(batch: &KvEventBatch) -> Option<u16> {
         .map_or(Some(0), |rank| u16::try_from(rank).ok())
 }
 
-/// Count one chunk of a relay's snapshot on its stream. `open` is the chunks
-/// still to come of the snapshot the stream is inside, `None` outside one: a
-/// first chunk, or a chunk outside a snapshot, opens one of the count the
-/// chunk says, and the chunk that fills the count closes it. A stream that
-/// ends with a snapshot open has brought a partial live set, which the
-/// collector says to the sink. Returns whether the chunk opened a snapshot:
-/// the start the collector says ahead of the chunk.
-fn count_snapshot_chunk(open: &mut Option<u32>, chunk: &KvSnapshotChunk) -> bool {
-    let (opens, left) = match *open {
-        Some(left) if chunk.index != 0 => (false, left),
-        _ => (true, chunk.count.max(1)),
-    };
-    *open = (left > 1).then(|| left - 1);
-    opens
+/// Count one chunk of a relay snapshot on its stream. An opening chunk has a
+/// nonzero count and index zero, and starts over any open snapshot; its later
+/// chunks keep that count and carry exactly increasing indices. The last chunk
+/// closes the snapshot. A stream that ends with a snapshot open has brought a
+/// partial live set, which the collector says to the sink. Returns whether the
+/// chunk opened a snapshot, or an error when it does not continue a
+/// well-formed snapshot.
+fn count_snapshot_chunk(
+    open: &mut Option<SnapshotProgress>,
+    chunk: &KvSnapshotChunk,
+) -> Result<bool, SnapshotMismatch> {
+    match *open {
+        _ if chunk.index == 0 && chunk.count > 0 => {
+            *open = (chunk.count > 1).then_some(SnapshotProgress {
+                count: chunk.count,
+                next_index: 1,
+            });
+            Ok(true)
+        }
+        Some(progress) if chunk.count == progress.count && chunk.index == progress.next_index => {
+            let next_index = progress.next_index + 1;
+            *open = (next_index < progress.count).then_some(SnapshotProgress {
+                count: progress.count,
+                next_index,
+            });
+            Ok(false)
+        }
+        expected => Err(SnapshotMismatch {
+            expected,
+            index: chunk.index,
+            count: chunk.count,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -1787,6 +1845,52 @@ mod tests {
         );
     }
 
+    /// A repeated chunk makes a relay snapshot malformed: the partial
+    /// snapshot is abandoned, the repeated chunk and later live events are
+    /// not admitted, and the next round asks for a clean snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeated_snapshot_chunk_abandons_the_partial_snapshot() {
+        let chunk = |sequence_number, index| KvEventBatch {
+            sequence_number,
+            snapshot: Some(KvSnapshotChunk {
+                index,
+                count: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let live = KvEventBatch {
+            sequence_number: 9,
+            ..stored_batch(&[(1, 16)])
+        };
+        let script = vec![Ok(chunk(6, 0)), Ok(chunk(7, 1)), Ok(chunk(8, 1)), Ok(live)];
+        let (worker, _engine) = connected(Script::Stream(script));
+        let sink = Said::default();
+        let sub = said_subscription(&worker, &sink);
+        let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
+        let mut backoff = Backoff::new();
+        backoff.grow();
+        let grown_delay = backoff.delay_ms();
+        let round = Rounds::subscription_round(&sub, &mut backoff, &mut shutdown_rx).await;
+        let said: Vec<String> = sink
+            .calls()
+            .into_iter()
+            .filter(|call| !call.starts_with("cursor"))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "reconnected 7",
+                "resync 7 None snapshot",
+                "admit 7 rank 0 seq 6 chunk",
+                "admit 7 rank 0 seq 7 chunk",
+                "resync 7 None snapshot_abandoned",
+            ]
+        );
+        assert!(matches!(round, Round::Backoff));
+        assert_eq!(backoff.delay_ms(), grown_delay);
+    }
+
     /// A subscribe call the engine refuses as out of range is an expired
     /// replay cursor: the collector says so to the sink, starts the backoff
     /// over and subscribes again at once.
@@ -1992,11 +2096,10 @@ mod tests {
         );
     }
 
-    /// The count of a relay snapshot's chunks, rule by rule: a first chunk
-    /// opens a snapshot of its count, inside an open one too; a chunk that
-    /// comes without its first opens one as well; a later chunk counts down
-    /// and the one that fills the count closes it; a count of zero is one
-    /// chunk.
+    /// The count and order of a relay snapshot's chunks, rule by rule: index
+    /// zero opens one with a nonzero count, including inside an open snapshot;
+    /// later chunks keep that count and increase exactly by one; the last
+    /// closes it. Missing, repeated and count-changing chunks are malformed.
     #[test]
     fn a_snapshots_chunks_are_counted_by_these_rules() {
         let chunk = |index, count| KvSnapshotChunk {
@@ -2004,22 +2107,56 @@ mod tests {
             count,
             ..Default::default()
         };
-        // The count before the chunk, the chunk, whether it opens a
-        // snapshot, the count after it.
+        let progress = |count, next_index| SnapshotProgress { count, next_index };
+        let mismatch = |expected, index, count| SnapshotMismatch {
+            expected,
+            index,
+            count,
+        };
+        // The progress before the chunk, the chunk, its result and the
+        // progress after it.
         let rows = [
-            (None, chunk(0, 3), true, Some(2)),
-            (Some(2), chunk(1, 3), false, Some(1)),
-            (Some(1), chunk(2, 3), false, None),
-            (None, chunk(1, 3), true, Some(2)),
-            (Some(2), chunk(0, 2), true, Some(1)),
-            (None, chunk(0, 1), true, None),
-            (None, chunk(0, 0), true, None),
+            (None, chunk(0, 3), Ok(true), Some(progress(3, 1))),
+            (
+                Some(progress(3, 1)),
+                chunk(1, 3),
+                Ok(false),
+                Some(progress(3, 2)),
+            ),
+            (Some(progress(3, 2)), chunk(2, 3), Ok(false), None),
+            (None, chunk(0, 1), Ok(true), None),
+            (None, chunk(1, 3), Err(mismatch(None, 1, 3)), None),
+            (None, chunk(0, 0), Err(mismatch(None, 0, 0)), None),
+            (
+                Some(progress(3, 1)),
+                chunk(2, 3),
+                Err(mismatch(Some(progress(3, 1)), 2, 3)),
+                Some(progress(3, 1)),
+            ),
+            (
+                Some(progress(3, 2)),
+                chunk(1, 3),
+                Err(mismatch(Some(progress(3, 2)), 1, 3)),
+                Some(progress(3, 2)),
+            ),
+            (
+                Some(progress(3, 1)),
+                chunk(1, 4),
+                Err(mismatch(Some(progress(3, 1)), 1, 4)),
+                Some(progress(3, 1)),
+            ),
+            (
+                Some(progress(3, 1)),
+                chunk(0, 2),
+                Ok(true),
+                Some(progress(2, 1)),
+            ),
         ];
-        for (before, chunk, opens, after) in rows {
+        for (before, chunk, result, after) in rows {
             let mut open = before;
             assert_eq!(
                 count_snapshot_chunk(&mut open, &chunk),
-                opens,
+                result,
                 "{before:?} {chunk:?}"
             );
             assert_eq!(open, after, "{before:?} {chunk:?}");

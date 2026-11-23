@@ -99,6 +99,7 @@ fn binding() -> Vec<McpServerBinding> {
         server_key: "weather".to_string(),
         allowed_tools: None,
         list_error: None,
+        pool_key: None,
     }]
 }
 

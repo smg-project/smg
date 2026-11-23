@@ -69,7 +69,7 @@ impl BoundedLabels {
         }
         let mut admitted = self.admitted.load(Ordering::Relaxed);
         loop {
-            if admitted >= self.cap {
+            if self.is_full(admitted) {
                 return Arc::clone(&BOUNDED_LABEL_SENTINEL_ARC);
             }
             match self.admitted.compare_exchange_weak(
@@ -91,11 +91,56 @@ impl BoundedLabels {
             Entry::Vacant(entry) => Arc::clone(&*entry.insert(Arc::from(s))),
         }
     }
+
+    /// Whether the set admits no value more: `admitted` is at its cap, or
+    /// a test reads the set as full on its own thread. Asked only for a
+    /// value the set does not hold.
+    fn is_full(&self, admitted: usize) -> bool {
+        #[cfg(test)]
+        if labels_full::on_this_thread() {
+            return true;
+        }
+        admitted >= self.cap
+    }
 }
 
 /// Intern a client-supplied model label, bounded by `MAX_MODEL_LABELS`.
 pub fn intern_model_label(model_id: &str) -> Arc<str> {
     MODEL_LABELS.intern(model_id)
+}
+
+/// For this crate's tests: a thread's say that the bounded label sets are
+/// full. A value a set does not hold then gets the sentinel, as it does
+/// past the set's cap, and no process-wide set is filled under the other
+/// tests.
+#[cfg(test)]
+pub(crate) mod labels_full {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FULL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The say, held: it ends when this drops, so a case that fails leaves
+    /// none behind on its thread.
+    #[must_use = "the say ends when the guard drops"]
+    pub(crate) struct Full(());
+
+    impl Drop for Full {
+        fn drop(&mut self) {
+            FULL.set(false);
+        }
+    }
+
+    /// Have this thread read the sets as full until the guard drops.
+    pub(crate) fn hold_on_this_thread() -> Full {
+        FULL.set(true);
+        Full(())
+    }
+
+    pub(super) fn on_this_thread() -> bool {
+        FULL.get()
+    }
 }
 
 /// Per-thread caches of the handles the per-request records go through.
@@ -208,6 +253,23 @@ pub mod handles {
         len < MAX_KEPT_PER_MAP && !is_sentinel(label)
     }
 
+    fn find_model_handle<'a, H, S: BuildHasher>(
+        map: &'a HashMap<Arc<str>, H, S>,
+        model_id: &str,
+    ) -> Option<&'a H> {
+        // One model is the usual deployment, and comparing its name costs a
+        // fraction of hashing it with SipHash: the hash runs only once this
+        // map keeps a second label, whatever request brought it.
+        if map.len() == 1 {
+            map.iter()
+                .next()
+                .filter(|&(label, _)| **label == *model_id)
+                .map(|(_, handle)| handle)
+        } else {
+            map.get(model_id)
+        }
+    }
+
     /// Uses the handle under the model label of `model_id`, building it on
     /// first sight with the label the interner gives and keeping it, when
     /// [`kept`] says so, under that same `Arc<str>`: the map holds the
@@ -218,7 +280,7 @@ pub mod handles {
         build: impl FnOnce(Arc<str>) -> H,
         use_handle: impl FnOnce(&H),
     ) {
-        if let Some(handle) = map.get(model_id) {
+        if let Some(handle) = find_model_handle(map, model_id) {
             use_handle(handle);
             return;
         }
@@ -249,9 +311,21 @@ pub mod handles {
 
     #[cfg(test)]
     mod tests {
-        use std::cell::Cell;
+        use std::{cell::Cell, collections::hash_map::DefaultHasher, hash::BuildHasher, rc::Rc};
 
         use super::*;
+
+        #[derive(Clone)]
+        struct CountingBuildHasher(Rc<Cell<usize>>);
+
+        impl BuildHasher for CountingBuildHasher {
+            type Hasher = DefaultHasher;
+
+            fn build_hasher(&self) -> Self::Hasher {
+                self.0.set(self.0.get() + 1);
+                DefaultHasher::new()
+            }
+        }
 
         #[test]
         fn a_handle_is_built_once_per_key_and_used_every_time() {
@@ -328,6 +402,47 @@ pub mod handles {
         }
 
         #[test]
+        fn one_model_lookup_skips_hashing_but_two_model_lookup_does_not() {
+            let hashes = Rc::new(Cell::new(0));
+            let mut map = HashMap::with_hasher(CountingBuildHasher(Rc::clone(&hashes)));
+            map.insert(Arc::from("model-a"), 70);
+            hashes.set(0);
+
+            assert_eq!(find_model_handle(&map, "model-a"), Some(&70));
+            assert_eq!(hashes.get(), 0);
+            assert_eq!(find_model_handle(&map, "model-b"), None);
+            assert_eq!(hashes.get(), 0);
+
+            map.insert(Arc::from("model-b"), 71);
+            hashes.set(0);
+            assert_eq!(find_model_handle(&map, "model-a"), Some(&70));
+            assert!(hashes.get() > 0);
+        }
+
+        #[test]
+        fn a_map_of_one_model_finds_that_model_and_no_other() {
+            let mut map: HashMap<Arc<str>, usize> = HashMap::new();
+            let builds = Cell::new(0);
+            let mut used = Vec::new();
+            // The two names have one length: only their last byte tells
+            // them apart.
+            for model in ["model-a", "model-a", "model-b", "model-a", "model-b"] {
+                with_model_handle(
+                    &mut map,
+                    model,
+                    |label| {
+                        builds.set(builds.get() + 1);
+                        label.len() * 10 + usize::from(label.ends_with('b'))
+                    },
+                    |handle| used.push(*handle),
+                );
+            }
+            assert_eq!(builds.get(), 2);
+            assert_eq!(map.len(), 2);
+            assert_eq!(used, [70, 70, 71, 70, 71]);
+        }
+
+        #[test]
         fn the_sentinel_is_used_but_never_kept() {
             let sentinel = Arc::clone(&BOUNDED_LABEL_SENTINEL_ARC);
             assert!(is_sentinel(&sentinel));
@@ -378,5 +493,19 @@ mod tests {
         let b2 = labels.intern("m2");
         assert!(Arc::ptr_eq(&b, &b2));
         assert_ne!(&*a, BOUNDED_LABEL_SENTINEL);
+    }
+
+    #[test]
+    fn a_thread_reads_the_label_sets_as_full_until_the_say_drops() {
+        let admitted = intern_model_label("a-model-admitted-ahead");
+        {
+            let _full = labels_full::hold_on_this_thread();
+            let again = intern_model_label("a-model-admitted-ahead");
+            assert!(Arc::ptr_eq(&again, &admitted));
+            let met = intern_model_label("a-model-met-while-full");
+            assert_eq!(&*met, BOUNDED_LABEL_SENTINEL);
+        }
+        let met = intern_model_label("a-model-met-while-full");
+        assert_eq!(&*met, "a-model-met-while-full");
     }
 }

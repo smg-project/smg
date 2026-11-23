@@ -23,6 +23,11 @@ pub const DISCOVERY_PROVIDER_LABEL: &str = "smg.ai/discovery-provider";
 /// kept. An absent label reads as unknown, never as a refusal.
 pub const SUPPORTS_VISION_LABEL: &str = "supports_vision";
 
+/// Whether text contains a Unicode control character.
+pub fn has_control_character(text: &str) -> bool {
+    text.chars().any(char::is_control)
+}
+
 /// Serialize to flat label map, skipping nulls/zeros/empty.
 ///
 /// Booleans are emitted as `"true"` / `"false"` so downstream consumers

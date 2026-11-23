@@ -12,10 +12,11 @@ use std::{
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
-use tracing::{info, warn};
+use tracing::warn;
 
 use super::{dp_rank_token_loads, LoadConsumer, WorkerLoadManager};
 use crate::{
+    health::overload::{log_overload_edge, OverloadReading},
     identity::basic::Worker,
     load::port::{GroupTick, LoadSink, PollMode, PolledMember, PolledRanks},
     registry::{Generation, WorkerRegistry},
@@ -71,22 +72,12 @@ impl<G: Generation> ClassicLoadSink<G> {
         if !self.worker_registry.set_worker_overloaded(worker, verdict) {
             return;
         }
-        let waiting = load.map_or(0, WorkerLoadResponse::total_waiting_reqs);
-        let kv_pressure = load.map_or(0.0, WorkerLoadResponse::effective_kv_pressure);
-        // The line keeps the monitor's log target: it was written there
-        // before the port.
-        info!(
-            target: "smg_worker::load::monitor",
-            worker_url = %worker.redacted_url(),
-            overloaded = verdict,
-            waiting_requests = waiting,
-            kv_pressure,
-            waiting_threshold = ?overload.waiting_requests,
-            kv_pressure_threshold = ?overload.token_usage,
-            source,
-            "Worker overload veto {}",
-            if verdict { "set" } else { "cleared" }
-        );
+        let reading = OverloadReading {
+            waiting_requests: load.map_or(0, WorkerLoadResponse::total_waiting_reqs),
+            kv_pressure: load.map_or(0.0, WorkerLoadResponse::effective_kv_pressure),
+            thresholds: overload,
+        };
+        log_overload_edge(worker.as_ref(), verdict, &reading, source);
     }
 
     /// The poll decision for `url` at `now` from the receipt times of its
@@ -247,8 +238,8 @@ impl<G: Generation> ClassicLoadSink<G> {
     }
 
     /// One polled member of an engine's answer: rows are merged, an answer
-    /// without a row retracts, and either that or a failed fetch clears the
-    /// overload veto, since absent means no opinion.
+    /// without a row retracts unless it counts ranks, and either that or a
+    /// failed fetch clears the overload veto, since absent means no opinion.
     fn member(&self, member: &PolledMember<'_>, polled_at: Instant, ranks: &mut PolledRanks) {
         let worker = member.worker;
         let url = worker.url();
@@ -256,19 +247,23 @@ impl<G: Generation> ClassicLoadSink<G> {
             Some(load) if !load.loads.is_empty() => {
                 self.merge(url, load, member.on_file, polled_at, ranks);
             }
-            Some(_) => {
+            Some(load) => {
                 self.apply_overload_verdict(worker, None, "poll");
                 // A successful native poll can retract a rank. A failed poll
                 // leaves the last-known DP cache alone; an explicit omission
                 // of a rank that pushed nothing since the tick began must not
                 // keep that rank selectable or be published as an idle load.
-                self.retract(
-                    url,
-                    worker.dp_rank(),
-                    member.on_file,
-                    polled_at,
-                    &mut ranks.leaving,
-                );
+                // An answer that counts ranks and lists none is short by its
+                // own count, as in `merge`: it retracts no rank from the file.
+                if load.dp_rank_count <= 0 {
+                    self.retract(
+                        url,
+                        worker.dp_rank(),
+                        member.on_file,
+                        polled_at,
+                        &mut ranks.leaving,
+                    );
+                }
                 if let Some(rank) = worker.dp_rank() {
                     self.worker_load_manager.remove_rank(url, rank);
                 } else {
@@ -323,7 +318,7 @@ impl<G: Generation> LoadSink for ClassicLoadSink<G> {
         self.report(answer, polled_at).leaving
     }
 
-    fn fetch_failed(&self, members: &[Arc<dyn Worker>]) {
+    fn fetch_failed(&self, members: &[Arc<dyn Worker>], _polled_at: Instant) {
         for worker in members {
             self.apply_overload_verdict(worker, None, "poll");
         }
@@ -363,6 +358,10 @@ impl<G: Generation> LoadSink for ClassicLoadSink<G> {
 
     fn needs_loads(&self) -> bool {
         self.load_consumer.needs_loads()
+    }
+
+    fn polls(&self, worker: &dyn Worker) -> bool {
+        self.load_consumer.polls(worker)
     }
 
     fn tick(&self, tick: &GroupTick<'_>) {

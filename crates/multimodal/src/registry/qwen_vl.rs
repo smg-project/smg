@@ -157,15 +157,19 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
         modality: Modality,
     ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
         match modality {
-            Modality::Image => Ok(Box::new(Qwen2VLProcessor::from_config_for(
-                preprocessor_config,
-                modality,
-            ))),
-            Modality::Video if Self::names_a_video_token(model_config) => Ok(Box::new(
-                Qwen2VLProcessor::from_config_for(preprocessor_config, modality),
-            )),
-            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
+            Modality::Image => {}
+            Modality::Video if Self::names_a_video_token(model_config) => {}
+            _ => return Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
+        let processor = Qwen2VLProcessor::from_config_for(preprocessor_config, modality);
+        processor
+            .validate()
+            .map_err(|error| ModelRegistryError::InvalidPreprocessorConfig {
+                spec: self.name(),
+                modality,
+                reason: error.to_string(),
+            })?;
+        Ok(Box::new(processor))
     }
 
     fn prompt_replacements(

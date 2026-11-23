@@ -104,7 +104,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use kv_index::{
     compute_request_content_hashes, request_prefix_hashes, salt::request_content_hashes_with_seed,
-    ContentHash, OverlapScores, TenantId, TokenTree, Tree,
+    ContentHash, ModelTrees, OverlapScores, TenantId, TokenTree, Tree,
 };
 use parking_lot::RwLock;
 use rand::RngExt;
@@ -229,10 +229,10 @@ pub struct CacheAwarePolicy {
     /// Optimistic self-accounting of dispatches the engines have not yet
     /// reported; `None` unless `selection_accounting_ttl_ms > 0`.
     accounting: Option<OptimisticAccounting>,
-    /// String-based trees for HTTP connections (text input)
-    string_trees: Arc<DashMap<String, Arc<Tree>, FxBuildHasher>>,
-    /// Token-based trees for gRPC connections (pre-tokenized input)
-    token_trees: Arc<DashMap<String, Arc<TokenTree>, FxBuildHasher>>,
+    /// The trees by model: string-based for HTTP connections (text input),
+    /// token-based for gRPC connections (pre-tokenized input). Shared with
+    /// the eviction task.
+    trees: Arc<ModelTrees>,
     _eviction_task: Option<PeriodicTask>,
     /// Event-driven KV cache monitor for overlap scoring (gRPC workers only).
     kv_monitor: RwLock<Option<Arc<KvEventMonitor>>>,
@@ -331,26 +331,54 @@ fn token_tree_totals(tree: &TokenTree) -> (usize, usize) {
     (counts.values().sum(), counts.len())
 }
 
-/// The per-model tree, created on first sight.
-///
-/// Reads first: `DashMap::entry` takes the shard's *exclusive* lock (and a
-/// `String` key allocation) on every call, and every request for a model lands
-/// on the same shard, so the selection hot path would serialize on it. A shared
-/// read plus an `Arc` clone is uncontended; only a model's first request pays
-/// for the insert.
-fn tree_for_model<V>(
-    trees: &DashMap<String, Arc<V>, FxBuildHasher>,
-    model_id: &str,
-    new_tree: impl FnOnce() -> V,
-) -> Arc<V> {
-    if let Some(tree) = trees.get(model_id) {
-        return Arc::clone(tree.value());
-    }
-    trees
-        .entry(model_id.to_string())
-        .or_insert_with(|| Arc::new(new_tree()))
-        .value()
-        .clone()
+/// One eviction pass over every tree of `trees` at `max_tree_size`, with the
+/// per-model gauges and the log line of the tree sizes: what the eviction
+/// task runs on its interval.
+fn evict_trees(trees: &ModelTrees, max_tree_size: usize) {
+    // Evict string trees (HTTP)
+    let mut total_chars: usize = 0;
+    let mut string_hashed: usize = 0;
+    trees.evict_string_trees(max_tree_size, |model_id, tree| {
+        let (chars, tenants) = string_tree_totals(tree);
+        total_chars += chars;
+        string_hashed += tree.hashed_paths();
+        Metrics::set_cache_tree_chars(model_id, chars);
+        Metrics::set_cache_tree_tenants(model_id, "string", tenants);
+
+        debug!(
+            "String tree eviction completed for model {}, max_size: {}",
+            model_id, max_tree_size
+        );
+    });
+    // Evict token trees (gRPC)
+    let mut total_tokens: usize = 0;
+    let mut token_hashed: usize = 0;
+    trees.evict_token_trees(max_tree_size, |model_id, tree| {
+        let (tokens, tenants) = token_tree_totals(tree);
+        total_tokens += tokens;
+        token_hashed += tree.hashed_paths();
+        Metrics::set_cache_tree_tokens(model_id, tokens);
+        Metrics::set_cache_tree_tenants(model_id, "token", tenants);
+
+        debug!(
+            "Token tree eviction completed for model {}, max_size: {}",
+            model_id, max_tree_size
+        );
+    });
+    // Log tree sizes — model counts, aggregate sizes and the
+    // paths a mesh hash names, from the per-tenant counters.
+    // DO NOT call tree.snapshot() here — it clones all
+    // edge text (~170 MB) every cycle.
+    tracing::info!(
+        "Tree memory: string_trees={} models / {} chars / {} hashed paths, \
+         token_trees={} models / {} tokens / {} hashed paths",
+        trees.string_tree_count(),
+        total_chars,
+        string_hashed,
+        trees.token_tree_count(),
+        total_tokens,
+        token_hashed,
+    );
 }
 
 impl CacheAwarePolicy {
@@ -364,13 +392,11 @@ impl CacheAwarePolicy {
         config.cache_boundaries.sort_unstable();
         config.cache_boundaries.dedup();
 
+        // Token trees sized to the backend's KV page (`block_size`): affinity
+        // below one backend page is unusable by the engine.
+        let trees = Arc::new(ModelTrees::new(config.block_size));
         // Keyed by the operator's model ids and read on every request: the Fx
         // hasher, as the model registry's maps.
-        let string_trees = Arc::new(DashMap::<String, Arc<Tree>, FxBuildHasher>::with_hasher(
-            FxBuildHasher,
-        ));
-        let token_trees =
-            Arc::new(DashMap::<String, Arc<TokenTree>, FxBuildHasher>::with_hasher(FxBuildHasher));
         let placement_index = Arc::new(
             DashMap::<String, Arc<PlacementMap>, FxBuildHasher>::with_hasher(FxBuildHasher),
         );
@@ -385,67 +411,13 @@ impl CacheAwarePolicy {
                 })
             })
         } else if config.eviction_interval_secs > 0 {
-            let string_trees_clone = Arc::clone(&string_trees);
-            let token_trees_clone = Arc::clone(&token_trees);
+            let trees_clone = Arc::clone(&trees);
             let max_tree_size = config.max_tree_size;
 
             Some(PeriodicTask::spawn(
                 config.eviction_interval_secs,
                 "Eviction",
-                move || {
-                    // Evict string trees (HTTP)
-                    let mut total_chars: usize = 0;
-                    let mut string_hashed: usize = 0;
-                    for tree_ref in string_trees_clone.iter() {
-                        let model_id = tree_ref.key();
-                        let tree = tree_ref.value();
-                        tree.evict_tenant_by_size(max_tree_size);
-
-                        let (chars, tenants) = string_tree_totals(tree);
-                        total_chars += chars;
-                        string_hashed += tree.hashed_paths();
-                        Metrics::set_cache_tree_chars(model_id, chars);
-                        Metrics::set_cache_tree_tenants(model_id, "string", tenants);
-
-                        debug!(
-                            "String tree eviction completed for model {}, max_size: {}",
-                            model_id, max_tree_size
-                        );
-                    }
-                    // Evict token trees (gRPC)
-                    let mut total_tokens: usize = 0;
-                    let mut token_hashed: usize = 0;
-                    for tree_ref in token_trees_clone.iter() {
-                        let model_id = tree_ref.key();
-                        let tree = tree_ref.value();
-                        tree.evict_tenant_by_size(max_tree_size);
-
-                        let (tokens, tenants) = token_tree_totals(tree);
-                        total_tokens += tokens;
-                        token_hashed += tree.hashed_paths();
-                        Metrics::set_cache_tree_tokens(model_id, tokens);
-                        Metrics::set_cache_tree_tenants(model_id, "token", tenants);
-
-                        debug!(
-                            "Token tree eviction completed for model {}, max_size: {}",
-                            model_id, max_tree_size
-                        );
-                    }
-                    // Log tree sizes — model counts, aggregate sizes and the
-                    // paths a mesh hash names, from the per-tenant counters.
-                    // DO NOT call tree.snapshot() here — it clones all
-                    // edge text (~170 MB) every cycle.
-                    tracing::info!(
-                        "Tree memory: string_trees={} models / {} chars / {} hashed paths, \
-                         token_trees={} models / {} tokens / {} hashed paths",
-                        string_trees_clone.len(),
-                        total_chars,
-                        string_hashed,
-                        token_trees_clone.len(),
-                        total_tokens,
-                        token_hashed,
-                    );
-                },
+                move || evict_trees(&trees_clone, max_tree_size),
             ))
         } else {
             None
@@ -472,8 +444,7 @@ impl CacheAwarePolicy {
             load_scorer: LeastLoadPolicy::new(),
             selection,
             accounting,
-            string_trees,
-            token_trees,
+            trees,
             _eviction_task: eviction_task,
             kv_monitor: RwLock::new(None),
             load_rx: RwLock::new(None),
@@ -497,12 +468,6 @@ impl CacheAwarePolicy {
     #[cfg(test)]
     pub fn set_mesh_attached_for_test(&self, attached: bool) {
         self.mesh_attached.store(attached, Ordering::Relaxed);
-    }
-
-    /// Token tree sized to the backend's KV page (`block_size`): affinity
-    /// below one backend page is unusable by the engine.
-    fn new_token_tree(&self) -> TokenTree {
-        TokenTree::with_config(self.config.block_size.max(1), Default::default())
     }
 
     fn mesh_attached(&self) -> bool {
@@ -656,8 +621,8 @@ impl CacheAwarePolicy {
     #[cfg(test)]
     pub(crate) fn tree_tenants_for_test(&self, model_id: &str) -> Vec<String> {
         let mut tenants: Vec<String> = self
-            .string_trees
-            .get(normalize_model_key(model_id))
+            .trees
+            .string_tree(normalize_model_key(model_id))
             .map(|tree| tree.get_tenant_char_count().into_keys().collect())
             .unwrap_or_default();
         tenants.sort();
@@ -757,9 +722,7 @@ impl CacheAwarePolicy {
             return;
         }
         let tree_key = normalize_model_key(worker.model_id());
-        tree_for_model(&self.string_trees, tree_key, Tree::new).insert_text("", worker.url());
-        tree_for_model(&self.token_trees, tree_key, || self.new_token_tree())
-            .insert_tokens(&[], worker.url());
+        self.trees.add_tenant(tree_key, worker.url());
     }
 
     /// Remove a worker from the trees
@@ -773,12 +736,7 @@ impl CacheAwarePolicy {
     pub fn remove_worker_by_url(&self, url: &str) {
         self.load_scorer.remove_worker(url);
         let tenant: TenantId = Arc::from(url);
-        for tree_ref in self.string_trees.iter() {
-            tree_ref.value().remove_tenant_all(&tenant);
-        }
-        for tree_ref in self.token_trees.iter() {
-            tree_ref.value().remove_tenant_all(&tenant);
-        }
+        self.trees.remove_tenant(&tenant);
         let placement_maps: Vec<Arc<PlacementMap>> = self
             .placement_index
             .iter()
@@ -795,9 +753,7 @@ impl CacheAwarePolicy {
     /// `model_id`'s string tree, for tests that seed and read its tenants.
     #[cfg(test)]
     pub(crate) fn string_tree(&self, model_id: &str) -> Option<Arc<Tree>> {
-        self.string_trees
-            .get(normalize_model_key(model_id))
-            .map(|tree| Arc::clone(tree.value()))
+        self.trees.string_tree(normalize_model_key(model_id))
     }
 
     /// Remove several workers from one model. Tree cleanup remains precise per
@@ -808,24 +764,7 @@ impl CacheAwarePolicy {
             .iter()
             .map(|worker_url| TenantId::from(worker_url.as_str()))
             .collect();
-        let string_tree = self
-            .string_trees
-            .get(model_id)
-            .map(|entry| Arc::clone(entry.value()));
-        if let Some(tree) = string_tree {
-            for tenant in &tenants {
-                tree.remove_tenant_all(tenant);
-            }
-        }
-        let token_tree = self
-            .token_trees
-            .get(model_id)
-            .map(|entry| Arc::clone(entry.value()));
-        if let Some(tree) = token_tree {
-            for tenant in &tenants {
-                tree.remove_tenant_all(tenant);
-            }
-        }
+        self.trees.remove_tenants_from_model(model_id, &tenants);
         let placements = self
             .placement_index
             .get(model_id)
@@ -843,25 +782,19 @@ impl CacheAwarePolicy {
     #[cfg(test)]
     pub(crate) fn evict_cache(&self, max_size: usize) {
         // Evict string trees (HTTP)
-        for tree_ref in self.string_trees.iter() {
-            let model_id = tree_ref.key();
-            let tree = tree_ref.value();
-            tree.evict_tenant_by_size(max_size);
+        self.trees.evict_string_trees(max_size, |model_id, _| {
             debug!(
                 "String tree eviction for model {}, max_size: {}",
                 model_id, max_size
             );
-        }
+        });
         // Evict token trees (gRPC)
-        for tree_ref in self.token_trees.iter() {
-            let model_id = tree_ref.key();
-            let tree = tree_ref.value();
-            tree.evict_tenant_by_size(max_size);
+        self.trees.evict_token_trees(max_size, |model_id, _| {
             debug!(
                 "Token tree eviction for model {}, max_size: {}",
                 model_id, max_size
             );
-        }
+        });
     }
 
     /// Select the expected-wait worker (used when KV pressure abandons
@@ -885,10 +818,7 @@ impl CacheAwarePolicy {
             let (keyed, _marker_len) = self.keyed_tokens(info, tokens);
             let tokens: &[u32] = &keyed;
             // gRPC request: update token tree
-            let tree = self
-                .token_trees
-                .get(model_id)
-                .map(|entry| entry.value().clone());
+            let tree = self.trees.token_tree(model_id);
             if let Some(tree) = tree {
                 // With the mesh attached the path's hash rides on the insert, so
                 // a peer's delta that names this path resolves to its node here.
@@ -910,10 +840,7 @@ impl CacheAwarePolicy {
             let (keyed, _marker_len) = Self::keyed_text(info, text);
             let text: &str = &keyed;
             // HTTP request: update string tree
-            let tree = self
-                .string_trees
-                .get(model_id)
-                .map(|entry| entry.value().clone());
+            let tree = self.trees.string_tree(model_id);
 
             if let Some(tree) = tree {
                 // The empty text ends at the root, which no hash names.
@@ -1009,17 +936,11 @@ impl TreeHandle for CacheAwarePolicy {
         let model_id = normalize_model_key(model_id);
         match tree_kind {
             TreeKind::String => {
-                let tree = self
-                    .string_trees
-                    .get(model_id)
-                    .map(|entry| Arc::clone(entry.value()));
+                let tree = self.trees.string_tree(model_id);
                 tree.is_some_and(|tree| tree.insert_tenant_by_hash(node_hash, worker_url))
             }
             TreeKind::Token => {
-                let tree = self
-                    .token_trees
-                    .get(model_id)
-                    .map(|entry| Arc::clone(entry.value()));
+                let tree = self.trees.token_tree(model_id);
                 tree.is_some_and(|tree| tree.insert_tenant_by_hash(node_hash, worker_url))
             }
         }
@@ -1033,13 +954,13 @@ impl TreeHandle for CacheAwarePolicy {
         let model_id = normalize_model_key(model_id);
         match tree_kind {
             TreeKind::String => {
-                let tree = self.string_trees.get(model_id)?.value().clone();
+                let tree = self.trees.string_tree(model_id)?;
                 Some(Box::new(tree.iter_entries().map(|(path, tenants)| {
                     RepairEntry::String { path, tenants }
                 })))
             }
             TreeKind::Token => {
-                let tree = self.token_trees.get(model_id)?.value().clone();
+                let tree = self.trees.token_tree(model_id)?;
                 Some(Box::new(tree.iter_entries().map(|(tokens, tenants)| {
                     RepairEntry::Token { tokens, tenants }
                 })))
@@ -1055,11 +976,7 @@ impl TreeHandle for CacheAwarePolicy {
                 // Create the tree on first repair page if it
                 // doesn't exist yet locally — repair is the
                 // primary cold-start path for a fresh peer.
-                let tree = self
-                    .string_trees
-                    .entry(model_id.to_string())
-                    .or_insert_with(|| Arc::new(Tree::new()))
-                    .clone();
+                let tree = self.trees.string_tree_or_new(model_id);
                 for entry in &page.entries {
                     match entry {
                         RepairEntry::String { path, tenants } => {
@@ -1085,11 +1002,7 @@ impl TreeHandle for CacheAwarePolicy {
                 }
             }
             TreeKind::Token => {
-                let tree = self
-                    .token_trees
-                    .entry(model_id.to_string())
-                    .or_insert_with(|| Arc::new(self.new_token_tree()))
-                    .clone();
+                let tree = self.trees.token_tree_or_new(model_id);
                 for entry in &page.entries {
                     match entry {
                         RepairEntry::Token { tokens, tenants } => {
@@ -2245,10 +2158,13 @@ impl CacheAwarePolicy {
         if shallow {
             self.divert_shallow_seen.store(true, Ordering::Relaxed);
         }
-        let hits = self.divert_hits.fetch_add(1, Ordering::Relaxed) + 1;
+        let hits = self
+            .divert_hits
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         let shallow_seen = self.divert_shallow_seen.load(Ordering::Relaxed);
         let due = (hits >= warmup.divert_every && (shallow || !shallow_seen))
-            || hits >= 2 * warmup.divert_every;
+            || hits >= warmup.divert_every.saturating_mul(2);
         if !due {
             return None;
         }
@@ -3532,7 +3448,7 @@ impl CacheAwarePolicy {
         model_id: &str,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        let tree = tree_for_model(&self.token_trees, model_id, || self.new_token_tree());
+        let tree = self.trees.token_tree_or_new(model_id);
 
         // The namespaced key (see `keyed_tokens`); a match count read from
         // the tree has `marker_len` subtracted.
@@ -3621,7 +3537,7 @@ impl CacheAwarePolicy {
         model_id: &str,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        let tree = tree_for_model(&self.string_trees, model_id, Tree::new);
+        let tree = self.trees.string_tree_or_new(model_id);
 
         // Same partition rule as the token tree, in chars.
         let (keyed, marker_len) = Self::keyed_text(info, text);

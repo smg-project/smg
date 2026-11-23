@@ -2,10 +2,12 @@
 
 use std::time::Duration;
 
-use wfaas::{BackoffStrategy, StepDefinition, StepId, WorkflowDefinition};
+use wfaas::{
+    BackoffStrategy, StepDefinition, StepId, ValidationError, WorkflowDefinition, WorkflowEngine,
+};
 
 use super::*;
-use crate::workflow::host::testing::RegistryHost;
+use crate::workflow::host::testing::{registration_settings, RegistryHost};
 
 type Data = WorkerRegistrationWorkflowData<RegistryHost>;
 
@@ -13,12 +15,10 @@ const HOST_GATE_STEP: &str = "host_gate";
 
 fn settings(timeout_secs: u64, delay_secs: u64, interval_secs: u64) -> RegistrationSettings {
     RegistrationSettings {
-        upstream_http2: false,
-        health_check_timeout_secs: 5,
         startup_timeout_secs: timeout_secs,
         startup_delay_secs: delay_secs,
         startup_check_interval_secs: interval_secs,
-        dp_aware: false,
+        ..registration_settings()
     }
 }
 
@@ -39,6 +39,7 @@ fn a_named_gate_holds_the_detection_behind_the_hosts_step() {
         &settings(300, 7, 5),
         RegistrationGates {
             detection: Some(HOST_GATE_STEP),
+            ..RegistrationGates::default()
         },
     );
 
@@ -158,6 +159,7 @@ fn the_dp_read_waits_on_the_metadata_read() {
         RegistrationGates::default(),
         RegistrationGates {
             detection: Some(HOST_GATE_STEP),
+            ..RegistrationGates::default()
         },
     ] {
         let workflow = worker_registration_workflow::<RegistryHost>(&settings(300, 7, 5), gates);
@@ -173,4 +175,53 @@ fn the_dp_read_waits_on_the_metadata_read() {
         assert_eq!(step.timeout, Some(Duration::from_secs(10)));
         assert!(matches!(step.on_failure, FailureAction::FailWorkflow));
     }
+}
+
+#[test]
+fn the_creation_waits_on_the_dp_read_or_on_the_hosts_gate() {
+    for (creation, dependency) in [
+        (None, DISCOVER_DP_STEP),
+        (Some(HOST_GATE_STEP), HOST_GATE_STEP),
+    ] {
+        let workflow = worker_registration_workflow::<RegistryHost>(
+            &settings(300, 7, 5),
+            RegistrationGates {
+                creation,
+                ..RegistrationGates::default()
+            },
+        );
+        let step = workflow
+            .steps
+            .iter()
+            .find(|step| step.id == StepId::new("create_local_worker"))
+            .expect("the creation step is in the workflow");
+
+        assert_eq!(step.depends_on, [StepId::new(dependency)]);
+        assert!(step.depends_on_any.is_empty());
+        assert_eq!(step.name, "Create Local Worker");
+        assert_eq!(step.timeout, Some(Duration::from_secs(5)));
+        assert!(step.retry_policy.is_none());
+        assert!(matches!(step.on_failure, FailureAction::FailWorkflow));
+    }
+}
+
+#[test]
+fn a_creation_gate_must_name_a_step_the_host_added() {
+    let workflow = worker_registration_workflow::<RegistryHost>(
+        &settings(300, 7, 5),
+        RegistrationGates {
+            creation: Some(HOST_GATE_STEP),
+            ..RegistrationGates::default()
+        },
+    );
+
+    let error = WorkflowEngine::new()
+        .register_workflow(workflow)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ValidationError::MissingDependency { step, dependency }
+            if step == StepId::new("create_local_worker") && dependency == StepId::new(HOST_GATE_STEP)
+    ));
 }

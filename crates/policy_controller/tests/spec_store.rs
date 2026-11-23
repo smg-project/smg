@@ -47,7 +47,7 @@ use std::{
 };
 
 use replicas::{Lease, Replica, ROOM};
-use smg_policy_controller::{
+use smg_policy_controller::service::{
     elector::ElectionSettings,
     proto::{
         controller_frame, decide_answer, decision, gateway_frame,
@@ -155,6 +155,7 @@ async fn decide(replica: &Replica) -> Option<decide_answer::Answer> {
             }),
             constraints: None,
             again: false,
+            ..Default::default()
         })
         .await
         .expect("the stream takes the request");
@@ -256,15 +257,16 @@ async fn an_enforce_on_a_spec_store_runs_and_a_start_runs_it_again() {
     assert!(ready.contains(r#""status":"ready""#), "{ready}");
     let nothing = read(&replica, 0).await.expect_err("nothing stands");
     assert_eq!(nothing.code(), Code::NotFound, "{nothing:?}");
-    // A decision there is generation 0's, which binds no model: a shed
-    // the binding declines, never a pick by a document nobody wrote.
+    // No worker serves the model, so a decision there is made over no
+    // list: a shed for want of endpoints under the stage `none`, whatever
+    // document stands, never a pick by a document nobody wrote.
     match decide(&replica).await {
         Some(decide_answer::Answer::Decision(Decision {
             outcome: Some(decision::Outcome::Shed(shed)),
             ..
         })) => {
-            assert_eq!(shed.reason(), ShedReason::PolicyDeclined, "{shed:?}");
-            assert_eq!(shed.emptied_by, "binding", "{shed:?}");
+            assert_eq!(shed.reason(), ShedReason::NoEndpoints, "{shed:?}");
+            assert_eq!(shed.emptied_by, "none", "{shed:?}");
         }
         other => panic!("a shed answers a decision before the first apply: {other:?}"),
     }

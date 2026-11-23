@@ -3,20 +3,13 @@
 //! store applied the writes (design 5.4, the leader's log).
 //!
 //! The store knows the trait alone. The replication log
-//! ([`crate::replication::Log`]) is its one implementation: a store with a
+//! ([`crate::service::replication::Log`]) is its one implementation: a store with a
 //! journal is a store whose history a standby or a watcher of its rows can
 //! follow, and a store without one (a gateway deciding in its own process)
-//! pays one branch a write. A journal says once whether it carries load
-//! rows: one that follows the membership alone costs a load write no more
-//! than none.
+//! pays one branch a write. A journal carries no load row: a load write
+//! tells it nothing.
 
-use crate::{
-    store::{
-        loads::LoadSample,
-        workers::{MembershipChange, WorkerRow},
-    },
-    view::WorkerId,
-};
+use crate::store::workers::{MembershipChange, WorkerRow};
 
 /// A place in a store's history: the number of a replicated write, and the
 /// term the store wrote it under. The default is the place before every
@@ -36,25 +29,13 @@ pub struct Position {
     pub term: u64,
 }
 
-/// The kinds of write a journal carries, as a reader of it asks for them.
-/// A kind stands with its slowest reader: watched if a watcher can ask for
-/// it, with the load rows if a standby alone follows it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Kinds {
-    /// The watched kinds, those a watcher of the rows can ask for:
-    /// membership and status writes, the starts of terms and the
-    /// generations applied. A watch is told nothing of a generation yet:
-    /// its needs are what one would ask for.
-    Watched,
-    /// Every kind: the watched kinds and the load rows. What a standby
-    /// follows.
-    All,
-}
-
-/// What a store tells at each replicated write.
+/// What a store tells at each replicated write: the kinds a watcher of the
+/// rows or a standby can ask for. They are membership and status writes,
+/// the starts of terms and the generations applied. A watch is told nothing
+/// of a generation yet: its needs are what one would ask for.
 ///
 /// Every call but [`Journal::released`] arrives under a lock of the store
-/// (the membership lock, the load lock or the turn of the leases' file),
+/// (the membership lock or the turn of the leases' file),
 /// so an implementation returns at once: it takes no lock a reader may
 /// hold for long, it never waits on a standby and it calls nothing of the
 /// store.
@@ -77,11 +58,6 @@ pub trait Journal: Send + Sync {
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
     );
-
-    /// One rank's load row, as the store put it on file, with the place of
-    /// the leader's event it applies as [`Journal::member`] has it. Never
-    /// told to a journal that carries no load rows.
-    fn load(&self, at: Option<Position>, id: WorkerId, rank: u16, sample: &LoadSample);
 
     /// A generation applied, by its number: told under the membership lock
     /// behind the publication of its first world, so its place orders it
@@ -112,20 +88,16 @@ pub trait Journal: Send + Sync {
     /// leads no term.
     fn term_followed(&self, at: Position);
 
-    /// Whether the journal carries load rows, asked once when the store is
-    /// built: where it does not, a load write tells nothing.
-    fn carries_loads(&self) -> bool;
-
-    /// The last write of `kinds` told, with its term.
-    fn head(&self, kinds: Kinds) -> Position;
+    /// The last write told, with its term.
+    fn head(&self) -> Position;
 
     /// The term the journal followed, `None` while the store leads the
     /// journal's term: from a take that starts the term until the store
     /// follows another history. A take that starts no term changes nothing.
     fn followed(&self) -> Option<u64>;
 
-    /// The store has let go of every lock of a write of the watched kinds:
-    /// the one call that arrives under no lock of the store. It follows
+    /// The store has let go of every lock of a journaled write: the one
+    /// call that arrives under no lock of the store. It follows
     /// each such write, and a call that wrote nothing may be followed by
     /// it too. What a journal wakes at its writes it wakes here, so no
     /// writer and no reservation waits behind the wake; a journal that

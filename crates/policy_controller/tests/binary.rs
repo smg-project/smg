@@ -164,6 +164,13 @@ fn the_served_benchs_settings_are_the_binarys() {
     let ours = settings_after(binary, "const SETTINGS").expect("the binary's settings");
     let theirs = settings_after(bench, "pub static MALLOC_CONF").expect("the bench's copy");
     assert_eq!(theirs, ours, "the bench's settings are not the binary's");
+    // The in-process engine's bench counts under a copy of them too.
+    let in_process = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/benches/in_process.rs"
+    ));
+    let theirs = settings_after(in_process, "pub static MALLOC_CONF").expect("its copy");
+    assert_eq!(theirs, ours, "the in-process bench's settings differ");
 }
 
 /// The byte string a source assigns after `name`, without its quotes.

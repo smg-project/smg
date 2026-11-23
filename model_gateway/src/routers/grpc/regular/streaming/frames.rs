@@ -325,8 +325,12 @@ fn push_logprobs_view(
                 if at > 0 {
                     buffer.extend_from_slice(b",");
                 }
-                let text = decode(token_id);
-                push_logprob_token(buffer, &text, logprob, Some(text.as_bytes()));
+                let text: &str = if token_id == position.token_id {
+                    &token
+                } else {
+                    &decode(token_id)
+                };
+                push_logprob_token(buffer, text, logprob, Some(text.as_bytes()));
                 buffer.extend_from_slice(b"}");
             }
             buffer.extend_from_slice(b"]}");
@@ -387,8 +391,8 @@ pub(super) fn push_json<W: io::Write, T: Serialize + ?Sized>(writer: W, value: &
 /// A generate choice's text so far as the contents of its JSON string: the
 /// bytes serde writes between the quotes, escaped once as each chunk arrives.
 /// Every event of a generate stream carries the choice's whole text, and the
-/// stream only appends to it (each chunk is decoded on its own and pushed),
-/// so the escaped form is extended in step and never rewritten, and an event
+/// stream only appends to it (each decoded delta is pushed), so the escaped
+/// form is extended in step and never rewritten, and an event
 /// copies the text into its frame instead of escaping it again (serde's
 /// escape walked every byte of the answer on every event, a cost growing
 /// with the square of the answer's length). The bytes are serde's own:

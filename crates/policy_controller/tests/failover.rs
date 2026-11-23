@@ -61,7 +61,7 @@ use std::{
 use engines::{eventually, mock_engine};
 use openai_protocol::worker::RuntimeType;
 use replicas::{Lease, Replica, ROOM};
-use smg_policy_controller::{
+use smg_policy_controller::service::{
     client::{self, Answer, Client},
     elector::ElectionSettings,
     proto::{
@@ -240,6 +240,7 @@ async fn placed(gateway: &mut Client, replica: &Replica, key: u64, n: u64) -> Re
         }),
         constraints: None,
         again: false,
+        ..Default::default()
     };
     let began = Instant::now();
     let answer = loop {

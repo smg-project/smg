@@ -46,14 +46,16 @@ vendored-openssl = ["openssl/vendored"]
 name = "smg"
 crate-type = ["rlib"]
 
+# Both binaries use the library's command line. Its unit tests run with the
+# library, so neither builds a test harness.
 [[bin]]
 name = "smg"
 path = "src/main.rs"
+test = false
 
 [[bin]]
 name = "amg"
 path = "src/main.rs"
-# The same source as `smg`: its unit tests run in the `smg` binary's test harness, so this one builds none.
 test = false
 
 [dependencies]
@@ -106,10 +108,7 @@ smg-mm-rdma.workspace = true
 smg-wasm = { workspace = true, features = ["storage-hooks"] }
 smg-mesh.workspace = true
 smg-rl.workspace = true
-# The policy document and its presets alone, with none of the crate's
-# features: the routing configuration is written as a document
-# (`config/policy_document.rs`) and nothing decides by it.
-smg-policy-controller.workspace = true
+smg-policy-controller = { workspace = true, features = ["in-process", "operator"] }
 smg-grpc-client.workspace = true
 engine-zmq-client.workspace = true
 engine-zmq-adapter.workspace = true
@@ -198,7 +197,7 @@ rsa = { version = "0.9", features = ["sha2"] }
 rustls-pemfile = "2.2"
 jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
 validator = "0.20.0"
-tracing-test = "0.2"
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 tokio = { workspace = true, features = ["test-util"] }
 kv-index.workspace = true
 # The bellwether render-parity test reads the fixture manifests (TOML).
@@ -230,11 +229,6 @@ harness = false
 name = "tokenizer_benchmark"
 harness = false
 path = "benches/tokenizer_benchmark.rs"
-
-[[bench]]
-name = "tool_parser_benchmark"
-harness = false
-path = "benches/tool_parser_benchmark.rs"
 
 [[bench]]
 name = "manual_policy_benchmark"
@@ -320,6 +314,13 @@ path = "benches/forced_call_stream.rs"
 name = "symphony_messages_stream"
 harness = false
 path = "benches/symphony_messages_stream.rs"
+
+# One request's routing under the classic policies: a fixed count of
+# decisions a cell, so the same binary counts instructions.
+[[bench]]
+name = "decision_paths"
+harness = false
+path = "benches/decision_paths.rs"
 
 [lints]
 workspace = true

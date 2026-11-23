@@ -55,7 +55,7 @@ use std::{
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 
-use crate::lease::LeaseId;
+use crate::tracking::lease::LeaseId;
 
 /// The bits of an id's counter that count inside a block: 2^20 ids a
 /// block, 4,096 blocks a term.
@@ -371,7 +371,7 @@ mod tests {
     };
 
     use super::{Blocks, Minted, BLOCK, BLOCKS, BLOCK_BITS};
-    use crate::lease::LeaseId;
+    use crate::tracking::lease::LeaseId;
 
     /// The id of `term` and `counter`, as the mint lays an id out.
     fn id(term: u64, counter: u32) -> LeaseId {

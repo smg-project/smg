@@ -1,6 +1,6 @@
 //! The policy controller's two wire contracts, compiled and parsed at test
 //! time (`contracts/README.md`): the gRPC protocol in package `smg.policy.v1`
-//! and the WebAssembly world `smg:policy@1.1.0`. Nothing at run time reads
+//! and the WebAssembly world `smg:policy@1.2.0`. Nothing at run time reads
 //! the files; the world's `types` interface is rendered from the crate's
 //! types by the `wit` module and held to the committed file by `tests/wit.rs`.
 //! The tests here hold four things: the
@@ -25,10 +25,15 @@ use prost_types::{
     DescriptorProto, FileDescriptorProto, FileDescriptorSet, ServiceDescriptorProto,
 };
 use smg_policy_controller::{
-    fingerprint, spec::DENIED_HEADERS, AffinityFacts, Candidate, Constraints, HashKind, Health,
-    Identity, Lease, LeaseKind, Lifted, LoadRow, MediaCounts, Membership, Outcome, OverloadRegime,
-    Pair, Phase, PoolFacts, Queue, ReleaseReason, RequestFacts, Role, Shed, ShedReason, Side,
-    Signal, SignalSource, Target, Trace, TransportClass, ZoneCapacity,
+    cases,
+    document::{PolicySpec, DENIED_HEADERS},
+    engine::{
+        fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Health, Identity, LiftedVeto,
+        LoadRow, MediaCounts, OverloadRegime, Pair, Phase, PoolFacts, Queue, RequestFacts, Role,
+        Shed, ShedReason, SignalSource, Target, Trace, ZoneCapacity,
+    },
+    mirrored, record,
+    tracking::{Lease, LeaseKind, Side},
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
@@ -39,7 +44,7 @@ const WORLD_WIT: &str = "smg-policy.wit";
 const PACKAGE: &str = "smg.policy.v1";
 const WIT_NAMESPACE: &str = "smg";
 const WIT_PACKAGE: &str = "policy";
-const WIT_VERSION: &str = "1.1.0";
+const WIT_VERSION: &str = "1.2.0";
 
 /// The header deny-list of design section 4.6: the names no view may read
 /// and no routing-key override may key on, lowercase, in this order, each
@@ -62,36 +67,13 @@ fn the_header_deny_list_holds_its_seven_names() {
     }
 }
 
-/// A record's field names in declaration order. The pattern names every
-/// field without `..`, so the crate's type cannot gain, lose or rename one
-/// without this file failing to compile: the wire tables below cannot drift
-/// from the record silently. A field written `name as "spelled"` is listed
-/// under the name the contracts spell, the pattern still naming the
-/// struct's own: a pair, both sides checked.
-macro_rules! record {
-    (@spelled $field:ident) => { stringify!($field) };
-    (@spelled $field:ident $spelled:literal) => { $spelled };
-    ($ty:ty, $name:ident { $($field:ident $(as $spelled:literal)?),+ $(,)? }) => {{
-        // Never called: its pattern is the exhaustiveness proof.
-        fn exhaustive(value: $ty) {
-            let $name { $($field: _),+ } = value;
-        }
-        let _: fn($ty) = exhaustive;
-        &[$(record!(@spelled $field $($spelled)?)),+][..]
-    }};
-}
-
-/// An enum's variant names in declaration order, by the same proof: a match
-/// without a wildcard arm.
-macro_rules! cases {
-    ($ty:ty, $name:ident { $($case:ident),+ $(,)? }) => {{
-        fn exhaustive(value: $ty) {
-            match value { $($name::$case { .. } => {}),+ }
-        }
-        let _: fn($ty) = exhaustive;
-        &[$(stringify!($case)),+][..]
-    }};
-}
+// A record's field names and an enum's case names are listed by the
+// library's two proof macros (`record!`, `cases!`, its module `mirrored`):
+// a pattern that names every field without `..` and a match without a
+// wildcard arm, so a type cannot gain, lose or rename one without this file
+// failing to compile. No such pattern of a type marked non-exhaustive
+// builds outside the library: the lists of those five are stated there, by
+// the same macros, and read here (`mirrored::outcome` and its like).
 
 fn candidate_record() -> &'static [&'static str] {
     record!(
@@ -121,6 +103,7 @@ fn candidate_record() -> &'static [&'static str] {
             host_local,
             active_sessions,
             key,
+            engine,
         }
     )
 }
@@ -163,13 +146,20 @@ fn request_record() -> &'static [&'static str] {
             media,
             seed,
             block_size,
+            prompt_chars,
+            prompt_bytes,
             now_micros,
             pinned_at,
             lent_in_flight,
+            lent_session_in_flight,
             session_counted,
             affinity,
             named,
             model_fingerprint,
+            signal_cells,
+            client_key,
+            ring,
+            ring_positions,
         }
     )
 }
@@ -200,10 +190,12 @@ fn constraints_record() -> &'static [&'static str] {
             excluded,
             wire_modes,
             overload_lifted,
+            decode_later,
             subset_hint,
+            demands,
             stalled,
             held,
-            pins
+            places
         }
     )
 }
@@ -221,6 +213,7 @@ fn pool_record() -> &'static [&'static str] {
             reach,
             reported,
             engines,
+            word,
         }
     )
 }
@@ -279,7 +272,8 @@ fn pair_record() -> &'static [&'static str] {
         Pair {
             decode_position,
             decode_id,
-            decode_dp_rank
+            decode_dp_rank,
+            decode_verdict
         }
     )
 }
@@ -324,8 +318,8 @@ fn trace_record() -> &'static [&'static str] {
 }
 
 /// The lease's session crosses under the name both contracts still spell,
-/// `session_key`: the change that first reads a lease from the wire renames
-/// the field in both and takes this pair out.
+/// `session_key`. A gateway's client reads it under that name. A change that
+/// renames the field renames it in both contracts and takes this pair out.
 fn lease_record() -> &'static [&'static str] {
     record!(
         Lease,
@@ -340,24 +334,14 @@ fn lease_record() -> &'static [&'static str] {
             session_verdict,
             issued_micros,
             tokens,
+            chars,
+            bytes,
         }
     )
 }
 
 fn outcome_record() -> &'static [&'static str] {
-    record!(
-        Outcome,
-        Outcome {
-            side,
-            served,
-            status,
-            class,
-            ttft_micros,
-            tokens_in,
-            tokens_out,
-            duration_micros,
-        }
-    )
+    mirrored::outcome()
 }
 
 /// The crate's enums the two contracts spell out, with the proto enum (a
@@ -462,50 +446,19 @@ fn enum_mirrors() -> Vec<(
             "Completed.Class",
             "CLASS",
             "transport-class",
-            cases!(
-                TransportClass,
-                TransportClass {
-                    Ok,
-                    ClientError,
-                    ServerError,
-                    ConnectFailed,
-                    Timeout,
-                    Cancelled,
-                }
-            ),
+            mirrored::transport_class(),
         ),
         (
             "Released.Reason",
             "REASON",
             "release-reason",
-            cases!(
-                ReleaseReason,
-                ReleaseReason {
-                    Abandoned,
-                    LateDecision,
-                    ClientGone,
-                    CommitFailed,
-                    Expired,
-                    WorkerRemoved,
-                }
-            ),
+            mirrored::release_reason(),
         ),
         (
             "MembershipChange.Kind",
             "KIND",
             "membership",
-            cases!(
-                Membership<'_>,
-                Membership {
-                    Added,
-                    Removed,
-                    Replaced,
-                    Relabelled,
-                    Resized,
-                    Snapshot,
-                    Left,
-                }
-            ),
+            mirrored::membership(),
         ),
     ]
 }
@@ -528,14 +481,7 @@ fn shed_reasons() -> &'static [&'static str] {
 /// The signal kinds have a WIT variant; the proto spells them as a `oneof`
 /// whose third case names its unit.
 fn signal_cases() -> &'static [&'static str] {
-    cases!(
-        Signal,
-        Signal {
-            Load,
-            Health,
-            GatewayVeto
-        }
-    )
+    mirrored::signal()
 }
 
 /// How a message of the protocol relates to the record it mirrors.
@@ -546,7 +492,8 @@ struct ProtoMirror {
     /// Record fields the wire does not carry: a host instant, a host-local
     /// position, the in-process length of a fixed array, the trace the wire
     /// hoists into `Decision`, whether a report counts resident tokens, a
-    /// fingerprint the host carries of a name the wire carries.
+    /// fingerprint the host carries of a name the wire carries, the place
+    /// of a row's engine among the engines of its host's list.
     host_only: &'static [&'static str],
     /// Wire fields outside the record, in the wire's order: an event's key
     /// before it, controller facts, a wire-only input, the observability
@@ -601,7 +548,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Candidate",
             record: candidate_record(),
-            host_only: &["position", "load_sampled_at_micros"],
+            host_only: &["position", "load_sampled_at_micros", "engine"],
             wire_only: affinity_record(),
             wire: &[
                 ("id", Type::Fixed64),
@@ -641,13 +588,19 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
             // The affinity column rides the request in the crate; the wire
             // carries each entry in its candidate.
             host_only: &[
+                "prompt_chars",
+                "prompt_bytes",
                 "now_micros",
                 "pinned_at",
                 "lent_in_flight",
+                "lent_session_in_flight",
                 "session_counted",
                 "affinity",
                 "named",
                 "model_fingerprint",
+                "signal_cells",
+                "ring",
+                "ring_positions",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -670,6 +623,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("seed", Type::Fixed64),
                 ("prompt_text", Type::Bytes),
                 ("block_size", Type::Uint32),
+                ("client_key", Type::Fixed64),
             ],
             repeated: &["block_hashes", "tried", "headers"],
             optional: &[],
@@ -677,7 +631,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Constraints",
             record: constraints_record(),
-            host_only: &["stalled", "held", "pins"],
+            host_only: &["decode_later", "demands", "stalled", "held", "places"],
             wire_only: &[],
             wire: &[
                 ("excluded", Type::Fixed64),
@@ -691,7 +645,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "PoolFacts",
             record: pool_record(),
-            host_only: &["reach", "reported", "engines"],
+            host_only: &["reach", "reported", "engines", "word"],
             wire_only: &[],
             wire: &[
                 ("pool_size", Type::Uint32),
@@ -733,7 +687,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Pair",
             record: pair_record(),
-            host_only: &["decode_position"],
+            host_only: &["decode_position", "decode_verdict"],
             wire_only: &[],
             wire: &[
                 ("decode_id", Type::Fixed64),
@@ -778,6 +732,8 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "affinity_source",
                 // The record reads it from its count ([`Trace::drew_first`]).
                 "drew_first",
+                // The record marks this in `profile` ([`Trace::made_under`]).
+                "no_profile",
             ],
             wire: &[
                 ("profile", Type::Uint32),
@@ -793,6 +749,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("affinity_source", Type::Enum),
                 ("drew_first", Type::Bool),
                 ("lifted", Type::Enum),
+                ("no_profile", Type::Bool),
             ],
             repeated: &["top", "drops"],
             optional: &["survivors"],
@@ -800,7 +757,13 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Lease",
             record: lease_record(),
-            host_only: &["booked", "session_verdict", "issued_micros"],
+            host_only: &[
+                "booked",
+                "session_verdict",
+                "issued_micros",
+                "chars",
+                "bytes",
+            ],
             wire_only: &["term", "dispatch_ttl_ms", "origin"],
             wire: &[
                 ("id", Type::Fixed64),
@@ -864,7 +827,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "candidate",
             crate_record: candidate_record(),
-            host_only: &["position", "load_sampled_at_micros"],
+            host_only: &["position", "load_sampled_at_micros", "engine"],
             before: &[],
             beside: affinity_record(),
         },
@@ -879,13 +842,20 @@ fn wit_mirrors() -> Vec<WitMirror> {
             record: "request",
             crate_record: request_record(),
             host_only: &[
+                "prompt_chars",
+                "prompt_bytes",
                 "now_micros",
                 "pinned_at",
                 "lent_in_flight",
+                "lent_session_in_flight",
                 "session_counted",
                 "affinity",
                 "named",
                 "model_fingerprint",
+                "signal_cells",
+                "client_key",
+                "ring",
+                "ring_positions",
             ],
             before: &[],
             beside: &[],
@@ -900,21 +870,27 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pool",
             crate_record: pool_record(),
-            host_only: &["reach", "reported", "engines"],
+            host_only: &["reach", "reported", "engines", "word"],
             before: &[],
             beside: &[],
         },
         WitMirror {
             record: "lease",
             crate_record: lease_record(),
-            host_only: &["booked", "session_verdict", "issued_micros"],
+            host_only: &[
+                "booked",
+                "session_verdict",
+                "issued_micros",
+                "chars",
+                "bytes",
+            ],
             before: &[],
             beside: &[],
         },
         WitMirror {
             record: "pair",
             crate_record: pair_record(),
-            host_only: &["decode_position"],
+            host_only: &["decode_position", "decode_verdict"],
             before: &[],
             beside: &[],
         },
@@ -1093,7 +1069,14 @@ const ONEOFS: &[(&str, &str, &str, &[&str])] = &[
             "relabelled",
             "needs",
             "snapshot_required",
+            "ranks",
         ],
+    ),
+    (
+        CONTROLLER_PROTO,
+        "RankRow",
+        "made",
+        &["registered", "replaced", "removed", "relabelled"],
     ),
     (
         CONTROLLER_PROTO,
@@ -1180,6 +1163,41 @@ fn message<'a>(file: &'a FileDescriptorProto, name: &str) -> Option<&'a Descript
     file.message_type
         .iter()
         .find(|message| message.name() == name)
+}
+
+#[test]
+fn least_cost_term_names_match_the_plugin_contract_fields() {
+    let set = compile_protocol().expect("the protocol compiles");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin contract");
+    for (prefix, record, terms) in [
+        (
+            "load",
+            "LoadRow",
+            &[
+                "running",
+                "queued",
+                "waiting_uncached_tokens",
+                "kv_usage_permille",
+                "active_kv_permille",
+                "resident_tokens",
+            ][..],
+        ),
+        ("candidate", "Candidate", &["in_flight"][..]),
+    ] {
+        let record = message(plugin, record).expect("the term's record");
+        for field in terms {
+            assert!(
+                record.field.iter().any(|f| f.name() == *field),
+                "{prefix}.{field}"
+            );
+            let profile = serde_yaml::from_str(&format!(
+                "score: [{{least-cost: {{terms: {{{prefix}.{field}: 7}}, unreported: missing-as-zero}}}}]\npick: best"
+            )).expect("a profile with one term");
+            let spec = PolicySpec::new([("p".to_string(), profile)].into());
+            spec.validate()
+                .unwrap_or_else(|err| panic!("{prefix}.{field}: {err}"));
+        }
+    }
 }
 
 fn service<'a>(file: &'a FileDescriptorProto, name: &str) -> Option<&'a ServiceDescriptorProto> {
@@ -1475,8 +1493,8 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
     // Its zero is none, a case, on purpose: the enum's comment says why.
     let found = enum_values(plugin, "LiftedVeto").expect("LiftedVeto is an enum");
     let expected: Vec<(String, i32)> = cases!(
-        Lifted,
-        Lifted {
+        LiftedVeto,
+        LiftedVeto {
             None,
             Overload,
             Liveness
@@ -1765,6 +1783,53 @@ fn the_watch_workers_resume_fields_are_pinned() {
             .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
             .collect();
         assert_eq!(found, expected, "{message_name}: a resume field moved");
+    }
+}
+
+/// What a gateway says to ask a pair's decode after its prefill, by name
+/// and number: the word on the pair's first request, and the lease whose
+/// decode side a later request asks.
+const DECODE_CALL_FIELDS: &[ResumeField] = &[
+    ("decode_later", 5, Type::Bool),
+    ("decode_of", 6, Type::Fixed64),
+];
+
+/// Why a decode call is refused, by name and number.
+const DECODE_CALL_REASONS: &[(&str, i32)] = &[
+    ("REASON_DECODE_NO_LEASE", 5),
+    ("REASON_DECODE_NOT_CHOSEN", 6),
+    ("REASON_DECODE_PREFILL_NOT_HELD", 7),
+    ("REASON_DECODE_STANDS", 8),
+];
+
+#[test]
+fn the_decode_call_fields_and_reasons_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    let request = message(controller, "DecideRequest").expect("the request is a message");
+    let pinned = |name: &str| {
+        DECODE_CALL_FIELDS
+            .iter()
+            .any(|(field, _, _)| *field == name)
+    };
+    let found: Vec<(String, i32, Type, bool)> = fields(request)
+        .into_iter()
+        .filter(|(name, _, _, _, _)| pinned(name))
+        .map(|(name, number, kind, _, optional)| (name, number, kind, optional))
+        .collect();
+    // The lease's id is optional: its presence tells a call from a pair's
+    // first request.
+    let expected: Vec<(String, i32, Type, bool)> = DECODE_CALL_FIELDS
+        .iter()
+        .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind, *name == "decode_of"))
+        .collect();
+    assert_eq!(found, expected, "a decode call's field moved");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    let reasons = enum_values(plugin, "Busy.Reason").expect("the reasons are an enum");
+    for (name, number) in DECODE_CALL_REASONS {
+        let reason = ((*name).to_owned(), *number);
+        assert!(reasons.contains(&reason), "{name} moved");
     }
 }
 

@@ -52,7 +52,7 @@ use smg_worker::{
 };
 
 use super::{
-    placement::{select_pair, Pair, PairFailure, PlacementFailure, PlacementInputs},
+    placement::{select_pair, PairFailure, PlacedPair, PlacementFailure, PlacementInputs, Stated},
     prefill_admission::{PrefillAdmission, PrefillAdmissionAttempt, PrefillSelectionContext},
 };
 use crate::{
@@ -285,7 +285,7 @@ impl Bed {
         }
     }
 
-    fn answer(&self, placed: &Result<Pair, Box<PairFailure>>) -> Answer {
+    fn answer(&self, placed: &Result<PlacedPair, Box<PairFailure>>) -> Answer {
         let place = |pool: &[Arc<dyn Worker>], worker: &Arc<dyn Worker>| {
             pool.iter()
                 .position(|w| w.url() == worker.url())
@@ -293,8 +293,8 @@ impl Bed {
         };
         match placed {
             Ok(pair) => Answer::Pair(
-                place(&self.prefills, &pair.prefill),
-                place(&self.decodes, &pair.decode),
+                place(&self.prefills, pair.prefill.worker()),
+                place(&self.decodes, pair.decode.worker()),
             ),
             Err(failure) => Answer::None {
                 role: format!("{:?}", failure.role).to_lowercase(),
@@ -322,6 +322,7 @@ impl Bed {
                 None,
                 None,
                 PlacementInputs::default(),
+                Stated::nothing,
             ));
         };
         let mut answer = None;
@@ -340,10 +341,11 @@ impl Bed {
                     None,
                     Some(capacity),
                     PlacementInputs::default(),
+                    Stated::nothing,
                 );
                 answer = Some(self.answer(&placed));
                 match placed {
-                    Ok(pair) => capacity.select(pair.prefill, ()),
+                    Ok(pair) => capacity.select(pair.prefill.into_worker(), ()),
                     Err(failure)
                         if matches!(failure.verdict, PlacementFailure::PrefillAtCapacity) =>
                     {

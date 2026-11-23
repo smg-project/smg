@@ -712,15 +712,15 @@ fn video_fetch_config(
 }
 
 /// Lowest sampling rate MiniMax-M3 accepts for a video clip.
-pub const MIN_SAMPLE_FPS: f64 = 0.2;
+pub(crate) const MIN_SAMPLE_FPS: f64 = 0.2;
 /// Highest sampling rate MiniMax-M3 accepts for a video clip.
-pub const MAX_SAMPLE_FPS: f64 = 5.0;
+pub(crate) const MAX_SAMPLE_FPS: f64 = 5.0;
 /// Smallest per-frame long-side cap MiniMax-M3 accepts.
-pub const MIN_VIDEO_LONG_SIDE: u32 = 150;
+pub(crate) const MIN_VIDEO_LONG_SIDE: u32 = 150;
 /// Largest per-frame long-side cap MiniMax-M3 accepts.
-pub const MAX_VIDEO_LONG_SIDE: u32 = 3584;
+pub(crate) const MAX_VIDEO_LONG_SIDE: u32 = 3584;
 /// Vision patch factor the per-frame cap must align to.
-pub const VIDEO_LONG_SIDE_FACTOR: u32 = 28;
+pub(crate) const VIDEO_LONG_SIDE_FACTOR: u32 = 28;
 
 /// Reject a sampling rate outside M3's accepted range.
 fn validate_sample_fps(value: f64) -> MultiModalResult<f64> {

@@ -50,6 +50,7 @@ fn internal_binding() -> McpServerBinding {
         server_key: INTERNAL_SERVER.to_string(),
         allowed_tools: None,
         list_error: None,
+        pool_key: None,
     }
 }
 

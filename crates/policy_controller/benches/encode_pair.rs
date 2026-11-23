@@ -29,8 +29,11 @@ use std::hint::black_box;
 use common::{build_view, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
-    Candidate, Constraints, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Identity,
-    MediaCounts, PairPools, PolicySpec, PoolFacts, RequestFacts, Role, Scratch, WorkerId,
+    document::PolicySpec,
+    engine::{
+        Candidate, Constraints, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Identity,
+        MediaCounts, PairPools, PoolFacts, RequestFacts, Role, Scratch, WorkerId,
+    },
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -90,6 +93,7 @@ fn encode_pair(c: &mut Criterion) {
                 facts: &of_encoders,
                 prefill_classes: &prefill_classes,
                 affinity: &[],
+                ..EncodePool::default()
             };
             let pool = PoolFacts {
                 pool_size: prefills.len() as u32,
@@ -210,6 +214,7 @@ fn left_out(c: &mut Criterion) {
                 facts: &of_encoders,
                 prefill_classes: &prefill_classes,
                 affinity: &[],
+                ..EncodePool::default()
             };
             let pool = PoolFacts {
                 pool_size: prefills.len() as u32,

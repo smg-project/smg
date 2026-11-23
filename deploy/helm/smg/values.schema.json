@@ -28,7 +28,8 @@
             "least_load",
             "manual",
             "consistent_hashing",
-            "prefix_hash"
+            "prefix_hash",
+            "bucket"
           ]
         },
         "parser": { "type": "string", "enum": ["", "legacy", "symphony"] },

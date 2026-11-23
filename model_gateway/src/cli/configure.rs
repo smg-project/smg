@@ -1,13 +1,29 @@
 //! Phase 1b to phase 3 of the start-up, on the parsed arguments: the secrets'
 //! sources resolved into the flag fields, the start-up announced, and the
 //! server configuration assembled from the flags (`CliArgs::configure`).
-//! The argument structs stay with `CliArgs` at the crate root, where clap
-//! builds them; this module reads them.
+//! The parent module declares the argument structs that clap builds.
 
 use std::collections::HashMap;
 
 use rand::{distr::Alphanumeric, RngExt};
-use smg::{
+use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
+use smg_mesh::{MTLSConfig, MeshServerConfig};
+use smg_policy_controller::stages::StageRegistry;
+use smg_service_discovery::RuntimeDiscoveryConfig;
+use smg_worker::identity::{
+    basic::{ConnectionMode, RuntimeType},
+    endpoint::Endpoint,
+};
+
+use super::{
+    secrets::{
+        EnvLookup, API_KEY_SETTING, CONTROL_PLANE_API_KEYS_SETTING, POSTGRES_DB_URL_SETTING,
+        REDIS_URL_SETTING, TENANT_API_KEYS_SETTING,
+    },
+    value::parse_role_mapping,
+    Backend, CliArgs, DiscoveryProvider,
+};
+use crate::{
     config::{
         bind_socket_addr,
         secrets::{parse_control_plane_api_key, parse_tenant_api_key},
@@ -30,22 +46,6 @@ use smg::{
     },
     version,
 };
-use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
-use smg_mesh::{MTLSConfig, MeshServerConfig};
-use smg_service_discovery::RuntimeDiscoveryConfig;
-use smg_worker::identity::{
-    basic::{ConnectionMode, RuntimeType},
-    endpoint::Endpoint,
-};
-
-use super::{
-    secrets::{
-        EnvLookup, API_KEY_SETTING, CONTROL_PLANE_API_KEYS_SETTING, POSTGRES_DB_URL_SETTING,
-        REDIS_URL_SETTING, TENANT_API_KEYS_SETTING,
-    },
-    value::parse_role_mapping,
-};
-use crate::{Backend, CliArgs, DiscoveryProvider};
 
 enum OracleConnectSource {
     Dsn { descriptor: String },
@@ -402,6 +402,17 @@ impl CliArgs {
             server_key_path: key.into(),
             ..MTLSConfig::default()
         }))
+    }
+
+    /// Select the main routing policy. A policy document replaces the
+    /// routing flags, so the line names no policy beside one: the
+    /// configuration's default stands in, and the document decides.
+    fn routing_policy(&self) -> PolicyConfig {
+        match self.routing.policy.as_deref() {
+            Some(policy) => self.parse_policy(policy),
+            None if self.routing.policy_spec.is_some() => RouterConfig::default().policy,
+            None => self.parse_policy("cache_aware"),
+        }
     }
 
     /// Build a routing policy with the same per-policy defaults as the CLI flags.
@@ -961,6 +972,7 @@ impl CliArgs {
                     worker_ports_annotation: "smg.ai/worker-ports".to_string(),
                     kv_connector_annotation: self.discovery.kv_connector_annotation.clone(),
                     kv_engine_id_annotation: self.discovery.kv_engine_id_annotation.clone(),
+                    pairing_protocol_label: self.discovery.pairing_protocol_label.clone(),
                     router_selector: Self::parse_label_selector(&self.discovery.router_selector),
                     router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                     model_id_source: self.discovery.model_id_from.clone(),
@@ -1106,14 +1118,15 @@ impl CliArgs {
     }
 
     /// The routing part of the configuration: what a policy document reads,
-    /// and what the validator's routing rules read beside it (the workers'
-    /// discovery, the multi-router mode and the data-parallel setting). A
-    /// start's assembly builds on it and `--print-policy-spec` converts it
-    /// alone, so the two read one routing part. No file is read here.
+    /// the multi-router mode with it, and what the validator's routing rules
+    /// read beside it (the workers' discovery and the data-parallel
+    /// setting). A start's assembly builds on it and `--print-policy-spec`
+    /// converts it alone, so the two read one routing part. No file is read
+    /// here.
     fn routing_part(&self, mode: RoutingMode) -> ConfigResult<RouterConfigBuilder> {
         Ok(RouterConfig::builder()
             .mode(mode)
-            .policy(self.parse_policy(&self.routing.policy))
+            .policy(self.routing_policy())
             .cache_boundaries(self.routing.cache_boundaries.clone())
             .maybe_discovery(self.discovery_config()?)
             .igw(self.routing.enable_igw)
@@ -1226,6 +1239,7 @@ impl CliArgs {
             .job_queue_capacity(self.routing.job_queue_capacity)
             .job_queue_concurrency(self.routing.job_queue_concurrency)
             .load_monitor_interval_secs(self.workers.load_monitor_interval)
+            .load_monitor_interval_ms(self.workers.load_monitor_interval_ms)
             .worker_stall_secs(self.workers.worker_stall_secs)
             .worker_wedge_secs(self.workers.worker_wedge_secs)
             .worker_stale_secs(self.workers.worker_stale_secs)
@@ -1336,6 +1350,8 @@ impl CliArgs {
             .maybe_reasoning_parser(self.model.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.model.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.model.mcp_config_path.as_ref())
+            .policy_controller(self.routing.policy_controller == "on")
+            .maybe_policy_spec_path(self.routing.policy_spec.as_ref())
             .retries(!self.serving.disable_retries)
             .upstream_http2(self.routing.upstream_http2)
             .circuit_breaker(!self.serving.disable_circuit_breaker)
@@ -1462,9 +1478,18 @@ impl CliArgs {
         if self.routing.enable_igw {
             return;
         }
-        println!("Policy: {}", self.routing.policy);
+        println!("{}", self.policy_line());
         for line in self.node_lines(prefill_urls, encode_urls) {
             println!("{line}");
+        }
+    }
+
+    /// The banner's policy line: the document where one decides, else the
+    /// policy the line means.
+    fn policy_line(&self) -> String {
+        match &self.routing.policy_spec {
+            Some(path) => format!("Policy: document {path}"),
+            None => format!("Policy: {}", self.routing_policy().name()),
         }
     }
 
@@ -1536,10 +1561,14 @@ impl CliArgs {
     }
 
     /// The answer of `--print-policy-spec`: the policy document this command
-    /// line means, as YAML, checked as this gateway checks a document where
-    /// it hosts the controller ([`RouterConfig::hosted_policy`]). The routing
-    /// part of the line is read alone ([`Self::routing_config`]). Nothing is
-    /// bound or spawned.
+    /// line means, as YAML, checked as the gateway checks a document it
+    /// hosts ([`RouterConfig::hosted_policy`]), over the stock stages. The
+    /// document is the one the routing flags mean, which names stock
+    /// stages alone: a supplied document is refused beside the print. A
+    /// host's table holds every stock stage beside the host's own, so it
+    /// answers this document as the stock table does. The routing part of
+    /// the line is read alone ([`Self::routing_config`]). Nothing is bound
+    /// or spawned.
     pub(crate) fn policy_spec_print(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -1559,7 +1588,7 @@ impl CliArgs {
         };
         // A document this gateway's check refuses is still the one the flags
         // mean: it prints, with the check's word for what it refuses.
-        match config.hosted_policy(&document) {
+        match config.hosted_policy(&document, &StageRegistry::builtin()) {
             Ok(_) => PolicySpecPrint::Document(yaml),
             Err(refusal) => PolicySpecPrint::DocumentRefused {
                 document: yaml,

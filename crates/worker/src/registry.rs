@@ -19,7 +19,7 @@ use std::{
 use arc_swap::ArcSwap;
 use dashmap::{mapref::entry::Entry, DashMap};
 use rustc_hash::FxBuildHasher;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Notify};
 use uuid::Uuid;
 
 use crate::{
@@ -33,13 +33,14 @@ use crate::{
     metrics::writers::Metrics,
     metrics_labels,
     model_card::ModelCard,
-    registry::event::{WorkerConnected, WorkerEvent},
+    registry::event::{WorkerEvent, WorkerSignal},
     settings::RetryConfig,
     worker::WorkerStatus,
     UNKNOWN_MODEL_ID,
 };
 
 pub mod event;
+mod pool;
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -140,6 +141,15 @@ struct GlobalRoutingSnapshot<G> {
 /// and node maps the same way.
 type ModelIndex<G> = Arc<DashMap<String, Arc<G>, FxBuildHasher>>;
 
+/// Shards of the maps that hold one entry a model and are iterated on
+/// request paths, on any host: the model index
+/// ([`WorkerRegistry::model_count`]) and the per-model retry overrides
+/// ([`WorkerRegistry::any_model_retry_override_enables_retries`]). Iterating
+/// a map costs one lock and one allocation a shard, whether the shard holds
+/// an entry or not: the count must not follow the CPUs the process sees, as
+/// the library's default does (four shards a CPU).
+const MODEL_MAP_SHARDS: usize = 16;
+
 /// Model alias to canonical model ID.
 type ModelAliasIndex = Arc<DashMap<String, Arc<str>, FxBuildHasher>>;
 
@@ -184,8 +194,8 @@ pub struct WorkerRegistry<G> {
     /// once, with the registry.
     empty_generation: Arc<G>,
 
-    /// Monotonic membership generation; bumped on every register / replace /
-    /// remove.
+    /// Membership generation; bumped on every register / replace / remove.
+    /// `usize::MAX` is reserved for the stale snapshot marker.
     global_epoch: AtomicUsize,
 
     /// Orders membership writes against rebuild scans. Mutators hold the
@@ -229,6 +239,11 @@ pub struct WorkerRegistry<G> {
     /// reading it costs one map probe and no worker walk.
     model_overloaded: Arc<DashMap<String, AtomicUsize, FxBuildHasher>>,
 
+    /// Count of workers in each pool group, which the pool-size gauge reads.
+    /// Moved by a delta where a worker enters, is replaced or leaves, with
+    /// the gauge's write in the same hold.
+    pool_sizes: pool::PoolSizes,
+
     /// `--worker-overload-shed`: refuse a request with a 503 when every
     /// candidate is overloaded instead of steering it to the least-loaded
     /// one. Read by every router at its overload decision points.
@@ -266,15 +281,23 @@ pub struct WorkerRegistry<G> {
     event_tx: broadcast::Sender<WorkerEvent>,
 
     /// Sender handed to workers so a completed backend connection can wake
-    /// the manager for immediate promotion (see [`WorkerConnected`]). Lives
-    /// on the registry because workers are built before the manager starts,
-    /// and dynamically-registered workers need it long after.
-    connect_signal_tx: mpsc::UnboundedSender<WorkerConnected>,
+    /// the manager for immediate promotion, and a move of the liveness veto
+    /// reaches the health sink (see [`WorkerSignal`]). Lives on the registry
+    /// because workers are built before the manager starts, and
+    /// dynamically-registered workers need it long after.
+    connect_signal_tx: mpsc::UnboundedSender<WorkerSignal>,
 
-    /// Receiver drained by the manager's health loop. Taken once via
-    /// [`Self::take_connect_signal_receiver`]; `None` thereafter (and when
-    /// no manager runs, e.g. health checks globally disabled).
-    connect_signal_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<WorkerConnected>>>,
+    /// Receiver drained by the manager's health loop. One loop holds it at
+    /// a time: [`Self::take_connect_signal_receiver`] hands it out, and the
+    /// loop hands it back at its end
+    /// ([`Self::return_connect_signal_receiver`]). It waits here while no
+    /// loop runs: health checks globally disabled, or between two loops of
+    /// a host that starts one for each term of its lead.
+    connect_signal_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<WorkerSignal>>>,
+
+    /// Wakes a loop that started while another held the receiver: told each
+    /// time the receiver comes back.
+    connect_signal_home: Notify,
 
     /// What makes the engine connection of a worker this registry builds
     /// from a peer's published state (see [`Self::with_engine_connector`]).
@@ -298,7 +321,10 @@ impl<G: Generation> WorkerRegistry<G> {
         let empty_generation = Arc::new(G::of(Arc::from(Self::EMPTY_WORKERS)));
         Self {
             workers: Arc::new(DashMap::new()),
-            model_index: Arc::new(DashMap::with_hasher(FxBuildHasher)),
+            model_index: Arc::new(DashMap::with_hasher_and_shard_amount(
+                FxBuildHasher,
+                MODEL_MAP_SHARDS,
+            )),
             global_routing_snapshot: ArcSwap::from_pointee(GlobalRoutingSnapshot {
                 epoch: 0,
                 snapshot: Arc::clone(&empty_generation),
@@ -315,9 +341,13 @@ impl<G: Generation> WorkerRegistry<G> {
             url_to_id: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             worker_mutation_locks: Arc::new(DashMap::new()),
             model_overloaded: Arc::new(DashMap::with_hasher(FxBuildHasher)),
+            pool_sizes: pool::PoolSizes::default(),
             overload_shed: Arc::new(AtomicBool::new(false)),
             overload_transitions: Arc::new(parking_lot::Mutex::new(())),
-            model_retry_configs: Arc::new(DashMap::with_hasher(FxBuildHasher)),
+            model_retry_configs: Arc::new(DashMap::with_hasher_and_shard_amount(
+                FxBuildHasher,
+                MODEL_MAP_SHARDS,
+            )),
             worker_origins: Arc::new(DashMap::new()),
             import_records: Arc::new(DashMap::new()),
             // Sized for fleet-scale bursts (startup registration, probe
@@ -327,6 +357,7 @@ impl<G: Generation> WorkerRegistry<G> {
             event_tx: broadcast::Sender::new(1024),
             connect_signal_tx,
             connect_signal_rx: parking_lot::Mutex::new(Some(connect_signal_rx)),
+            connect_signal_home: Notify::new(),
             engine_connector: None,
         }
     }
@@ -390,22 +421,48 @@ impl<G: Generation> WorkerRegistry<G> {
         self.event_tx.subscribe()
     }
 
-    /// Clone the connect-signal sender for a worker to fire once its backend
-    /// connection completes. See [`WorkerConnected`]. Holds no locks.
-    pub fn connect_signal_sender(&self) -> mpsc::UnboundedSender<WorkerConnected> {
+    /// Clone the signal sender for a worker. It says there that its backend
+    /// connection completed, and that its liveness veto moved. See
+    /// [`WorkerSignal`]. Holds no locks.
+    pub fn connect_signal_sender(&self) -> mpsc::UnboundedSender<WorkerSignal> {
         self.connect_signal_tx.clone()
     }
 
-    /// Take the connect-signal receiver. Returns `Some` exactly once (the
-    /// manager takes it at startup); `None` on any later call. Holds the
-    /// receiver lock briefly.
-    pub fn take_connect_signal_receiver(&self) -> Option<mpsc::UnboundedReceiver<WorkerConnected>> {
+    /// Take the connect-signal receiver: `Some` for the one loop that holds
+    /// it, `None` while another does. A loop hands it back at its end
+    /// ([`Self::return_connect_signal_receiver`]), and the next take gets it
+    /// with every signal sent meanwhile. The take is the crate's, as the
+    /// hand-back is: a taker that could not hand it back would leave every
+    /// later loop without signals. Holds the receiver lock briefly.
+    pub(crate) fn take_connect_signal_receiver(
+        &self,
+    ) -> Option<mpsc::UnboundedReceiver<WorkerSignal>> {
         self.connect_signal_rx.lock().take()
+    }
+
+    /// Hand the connect-signal receiver back, at the end of the loop that
+    /// took it, and wake a loop that waits for it
+    /// ([`Self::connect_signal_receiver_returned`]). Holds the receiver lock
+    /// briefly.
+    pub(crate) fn return_connect_signal_receiver(
+        &self,
+        receiver: mpsc::UnboundedReceiver<WorkerSignal>,
+    ) {
+        *self.connect_signal_rx.lock() = Some(receiver);
+        self.connect_signal_home.notify_one();
+    }
+
+    /// Resolves once the receiver was handed back. A loop that started
+    /// without it awaits this, then takes. A hand-back nobody awaited is
+    /// kept for the next await, so a loop that takes nothing on waking
+    /// awaits again.
+    pub(crate) async fn connect_signal_receiver_returned(&self) {
+        self.connect_signal_home.notified().await;
     }
 
     /// True if any registered worker is Pending and depends on the connect
     /// signal (rather than health polling) to reach Ready. Such a worker is
-    /// promoted only by the manager consuming [`WorkerConnected`], so the
+    /// promoted only by the manager consuming [`WorkerSignal::Connected`], so the
     /// manager must run even when health checks are otherwise disabled.
     pub fn has_workers_awaiting_connect_signal(&self) -> bool {
         self.get_by_connection(ConnectionMode::Zmq)
@@ -1230,8 +1287,10 @@ impl<G: Generation> WorkerRegistry<G> {
     /// worker on this node, so the worker must be published to the mesh and
     /// must not be deleted by a peer tombstone.
     ///
-    /// Used by `PUT /workers/{worker_id}`, which answers 202 and registers
-    /// later, so other writes for the same URL can land in between. Both
+    /// Used by a metadata update of `/workers/{worker_id}`, which answers 202
+    /// and registers later, so other writes for the same URL can land in
+    /// between (a `PUT` goes through
+    /// [`Self::replace_claiming_local_unless_draining`]). Both
     /// preconditions are checked under the per-worker mutation lock and the
     /// call returns `false` if either fails:
     ///
@@ -1251,7 +1310,33 @@ impl<G: Generation> WorkerRegistry<G> {
             worker_id,
             new_worker,
             Some(WorkerOrigin::Local),
-            Some(expected_revision),
+            Some(Expected {
+                revision: expected_revision,
+                refuse_draining: false,
+            }),
+            None,
+        )
+    }
+
+    /// [`Self::replace_claiming_local`] for `PUT /workers/{worker_id}`: it
+    /// also returns `false` when the worker reads `Draining`, checked under
+    /// the same lock. A removal's mark leaves the revision as it is, so a
+    /// `PUT` answered before the mark would otherwise write its replacement
+    /// onto a worker that is leaving.
+    pub fn replace_claiming_local_unless_draining(
+        &self,
+        worker_id: &WorkerId,
+        new_worker: Arc<dyn Worker>,
+        expected_revision: u64,
+    ) -> bool {
+        self.replace_inner(
+            worker_id,
+            new_worker,
+            Some(WorkerOrigin::Local),
+            Some(Expected {
+                revision: expected_revision,
+                refuse_draining: true,
+            }),
             None,
         )
     }
@@ -1268,13 +1353,15 @@ impl<G: Generation> WorkerRegistry<G> {
     /// the replacement, as a removal does for `remove_inner`; a replacement
     /// without a usable spec keeps an import built from one), and the record
     /// is written before the lock is released, so the compare and the write
-    /// are one step.
+    /// are one step. `expected` is what the caller asks of the worker it
+    /// replaces ([`Expected`]), tested under the same lock: a miss aborts
+    /// the replacement.
     fn replace_inner(
         &self,
         worker_id: &WorkerId,
         new_worker: Arc<dyn Worker>,
         promote_origin: Option<WorkerOrigin>,
-        expected_revision: Option<u64>,
+        expected: Option<Expected>,
         import: Option<ImportRecord>,
     ) -> bool {
         // Serialize concurrent replacements for the same worker ID.
@@ -1288,19 +1375,29 @@ impl<G: Generation> WorkerRegistry<G> {
 
         if let Some(record) = import {
             if !self.import_rebuild_wanted(worker_id, record) {
+                drop(_guard);
+                self.forget_lock_of_missing(worker_id, lock);
                 return false;
             }
         }
 
         let old_worker = match self.workers.get(worker_id) {
             Some(entry) => entry.clone(),
-            None => return false,
+            None => {
+                drop(_guard);
+                self.forget_lock_of_missing(worker_id, lock);
+                return false;
+            }
         };
 
         // Each replacement bumps the revision (see `inherit_shared_state_from`
         // below), so a caller that captured the revision before it started can
         // detect that another replacement landed first and give up.
-        if let Some(expected) = expected_revision {
+        if let Some(Expected {
+            revision: expected,
+            refuse_draining,
+        }) = expected
+        {
             let current = old_worker.revision();
             if current != expected {
                 tracing::warn!(
@@ -1312,9 +1409,18 @@ impl<G: Generation> WorkerRegistry<G> {
                 );
                 return false;
             }
+            // Under the lock the removal's drain writes its mark under.
+            if refuse_draining && old_worker.status() == WorkerStatus::Draining {
+                tracing::warn!(
+                    worker_id = %worker_id.as_str(),
+                    worker_url = old_worker.redacted_url(),
+                    "Aborting replacement: a removal is draining the worker"
+                );
+                return false;
+            }
         }
 
-        let old_models: HashSet<String> = worker_model_ids(&old_worker).into_iter().collect();
+        let old_models: HashSet<String> = self.models_left_by(&old_worker).into_iter().collect();
         let new_models: HashSet<String> = worker_model_ids(&new_worker).into_iter().collect();
 
         // URL changes are not supported via replace — use remove + register instead
@@ -1354,14 +1460,25 @@ impl<G: Generation> WorkerRegistry<G> {
         // they go: the series store keeps its witness, so a later removal of
         // the URL drops those writes until the old instance is gone too.
         Metrics::worker_replaced(old_worker.url(), Arc::downgrade(&old_worker));
+        // A replacement of another type, mode or primary model leaves one
+        // pool group and joins another, in this one step.
+        self.pool_sizes
+            .replaced(old_worker.as_ref(), new_worker.as_ref());
+
+        // The replacement's series are its own from here: its HTTP/2 flag,
+        // and the breaker it ends with, the adopted one or one of its own.
+        // Its build wrote none, so a replacement that never got here left
+        // the old worker's series as they stood.
+        new_worker.publish_series();
 
         // The replacement owns its handshake driver. Release any binds the
         // retired instance still holds while waiting for the engine.
         old_worker.abort_background_tasks();
 
         // Diff model indexes: remove stale, add new.
+        let mut emptied = Vec::new();
         for removed_model in old_models.difference(&new_models) {
-            self.remove_worker_from_model_index(removed_model, old_worker.url());
+            self.remove_worker_from_model_index(removed_model, &old_worker);
             // Mirror `remove()`: drop any per-model retry override when
             // the replacement leaves the model with no workers. Without
             // this, `get_retry_config()` would keep returning a stale
@@ -1372,6 +1489,7 @@ impl<G: Generation> WorkerRegistry<G> {
                 .is_none_or(|workers| workers.members().is_empty());
             if model_empty {
                 self.model_retry_configs.remove(removed_model);
+                emptied.push(removed_model.clone());
             }
         }
         for added_model in new_models.difference(&old_models) {
@@ -1385,10 +1503,8 @@ impl<G: Generation> WorkerRegistry<G> {
 
         // Update aliases after canonical indexes so alias removal can inspect
         // the final worker set for each canonical model.
-        for model in old_worker.models() {
-            for alias in model.aliases {
-                self.remove_model_alias_if_unused(&alias, &model.id);
-            }
+        for (alias, canonical_id) in self.aliases_left_by(&old_worker, &emptied) {
+            self.remove_model_alias_if_unused(&alias, &canonical_id);
         }
         for model in new_worker.models() {
             for alias in model.aliases {
@@ -1576,7 +1692,11 @@ impl<G: Generation> WorkerRegistry<G> {
 
         let _guard = lock.lock();
 
-        let worker = self.workers.get(worker_id)?.clone();
+        let Some(worker) = self.workers.get(worker_id).map(|entry| entry.clone()) else {
+            drop(_guard);
+            self.forget_lock_of_missing(worker_id, lock);
+            return None;
+        };
         if expected_revision.is_some_and(|revision| worker.revision() != revision) {
             return None;
         }
@@ -1650,17 +1770,7 @@ impl<G: Generation> WorkerRegistry<G> {
         // Stored before the publish: a snapshot published from here on reads
         // the new cards.
         worker.set_models(models);
-        let holding: Vec<String> = self
-            .model_index
-            .iter()
-            .filter(|entry| {
-                entry
-                    .members()
-                    .iter()
-                    .any(|member| Arc::ptr_eq(member, worker))
-            })
-            .map(|entry| entry.key().clone())
-            .collect();
+        let holding = self.indexed_under(worker);
         // As in add_worker_to_model_index: a replaced snapshot drops after
         // its shard guard, not under it.
         let mut previous = Vec::with_capacity(holding.len());
@@ -1674,6 +1784,80 @@ impl<G: Generation> WorkerRegistry<G> {
         let _order = self.global_membership_order.read();
         self.bump_global_routing_epoch();
         true
+    }
+
+    /// The models whose index entry holds `worker`, by its handle.
+    ///
+    /// The index is written from a worker's model list as it registers or
+    /// takes another's place, and a refresh of the list leaves the index as
+    /// it is ([`Self::refresh_models`]). So the entries that hold a worker
+    /// are read from the index, and not from its list of the minute.
+    fn indexed_under(&self, worker: &Arc<dyn Worker>) -> Vec<String> {
+        self.model_index
+            .iter()
+            .filter(|entry| {
+                entry
+                    .members()
+                    .iter()
+                    .any(|member| Arc::ptr_eq(member, worker))
+            })
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
+    /// The models a removal or a replacement takes `worker` out of: the ones
+    /// it lists now, and every one whose index entry still holds it. A
+    /// refresh of its list can leave out a model the index keeps, and the
+    /// lookup by that model would hand the worker out past its removal.
+    fn models_left_by(&self, worker: &Arc<dyn Worker>) -> Vec<String> {
+        let mut model_ids = worker_model_ids(worker);
+        for held in self.indexed_under(worker) {
+            if !model_ids.contains(&held) {
+                model_ids.push(held);
+            }
+        }
+        model_ids
+    }
+
+    /// The aliases that resolve to one of `model_ids`, each with its model,
+    /// read from the alias index: an alias can outlive the card that
+    /// declared it, where a refresh dropped the card.
+    fn aliases_of(&self, model_ids: &[String]) -> Vec<(String, String)> {
+        self.model_alias_index
+            .iter()
+            .filter(|entry| {
+                model_ids
+                    .iter()
+                    .any(|id| id.as_str() == entry.value().as_ref())
+            })
+            .map(|entry| (entry.key().clone(), entry.value().to_string()))
+            .collect()
+    }
+
+    /// The aliases a removal or a replacement asks after: the ones the
+    /// cards of `worker` declare, and every alias of a model the write
+    /// `emptied`.
+    ///
+    /// The second part is read from the alias index, since a refresh can
+    /// drop the card that declared an alias. It reads the emptied models
+    /// alone. A refresh writes cards with no alias, so where peers still
+    /// serve a model, their cards of the minute cannot tell an alias they
+    /// registered from a stale one, and the alias stays.
+    fn aliases_left_by(
+        &self,
+        worker: &Arc<dyn Worker>,
+        emptied: &[String],
+    ) -> Vec<(String, String)> {
+        let mut aliases = self.aliases_of(emptied);
+        for model in worker.models() {
+            aliases.extend(
+                model
+                    .aliases
+                    .into_iter()
+                    .map(|alias| (alias, model.id.clone())),
+            );
+        }
+        aliases
     }
 
     /// Reserve (or retrieve) a stable UUID for a worker URL.
@@ -1758,6 +1942,8 @@ impl<G: Generation> WorkerRegistry<G> {
                 .get(worker_id)
                 .map(|entry| condition(entry.value()));
             if holds != Some(true) {
+                drop(_guard);
+                self.forget_lock_of_missing(worker_id, lock);
                 return None;
             }
         }
@@ -1768,6 +1954,8 @@ impl<G: Generation> WorkerRegistry<G> {
                     worker_id = %worker_id.as_str(),
                     "Aborting removal: worker origin changed before the lock was acquired"
                 );
+                drop(_guard);
+                self.forget_lock_of_missing(worker_id, lock);
                 return None;
             }
         }
@@ -1799,14 +1987,17 @@ impl<G: Generation> WorkerRegistry<G> {
             // registration of the same URL cannot slip in between and have its
             // fresh series retired under it.
             Metrics::remove_worker_metrics(worker.url(), Arc::downgrade(&worker));
+            // Its pool group gives it up in the same step.
+            self.pool_sizes.left(worker.as_ref());
             self.url_to_id.remove(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
             self.worker_origins.remove(worker_id);
             self.import_records.remove(worker_id);
 
-            for model_id in worker_model_ids(&worker) {
-                self.remove_worker_from_model_index(&model_id, worker.url());
+            let mut emptied = Vec::new();
+            for model_id in self.models_left_by(&worker) {
+                self.remove_worker_from_model_index(&model_id, &worker);
                 // Drop the per-model retry config when the last worker leaves.
                 let model_empty = self
                     .model_index
@@ -1814,12 +2005,11 @@ impl<G: Generation> WorkerRegistry<G> {
                     .is_none_or(|w| w.members().is_empty());
                 if model_empty {
                     self.model_retry_configs.remove(&model_id);
+                    emptied.push(model_id);
                 }
             }
-            for model in worker.models() {
-                for alias in model.aliases {
-                    self.remove_model_alias_if_unused(&alias, &model.id);
-                }
+            for (alias, canonical_id) in self.aliases_left_by(&worker, &emptied) {
+                self.remove_model_alias_if_unused(&alias, &canonical_id);
             }
             if let Some(mut type_workers) = self.type_workers.get_mut(worker.worker_type()) {
                 type_workers.retain(|id| id != worker_id);
@@ -1846,8 +2036,27 @@ impl<G: Generation> WorkerRegistry<G> {
 
             Some(worker)
         } else {
+            drop(_guard);
+            self.forget_lock_of_missing(worker_id, lock);
             None
         }
+    }
+
+    /// Gives up `lock`, the mutation lock of `worker_id` that a call has
+    /// released, and takes its entry out of the map when no worker stands
+    /// under the id and no other call holds it. Only the removal that finds
+    /// a worker drops its entry, so one a later call makes would stay.
+    fn forget_lock_of_missing(&self, worker_id: &WorkerId, lock: Arc<parking_lot::Mutex<()>>) {
+        // Dropped first: of several late calls the last one out then finds
+        // the map's reference alone.
+        drop(lock);
+        if self.workers.contains_key(worker_id) {
+            return;
+        }
+        // References are made under the map's entry lock only, so the map's
+        // alone means no call holds this lock or waits on it.
+        self.worker_mutation_locks
+            .remove_if(worker_id, |_, current| Arc::strong_count(current) == 1);
     }
 
     /// Remove a worker by URL.
@@ -2037,15 +2246,13 @@ impl<G: Generation> WorkerRegistry<G> {
         }
 
         // The worker's series are kept for the time its address is
-        // registered (see `metrics::series`). The builder's
-        // writes for health, HTTP/2 and breaker state preceded this
-        // registration and were dropped if the address was retired by an
-        // earlier removal, so they are repeated here.
+        // registered (see `metrics::series`), and building a worker writes
+        // none of them: they start here, where the worker enters.
         Metrics::worker_registered(worker.url());
-        Metrics::set_worker_health(worker.url(), worker.is_healthy());
-        Metrics::set_worker_http2(worker.url(), worker.http2());
-        Metrics::set_worker_cb_state(worker.url(), worker.circuit_breaker_state().as_int());
+        worker.publish_series();
         worker.republish_state();
+        // Its pool group counts it from here.
+        self.pool_sizes.entered(worker.as_ref());
 
         // The worker's request counter starts at zero with its registration,
         // so a worker that gets no traffic shows as such.
@@ -2127,7 +2334,15 @@ impl<G: Generation> WorkerRegistry<G> {
     /// worker-map mutation and this bump, so the rebuild scan cannot observe
     /// a half-applied write.
     fn bump_global_routing_epoch(&self) {
-        self.global_epoch.fetch_add(1, Ordering::Release);
+        self.global_epoch
+            .update(Ordering::Release, Ordering::Relaxed, |epoch| {
+                let next = epoch.wrapping_add(1);
+                if next == usize::MAX {
+                    0
+                } else {
+                    next
+                }
+            });
         let previous = self
             .global_routing_snapshot
             .swap(Arc::new(GlobalRoutingSnapshot {
@@ -2184,9 +2399,13 @@ impl<G: Generation> WorkerRegistry<G> {
         fresh
     }
 
-    /// Drop `worker_url` from the copy-on-write model index slice for
-    /// `model_id`. Evicts the whole model entry when empty.
-    fn remove_worker_from_model_index(&self, model_id: &str, worker_url: &str) {
+    /// Drop `worker` from the copy-on-write model index slice for
+    /// `model_id`, by its handle. Evicts the whole model entry when empty.
+    ///
+    /// By handle and not by URL: a removal frees its URL ahead of its walk
+    /// of the index, so a registration of the same URL can stand in the
+    /// slice already, and it keeps its place.
+    fn remove_worker_from_model_index(&self, model_id: &str, worker: &Arc<dyn Worker>) {
         let mut should_remove_entry = false;
         // As in add_worker_to_model_index: the replaced snapshot drops after
         // the shard guard, not under it.
@@ -2196,7 +2415,7 @@ impl<G: Generation> WorkerRegistry<G> {
             let new_workers: Vec<Arc<dyn Worker>> = entry
                 .members()
                 .iter()
-                .filter(|w| w.url() != worker_url)
+                .filter(|w| !Arc::ptr_eq(w, worker))
                 .cloned()
                 .collect();
 
@@ -2450,6 +2669,15 @@ impl<G: Generation> Default for WorkerRegistry<G> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// What a replacement asks of the worker it replaces, tested under the
+/// worker's mutation lock.
+struct Expected {
+    /// The revision the caller read: it moves when another replacement lands.
+    revision: u64,
+    /// Whether a worker that reads `Draining` is refused too (a `PUT`).
+    refuse_draining: bool,
 }
 
 /// What a mesh import was last built from: its owner's publication

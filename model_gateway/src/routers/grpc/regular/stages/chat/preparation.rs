@@ -112,9 +112,9 @@ pub(crate) async fn prepare_chat_like(
 
         // The media-part order and, for a request with media, the plan and
         // the placeholder tokens, resolved from the registries as the
-        // Messages stage resolves them (`utils::resolve_media`).
+        // Messages stage resolves them (`multimodal::resolve_media`).
         let model_id = ctx.input.model_id.as_str();
-        let media = utils::resolve_media(
+        let media = multimodal::resolve_media(
             &ctx.components,
             model_id,
             &*tokenizer,
@@ -148,14 +148,17 @@ pub(crate) async fn prepare_chat_like(
                     // client's to fix: one WARN with the cause, the answer
                     // marked reported. Every other failure (a tokenizer with
                     // no chat template, a render the template did not refuse
-                    // itself) keeps ERROR and stays unmarked.
+                    // itself) keeps ERROR and stays unmarked; among them the
+                    // failure that is the template's own whatever the request
+                    // holds is answered in the server's class
+                    // (`PromptError::answer`).
                     let refused = e.is_refusal();
                     if refused {
                         warn!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
                     } else {
                         error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
                     }
-                    let answer = error::bad_request("process_messages_failed", String::from(e));
+                    let answer = e.answer();
                     return Err(if refused {
                         utils::reported(answer)
                     } else {

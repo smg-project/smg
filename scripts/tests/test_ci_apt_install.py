@@ -12,6 +12,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO / "scripts"
 
@@ -362,3 +364,146 @@ def test_every_archive_install_of_ci_goes_through_the_helper() -> None:
             and line.strip() not in KEPT.get(name, set())
         ]
     assert bare == []
+
+
+def test_strict_mirror_failure_never_refreshes_or_installs(tmp_path: Path) -> None:
+    bed = Bed(tmp_path)
+    (bed.scripts / "ci_apt_mirror.sh").write_text(
+        '#!/bin/bash\necho "$*" >> "$MIRROR_CALLS"\nexit 71\n'
+    )
+    result = bed.install("--strict-mirror", "sudo", "-y", "pkg")
+    assert result.returncode == 71, result.stderr
+    assert bed.lines("mirror_calls") == ["", "--reprobe", "--reprobe"]
+    assert bed.lines("update_calls") == []
+    assert bed.lines("install_calls") == []
+    assert bed.lines("sleeps") == ["10", "20"]
+
+
+def test_default_mirror_failure_still_uses_existing_sources(tmp_path: Path) -> None:
+    bed = Bed(tmp_path)
+    (bed.scripts / "ci_apt_mirror.sh").write_text(
+        '#!/bin/bash\necho "$*" >> "$MIRROR_CALLS"\nexit 71\n'
+    )
+    result = bed.install("sudo", "-y", "pkg")
+    assert result.returncode == 0, result.stderr
+    assert "mirror probe failed" in result.stderr
+    assert bed.lines("update_calls") == ["sudo"]
+    assert bed.lines("install_calls") == ["install -y pkg"]
+
+
+def test_strict_mirror_still_requires_packages(tmp_path: Path) -> None:
+    bed = Bed(tmp_path)
+    for arguments in (("--strict-mirror",), ("--strict-mirror", "sudo")):
+        result = bed.install(*arguments)
+        assert result.returncode == 2
+    assert bed.lines("mirror_calls") == []
+    assert bed.lines("install_calls") == []
+
+
+def mirror_bed(root: Path) -> Bed:
+    """The real mirror selector over private sources, with only curl replaced."""
+    bed = Bed(root)
+    shutil.copy(SCRIPTS / "ci_apt_mirror.sh", bed.scripts)
+    for name in ("head", "tee", "cmp", "chmod", "mv"):
+        real = shutil.which(name)
+        assert real is not None, name
+        os.symlink(real, bed.bin / name)
+    (root / "etc-apt" / "apt.conf.d").mkdir(parents=True)
+    (root / "etc-apt" / "sources.list.d").mkdir()
+    (root / "os-release").write_text("ID=ubuntu\nVERSION_CODENAME=noble\n")
+    curl = bed.bin / "curl"
+    curl.write_text('#!/bin/bash\nprintf \'%s\\n\' "${!#}" >> "$MIRROR_PROBE_LOG"\n')
+    curl.chmod(0o755)
+    return bed
+
+
+def run_mirror(bed: Bed, mirrors: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+    return bed.run(
+        "bash",
+        "scripts/ci_apt_mirror.sh",
+        *arguments,
+        CI_OS_RELEASE=str(bed.root / "os-release"),
+        CI_APT_MIRRORS=mirrors,
+        MIRROR_PROBE_LOG=str(bed.root / "mirror_probes"),
+    )
+
+
+@pytest.mark.parametrize("field", ["URIs:", "URIs: ", "uRiS:\t"])
+def test_deb822_uri_values_preserve_field_spacing_and_unmanaged_urls(
+    tmp_path: Path, field: str
+) -> None:
+    bed = mirror_bed(tmp_path)
+    main = "http://archive.ubuntu.com/ubuntu/"
+    security = "https://security.ubuntu.com/ubuntu/"
+    chosen = "http://azure.archive.ubuntu.com/ubuntu"
+    unrelated = "https://mirror.example/a.[x]+(repo)&extras/"
+    ports = "http://ports.ubuntu.com/ubuntu-ports"
+    source = tmp_path / "etc-apt" / "sources.list.d" / "ubuntu.sources"
+    original = (
+        f"Types: deb\n{field}{main}\t {unrelated}  {ports}\t{security} \n"
+        "Suites: noble noble-security\nComponents: main\n"
+    )
+    source.write_text(original)
+    result = run_mirror(bed, chosen)
+    assert result.returncode == 0, result.stderr
+    assert source.read_text() == original.replace(main, chosen + "/").replace(
+        security, chosen + "/"
+    ), result.stdout
+    assert bed.lines("install_calls") == []
+    assert bed.lines("update_calls") == []
+
+
+@pytest.mark.parametrize(
+    "current,alternate",
+    [
+        (
+            "http://azure.archive.ubuntu.com/ubuntu/",
+            "http://eu-frankfurt-1.clouds.archive.ubuntu.com/ubuntu/",
+        ),
+        ("https://mirror.example/a.[x]+(repo)/", "https://backup.example/repo&extras/"),
+    ],
+)
+def test_trailing_slash_mirrors_rewrite_then_reprobe_to_another_origin(
+    tmp_path: Path, current: str, alternate: str
+) -> None:
+    bed = mirror_bed(tmp_path)
+    main = "http://archive.ubuntu.com/ubuntu/"
+    security = "http://security.ubuntu.com/ubuntu/"
+    legacy = tmp_path / "etc-apt" / "sources.list"
+    deb822 = tmp_path / "etc-apt" / "sources.list.d" / "ubuntu.sources"
+    unrelated = tmp_path / "etc-apt" / "sources.list.d" / "unrelated.list"
+    legacy_original = f"deb {main} noble main\ndeb {security} noble-security main\n"
+    deb822_original = f"Types: deb\nURIs: {main}\t{security}\nSuites: noble noble-security\n"
+    untouched = (
+        "deb http://ports.ubuntu.com/ubuntu-ports noble main\n"
+        "deb https://mirror.example/aZxrepo/ noble main\n"
+    )
+    legacy.write_text(legacy_original)
+    deb822.write_text(deb822_original)
+    unrelated.write_text(untouched)
+    mirrors = current + " " + alternate
+    first = run_mirror(bed, mirrors)
+    assert first.returncode == 0, first.stderr
+    first_sources = (legacy.read_text(), deb822.read_text())
+    first_marker = (tmp_path / "etc-apt" / "apt.conf.d" / "99-ci-mirror").read_text()
+    (tmp_path / "mirror_probes").write_text("")
+    second = run_mirror(bed, mirrors, "--reprobe")
+    assert second.returncode == 0, second.stderr
+    expected_first = tuple(
+        text.replace(main, current).replace(security, current)
+        for text in (legacy_original, deb822_original)
+    )
+    assert first_sources == expected_first, (first.stdout, second.stdout)
+    assert (legacy.read_text(), deb822.read_text()) == tuple(
+        text.replace(main, alternate).replace(security, alternate)
+        for text in (legacy_original, deb822_original)
+    ), second.stdout
+    assert f"mirror={current}" in first_marker
+    assert (
+        f"mirror={alternate}" in (tmp_path / "etc-apt" / "apt.conf.d" / "99-ci-mirror").read_text()
+    )
+    assert unrelated.read_text() == untouched
+    probes = bed.lines("mirror_probes")
+    assert len(probes) == 2 and all(url.startswith(alternate) for url in probes)
+    assert bed.lines("install_calls") == []
+    assert bed.lines("update_calls") == []

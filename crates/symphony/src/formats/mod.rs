@@ -1,6 +1,6 @@
 //! The formats: how each model family writes reasoning and tool calls, each a [`Format`] table
 //! the [`Engine`] runs. One module per table, named after the family that writes it; the README's
-//! models table, written by `tests/readme.rs` from the registry, lists every checkpoint each table
+//! models table, held to the registry by `tests/readme.rs`, lists every checkpoint each table
 //! reads, and `docs/tables.md` holds the notes on each table: what its template writes, what the
 //! table decides beyond the others, and what it leaves open.
 //!
@@ -13,6 +13,7 @@
 
 use crate::shape::{Layout, Message};
 
+pub mod command;
 pub mod deepseek_v3;
 pub mod deepseek_v3_1;
 pub mod deepseek_v3_2;
@@ -24,6 +25,7 @@ pub mod function_gemma;
 pub mod gemma4;
 pub mod glm;
 pub mod glm4;
+pub mod gpt_oss;
 pub mod hy4;
 pub mod hy_v3;
 pub mod inkling;
@@ -52,6 +54,7 @@ pub mod registry;
 pub mod seed_oss;
 pub mod xlam;
 
+pub use command::command;
 pub use deepseek_v3::deepseek_v3;
 pub use deepseek_v3_1::deepseek_v3_1;
 pub use deepseek_v3_2::deepseek_v3_2;
@@ -63,6 +66,7 @@ pub use function_gemma::function_gemma;
 pub use gemma4::gemma4;
 pub use glm::glm;
 pub use glm4::glm4;
+pub use gpt_oss::gpt_oss;
 pub use hy4::hy4;
 pub use hy_v3::hy_v3;
 pub use inkling::inkling;
@@ -70,7 +74,7 @@ pub use inkling2::inkling2;
 pub use iquest::iquest;
 pub use json::json;
 pub use k2_horizon::k2_horizon;
-pub use kimi_k2::kimi_k2;
+pub use kimi_k2::{kimi, kimi_k2};
 pub use kimi_k3::kimi_k3;
 pub use lfm2_5::lfm2_5;
 pub use ling::ling;
