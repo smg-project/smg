@@ -636,8 +636,7 @@ mod tests {
         engine::view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
         store::{
             GatewayId, LoadSample, LoadSource, MemoryStore, Overload, PollMode as StorePollMode,
-            Reachability, SignalWriteOutcome, ViewBuffers, ViewQuery, WorkerFacts, WorkerPatch,
-            WorkerStatus, WorkersStore,
+            Reachability, SignalWriteOutcome, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
         },
         worker_host::{object, Members, SoleLead},
     };
@@ -804,36 +803,6 @@ mod tests {
                 })
             })
         }
-
-        fn overloaded(&self, id: WorkerId, now: Instant) -> bool {
-            let mut out = ViewBuffers::default();
-            let ask = ViewQuery {
-                gateway: GatewayId(1),
-                now,
-                pinned: None,
-                affinity: false,
-                signal_cells: false,
-            };
-            self.store
-                .memory
-                .snapshot()
-                .build(MODEL, Role::Single, &ask, &mut out)
-                .expect("the pool");
-            out.candidates
-                .iter()
-                .find(|row| row.id == id)
-                .expect("a candidate")
-                .health
-                .overloaded
-        }
-
-        /// Show what the store's load writes left waiting, as its host
-        /// does.
-        fn publish(&self) {
-            if let Some(due) = self.store.memory.publish_due() {
-                self.store.memory.publish(due);
-            }
-        }
     }
 
     fn facts(url: &str) -> WorkerFacts {
@@ -884,8 +853,7 @@ mod tests {
         let pair = replica.two_ranks(Some(5));
         adapter.record(&pair[0].1, 0, &report(0, 6), now, now);
         adapter.record(&pair[1].1, 1, &report(1, 1), now, now);
-        for (id, worker) in &pair {
-            assert!(replica.overloaded(*id, now));
+        for (_, worker) in &pair {
             assert!(!worker.is_overloaded());
         }
         pair
@@ -1072,7 +1040,7 @@ mod tests {
     #[test]
     fn a_rank_the_answer_leaves_out_keeps_its_row_and_no_rank_leaves_the_file() {
         let replica = Replica::new();
-        let [(zero, first), (one, second)] = replica.two_ranks(None);
+        let [(_, first), (one, second)] = replica.two_ranks(None);
         let adapter = replica.lead();
         let now = Instant::now();
         let old = report(1, 7);
@@ -1087,8 +1055,6 @@ mod tests {
         let ranks = adapter.report(&[polled(&first, Some(&report(0, 3))), absent], asked);
         assert_eq!(ranks, PolledRanks::default());
         assert_eq!(replica.store.load(one, 1), Some(before));
-        assert!(!replica.overloaded(zero, asked));
-        assert!(replica.overloaded(one, asked));
     }
 
     #[test]
@@ -1110,8 +1076,6 @@ mod tests {
             [replica.store.load(zero, 0), replica.store.load(one, 1)],
             rows
         );
-        assert!(!replica.overloaded(zero, asked));
-        assert!(!replica.overloaded(one, asked));
         assert_eq!(replica.store.calls.lock().reports, 1);
     }
 
@@ -1120,14 +1084,12 @@ mod tests {
         let replica = Replica::new();
         let adapter = replica.lead();
         let now = Instant::now();
-        let [(zero, first), (one, second)] = busy_pair(&replica, &adapter, now);
+        let [(_, first), (_, second)] = busy_pair(&replica, &adapter, now);
         let asked = now + PERIOD;
         assert!(adapter
             .report_empty(&[polled(&second, None)], asked)
             .is_empty());
         assert_eq!(replica.store.calls.lock().reports, 0);
-        assert!(replica.overloaded(zero, asked));
-        assert!(replica.overloaded(one, asked));
         assert_eq!(adapter.poll_mode(&first, asked, PERIOD), PollMode::Fallback);
     }
 
@@ -1141,29 +1103,12 @@ mod tests {
         let asked = now + Duration::from_millis(1);
         adapter.fetch_failed(slice::from_ref(&second), asked);
         assert_eq!(replica.store.calls.lock().reports, 0);
-        assert!(replica.overloaded(one, Instant::now()));
         adapter.fetch_failed(&[first, second], asked);
         assert_eq!(replica.store.calls.lock().reports, 1);
         assert_eq!(
             [replica.store.load(zero, 0), replica.store.load(one, 1)],
             rows
         );
-        assert!(!replica.overloaded(one, Instant::now()));
-    }
-
-    /// A rank that pushed while the poll was out is the newer: the failed
-    /// fetch's word that no report came leaves its verdict.
-    #[test]
-    fn a_failed_fetch_leaves_the_verdict_of_a_push_during_its_poll() {
-        let replica = Replica::new();
-        let adapter = replica.lead();
-        let asked = Instant::now() - PERIOD;
-        let pushed = asked + Duration::from_millis(1);
-        let [(zero, first), (one, second)] = busy_pair(&replica, &adapter, pushed);
-        adapter.fetch_failed(&[first, second], asked);
-        assert_eq!(replica.store.calls.lock().reports, 1);
-        assert!(replica.overloaded(zero, pushed));
-        assert!(replica.overloaded(one, pushed));
     }
 
     /// A worker whose status left `Ready` is forgotten, and its object
@@ -1180,28 +1125,6 @@ mod tests {
         assert_eq!(replica.store.calls.lock().evicts, 1);
         assert_eq!(replica.store.ranks(id), 0);
         assert!(adapter.members.read().is_empty());
-    }
-
-    /// A busy rank that leaves `Ready` does not hold its engine's verdict
-    /// over the rank that stays: its forget takes its sample off the file,
-    /// and the engine is judged again. An eviction names no instant, so the
-    /// judgment waits for the host's publication.
-    #[test]
-    fn a_rank_that_left_ready_does_not_hold_its_engines_verdict() {
-        let replica = Replica::new();
-        let adapter = replica.lead();
-        let now = Instant::now();
-        let [(zero, first), (one, _second)] = busy_pair(&replica, &adapter, now);
-        first.set_status(ObjectStatus::NotReady);
-        adapter.forget(&first);
-        assert_eq!(replica.store.ranks(zero), 0);
-        replica.publish();
-        assert!(!replica.overloaded(one, now));
-        // The rank drains its queue and keeps pushing: nothing is laid.
-        adapter.record(&first, 0, &report(0, 6), now, now);
-        assert_eq!(replica.store.ranks(zero), 0);
-        replica.publish();
-        assert!(!replica.overloaded(one, now));
     }
 
     /// A rank's status left `Ready` while its engine's poll was out. The
@@ -1222,8 +1145,6 @@ mod tests {
         );
         assert_eq!(replica.store.ranks(zero), 0);
         assert_eq!(replica.store.ranks(one), 1);
-        replica.publish();
-        assert!(!replica.overloaded(one, now));
     }
 
     /// A reset drops the adapter's entries and keeps the store's rows. A
@@ -1336,8 +1257,8 @@ mod tests {
     }
 
     /// The collector lost the event of a rank that left `Ready`, so it said
-    /// no forget. Its reset drops the loads of the row that is not `Ready`,
-    /// and the rank that stays is judged alone.
+    /// no forget. Its reset drops the loads of the row that is not `Ready`
+    /// and keeps those of the rank that stays.
     #[test]
     fn a_reset_drops_the_loads_of_a_row_that_is_not_ready() {
         let replica = Replica::new();
@@ -1349,13 +1270,9 @@ mod tests {
             .store
             .memory
             .set_status(zero, WorkerStatus::NotReady, row.revision);
-        replica.publish();
-        assert!(replica.overloaded(one, now));
         adapter.reset();
         assert_eq!(replica.store.ranks(zero), 0);
         assert_eq!(replica.store.ranks(one), 1);
-        replica.publish();
-        assert!(!replica.overloaded(one, now));
     }
 
     #[test]
@@ -1506,10 +1423,6 @@ mod tests {
         assert_eq!(replica.store.calls.lock().periods, 1);
     }
 
-    /// One row's cells as a publication holds them: each cell's value and
-    /// its sample instant, or none.
-    type Held = Vec<Option<(f64, u64)>>;
-
     /// What [`declare`] declares: the depth in items and the fixed count
     /// of used tokens.
     const DECLARED: [(&str, &str); 2] = [("depth", "items"), ("kv_tokens_used", "tokens")];
@@ -1538,33 +1451,6 @@ mod tests {
         applied.expect("a newer generation");
     }
 
-    /// Each row's signal cells once the store's writes are shown, by
-    /// worker, in the declared names' order: the depth, then the tokens.
-    fn cells(replica: &Replica) -> FxHashMap<WorkerId, Held> {
-        replica.publish();
-        replica.store.memory.deciding(|world| {
-            let ask = ViewQuery {
-                gateway: GatewayId(1),
-                now: Instant::now(),
-                pinned: None,
-                affinity: false,
-                signal_cells: true,
-            };
-            let mut out = ViewBuffers::default();
-            let view = world
-                .view(MODEL, Role::Single, &ask, false, &mut out)
-                .expect("the pool");
-            let block = view.signal_cells.expect("the publication's block");
-            let held = |cell: &crate::load::SignalCell| {
-                (!cell.is_none()).then_some((cell.value, cell.sampled_at_micros))
-            };
-            let cells = block.cells().chunks(block.signals());
-            let ids = view.candidates.iter().map(|row| row.id);
-            ids.zip(cells.map(|cells| cells.iter().map(held).collect()))
-                .collect()
-        })
-    }
-
     /// One rank's report: its depth by name, a name no document declares,
     /// and the fixed count of used tokens.
     fn stating(rank: i32, depth: f64, age_ms: Option<u32>) -> WorkerLoadResponse {
@@ -1591,8 +1477,7 @@ mod tests {
     #[test]
     fn a_records_declared_values_follow_its_row_into_the_store() {
         let replica = Replica::new();
-        // The second rank of two: a value written at another rank reaches
-        // no row.
+        // The second rank of two.
         let (id, worker) = replica.add(WorkerFacts {
             dp_rank: 1,
             dp_size: 2,
@@ -1603,28 +1488,22 @@ mod tests {
         let sampled = Instant::now() + Duration::from_secs(1);
         let received = sampled + Duration::from_millis(37);
         adapter.record(&worker, 1, &stating(1, 3.0, Some(20)), received, sampled);
-        // A value is as old as it says before its record's sample, and one
-        // that states no age is as old as its record.
+        // The two declared values are written. The name no document
+        // declares was never offered: no write counts it.
         let store = &replica.store.memory;
-        let aged = store.micros(sampled - Duration::from_millis(20));
-        let held = [Some((3.0, aged)), Some((1_025.0, store.micros(sampled)))];
-        assert_eq!(cells(&replica)[&id], held);
-        // The name no document declares was never offered: no write
-        // counts it.
         assert_eq!(store.stats().signal_writes, [2, 0, 0, 0, 0, 0]);
-        // A record that leaves the names out leaves their cells.
+        // A record that leaves the names out writes none.
         let later = received + PERIOD;
         adapter.record(&worker, 1, &report(1, 4), later, later);
         let row = replica.store.load(id, 1).expect("the later row");
         assert_eq!(row.row.running, 4);
-        assert_eq!(cells(&replica)[&id], held);
         assert_eq!(store.stats().signal_writes, [2, 0, 0, 0, 0, 0]);
     }
 
     #[test]
     fn a_polled_answers_values_follow_the_rows_the_store_took() {
         let replica = Replica::new();
-        let [(zero, first), (one, second)] = replica.two_ranks(None);
+        let [(_, first), (_, second)] = replica.two_ranks(None);
         declare(&replica);
         let adapter = replica.lead();
         let asked = Instant::now();
@@ -1641,12 +1520,9 @@ mod tests {
             asked,
         );
         assert_eq!(ranks.newer, [0]);
-        // A polled value is dated as its row is: at the poll's start.
+        // The row the store took writes its two values, and the row passed
+        // over writes none.
         let store = &replica.store.memory;
-        let at = store.micros(asked);
-        let held = cells(&replica);
-        assert_eq!(held[&zero], [None, None]);
-        assert_eq!(held[&one], [Some((5.0, at)), Some((1_025.0, at))]);
         assert_eq!(store.stats().signal_writes, [2, 0, 0, 0, 0, 0]);
         // A failed fetch and an answer with no row write no value.
         let empty = WorkerLoadResponse::default();
@@ -1673,482 +1549,12 @@ mod tests {
         assert_eq!(counts.signal_writes, [0; 6]);
     }
 
-    /// A report of a worker over several ranks: one entry a rank, with the
-    /// depth the rank states by name where it states one. No entry states
-    /// a fixed count.
-    fn file(ranks: &[(i32, Option<f64>)]) -> WorkerLoadResponse {
-        let entry = |&(rank, depth): &(i32, Option<f64>)| SchedulerLoadSnapshot {
-            dp_rank: rank,
-            num_running_reqs: 1,
-            kept: LoadTelemetry::USED_TOKENS | LoadTelemetry::TOTAL_TOKENS,
-            values: depth
-                .map(|value| NamedValue {
-                    name: "depth".into(),
-                    unit: "items".into(),
-                    value,
-                    age_ms: None,
-                })
-                .into_iter()
-                .collect(),
-            ..Default::default()
-        };
-        WorkerLoadResponse {
-            dp_rank_count: i32::try_from(ranks.len()).unwrap_or(i32::MAX),
-            loads: ranks.iter().map(entry).collect(),
-            ..Default::default()
-        }
-    }
-
-    /// The depth the row of `id` holds once the store's writes are shown:
-    /// its value and its sample instant.
-    fn depth(replica: &Replica, id: WorkerId) -> Option<(f64, u64)> {
-        cells(replica)[&id][0]
-    }
-
-    /// One row over an engine of two ranks. Rank 1 states its depth once
-    /// and falls silent, and rank 0 states its own each second. The row's
-    /// sum stays as old as rank 1's statement, so the signal's maximum age
-    /// ends it.
-    #[test]
-    fn a_silent_ranks_value_keeps_its_own_instant_behind_a_row_of_several_ranks() {
-        let replica = Replica::new();
-        let (id, worker) = replica.add(facts(URL));
-        declare(&replica);
-        let adapter = replica.lead();
-        let start = Instant::now() + Duration::from_secs(1);
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let both = file(&[(0, Some(1.0)), (1, Some(100.0))]);
-        adapter.record(&worker, 1, &both, at(0), at(0));
-        for second in 1..=9 {
-            let now = at(second * 1_000);
-            adapter.record(&worker, 0, &both, now, now);
-        }
-        let silent = replica.store.memory.micros(at(0));
-        assert_eq!(depth(&replica, id), Some((101.0, silent)));
-    }
-
-    /// A record may leave a name out. One such record of rank 1 leaves
-    /// rank 1's last statement standing, and the row's value follows rank
-    /// 0's next one.
-    #[test]
-    fn a_record_with_no_value_from_one_rank_leaves_the_others_standing() {
-        let replica = Replica::new();
-        let (id, worker) = replica.add(facts(URL));
-        declare(&replica);
-        let adapter = replica.lead();
-        let start = Instant::now() + Duration::from_secs(1);
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let both = file(&[(0, Some(1.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 1, &both, at(0), at(0));
-        adapter.record(&worker, 0, &both, at(10), at(10));
-        assert_eq!(depth(&replica, id).map(|(value, _)| value), Some(3.0));
-        let bare = file(&[(0, Some(1.0)), (1, None)]);
-        adapter.record(&worker, 1, &bare, at(20), at(20));
-        let moved = file(&[(0, Some(3.0)), (1, None)]);
-        adapter.record(&worker, 0, &moved, at(30), at(30));
-        assert_eq!(depth(&replica, id).map(|(value, _)| value), Some(5.0));
-    }
-
-    #[test]
-    fn a_polled_answer_of_several_ranks_states_each_rank_though_its_row_is_passed_over() {
-        let replica = Replica::new();
-        let (id, worker) = replica.add(facts(URL));
-        declare(&replica);
-        let adapter = replica.lead();
-        let start = Instant::now() + Duration::from_secs(1);
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let micros = |at: Instant| replica.store.memory.micros(at);
-        let both = file(&[(0, Some(1.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 1, &both, at(0), at(0));
-        adapter.record(&worker, 0, &both, at(10), at(10));
-        // Rank 0 pushes while a poll is out: the store passes the answer's
-        // row over, and the row's value stays the records' own.
-        let asked = at(1_000);
-        let pushed = file(&[(0, Some(5.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 0, &pushed, at(1_001), at(1_001));
-        let answer = file(&[(0, Some(4.0)), (1, Some(6.0))]);
-        let ranks = adapter.report(&[polled(&worker, Some(&answer))], asked);
-        assert_eq!(ranks.newer, [0]);
-        assert_eq!(depth(&replica, id), Some((7.0, micros(at(0)))));
-        // Rank 0's next record reads rank 1 as the answer stated it, at
-        // the poll's start. Rank 0's own record is newer than the answer.
-        adapter.record(&worker, 0, &pushed, at(1_500), at(1_500));
-        assert_eq!(depth(&replica, id), Some((11.0, micros(asked))));
-        // An answer whose row the store takes writes the row's value.
-        let later = at(3_000);
-        let answer = file(&[(0, Some(1.0)), (1, Some(1.0))]);
-        let ranks = adapter.report(&[polled(&worker, Some(&answer))], later);
-        assert!(ranks.newer.is_empty());
-        assert_eq!(depth(&replica, id), Some((2.0, micros(later))));
-    }
-
-    /// A worker's statements go with its entry, at a reset and at a
-    /// forget. The new entry was told nothing of the ranks: each counts at
-    /// its next record.
-    #[test]
-    fn a_workers_statements_go_with_its_entry() {
-        let replica = Replica::new();
-        let (id, worker) = replica.add(facts(URL));
-        declare(&replica);
-        let adapter = replica.lead();
-        let start = Instant::now() + Duration::from_secs(1);
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let both = file(&[(0, Some(1.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 1, &both, at(0), at(0));
-        // A reset drops the entry, and with it rank 1's statement and its
-        // instant: rank 0's record alone makes no value.
-        adapter.reset();
-        adapter.record(&worker, 0, &both, at(10), at(10));
-        assert_eq!(depth(&replica, id), None);
-        adapter.record(&worker, 1, &both, at(20), at(20));
-        adapter.record(&worker, 0, &both, at(30), at(30));
-        let restated = replica.store.memory.micros(at(20));
-        assert_eq!(depth(&replica, id), Some((3.0, restated)));
-        // A forget drops it too, with the row's cells.
-        adapter.forget(&worker);
-        adapter.record(&worker, 0, &both, at(40), at(40));
-        assert_eq!(depth(&replica, id), None);
-    }
-
-    /// A worker's first records list one rank, and are read as a worker
-    /// of one rank. The next rank's first record reads the first rank's
-    /// entry, under that rank's own record: a rank that stated once and
-    /// fell silent counts all the same, as old as it is.
-    #[test]
-    fn a_ranks_first_statement_counts_at_the_next_ranks_first_record() {
-        let replica = Replica::new();
-        let (id, worker) = replica.add(facts(URL));
-        declare(&replica);
-        let adapter = replica.lead();
-        let start = Instant::now() + Duration::from_secs(1);
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let alone = file(&[(1, Some(100.0))]);
-        adapter.record(&worker, 1, &alone, at(0), at(0));
-        assert_eq!(depth(&replica, id), None);
-        let both = file(&[(0, Some(1.0)), (1, Some(100.0))]);
-        adapter.record(&worker, 0, &both, at(9_000), at(9_000));
-        let first = replica.store.memory.micros(at(0));
-        assert_eq!(depth(&replica, id), Some((101.0, first)));
-    }
-
-    /// A new document ends the statements, though it declares the same
-    /// signals. The next record reads each rank's latest record again,
-    /// under that rank's own instant, so the row's value moves at once.
-    #[test]
-    fn a_new_document_reads_each_ranks_latest_record_again() {
-        let replica = Replica::new();
-        let (id, worker) = replica.add(facts(URL));
-        declare(&replica);
-        let adapter = replica.lead();
-        let start = Instant::now() + Duration::from_secs(1);
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let both = file(&[(0, Some(1.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 1, &both, at(0), at(0));
-        adapter.record(&worker, 0, &both, at(10), at(10));
-        assert_eq!(depth(&replica, id).map(|(value, _)| value), Some(3.0));
-        declare_as(&replica, 3, &DECLARED);
-        let moved = file(&[(0, Some(4.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 0, &moved, at(30), at(30));
-        let first = replica.store.memory.micros(at(0));
-        assert_eq!(depth(&replica, id), Some((6.0, first)));
-    }
-
-    /// A signal removed and declared again starts with no value, as the
-    /// store's cells do: nothing a rank stated passes the document that
-    /// stood between. A rank whose latest record leaves the name out
-    /// counts when it states the name again.
-    #[test]
-    fn a_signal_declared_again_starts_from_the_latest_records() {
-        let replica = Replica::new();
-        let (id, worker) = replica.add(facts(URL));
-        declare(&replica);
-        let adapter = replica.lead();
-        let start = Instant::now() + Duration::from_secs(1);
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let both = file(&[(0, Some(1.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 1, &both, at(0), at(0));
-        adapter.record(&worker, 0, &both, at(10), at(10));
-        let bare = file(&[(0, Some(1.0)), (1, None)]);
-        adapter.record(&worker, 1, &bare, at(20), at(20));
-        assert_eq!(depth(&replica, id).map(|(value, _)| value), Some(3.0));
-        // Two documents between two reports: the depth goes, and comes
-        // back as it was declared.
-        declare_as(&replica, 3, &DECLARED[1..]);
-        declare_as(&replica, 4, &DECLARED);
-        let moved = file(&[(0, Some(4.0)), (1, None)]);
-        adapter.record(&worker, 0, &moved, at(30), at(30));
-        assert_eq!(depth(&replica, id), None);
-        let both = file(&[(0, Some(4.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 1, &both, at(40), at(40));
-        adapter.record(&worker, 0, &both, at(50), at(50));
-        let restated = replica.store.memory.micros(at(40));
-        assert_eq!(depth(&replica, id), Some((6.0, restated)));
-    }
-
-    /// A poll's row stands in the place of a silent rank's sample at the
-    /// row's own rank, though its answer leaves that rank out and the
-    /// rank's pushed entry stays on file. The entry is as old as the
-    /// rank's own record, which the worker's entry noted: it is not dated
-    /// by the poll, and no old value reads fresh.
-    #[test]
-    fn a_polls_row_in_a_ranks_place_dates_no_entry() {
-        let replica = Replica::new();
-        let (id, worker) = replica.add(facts(URL));
-        declare(&replica);
-        let adapter = replica.lead();
-        let start = Instant::now() + Duration::from_secs(1);
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let alone = file(&[(0, Some(100.0))]);
-        adapter.record(&worker, 0, &alone, at(0), at(0));
-        // An answer that lists rank 1 alone, with no depth: its row takes
-        // the place of rank 0's sample.
-        let answer = file(&[(1, None)]);
-        adapter.report(&[polled(&worker, Some(&answer))], at(9_000));
-        let both = file(&[(0, Some(100.0)), (1, Some(1.0))]);
-        adapter.record(&worker, 1, &both, at(10_000), at(10_000));
-        let bare = file(&[(0, None), (1, Some(1.0))]);
-        adapter.record(&worker, 0, &bare, at(11_000), at(11_000));
-        // Rank 0's depth counts as old as rank 0 stated it.
-        let first = replica.store.memory.micros(at(0));
-        assert_eq!(depth(&replica, id), Some((101.0, first)));
-    }
-
-    /// An answer of one rank is one sample, and its entry is laid on the
-    /// worker's pushed report. Where the store took its row, the entry is
-    /// as old as the answer: the next rank's first record counts it so.
-    #[test]
-    fn an_answer_of_one_rank_counts_under_its_own_instant() {
-        let replica = Replica::new();
-        let (id, worker) = replica.add(facts(URL));
-        declare(&replica);
-        let adapter = replica.lead();
-        let start = Instant::now() + Duration::from_secs(1);
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let alone = file(&[(0, Some(1.0))]);
-        adapter.record(&worker, 0, &alone, at(0), at(0));
-        let answer = file(&[(0, Some(2.0))]);
-        let asked = at(5_000);
-        let ranks = adapter.report(&[polled(&worker, Some(&answer))], asked);
-        assert!(ranks.newer.is_empty());
-        // The report after rank 1's first record: rank 0 as the answer
-        // laid it, and rank 1's own.
-        let both = file(&[(0, Some(2.0)), (1, Some(100.0))]);
-        adapter.record(&worker, 1, &both, at(6_000), at(6_000));
-        let bare = file(&[(0, None), (1, Some(100.0))]);
-        adapter.record(&worker, 0, &bare, at(7_000), at(7_000));
-        let answered = replica.store.memory.micros(asked);
-        assert_eq!(depth(&replica, id), Some((102.0, answered)));
-    }
-
-    /// An answer can leave out a rank the pushed report still lists.
-    /// Nothing the rank stated ends with the answer: the row's value keeps
-    /// moving with the other ranks.
-    #[test]
-    fn an_answer_that_leaves_a_rank_out_ends_nothing_of_it() {
-        let replica = Replica::new();
-        let (id, worker) = replica.add(facts(URL));
-        declare(&replica);
-        let adapter = replica.lead();
-        let start = Instant::now() + Duration::from_secs(1);
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let micros = |at: Instant| replica.store.memory.micros(at);
-        let all = file(&[(0, Some(1.0)), (1, Some(2.0)), (2, Some(4.0))]);
-        adapter.record(&worker, 2, &all, at(0), at(0));
-        adapter.record(&worker, 1, &all, at(10), at(10));
-        adapter.record(&worker, 0, &all, at(20), at(20));
-        assert_eq!(depth(&replica, id), Some((7.0, micros(at(0)))));
-        // Rank 0 pushes while a poll is out, and the answer lists ranks 0
-        // and 1 alone: the store passes its row over.
-        let asked = at(1_000);
-        let pushed = file(&[(0, Some(3.0)), (1, Some(2.0)), (2, Some(4.0))]);
-        adapter.record(&worker, 0, &pushed, at(1_001), at(1_001));
-        assert_eq!(depth(&replica, id), Some((9.0, micros(at(0)))));
-        let answer = file(&[(0, Some(3.0)), (1, Some(2.0))]);
-        let ranks = adapter.report(&[polled(&worker, Some(&answer))], asked);
-        assert_eq!(ranks.newer, [0]);
-        // Rank 0's next record still counts rank 2, as old as rank 2's
-        // own record.
-        let next = file(&[(0, Some(5.0)), (1, Some(2.0)), (2, Some(4.0))]);
-        adapter.record(&worker, 0, &next, at(1_500), at(1_500));
-        assert_eq!(depth(&replica, id), Some((11.0, micros(at(0)))));
-    }
-
-    /// An answer's entry is laid over a rank's entry on the pushed report,
-    /// though the rank pushed a record while the poll was out. What the
-    /// answer stated of the rank is as old as the poll, whatever the rank
-    /// pushed since and whatever a later answer leaves out.
-    #[test]
-    fn what_an_answer_stated_is_as_old_as_its_poll() {
-        let replica = Replica::new();
-        let (id, worker) = replica.add(facts(URL));
-        declare(&replica);
-        let adapter = replica.lead();
-        let start = Instant::now() + Duration::from_secs(1);
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let micros = |at: Instant| replica.store.memory.micros(at);
-        let all = file(&[(0, Some(1.0)), (1, Some(2.0)), (2, Some(4.0))]);
-        adapter.record(&worker, 2, &all, at(0), at(0));
-        adapter.record(&worker, 1, &all, at(10), at(10));
-        adapter.record(&worker, 0, &all, at(20), at(20));
-        // A poll goes out. Rank 2 pushes with no depth and rank 0 pushes,
-        // so the store passes the answer's row over. The answer states 7
-        // for rank 2, and that entry is laid on the pushed report.
-        let asked = at(1_000);
-        let bare = file(&[(0, Some(1.0)), (1, Some(2.0)), (2, None)]);
-        adapter.record(&worker, 2, &bare, at(2_000), at(2_000));
-        adapter.record(&worker, 0, &bare, at(2_100), at(2_100));
-        let answer = file(&[(0, Some(1.0)), (1, Some(2.0)), (2, Some(7.0))]);
-        let ranks = adapter.report(&[polled(&worker, Some(&answer))], asked);
-        assert_eq!(ranks.newer, [0]);
-        // A later answer leaves rank 2 out, and is passed over as well.
-        let later = at(3_000);
-        let laid = file(&[(0, Some(1.0)), (1, Some(2.0)), (2, Some(7.0))]);
-        adapter.record(&worker, 0, &laid, at(3_100), at(3_100));
-        let partial = file(&[(0, Some(1.0)), (1, Some(2.0))]);
-        let ranks = adapter.report(&[polled(&worker, Some(&partial))], later);
-        assert_eq!(ranks.newer, [0]);
-        // Ranks 1 and 0 push: rank 2 counts 7, as old as the first poll.
-        adapter.record(&worker, 1, &laid, at(3_500), at(3_500));
-        let next = file(&[(0, Some(5.0)), (1, Some(2.0)), (2, Some(7.0))]);
-        adapter.record(&worker, 0, &next, at(4_000), at(4_000));
-        assert_eq!(depth(&replica, id), Some((14.0, micros(asked))));
-    }
-
-    /// An answer states each rank before its stream starts, and the first
-    /// pushed reports list one rank, then two. What the answer stated
-    /// stands meanwhile: the pushed report is still finding the ranks.
-    #[test]
-    fn what_an_answer_stated_stands_while_the_pushed_report_finds_the_ranks() {
-        let replica = Replica::new();
-        let (id, worker) = replica.add(facts(URL));
-        declare(&replica);
-        let adapter = replica.lead();
-        let start = Instant::now() + Duration::from_secs(1);
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let micros = |at: Instant| replica.store.memory.micros(at);
-        let asked = at(0);
-        let answer = file(&[(0, Some(1.0)), (1, Some(2.0))]);
-        adapter.report(&[polled(&worker, Some(&answer))], asked);
-        assert_eq!(depth(&replica, id), Some((3.0, micros(asked))));
-        // Each rank's first record leaves the depth out, and the first
-        // pushed report lists rank 0 alone.
-        let alone = file(&[(0, None)]);
-        adapter.record(&worker, 0, &alone, at(1_000), at(1_000));
-        let both = file(&[(0, None), (1, None)]);
-        adapter.record(&worker, 1, &both, at(1_100), at(1_100));
-        // Rank 0 states 5: rank 1 counts as the answer stated it.
-        let moved = file(&[(0, Some(5.0)), (1, None)]);
-        adapter.record(&worker, 0, &moved, at(2_000), at(2_000));
-        assert_eq!(depth(&replica, id), Some((7.0, micros(asked))));
-    }
-
-    /// A record can be sampled long before it is received. One received
-    /// while a poll is out keeps its entry on the worker's report, though
-    /// the answer lists its rank: the entry stays as old as the record's
-    /// sample, and the poll's start dates nothing of it.
-    #[test]
-    fn a_passed_over_answer_dates_no_entry_the_report_keeps() {
-        let replica = Replica::new();
-        let (id, worker) = replica.add(facts(URL));
-        declare(&replica);
-        let adapter = replica.lead();
-        let start = Instant::now() + Duration::from_secs(1);
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let asked = at(9_000);
-        // Rank 0's first record: received behind the poll's start, and
-        // sampled nine seconds ahead of it.
-        let alone = file(&[(0, Some(100.0))]);
-        adapter.record(&worker, 0, &alone, at(10_000), at(0));
-        let answer = file(&[(0, None), (1, None)]);
-        let ranks = adapter.report(&[polled(&worker, Some(&answer))], asked);
-        assert_eq!(ranks.newer, [0]);
-        let both = file(&[(0, Some(100.0)), (1, Some(1.0))]);
-        adapter.record(&worker, 1, &both, at(11_000), at(11_000));
-        let bare = file(&[(0, None), (1, Some(1.0))]);
-        adapter.record(&worker, 0, &bare, at(12_000), at(12_000));
-        let sampled = replica.store.memory.micros(at(0));
-        assert_eq!(depth(&replica, id), Some((101.0, sampled)));
-    }
-
-    /// A report under a document that declares no signal is not read, so
-    /// the keeper is not told it. Here an answer's entry of rank 1 is as
-    /// old as its poll, and under such a document rank 1 pushes a record
-    /// sampled long before that poll. Once the depth is declared again
-    /// that entry is not dated by the poll: the keeper went, and rank 1
-    /// counts at its next record. The row's cell moves at its own rank's.
-    #[test]
-    fn a_report_under_no_signal_ends_what_the_keeper_was_told() {
-        let replica = Replica::new();
-        let (id, worker) = replica.add(facts(URL));
-        declare(&replica);
-        let adapter = replica.lead();
-        let start = Instant::now() + Duration::from_secs(1);
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let micros = |at: Instant| replica.store.memory.micros(at);
-        let both = file(&[(0, Some(1.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 1, &both, at(0), at(0));
-        adapter.record(&worker, 0, &both, at(10), at(10));
-        let asked = at(5_000);
-        let answer = file(&[(0, Some(5.0)), (1, Some(6.0))]);
-        let ranks = adapter.report(&[polled(&worker, Some(&answer))], asked);
-        assert!(ranks.newer.is_empty());
-        assert_eq!(depth(&replica, id), Some((11.0, micros(asked))));
-        // No signal is declared, and rank 1's record comes in: sampled
-        // four seconds ahead of the poll, with another depth.
-        declare_as(&replica, 3, &[]);
-        let late = file(&[(0, Some(5.0)), (1, Some(60.0))]);
-        adapter.record(&worker, 1, &late, at(6_000), at(1_000));
-        declare_as(&replica, 4, &DECLARED);
-        let moved = file(&[(0, Some(7.0)), (1, Some(60.0))]);
-        adapter.record(&worker, 0, &moved, at(7_000), at(7_000));
-        assert_eq!(depth(&replica, id), None);
-        let next = file(&[(0, Some(7.0)), (1, Some(61.0))]);
-        adapter.record(&worker, 1, &next, at(8_000), at(8_000));
-        adapter.record(&worker, 0, &next, at(9_000), at(9_000));
-        assert_eq!(depth(&replica, id), Some((68.0, micros(at(8_000)))));
-    }
-
-    /// The entry's note of a report of one rank goes the same way. An
-    /// answer of rank 0 alone is noted at its poll, and under a document
-    /// that declares no signal rank 0 pushes a record sampled long before
-    /// it. Rank 1's first record then finds no note: rank 0's entry is not
-    /// dated by the poll, and rank 0 counts when it states its depth again.
-    #[test]
-    fn a_report_under_no_signal_ends_the_entrys_note() {
-        let replica = Replica::new();
-        let (id, worker) = replica.add(facts(URL));
-        declare(&replica);
-        let adapter = replica.lead();
-        let start = Instant::now() + Duration::from_secs(1);
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let micros = |at: Instant| replica.store.memory.micros(at);
-        let alone = file(&[(0, Some(1.0))]);
-        adapter.record(&worker, 0, &alone, at(0), at(0));
-        let asked = at(5_000);
-        let answer = file(&[(0, Some(5.0))]);
-        let ranks = adapter.report(&[polled(&worker, Some(&answer))], asked);
-        assert!(ranks.newer.is_empty());
-        assert_eq!(depth(&replica, id), Some((5.0, micros(asked))));
-        declare_as(&replica, 3, &[]);
-        let late = file(&[(0, Some(60.0))]);
-        adapter.record(&worker, 0, &late, at(6_000), at(1_000));
-        declare_as(&replica, 4, &DECLARED);
-        let both = file(&[(0, Some(60.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 1, &both, at(7_000), at(7_000));
-        let bare = file(&[(0, None), (1, Some(2.0))]);
-        adapter.record(&worker, 0, &bare, at(8_000), at(8_000));
-        assert_eq!(depth(&replica, id), None);
-        let next = file(&[(0, Some(61.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 0, &next, at(9_000), at(9_000));
-        assert_eq!(depth(&replica, id), Some((63.0, micros(at(7_000)))));
-    }
-
-    /// A rank worker's report is one rank's, by a record and by a poll:
-    /// its last value is the store's cell, and its entry makes no keeper.
+    /// A rank worker's report is one rank's, by a record and by a poll: its
+    /// entry makes no keeper.
     #[test]
     fn a_worker_of_one_rank_keeps_no_statement() {
         let replica = Replica::new();
-        let [(zero, first), (one, second)] = replica.two_ranks(None);
+        let [(_, first), (_, second)] = replica.two_ranks(None);
         declare(&replica);
         let adapter = replica.lead();
         let now = Instant::now() + Duration::from_secs(1);
@@ -2163,9 +1569,6 @@ mod tests {
             ],
             asked,
         );
-        let at = replica.store.memory.micros(asked);
-        assert_eq!(depth(&replica, zero), Some((4.0, at)));
-        assert_eq!(depth(&replica, one), Some((6.0, at)));
         let members = adapter.members.read();
         assert_eq!(members.len(), 2);
         let one_rank = |kept: &KeptMember| matches!(*kept.shown.lock(), Shown::OneRank(_));

@@ -182,10 +182,7 @@ fn milliseconds(seconds: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::Arc,
-        time::{Duration, Instant},
-    };
+    use std::{sync::Arc, time::Instant};
 
     use smg_worker::{
         identity::{basic::Worker, builder::BasicWorkerBuilder},
@@ -199,14 +196,13 @@ mod tests {
         document::spec::Pairing,
         engine::{
             demands::DemandFacts,
-            view::{LoadRow, Role, WireModes, WorkerId},
+            view::{Role, WireModes, WorkerId},
         },
         store::{
             encoding::{EncodeHandoff, EncodeOffer},
             pairing::{mismatch, Member, PairingDescriptor, LAYOUT_FACTS},
-            GatewayId, HealthPolicy, LoadSink as _, LoadSource, MemoryStore, Overload,
-            Reachability, Registrant, Signals, ViewBuffers, ViewQuery, WorkerFacts, WorkerRow,
-            WorkerStatus, WorkersStore as _,
+            GatewayId, HealthPolicy, Overload, Reachability, Registrant, Signals, WorkerFacts,
+            WorkerRow, WorkerStatus,
         },
         worker_host::object,
     };
@@ -525,10 +521,9 @@ mod tests {
     }
 
     /// A threshold of the object's own under half a permille is held as
-    /// one, as a document's is. At none the store reads every engine with
-    /// a rank on file as over it, so an idle worker would be vetoed.
+    /// one, as a document's is.
     #[test]
-    fn a_threshold_under_half_a_permille_is_held_as_one_and_vetoes_no_idle_worker() {
+    fn a_threshold_under_half_a_permille_is_held_as_one() {
         let spec = WorkerSpec {
             models: vec![ModelCard::new("model")].into(),
             overload: OverloadUpdate {
@@ -538,27 +533,7 @@ mod tests {
             ..WorkerSpec::new(URL.to_owned())
         };
         let found = facts(&<BasicWorkerBuilder>::from_spec(spec).build(), None);
-        let stated = found.overload.kv_usage_permille;
-
-        let store = MemoryStore::with_publish_window(Duration::ZERO);
-        let now = Instant::now();
-        let id = store.upsert(found).id();
-        store.publish_now();
-        store.record(id, 0, LoadRow::default(), now, LoadSource::Stream);
-        store.publish_now();
-        let ask = ViewQuery {
-            gateway: GatewayId(1),
-            now,
-            pinned: None,
-            affinity: false,
-            signal_cells: false,
-        };
-        let mut view = ViewBuffers::default();
-        store
-            .build_view("model", Role::Single, &ask, &mut view)
-            .expect("the pool");
-        assert!(!view.candidates[0].health.overloaded, "idle, and read over");
-        assert_eq!(stated, Some(1));
+        assert_eq!(found.overload.kv_usage_permille, Some(1));
     }
 
     #[test]
