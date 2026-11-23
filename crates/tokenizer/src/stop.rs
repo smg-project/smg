@@ -682,57 +682,11 @@ impl StopIds {
     }
 }
 
-/// Builder for StopSequenceDecoder
-pub struct StopSequenceDecoderBuilder {
-    tokenizer: Arc<dyn traits::Tokenizer>,
-    config: StopSequenceConfig,
-    skip_special_tokens: bool,
-}
-
-impl StopSequenceDecoderBuilder {
-    pub fn new(tokenizer: Arc<dyn traits::Tokenizer>) -> Self {
-        StopSequenceDecoderBuilder {
-            tokenizer,
-            config: StopSequenceConfig::default(),
-            skip_special_tokens: true,
-        }
-    }
-
-    pub fn stop_token(mut self, token_id: TokenIdType) -> Self {
-        self.config.stop_tokens.insert(token_id);
-        self
-    }
-
-    pub fn stop_sequence(mut self, sequence: impl Into<String>) -> Self {
-        self.config.stop_sequences.push(sequence.into());
-        self
-    }
-
-    pub fn visible_stop_token(mut self, token_id: TokenIdType) -> Self {
-        self.config.visible_stop_tokens.insert(token_id);
-        self
-    }
-
-    pub fn visible_stop_sequence(mut self, sequence: impl Into<String>) -> Self {
-        self.config.visible_stop_sequences.push(sequence.into());
-        self
-    }
-
-    pub fn skip_special_tokens(mut self, skip: bool) -> Self {
-        self.skip_special_tokens = skip;
-        self
-    }
-
-    pub fn build(self) -> StopSequenceDecoder {
-        StopSequenceDecoder::new(self.tokenizer, self.config, self.skip_special_tokens)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashSet, sync::Arc};
 
-    use super::{SequenceDecoderStep, StopIds, StopSequenceDecoderBuilder, INLINE_STOP_IDS};
+    use super::{SequenceDecoderStep, StopIds, INLINE_STOP_IDS};
     use crate::{
         mock::MockTokenizer, SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder,
     };
@@ -973,20 +927,6 @@ mod tests {
 
         let result = decoder.process_token(999).unwrap();
         assert!(matches!(result, SequenceDecoderOutput::StoppedWithText(_)));
-    }
-
-    #[test]
-    fn test_builder_pattern() {
-        let tokenizer = Arc::new(MockTokenizer::new());
-
-        let decoder = StopSequenceDecoderBuilder::new(tokenizer)
-            .stop_token(999)
-            .stop_sequence("STOP")
-            .visible_stop_token(1000)
-            .skip_special_tokens(true)
-            .build();
-
-        assert!(!decoder.is_stopped());
     }
 
     #[test]

@@ -214,8 +214,8 @@ gateway's request schema.
 - Supports both token-level stops (visible or hidden) and arbitrary string sequences. When a string
   stop is configured, the decoder emits only the safe prefix and keeps a suffix jailed until it can
   decide whether it completes a stop sequence.
-- Provides `StopSequenceDecoderBuilder` for ergonomic configuration and exposes `process_token`,
-  `process_tokens`, `flush`, `reset`, and `is_stopped` helpers.
+- Takes a `StopSequenceConfig`, whose `with_*` setters add the stops, and exposes `process_token`,
+  `process_tokens`, `flush`, `finish`, `reset`, and `is_stopped` helpers.
 
 ## Caching (`cache/`)
 The caching subsystem provides multi-level caching for tokenizer results:
@@ -476,8 +476,8 @@ difference between implementations.
 ```rust
 use std::sync::Arc;
 use llm_tokenizer::{
-    create_tokenizer_from_file, create_tokenizer, SequenceDecoderOutput, Tokenizer,
-    stop::StopSequenceDecoderBuilder,
+    create_tokenizer_from_file, create_tokenizer, SequenceDecoderOutput, StopSequenceConfig,
+    StopSequenceDecoder, Tokenizer,
 };
 
 // Load a tokenizer from disk (Hugging Face JSON)
@@ -491,22 +491,28 @@ assert!(!encoding.token_ids().is_empty());
 let openai = Tokenizer::from_arc(create_tokenizer("gpt-4")?);
 let text = openai.decode(&[1, 2, 3], true)?;
 
-// Incremental decoding with stop sequences
-let mut stream = tokenizer.decode_stream(&[], true);
-let mut stop = StopSequenceDecoderBuilder::new(Arc::clone(&inner))
-    .stop_sequence("\nHuman:")
-    .build();
+// Incremental decoding with stop sequences: the stop decoder takes every
+// token id and decodes incrementally itself
+let mut stop = StopSequenceDecoder::new(
+    Arc::clone(&inner),
+    StopSequenceConfig::default().with_stop_sequence("\nHuman:"),
+    true, // skip special tokens
+);
 for &token in encoding.token_ids() {
-    if let Some(chunk) = stream.step(token)? {
-        match stop.process_token(token)? {
-            SequenceDecoderOutput::Text(t) => println!("{}", t),
-            SequenceDecoderOutput::StoppedWithText(t) => {
-                println!("{}", t);
-                break;
-            }
-            SequenceDecoderOutput::Held | SequenceDecoderOutput::Stopped => {}
+    match stop.process_token(token)? {
+        SequenceDecoderOutput::Text(t) => print!("{t}"),
+        SequenceDecoderOutput::StoppedWithText(t) => {
+            print!("{t}");
+            break;
         }
+        SequenceDecoderOutput::Stopped => break,
+        SequenceDecoderOutput::Held => {}
     }
+}
+// End of input: release the text still held as a possible start of a stop
+match stop.finish()? {
+    SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) => println!("{t}"),
+    SequenceDecoderOutput::Held | SequenceDecoderOutput::Stopped => println!(),
 }
 ```
 
