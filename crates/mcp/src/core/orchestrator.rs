@@ -1107,6 +1107,15 @@ impl McpOrchestrator {
         let arguments_str = input.arguments.to_string();
 
         let qualified = QualifiedToolName::new(server_key, &input.tool_name);
+        let named = if request_ctx.pool_key.is_some()
+            && (server_label.is_empty()
+                || server_label.contains("://")
+                || server_label.contains(char::is_control))
+        {
+            "unnamed"
+        } else {
+            server_label
+        };
 
         match entry {
             Some(entry) => match self
@@ -1115,6 +1124,7 @@ impl McpOrchestrator {
                     qualified,
                     &input.call_id,
                     input.arguments,
+                    named,
                     request_ctx,
                 )
                 .await
@@ -1137,9 +1147,13 @@ impl McpOrchestrator {
                 }
             },
             None => {
+                let server = match &request_ctx.pool_key {
+                    Some(key) if key.url == server_key => named,
+                    _ => server_key,
+                };
                 let err = format!(
                     "Tool '{}' not found on server '{}'",
-                    input.tool_name, server_key
+                    input.tool_name, server
                 );
                 ToolExecutionResult::Executed(ToolExecutionOutput {
                     call_id: input.call_id,
@@ -1162,6 +1176,7 @@ impl McpOrchestrator {
         qualified: QualifiedToolName,
         call_id: &str,
         arguments: Value,
+        server_label: &str,
         request_ctx: &McpRequestContext<'_>,
     ) -> ToolExecutionResult {
         self.active_executions.fetch_add(1, Ordering::SeqCst);
@@ -1172,7 +1187,13 @@ impl McpOrchestrator {
         let call_start_time = Instant::now();
 
         let result = match self
-            .execute_tool_with_approval_raw_internal(entry, call_id, arguments, request_ctx)
+            .execute_tool_with_approval_raw_internal(
+                entry,
+                call_id,
+                arguments,
+                server_label,
+                request_ctx,
+            )
             .await
         {
             Ok(ApprovalExecutionResult::Success(raw_result)) => {
@@ -1230,6 +1251,7 @@ impl McpOrchestrator {
         entry: &ToolEntry,
         call_id: &str,
         arguments: Value,
+        server_label: &str,
         request_ctx: &McpRequestContext<'_>,
     ) -> McpResult<ApprovalExecutionResult> {
         let elicitation_id = Self::approval_elicitation_id(entry.tool_name(), call_id);
@@ -1256,7 +1278,12 @@ impl McpOrchestrator {
                 }
                 self.metrics.record_approval_granted();
                 let result = self
-                    .execute_tool_with_reconnect(entry, arguments, request_ctx.pool_key.as_ref())
+                    .execute_tool_with_reconnect(
+                        entry,
+                        arguments,
+                        server_label,
+                        request_ctx.pool_key.as_ref(),
+                    )
                     .await?;
                 Ok(ApprovalExecutionResult::Success(result))
             }
@@ -1280,6 +1307,7 @@ impl McpOrchestrator {
                             .execute_tool_with_reconnect(
                                 entry,
                                 arguments,
+                                server_label,
                                 request_ctx.pool_key.as_ref(),
                             )
                             .await?;
@@ -1298,6 +1326,7 @@ impl McpOrchestrator {
         &self,
         entry: &ToolEntry,
         arguments: Value,
+        server_label: &str,
         pool_key: Option<&PoolKey>,
     ) -> McpResult<CallToolResult> {
         // A pool key is its own address's: a tool that targets another server
@@ -1326,6 +1355,7 @@ impl McpOrchestrator {
                 entry,
                 arguments.clone(),
                 Self::remaining(deadline),
+                server_label,
                 pool_key,
             )
             .await
@@ -1343,8 +1373,14 @@ impl McpOrchestrator {
                     None => self.recover_after_disconnect(&name, initial_client).await,
                 };
                 Self::after_recovery(replayable, recovery, &name, entry.tool_name())?;
-                self.execute_tool_impl(entry, arguments, Self::remaining(deadline), pool_key)
-                    .await
+                self.execute_tool_impl(
+                    entry,
+                    arguments,
+                    Self::remaining(deadline),
+                    server_label,
+                    pool_key,
+                )
+                .await
             }
             Err(e) => Err(e),
         }
@@ -1562,6 +1598,7 @@ impl McpOrchestrator {
         entry: &ToolEntry,
         mut arguments: Value,
         bound: Option<Duration>,
+        server_label: &str,
         pool_key: Option<&PoolKey>,
     ) -> McpResult<CallToolResult> {
         // The server the call reaches is the one the recovery is keyed by;
@@ -1588,7 +1625,7 @@ impl McpOrchestrator {
         }
 
         // Execute on server
-        self.execute_on_server(target_server, request, bound, pool_key)
+        self.execute_on_server(target_server, request, bound, server_label, pool_key)
             .await
     }
 
@@ -1663,6 +1700,7 @@ impl McpOrchestrator {
         server_key: &str,
         request: CallToolRequestParams,
         bound: Option<Duration>,
+        server_label: &str,
         pool_key: Option<&PoolKey>,
     ) -> McpResult<CallToolResult> {
         // Every call is bounded: a hung server must not hold a tool loop open
@@ -1687,20 +1725,20 @@ impl McpOrchestrator {
                 warn!(
                     "Refusing tool execution on '{}': multiple pooled connections share this \
                      URL with different credentials/tenants; cannot select one safely",
-                    server_key
+                    server_label
                 );
                 return Err(McpError::ServerAccessDenied(format!(
-                    "ambiguous MCP connection for '{server_key}': multiple credentials or \
+                    "ambiguous MCP connection for '{server_label}': multiple credentials or \
                      tenants are pooled for this URL"
                 )));
             }
             let Some(client) = self.connection_pool.get(key) else {
-                return Err(McpError::ServerNotFound(server_key.to_string()));
+                return Err(McpError::ServerNotFound(server_label.to_string()));
             };
             // Note: Pooled connections trigger Disconnected but
             // recovery logic is currently scoped to static servers.
             let result = Self::bounded(bound, client.call_tool(request)).await;
-            return Self::map_call_result(server_key, &tool, configured_secs, result);
+            return Self::map_call_result(server_label, &tool, configured_secs, result);
         }
 
         // Clone the client out of the map so no shard guard is held across
@@ -3335,11 +3373,11 @@ mod tests {
         // The address pooled under a second key: a call on it is refused.
         let two = connect(url, "two").await;
         assert_eq!(
-            first.execute_tool(input()).await.error_message,
-            Some(format!(
-                "Tool call failed: Server access denied: ambiguous MCP connection for '{url}': \
+            first.execute_tool(input()).await.error_message.as_deref(),
+            Some(
+                "Tool call failed: Server access denied: ambiguous MCP connection for 'tools': \
                  multiple credentials or tenants are pooled for this URL"
-            ))
+            )
         );
         // Two bindings of the label, of which only the second admits the
         // tool: the call uses the second's connection.
@@ -3352,8 +3390,8 @@ mod tests {
         // A third connection takes the first one's place in the pool of two.
         connect("http://other.example/mcp", "three").await;
         assert_eq!(
-            first.execute_tool(input()).await.error_message,
-            Some(format!("Tool call failed: Server not found: {url}"))
+            first.execute_tool(input()).await.error_message.as_deref(),
+            Some("Tool call failed: Server not found: tools")
         );
         assert_eq!(read(second.execute_tool(input()).await), "two");
         // The same call made directly: the key goes on the caller's context.
@@ -3371,6 +3409,24 @@ mod tests {
             ),
             "two"
         );
+        for (server, label, named) in [
+            (url, "tools", "tools"),
+            (url, url, "unnamed"),
+            (url, "two\nlines", "unnamed"),
+            ("conf", "tools", "conf"),
+        ] {
+            let missing = ToolExecutionInput {
+                tool_name: "missing".to_string(),
+                ..input()
+            };
+            let output = orchestrator
+                .execute_tool_resolved(missing, server, label, &ctx)
+                .await;
+            assert_eq!(
+                output.error_message,
+                Some(format!("Tool 'missing' not found on server '{named}'"))
+            );
+        }
         // A key serves its own address alone: an alias whose target is
         // another server is called there, without the key.
         let who = ToolExecutionInput {
@@ -3389,8 +3445,16 @@ mod tests {
         // The second one's server goes away.
         servers.remove(1).cancel().await.unwrap();
         assert_eq!(
-            second.execute_tool(input()).await.error_message,
-            Some(format!("Tool call failed: Server disconnected: {url}"))
+            second.execute_tool(input()).await.error_message.as_deref(),
+            Some("Tool call failed: Server disconnected: tools")
+        );
+        assert_eq!(
+            orchestrator
+                .execute_tool_resolved(input(), url, "", &ctx)
+                .await
+                .error_message
+                .as_deref(),
+            Some("Tool call failed: Server disconnected: unnamed")
         );
     }
 
