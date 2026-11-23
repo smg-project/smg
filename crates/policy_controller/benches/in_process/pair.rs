@@ -120,6 +120,10 @@ impl RequestMaker for StatedPair<'_> {
             admission: &Open,
             prefill_places: None,
             decode_places: None,
+            prefill_stalled: &[],
+            prefill_held: &[],
+            decode_stalled: &[],
+            decode_held: &[],
         })
     }
 }

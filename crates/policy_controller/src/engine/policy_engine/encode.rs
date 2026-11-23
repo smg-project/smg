@@ -16,7 +16,7 @@ use std::{sync::Arc, time::Instant};
 use smg_worker::load::state::LoadSnapshot;
 
 use super::{
-    pair::{issued, not_narrowed_by, stamp, Buffers, PairLists, BUFFERS},
+    pair::{issued, not_decided, stamp, Buffers, PairLists, BUFFERS},
     single::{self, PLACES},
     PolicyEngine, PoolMembers,
 };
@@ -81,7 +81,8 @@ impl EncodeLists<'_> {
     /// This call's instant is written into its facts: `now` on `clock`.
     ///
     /// A pair's lists are narrowed by no demand, no subset hint and no
-    /// places: a request that states one is shed or declined as its pair's
+    /// places, and a request's own mask names places of no one list: a
+    /// request that states one of these is shed or declined as its pair's
     /// own decision answers it, and no key is placed. One side of the pair
     /// alone is no pair, and the engine says so behind the encoders: a
     /// request that no encoder is ready for is shed under the encode side's
@@ -94,6 +95,14 @@ impl EncodeLists<'_> {
     /// and no key is placed: the engine decides an encode request's pair
     /// over the workers it admits for the items and reads no place of the
     /// lists.
+    ///
+    /// Each side of the pair reads the places its host's standing vetoes
+    /// mask and hold beside that side's list
+    /// ([`PairLists::prefill_stalled`], [`PairLists::decode_stalled`]),
+    /// numbered with the workers the engine admits for the items. A side
+    /// whose host states none reads no mask, and neither do the encoders.
+    /// A side whose profile shows its rows to a plugin is declined beside
+    /// a mask, under the stage `written-rows`.
     ///
     /// No lease is issued here and no stage is told of one: the engine's
     /// entry issues the pair's
@@ -115,7 +124,7 @@ impl EncodeLists<'_> {
         placed: &mut EncodePlaced,
     ) -> Decision {
         let pair = &self.pair;
-        if not_narrowed_by(&request.constraints).is_some() {
+        if not_decided(&request.constraints).is_some() {
             placed.clear();
             return pair.decide(spec, loads, clock, now, request, None);
         }
@@ -133,6 +142,7 @@ impl EncodeLists<'_> {
             return shed(ShedReason::PolicyDeclined, PLACES, seed, generation);
         }
         let (facts, cx) = (&request.facts, &request.constraints);
+        let [prefill_cx, decode_cx] = pair.masked(cx);
         let mut decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;
             let (workers, records) = (pair.prefill.workers(), pair.prefill.records(spec, clock));
@@ -156,7 +166,16 @@ impl EncodeLists<'_> {
             };
             let (engine, scratch) = (spec.engine(), &mut buffers.scratch);
             engine.decide_encode_pair(
-                facts, &pool, pools, encode, items, cx, cx, cx, scratch, placed,
+                facts,
+                &pool,
+                pools,
+                encode,
+                items,
+                &prefill_cx,
+                &decode_cx,
+                cx,
+                scratch,
+                placed,
             )
         };
         BUFFERS.with(|buffers| match buffers.try_borrow_mut() {

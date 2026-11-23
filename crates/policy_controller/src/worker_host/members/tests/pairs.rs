@@ -246,6 +246,10 @@ fn both_engines_pick_the_one_pair_of_one_fleet() {
         admission: &OpenAdmission,
         prefill_places: None,
         decode_places: None,
+        prefill_stalled: &[],
+        prefill_held: &[],
+        decode_stalled: &[],
+        decode_held: &[],
     };
     assert!(OpenAdmission.has_capacity(0) && OpenAdmission.has_room(1));
     let (mut request, now) = (asked(), Instant::now());

@@ -1413,6 +1413,13 @@ pub struct Constraints<'a> {
     /// publication's own rows hands them here, and a reader of a row's
     /// stalled bit asks both ([`Constraints::masks`]). Empty where the rows
     /// were written for the decision. In-process only.
+    ///
+    /// They are positions of the one list a set is opened over, as
+    /// [`Self::places`] are. A pair's host states each side's beside its
+    /// two lists, with the rows a hold stands on. A pair's request that
+    /// states either of its own, and an encode request's, is declined by
+    /// the engine over worker lists, by name, as one that states places
+    /// of its own is.
     pub stalled: &'a [u32],
     /// The rows of [`Self::stalled`] a hold of this host stands on, in
     /// order, each once: a veto no rule lifts, as an open breaker's is. The

@@ -465,6 +465,10 @@ fn a_pairs_frame_is_decided_over_its_two_lists_and_shed_where_it_hints_0() {
         admission: &Open,
         prefill_places: None,
         decode_places: None,
+        prefill_stalled: &[],
+        prefill_held: &[],
+        decode_stalled: &[],
+        decode_held: &[],
     };
     let now = Instant::now();
     let asked = |hint: Option<u32>| {

@@ -68,7 +68,7 @@ use crate::{
         framework::{release, Engine, PairPools, Scratch},
         lease_events,
         pair_classes::PartnerClasses,
-        records::{DecisionClock, Live},
+        records::{vetoes, DecisionClock, Live},
         view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, Session},
     },
     stages::Lifecycle,
@@ -112,6 +112,13 @@ pub trait PairAdmission: fmt::Debug {
 /// that side's list it may take ([`Self::prefill_places`],
 /// [`Self::decode_places`]). The lists stay the pools' own, with their
 /// records and their pair classes: nothing is made for a part of a list.
+///
+/// A host whose worker objects do not carry its own standing vetoes states
+/// them beside each list too, by place ([`Self::prefill_stalled`],
+/// [`Self::prefill_held`], [`Self::decode_stalled`],
+/// [`Self::decode_held`]): a place of one list says nothing of the other.
+/// A side whose profile shows its rows to a plugin reads them in the rows
+/// written for the decision.
 #[derive(Clone, Copy, Debug)]
 pub struct PairLists<'a> {
     /// The prefills.
@@ -133,9 +140,95 @@ pub struct PairLists<'a> {
     /// The decode asked again behind a held prefill is held to them too,
     /// and its held prefill is found wherever it stands in its list.
     pub decode_places: Option<&'a [u32]>,
+    /// The places of the prefill list a standing veto of the host masks,
+    /// ascending, each once; empty for none ([`Constraints::stalled`]). The
+    /// prefill side reads them as a single request's list reads its own.
+    pub prefill_stalled: &'a [u32],
+    /// The places of [`Self::prefill_stalled`] a hold of the host stands
+    /// on, which no rule lifts ([`Constraints::held`]).
+    pub prefill_held: &'a [u32],
+    /// The places of the decode list a standing veto of the host masks,
+    /// stated as the prefills' are. The decode asked again behind a held
+    /// prefill reads them too, and its held prefill is found whatever
+    /// masks it by then.
+    pub decode_stalled: &'a [u32],
+    /// The places of [`Self::decode_stalled`] a hold of the host stands on.
+    pub decode_held: &'a [u32],
 }
 
-impl PairLists<'_> {
+/// What a host states of one side's list beside the list: the places the
+/// request may take, and the places its standing vetoes mask and hold.
+#[derive(Clone, Copy, Debug)]
+struct Beside<'a> {
+    places: Option<&'a [u32]>,
+    stalled: &'a [u32],
+    held: &'a [u32],
+}
+
+impl<'a> Beside<'a> {
+    /// Whether the side states nothing: the request's constraints are then
+    /// the side's as they stand.
+    const fn states_nothing(&self) -> bool {
+        self.places.is_none() && self.stalled.is_empty() && self.held.is_empty()
+    }
+
+    /// The request's constraints with this side's places and mask.
+    fn of(self, cx: &Constraints<'a>) -> Constraints<'a> {
+        Constraints {
+            places: self.places,
+            stalled: self.stalled,
+            held: self.held,
+            ..*cx
+        }
+    }
+
+    /// The side as its decision of `phase` reads it over `rows`, the
+    /// side's records written for that decision. Where the side's profile
+    /// shows its rows to a plugin, the mask is written into them and the
+    /// side states none ([`vetoes::written`]): a plugin is shown a record's
+    /// own fields, and the engine declines such a profile over a mask
+    /// beside its rows. A side under no veto pays one test.
+    fn written(self, engine: &Engine, model: &str, phase: Phase, rows: &mut [Candidate]) -> Self {
+        if self.stalled.is_empty() {
+            return self;
+        }
+        let beside = Constraints {
+            stalled: self.stalled,
+            held: self.held,
+            ..Constraints::default()
+        };
+        let read = vetoes::written(engine, model, phase, rows, &beside);
+        Self {
+            stalled: read.stalled,
+            held: read.held,
+            ..self
+        }
+    }
+}
+
+impl<'a> PairLists<'a> {
+    /// The request's constraints as each side reads them where its places
+    /// are not stated: the prefills', then the decodes'. A side reads the
+    /// mask its host states beside its list and no other: a request that
+    /// states a mask of its own is declined ahead of this
+    /// ([`not_decided`]). An encode request's decision hands them to the
+    /// engine, which numbers a mask with the workers it admits for the
+    /// items.
+    pub(super) fn masked(&self, cx: &Constraints<'a>) -> [Constraints<'a>; 2] {
+        let side = |stalled, held| {
+            let side = Beside {
+                places: None,
+                stalled,
+                held,
+            };
+            side.of(cx)
+        };
+        [
+            side(self.prefill_stalled, self.prefill_held),
+            side(self.decode_stalled, self.decode_held),
+        ]
+    }
+
     /// One decision for a pair at `now`, over records written for it from
     /// both lists' worker objects and from `loads`, the host's snapshot of
     /// its workers' reports, with each record's pair class and its side's
@@ -168,7 +261,18 @@ impl PairLists<'_> {
         let live = Live::at(spec.engine(), clock, now, loads, None);
         request.facts.now_micros = live.now_micros();
         let (facts, cx) = (&request.facts, &request.constraints);
-        let places = [self.prefill_places, self.decode_places];
+        let sides = [
+            Beside {
+                places: self.prefill_places,
+                stalled: self.prefill_stalled,
+                held: self.prefill_held,
+            },
+            Beside {
+                places: self.decode_places,
+                stalled: self.decode_stalled,
+                held: self.decode_held,
+            },
+        ];
         let decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;
             let (workers, records) = (self.prefill.workers(), self.prefill.records(spec, clock));
@@ -176,20 +280,28 @@ impl PairLists<'_> {
             let (workers, records) = (self.decode.workers(), self.decode.records(spec, clock));
             let (decodes, decode_facts) = records.write(workers, &live, decodes);
             stamp(prefills, decodes, self.classes, self.admission);
+            let (engine, scratch) = (spec.engine(), &mut buffers.scratch);
+            // A side whose profile shows its rows is handed its mask in
+            // them. The decode asked again reads no mask of the prefills.
+            let [prefill_side, decode_side] = sides;
+            let decode_side = decode_side.written(engine, facts.model, Phase::Decode, decodes);
+            let prefill_side = match held {
+                None => prefill_side.written(engine, facts.model, Phase::Prefill, prefills),
+                Some(_) => prefill_side,
+            };
             let pools = PairPools {
                 prefills,
                 decodes,
                 table: self.classes.table(),
                 ..PairPools::default()
             };
-            let (engine, scratch) = (spec.engine(), &mut buffers.scratch);
             match held {
                 None => {
-                    let sides = (cx, places);
+                    let sides = (cx, [prefill_side, decode_side]);
                     decide_records(engine, facts, sides, &prefill_facts, pools, scratch)
                 }
                 Some(held) => {
-                    let side = (cx, places[1]);
+                    let side = (cx, decode_side);
                     decide_decode_records(engine, facts, side, &decode_facts, pools, held, scratch)
                 }
             }
@@ -249,7 +361,7 @@ pub(super) fn stamp(
 /// places the request states itself ([`single::PLACES`]): one set cannot
 /// hold two lists, and each side's places are its lists' to state
 /// ([`PairLists::prefill_places`], [`PairLists::decode_places`]).
-pub(super) fn not_narrowed_by(cx: &Constraints<'_>) -> Option<(ShedReason, &'static str)> {
+fn not_narrowed_by(cx: &Constraints<'_>) -> Option<(ShedReason, &'static str)> {
     match cx.subset_hint {
         Some(0) => Some((ShedReason::NoEndpoints, SUBSET_HINT)),
         Some(_) => Some((ShedReason::PolicyDeclined, SUBSET_HINT)),
@@ -257,6 +369,22 @@ pub(super) fn not_narrowed_by(cx: &Constraints<'_>) -> Option<(ShedReason, &'sta
         None if cx.places.is_some() => Some((ShedReason::PolicyDeclined, single::PLACES)),
         None => None,
     }
+}
+
+/// How a pair's own decision answers a request it is not narrowed by
+/// ([`not_narrowed_by`]) or one that states a mask of its own
+/// ([`Constraints::stalled`], [`Constraints::held`]). Such a mask is
+/// declined under the places' name ([`single::PLACES`]): it names places
+/// of one list, and each side's are stated beside its list
+/// ([`PairLists::prefill_stalled`], [`PairLists::decode_stalled`]). What
+/// a pair is not narrowed by is answered first. An encode request is the
+/// pair's too: its three lists' decision asks this ahead of its own pass,
+/// so the same request is answered alike at its first decision and at its
+/// decode asked again.
+pub(super) fn not_decided(cx: &Constraints<'_>) -> Option<(ShedReason, &'static str)> {
+    let masked = !cx.stalled.is_empty() || !cx.held.is_empty();
+    let declined = (ShedReason::PolicyDeclined, single::PLACES);
+    not_narrowed_by(cx).or_else(|| masked.then_some(declined))
 }
 
 /// The request's session under the decode phase: each side of a pair keeps
@@ -272,7 +400,9 @@ fn decode_session(facts: &RequestFacts<'_>) -> Session {
 /// A pair's decision over the records of its two lists, stamped
 /// ([`stamp`]): the engine's pair entry. `pool` holds the prefill list's
 /// facts. The request's constraints are read by both sides, each with
-/// the places its list states (`places`: the prefills', the decodes').
+/// the places its list states and the places its host's vetoes mask and
+/// hold in it (`sides`: the prefills', the decodes'). A side whose mask
+/// was written into its records states none here ([`Beside::written`]).
 ///
 /// One side alone is no pair: where either list holds no record the engine
 /// answers over no candidate. A request that states a hard demand or a
@@ -281,7 +411,7 @@ fn decode_session(facts: &RequestFacts<'_>) -> Session {
 fn decide_records(
     engine: &Engine,
     facts: &RequestFacts<'_>,
-    (cx, places): (&Constraints<'_>, [Option<&[u32]>; 2]),
+    (cx, sides): (&Constraints<'_>, [Beside<'_>; 2]),
     pool: &PoolFacts<'_>,
     pools: PairPools<'_>,
     scratch: &mut Scratch,
@@ -293,24 +423,16 @@ fn decide_records(
         };
         return engine.decide_pair(facts, &none, PairPools::default(), cx, cx, scratch);
     }
-    if let Some((reason, stage)) = not_narrowed_by(cx) {
+    if let Some((reason, stage)) = not_decided(cx) {
         return shed(reason, stage, facts.seed, pool.generation);
     }
-    match places {
-        [None, None] => engine.decide_pair(facts, pool, pools, cx, cx, scratch),
-        // Each side's set opens with its own places.
-        [prefills, decodes] => {
-            let prefill_cx = Constraints {
-                places: prefills,
-                ..*cx
-            };
-            let decode_cx = Constraints {
-                places: decodes,
-                ..*cx
-            };
-            engine.decide_pair(facts, pool, pools, &prefill_cx, &decode_cx, scratch)
-        }
+    let [prefills, decodes] = sides;
+    if prefills.states_nothing() && decodes.states_nothing() {
+        return engine.decide_pair(facts, pool, pools, cx, cx, scratch);
     }
+    // Each side's set opens with its own places, under its own mask.
+    let (prefill_cx, decode_cx) = (prefills.of(cx), decodes.of(cx));
+    engine.decide_pair(facts, pool, pools, &prefill_cx, &decode_cx, scratch)
 }
 
 /// What a pair's first pick ([`PairLists::decide`]) issues: the prefill
@@ -356,7 +478,8 @@ pub(super) fn issue(
 /// ([`stamp`]): the engine's decode entry over the partners of the prefill
 /// of `held`, the target the pair holds, handed the decode that target
 /// names. `pool` holds the decode list's facts. The decodes are held to
-/// `places`, the decode list's.
+/// the decode list's places and read under its mask (`side`). The prefill
+/// list's mask is not read: the held prefill ran already.
 ///
 /// A prefill list with no record holds no held prefill: the entry answers
 /// over no list, is handed no decode and names the prefill that left,
@@ -370,7 +493,7 @@ pub(super) fn issue(
 fn decide_decode_records(
     engine: &Engine,
     facts: &RequestFacts<'_>,
-    (cx, places): (&Constraints<'_>, Option<&[u32]>),
+    (cx, side): (&Constraints<'_>, Beside<'_>),
     pool: &PoolFacts<'_>,
     pools: PairPools<'_>,
     held: &Target,
@@ -390,17 +513,15 @@ fn decide_decode_records(
         return engine.decide_decode(&facts, &none, no_lists, prefill, None, cx, scratch);
     }
     let listed = |_: &_| pools.prefills.iter().any(|row| row.id == prefill);
-    if let Some((reason, stage)) = not_narrowed_by(cx).filter(listed) {
+    if let Some((reason, stage)) = not_decided(cx).filter(listed) {
         return shed(reason, stage, facts.seed, pool.generation);
     }
     let first = held.pair.map(|pair| (pair.decode_id, pair.decode_dp_rank));
-    match places {
-        None => engine.decide_decode(&facts, pool, pools, prefill, first, cx, scratch),
-        Some(_) => {
-            let decode_cx = Constraints { places, ..*cx };
-            engine.decide_decode(&facts, pool, pools, prefill, first, &decode_cx, scratch)
-        }
+    if side.states_nothing() {
+        return engine.decide_decode(&facts, pool, pools, prefill, first, cx, scratch);
     }
+    let decode_cx = side.of(cx);
+    engine.decide_decode(&facts, pool, pools, prefill, first, &decode_cx, scratch)
 }
 
 /// What a pick of the decode decided again ([`PairLists::decide`] behind a
@@ -593,6 +714,8 @@ mod tests {
             DecisionGuard,
         },
     };
+
+    mod vetoed;
 
     const MODEL: &str = "model-a";
 
@@ -787,6 +910,16 @@ mod tests {
         PartnerClasses::number(decodes as usize, (0..prefills).map(|_| all.as_slice()))
     }
 
+    /// What a host states beside one side's list where it holds the side
+    /// to `places` and no veto of its own stands on a place.
+    fn unvetoed(places: Option<&[u32]>) -> Beside<'_> {
+        Beside {
+            places,
+            stalled: &[],
+            held: &[],
+        }
+    }
+
     /// The pair decided now over the two lists' records.
     fn decide_over(
         spec: &AppliedSpec,
@@ -799,7 +932,7 @@ mod tests {
         decide_records(
             spec.engine(),
             facts,
-            (&free, [None, None]),
+            (&free, [unvetoed(None); 2]),
             &pool(prefills),
             pools(prefills, decodes, classes),
             &mut Scratch::default(),
@@ -916,7 +1049,7 @@ mod tests {
             let decision = decide_records(
                 spec.engine(),
                 &facts(),
-                (cx, [None, None]),
+                (cx, [unvetoed(None); 2]),
                 &pool(&prefills),
                 pools(&prefills, &decodes, &classes),
                 &mut Scratch::default(),
@@ -1075,7 +1208,7 @@ mod tests {
         let again = decide_decode_records(
             pair.spec.engine(),
             &facts,
-            (&Constraints::default(), None),
+            (&Constraints::default(), unvetoed(None)),
             &pool(&decodes),
             pools(&prefills, &decodes, &classes),
             &prefill_alone(WorkerId(1)),
@@ -1107,7 +1240,7 @@ mod tests {
         let again = decide_decode_records(
             pair.spec.engine(),
             &facts(),
-            (&Constraints::default(), None),
+            (&Constraints::default(), unvetoed(None)),
             &pool(&decodes),
             pools(&prefills, &decodes, &classes),
             &prefill_alone(WorkerId(5)),
@@ -1245,6 +1378,10 @@ mod tests {
                 admission: &OPEN,
                 prefill_places: None,
                 decode_places: None,
+                prefill_stalled: &[],
+                prefill_held: &[],
+                decode_stalled: &[],
+                decode_held: &[],
             };
             let constraints = Constraints {
                 decode_later: later,
@@ -1317,8 +1454,24 @@ mod tests {
             constraints: Constraints<'_>,
             places: [Option<&[u32]>; 2],
         ) -> Decision {
+            let unmasked = [[&[][..]; 2]; 2];
+            self.decide_vetoed(admission, (seed, held), constraints, places, unmasked)
+        }
+
+        /// [`Self::decide_among`] for a host whose standing vetoes mask
+        /// `vetoes`: for the prefill list and then for the decode list,
+        /// the places masked and those of them a hold stands on.
+        fn decide_vetoed(
+            &self,
+            admission: &dyn PairAdmission,
+            (seed, held): (u64, Option<&Target>),
+            constraints: Constraints<'_>,
+            places: [Option<&[u32]>; 2],
+            vetoes: [[&[u32]; 2]; 2],
+        ) -> Decision {
             let [prefill, decode] = &self.members;
             let classes = every(self.prefills.len(), self.decodes.len() as u32);
+            let [[prefill_stalled, prefill_held], [decode_stalled, decode_held]] = vetoes;
             let lists = PairLists {
                 prefill,
                 decode,
@@ -1326,6 +1479,10 @@ mod tests {
                 admission,
                 prefill_places: places[0],
                 decode_places: places[1],
+                prefill_stalled,
+                prefill_held,
+                decode_stalled,
+                decode_held,
             };
             let mut request = Request {
                 id: b"",
@@ -1593,7 +1750,7 @@ mod tests {
             decide_records(
                 spec.engine(),
                 &facts,
-                (&free, places),
+                (&free, places.map(unvetoed)),
                 &pool(&prefills),
                 pools(&prefills, &decodes, &classes),
                 &mut Scratch::default(),
@@ -1637,7 +1794,7 @@ mod tests {
             decide_decode_records(
                 pair.spec.engine(),
                 &facts,
-                (&free, Some(places)),
+                (&free, unvetoed(Some(places))),
                 &pool(&decodes),
                 pools(&prefills, &decodes, &classes),
                 &prefill_alone(WorkerId(2)),
@@ -1806,7 +1963,7 @@ mod tests {
             let again = decide_decode_records(
                 pair.spec.engine(),
                 &facts(),
-                (&demanded, None),
+                (&demanded, unvetoed(None)),
                 &pool(&decodes),
                 pools(&prefills, &decodes, &classes),
                 &prefill_alone(WorkerId(1)),
@@ -1997,6 +2154,10 @@ mod tests {
                 admission: &OPEN,
                 prefill_places: None,
                 decode_places: None,
+                prefill_stalled: &[],
+                prefill_held: &[],
+                decode_stalled: &[],
+                decode_held: &[],
             };
             let positions = [position];
             let facts = RequestFacts {
@@ -3145,7 +3306,7 @@ mod tests {
             let decision = decide_records(
                 spec.engine(),
                 &facts,
-                (&free, [None, Some(&[5])]),
+                (&free, [unvetoed(None), unvetoed(Some(&[5]))]),
                 &pool(&prefills),
                 pools(&prefills, &decodes, &classes),
                 &mut Scratch::default(),
@@ -3177,7 +3338,7 @@ mod tests {
         let decision = decide_records(
             spec.engine(),
             &facts(),
-            (&free, [Some(&[0]), None]),
+            (&free, [unvetoed(Some(&[0])), unvetoed(None)]),
             &pool(&prefills),
             pools(&prefills, &decodes, &classes),
             &mut Scratch::default(),
@@ -3210,7 +3371,7 @@ mod tests {
             decide_decode_records(
                 pair.spec.engine(),
                 &facts(),
-                (cx, places),
+                (cx, unvetoed(places)),
                 &pool(&decodes),
                 pools(&prefills, &decodes, &classes),
                 &prefill_alone(WorkerId(held)),
@@ -3292,7 +3453,7 @@ mod tests {
             decide_records(
                 spec.engine(),
                 &facts(),
-                (&free, [None, Some(&[1])]),
+                (&free, [unvetoed(None), unvetoed(Some(&[1]))]),
                 &pool(&prefills),
                 pools(&prefills, &decodes, &classes),
                 &mut Scratch::default(),
@@ -3370,7 +3531,7 @@ mod tests {
             let decision = decide_records(
                 steers.engine(),
                 &facts,
-                (&free, [None, Some(&[5])]),
+                (&free, [unvetoed(None), unvetoed(Some(&[5]))]),
                 &pool(&prefills),
                 pools(&prefills, &decodes, &classes),
                 &mut Scratch::default(),
