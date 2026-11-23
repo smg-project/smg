@@ -277,11 +277,13 @@ on one prefill worker, and classic places it by the main policy. Over gRPC or ZM
 with no worker, as the encode mode does, so the document binds no single request. The settings
 state how the gateway reaches its workers.
 
-The document plans the pair alone in other cases too, among them:
+The document plans the mode's own sides alone, with no single request, in other cases too. Among
+them:
 
 - The main policy states a setting that no document says.
-- In a gateway of one router, one of the two policies (the pairs', the single requests') names a
-  block size and the other places by a prefix ring, which counts its key in another size.
+- In a gateway of one router, or in the encode mode of many routers, a policy of one of the two
+  families (the mode's own sides, the single requests) names a block size and a policy of the
+  other places by a prefix ring, which counts its key in another size.
 
 A request of the family left out is then refused: the token count in a gateway of one router,
 each single request in a gateway of many routers.
@@ -1236,8 +1238,8 @@ There is a trap for the lender: classic asks its ring for two different texts.
 
 | Policy | What classic asks its ring for |
 |---|---|
-| `prefix_hash` | the sixteen hex digits of the hash of the bytes a request is placed by, also where those bytes are a routing key's (`model_gateway/src/policies/prefix_hash.rs:223`, `:292`, `:300`) |
-| `consistent_hashing` | the routing key's own text (`model_gateway/src/policies/consistent_hashing.rs:84`, `:109`) |
+| `prefix_hash` | the sixteen hex digits of the hash of the bytes a request is placed by, also where those bytes are a routing key's (`ring_key` and `find_worker_with_load_balance` in `model_gateway/src/policies/prefix_hash.rs`) |
+| `consistent_hashing` | the routing key's own text (`find_by_consistent_hash` in `model_gateway/src/policies/consistent_hashing.rs`) |
 
 A lender that states a request's place from the wrong text sends routing keys to other workers
 than classic does, and no test in the crate sees it.
@@ -1643,7 +1645,7 @@ request ──> route (HTTP or gRPC, any family)
   engine is lent **[planned]**: it keeps them, runs their size pass on a timer and tells them a
   worker that left.
 
-  The start makes the policy crate's one start call as the last step of the context's build. The document is checked first against the table of stages the gateway's host hands the start, or the stock table where it hands none, and a refused document ends the start before the gateway listens. The engine's task follows the registry's events and tells the document's stages a worker that joined and a worker that was removed. Where the configuration runs the policy controller the gateway builds its policy registry with no classic policy object: a stand-in that places nothing stands in its default and encode slots, and a worker's registration and a router's build add no policy.
+  The start makes the policy crate's one start call as the last step of the context's build. The document is checked first against the table of stages the gateway's host hands the start, or the stock table where it hands none, and a refused document ends the start before the gateway listens. The engine's task follows the registry's events and tells the document's stages a worker that joined and a worker that was removed. With the engine on, the gateway builds its policy registry with no classic policy object: a stand-in that places nothing stands in its default and encode slots, and a worker's registration and a router's build add no policy.
 
 - **Each request.** Four of the five functions ask the engine. They fill `PlaceRequest` from the inputs
   they already take. A route names the answer's type and makes its load guard from the answer, in the places it made one before.
@@ -1697,6 +1699,10 @@ The bar for that change:
 | `--print-policy-spec` | print the document the routing flags mean, and exit |
 
 They came back with the change (decision 9). No released version has them.
+
+In a gateway whose every router is a third-party provider's, `on` changes nothing: no engine
+starts, the classic policies stay, and the start says so in one log line. A document supplied
+beside such a mode is refused at the start, by the mode's name.
 
 ## 10. The controller **[partly]**
 
