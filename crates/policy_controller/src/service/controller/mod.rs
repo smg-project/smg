@@ -29,8 +29,9 @@
 //! and returns.
 //!
 //! Every replica runs the same loop, the load driver included. A follower
-//! polls no engine and is sent no load row: its first poll goes out at its
-//! promotion, and its decisions read no load report until that poll lands.
+//! polls no engine, is sent no load row and holds none: the rows of a lead
+//! are dropped where the lead ends. Its first poll goes out at its
+//! promotion. A decision reads none of the store's load rows yet.
 //!
 //! Every socket a listener accepts is set to send at once: a small answer
 //! never waits for the peer's acknowledgement of the write before it.
@@ -921,9 +922,10 @@ impl Controller {
         let loads = driver.stats();
         let driver_stop = stop.subscribe();
         // A replica that follows polls no engine: it decides no request, and
-        // it is sent no load row. The loop itself runs on every replica: it
-        // pays the store's publications, so a followed row reaches the
-        // published world.
+        // it is sent no load row. The driver drops the rows of its own lead
+        // at the word that the lead ended. The loop itself runs on every
+        // replica: it pays the store's publications, so a followed row
+        // reaches the published world.
         let polls = follows.map(|_| shared.role.subscribe());
         tasks.spawn(async move {
             match polls {

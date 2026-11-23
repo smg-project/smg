@@ -43,6 +43,9 @@ pub enum Event {
     /// watched kinds. It changes nothing a standby holds; it is why the
     /// head of a store that leads is never under term `0`, and how a
     /// follower of the log learns the term before the leader's next write.
+    /// A standby journals it too at the place of a load row an older
+    /// leader tells it: the row is kept nowhere, and its place stays
+    /// counted.
     Term,
     /// A generation applied, by its number: one of the watched kinds, and
     /// told to no watch. The document it runs from is its door's to hold,

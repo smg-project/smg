@@ -96,13 +96,13 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ),
     ("LoadSink", "load", EntryReplication::Read),
     ("LoadSink", "ranks", EntryReplication::Read),
-    // The load adapter of a host with no standby is the one caller.
+    // The load driver drops a replica's rows at each turn of its role, and
+    // a host's load adapter drops a worker's where its reports stop: each
+    // replica's own rows, and a standby holds none.
     (
         "LoadSink",
         "evict",
-        EntryReplication::NotYet(
-            "the first host with a standby beside the load adapter brings its event",
-        ),
+        EntryReplication::Rebuilt("each replica drops its own load rows"),
     ),
     (
         "LoadSink",

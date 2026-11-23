@@ -1438,6 +1438,9 @@ message ReplicationEvent {
   oneof event {
     WorkerEvent membership = 1;
     HealthRow health = 2;
+    // A leader of this build sends none. A standby told one by an older
+    // leader journals its position alone, as a term's start, and keeps no
+    // load row. The case stays until the protocol's next break.
     LoadSample load = 3;
     SessionRow pin = 4;
     LeaseRow reservation = 5;

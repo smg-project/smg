@@ -16,8 +16,9 @@
 //! the write's own critical section: a membership or status write with its
 //! row, a load row, an applied generation by its number
 //! ([`Event::Generation`]), and the store's take of a term, which is a
-//! position of its own ([`Event::Term`]). A worker's load rows stand between its
-//! registration and its leaving. Every other entry of the store stands on one
+//! position of its own ([`Event::Term`]). A standby journals that event too
+//! at the place of a load row an older leader tells it. A worker's load rows
+//! stand between its registration and its leaving. Every other entry of the store stands on one
 //! list with what rebuilds it on a standby ([`ENTRIES`]): a gateway's own
 //! facts return in its hello, each replica hears the engines' cache events
 //! itself, and a decision's writes (pins, reservations, lease ends) are not

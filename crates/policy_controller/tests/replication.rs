@@ -947,6 +947,10 @@ async fn a_snapshot_and_the_batches_after_it_are_the_next_snapshot_under_a_write
             written_past(&leader.store, taken.replication_seq).await;
             streams.push((standby, taken));
         }
+        // The events the case counts are waited for, never timed: a load
+        // row of the writer is no event of the log.
+        let first = streams[0].1.replication_seq;
+        written_past(&leader.store, first + 100).await;
         stop.store(true, Ordering::Relaxed);
         let rounds = writer.join().expect("the writer");
         let last = snapshot(leader.replication).await.expect("a snapshot");
@@ -1481,7 +1485,12 @@ async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let lease = dir.path().join("lease");
     with_leader(shared(&dir), |leader| async move {
-        writes(&leader.store, 3);
+        let id = writes(&leader.store, 3);
+        // A load row of the lead, on the leader's own table.
+        leader
+            .store
+            .record(id, 0, running(3), Instant::now(), LoadSource::Stream);
+        assert!(leader.store.load(id, 0).is_some());
         let base = snapshot(leader.replication).await.expect("a snapshot");
         let held = place(base.replication_seq, base.replication_term);
         let mut open = replicate(leader.replication, held.clone())
@@ -1523,6 +1532,16 @@ async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
             never = removed_again(&lease) => match never {},
         };
         assert_eq!(ended, Some(Code::Aborted));
+        // The lead ended: its load row is dropped, so none stands for a
+        // later take to read.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while leader.store.load(id, 0).is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "a replica that lost the lead holds its lead's load row"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         // The fence is closed, and the hello names a place past the head.
         let lost = place(base.replication_seq + 1_000, base.replication_term);
         late.send(proto::ReplicaFrame {
@@ -1803,7 +1822,9 @@ async fn a_promoted_standby_holds_every_row_of_its_leader_and_no_load_row() {
         let (store, stop) = (Arc::clone(&leader.store), Arc::clone(&stop));
         thread::spawn(move || churn(&store, &stop))
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The events the case counts are waited for, never timed: a load row
+    // of the writer is no event of the log.
+    written_past(&leader.store, began.0 + 100).await;
     stop.store(true, Ordering::Relaxed);
     let rounds = writer.join().expect("the writer");
     let (head, wrote) = leader.held();
