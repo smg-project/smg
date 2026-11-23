@@ -1299,25 +1299,14 @@ async fn decode_video_frames(
                 })
                 .await
                 .map_err(MediaConnectorError::Blocking)?;
-                match result {
-                    Ok(frames) => Ok(frames),
-                    Err(error) => {
-                        if log_video_decode_timing_enabled() {
-                            info!(
-                                error = %error,
-                                "smg_mm_timing video_decode_opencv_buffer_fallback"
-                            );
-                        }
-                        decode_video_bytes_with_tempfile(bytes, cfg)
-                            .await
-                            .map_err(|fallback_error| {
-                                let message = format!(
-                                    "buffered OpenCV decode failed: {error}; tempfile OpenCV fallback failed: {fallback_error}"
-                                );
-                                fallback_failed(error, fallback_error, message)
-                            })
-                    }
-                }
+                opencv_frames_or_fallback(
+                    result,
+                    "smg_mm_timing video_decode_opencv_buffer_fallback",
+                    "buffered OpenCV decode",
+                    "tempfile OpenCV fallback",
+                    decode_video_bytes_with_tempfile(bytes, cfg),
+                )
+                .await
             }
             #[cfg(not(feature = "opencv-video"))]
             {
@@ -1338,25 +1327,14 @@ async fn decode_video_frames(
                 })
                 .await
                 .map_err(MediaConnectorError::Blocking)?;
-                match opencv_result {
-                    Ok(frames) => Ok(frames),
-                    Err(opencv_error) => {
-                        if log_video_decode_timing_enabled() {
-                            info!(
-                                error = %opencv_error,
-                                "smg_mm_timing video_decode_auto_opencv_fallback"
-                            );
-                        }
-                        decode_video_bytes_with_tempfile(bytes, cfg)
-                            .await
-                            .map_err(|fallback_error| {
-                                let message = format!(
-                                    "buffered OpenCV decode failed: {opencv_error}; tempfile fallback failed: {fallback_error}"
-                                );
-                                fallback_failed(opencv_error, fallback_error, message)
-                            })
-                    }
-                }
+                opencv_frames_or_fallback(
+                    opencv_result,
+                    "smg_mm_timing video_decode_auto_opencv_fallback",
+                    "buffered OpenCV decode",
+                    "tempfile fallback",
+                    decode_video_bytes_with_tempfile(bytes, cfg),
+                )
+                .await
             }
             #[cfg(not(feature = "opencv-video"))]
             {
@@ -1379,6 +1357,32 @@ async fn decode_video_bytes_with_tempfile(
             .map_err(MediaConnectorError::Blocking)??
     };
     decode_video_frames_from_path(input_file.path(), input_bytes, cfg).await
+}
+
+/// An OpenCV loader's frames, or `fallback`'s where the loader failed. A
+/// reservation the loader was refused ([`is_out_of_memory`]) starts no
+/// fallback: a second decode would ask a process just refused memory for the
+/// clip again, and its verdict would stand over this process's own.
+#[cfg(any(feature = "opencv-video", test))]
+async fn opencv_frames_or_fallback(
+    loaded: Result<DecodedVideoFrames, MediaConnectorError>,
+    event: &'static str,
+    first: &'static str,
+    second: &'static str,
+    fallback: impl std::future::Future<Output = Result<DecodedVideoFrames, MediaConnectorError>>,
+) -> Result<DecodedVideoFrames, MediaConnectorError> {
+    let error = match loaded {
+        Ok(frames) => return Ok(frames),
+        Err(error) if is_out_of_memory(&error) => return Err(error),
+        Err(error) => error,
+    };
+    if log_video_decode_timing_enabled() {
+        info!(error = %error, "{event}");
+    }
+    fallback.await.map_err(|fallback_error| {
+        let message = format!("{first} failed: {error}; {second} failed: {fallback_error}");
+        fallback_failed(error, fallback_error, message)
+    })
 }
 
 /// The error of a video decode whose fallback failed too, with both
@@ -1455,27 +1459,14 @@ async fn decode_video_frames_from_path(
                 .await
                 .map_err(MediaConnectorError::Blocking)?;
 
-                match opencv_result {
-                    Ok(frames) => Ok(frames),
-                    Err(opencv_error) => {
-                        if log_video_decode_timing_enabled() {
-                            info!(
-                                error = %opencv_error,
-                                "smg_mm_timing video_decode_auto_opencv_fallback"
-                            );
-                        }
-
-                        match decode_video_with_ffmpeg(input_path, input_bytes, cfg).await {
-                            Ok(frames) => Ok(frames),
-                            Err(ffmpeg_error) => {
-                                let message = format!(
-                                    "OpenCV decode failed: {opencv_error}; ffmpeg fallback failed: {ffmpeg_error}"
-                                );
-                                Err(fallback_failed(opencv_error, ffmpeg_error, message))
-                            }
-                        }
-                    }
-                }
+                opencv_frames_or_fallback(
+                    opencv_result,
+                    "smg_mm_timing video_decode_auto_opencv_fallback",
+                    "OpenCV decode",
+                    "ffmpeg fallback",
+                    decode_video_with_ffmpeg(input_path, input_bytes, cfg),
+                )
+                .await
             }
 
             #[cfg(not(feature = "opencv-video"))]
@@ -1765,7 +1756,7 @@ where
     let mut rgb_output = None;
     let mut frames = Vec::new();
     frames.try_reserve(frame_indices.len()).map_err(|e| {
-        MediaConnectorError::VideoDecode(format!(
+        out_of_memory(format!(
             "failed to reserve {} decoded video frame records: {e}",
             frame_indices.len()
         ))
@@ -1834,10 +1825,7 @@ where
                 )
             })?;
             ensure_decoded_byte_limit(decoded_bytes)?;
-            rgb_output = Some(
-                RgbOutputBuffer::with_capacity(decoded_bytes)
-                    .map_err(MediaConnectorError::VideoDecode)?,
-            );
+            rgb_output = Some(RgbOutputBuffer::with_capacity(decoded_bytes)?);
         }
         let output = rgb_output.as_mut().ok_or_else(|| {
             MediaConnectorError::VideoDecode("missing OpenCV RGB output buffer".to_string())
@@ -1849,9 +1837,7 @@ where
             )
         })?;
         ensure_decoded_byte_limit(new_len)?;
-        let (offset, len) = output
-            .push_bgr(&bgr_frame, decoded_width, decoded_height)
-            .map_err(MediaConnectorError::VideoDecode)?;
+        let (offset, len) = output.push_bgr(&bgr_frame, decoded_width, decoded_height)?;
         let frame = DecodedRgbFrame {
             width: decoded_width,
             height: decoded_height,
@@ -3422,17 +3408,17 @@ fn is_video_budget_error(error: &MediaConnectorError) -> bool {
 /// ([`out_of_memory`]), or a pipe the system could not serve. Where the error
 /// of a frame runner decides a fallback, this one ends the decode by rule: no
 /// next runner, no sequential pass after the seeks, no resampling after a
-/// resized selection. The probes handle their own errors. It reads the kind,
-/// which is what [`MediaConnectorError::fallback_failed`] keeps of such an
-/// error.
+/// resized selection, no fallback after the OpenCV loader. The probes handle
+/// their own errors. It reads the kind, which is what
+/// [`MediaConnectorError::fallback_failed`] keeps of such an error.
 fn is_out_of_memory(error: &MediaConnectorError) -> bool {
     matches!(error, MediaConnectorError::DecodeIo(io) if io.kind() == std::io::ErrorKind::OutOfMemory)
 }
 
 /// The error of a reservation the allocator refused, which is this process's:
 /// a command's output, the joined output of the seek runs, the raw runner's
-/// frame records.
-fn out_of_memory(message: String) -> MediaConnectorError {
+/// frame records, the OpenCV loader's output and frame records.
+pub(crate) fn out_of_memory(message: String) -> MediaConnectorError {
     MediaConnectorError::DecodeIo(std::io::Error::new(
         std::io::ErrorKind::OutOfMemory,
         message,
