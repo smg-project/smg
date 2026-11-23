@@ -963,6 +963,18 @@ fn a_pick_that_meets_a_held_record_leaves_its_prefix_out() {
     assert_eq!(bed.affinity.left_out(), 1);
 }
 
+/// A list of no worker is read no table: no record of sent prefixes is
+/// made and the host's index is not asked.
+#[test]
+fn a_list_of_no_worker_keeps_no_record() {
+    let (affinity, host, _) = hosted(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 0);
+    let asked = prompt(1_000, 4);
+    bed.decide(&request(&asked, 7, NOW), None);
+    assert!(bed.affinity.records.lock().is_empty());
+    assert_eq!(host.asked.load(Ordering::Relaxed), 0);
+}
+
 /// A prompt of more blocks than one turn of the record's lock writes is
 /// recorded to its end.
 #[test]
