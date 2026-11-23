@@ -54,6 +54,8 @@
 mod conversations;
 #[path = "../tests/common/counting_alloc.rs"]
 mod counting_alloc;
+#[path = "in_process/encode.rs"]
+mod encode;
 #[path = "in_process/pair.rs"]
 mod pair;
 #[path = "in_process/place.rs"]
@@ -213,6 +215,20 @@ const CELLS: &[Cell] = &[
         name: "consistent_hashing",
         document: || preset("consistent_hashing"),
         request: keyed,
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "encode_least_load",
+        document: || encode::of("least_load"),
+        request: encode::request,
+        words: encode::words,
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "encode_round_robin",
+        document: || encode::of("round_robin"),
+        request: encode::request,
+        words: encode::words,
         ..Cell::PLAIN
     },
     Cell {
@@ -664,8 +680,9 @@ fn stretch<T>(
 
 fn main() {
     let run = run();
-    // A pair's cell hands two lists: its run is its file's.
-    if pair::runs(&run) {
+    // A pair's cell hands two lists and an encode request's three: such a
+    // run is its file's.
+    if pair::runs(&run) || encode::runs(&run) {
         return;
     }
     let Cell {

@@ -2,13 +2,15 @@
 //! makes for a request ([`PolicyEngine::place`]), instead of the engine's
 //! entry.
 //!
-//! It is asked for a cell whose request is plain and carries no key. The
-//! caller states the model, its list and a prompt of the size the plain
-//! request states, and says the dispatch and the end of the placement it is
-//! answered. It lends no load snapshot: the engine reads its own. The
-//! result line names the entry asked (`entry=`).
+//! It is asked for a cell whose request is plain and carries no key, and
+//! for an encode request's cell, whose own file states its three lists
+//! ([`asked_with_lists`]). For a plain cell the caller states the model,
+//! its list and a prompt of the size the plain request states, and says
+//! the dispatch and the end of the placement it is answered. It lends no
+//! load snapshot: the engine reads its own. The result line names the
+//! entry asked (`entry=`).
 //!
-//! Every request states its prompt's entry in a token tree
+//! Every request of a plain cell states its prompt's entry in a token tree
 //! ([`Prompt::entry`]), as a host that lends one states it for each
 //! request. A cell whose document reads no tree never has it asked: its
 //! count is what the stated field costs unread. A cell whose callers hold
@@ -31,7 +33,7 @@ use super::{conversations, ruled, Host, Run, MODEL, RING};
 
 /// The prompt a request by the one call states: 1,024 token ids, the size
 /// the plain request states.
-static PROMPT: [u32; 1_024] = [0; 1_024];
+pub(super) static PROMPT: [u32; 1_024] = [0; 1_024];
 
 /// The plain prompt's entry in a token tree: its token ids, under no cache
 /// partition.
@@ -168,4 +170,15 @@ pub(super) fn word() -> &'static str {
     } else {
         " entry=decide_at"
     }
+}
+
+/// Whether `run` asks the one call of a cell that hands lists of its own,
+/// which its own file runs: an encode request's. Such a cell states no
+/// route's rule, and the run stops on one. The result line's word says the
+/// entry asked.
+pub(super) fn asked_with_lists(run: &Run) -> bool {
+    assert!(run.entry != ruled::ENTRY, "such a cell states no rule");
+    let asked = run.entry == "place";
+    ASKED.store(asked, Ordering::Relaxed);
+    asked
 }
