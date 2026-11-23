@@ -454,14 +454,6 @@ name = "store_view"
 harness = false
 
 [[bench]]
-name = "store_pair"
-harness = false
-
-[[bench]]
-name = "store_lent_rows"
-harness = false
-
-[[bench]]
 name = "store"
 harness = false
 
@@ -471,10 +463,6 @@ harness = false
 
 [[bench]]
 name = "store_journal"
-harness = false
-
-[[bench]]
-name = "store_affinity_rows"
 harness = false
 
 [[bench]]

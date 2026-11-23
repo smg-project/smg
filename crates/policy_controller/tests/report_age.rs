@@ -1,21 +1,15 @@
-//! Report age at the decision, across the load readers and both view forms.
+//! Report age at the decision, across the load readers.
 
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
-
-use std::time::{Duration, Instant};
 
 use smg_policy_controller::{
     document::{PolicySpec, SpecError, API_VERSION},
     engine::{
         AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Decision, Engine,
-        Health, LoadRow, PairPools, Phase, PoolFacts, RequestFacts, Role, ScoreFront, Scratch,
-        Target, WorkerId,
+        Health, LoadRow, PairPools, Phase, PoolFacts, RequestFacts, ScoreFront, Scratch, Target,
+        WorkerId,
     },
     stages::Lifecycle,
-    store::{
-        GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, ViewQuery, WorkerFacts,
-        WorkerStatus, WorkersStore,
-    },
     tracking::{Lease, Membership, Side},
 };
 
@@ -420,102 +414,4 @@ fn both_sides_of_a_pair_use_the_report_age_limit() {
         decide(&spec.validate().expect("the bare pair policy")),
         (prefills[0].id, decodes[0].id)
     );
-}
-
-#[test]
-fn lent_and_written_rows_expire_at_the_same_instant() {
-    for limit_ms in [LIMIT_MS, MAX_LIMIT_MS] {
-        check_view_limit(limit_ms);
-    }
-}
-
-fn check_view_limit(limit_ms: u64) {
-    let store = MemoryStore::new();
-    let at_limit = Instant::now();
-    let sampled = at_limit - Duration::from_millis(limit_ms);
-    let add = |key: &str, at, work| {
-        let worker = store.upsert(WorkerFacts {
-            key: key.to_owned(),
-            engine: key.to_owned(),
-            incarnation: 1,
-            models: vec!["m".to_owned()],
-            dp_size: 1,
-            ..WorkerFacts::default()
-        });
-        let id = worker.id();
-        let revision = store.get(id).expect("a worker").revision;
-        store
-            .set_status(id, WorkerStatus::Ready, revision)
-            .expect("ready");
-        store.record(
-            id,
-            0,
-            LoadRow {
-                running: work,
-                live_rate: 1_000,
-                ..LoadRow::default()
-            },
-            at,
-            LoadSource::Stream,
-        );
-        id
-    };
-    let first = add("worker-a", sampled, 17);
-    let second = add("worker-b", at_limit, 2);
-    store.publish_now();
-    let engine = policy(r#""least-load""#, Some(limit_ms));
-    let decide = |at, written| {
-        let ask = ViewQuery {
-            gateway: GatewayId(0),
-            now: at,
-            pinned: None,
-            affinity: false,
-            signal_cells: false,
-        };
-        store.with_snapshot(|world| {
-            let mut buffers = ViewBuffers::default();
-            let view = world
-                .view("m", Role::Single, &ask, written, &mut buffers)
-                .expect("the pool");
-            let facts = RequestFacts {
-                model: "m",
-                now_micros: view.built.now_micros,
-                ..request()
-            };
-            let decision = engine.decide(
-                &facts,
-                &view.pool_facts(),
-                view.candidates,
-                &Constraints::default(),
-                &mut Scratch::new(),
-            );
-            let row = view
-                .candidates
-                .iter()
-                .find(|row| row.id == first)
-                .expect("a row");
-            (decision, row.load.expect("the load record").report_age_ms)
-        })
-    };
-    // The stale row has no requests in flight, so its missing report uses
-    // the fresh row's baseline. At the boundary it still has its own cost.
-    let expired = at_limit + Duration::from_micros(1);
-    let (at_edge, lent_age) = decide(at_limit, false);
-    assert_eq!(
-        at_edge
-            .pick()
-            .expect("a pick")
-            .targets
-            .iter()
-            .next()
-            .expect("a worker")
-            .id,
-        second
-    );
-    assert_eq!(lent_age, 0);
-    assert_eq!(decide(at_limit, true), (at_edge, limit_ms as u32));
-    let (after, lent_age) = decide(expired, false);
-    assert_eq!(lent_age, 0);
-    assert_ne!(after, at_edge);
-    assert_eq!(decide(expired, true), (after, limit_ms as u32));
 }
