@@ -11,7 +11,9 @@ use smg_worker::test_support::ready_worker;
 
 use super::*;
 use crate::{
-    document::spec::{PolicySpec, RulePlaced, ScoreStage, ShadowSpec, WarmupSliceParams},
+    document::spec::{
+        PolicySpec, ProfileSpec, RulePlaced, ScoreStage, ShadowSpec, WarmupSliceParams,
+    },
     engine::{
         decision::{Pick, Shed, ShedReason, Target, Targets, Trace},
         framework::Scratch,
@@ -38,20 +40,41 @@ fn preset(name: &str) -> AppliedSpec {
 /// The cache-aware preset with its warm-up stage ruling by `secs` seconds
 /// and four blocks, so a case's few blocks make a level.
 fn warming_by(secs: u64) -> AppliedSpec {
+    ruled_by(warm_up(secs), |_| {})
+}
+
+/// The warm-up stage of [`warming_by`], for a case that states one more
+/// of its numbers.
+fn warm_up(secs: u64) -> WarmupSliceParams {
+    WarmupSliceParams {
+        weight: 8.0,
+        secs: Some(secs),
+        blocks: Some(4),
+        ..WarmupSliceParams::default()
+    }
+}
+
+/// The cache-aware preset with `stage` as its warm-up stage, its profile
+/// as `change` then leaves it.
+fn ruled_by(stage: WarmupSliceParams, change: impl FnOnce(&mut ProfileSpec)) -> AppliedSpec {
     let mut document = PolicySpec::preset("cache_aware").expect("the preset");
     document.generation = 1;
     let profile = document
         .profiles
         .get_mut("cache_aware")
         .expect("the preset's profile");
-    profile.score[0] = ScoreStage::WarmupSlice(WarmupSliceParams {
-        weight: 8.0,
-        secs: Some(secs),
-        blocks: Some(4),
-        ..WarmupSliceParams::default()
-    })
-    .into();
+    profile.score[0] = ScoreStage::WarmupSlice(stage).into();
+    change(profile);
     AppliedSpec::validate(&document).expect("the document validates")
+}
+
+/// [`warming_by`] sixty seconds under a picker whose sample is `sample`
+/// rows: the most holders, and the most warming rows, a decision is named.
+fn sampled(sample: u32) -> AppliedSpec {
+    use crate::document::spec::{BestParams, PickStage};
+    ruled_by(warm_up(60), |profile| {
+        profile.pick = PickStage::Best(BestParams { sample }).into();
+    })
 }
 
 fn address(at: usize) -> String {
@@ -969,6 +992,113 @@ fn a_young_worker_is_named_until_its_window_ends() {
     assert_eq!(warming(NOW + SECOND), (vec![3], false));
     // By the table that stands, past the end of the row's own window.
     assert_eq!(warming(NOW + 2 * SECOND - 1), (vec![], false));
+}
+
+/// Past the picker's sample the warming rows a decision is named are a
+/// draw of the sample from its seed, each row as likely as another and
+/// none twice. Within the sample every one is named.
+#[test]
+fn warming_rows_past_the_sample_are_a_draw_each_row_as_likely() {
+    // Fourteen workers hold a level, and the ten behind them nothing: thin
+    // beside a fleet whose median holds one.
+    let bed = |sample| {
+        let (affinity, _, index) = hosted(true);
+        let index = index.expect("the index");
+        let level = hashes_of(&prompt(1_000, 8));
+        for at in 0..14 {
+            store(&index, at, &level);
+        }
+        Bed::new(affinity, sampled(sample), 24)
+    };
+    let other = prompt(50_000, 2);
+    let thin: Vec<u32> = (14..24).collect();
+    let named = bed(16).decide(&request(&other, 1, NOW), None);
+    let named = named.expect("rows");
+    assert_eq!((named.warming, named.thin), (thin.clone(), true));
+    let cut = bed(4);
+    let mut drawn = std::collections::BTreeMap::new();
+    for seed in 0..1_000 {
+        let named = cut.decide(&request(&other, seed, NOW), None);
+        let rows = named.expect("rows").warming;
+        assert_eq!(rows.len(), 4, "seed {seed}");
+        assert!(rows.is_sorted_by(|a, b| a < b), "{rows:?}");
+        for row in rows {
+            *drawn.entry(row).or_insert(0_u32) += 1;
+        }
+    }
+    // 1,000 draws of 4 in 10: about 400 a row.
+    assert_eq!(drawn.keys().copied().collect::<Vec<_>>(), thin);
+    assert!(
+        drawn.values().all(|count| (300..=500).contains(count)),
+        "{drawn:?}"
+    );
+}
+
+/// The holders' draw and the warming rows' draw are on streams of their
+/// own. Two workers are the request's only holders and the list's only
+/// warming rows, under a sample of one: over the seeds each list names
+/// either worker beside either worker of the other. On one stream the two
+/// draws would read one value, and one list's row would give the other's.
+#[test]
+fn the_holders_and_the_warming_rows_are_drawn_apart() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    // Two workers hold a level of blocks of their own.
+    let level = hashes_of(&prompt(1_000, 8));
+    for at in 0..2 {
+        store(&index, at, &level);
+    }
+    // Two hold the request's one block and nothing more: thin.
+    let asked = prompt(9_000, 1);
+    for at in 2..4 {
+        store(&index, at, &hashes_of(&asked));
+    }
+    let bed = Bed::new(affinity, sampled(1), 4);
+    let mut pairs = std::collections::BTreeSet::new();
+    for seed in 0..64 {
+        let named = bed.decide(&request(&asked, seed, NOW), None);
+        let named = named.expect("rows");
+        assert_eq!(
+            (named.holders.len(), named.warming.len()),
+            (1, 1),
+            "seed {seed}"
+        );
+        pairs.insert((named.holders[0].0, named.warming[0]));
+    }
+    assert_eq!(pairs.len(), 4, "{pairs:?}");
+}
+
+/// A document rules the warming rows by its own stage. One whose profile
+/// holds no warm-up stage names nobody. One whose stage holds another
+/// number rules by it: a worker that holds a quarter of the fleet's median
+/// is thin under half of it, and is not under a fifth.
+#[test]
+fn a_document_rules_the_warming_rows_by_its_own_stage() {
+    // Three workers hold a level, the fourth a quarter of what they hold,
+    // and the fifth nothing.
+    let warming = |spec| {
+        let (affinity, _, index) = hosted(true);
+        let index = index.expect("the index");
+        let level = hashes_of(&prompt(1_000, 8));
+        for at in 0..3 {
+            store(&index, at, &level);
+        }
+        store(&index, 3, &level[..2]);
+        let bed = Bed::new(affinity, spec, 5);
+        let named = bed.decide(&request(&prompt(50_000, 2), 7, NOW), None);
+        let named = named.expect("rows");
+        (named.warming, named.thin)
+    };
+    assert_eq!(warming(warming_by(60)), (vec![3, 4], true));
+    let unruled = ruled_by(warm_up(60), |profile| {
+        profile.score.remove(0);
+    });
+    assert_eq!(warming(unruled), (vec![], false));
+    let fifth = WarmupSliceParams {
+        thin_ratio: Some(0.2),
+        ..warm_up(60)
+    };
+    assert_eq!(warming(ruled_by(fifth, |_| {})), (vec![4], true));
 }
 
 /// A list's table is read once, then again by a decision a second later:
