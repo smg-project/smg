@@ -528,7 +528,8 @@ fn what_a_shadow_said_names_its_binding_its_kind_and_its_first_target() {
     let maker = Asks::of(asked, Some(&members));
     let now = Instant::now();
     let made = engine.members_of(members.lent());
-    let (decision, said) = super::decide(&engine, &mut asked, made, &maker, None, now, word);
+    let (decision, said) =
+        super::decide(engine.loaded(), &mut asked, made, &maker, None, now, word);
     // The shadow's picker takes the row behind the live pick's: the live
     // pick's alternate.
     let pick = decision.pick().expect("a pick");

@@ -337,8 +337,9 @@ impl Checked {
         self.constraints.subset_hint
     }
 
-    /// The request's block hashes, in order from its first block.
-    #[cfg(test)]
+    /// The request's block hashes, in order from its first block. Its one
+    /// reader is a case of the client's wire.
+    #[cfg(all(test, feature = "client"))]
     pub(crate) fn block_hashes(&self) -> &[u64] {
         &self.facts.block_hashes
     }

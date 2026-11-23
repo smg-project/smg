@@ -413,7 +413,7 @@ mod tests {
             .whole()
             .expect("a whole decision");
         assert_eq!(said_later, later);
-        Placement::taken(engine, decided, later, now, 0, worker, decode)
+        Placement::taken(engine.loaded(), decided, later, now, 0, worker, decode)
             .expect("a placement")
             .kept()
     }

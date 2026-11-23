@@ -65,7 +65,7 @@ use std::{
 
 use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, runtime::RoutingState};
 
-use super::{keys, overlap, PolicyEngine, PoolMembers};
+use super::{keys, overlap, Loaded, PoolMembers};
 use crate::{
     engine::{
         decision::{Decision, Shed, ShedReason, Trace, SUBSET_HINT, WIRES},
@@ -116,7 +116,7 @@ const NO_STAGE: &str = "none";
 /// Under a document that takes no word on a lease the place is the whole
 /// answer. Under any other the pick is noted ([`noted`]).
 pub(super) fn alone(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     model: &str,
     plain: Plain,
     members: &PoolMembers,
@@ -143,7 +143,7 @@ pub(super) fn alone(
 /// is told where a stage takes it. `None` where the list holds no worker at
 /// the place.
 pub(super) fn noted(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     pick: AlonePick,
     members: &PoolMembers,
     plain: Plain,
@@ -153,7 +153,7 @@ pub(super) fn noted(
     let worker = members.workers().get(position)?;
     // The list's records name each worker once a list: a pick reads the id
     // there and hashes no address.
-    let document = &own.document;
+    let document = own.document;
     let records = members.records(&document.spec, &own.clock);
     let id = *records.ids().get(position)?;
     let dp_rank = records::worker_rank(worker.as_ref());
@@ -252,7 +252,7 @@ impl WholeDecision for WithoutShadow {
 /// A first attempt pays one test for it, and a retry over any other list
 /// one more.
 pub(super) fn decide(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     request: &mut Request<'_>,
     members: &PoolMembers,
     maker: &(impl RequestMaker + ?Sized),
@@ -337,7 +337,7 @@ pub(super) fn decide(
     reason = "a decision's inputs, the request's maker and the whole decision"
 )]
 fn by_facts<const RETRY: bool>(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     members: &PoolMembers,
     records: &PoolRecords,
     live: &records::Live<'_>,
@@ -392,7 +392,7 @@ fn by_facts<const RETRY: bool>(
 /// of a pin its rule keeps from the profile.
 #[inline(never)]
 fn handed_on(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     members: &PoolMembers,
     records: &PoolRecords,
     facts: &mut RequestFacts<'_>,
@@ -402,7 +402,7 @@ fn handed_on(
     overlap::decide(
         &own.affinity,
         members.affinity(),
-        own.spec(),
+        &own.document.spec,
         members.workers(),
         records.ids(),
         facts,
@@ -433,7 +433,7 @@ fn handed_on(
     reason = "a decision's inputs, the request's maker and the whole decision"
 )]
 fn retried(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     members: &PoolMembers,
     records: &PoolRecords,
     live: &records::Live<'_>,
@@ -484,7 +484,7 @@ fn held<'a>(
 
 /// The answer for a request whose host handed no list: a pool of no worker,
 /// which no stage emptied.
-pub(super) fn over_none(own: &PolicyEngine, request: &Request<'_>) -> Decision {
+pub(super) fn over_none(own: Loaded<'_, '_>, request: &Request<'_>) -> Decision {
     shed(own, request, ShedReason::NoEndpoints, NO_STAGE)
 }
 
@@ -494,12 +494,16 @@ pub(super) fn over_none(own: &PolicyEngine, request: &Request<'_>) -> Decision {
 /// of the whole pass kept the pass from being inlined, 43 instructions a
 /// decision.
 #[cold]
-pub(super) fn declined(own: &PolicyEngine, request: &Request<'_>, stage: &'static str) -> Decision {
+pub(super) fn declined(
+    own: Loaded<'_, '_>,
+    request: &Request<'_>,
+    stage: &'static str,
+) -> Decision {
     shed(own, request, ShedReason::PolicyDeclined, stage)
 }
 
 fn shed(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     request: &Request<'_>,
     reason: ShedReason,
     emptied_by: &'static str,
@@ -530,13 +534,13 @@ fn shed(
 /// Under a document that takes no word a pick has no lease: no id is
 /// taken, and its guard owes the engine nothing.
 pub(super) fn issued(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     decision: Decision,
     request: &Request<'_>,
     now: Instant,
 ) -> DecideOutcome {
     let facts = &request.facts;
-    let document = &own.document;
+    let document = own.document;
     let leased = document.hears.intersects(EventSet::LEASE);
     let noted = decision.pick().filter(|_| leased);
     let lease = noted.and_then(|pick| {
@@ -586,7 +590,7 @@ pub(crate) mod tests {
         worker::WorkerStatus,
     };
 
-    use super::*;
+    use super::{super::PolicyEngine, *};
     use crate::{
         document::spec::{
             AppliedSpec, Assignment, PolicySpec, RulePlaced, ScoreStage, ShadowSpec,
@@ -1981,7 +1985,7 @@ pub(crate) mod tests {
         let mut asked = request();
         asked.facts.now_micros = engine.clock.micros(Instant::now());
         hashes.write_to(&mut asked.facts);
-        let nobody = over_none(engine, &asked);
+        let nobody = over_none(engine.loaded(), &asked);
         let ids: Vec<WorkerId> = list
             .iter()
             .map(|worker| worker_id(worker.as_ref()))
@@ -3154,8 +3158,15 @@ pub(crate) mod tests {
             let targets = decided.decision.pick().expect("a pick").targets;
             let taken = targets.as_slice().get(index).copied();
             let worker = Arc::clone(&list[taken.map_or(0, |taken| taken.position as usize)]);
-            let placement =
-                crate::tracking::Placement::taken(engine, decided, later, now, index, worker, None);
+            let placement = crate::tracking::Placement::taken(
+                engine.loaded(),
+                decided,
+                later,
+                now,
+                index,
+                worker,
+                None,
+            );
             (placement, taken)
         };
         let by_hand = || {
@@ -3328,8 +3339,15 @@ pub(crate) mod tests {
             let first = first.expect("a target");
             let worker = Arc::clone(&list[first.position as usize]);
             let now = Instant::now();
-            let placement =
-                crate::tracking::Placement::taken(engine, decided, later, now, 0, worker, None);
+            let placement = crate::tracking::Placement::taken(
+                engine.loaded(),
+                decided,
+                later,
+                now,
+                0,
+                worker,
+                None,
+            );
             let mut placement = placement.expect("a placement");
             assert_eq!(words(), [("issued", first.id, 0)]);
             placement.sent(side);
@@ -3375,8 +3393,15 @@ pub(crate) mod tests {
         let first = first.expect("a target");
         let worker = Arc::clone(&list[first.position as usize]);
         let now = Instant::now();
-        let placement =
-            crate::tracking::Placement::taken(engine, decided, later, now, 0, worker, None);
+        let placement = crate::tracking::Placement::taken(
+            engine.loaded(),
+            decided,
+            later,
+            now,
+            0,
+            worker,
+            None,
+        );
         let mut placement = placement.expect("a placement");
         let ended = |side: Side| Outcome {
             side,
@@ -3446,7 +3471,7 @@ pub(crate) mod tests {
         let pick = placed(engine, &Asks::of(request(), Some(&members)));
         assert_eq!(pick.profile, 1, "the document's second profile picked");
         let worker = &list[pick.place as usize];
-        let label = engine.label_at(pick.profile);
+        let label = engine.loaded().label_at(pick.profile);
         let mut placement = crate::tracking::Placement::alone(Arc::clone(worker), label);
         assert!(!placement.owes_events());
         placement.sent(Side::Single);
@@ -3472,7 +3497,7 @@ pub(crate) mod tests {
         let worker = &list[target.position as usize];
         let now = Instant::now();
         let placement = crate::tracking::Placement::taken(
-            engine,
+            engine.loaded(),
             decided,
             later,
             now,
@@ -3554,8 +3579,15 @@ pub(crate) mod tests {
         let second = Duration::from_secs(1);
         let decided_at = Instant::now().checked_sub(second);
         let decided_at = decided_at.expect("an earlier instant");
-        let placement =
-            crate::tracking::Placement::taken(engine, decided, later, decided_at, 0, worker, None);
+        let placement = crate::tracking::Placement::taken(
+            engine.loaded(),
+            decided,
+            later,
+            decided_at,
+            0,
+            worker,
+            None,
+        );
         let mut placement = placement.expect("a placement");
         placement.sent(Side::Single);
         drop(placement);
@@ -3580,8 +3612,15 @@ pub(crate) mod tests {
         let first = *picked.targets.first().expect("a target");
         let worker = Arc::clone(&list[first.position as usize]);
         let now = Instant::now();
-        let placement =
-            crate::tracking::Placement::taken(engine, decided, later, now, 0, worker, None);
+        let placement = crate::tracking::Placement::taken(
+            engine.loaded(),
+            decided,
+            later,
+            now,
+            0,
+            worker,
+            None,
+        );
         let mut placement = placement.expect("a placement");
         let measured = Outcome {
             tokens_out: 34,

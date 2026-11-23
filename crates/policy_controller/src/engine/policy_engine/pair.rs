@@ -67,7 +67,7 @@ use std::{
 
 use smg_worker::load::state::LoadSnapshot;
 
-use super::{signals, single, PolicyEngine, PoolMembers};
+use super::{signals, single, Loaded, PolicyEngine, PoolMembers};
 use crate::{
     engine::{
         decision::{shed, Decision, ShedReason, Target, SUBSET_HINT, WIRES},
@@ -275,6 +275,7 @@ impl<'a> PairLists<'a> {
         request: &mut Request<'_>,
         held: Option<&Target>,
     ) -> Decision {
+        let engine = engine.loaded();
         let sides = (
             engine.members_of(self.prefill),
             engine.members_of(self.decode),
@@ -286,7 +287,7 @@ impl<'a> PairLists<'a> {
     /// its caller asked of their cells.
     pub(super) fn decide_over(
         &self,
-        engine: &PolicyEngine,
+        engine: Loaded<'_, '_>,
         (prefill, decode): (&PoolMembers, &PoolMembers),
         loads: Option<&Arc<LoadSnapshot>>,
         now: Instant,
@@ -407,7 +408,7 @@ impl<'a> PairLists<'a> {
 #[cold]
 #[inline(never)]
 fn tried_engines(
-    engine: &PolicyEngine,
+    engine: Loaded<'_, '_>,
     tried: &[WorkerId],
     [prefill, decode]: [&PoolMembers; 2],
 ) -> Option<Vec<WorkerId>> {
@@ -679,7 +680,7 @@ fn decode_side(facts: &RequestFacts<'_>, decision: &Decision, prefill: &Lease) -
 /// A panic in the decision itself is not held here: it costs the call its
 /// decision, as a first decision's does.
 fn issue_decode_caught(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     facts: &RequestFacts<'_>,
     decision: &Decision,
     prefill: &Lease,
@@ -709,7 +710,7 @@ fn issue_decode_caught(
 /// lists' own decision makes.
 #[inline]
 pub(super) fn decide(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     lists: &PairLists<'_>,
     request: &mut Request<'_>,
     target: Option<&Target>,
@@ -735,7 +736,7 @@ pub(super) fn decide(
 /// reports in `loads`: the snapshot the request gives for this call, or
 /// the newest the engine's own task keeps at hand.
 pub(super) fn decided(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     lists: &PairLists<'_>,
     request: &mut Request<'_>,
     held: Option<&HeldDecision<'_>>,
@@ -759,7 +760,7 @@ pub(super) fn decided(
 // instructions, counted with Callgrind.
 #[inline(always)]
 pub(super) fn issued(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     request: &Request<'_>,
     decision: Decision,
     held: Option<&HeldDecision<'_>>,
@@ -1674,7 +1675,7 @@ mod tests {
         let prefill = &host.prefills[taken.position as usize];
         let decode = &host.decodes[pair.decode_position as usize];
         let placement = crate::tracking::Placement::taken(
-            &host.engine,
+            host.engine.loaded(),
             decided,
             later,
             now,
@@ -1702,7 +1703,7 @@ mod tests {
         drop(placement);
         let (decided, later, now, _, _) = whole();
         let unsent = crate::tracking::Placement::taken(
-            &host.engine,
+            host.engine.loaded(),
             decided,
             later,
             now,
@@ -2662,9 +2663,22 @@ mod tests {
         for _ in 0..4 {
             let mut asked = alone.asks(&classes, false);
             let mut leased = leasing.asks(&classes, false);
-            let decision = decide(&alone.engine, &asked.1, &mut asked.0, None, None, now);
-            let outcome =
-                super::decided(&leasing.engine, &leased.1, &mut leased.0, None, None, now);
+            let decision = decide(
+                alone.engine.loaded(),
+                &asked.1,
+                &mut asked.0,
+                None,
+                None,
+                now,
+            );
+            let outcome = super::decided(
+                leasing.engine.loaded(),
+                &leased.1,
+                &mut leased.0,
+                None,
+                None,
+                now,
+            );
             assert!(outcome.lease.is_some(), "the leasing form issues its pick");
             assert_eq!(alone.picked(&decision), leasing.picked(&outcome.decision));
         }
@@ -2672,8 +2686,22 @@ mod tests {
         // behind the target each engine's first pick names.
         let mut asked = alone.asks(&classes, true);
         let mut leased = leasing.asks(&classes, true);
-        let first = decide(&alone.engine, &asked.1, &mut asked.0, None, None, now);
-        let outcome = super::decided(&leasing.engine, &leased.1, &mut leased.0, None, None, now);
+        let first = decide(
+            alone.engine.loaded(),
+            &asked.1,
+            &mut asked.0,
+            None,
+            None,
+            now,
+        );
+        let outcome = super::decided(
+            leasing.engine.loaded(),
+            &leased.1,
+            &mut leased.0,
+            None,
+            None,
+            now,
+        );
         assert_eq!(alone.picked(&first), leasing.picked(&outcome.decision));
         let (ours, theirs) = (target_at(&first, 0), target_at(&outcome.decision, 0));
         let lease = outcome.lease.expect("the pair's lease").lease;
@@ -2690,7 +2718,7 @@ mod tests {
         };
         let call = now + Duration::from_millis(1);
         let again = decide(
-            &alone.engine,
+            alone.engine.loaded(),
             &asked.1,
             &mut asked.0,
             Some(&ours),
@@ -2698,7 +2726,7 @@ mod tests {
             call,
         );
         let issued = super::decided(
-            &leasing.engine,
+            leasing.engine.loaded(),
             &leased.1,
             &mut leased.0,
             Some(&held),
@@ -2711,7 +2739,14 @@ mod tests {
         // A request held to a wire no worker of the lists is dialed on.
         let mut undialed = alone.asks(&classes, false);
         undialed.0.constraints.wire_modes = WireModes::ZMQ;
-        match decide(&alone.engine, &undialed.1, &mut undialed.0, None, None, now) {
+        match decide(
+            alone.engine.loaded(),
+            &undialed.1,
+            &mut undialed.0,
+            None,
+            None,
+            now,
+        ) {
             Decision::Shed(shed) => assert_eq!(
                 (shed.reason, shed.emptied_by),
                 (ShedReason::PolicyDeclined, WIRES)
@@ -2724,7 +2759,7 @@ mod tests {
         refused.0.constraints.wire_modes = WireModes::ZMQ;
         for behind in [None, Some(&held)] {
             let declined = super::decided(
-                &leasing.engine,
+                leasing.engine.loaded(),
                 &refused.1,
                 &mut refused.0,
                 behind,

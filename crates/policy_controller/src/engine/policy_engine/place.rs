@@ -70,7 +70,7 @@ use std::{
 
 use smg_worker::identity::basic::Worker;
 
-use super::PolicyEngine;
+use super::{Loaded, PolicyEngine};
 use crate::{
     document::{
         spec::{AppliedSpec, DecodePick},
@@ -825,7 +825,7 @@ const fn declined(stated: &'static str) -> Unplaced {
 /// a decode decided again is asked through its guard ([`decode_again`]).
 #[inline]
 pub(super) fn decide(
-    engine: &PolicyEngine,
+    engine: Loaded<'_, '_>,
     made: &Made<'_, '_>,
 ) -> Result<(Decided, Option<Instant>), DecisionRefused> {
     let dated = Cell::new(None);
@@ -876,7 +876,7 @@ pub(super) type Sides = (Arc<dyn Worker>, Option<Arc<dyn Worker>>);
 /// The decision's shed or its queue ([`picked`]).
 #[inline]
 pub(super) fn walk<'a>(
-    engine: &'static PolicyEngine,
+    engine: Loaded<'static, '_>,
     decided: DecideOutcome,
     later: bool,
     now: Instant,
@@ -898,7 +898,7 @@ pub(super) fn walk<'a>(
         match catch_unwind(AssertUnwindSafe(ask)) {
             Ok(held) => held,
             Err(panic) => {
-                give_up(engine, decided, later, now);
+                give_up(engine.object, decided, later, now);
                 resume_unwind(panic)
             }
         }
@@ -906,7 +906,7 @@ pub(super) fn walk<'a>(
         ask()
     };
     let Some((index, (worker, decode))) = held else {
-        give_up(engine, decided, later, now);
+        give_up(engine.object, decided, later, now);
         for id in failed.into_iter().flatten().flatten() {
             if !missed.contains(&id) {
                 missed.push(id);
@@ -1079,7 +1079,7 @@ impl Call {
 /// decision's filters compare. The engine's value of the list holds the
 /// records, and the ask's decision filled the list's cell, so this ask of
 /// the cell fills nothing.
-fn named(engine: &PolicyEngine, list: Option<LentList<'_>>, place: u32) -> Option<WorkerId> {
+fn named(engine: Loaded<'_, '_>, list: Option<LentList<'_>>, place: u32) -> Option<WorkerId> {
     let records = engine
         .members_of(list?)
         .records(&engine.document.spec, &engine.clock);
@@ -1118,18 +1118,18 @@ fn raise(
 /// Where the rule refused one of them that was ready, the call's later
 /// asks are held to the workers the rule takes ([`hold_to_rule`]).
 fn single<'a>(
-    engine: &'static PolicyEngine,
+    engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
     list: Option<LentList<'_>>,
     call: &mut Call,
 ) -> Result<Placement<'a>, Unplaced> {
     let mut made = Made {
         budget_micros: call.left(request)?,
-        ..Made::asked(engine, request, call)
+        ..Made::asked(engine.object, request, call)
     };
     let decided = decide(engine, &made);
     if let Some(panic) = made.panicked.take() {
-        raise(engine, panic, decided);
+        raise(engine.object, panic, decided);
     }
     let (decided, dated) = decided.map_err(Unplaced::Refused)?;
     let (key, sent) = (made.key(), made.sent.get());
@@ -1343,14 +1343,15 @@ impl PolicyEngine {
         if request.encode.is_some() && !matches!(request.lists, WorkerLists::Encode(_)) {
             return Err(declined(ENCODE_ITEMS));
         }
+        let own = self.loaded();
         match request.lists {
-            WorkerLists::Pair(ref lists) => pair::place(self, request, lists, &mut Call::default()),
-            WorkerLists::Single(list) => single(self, request, Some(list), &mut Call::default()),
-            WorkerLists::None => single(self, request, None, &mut Call::default()),
+            WorkerLists::Pair(ref lists) => pair::place(own, request, lists, &mut Call::default()),
+            WorkerLists::Single(list) => single(own, request, Some(list), &mut Call::default()),
+            WorkerLists::None => single(own, request, None, &mut Call::default()),
             // A pair's lists and an encode request's are read where the
             // request holds them: a copy of either here costs every request
             // a larger frame.
-            WorkerLists::Encode(ref lists) => encode::three(self, request, lists),
+            WorkerLists::Encode(ref lists) => encode::three(own, request, lists),
         }
     }
 }

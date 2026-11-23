@@ -55,7 +55,7 @@ use std::{sync::Arc, time::Instant};
 
 use smg_worker::load::state::LoadSnapshot;
 
-use super::{PolicyEngine, PoolMembers};
+use super::{Loaded, PoolMembers};
 use crate::{
     document::spec::AppliedSpec,
     engine::{
@@ -90,7 +90,7 @@ impl PoolMembers {
 
 /// One made single request's decision where its profile reads a named
 /// signal: the decision every made single request takes over its snapshot
-/// ([`PolicyEngine::decide_with_loads`]), made over a copy of the request
+/// ([`Loaded::decide_with_loads`]), made over a copy of the request
 /// with its list's signal cells in its facts. The cells a caller put on the
 /// request are not read: under no snapshot the copy carries none.
 ///
@@ -116,7 +116,7 @@ impl PoolMembers {
 /// out of line for every request.
 #[inline(never)]
 pub(super) fn decide(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     request: &mut Request<'_>,
     members: &PoolMembers,
     maker: &dyn RequestMaker,

@@ -527,7 +527,8 @@ document's stages and what they remember. It holds no worker of its own: the reg
 // engine/policy_engine.rs
 pub struct PolicyEngine {
     document: InForce,    // the validated document (profiles, bindings, stage objects and their state), its
-                          // number, and what is read of it once: which lease events its stages need
+                          // number, what is read of it once (which lease events its stages need) and its
+                          // shadow counts
     clock: DecisionClock, // one clock for every decision and every load report's age
     leases: OwnWord,      // the id of the last lease issued: one atomic counter
     affinity: Affinity,   // cache affinity: the host's index of cache events, and the engine's own

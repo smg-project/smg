@@ -23,7 +23,7 @@ use crate::{
         decision::Target,
         decision_engine::{Decided, DecisionRefused},
         list_cell::LentList,
-        policy_engine::PolicyEngine,
+        policy_engine::Loaded,
         prefills_full,
         view::{Phase, WorkerId},
         PairLists,
@@ -35,8 +35,8 @@ use crate::{
 /// engine's document: the decode profile of the binding `model` resolves
 /// to, and that binding's one profile where it names no other. The empty
 /// label where no binding matches.
-pub(super) fn decode_label(engine: &PolicyEngine, model: &str) -> &'static str {
-    let binding = engine.spec().engine().binding(model, Phase::Prefill);
+pub(super) fn decode_label(engine: Loaded<'_, '_>, model: &str) -> &'static str {
+    let binding = engine.document.spec.engine().binding(model, Phase::Prefill);
     let position = binding.map(|binding| binding.decode_profile.unwrap_or(binding.profile));
     position.map_or("", |position| engine.label_at(position))
 }
@@ -64,12 +64,12 @@ pub(super) fn decode_label(engine: &PolicyEngine, model: &str) -> &'static str {
 /// ([`DecisionRefused::Faulted`]): no ask after it would leave anything
 /// new out.
 pub(super) fn ask<'a>(
-    engine: &'static PolicyEngine,
+    engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
     lists: &PairLists<'_>,
     call: &mut Call,
 ) -> Result<Option<Placement<'a>>, Unplaced> {
-    let made = Made::asked(engine, request, call);
+    let made = Made::asked(engine.object, request, call);
     let (decided, dated) = decide(engine, &made).map_err(Unplaced::Refused)?;
     let key = made.key();
     // A pair's decision is whole: no one pick decides a place of two lists.
@@ -125,7 +125,7 @@ pub(super) fn sides(
 /// What an ask answers, and [`Unplaced::NoWorkers`] where no target of the
 /// call's last ask holds.
 pub(super) fn place<'a>(
-    engine: &'static PolicyEngine,
+    engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
     lists: &PairLists<'_>,
     call: &mut Call,

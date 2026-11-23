@@ -40,7 +40,7 @@ use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot};
 
 use super::{
     single::{self, WholeDecision},
-    PolicyEngine, PoolMembers,
+    Loaded, PolicyEngine, PoolMembers,
 };
 use crate::engine::{
     decision::Decision,
@@ -87,7 +87,7 @@ impl WholeDecision for WithShadow<'_> {
 /// this one.
 #[inline(never)]
 pub(super) fn issued(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     decision: Decision,
     request: &Request<'_>,
     now: Instant,
@@ -113,7 +113,7 @@ impl PolicyEngine {
     )]
     pub(crate) fn count_shadow(&self, said: Option<Shadowed>) {
         if let Some(said) = said {
-            count(self, said);
+            count(self.loaded(), said);
         }
     }
 }
@@ -135,7 +135,7 @@ impl PolicyEngine {
 /// Out of line, as [`issued`] is.
 #[inline(never)]
 pub(super) fn decide(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     request: &mut Request<'_>,
     members: &PoolMembers,
     maker: &(impl RequestMaker + ?Sized),
@@ -162,7 +162,7 @@ pub(super) fn decide(
 
 /// Counts what the shadow of a single request said, for its binding. The
 /// table is allocated at the first count.
-fn count(own: &PolicyEngine, said: Shadowed) {
+fn count(own: Loaded<'_, '_>, said: Shadowed) {
     let counts = &own.document.shadow_counts;
     let counts = counts.get_or_init(Box::<ShadowCounts>::default);
     let count = counts.of(said.binding, Counted::Single, said.kind);
