@@ -145,26 +145,14 @@ impl Listing {
         Some(&self.text[start as usize..end as usize])
     }
 
-    /// How many tokens have at most `most` characters; one of at most
-    /// `most` bytes is counted from its span alone.
-    pub(crate) fn of_at_most(&self, most: usize) -> usize {
+    /// How many tokens have at most `most` bytes or are taken by `longer`;
+    /// one of at most `most` bytes is counted from its span alone.
+    pub(crate) fn count(&self, most: usize, longer: impl Fn(&str) -> bool) -> usize {
         self.spans
             .iter()
             .filter(|&&(start, end)| {
-                (end - start) as usize <= most
-                    || self.text[start as usize..end as usize]
-                        .chars()
-                        .nth(most)
-                        .is_none()
+                (end - start) as usize <= most || longer(&self.text[start as usize..end as usize])
             })
-            .count()
-    }
-
-    /// How many tokens have at most `bytes` bytes, from the spans alone.
-    pub(crate) fn within(&self, bytes: usize) -> usize {
-        self.spans
-            .iter()
-            .filter(|&&(start, end)| (end - start) as usize <= bytes)
             .count()
     }
 

@@ -2541,10 +2541,18 @@ impl NativeEncoder {
         // its key has bytes.
         let mut table = match listing {
             Some(listing) => ShortPieceTable::for_entries(if chars.is_some() {
-                // The marker is three bytes of an entry and one of its key.
-                listing.within(WORD_MARKER.len_utf8() * SHORT_PIECE_MAX_BYTES)
+                // A longer entry is short by its key's length: its bytes,
+                // each marker's three as one. One with a space has no key.
+                let extra = WORD_MARKER.len_utf8() - 1;
+                listing.count(SHORT_PIECE_MAX_BYTES, |entry| {
+                    !entry.contains(' ')
+                        && entry.len() - extra * entry.matches(WORD_MARKER).count()
+                            <= SHORT_PIECE_MAX_BYTES
+                })
             } else {
-                listing.of_at_most(SHORT_PIECE_MAX_BYTES)
+                listing.count(SHORT_PIECE_MAX_BYTES, |entry| {
+                    entry.chars().nth(SHORT_PIECE_MAX_BYTES).is_none()
+                })
             }),
             // No count before the pass: the table starts small and grows
             // in place, in a reservation for the whole vocabulary, its only
