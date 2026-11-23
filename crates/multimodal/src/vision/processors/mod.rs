@@ -20,7 +20,6 @@
 //! - **Kimi-K3** (`kimi_k3`): Same MoonViT stack with a 4x patch budget and
 //!   chessboard alpha compositing
 //! - **Phi3-Vision** (`phi3_vision`): Dynamic HD transform with 336x336 tiles
-//! - **Phi4-Vision** (`phi4_vision`): Dynamic HD transform with 448x448 tiles and SiGLIP encoder
 //! - **LLaMA 4 Vision** (`llama4_vision`): Tile-based processing with 336x336 tiles and global tile
 //! - **Pixtral/Mistral3** (`pixtral`): CLIP-based preprocessing with dynamic resolution
 //! - **Nemotron VL / Omni** (`nemotron_omni`): C-RADIO tiled or dynamic-resolution images and video frames, geometry
@@ -41,7 +40,6 @@ pub mod moonvit;
 pub mod muse_spark;
 pub mod nemotron_omni;
 pub mod phi3_vision;
-pub mod phi4_vision;
 pub mod pixtral;
 pub mod qwen2_vl;
 pub mod qwen3_omni_vision;
@@ -62,7 +60,6 @@ pub use minimax_m3::MiniMaxM3VisionProcessor;
 pub use muse_spark::MuseSparkVisionProcessor;
 pub use nemotron_omni::NemotronOmniProcessor;
 pub use phi3_vision::Phi3VisionProcessor;
-pub use phi4_vision::Phi4VisionProcessor;
 pub use pixtral::PixtralProcessor;
 pub use qwen2_vl::Qwen2VLProcessor;
 pub use qwen3_omni_vision::Qwen3OmniVisionProcessor;

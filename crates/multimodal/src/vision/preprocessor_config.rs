@@ -223,7 +223,8 @@ pub struct PreProcessorConfig {
     #[serde(default)]
     pub num_crops: Option<usize>,
 
-    /// Phi4-Vision: dynamic HD max crops
+    /// The crop budget of an upstream Phi4-Vision config. No processor of this
+    /// crate applies it; Inkling2 refuses a config that sets it.
     #[serde(default)]
     pub dynamic_hd: Option<usize>,
 
