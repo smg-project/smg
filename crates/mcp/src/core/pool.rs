@@ -308,6 +308,26 @@ impl McpConnectionPool {
         true
     }
 
+    /// Takes `client` out of the pool when `key` still holds that very
+    /// connection, as an eviction does: the count goes down, and the callback
+    /// runs once no pooled connection holds the key's URL.
+    pub(crate) fn remove(&self, key: &PoolKey, client: &Arc<McpClient>) {
+        let mut connections = self.connections.lock();
+        if connections
+            .peek(key)
+            .is_none_or(|cached| !Arc::ptr_eq(&cached.client, client))
+        {
+            return;
+        }
+        connections.pop(key);
+        self.connection_count.fetch_sub(1, Ordering::Relaxed);
+        if let Some(callback) = &self.eviction_callback {
+            if !connections.iter().any(|(pooled, _)| pooled.url == key.url) {
+                callback(key);
+            }
+        }
+    }
+
     /// Whether the connection under `key` is pooled with its tools listed
     /// (a plain hit); false for a pending or failed listing and for a key the
     /// pool does not hold. No promotion.

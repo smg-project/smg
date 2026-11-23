@@ -1826,7 +1826,12 @@ impl McpOrchestrator {
         // transient refusal does not stand until eviction, and a caller
         // arriving during another's listing takes no pending listing for a
         // success.
-        let pooled = self.connection_pool.get(&pool_key);
+        let mut pooled = self.connection_pool.get(&pool_key);
+        // A pooled connection whose transport is closed answers no call: it
+        // leaves the pool, and this caller connects anew.
+        if let Some(closed) = pooled.take_if(|client| client.is_transport_closed()) {
+            self.connection_pool.remove(&pool_key, &closed);
+        }
         if pooled.is_some() && self.connection_pool.is_listed(&pool_key) {
             return Ok(ConnectedServer {
                 server_key,
@@ -3068,6 +3073,50 @@ mod tests {
             "{err:?}"
         );
         assert!(orchestrator.reconnection_locks.is_empty());
+    }
+
+    /// A pooled connection whose transport closed is no hit at the connect:
+    /// it leaves the pool, and the caller connects anew.
+    #[tokio::test]
+    async fn a_closed_pooled_connection_leaves_the_pool_at_the_next_connect() {
+        let orchestrator = McpOrchestrator::new_test();
+        // A dead local port: a new connect fails at once.
+        let url = "http://127.0.0.1:1/mcp";
+        let config = McpServerConfig {
+            transport: McpTransport::Streamable {
+                url: url.to_string(),
+                token: None,
+                headers: HashMap::new(),
+            },
+            ..sse_server("tools", url)
+        };
+        let key = PoolKey::from_config(&config, None);
+        let pool = &orchestrator.connection_pool;
+        let (server_io, client_io) = tokio::io::duplex(64);
+        let client = rmcp::service::serve_directly((), client_io, None);
+        let client = pool
+            .get_or_create(key.clone(), config.clone(), |_, _| {
+                std::future::ready(Ok(client))
+            })
+            .await
+            .unwrap();
+        pool.set_listing(&key, &client, Listing::Listed, || {});
+
+        // The server's end closes.
+        drop(server_io);
+        timeout(Duration::from_secs(5), async {
+            while !client.is_transport_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the client reads its transport closed");
+        let err = orchestrator
+            .connect_dynamic_server(config)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::ConnectionFailed(_)), "{err:?}");
+        assert!(pool.is_empty());
     }
 
     /// A dynamic server's tool call uses the connection pooled under its own
