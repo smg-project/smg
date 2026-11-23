@@ -59,8 +59,8 @@ pub(crate) struct Assignment {
     /// gateway's JSON-schema constraint forces the call and the family numbers its ids by the
     /// conversation ([`CallIdFamily`]). The forced JSON has no header for the table to take an id
     /// from, so the reader gives each of its calls the family's id, as the older forced arm does.
-    /// So it does for every call of a table that reads in the place of the legacy parsers
-    /// ([`gives_way`]), which numbered the family's calls and whose table mints its ids.
+    /// So it does for every call of a table whose own name gives way ([`gives_way`]: today
+    /// `kimi`): it reads in the place of the legacy parsers, which numbered the family's calls.
     /// `None` for every other request: its ids are the table's.
     pub forced_ids: Option<(CallIdFamily, usize)>,
     /// The request holds the answer to JSON (a `json_object` or `json_schema` response format, a
@@ -347,9 +347,10 @@ pub(crate) fn assign_for(
             false,
         )
     };
-    // The forced JSON has no header to read an id from, and the table of a name that gives way
-    // leaves its ids to the gateway: a family that numbers its ids by the conversation numbers
-    // these too, as the older parsers do.
+    // The forced JSON has no header to read an id from, and a table whose own name gives way
+    // (`GIVING_WAY`: today `kimi`) leaves its ids to the gateway: a family that numbers its ids
+    // by the conversation numbers these too, as the older parsers do. A table read through
+    // another such name (`command`, through `cohere_cmd`) mints its own.
     let forced_ids = (is_forced || gives_way(format.name()))
         .then(|| CallIdFamily::of(asks.model()))
         .flatten()

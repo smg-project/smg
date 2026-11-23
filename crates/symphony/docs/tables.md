@@ -931,6 +931,19 @@ the output as it comes, a marker where its state has a row for it and a block ob
   under the JSON-answer option both are text inside a string of the answer. That parser removed
   the text markers from all the text it read, and read an action block wherever it stood.
 
+The older parsers' names answer to this table: `cohere` for the calls, with the differences
+above, and `cohere_cmd` for the thought. On that parser's own cases the thought reads the same;
+what stands behind it does not: the table drops the answer's markers and the whitespace alone
+before them, where the `cohere_cmd` parser left the text behind the thought as written
+(`\n<|START_RESPONSE|>The answer is 42.<|END_RESPONSE|>`, which is `The answer is 42.` here).
+Streamed, the `cohere` parser read a call from one object alone between the action markers and
+gave the list the template renders back as text; the table gives the list's calls. Either name
+selects the table for both channels, as every name a table answers to does: beside `cohere`
+another reasoning parser's name no longer reads the thought (with `qwen3`, a `<think>` block
+stays in the answer), and `cohere_cmd` alone, where no other name and no registry row selects a
+reader, reads the calls as well, so a call in another family's form stays text. Under
+`--parser legacy` each name reads with its own parser.
+
 What it leaves open: the structural tag derived from the table spells a call `name` and
 `arguments`, which the table reads and the template does not write. A checkpoint whose template
 writes the answer between `<|START_TEXT|>` and `<|END_TEXT|>` has no recorded output and no row

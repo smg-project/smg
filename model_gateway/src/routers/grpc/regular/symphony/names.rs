@@ -297,7 +297,8 @@ pub(crate) fn set_aside_by_the_registry(
 /// Whether the parser names set for a model (the flags, or one worker's labels) are names the
 /// gateway reads with under `parser`: a legacy parser's, or, with Symphony on, a table's or
 /// [`TEMPLATE_PARSER`]. `tools` and `reasoning` are the legacy registries; a name whose registry
-/// is absent is not checked (its parsers are unused in that configuration). A name no legacy
+/// is absent is not checked (its parsers are unused in that configuration), but that kind's
+/// names stay its own for the other name's check: the stock registry tells them. A name no legacy
 /// parser has that a table answers to (the table's own name, or a launcher's name for a family
 /// whose table has no older parser), and [`TEMPLATE_PARSER`], bind the other name to the same or
 /// to nothing: the two names are one selection, and where the other name selects the legacy
@@ -322,9 +323,18 @@ fn checked_names(
     reasoning: Option<&reasoning_parser::ParserFactory>,
 ) -> Result<(), String> {
     let symphony = parser == ParserChoice::Symphony;
-    let legacy_tool = |name: &str| tools.is_some_and(|factory| factory.has_parser(name));
-    let legacy_reasoning =
-        |name: &str| reasoning.is_some_and(|factory| factory.registry().has_parser(name));
+    // The stock registry stands for an absent one: a name is its kind's whichever registries
+    // the context holds, so the other kind's check refuses it as it does beside both.
+    let legacy_tool = |name: &str| match tools {
+        Some(factory) => factory.has_parser(name),
+        None => tool_parser::ParserFactory::new().has_parser(name),
+    };
+    let legacy_reasoning = |name: &str| match reasoning {
+        Some(factory) => factory.registry().has_parser(name),
+        None => reasoning_parser::ParserFactory::new()
+            .registry()
+            .has_parser(name),
+    };
     // The table a name selects when no legacy parser of its kind has it: the table named so,
     // else the one that answers to it when no legacy parser of either kind has the name as the
     // registries spell it (a table answers in any case, the registries in theirs); a legacy
@@ -746,6 +756,8 @@ mod tests {
             ("kimi_k25", "kimi_k2"),
             ("kimi", "kimi"),
             ("inkling", "inkling"),
+            ("cohere", "command"),
+            ("cohere_cmd", "command"),
             ("minimax", "minimax_m2"),
             ("minimax_m2", "minimax_m2"),
             ("minimax_m3", "minimax_m3"),
@@ -919,6 +931,19 @@ mod tests {
         assert_eq!(
             check_names(legacy, &pair(Some("muse"), Some("nonsense")), None, None),
             Ok(())
+        );
+        // A name of the absent registry's kind is still that kind's: beside the tool registry
+        // alone the reasoning parser's `cohere_cmd` is no tool-call name, as beside both.
+        let tools = tool_parser::ParserFactory::new();
+        let why = checked_names(
+            symphony,
+            &pair(Some("cohere_cmd"), None),
+            Some(&tools),
+            None,
+        );
+        assert_eq!(
+            why.expect_err("wrong kind"),
+            "unknown tool-call parser 'cohere_cmd': neither a legacy parser nor a Symphony table"
         );
     }
 
@@ -1228,7 +1253,7 @@ mod tests {
         for flags in [
             v13.clone(),
             pair(Some(TEMPLATE_PARSER), Some(TEMPLATE_PARSER)),
-            pair(Some("cohere"), None),
+            pair(Some("pythonic"), None),
             pair(Some("passthrough"), None),
         ] {
             assert_eq!(
@@ -1251,7 +1276,7 @@ mod tests {
         )
         .is_err());
         assert_eq!(
-            read(&ModelNames::flagged(&pair(Some("cohere"), None)), unknown),
+            read(&ModelNames::flagged(&pair(Some("pythonic"), None)), unknown),
             Ok(None)
         );
         assert_eq!(
@@ -1285,6 +1310,7 @@ mod tests {
     fn a_reasoning_name_that_gives_way_reads_where_no_other_table_does() {
         let unknown = "acme/ministral-3-14b-instruct-w4a16";
         let kimi = || pair(None, Some("kimi"));
+        let cohere_cmd = || pair(None, Some("cohere_cmd"));
         let cases = [
             (
                 kimi(),
@@ -1301,7 +1327,14 @@ mod tests {
                 Some("kimi_k3"),
             ),
             (Names::default(), kimi(), unknown, Some("kimi")),
-            (pair(None, Some("cohere_cmd")), kimi(), unknown, None),
+            (pair(None, Some("deepseek_r1")), kimi(), unknown, None),
+            (
+                cohere_cmd(),
+                Names::default(),
+                "Qwen/Qwen3-8B",
+                Some("qwen3"),
+            ),
+            (cohere_cmd(), kimi(), unknown, Some("command")),
         ];
         let read = cases.each_ref().map(|(labels, flags, model, _)| {
             let labels = labels.clone();
@@ -1449,7 +1482,7 @@ mod tests {
             qwen3("the model's response template")
         );
         assert_eq!(
-            spelled(pair(Some("cohere"), None), known),
+            spelled(pair(Some("pythonic"), None), known),
             qwen3("the legacy parsers")
         );
         assert_eq!(
