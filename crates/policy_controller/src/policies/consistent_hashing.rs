@@ -92,14 +92,28 @@ pub(crate) fn profile() -> ProfileSpec {
 }
 
 /// The headers the `consistent_hashing` policy reads a request's routing key
-/// from, in order. `header` makes one source from a header's name and whether
-/// the header tells one client from another.
+/// from, in order, and behind them the header a request names its worker
+/// under ([`target_source`]). `header` makes one source from a header's name
+/// and whether the header tells one client from another.
 pub(crate) fn key_sources(header: impl Fn(&str, bool) -> KeySourceSpec) -> Vec<KeySourceSpec> {
     vec![
         header(MANUAL_SESSION_HEADER, false),
         header("x-forwarded-for", true),
         header("cookie", true),
+        target_source(),
     ]
+}
+
+/// The policy's target source: the header a request names its one worker
+/// under, by a number that counts the workers of the request's list
+/// ([`KeySourceSpec::target`]). The gateway's policy of this name alone
+/// reads that header, so no other policy's document names it.
+pub(crate) fn target_source() -> KeySourceSpec {
+    KeySourceSpec {
+        header: Some("x-smg-target-worker".to_string()),
+        target: true,
+        ..KeySourceSpec::default()
+    }
 }
 
 /// Positions per member: an even share of the key space per member for the

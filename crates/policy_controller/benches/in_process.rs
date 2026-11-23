@@ -215,6 +215,15 @@ const CELLS: &[Cell] = &[
         request: keyed,
         ..Cell::PLAIN
     },
+    // The hash ring's document with a request that carries no key: the
+    // one cell of that document the one call for a request can be asked
+    // for (`--entry place`), where it reads the request's headers for the
+    // worker a request may name.
+    Cell {
+        name: "consistent_hashing_no_key",
+        document: || preset("consistent_hashing"),
+        ..Cell::PLAIN
+    },
     Cell {
         name: "least_load",
         document: || preset("least_load"),

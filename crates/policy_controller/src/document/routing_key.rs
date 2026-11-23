@@ -17,6 +17,11 @@
 //! here and leaves in no other form, so its position is taken here, with
 //! the two keys, by one read of the sources ([`KeySources::derive_keys`]).
 //!
+//! A source can name the one worker a request goes to, by a number that
+//! counts the workers of the request's list. It hands no key: its number
+//! is read apart ([`KeySources::target`]), by the one call that places a
+//! request in process.
+//!
 //! [`RequestFacts::client_key`]: crate::engine::RequestFacts::client_key
 //! [`RequestFacts::ring_positions`]: crate::engine::RequestFacts::ring_positions
 //! [`RequestFacts::session_key`]: crate::engine::RequestFacts::session_key
@@ -36,6 +41,9 @@ use crate::{
 pub struct KeySources {
     sources: Box<[Source]>,
     strip_lineage: bool,
+    /// The header of the block's target source, where it names one
+    /// ([`Self::target`]): no source of a key.
+    target: Option<Box<str>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,9 +123,12 @@ impl KeySources {
     }
 
     fn of_block(block: &RoutingKeySpec, view: &ViewSpec) -> Self {
+        let mut target = block.sources.iter().filter(|source| source.target);
+        let target = target.find_map(|source| source.header.as_deref());
         let sources = block
             .sources
             .iter()
+            .filter(|source| !source.target)
             .map(|source| Source {
                 plain: source
                     .header
@@ -131,6 +142,7 @@ impl KeySources {
         Self {
             sources,
             strip_lineage: block.strip_lineage,
+            target: target.map(Box::from),
         }
     }
 
@@ -154,6 +166,7 @@ impl KeySources {
         Self {
             sources,
             strip_lineage: false,
+            target: None,
         }
     }
 
@@ -250,17 +263,27 @@ impl KeySources {
     /// The value [`Self::derive_client`] takes the client's key of, where
     /// it can be handed: visible ASCII, and so text.
     fn client<'a>(&self, header: &impl Fn(&str) -> Option<&'a [u8]>) -> Option<&'a str> {
-        self.sources
-            .iter()
-            .filter(|source| source.client)
-            .find_map(|source| header(source.header.as_deref()?))
-            .filter(|value| {
-                !value.is_empty()
-                    && value
-                        .iter()
-                        .all(|&byte| matches!(byte, b'\t' | b' '..=b'~'))
-            })
-            .and_then(|value| std::str::from_utf8(value).ok())
+        let mut clients = self.sources.iter().filter(|source| source.client);
+        text(clients.find_map(|source| header(source.header.as_deref()?))?)
+    }
+
+    /// Whether the block names a target source: a host reads
+    /// [`Self::target`] for its requests where it does.
+    pub fn names_target(&self) -> bool {
+        self.target.is_some()
+    }
+
+    /// The number a request names its worker by, under the block's target
+    /// source: `Some(None)` where the request names a worker and its text
+    /// is no number, so it reaches no worker of any list. `None` where the
+    /// request names no worker: the block has no target source, or the
+    /// request carries no text under its header, a value that is empty or
+    /// not visible ASCII among them. A number is decimal digits, with one
+    /// `+` ahead of them or none. Which workers it counts, and so which
+    /// worker it reaches, is its reader's to say.
+    pub fn target<'a>(&self, header: impl Fn(&str) -> Option<&'a [u8]>) -> Option<Option<u32>> {
+        let named = text(header(self.target.as_deref()?)?)?;
+        Some(named.parse().ok())
     }
 
     /// The request's keys, by one read of the sources: its routing key
@@ -314,6 +337,14 @@ impl KeySources {
             }
         }
     }
+}
+
+/// A header's value as its text, where it can be handed: not empty, and
+/// visible ASCII.
+fn text(value: &[u8]) -> Option<&str> {
+    let visible = |&byte: &u8| matches!(byte, b'\t' | b' '..=b'~');
+    let value = Some(value).filter(|value| !value.is_empty() && value.iter().all(visible))?;
+    std::str::from_utf8(value).ok()
 }
 
 /// A document's byte count as a length.
@@ -535,6 +566,51 @@ mod tests {
             sources.headers().collect::<Vec<_>>(),
             ["x-smg-routing-key", "x-forwarded-for", "cookie"]
         );
+    }
+
+    /// A target source names the request's worker by a number and hands no
+    /// key: neither read of a key takes its header, and a host is told no
+    /// header of it to keep for a key. A number is decimal digits, with one
+    /// `+` ahead of them or none, as large as a place can be. A text that
+    /// is no such number names a worker that is no place of any list. A
+    /// header that is absent, empty or not visible ASCII names no worker,
+    /// and neither does any header under a block with no target source.
+    ///
+    /// The gateway's own policy takes the header's value where it is text
+    /// and not empty (`crates/external_router/src/header_utils.rs`, lines
+    /// 94 to 103) and reads it as a number
+    /// (`model_gateway/src/policies/consistent_hashing.rs`, lines 154 and
+    /// 155).
+    #[test]
+    fn a_target_source_names_a_place_and_hands_no_key() {
+        let block = sources(
+            r#"{"sources":[{"header":"x-smg-routing-key"},{"header":"x-smg-target-worker","target":true},{"header":"cookie","client":true}]}"#,
+        );
+        assert!(block.names_target());
+        let named = |value: &[u8]| block.target(request(&[("x-smg-target-worker", value)]));
+        for (text, place) in [("0", 0), ("7", 7), ("+7", 7), ("007", 7)] {
+            assert_eq!(named(text.as_bytes()), Some(Some(place)), "{text}");
+        }
+        assert_eq!(named(b"4294967295"), Some(Some(u32::MAX)));
+        for text in ["4294967296", "-1", "1.5", " 1", "1 ", "one", "+", "0x1"] {
+            assert_eq!(named(text.as_bytes()), Some(None), "{text:?}");
+        }
+        for unusable in [&b""[..], &[0xc3, 0xa9][..], &b"1\x00"[..]] {
+            assert_eq!(named(unusable), None, "{unusable:?}");
+        }
+        assert_eq!(block.target(request(&[])), None, "absent");
+
+        let only: [(&str, &[u8]); 1] = [("x-smg-target-worker", b"7")];
+        assert_eq!(block.derive(request(&only), None), None);
+        assert_eq!(block.derive_client(request(&only)), 0);
+        assert_eq!(
+            block.headers().collect::<Vec<_>>(),
+            ["x-smg-routing-key", "cookie"]
+        );
+
+        let unnamed = sources(ORDERED);
+        assert!(!unnamed.names_target());
+        assert_eq!(unnamed.target(request(&only)), None);
     }
 
     /// A ring for these cases: a key stands at its text's fingerprint.

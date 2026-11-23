@@ -37,6 +37,10 @@
 //! answered a [`Placement`], which it keeps with the request, or the reason
 //! there is none ([`Unplaced`]).
 //!
+//! A single request that names its worker, under a document whose binding
+//! says which header names it, is held to that one worker and goes to no
+//! other ([`target`]).
+//!
 //! A request with a pair's two lists is placed a target at a time over both
 //! its workers ([`pair`]), three decisions a call at most. Its later
 //! decisions are not held to the workers the rule takes.
@@ -55,6 +59,7 @@
 mod decode_again;
 mod encode;
 mod pair;
+mod target;
 
 use std::{
     any::Any,
@@ -315,7 +320,9 @@ pub struct PlaceRequest<'a> {
     /// worker before. It is asked of no pair's list: a pair's worker it
     /// refuses is passed over like one that is not ready. A rule that
     /// holds for every request of a route belongs to the list its caller
-    /// hands.
+    /// hands. For a single request that names its worker
+    /// ([`PolicyEngine::place`]) it is asked ahead of the call's decision
+    /// too, of each available worker the request's number counts.
     ///
     /// Where a pair's decode is decided again on its decode side
     /// ([`PlacementSide::decode_again`](crate::tracking::PlacementSide::decode_again)),
@@ -409,9 +416,11 @@ pub(super) struct Made<'r, 'a> {
     /// The prompt's block hashes, made at the request's first making and
     /// borrowed by each one after it.
     hashes: OnceCell<PromptHashes>,
-    /// The cell of the call the request is asked in ([`Call`]): the hashes
-    /// are then made in it, once a call, and `hashes` stays empty.
-    of_call: Option<&'r OnceCell<PromptHashes>>,
+    /// The call the request is asked in ([`Call`]): the hashes are then
+    /// made in its cell, once a call, and `hashes` stays empty. Where the
+    /// call says so, the request is made with no routing value and no
+    /// client's value, whatever its sources hold ([`Call::unkeyed`]).
+    of_call: Option<&'r Call>,
     /// The headers of the document's view that the request carries, made
     /// at the request's first making like the hashes.
     headers: OnceCell<Vec<Header<'a>>>,
@@ -517,11 +526,8 @@ impl<'r, 'a> Made<'r, 'a> {
         request: &'r PlaceRequest<'a>,
         call: &'r Call,
     ) -> Self {
-        // The places are kept behind a target the rule refused, which the
-        // call missed: a request held to them is never plain.
-        debug_assert!(call.admitted.is_none() || !call.missed.is_empty());
         Self {
-            of_call: Some(&call.hashes),
+            of_call: Some(call),
             places: call.admitted.as_deref(),
             ..Self::new(engine, request, call.missed.as_slice())
         }
@@ -542,11 +548,14 @@ impl<'r, 'a> Made<'r, 'a> {
     /// The routing value is the first source that holds one; none where
     /// the binding names no source or none holds a value. The client's
     /// value is read only where the request has no routing value: it
-    /// places where no session does.
+    /// places where no session does. A request its call makes with no key
+    /// has neither ([`Call::unkeyed`]).
     fn keys(&self, place: impl FnOnce(&str, bool) -> Option<u64>) -> DerivedKeys<'a> {
         let request = self.request;
         let spec = self.engine.spec();
-        let Some(sources) = spec.key_sources_for(request.model, request.phase()) else {
+        let sources = spec.key_sources_for(request.model, request.phase());
+        let unkeyed = || self.of_call.is_some_and(|call| call.unkeyed);
+        let Some(sources) = sources.filter(|_| !unkeyed()) else {
             return DerivedKeys::default();
         };
         let headers = request.headers;
@@ -738,7 +747,8 @@ impl RequestMaker for Made<'_, '_> {
         };
         let (tokens, text) = (request.prompt.tokens, request.prompt.text);
         if tokens.is_some() || text.is_some() {
-            let hashes = self.of_call.unwrap_or(&self.hashes).get_or_init(|| {
+            let cell = self.of_call.map_or(&self.hashes, |call| &call.hashes);
+            let hashes = cell.get_or_init(|| {
                 self.engine
                     .prompt_hashes(request.model, tokens, text, request.prompt.seeds)
             });
@@ -768,14 +778,16 @@ impl RequestMaker for Made<'_, '_> {
         }
     }
 
-    // A first attempt that names nothing tried or missed, demands nothing,
-    // carries no encode item and asks no decode again is plain. Its size
+    // A first attempt that names nothing tried or missed, is held to no
+    // place of its list, demands nothing, carries no encode item and asks
+    // no decode again is plain. Its size
     // is the one the request made would state. A decode asked again is a
     // pair's word, over its two lists or an encode request's three: over
     // one list it asks nothing, and the request is plain still.
     fn plain(&self) -> Option<Plain> {
         let request = self.request;
         let first = request.attempt == 0 && request.tried.is_empty() && self.missed.is_empty();
+        let first = first && self.places.is_none();
         let pair = matches!(request.lists, WorkerLists::Pair(_) | WorkerLists::Encode(_));
         let again = request.decode_again && pair;
         let asks_more = !request.demands.is_none() || request.encode.is_some() || again;
@@ -856,8 +868,9 @@ pub enum Unplaced {
         /// The stage that left no worker, what of the request the engine
         /// does not decide, or what of the request ended its call: a
         /// route's rule that takes no worker of the list (`admits`), a
-        /// budget the call's earlier decisions used up (`budget`). A
-        /// caller's refusal line names it.
+        /// budget the call's earlier decisions used up (`budget`), a
+        /// worker the request names that cannot take it
+        /// (`target-worker`). A caller's refusal line names it.
         emptied_by: &'static str,
         /// The seconds after which a retry may find room: a caller's
         /// retry hint.
@@ -1143,8 +1156,17 @@ pub(super) struct Call {
     /// decision none of whose targets could be sent to where the rule
     /// refused one that was ready ([`hold_to_rule`]). The call's later
     /// asks are held to them ([`Constraints::places`]). `None` ahead of
-    /// that decision, and for a request with no rule.
+    /// that decision, and for a request with no rule. For a request that
+    /// names its worker they are that worker's one place, from ahead of
+    /// the call's first ask ([`target`]), and the rule is not asked of
+    /// the list again.
     admitted: Option<Vec<u32>>,
+    /// Whether the call's requests are made with no routing value and no
+    /// client's value: a request that names its worker over a list none of
+    /// whose workers can be sent to ([`target`]). The worker a request
+    /// names outranks its routing value, so that value keeps no worker
+    /// over a veto.
+    unkeyed: bool,
     /// The instant of the call's first ask, for a request that states a
     /// budget: the budget is counted from it ([`Call::left`]). `None` for
     /// a request that states no budget: no clock is read for its budget.
@@ -1425,6 +1447,31 @@ impl PolicyEngine {
     /// is read by its state alone: the route's rule is asked of the pair's
     /// two workers. With no item the three lists are placed as their pair.
     ///
+    /// A single request may name its worker. Under a document whose
+    /// binding names a target source
+    /// ([`KeySourceSpec::target`](crate::document::spec::KeySourceSpec::target)),
+    /// the header's number counts, from 0 and in the list's order, the
+    /// workers of the request's list it can be sent to when the call reads
+    /// them: available by the worker's own test, and taken by the route's
+    /// rule, which is asked of each available worker up to the one the
+    /// number reaches. So a number names another worker while one ahead of
+    /// it is down, and a worker over its overload thresholds is not
+    /// counted. The call's one decision is held to the place of the worker
+    /// the number reaches ([`Constraints::places`]), ahead of the
+    /// request's routing value and of every other rule of the document:
+    /// its filters read the worker, and a retry is handed the worker it
+    /// tried. The request goes to that worker or to none. It is shed with
+    /// no endpoint, under `target-worker`, where the header's text is no
+    /// number, fewer workers can be sent to, the decision names no worker
+    /// because of the worker, or the worker cannot be sent to after all.
+    /// Where no worker of the list can be sent to, there is none to count:
+    /// the request is placed as one that names no worker, by the binding's
+    /// rule for workers that are all vetoed, and with no routing value,
+    /// which a named worker outranks. A header that is absent, empty or
+    /// not text names no worker. A pair's request and an encode request
+    /// are not read for a target: they are placed by the rest of the
+    /// document.
+    ///
     /// Declined by name ([`ShedReason::PolicyDeclined`]): a request that
     /// carries encode items over other lists than an encode request's
     /// three (`encode-items`). A pair that states a demand is shed with no
@@ -1475,6 +1522,12 @@ impl PolicyEngine {
         let own = self.loaded();
         match request.lists {
             WorkerLists::Pair(ref lists) => pair::place(own, request, lists, &mut Call::default()),
+            // Whether a binding names a target source was decided when the
+            // document was applied: under one that names none, a request
+            // pays this test and no read of a header.
+            WorkerLists::Single(list) if own.document.spec.names_target() => {
+                target::single(own, request, list)
+            }
             WorkerLists::Single(list) => single(own, request, Some(list), &mut Call::default()),
             WorkerLists::None => single(own, request, None, &mut Call::default()),
             // A pair's lists and an encode request's are read where the
