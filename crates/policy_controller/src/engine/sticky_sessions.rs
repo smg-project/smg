@@ -125,6 +125,19 @@ impl DecodeVerdict {
             _ => SessionVerdict::None,
         }
     }
+
+    /// What a pair keeps of its decode side's `verdict`: a claim's worker
+    /// is the decode the pair names, the first target of that side's
+    /// decision.
+    #[must_use]
+    pub(crate) const fn of(verdict: SessionVerdict) -> Self {
+        match verdict {
+            SessionVerdict::None => Self::NONE,
+            SessionVerdict::Pinned => Self::PINNED,
+            SessionVerdict::Respill => Self::RESPILL,
+            SessionVerdict::Claimed(_) => Self::CLAIMED,
+        }
+    }
 }
 
 /// The pins of one key: the preferred worker first, the failover second;
