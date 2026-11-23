@@ -73,7 +73,9 @@ pub fn load_row(
         kv_usage_permille: permille(kv_usage / ranks),
         active_kv_permille: permille(active_kv / ranks),
         live_rate: if live_rate.is_finite() && live_rate > 0.0 {
-            live_rate.min(f64::from(u32::MAX)) as u32
+            // Zero says no rate: cut to it, a rate under one token a second
+            // would drain its row at the mean rate of the row's peers.
+            live_rate.clamp(1.0, f64::from(u32::MAX)) as u32
         } else {
             0
         },
@@ -353,6 +355,21 @@ mod tests {
         ]);
         let row = load_row(&one_idle, Role::Decode, now, now, SignalSource::Events);
         assert_eq!(row.live_rate, 40);
+    }
+
+    /// Zero is the row's word for no rate, and a scorer drains such a row at
+    /// its peers' mean rate: a busy worker's rate under one must not read so,
+    /// and a rate stated as zero still must.
+    #[test]
+    fn a_rate_under_one_token_a_second_is_a_rate_of_one() {
+        let now = Instant::now();
+        let rate = |gen, prefill, role| {
+            let busy = report(vec![rank(1, 0, 0.1, gen, Some(prefill))]);
+            load_row(&busy, role, now, now, SignalSource::Poll).live_rate
+        };
+        assert_eq!(rate(0.5, 0.0, Role::Decode), 1);
+        assert_eq!(rate(0.0, 0.5, Role::Prefill), 1);
+        assert_eq!(rate(0.0, 0.5, Role::Decode), 0, "a stated zero");
     }
 
     #[test]
