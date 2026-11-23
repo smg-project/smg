@@ -150,16 +150,9 @@ pub(super) fn turn(host: &Host, prompt: &conversations::Turn<'_>, rule: bool) ->
 #[inline(never)]
 pub(super) fn said(placement: &mut Placement<'_>) {
     placement.sent(Side::Single);
-    let end = Outcome {
-        side: Side::Single,
-        served: placement.id(),
-        status: 200,
-        class: TransportClass::Ok,
-        ttft_micros: 0,
-        tokens_in: 1_024,
-        tokens_out: 0,
-        duration_micros: 0,
-    };
+    let mut end =
+        Outcome::reported(200, TransportClass::Ok).with_served(Side::Single, placement.id());
+    end.tokens_in = 1_024;
     placement.ended(Side::Single, end);
 }
 

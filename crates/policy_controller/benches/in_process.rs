@@ -654,16 +654,8 @@ impl Host {
     #[inline(never)]
     fn told(held: &mut DecisionGuard<&PolicyEngine>, served: WorkerId, now: Instant) {
         held.dispatched(now);
-        let end = Outcome {
-            side: Side::Single,
-            served,
-            status: 200,
-            class: TransportClass::Ok,
-            ttft_micros: 0,
-            tokens_in: 1_024,
-            tokens_out: 0,
-            duration_micros: 0,
-        };
+        let mut end = Outcome::reported(200, TransportClass::Ok).with_served(Side::Single, served);
+        end.tokens_in = 1_024;
         held.completed(&end, now);
     }
 }

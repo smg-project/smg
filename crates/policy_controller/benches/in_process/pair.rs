@@ -188,15 +188,10 @@ impl Decodes {
                 decode
             };
             held.dispatched_decode(now);
-            let end = |side, served| Outcome {
-                side,
-                served,
-                status: 200,
-                class: TransportClass::Ok,
-                ttft_micros: 0,
-                tokens_in: 1_024,
-                tokens_out: 0,
-                duration_micros: 0,
+            let end = |side, served| {
+                let mut end = Outcome::reported(200, TransportClass::Ok).with_served(side, served);
+                end.tokens_in = 1_024;
+                end
             };
             held.completed(&end(Side::Prefill, target.id), now);
             held.completed(&end(Side::Decode, decode), now);

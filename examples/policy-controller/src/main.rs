@@ -69,10 +69,7 @@ impl Scorer for Pack {
     /// hands none to a scorer that does not declare them, and every worker
     /// then reads as idle.
     fn needs(&self) -> Needs {
-        Needs {
-            loads: true,
-            ..Needs::default()
-        }
+        Needs::NONE.with_loads()
     }
 
     /// This scorer only places, and by the engines' own reports: it turns

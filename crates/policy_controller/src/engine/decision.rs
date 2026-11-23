@@ -24,6 +24,9 @@ pub const TRACE_TOP: usize = 3;
 
 /// One target: a candidate by position and id, with the decode side when the
 /// decision is a pair.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..Target::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Target {
     /// Position in the host's candidate slice (the prefill's for a pair).
@@ -36,6 +39,9 @@ pub struct Target {
 
 /// The decode side of a pair target, by position in the host's decode slice.
 /// The rendezvous the two sides meet at is the host's at dispatch.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..Pair::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Pair {
     pub decode_position: u32,
@@ -456,6 +462,9 @@ pub enum OverlapSource {
 ///
 /// Six bytes, in bytes a pick's targets had spare behind their count: a
 /// pick is no larger for it ([`Pick::overlap`]).
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..Overlap::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Overlap {
     /// The leading blocks the worker holds, by the stage's source: the
@@ -536,6 +545,9 @@ enum Placing {
 /// onto the lease it commits, and fills the lease's session from the
 /// request ([`crate::engine::RequestFacts::session`]) for every keyed request, rule
 /// or no rule: the verdict alone says whether the commit moves a pin.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..Pick::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Pick {
     pub targets: Targets,

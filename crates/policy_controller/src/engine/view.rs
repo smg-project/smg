@@ -289,6 +289,9 @@ pub(crate) fn threshold_permille(usage: f64) -> u16 {
 /// One load row as the view carries it: the engine load record's routing
 /// core, in the record's own names, rounded to narrow fields by the host.
 /// Permille fields are the record's ratios times 1000.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..LoadRow::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoadRow {
     /// Requests running on the engine.
@@ -462,6 +465,9 @@ impl Session {
 /// held by a worker just admitted, which is what every candidate reads as
 /// when the column is empty. On a wire the five are fields of the
 /// candidate's own record, at the numbers they were given.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..AffinityFacts::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AffinityFacts {
     /// Prefix blocks of the request this worker holds, by the event index.
@@ -748,6 +754,9 @@ impl Reads<'_> {
 /// The wire form drops the position and the sample instant, carries the
 /// candidate's [`AffinityFacts`] in the same record and encodes to about 76
 /// bytes with its load row.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..Candidate::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(align(64))]
 pub struct Candidate {
@@ -1073,6 +1082,9 @@ pub struct KeyedRow {
 
 /// One request as a decision sees it. Borrowed from the host for the
 /// duration of the decision.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..RequestFacts::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RequestFacts<'a> {
     /// The resolved model id, after aliasing.
@@ -1481,6 +1493,9 @@ pub trait PinSource: std::fmt::Debug + Sync {
 /// What only the deciding host knows now: its standing vetoes, the wires it
 /// speaks and the request-level lifts around the profile. The admission bits
 /// of a prefill window and a decode room ride the candidate rows.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..Constraints::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Constraints<'a> {
     /// Candidates this host just failed to reach.
@@ -1658,6 +1673,9 @@ impl<'a> Engines<'a> {
 }
 
 /// Pool-wide facts beside the candidates.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..PoolFacts::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PoolFacts<'a> {
     /// Pool size before any narrowing.

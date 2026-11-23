@@ -663,10 +663,8 @@ fn a_lease_filed_dispatched_and_completed_at_the_store_allocates_nothing() {
                 since_decision_micros: 100,
             };
             store.hand(&hand, lease, Said::Dispatched(dispatch, now));
-            let outcome = Outcome {
-                served: worker,
-                ..Outcome::reported(200, TransportClass::Ok)
-            };
+            let outcome =
+                Outcome::reported(200, TransportClass::Ok).with_served(Side::Single, worker);
             store.hand(&hand, lease, Said::Completed(outcome));
             HealthSink::completed(&store, gateway, worker, outcome.class, now);
             let ended = store.expire(now);

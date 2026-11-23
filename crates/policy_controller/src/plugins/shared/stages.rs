@@ -778,13 +778,13 @@ mod tests {
     /// for one that lists them all, and each kind alone its own call.
     #[test]
     fn an_adapter_hands_the_kinds_the_row_lists_and_no_other() {
-        let alone = EventKind::ALL.map(|kind| EventSet::of([kind]));
+        let alone = EventKind::EVERY.map(|kind| EventSet::of([kind]));
         let two = EventSet::of([EventKind::Completed, EventKind::Signal]);
         for listed in [EventSet::NONE, EventSet::ALL, two]
             .into_iter()
             .chain(alone)
         {
-            let wanted = EventKind::ALL.map(|kind| u32::from(listed.contains(kind)));
+            let wanted = EventKind::EVERY.map(|kind| u32::from(listed.contains(kind)));
             let scored = Told::listing(listed);
             tell(&PluginScorer::new(Arc::clone(&scored), None));
             assert_eq!(scored.told(), wanted, "the scorer, {listed:?}");

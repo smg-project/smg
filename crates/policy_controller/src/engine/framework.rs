@@ -160,8 +160,11 @@ impl TieBand {
 }
 
 /// How the values a scorer writes for the rows of one decision lie
-/// ([`Scorer::spread`]).
+/// ([`Scorer::spread`]). Further spreads add their cases: a stage names
+/// the one it writes, and a `match` outside this crate keeps an arm for
+/// the rest.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum ScoreSpread {
     /// Anywhere in `0.0..=1.0`.
     Any,
@@ -178,8 +181,11 @@ pub enum ScoreSpread {
 }
 
 /// What a rank's answer left in front, said beside its scores
-/// ([`Scorer::score_front`]).
+/// ([`Scorer::score_front`]). Further words add their cases: a stage
+/// names the one it says, and a `match` outside this crate keeps an arm
+/// for the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScoreFront {
     /// Nothing is said of the scores.
     Unsaid,
@@ -461,7 +467,23 @@ pub trait Scorer: Lifecycle + Debug {
 /// over that still follow its pick as alternates, in the order it left them.
 /// They follow a pick and never stand in for one: when the picker pushes no
 /// target, none is appended.
+///
+/// The record gains counts: code outside this crate makes it by
+/// [`Shortlist::all`] or [`Shortlist::new`], and matches it with `..`.
+///
+/// ```
+/// use smg_policy_controller::engine::Shortlist;
+/// let shortlist = Shortlist::new(2, 1);
+/// assert_eq!((shortlist.compared, shortlist.alternates), (2, 1));
+/// assert_eq!(Shortlist::all(5), Shortlist::new(5, 0));
+/// ```
+///
+/// ```compile_fail
+/// use smg_policy_controller::engine::Shortlist;
+/// let _ = Shortlist { compared: 2, alternates: 1 };
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Shortlist {
     /// How many survivors, from the front, the picker compares.
     pub compared: usize,
@@ -475,6 +497,16 @@ impl Shortlist {
         Self {
             compared: survivors,
             alternates: 0,
+        }
+    }
+
+    /// The first `compared` survivors are compared, and the next
+    /// `alternates` follow the pick as alternates.
+    #[must_use]
+    pub const fn new(compared: usize, alternates: usize) -> Self {
+        Self {
+            compared,
+            alternates,
         }
     }
 }
@@ -522,8 +554,11 @@ pub const RANK_FROM: usize = DRAW_FROM;
 // ranks.
 const _: () = assert!(RANK_FROM == DRAW_FROM);
 
-/// What a picker draws ([`Picker::unit`]).
+/// What a picker draws ([`Picker::unit`]). Further units add their cases:
+/// a picker names its own, and a `match` outside this crate keeps an arm
+/// for the rest.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DrawUnit {
     /// A row: a worker, or one rank of a data-parallel worker.
     #[default]

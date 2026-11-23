@@ -45,6 +45,9 @@ pub enum Side {
 }
 
 /// The record of one issued decision, or of one side of a pair decision.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..Lease::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Lease {
     pub id: LeaseId,
@@ -120,8 +123,10 @@ impl Lease {
 
 /// The transport outcome of a dispatch, beside its status: what a health
 /// rule reads when it weighs a prober's verdict against the gateways'
-/// reports.
+/// reports. Further classes add their cases: a `match` outside this crate
+/// keeps an arm for the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransportClass {
     Ok,
     ClientError,
@@ -131,8 +136,27 @@ pub enum TransportClass {
     Cancelled,
 }
 
-/// What a completed dispatch reported.
+/// What a completed dispatch reported. The record gains fields: code
+/// outside this crate makes it by [`Outcome::reported`], sets what it
+/// measured a field each, and matches it with `..`.
+///
+/// ```
+/// use smg_policy_controller::{
+///     engine::WorkerId,
+///     tracking::{Outcome, Side, TransportClass},
+/// };
+/// let mut outcome =
+///     Outcome::reported(200, TransportClass::Ok).with_served(Side::Single, WorkerId(7));
+/// outcome.tokens_out = 12;
+/// assert_eq!((outcome.served, outcome.tokens_out), (WorkerId(7), 12));
+/// ```
+///
+/// ```compile_fail
+/// use smg_policy_controller::tracking::{Outcome, TransportClass};
+/// let _ = Outcome { status: 500, ..Outcome::reported(200, TransportClass::Ok) };
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Outcome {
     pub side: Side,
     pub served: WorkerId,
@@ -149,12 +173,13 @@ pub struct Outcome {
 impl Outcome {
     /// An outcome that states how its request ended and nothing it
     /// measured: the status and the class, with every measure zero, under
-    /// no side and no served worker. Its caller adds what it measured by
-    /// struct update.
+    /// no side and no served worker. Its caller sets what it measured, a
+    /// field each.
     ///
     /// A placement that is told an end (`Placement::ended`, with the feature
     /// `in-process`) writes the side and the served worker over: its caller
-    /// leaves both as made here. A guard's caller states both.
+    /// leaves both as made here. A guard's caller states both
+    /// ([`Outcome::with_served`]).
     ///
     /// The class has no default: it feeds a worker's health, and an end
     /// whose caller forgot it must not read as [`TransportClass::Ok`].
@@ -171,10 +196,22 @@ impl Outcome {
             duration_micros: 0,
         }
     }
+
+    /// The outcome as the end of `side`'s dispatch to `served`: what a
+    /// caller that holds a guard states, where no placement writes the two
+    /// for it.
+    #[must_use]
+    pub const fn with_served(mut self, side: Side, served: WorkerId) -> Self {
+        self.side = side;
+        self.served = served;
+        self
+    }
 }
 
-/// Why a lease was released before its completion.
+/// Why a lease was released before its completion. Further reasons add
+/// their cases: a `match` outside this crate keeps an arm for the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReleaseReason {
     /// The lease ended before a dispatch: its host gave up, no dispatch
     /// was named by its deadline, or its answer was stopped for the fence
@@ -223,11 +260,37 @@ pub enum Said {
 /// A membership change the host reports. A host tells a join when it takes
 /// it, and a view that lists the row may follow: a stage that lists by the
 /// feed treats a member its candidates do not hold as one a filter took.
+///
+/// Further changes add their cases, and a case with named fields may gain
+/// one: a `match` outside this crate keeps an arm for the rest and ends
+/// such a case's pattern with `..`. It makes those two cases by their
+/// calls ([`Membership::replaced`], [`Membership::left`]).
+///
+/// ```
+/// use smg_policy_controller::{engine::WorkerId, tracking::Membership};
+/// let models = ["a-model".to_owned()];
+/// let replaced = Membership::replaced(WorkerId(1), WorkerId(2));
+/// let left = Membership::left(WorkerId(2), &models);
+/// assert!(matches!(replaced, Membership::Replaced { old: WorkerId(1), .. }));
+/// assert!(matches!(left, Membership::Left { models: [_], .. }));
+/// ```
+///
+/// ```compile_fail
+/// use smg_policy_controller::{engine::WorkerId, tracking::Membership};
+/// let _ = Membership::Replaced { old: WorkerId(1), new: WorkerId(2) };
+/// ```
+///
+/// ```compile_fail
+/// use smg_policy_controller::{engine::WorkerId, tracking::Membership};
+/// let _ = Membership::Left { id: WorkerId(2), models: &[] };
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Membership<'a> {
     Added(WorkerId),
     Removed(WorkerId),
     /// The same registration key with a new incarnation.
+    #[non_exhaustive]
     Replaced {
         old: WorkerId,
         new: WorkerId,
@@ -247,10 +310,27 @@ pub enum Membership<'a> {
     /// unlists the worker under these alone. Both plugin contracts carry
     /// the word: the guest's world as the case `left`, the remote one as a
     /// kind a stream of protocol 2 is sent.
+    #[non_exhaustive]
     Left {
         id: WorkerId,
         models: &'a [String],
     },
+}
+
+impl<'a> Membership<'a> {
+    /// The registration key of `old` under its new incarnation `new`
+    /// ([`Membership::Replaced`]).
+    #[must_use]
+    pub const fn replaced(old: WorkerId, new: WorkerId) -> Self {
+        Self::Replaced { old, new }
+    }
+
+    /// The worker `id` left its pool of each of `models`
+    /// ([`Membership::Left`]).
+    #[must_use]
+    pub const fn left(id: WorkerId, models: &'a [String]) -> Self {
+        Self::Left { id, models }
+    }
 }
 
 /// A signal about one worker. The named values a document declares under
@@ -258,7 +338,37 @@ pub enum Membership<'a> {
 /// rows ([`SignalCells`](crate::load::SignalCells)). A load row states its
 /// report's named values too, and borrows them: the word lives as long as
 /// they are lent.
+///
+/// Further signals add their cases, and each case may gain a field: a
+/// `match` outside this crate keeps an arm for the rest and ends a case's
+/// pattern with `..`. It makes a case by its call ([`Signal::load`],
+/// [`Signal::health`], [`Signal::gateway_veto`]).
+///
+/// ```
+/// use smg_policy_controller::{
+///     engine::{Health, WorkerId},
+///     tracking::Signal,
+/// };
+/// let health = Signal::health(WorkerId(1), Health::default());
+/// let veto = Signal::gateway_veto(WorkerId(1), 500_000);
+/// assert!(matches!(health, Signal::Health { worker: WorkerId(1), .. }));
+/// assert!(matches!(veto, Signal::GatewayVeto { until_micros: 500_000, .. }));
+/// ```
+///
+/// ```compile_fail
+/// use smg_policy_controller::{
+///     engine::{Health, WorkerId},
+///     tracking::Signal,
+/// };
+/// let _ = Signal::Health { worker: WorkerId(1), health: Health::default() };
+/// ```
+///
+/// ```compile_fail
+/// use smg_policy_controller::{engine::WorkerId, tracking::Signal};
+/// let _ = Signal::GatewayVeto { worker: WorkerId(1), until_micros: 500_000 };
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Signal<'a> {
     /// A load row for one rank of a worker, as the host shows it to its
     /// decisions. The in-process engine tells one row a worker object: the
@@ -306,16 +416,12 @@ pub enum Signal<'a> {
         /// of several ranks.
         signals: ReportSignals<'a>,
     },
-    Health {
-        worker: WorkerId,
-        health: Health,
-    },
+    #[non_exhaustive]
+    Health { worker: WorkerId, health: Health },
     /// A gateway's standing veto on a worker, until the given instant on the
     /// host's clock. In-process only; the wire carries a duration.
-    GatewayVeto {
-        worker: WorkerId,
-        until_micros: u64,
-    },
+    #[non_exhaustive]
+    GatewayVeto { worker: WorkerId, until_micros: u64 },
 }
 
 impl<'a> Signal<'a> {
@@ -337,6 +443,22 @@ impl<'a> Signal<'a> {
             slot: WorkerSlot::NONE,
             sampled_at_micros,
             signals: ReportSignals::NONE,
+        }
+    }
+
+    /// The health of `worker` ([`Signal::Health`]).
+    #[must_use]
+    pub const fn health(worker: WorkerId, health: Health) -> Self {
+        Self::Health { worker, health }
+    }
+
+    /// A gateway's veto on `worker` until `until_micros` on the host's
+    /// clock ([`Signal::GatewayVeto`]).
+    #[must_use]
+    pub const fn gateway_veto(worker: WorkerId, until_micros: u64) -> Self {
+        Self::GatewayVeto {
+            worker,
+            until_micros,
         }
     }
 
@@ -366,10 +488,12 @@ impl<'a> Signal<'a> {
 }
 
 /// One kind of lifecycle event: one of the six calls of [`Lifecycle`], as
-/// both plugin contracts name them.
+/// both plugin contracts name them. Further calls add their kinds: a
+/// `match` outside this crate keeps an arm for the rest.
 ///
 /// [`Lifecycle`]: crate::stages::Lifecycle
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EventKind {
     Issued,
     Dispatched,
@@ -380,8 +504,13 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    /// Every kind, in the order of its bit.
-    pub const ALL: [Self; 6] = [
+    /// Every kind, in the order of its bit. A slice: a further kind changes
+    /// no type that code outside this crate names.
+    pub const ALL: &'static [Self] = &Self::EVERY;
+
+    /// The list behind [`Self::ALL`] with its length in its type, for the
+    /// crate's own code that maps it.
+    pub(crate) const EVERY: [Self; 6] = [
         Self::Issued,
         Self::Dispatched,
         Self::Completed,
@@ -482,7 +611,7 @@ mod tests {
     /// place here, which is its place in [`EventKind::ALL`]: the one list
     /// that the set of every kind, the set's print and the cases read.
     fn kinds() -> [EventKind; 6] {
-        let kinds = EventKind::ALL;
+        let kinds = EventKind::EVERY;
         for (at, kind) in kinds.into_iter().enumerate() {
             let place = match kind {
                 EventKind::Issued => 0,
