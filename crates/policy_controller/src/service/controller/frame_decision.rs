@@ -16,38 +16,49 @@
 //! A pair is decided at its prefill, for both sides, over its model's two
 //! lists: [`decide_pair`] states each side's places by that side's own
 //! list and gives the request the same snapshot, and [`issue_pair`] files
-//! a lease a side under one id.
+//! a lease a side under one id. A decode call behind a pair's held prefill
+//! is decided over the same two lists, with the decode side's places alone
+//! ([`decide_decode`]), and its pick is issued under the pair's own lease
+//! ([`issue_decode`]).
 //!
 //! The engine that decides and the stages that are told are one object:
 //! the world's ([`StoreSnapshot::front`]). A lease is dated on that
 //! engine's clock, the one its decisions read.
 //!
-//! A decode call and an encode request have no decision here yet: their
-//! deciding thread answers them `Busy` and reads no list for them.
+//! An encode request and a decode frame that names no lease have no
+//! decision here yet: their deciding thread answers them `Busy` and reads
+//! no list for them.
 
-use std::sync::{atomic::Ordering, Arc};
+use std::{
+    panic::{catch_unwind, AssertUnwindSafe},
+    sync::{atomic::Ordering, Arc},
+};
 
 use smg_worker::load::state::LoadSnapshot;
+use tracing::error;
 
 use super::{
     decision_slots::{DecisionCall, Part},
     frame_request::FrameRequest,
     gateway_places::{Asking, GatewayPlaces, Taken},
+    lease_words::{issued_later, issuing},
     wire::{Checked, Lists},
 };
 use crate::{
     document::spec::AppliedSpec,
     engine::{
-        decision::{shed, Decision, Pick, ShedReason, Target},
-        decision_engine::{DecisionRefused, WorkerLists},
+        decision::{shed, Decision, Pair, Pick, ShedReason, Target},
+        decision_engine::{DecisionRefused, DecodeRefused, WorkerLists},
+        framework::release,
         policy_engine::PolicyEngine,
         shadow::Shadowed,
-        view::{fingerprint, Phase, RequestFacts, Role, Session},
+        view::{fingerprint, Phase, RequestFacts, Role, Session, WorkerId},
         PairLists,
     },
     stages::lifecycle::Lifecycle,
     store::{
-        DecodeSide, LeaseRecord, LeaseRefused, LeaseState, MemoryStore, PickRecord, StoreSnapshot,
+        DecodeIssue, DecodeSide, LeaseRecord, LeaseRefused, LeaseState, MemoryStore, PickRecord,
+        StoreSnapshot,
     },
     tracking::lease::{Lease, LeaseId, LeaseKind, Side},
     worker_host::{Members, Objects, OpenAdmission},
@@ -487,8 +498,8 @@ pub(crate) fn issue(
 /// A frame that states that its decode is sent later
 /// (`DecideRequest.decode_later`) files the decode side chosen: the side
 /// holds the pick's decodes and books nothing, and no stage hears of it
-/// until a dispatch names it. Its answer carries the prefill side's lease
-/// alone.
+/// until a decode call issues it ([`issue_decode`]) or a dispatch names it.
+/// Its answer carries the prefill side's lease alone.
 ///
 /// No shadow runs on a pair's side yet, so none is counted here. The
 /// decode side's lease states the prefill side's session verdict: the
@@ -545,6 +556,222 @@ pub(crate) fn issue_pair(
     let told = |lease: &Lease| stages.on_decision_issued(lease, decision);
     let lease = store.issue_decided_pair(record, side, slots, told)?;
     Ok(Some((lease, (!later).then(|| side.lease(&lease)))))
+}
+
+/// The decision of a decode call's frame, in the world of one load as
+/// [`decide_pair`] takes it: the pair's decode decided again behind the
+/// prefill its lease holds. `held` is the store's answer for the lease the
+/// call names ([`MemoryStore::held_pair`]): the held prefill's worker, then
+/// the decode the lease's first decision chose for the target that
+/// prefill's dispatch took. A decode profile that keeps its pick answers
+/// that decode again while its filters keep it.
+///
+/// The decode side's list alone is the asking gateway's to take, by its
+/// reach, wires and standing vetoes: the held prefill was sent already, and
+/// the engine finds it in its list wherever it stands. The answers come in
+/// a pair's order, for the one side. A model the registry holds no worker
+/// of, and one with no decode, are decided over no worker. Else a gateway
+/// whose wires or whose subset hint of 0 take every decode it dials is shed
+/// under that stage. Else a gateway that dials no decode is decided over no
+/// worker. Only then is the engine asked, and it alone looks for the held
+/// prefill: a call whose prefill left its list is shed under one of the
+/// answers above where one holds, and under the engine's own name for it
+/// otherwise. The request reads the reports of `loads` where a pair's
+/// first decision is given it ([`hands_reports`]).
+///
+/// A decode profile with a stage that may refuse by a report of leases is
+/// decided behind an apply of what waits at the files of leases, where the
+/// decider lent its place. The word asked is the decode phase's, which
+/// holds the pair's decode profile's: no stage of the prefill's profile
+/// runs at the call, so none of its can refuse.
+///
+/// `Ok` is the decision with what its side's lease takes of the frame: the
+/// request's session of the decode phase and the prompt's tokens.
+///
+/// # Errors
+///
+/// [`DecisionRefused::Faulted`] where the decision panicked: the engine
+/// caught it and counted it.
+pub(crate) fn decide_decode(
+    world: &StoreSnapshot,
+    objects: &Objects<Members>,
+    taken: &DecisionCall<'_, Checked>,
+    (prefill, first): (WorkerId, Option<(WorkerId, u16)>),
+    buffers: &mut FrameBuffers,
+    loads: &Arc<LoadSnapshot>,
+    own: &Part,
+) -> Result<(Decision, (Session, u32)), DecisionRefused> {
+    let DecisionCall {
+        request: frame,
+        gateway,
+        now,
+        left,
+        place,
+        ..
+    } = *taken;
+    let front = world.front();
+    let spec = front.spec();
+    let model = frame.model();
+    if frame.hashes() > frame.hashes_read(spec) {
+        own.hashes_cut.fetch_add(1, Ordering::Relaxed);
+    }
+    let (_, _, by_reports) = spec.engine().reads_for(model, Phase::Decode);
+    if let Some(place) = place.filter(|_| by_reports) {
+        place.apply_waiting();
+    }
+    let FrameBuffers {
+        lists,
+        decode_places,
+        ..
+    } = buffers;
+    let read = lists.of(frame);
+    // The target the pair holds: its prefill, and the decode its first
+    // decision chose for it.
+    let held = Target {
+        id: prefill,
+        pair: first.map(|(decode_id, decode_dp_rank)| Pair {
+            decode_id,
+            decode_dp_rank,
+            ..Pair::default()
+        }),
+        ..Target::default()
+    };
+    let over_none = || FrameRequest::new(frame, &read, left, WorkerLists::None);
+    let generation = objects.registry().model_generation(model);
+    // The decodes as the decision reads them: the list their role lends,
+    // and its records.
+    let listed = generation.as_deref().map(|generation| {
+        let lent = objects.lent(generation, Role::Decode);
+        let records = front.members_of(lent).records(spec, front.clock());
+        (generation, lent, records)
+    });
+    let decision = match listed.filter(|(.., records)| !records.is_empty()) {
+        Some((generation, decode, records)) => {
+            let reach = objects.reach(generation, Role::Decode);
+            let vetoes = world.gateway_vetoes(model, Role::Decode, gateway);
+            let asking = Asking::of(gateway, frame);
+            let decided = match decode_places.taken(reach, records, asking, vetoes.standing_at(now))
+            {
+                Taken::Held(decodes) => {
+                    let pair = PairLists {
+                        prefill: objects.lent(generation, Role::Prefill),
+                        decode,
+                        classes: objects.pair_classes(generation, spec.pairing()),
+                        admission: &OpenAdmission,
+                        prefill_places: None,
+                        decode_places: decodes.places,
+                        prefill_stalled: &[],
+                        prefill_held: &[],
+                        decode_stalled: decodes.stalled,
+                        decode_held: decodes.held,
+                    };
+                    let maker = FrameRequest::new(frame, &read, left, WorkerLists::Pair(pair));
+                    let maker = if hands_reports(spec) {
+                        maker.reading(loads)
+                    } else {
+                        maker
+                    };
+                    front.decide_decode_without_lease(&maker, &held, now)
+                }
+                Taken::Emptied(stage) => {
+                    let (seed, generation) = (frame.seed(), spec.generation());
+                    Ok(shed(ShedReason::NoEndpoints, stage, seed, generation))
+                }
+                Taken::Unreached => front.decide_decode_without_lease(&over_none(), &held, now),
+            };
+            // Counted whatever the decision came to.
+            let undialed = decode_places.undialed();
+            if undialed > 0 {
+                own.undialed.fetch_add(undialed, Ordering::Relaxed);
+            }
+            decided?
+        }
+        // A model nobody serves, and one with no decode.
+        None => front.decide_decode_without_lease(&over_none(), &held, now)?,
+    };
+    // What the side's lease takes of its request, read where the frame's
+    // lists still stand: a decode call's frame is read at the decode phase.
+    let booked = match decision.pick() {
+        Some(_) => {
+            let facts = frame.facts(&read, 0, 0);
+            (facts.session(), facts.prompt_tokens)
+        }
+        None => (Session::NONE, 0),
+    };
+    Ok((decision, booked))
+}
+
+/// Files a decode call's pick under `lease`, the pair's own lease, and
+/// tells the engine, under one hold of the file: the decode side on the
+/// pick's first decode, under the request's session of the decode phase,
+/// booking that decode's count. The side's lease comes with its issue's
+/// count, for an answer that does not leave
+/// ([`MemoryStore::unissue_decode`]). `None` for a shed, which files none.
+///
+/// The engine told is the one of the lease's own generation ([`issuing`]):
+/// behind a reload the engine of this instant decided the side and hears
+/// nothing of the lease. The issue is dated at this call
+/// ([`issued_later`]). A stage that panics there is held and counted, as
+/// under a report, and the caller still gets the pick the file holds.
+///
+/// # Errors
+///
+/// [`DecodeRefused`]: the lease moved since the call's first test.
+pub(crate) fn issue_decode(
+    store: &MemoryStore,
+    world: &StoreSnapshot,
+    taken: &DecisionCall<'_, Checked>,
+    lease: LeaseId,
+    decision: &Decision,
+    (session, tokens): (Session, u32),
+) -> Result<Option<(Lease, DecodeIssue)>, DecodeRefused> {
+    // Each target of the decode decided again names its decode.
+    let named = decision
+        .pick()
+        .and_then(|pick| Some((pick, pick.targets.first()?.pair?)));
+    let Some((pick, chosen)) = named else {
+        // A pick that named no decode would leave with no lease, its side
+        // still chosen: the engine makes none.
+        debug_assert!(
+            decision.pick().is_none(),
+            "a decode call's pick: {decision:?}"
+        );
+        return Ok(None);
+    };
+    let side = DecodeSide {
+        target: chosen.decode_id,
+        picked: PickRecord::of_decodes(&pick.targets),
+        session,
+        state: LeaseState::ISSUED,
+        tokens,
+        target_index: 0,
+    };
+    let slot = world
+        .booked_of(chosen.decode_id)
+        .or_else(|| store.filed_slot(chosen.decode_id));
+    let spec = world.spec();
+    let told = |lease: &Lease| {
+        let Some(engine) = issuing(spec, lease) else {
+            return;
+        };
+        let heard = || issued_later(world, engine, lease, decision, taken.now);
+        match catch_unwind(AssertUnwindSafe(heard)) {
+            Ok(()) => store.call_returned(),
+            Err(payload) => {
+                release(payload);
+                // The first fault of a streak writes its line, as under a
+                // gateway's frame.
+                if store.call_faulted() {
+                    error!(
+                        lease = lease.id.0,
+                        "a stage's call panicked at a decode call's issue: held, and the side stands as issued"
+                    );
+                }
+            }
+        }
+    };
+    let issued = store.issue_decided_decode(taken.gateway, lease, (side, slot), taken.now, told);
+    issued.map(Some)
 }
 
 #[cfg(test)]

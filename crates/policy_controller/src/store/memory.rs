@@ -3318,6 +3318,16 @@ impl FiledDecode {
             taken: 0,
         }
     }
+
+    /// The decode, with its rank, of the target the prefill's dispatch
+    /// took ([`Self::taken`]): the one a decode decided again behind that
+    /// prefill starts from. Every target of a pair's pick names the one
+    /// prefill, so the index its dispatch names says which decode its
+    /// host took.
+    #[cfg(feature = "controller")]
+    fn taken_decode(&self) -> Option<(WorkerId, u16)> {
+        self.side.target_at(self.taken)
+    }
 }
 
 /// The decode sides of the pairs' leases on file, each in a place its
@@ -4340,10 +4350,6 @@ impl MemoryStore {
     /// since, and nothing moves: the caller tells its engine of a release
     /// only behind `true`.
     #[cfg(feature = "controller")]
-    #[expect(
-        dead_code,
-        reason = "a decode call's lease is taken back again once it is decided over worker lists"
-    )]
     pub(crate) fn unissue_decode(
         &self,
         gateway: GatewayId,
@@ -4353,6 +4359,29 @@ impl MemoryStore {
         self.turn_of(self.file_of(lease))
             .taken_back(&(gateway, lease), Some(issue))
             .is_some()
+    }
+
+    /// The pair of the lease a decode call names, where the lease still
+    /// takes a decode side: its prefill is dispatched and held and its
+    /// decode side is chosen. The prefill's worker comes first, then the
+    /// worker and the rank of the decode the lease's first decision chose
+    /// for the target the prefill's dispatch took: the pick's first
+    /// target, or the one that dispatch named. The call reads this before
+    /// it decides, and its issue tests the same again under its own turn.
+    ///
+    /// # Errors
+    ///
+    /// Why the lease takes no decode side: the test of an issue
+    /// ([`Self::issue_decided_decode`]).
+    #[cfg(feature = "controller")]
+    pub(crate) fn held_pair(
+        &self,
+        gateway: GatewayId,
+        lease: LeaseId,
+    ) -> Result<(WorkerId, Option<(WorkerId, u16)>), DecodeRefused> {
+        self.turn_of(self.file_of(lease))
+            .chosen_decode(&(gateway, lease))
+            .map(|(held, decode)| (held.record.target, decode.taken_decode()))
     }
 
     /// The one issue behind the doors: a single's lease with no `pair`,

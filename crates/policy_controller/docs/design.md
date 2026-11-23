@@ -904,8 +904,8 @@ A second engine stood beside it: the store-backed engine, also called the old en
 decided over records copied into the policy store and kept its leases there. Its type is deleted,
 a step of stage 4 (section 16). The store's copies of the worker data that only it read are
 deleted in the steps behind it (sections 10.2 and 10.3). A controller decides a pair at its
-prefill over worker lists too; a decode call and an encode request are answered `Busy` until
-they follow (decision 5).
+prefill and its decode call over worker lists too; an encode request is answered `Busy` until
+it follows (decision 5).
 
 The types the two engines shared stay where they were moved ahead of the deletion: `Request`,
 `DecideOutcome`, `DecisionRefused` and `DecodeRefused` in the trait's file, and
@@ -1595,8 +1595,11 @@ A `Decide` request of the single phase is decided on one of a fixed set of threa
 picks the thread) by `PolicyEngine::decide_without_lease`, over the list of the model's workers
 that the worker objects' registry publishes. A pair's request at its prefill is decided there
 too, over the registry's two lists of its model. Its answer carries a lease a side, or the
-prefill side's alone where its frame stated the later decode. A decode call, an encode request
-and a prefill whose plan pairs no side are answered `Busy`, and their gateway decides them.
+prefill side's alone where its frame stated the later decode. A decode call that names the
+pair's lease is decided behind the prefill that lease holds, by
+`PolicyEngine::decide_decode_without_lease`, and its pick is issued under that lease. An encode
+request, a decode request that names no lease and a prefill whose plan pairs no side are
+answered `Busy`, and their gateway decides them.
 
 ### 10.2 As designed **[partly]**
 
@@ -1606,13 +1609,13 @@ the worker crate's structures, and the one engine.
 | Data | On main | As designed |
 |---|---|---|
 | workers | records in the store, and worker objects kept in step with them | worker objects in a worker-crate registry; beside each, the code that keeps the objects holds what a registration stated and the object does not hold as stated (10.3); the membership log that watchers and standbys read stays |
-| lists | the store's published copy; a single request's decision reads the registry's published list of the model's single workers, and a pair's at its prefill the lists of its two sides | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
-| health | the worker crate's health checker over the worker objects, on the leader; each outcome is copied into the store's record, an object's status follows its record's, and a single request's decision reads the object's | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
+| lists | the store's published copy; a single request's decision reads the registry's published list of the model's single workers, and a pair's, at its prefill and at its decode call, the lists of its two sides | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
+| health | the worker crate's health checker over the worker objects, on the leader; each outcome is copied into the store's record, an object's status follows its record's, and a decision reads the object's | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
 | loads | the worker crate's load monitor over the worker objects, while the replica leads: a decision is given its snapshot where the document reads reports and keeps none, and reads the overload verdict on the object; the crate's own poller and table still run, and no decision reads them | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic, whose gateway hands every worker the same two defaults |
-| cache events | an index of the store's own; a single request's decision reads none yet | the kv-index crate's index, filled by the worker crate's collector |
+| cache events | an index of the store's own; a decision reads none yet | the kv-index crate's index, filled by the worker crate's collector |
 | sessions | the engine's session table for a single request, one for each document | the engine's session table |
 | leases | the store's lease tables, in memory, one for each deciding thread | stay: a controller must remember what it issued to gateways |
-| decisions | a single request and a pair at its prefill: `PolicyEngine::decide_without_lease` over the registry's lists; a decode call and an encode request: none, the request is answered `Busy` | `PolicyEngine::decide_without_lease` over the registry's lists |
+| decisions | a single request, a pair at its prefill and its decode call: `PolicyEngine` over the registry's lists; an encode request: none, the request is answered `Busy` | `PolicyEngine::decide_without_lease` over the registry's lists |
 | discovery | not registering | the discovery crate through its host interface, registering through the worker crate's job queue |
 
 **Who sends a worker's data.** Nothing changes for a worker. It pushes its load records and its
@@ -2019,7 +2022,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The crate's bench of the kept engine | **[planned]** | |
 | The gateway as a host | **[partly]** | section 9, behind `--policy-controller on`, which is off by default: single requests and pairs on the HTTP and gRPC routes, a pair's decode asked again, a host's table of stages at the start; an encode request that carries an item is refused by name until the gateway hands the engine its three lists; every classic test of the gateway with the engine on (the bar's fourth point) is not met yet |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |
-| The controller on the one engine and the worker crate's structures | **[partly]** | a single request and a pair at its prefill are decided by `PolicyEngine` over the registry's lists; a decode call and an encode request are answered `Busy`; a decision reads no cache event, and no load report under a document that holds a stage that keeps reports, and a sessions rule's cap counts nothing (section 10.2) |
+| The controller on the one engine and the worker crate's structures | **[partly]** | a single request, a pair at its prefill and its decode call are decided by `PolicyEngine` over the registry's lists; an encode request is answered `Busy`; a decision reads no cache event, and no load report under a document that holds a stage that keeps reports, and a sessions rule's cap counts nothing (section 10.2) |
 | The controller finding its own workers | **[partly]** | discovery registers nothing yet |
 | A gateway under a controller | **[planned]** | section 11 |
 | User stages in WebAssembly and over gRPC | **[partly]** | library code that no document reaches |
@@ -2117,9 +2120,9 @@ inside the crate only.
 **Recommendation: (a).**
 
 **As taken.** The deciding threads were switched for a single request first (section 10.1), and
-the store-backed engine's type was deleted behind that step. A pair at its prefill is decided by
-the one engine over worker lists too. A decode call and an encode request are answered `Busy`
-until they follow.
+the store-backed engine's type was deleted behind that step. A pair at its prefill and its decode
+call are decided by the one engine over worker lists too. An encode request is answered `Busy`
+until it follows.
 
 ### Decision 6: a gateway under a controller that gets no answer in time
 

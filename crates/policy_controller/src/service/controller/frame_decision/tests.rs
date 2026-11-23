@@ -5,7 +5,9 @@
 //! same objects, for a request whose host states what the workers hold of
 //! its prompt, and one asks which documents are given the load snapshot.
 //! A pair's ask [`decide_pair`] for a pair at its prefill, and the two
-//! that file its leases ask [`issue_pair`] behind it.
+//! that file its leases ask [`issue_pair`] behind it. A decode call's ask
+//! [`decide_decode`] behind the pair its lease holds, and the two that
+//! issue its side ask [`issue_decode`] behind it.
 
 use std::{
     collections::BTreeSet,
@@ -17,11 +19,13 @@ use std::{
 use parking_lot::Mutex;
 use smg_worker::load::state::{one_rank_load, LoadSnapshot};
 
-use super::{decide, decide_pair, hands_reports, issue_pair, FrameBuffers};
+use super::{
+    decide, decide_decode, decide_pair, hands_reports, issue_decode, issue_pair, FrameBuffers,
+};
 use crate::{
     document::spec::{AppliedSpec, Assignment, PolicySpec},
     engine::{
-        decision::{Decision, ShedReason, Targets, SUBSET_HINT, WIRES},
+        decision::{Decision, ShedReason, Target, Targets, SUBSET_HINT, WIRES},
         decision_engine::{Request, RequestMaker, WorkerLists},
         decision_slot::DecisionSlot,
         framework::{DecisionScope, Filter, Picker, TieBand},
@@ -47,11 +51,11 @@ use crate::{
     },
     stages::{lifecycle::Lifecycle, registry::StageRegistry},
     store::{
-        AtWork, DecodeMark, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore,
-        LookOutcome, MemoryStore, PickRecord, Reachability, WorkerFacts, WorkerStatus,
-        WorkersStore,
+        pairing::PairingDescriptor, AtWork, DecodeIssue, DecodeMark, GatewayId, HealthSink,
+        LeaseRecord, LeaseState, LeasesStore, LookOutcome, MemoryStore, PickRecord, Reachability,
+        WorkerFacts, WorkerStatus, WorkersStore,
     },
-    tracking::lease::{Lease, LeaseId, Side, DISPATCH_TTL},
+    tracking::lease::{Dispatch, Lease, LeaseId, Side, DISPATCH_TTL},
     worker_host::{Members, Objects},
 };
 
@@ -1227,4 +1231,688 @@ fn a_pair_either_of_whose_sides_may_refuse_by_reports_applies_what_waits_at_the_
         assert!(matches!(decision, Decision::Pick(_)), "{decision:?}");
         assert_eq!(watch.look(), waited, "{picks:?}");
     }
+}
+
+/// A decode call's frame for [`PAIRED`]: the `n`th of [`at_prefill`]'s that
+/// names `lease`, which its reader takes at the decode phase.
+fn at_call(n: u8, lease: LeaseId, wires: WireModes, hint: Option<u32>) -> proto::DecideRequest {
+    let mut frame = at_prefill(n, wires, hint);
+    frame.decode_of = Some(lease.0);
+    frame
+}
+
+/// The decision of a decode call's `frame` as `gateway`'s at `now`, behind
+/// the pair `held`: what a deciding thread asks for the call once the store
+/// answered for its lease, behind the holder's follow. With it go the
+/// snapshot the load monitor published, and the decider's place at the
+/// files of leases where the case lends one.
+fn served_call(
+    store: &MemoryStore,
+    objects: &Objects<Members>,
+    frame: proto::DecideRequest,
+    (gateway, now): (GatewayId, Instant),
+    held: (WorkerId, Option<(WorkerId, u16)>),
+    (loads, place): (&Arc<LoadSnapshot>, Option<&AtWork>),
+) -> Decision {
+    let request = Checked::new(frame).expect("a frame the record holds");
+    let taken = taken_at(&request, gateway, (now, now), place);
+    objects.follow(store);
+    let (mut frames, own) = (FrameBuffers::default(), Part::default());
+    let decided = store
+        .deciding(|world| decide_decode(world, objects, &taken, held, &mut frames, loads, &own));
+    decided.expect("the engine decides").0
+}
+
+/// One decode call of [`GATEWAY`]'s decided and its pick issued, as a
+/// deciding thread does both under one load of the world: the store's
+/// answer for the lease the frame names first, the decision behind it, and
+/// for a pick the decode side's lease with its issue. The load monitor
+/// published nothing.
+fn leased_call(
+    store: &MemoryStore,
+    objects: &Objects<Members>,
+    frame: proto::DecideRequest,
+    now: Instant,
+) -> (Decision, Option<(Lease, DecodeIssue)>) {
+    let request = Checked::new(frame).expect("a frame the record holds");
+    let lease = request.decode_of().expect("a decode call's frame");
+    let taken = taken_at(&request, GATEWAY, (now, now), None);
+    objects.follow(store);
+    let (mut frames, own) = (FrameBuffers::default(), Part::default());
+    let loads = Arc::new(LoadSnapshot::default());
+    let held = store.held_pair(GATEWAY, lease);
+    let held = held.expect("the lease takes a decode side");
+    store.deciding(|world| {
+        let decided = decide_decode(world, objects, &taken, held, &mut frames, &loads, &own);
+        let (decision, booked) = decided.expect("the engine decides");
+        let issued = issue_decode(store, world, &taken, lease, &decision, booked);
+        (decision, issued.expect("the side stands chosen"))
+    })
+}
+
+/// The `n`th pair of [`GATEWAY`]'s leased with its decode asked for later,
+/// and its prefill dispatched to the pick's target at `index`: the pair's
+/// decision and the prefill side's lease.
+fn held_pair_at(
+    store: &MemoryStore,
+    objects: &Objects<Members>,
+    (n, index): (u8, u8),
+    now: Instant,
+) -> (Decision, Lease) {
+    let mut frame = at_prefill(n, WireModes::NONE, None);
+    frame.decode_later = true;
+    let (decision, prefill, decode) = leased_pair(store, objects, frame, now);
+    assert_eq!(decode, None, "the decode side stands chosen");
+    let sent = Dispatch {
+        side: Side::Prefill,
+        target_index: index,
+        since_decision_micros: 0,
+    };
+    assert!(LeasesStore::dispatched(
+        store, GATEWAY, prefill.id, sent, now
+    ));
+    (decision, prefill)
+}
+
+/// A decode call is decided over its model's two lists, and the decode
+/// side's list alone is the asking gateway's to take, by that side's reach
+/// and standing vetoes. Another gateway alone dials one decode and the
+/// asking gateway holds another: every call's pick names the one decode
+/// left. The held prefill was sent already and is found wherever it stands:
+/// a hold of the asking gateway on it sheds a pair at its prefill and takes
+/// nothing from the call, whose every target names it.
+#[test]
+fn a_decode_call_takes_the_decode_side_alone_and_finds_its_prefill_under_a_hold() {
+    let store = Arc::new(MemoryStore::new());
+    store
+        .apply(stock_pair_plan())
+        .expect("above the unbound start");
+    let p = side_member(&store, "p0", Role::Prefill, None);
+    let decodes = [
+        side_member(&store, "d0", Role::Decode, None),
+        side_member(&store, "d1", Role::Decode, None),
+        side_member(&store, "d2", Role::Decode, Some(OTHER)),
+    ];
+    let objects = holder(&store);
+    let now = Instant::now();
+    let until = Some(now + Duration::from_secs(60));
+    store.gateway_veto(GATEWAY, p, until);
+    store.gateway_veto(GATEWAY, decodes[0], until);
+    let frame = at_prefill(1, WireModes::NONE, None);
+    let pair = served_pair(&store, &objects, frame, GATEWAY, now);
+    let at_health = Some((ShedReason::NoEndpoints, "healthy"));
+    assert_eq!(shed_of(&pair), at_health, "a pair at its prefill");
+    let unread = Arc::new(LoadSnapshot::default());
+    let named = |gateway: GatewayId| -> BTreeSet<(WorkerId, WorkerId)> {
+        let mut named = BTreeSet::new();
+        for n in 1..=32 {
+            let frame = at_call(n, LeaseId(1), WireModes::NONE, None);
+            let (asked, given) = ((gateway, now), (&unread, None));
+            let answer = served_call(&store, &objects, frame, asked, (p, None), given);
+            let Decision::Pick(pick) = &answer else {
+                panic!("call {n} is answered no pick: {answer:?}");
+            };
+            let pairs = pairs_of(&answer);
+            assert_eq!(pairs.len(), pick.targets.len(), "a decode a target");
+            named.extend(pairs);
+        }
+        named
+    };
+    assert_eq!(named(GATEWAY), BTreeSet::from([(p, decodes[1])]));
+    let every: BTreeSet<(WorkerId, WorkerId)> = decodes.iter().map(|&d| (p, d)).collect();
+    assert_eq!(named(OTHER), every);
+}
+
+/// The answers of a decode call come in a pair's order, and the decode side
+/// alone states them. A model with no decode and a model nobody serves are
+/// decided over no worker, whatever the gateway states. Else decodes the
+/// gateway dials, whose every worker its wires or a hint of 0 take, shed
+/// the call under that stage. Else decodes it dials none of are decided
+/// over no worker. What the gateway dials of the prefills says nothing: the
+/// held prefill was sent.
+#[test]
+fn a_decode_call_answers_no_decode_then_the_decodes_emptied_then_none_dialed() {
+    let now = Instant::now();
+    let unread = Arc::new(LoadSnapshot::default());
+    // GATEWAY's call over a fleet of one prefill, which `prefill` alone
+    // dials, and of `decodes`, with the engine's own answer over no worker
+    // for the same call.
+    type Fleet<'a> = (Option<GatewayId>, &'a [Option<GatewayId>]);
+    let answered = |(prefill, decodes): Fleet<'_>, wires, hint: Option<u32>| {
+        let store = Arc::new(MemoryStore::new());
+        store
+            .apply(stock_pair_plan())
+            .expect("above the unbound start");
+        let p = side_member(&store, "p0", Role::Prefill, prefill);
+        for (n, &only) in decodes.iter().enumerate() {
+            side_member(&store, &format!("d{n}"), Role::Decode, only);
+        }
+        let objects = holder(&store);
+        let frame = at_call(1, LeaseId(1), wires, hint);
+        let request = Checked::new(frame.clone()).expect("a frame the record holds");
+        let (over_none, traced) = store.deciding(|world| {
+            let mut lists = Lists::default();
+            let read = lists.of(&request);
+            let maker = FrameRequest::new(&request, &read, BUDGET, WorkerLists::None);
+            let held = Target {
+                id: p,
+                ..Target::default()
+            };
+            let decided = world
+                .front()
+                .decide_decode_without_lease(&maker, &held, now);
+            let decided = decided.expect("the engine decides");
+            let trace = decided.trace();
+            (shed_of(&decided), (trace.seed, trace.generation))
+        });
+        assert!(over_none.is_some(), "no worker is no pick");
+        assert_eq!(traced.0, 1, "the frame's own seed");
+        let (asked, given) = ((GATEWAY, now), (&unread, None));
+        let answer = served_call(&store, &objects, frame, asked, (p, None), given);
+        // A shed the thread makes itself states what the engine's states:
+        // the frame's seed and the document's generation.
+        if shed_of(&answer).is_some() {
+            let trace = answer.trace();
+            assert_eq!((trace.seed, trace.generation), traced);
+        }
+        (answer, over_none)
+    };
+    let (http, grpc) = (WireModes::HTTP, WireModes::GRPC);
+    let stated = [(WireModes::NONE, None), (grpc, None), (http, Some(0))];
+    // No decode at all: over no worker, whatever the gateway states.
+    for (wires, hint) in stated {
+        let (answer, over_none) = answered((None, &[]), wires, hint);
+        assert_eq!(shed_of(&answer), over_none, "{wires:?}, a hint of {hint:?}");
+    }
+    // A decode the gateway dials and its wires or its hint take: shed under
+    // that stage, whoever dials the prefill.
+    let wires = Some((ShedReason::NoEndpoints, WIRES));
+    let hinted = Some((ShedReason::NoEndpoints, SUBSET_HINT));
+    for prefill in [None, Some(OTHER)] {
+        let fleet: Fleet<'_> = (prefill, &[None]);
+        assert_eq!(shed_of(&answered(fleet, grpc, None).0), wires);
+        assert_eq!(shed_of(&answered(fleet, http, Some(0)).0), hinted);
+    }
+    // A decode another gateway alone dials: over no worker, whatever the
+    // gateway states.
+    for (wires, hint) in stated {
+        let (answer, over_none) = answered((None, &[Some(OTHER)]), wires, hint);
+        assert_eq!(shed_of(&answer), over_none, "{wires:?}, a hint of {hint:?}");
+    }
+    // A decode the gateway dials: a pick behind the held prefill, though
+    // another gateway alone dials that prefill.
+    for prefill in [None, Some(OTHER)] {
+        let (answer, _) = answered((prefill, &[None]), http, None);
+        assert!(matches!(answer, Decision::Pick(_)), "{answer:?}");
+    }
+    // A model nobody serves: over no worker.
+    let store = Arc::new(MemoryStore::new());
+    store
+        .apply(stock_pair_plan())
+        .expect("above the unbound start");
+    let objects = holder(&store);
+    let frame = at_call(1, LeaseId(1), WireModes::NONE, None);
+    let (asked, given) = ((GATEWAY, now), (&unread, None));
+    let held = (WorkerId(7), None);
+    let answer = served_call(&store, &objects, frame, asked, held, given);
+    assert!(shed_of(&answer).is_some(), "{answer:?}");
+}
+
+/// The pair plan's document whose sides go by the least load, the best
+/// first, among the workers the health filter keeps.
+fn least_load_pair_plan() -> AppliedSpec {
+    let document = r#"{
+      "apiVersion": "smg.policy/v1",
+      "generation": 1,
+      "profiles": {
+        "side": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" }
+      },
+      "bindings": [
+        { "match": { "phase": ["prefill", "decode"] }, "plan": "pd-pair",
+          "profiles": { "prefill": "side", "decode": "side" } }
+      ]
+    }"#;
+    let document: PolicySpec = serde_json::from_str(document).expect("a document of this build");
+    staged(&document, &StageRegistry::builtin())
+}
+
+/// A decode call's request is given the load monitor's snapshot as its
+/// pair's first decision is: under a plan whose sides go by the least load,
+/// every call's pick names first the decode whose report shows no queue.
+/// Under a snapshot that holds no report no decode stands out, and the
+/// calls name more than one first.
+#[test]
+fn a_decode_calls_request_reads_the_reports_of_the_snapshot_it_is_given() {
+    let store = Arc::new(MemoryStore::new());
+    store
+        .apply(least_load_pair_plan())
+        .expect("above the unbound start");
+    let p = side_member(&store, "p0", Role::Prefill, None);
+    let decodes = ["d0", "d1", "d2"].map(|name| side_member(&store, name, Role::Decode, None));
+    let objects = holder(&store);
+    let now = Instant::now();
+    // The second decode reports no queue, and every other worker is deep
+    // in its own.
+    let reports = ["p0", "d0", "d1", "d2"].map(|name| {
+        let load = if name == "d1" {
+            one_rank_load(0, 0.1, 10.0)
+        } else {
+            one_rank_load(900_000, 0.9, 10.0)
+        };
+        (format!("http://{name}:8000"), load)
+    });
+    let published = LoadSnapshot::from_loads_for_test(reports.into_iter().collect());
+    let unread = Arc::new(LoadSnapshot::default());
+    let firsts = |loads: &Arc<LoadSnapshot>| -> BTreeSet<WorkerId> {
+        let calls = (1..=32).map(|n| at_call(n, LeaseId(1), WireModes::NONE, None));
+        let picks = calls.map(|frame| {
+            let (asked, given) = ((GATEWAY, now), (loads, None));
+            served_call(&store, &objects, frame, asked, (p, None), given)
+        });
+        let firsts = picks.map(|pick| pairs_of(&pick).first().expect("a pick").1);
+        firsts.collect()
+    };
+    assert_eq!(firsts(&published), BTreeSet::from([decodes[1]]));
+    assert!(firsts(&unread).len() > 1, "no report, and one decode alone");
+}
+
+/// A decode call whose decode profile holds a stage that may refuse by a
+/// report of leases is decided behind an apply of what waits at the other
+/// files, where its decider lent its place. The prefill profile's stages
+/// say nothing of it: the call runs none of them, and a frame left under
+/// another file's watch waits for that file's look.
+#[test]
+fn a_decode_call_whose_decode_side_may_refuse_by_reports_applies_what_waits_at_the_other_files() {
+    let mut catalog = StageRegistry::builtin();
+    catalog
+        .picker("by-reports", || Box::new(ByReports))
+        .expect("a free name");
+    let cases = [
+        (["random", "by-reports"], LookOutcome::Quiet),
+        (["by-reports", "random"], LookOutcome::Fed),
+        (["random", "random"], LookOutcome::Fed),
+    ];
+    for (picks, waited) in cases {
+        let store = Arc::new(MemoryStore::new().with_decision_slots(2));
+        store
+            .apply(pair_plan(&catalog, "[]", picks))
+            .expect("above the unbound start");
+        let p = side_member(&store, "p0", Role::Prefill, None);
+        side_member(&store, "d0", Role::Decode, None);
+        LeasesStore::set_term(&*store, 1);
+        let mut watch = a_frame_under_the_second_files_watch(&store, p);
+        // The first file's decision, its place lent.
+        let _acting = DecisionSlot::new(0).enter();
+        let place = store.at_work();
+        let objects = holder(&store);
+        let frame = at_call(1, LeaseId(1), WireModes::NONE, None);
+        let unread = Arc::new(LoadSnapshot::default());
+        let (asked, given) = ((GATEWAY, Instant::now()), (&unread, Some(&place)));
+        let decision = served_call(&store, &objects, frame, asked, (p, None), given);
+        assert!(matches!(decision, Decision::Pick(_)), "{decision:?}");
+        assert_eq!(watch.look(), waited, "{picks:?}");
+    }
+}
+
+/// A decode call starts from the decode its pair's first decision chose for
+/// the target the prefill's dispatch took: the store's answer for the lease
+/// reaches the engine. Under a decode profile that takes turns, and so
+/// keeps its pick, the call answers that decode again, the pick's first or
+/// the one the dispatch named, where a new turn names another. The side is
+/// issued on it under the pair's own id.
+#[test]
+fn a_decode_call_starts_from_the_decode_of_the_target_its_prefills_dispatch_took() {
+    let store = Arc::new(MemoryStore::new());
+    let turns = ["random", "round-robin"];
+    store
+        .apply(pair_plan(&StageRegistry::builtin(), "[]", turns))
+        .expect("above the unbound start");
+    let p = side_member(&store, "p0", Role::Prefill, None);
+    for name in ["d0", "d1", "d2"] {
+        side_member(&store, name, Role::Decode, None);
+    }
+    LeasesStore::set_term(&*store, 1);
+    let objects = holder(&store);
+    let now = Instant::now();
+    for (n, index) in [(1, 0), (2, 1)] {
+        let (first, prefill) = held_pair_at(&store, &objects, (n, index), now);
+        let chosen = pairs_of(&first);
+        assert!(chosen.len() > 1 && chosen[0].1 != chosen[1].1, "{first:?}");
+        let took = chosen[usize::from(index)].1;
+        let held = store.held_pair(GATEWAY, prefill.id);
+        assert_eq!(
+            held.map(|(prefill, decode)| (prefill, decode.map(|at| at.0))),
+            Ok((p, Some(took)))
+        );
+        let frame = at_call(n + 10, prefill.id, WireModes::NONE, None);
+        let (again, issued) = leased_call(&store, &objects, frame, now);
+        let named = pairs_of(&again);
+        assert_eq!(named.first(), Some(&(p, took)), "the target at {index}");
+        let (side, _) = issued.expect("a pick's issue");
+        let lease = (side.id, side.side, side.booked);
+        assert_eq!(lease, (prefill.id, Side::Decode, took));
+        // The side keeps the call's own pick, for a dispatch by its index.
+        let on_file = LeasesStore::sides(&*store, GATEWAY, prefill.id).expect("on file");
+        let targets = &again.pick().expect("a pick").targets;
+        assert!(targets.len() > 1, "a target behind the first: {again:?}");
+        for (at, target) in (0u8..).zip(targets.iter()) {
+            let pair = target.pair.expect("a decode a target");
+            let kept = on_file.target_of(Side::Decode, at);
+            let named = (pair.decode_id, pair.decode_dp_rank);
+            assert_eq!(kept, Some(named), "the call's target at {at}");
+        }
+    }
+}
+
+/// A hold of the asking gateway on the only decode sheds a decode call
+/// under the health filter: no rule lifts a hold, where a doubt of every
+/// decode is lifted as the last resort. Another gateway holds no veto, and
+/// the call is its pick.
+#[test]
+fn a_hold_on_the_only_decode_sheds_a_decode_call_under_the_health_filter() {
+    let store = Arc::new(MemoryStore::new());
+    store
+        .apply(stock_pair_plan())
+        .expect("above the unbound start");
+    let p = side_member(&store, "p0", Role::Prefill, None);
+    let d = side_member(&store, "d0", Role::Decode, None);
+    let objects = holder(&store);
+    let now = Instant::now();
+    let unread = Arc::new(LoadSnapshot::default());
+    let answered = |gateway| {
+        let frame = at_call(1, LeaseId(1), WireModes::NONE, None);
+        let (asked, given) = ((gateway, now), (&unread, None));
+        served_call(&store, &objects, frame, asked, (p, None), given)
+    };
+    assert_eq!(pairs_of(&answered(GATEWAY)), [(p, d)]);
+    store.gateway_veto(GATEWAY, d, Some(now + Duration::from_secs(60)));
+    let shed = Some((ShedReason::NoEndpoints, "healthy"));
+    assert_eq!(shed_of(&answered(GATEWAY)), shed);
+    assert_eq!(pairs_of(&answered(OTHER)), [(p, d)]);
+}
+
+/// The `random` picker, keeping each lease its engine tells it the issue
+/// of.
+#[derive(Debug)]
+struct Told(Arc<Mutex<Vec<Lease>>>);
+
+impl Lifecycle for Told {
+    fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
+        self.0.lock().push(*lease);
+    }
+}
+
+impl Picker for Told {
+    fn name(&self) -> &'static str {
+        "told"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: TieBand,
+        out: &mut Targets,
+    ) {
+        Random.pick(facts, candidates, kept, scores, band, out);
+    }
+}
+
+/// A decode call's pick is issued under its pair's own lease: the decode
+/// side on the pick's first decode, under the session the frame's reader
+/// states of a request of the decode phase and with the call's count of
+/// tokens, and that decode's worker is booked. The stages hear the issue
+/// dated at the call, three seconds behind the pair's own. A call that
+/// sheds files nothing. The issue's undo puts the side back as the call
+/// found it and frees the booking, and the prefill's stands throughout.
+#[test]
+fn a_decode_calls_pick_is_issued_under_its_pairs_lease_and_told_dated_at_the_call() {
+    let store = Arc::new(MemoryStore::new());
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let kept = Arc::clone(&told);
+    let mut catalog = StageRegistry::builtin();
+    let stage = move || -> Box<dyn Picker> { Box::new(Told(Arc::clone(&kept))) };
+    catalog.picker("told", stage).expect("a free name");
+    store
+        .apply(pair_plan(&catalog, r#"["healthy"]"#, ["random", "told"]))
+        .expect("above the unbound start");
+    let p = side_member(&store, "p0", Role::Prefill, None);
+    let d = side_member(&store, "d0", Role::Decode, None);
+    LeasesStore::set_term(&*store, 1);
+    let objects = holder(&store);
+    let now = Instant::now();
+    let (_, prefill) = held_pair_at(&store, &objects, (1, 0), now);
+    assert_eq!(*told.lock(), [prefill], "the prefill side's issue alone");
+    // What the leases on file book on the prefill and on the decode.
+    let booked = || {
+        let load = |name: &str| {
+            let url = format!("http://{name}:8000");
+            let object = objects.registry().get_by_url(&url).expect("its object");
+            object.load()
+        };
+        [load("p0"), load("d0")]
+    };
+    let side_on_file = || {
+        let sides = LeasesStore::sides(&*store, GATEWAY, prefill.id).expect("on file");
+        sides.decode.map(|side| (side.state, side.target))
+    };
+    let chosen = Some((LeaseState::Chosen, d));
+    assert_eq!((side_on_file(), booked()), (chosen, [1, 0]));
+    // The call's frame of one conversation, at `phase`: its key goes plain,
+    // so its reader makes the session of the phase it takes the frame at.
+    let framed = |phase: proto::Phase| {
+        let mut frame = at_call(2, prefill.id, WireModes::NONE, None);
+        let facts = frame.facts.as_mut().expect("the case's frame has facts");
+        (facts.phase, facts.prompt_tokens) = (phase.into(), 300);
+        facts.session_key = Some(proto::Identity {
+            form: Some(proto::identity::Form::Plain("conversation-7".to_owned())),
+        });
+        frame
+    };
+    // The session of a request of the decode phase, as the reader of a
+    // frame that states that phase and names no lease makes it.
+    let session = {
+        let mut stated = framed(proto::Phase::Decode);
+        stated.decode_of = None;
+        let request = Checked::new(stated).expect("a frame the record holds");
+        let mut lists = Lists::default();
+        let read = lists.of(&request);
+        request.facts(&read, 0, 0).session()
+    };
+    let call = now + Duration::from_secs(3);
+
+    // A call that sheds files nothing, and no stage hears of it.
+    let hinted = at_call(3, prefill.id, WireModes::HTTP, Some(0));
+    let (decision, issued) = leased_call(&store, &objects, hinted, call);
+    let at_hint = Some((ShedReason::NoEndpoints, SUBSET_HINT));
+    assert_eq!((shed_of(&decision), issued.is_none()), (at_hint, true));
+    assert_eq!((side_on_file(), booked()), (chosen, [1, 0]));
+    assert_eq!(told.lock().len(), 1);
+
+    // The call's frame states the prefill phase: a frame that names a
+    // lease is read at the decode phase whatever it states.
+    let (decision, issued) = leased_call(&store, &objects, framed(proto::Phase::Prefill), call);
+    assert_eq!(pairs_of(&decision), [(p, d)]);
+    let (side, issue) = issued.expect("a pick's issue");
+    let beside = Lease {
+        side: Side::Decode,
+        booked: d,
+        session,
+        tokens: 300,
+        ..prefill
+    };
+    assert_eq!(side, beside, "the pair's own id, generation and instant");
+    let dated = Lease {
+        issued_micros: prefill.issued_micros + 3_000_000,
+        ..side
+    };
+    assert_eq!(*told.lock(), [prefill, dated], "dated at the call");
+    let issued = Some((LeaseState::ISSUED, d));
+    assert_eq!((side_on_file(), booked()), (issued, [1, 1]));
+
+    assert!(store.unissue_decode(GATEWAY, prefill.id, issue));
+    assert_eq!((side_on_file(), booked()), (chosen, [1, 0]));
+}
+
+/// The `random` picker, whose issue call panics for a decode side that
+/// carries [`FAULTY_TOKENS`].
+#[derive(Debug)]
+struct Faulty;
+
+/// The count of tokens of the call whose issue [`Faulty`] panics at.
+const FAULTY_TOKENS: u32 = 666;
+
+impl Lifecycle for Faulty {
+    fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
+        let faulty = lease.side == Side::Decode && lease.tokens == FAULTY_TOKENS;
+        assert!(!faulty, "the case's own panic");
+    }
+}
+
+impl Picker for Faulty {
+    fn name(&self) -> &'static str {
+        "faulty"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: TieBand,
+        out: &mut Targets,
+    ) {
+        Random.pick(facts, candidates, kept, scores, band, out);
+    }
+}
+
+/// A stage that panics at the issue a decode call tells it is held and
+/// counted, as under a report: the side stands issued on file and the call
+/// still gets its lease. An issue whose telling returns ends the streak of
+/// faults: the next fault is the first of a streak again.
+#[test]
+fn a_stage_that_panics_at_a_decode_calls_issue_is_held_and_the_side_stands_issued() {
+    let store = Arc::new(MemoryStore::new());
+    let mut catalog = StageRegistry::builtin();
+    catalog
+        .picker("faulty", || Box::new(Faulty))
+        .expect("a free name");
+    store
+        .apply(pair_plan(&catalog, "[]", ["random", "faulty"]))
+        .expect("above the unbound start");
+    side_member(&store, "p0", Role::Prefill, None);
+    let d = side_member(&store, "d0", Role::Decode, None);
+    LeasesStore::set_term(&*store, 1);
+    let objects = holder(&store);
+    let now = Instant::now();
+    let (_, prefill) = held_pair_at(&store, &objects, (1, 0), now);
+    assert_eq!(store.lifecycle_faults(), 0);
+    // One call of the lease, whose frame states `tokens`.
+    let called = |n: u8, tokens: u32| {
+        let mut frame = at_call(n, prefill.id, WireModes::NONE, None);
+        let facts = frame.facts.as_mut().expect("the case's frame has facts");
+        facts.prompt_tokens = tokens;
+        let (_, issued) = leased_call(&store, &objects, frame, now);
+        issued.expect("the pick the file holds")
+    };
+    let (side, issue) = called(2, FAULTY_TOKENS);
+    assert_eq!((side.side, side.booked), (Side::Decode, d));
+    assert_eq!(store.lifecycle_faults(), 1);
+    let sides = LeasesStore::sides(&*store, GATEWAY, prefill.id).expect("on file");
+    let on_file = sides.decode.map(|side| (side.state, side.target));
+    assert_eq!(on_file, Some((LeaseState::ISSUED, d)));
+    // The next call's issue is told and returns: the streak ends.
+    assert!(store.unissue_decode(GATEWAY, prefill.id, issue));
+    called(3, 1);
+    assert_eq!(store.lifecycle_faults(), 1);
+    assert!(store.call_faulted(), "the first fault of a new streak");
+}
+
+/// A ready member `name` of [`PAIRED`] on `role`'s side, as [`side_member`]
+/// lays one, that offers a partner the KV transport `transport`.
+fn transport_member(store: &MemoryStore, name: &str, role: Role, transport: &str) -> WorkerId {
+    let key = format!("http://{name}:8000");
+    let descriptor = PairingDescriptor {
+        transport: Some(transport.to_owned()),
+        ..PairingDescriptor::default()
+    };
+    let facts = WorkerFacts {
+        key: key.clone(),
+        engine: key,
+        incarnation: 1,
+        role,
+        wire_modes: WireModes::HTTP,
+        models: vec![PAIRED.to_owned()],
+        dp_size: 1,
+        max_running: Some(4),
+        pairing: Some(Arc::new(descriptor)),
+        ..WorkerFacts::default()
+    };
+    let id = store.upsert(facts).id();
+    store.publish_now();
+    let row = WorkersStore::get(store, id).expect("the row");
+    let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
+    ready.expect("the row stands");
+    id
+}
+
+/// A pair's two sides pair by the classes of the document's own pairing, at
+/// the pair's first decision and at its decode call. Under the pairing of
+/// the stock plan a decode on another KV transport than the prefill's is no
+/// partner: no pick and no call names it. Under a plan that pairs on
+/// nothing every decode is a partner.
+#[test]
+fn a_pair_and_its_decode_call_pair_by_the_classes_of_the_documents_pairing() {
+    let plan = |pairing: Option<&str>| {
+        let plans = pairing.map_or_else(String::new, |mode| {
+            format!(r#""plans": {{ "pd-pair": {{ "pairing": "{mode}" }} }},"#)
+        });
+        let document = format!(
+            r#"{{
+              "apiVersion": "smg.policy/v1",
+              "generation": 1,
+              {plans}
+              "profiles": {{ "side": {{ "pick": "random" }} }},
+              "bindings": [
+                {{ "match": {{ "phase": ["prefill", "decode"] }}, "plan": "pd-pair",
+                  "profiles": {{ "prefill": "side", "decode": "side" }} }}
+              ]
+            }}"#
+        );
+        let document: PolicySpec =
+            serde_json::from_str(&document).expect("a document of this build");
+        staged(&document, &StageRegistry::builtin())
+    };
+    let now = Instant::now();
+    let unread = Arc::new(LoadSnapshot::default());
+    // The decodes the pair's first decisions name, and those its decode
+    // calls name behind the one prefill.
+    let named = |pairing: Option<&str>| {
+        let store = Arc::new(MemoryStore::new());
+        store.apply(plan(pairing)).expect("above the unbound start");
+        let p = transport_member(&store, "p0", Role::Prefill, "a");
+        let same = transport_member(&store, "d0", Role::Decode, "a");
+        let other = transport_member(&store, "d1", Role::Decode, "b");
+        let objects = holder(&store);
+        let mut firsts = BTreeSet::new();
+        let mut calls = BTreeSet::new();
+        for n in 1..=32 {
+            let frame = at_prefill(n, WireModes::NONE, None);
+            let first = served_pair(&store, &objects, frame, GATEWAY, now);
+            firsts.extend(pairs_of(&first).into_iter().map(|pair| pair.1));
+            let frame = at_call(n, LeaseId(1), WireModes::NONE, None);
+            let (asked, given) = ((GATEWAY, now), (&unread, None));
+            let call = served_call(&store, &objects, frame, asked, (p, None), given);
+            calls.extend(pairs_of(&call).into_iter().map(|pair| pair.1));
+        }
+        ([firsts, calls], same, other)
+    };
+    let (sides, same, _) = named(None);
+    assert_eq!(sides, [BTreeSet::from([same]), BTreeSet::from([same])]);
+    let (sides, same, other) = named(Some("off"));
+    let both = BTreeSet::from([same, other]);
+    assert_eq!(sides, [both.clone(), both]);
 }
