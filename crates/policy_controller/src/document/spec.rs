@@ -1195,9 +1195,12 @@ impl FilterStage {
 pub struct HasRoomParams {
     /// What a worker holds: field names and their coefficients, summed. At
     /// least one is required. A name written `signal.<name>` reads a signal
-    /// the document declares. Under a capacity that is a number, a field
-    /// or a signal of the worker is required: the request's size alone
-    /// reads nothing of a worker there. A worker that lacks a named value
+    /// the document declares. `request.max_output_tokens` reads the most
+    /// tokens the request's answer may hold, so a coefficient above zero
+    /// reserves room for the answer: a request that states no limit
+    /// reserves none. Under a capacity that is a number, a field or a
+    /// signal of the worker is required: the request's own values alone
+    /// read nothing of a worker there. A worker that lacks a named value
     /// has no room.
     #[serde(deserialize_with = "keyed_once")]
     #[schemars(extend(
@@ -1238,10 +1241,11 @@ fn signal_pattern() -> String {
     )
 }
 
-/// The names `has-room` may sum: every term's, and the request's size.
+/// The names `has-room` may sum: every term's, the request's size and its
+/// output limit.
 fn room_fields() -> Vec<&'static str> {
     let mut names: Vec<_> = CostTerm::NAMES.iter().map(|&(name, _)| name).collect();
-    names.push(HasRoomRule::REQUEST_TOKENS);
+    names.extend([HasRoomRule::REQUEST_TOKENS, HasRoomRule::OUTPUT_TOKENS]);
     names.sort_unstable();
     names
 }
@@ -3728,8 +3732,11 @@ fn has_room_of(
     let mut terms = Vec::new();
     let mut signal_terms = Vec::new();
     let mut request_tokens = 0.0;
+    let mut output_tokens = 0.0;
     for (name, &coefficient) in &p.used {
-        let term = if name == HasRoomRule::REQUEST_TOKENS {
+        // The request's own values are read off the request: no term of a
+        // worker stands for one.
+        let term = if name == HasRoomRule::REQUEST_TOKENS || name == HasRoomRule::OUTPUT_TOKENS {
             None
         } else {
             Some(named_term(signals, at, "used", name)?)
@@ -3746,6 +3753,7 @@ fn has_room_of(
         match term {
             Some(Named::Field(term)) => terms.push((term, coefficient)),
             Some(Named::Signal(signal)) => signal_terms.push((signal, coefficient)),
+            None if name == HasRoomRule::OUTPUT_TOKENS => output_tokens = coefficient,
             None => request_tokens = coefficient,
         }
     }
@@ -3769,16 +3777,22 @@ fn has_room_of(
             }
         },
     };
-    // Under a capacity that is a number, the request's size alone is one
-    // answer for every row: such a rule reads nothing of a worker, and it
-    // keeps every row or steps aside. A signal in the sum reads a worker,
+    // Under a capacity that is a number, the request's own values alone are
+    // one answer for every row: such a rule reads nothing of a worker, and
+    // it keeps every row or steps aside. A signal in the sum reads a worker,
     // and so does a capacity read of each worker, so both are settled
-    // first.
+    // first. Every name of such a rule is the request's: the refusal names
+    // the first of them in name order.
     if terms.is_empty() && signal_terms.is_empty() && capacity_signal.is_none() {
+        let first = if p.used.contains_key(HasRoomRule::OUTPUT_TOKENS) {
+            HasRoomRule::OUTPUT_TOKENS
+        } else {
+            HasRoomRule::REQUEST_TOKENS
+        };
         return Err(at.bad(
             "used",
-            HasRoomRule::REQUEST_TOKENS,
-            "at least one field or signal of the worker beside the request's size",
+            first,
+            "at least one field or signal of the worker beside the request's own values",
         ));
     }
     if !(0.0..1.0).contains(&p.headroom) {
@@ -3788,6 +3802,7 @@ fn has_room_of(
     let rule = HasRoomRule::new(
         &terms,
         request_tokens,
+        output_tokens,
         capacity,
         p.headroom,
         reads_sent.then(sent),

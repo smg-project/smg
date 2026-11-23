@@ -62,8 +62,8 @@ filter:
 ```
 
 - A worker has room where `used <= (1 - headroom) * capacity`. `used` adds each named value times its coefficient, in the document's units.
-- The names are the ones `least-cost` reads, and `request.prompt_tokens`, the request's size.
-- `used` names at least one field of the worker. Under a capacity that is a number the request's size alone is refused: every worker would read the same sum.
+- The names are the ones `least-cost` reads, `request.prompt_tokens`, the request's size, and `request.max_output_tokens`, the most tokens its answer may hold.
+- Under a capacity that is a number, `used` names at least one field or signal of the worker. The request's own values alone are refused there: every worker would read the same sum.
 - A worker that lacks a named value has no room: one with no report under a `load.` name, or one whose report does not count its resident tokens. Under `view.max_report_age_ms` an older report reads as none.
 - The filter stays soft. Where no worker has room, every worker stands, and the filter sheds nothing.
 - A `sent.` name reads the profile's count of sends, so the profile may set `sent_ttl_ms`.
