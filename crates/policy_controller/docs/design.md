@@ -685,7 +685,8 @@ What is not built in the engine that stays: a request that states a subset hint,
 or protocols that not every worker of its list serves is refused. The refusal names the input,
 except a pair's demand, which is shed under the stage `wires`.
 A pair's encode items are decided over a host's three lists, with the pair's lease issued
-(`PolicyEngine::decide_encode_at`). The trait's method for them takes no lists and refuses.
+(`PolicyEngine::decide_encode_at`). The trait has no method for them: the one it had took no
+lists and could only refuse, and it was removed.
 The encoders are the one list the engine narrows by protocol itself. An encoder is named by its
 place in its list, and what its host says of it and of each prefill is laid by that place, so the
 host has no narrowed list to hand. The decision leaves out each encoder that serves no protocol
@@ -860,7 +861,9 @@ the kept one. `GatewayId` is still defined in the store.
   and `Constraints::pins`. One of them needs a successor: a sessions rule with
   a cap asks `session_counted` of its host today.
 - The trait's method that the kept engine answers with a constant, `decide_encode_pair`, is built
-  or removed.
+  or removed. It is removed, and the guard's maker of that name with it, which is done: a host
+  asks the engine's own entry with its three lists (`PolicyEngine::decide_encode_at`) and holds
+  the answer (`DecisionGuard::holding`).
 - The record of sent prefixes leaves the single decision. The two trees a request is then
   decided in are the host's own, lent (section 4.5).
 

@@ -39,7 +39,6 @@ use smg_worker::load::state::LoadSnapshot;
 
 use super::{
     decision::{Decision, Pick, ShadowKind, Survivors, Target, Targets, Trace},
-    framework::{EncodeItems, EncodePlaced},
     prompt_hashes::{HashSeeds, PromptHashes},
     sticky_sessions::SessionVerdict,
     view::{Constraints, Phase, RequestFacts, Session, WireModes, WorkerId},
@@ -503,22 +502,6 @@ pub trait DecisionEngine {
     ) -> Result<DecideOutcome, DecisionRefused> {
         self.decide_decode_under(gateway, request, held, now)
     }
-
-    /// One decision for a pair with the encode `items` of its request: the
-    /// pair, and a worker for each item, written to `placed`. `placed` is
-    /// left empty where no decision is made.
-    ///
-    /// # Errors
-    ///
-    /// [`DecisionRefused`]: the engine made no decision for the request.
-    fn decide_encode_pair(
-        &self,
-        gateway: GatewayId,
-        request: &Request<'_>,
-        items: EncodeItems<'_>,
-        placed: &mut EncodePlaced,
-        now: Instant,
-    ) -> Result<DecideOutcome, DecisionRefused>;
 
     /// What the host says of a lease at `now`: a side's dispatch, a side's
     /// end, or a release. `held` is the guard's view of the decision at the
