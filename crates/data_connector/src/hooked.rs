@@ -627,6 +627,39 @@ impl ResponseStorage for HookedResponseStorage {
         Ok(result)
     }
 
+    async fn get_response_chain_for(
+        &self,
+        response_id: &ResponseId,
+        tenant: Option<&str>,
+    ) -> ResponseResult<ResponseChain> {
+        // One chain operation for the hook, as for the walk it stands for.
+        let payload = serde_json::json!({ "response_id": response_id, "max_depth": null });
+        let extra = run_before(
+            &*self.hook,
+            StorageOperation::GetResponseChain,
+            &payload,
+            ResponseStorageError::Rejected,
+        )
+        .await?;
+
+        let result = self
+            .inner
+            .get_response_chain_for(response_id, tenant)
+            .await?;
+
+        let result_json = serde_json::to_value(&result).unwrap_or_default();
+        run_after(
+            &*self.hook,
+            StorageOperation::GetResponseChain,
+            &payload,
+            &result_json,
+            &extra,
+        )
+        .await;
+
+        Ok(result)
+    }
+
     /// The lookup by output item id is a read of the response it finds, so the
     /// `GetResponse` hooks run on the found response's id, the policy of
     /// [`get_response`](Self::get_response); no hook operation of its own, so a

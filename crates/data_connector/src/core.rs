@@ -978,6 +978,40 @@ pub trait ResponseStorage: Send + Sync {
         Ok(chain)
     }
 
+    /// The part of [`Self::get_response_chain`] a caller of `tenant` may see:
+    /// the newest records down to the first it may not see (this walk reads
+    /// that one and stops); none for a hidden, missing or unstored id.
+    async fn get_response_chain_for(
+        &self,
+        response_id: &ResponseId,
+        tenant: Option<&str>,
+    ) -> ResponseResult<ResponseChain> {
+        let mut chain = ResponseChain::new();
+        let mut seen = HashSet::new();
+        let mut next = Some(response_id.clone());
+        while let Some(id) = next.take() {
+            if seen.contains(&id) {
+                return Err(ResponseStorageError::InvalidChain(format!(
+                    "cycle detected at response {}",
+                    id.0
+                )));
+            }
+            match self.get_response(&id).await? {
+                Some(response)
+                    if response.is_visible_to(tenant)
+                        && !(seen.is_empty() && is_unstored(&response)) =>
+                {
+                    next.clone_from(&response.previous_response_id);
+                    chain.add_response(response);
+                }
+                _ => break,
+            }
+            seen.insert(id);
+        }
+        chain.responses.reverse();
+        Ok(chain)
+    }
+
     /// Find the stored response whose `raw_response.output` carries an item
     /// with the given id (the lookup behind `item_reference` input items).
     ///
