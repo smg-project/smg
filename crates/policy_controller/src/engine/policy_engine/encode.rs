@@ -3,9 +3,15 @@
 //! the engine decides them in
 //! ([`Engine::decide_encode_pair`](crate::engine::Engine::decide_encode_pair)).
 //!
-//! No affinity column and no signal cell stands beside the encoders, and
-//! no ring is lent for them: an encode profile's stage that places by a
-//! ring places by its own.
+//! No affinity column stands beside the encoders, and no ring is lent for
+//! them: an encode profile's stage that places by a ring places by its
+//! own.
+//!
+//! **Named signals.** Under a document a stage of which reads a named
+//! signal, each of the three sides whose profile reads one is lent its own
+//! list's signal cells, of the snapshot the decision holds
+//! ([`signals::three`]). The decode asked again is a pair's
+//! ([`PairLists::decide`]) and is lent as one.
 //!
 //! **The entries.** A host asks through
 //! [`PolicyEngine::decide_encode_at`]: the three lists' decision, with the
@@ -17,6 +23,7 @@ use smg_worker::load::state::LoadSnapshot;
 
 use super::{
     pair::{issued, not_decided, stamp, tried_engines, Buffers, PairLists, BUFFERS},
+    signals,
     single::{self, PLACES},
     Loaded, PolicyEngine, PoolMembers,
 };
@@ -25,7 +32,7 @@ use crate::engine::{
     decision_engine::{DecideOutcome, DecisionRefused, Request, RequestMaker, WorkerLists},
     framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools},
     list_cell::LentList,
-    records::Live,
+    records::{HeldCells, Live},
     view::{Constraints, Phase, RequestFacts},
 };
 
@@ -245,15 +252,31 @@ impl EncodeLists<'_> {
             let (decodes, _) = records.write(workers, &live, decodes);
             stamp(prefills, decodes, pair.classes, pair.admission);
             let (workers, records) = (encoders.workers(), encoders.records(spec, clock));
-            let (encoders, _) = records.write(workers, &live, &mut buffers.encoders);
+            let (rows, _) = records.write(workers, &live, &mut buffers.encoders);
+            // Under a document a stage of which reads a named signal, each
+            // of the three sides that reads one is lent its list's cells
+            // for this call.
+            let lent = spec.needs().signal_cells.then(|| {
+                let members = [prefill, decode, encoders];
+                signals::three(members, spec, clock, &live, facts.model)
+            });
+            let [prefill_signal_cells, decode_signal_cells, signal_cells] = match &lent {
+                Some(lent) => lent
+                    .each_ref()
+                    .map(|side| side.as_ref().and_then(HeldCells::cells)),
+                None => [None; 3],
+            };
             let pools = PairPools {
                 prefills,
                 decodes,
+                prefill_signal_cells,
+                decode_signal_cells,
                 table: pair.classes.table(),
                 ..PairPools::default()
             };
             let encode = EncodePool {
-                encoders,
+                encoders: rows,
+                signal_cells,
                 facts: self.facts,
                 prefill_classes: self.prefill_classes,
                 ..EncodePool::default()

@@ -6720,6 +6720,32 @@ mod tests {
         assert_eq!(engine.needs_for("pd/x", Phase::Prefill), Needs::default());
         assert_eq!(engine.needs_for_phase(Phase::Decode), loads.or(headers));
         assert_eq!(engine.needs_for_phase(Phase::Prefill), Needs::default());
+
+        // An encode-phase binding before an `epd` binding decides the
+        // encode items that come alone. The encode side of an encode
+        // request decided in one call is decided by the binding its
+        // prefill lookup resolves to, with that pair's encode profile. The
+        // encode needs carry both, for the model and for the phase.
+        let text = r#"{
+          "apiVersion": "smg.policy/v1",
+          "profiles": {
+            "encode-only": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" },
+            "side": { "filter": ["healthy"], "pick": "round-robin" },
+            "pair-encode": { "filter": ["healthy"], "score": ["session-affinity"], "pick": "best" },
+            "default": { "filter": ["healthy"], "pick": "round-robin" }
+          },
+          "bindings": [
+            { "match": { "model": "*", "phase": ["encode"] }, "profile": "encode-only" },
+            { "match": { "model": "epd/*" }, "plan": "epd", "profiles": { "encode": "pair-encode", "prefill": "side", "decode": "side" } },
+            { "match": { "model": "*" }, "profile": "default" }
+          ]
+        }"#;
+        let engine = doc(text).validate().expect("validates");
+        assert_eq!(engine.needs_for("epd/x", Phase::Encode), loads.or(headers));
+        assert_eq!(engine.needs_for("other", Phase::Encode), loads);
+        assert_eq!(engine.needs_for("epd/x", Phase::Prefill), Needs::default());
+        assert_eq!(engine.needs_for_phase(Phase::Encode), loads.or(headers));
+        assert_eq!(engine.needs_for_phase(Phase::Prefill), Needs::default());
     }
 
     /// The needs rows are what a host must feed: a host that feeds, for a

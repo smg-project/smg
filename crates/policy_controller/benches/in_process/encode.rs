@@ -18,8 +18,10 @@
 //! encoders (`items=`, `encoders=`).
 //!
 //! Every worker of the three lists has a load report, and a prefill states
-//! its rate as its measured input rate too, as in a pair's cell. The
-//! result's `conversions=` counts the three lists together.
+//! its rate as its measured input rate too, as in a pair's cell. Under a
+//! document that declares the bench's signal each decode's report states a
+//! value of it, as in a pair's cell ([`signals::stated`]). The result's
+//! `conversions=` counts the three lists together.
 
 use std::{
     array,
@@ -48,7 +50,7 @@ use tokio::runtime::Builder;
 use super::{
     measure, mix,
     pair::{self, typed, Open},
-    place, reports, Cell, Host, Published, Run, Shadowed, Stated, MODEL,
+    place, reports, signals, Cell, Host, Published, Run, Shadowed, Stated, MODEL,
 };
 
 /// The images one request carries, each an item of its own.
@@ -335,6 +337,7 @@ pub(super) fn runs(run: &Run) -> bool {
     }
     loads.extend(reports(&decodes));
     loads.extend(reports(&encoders));
+    let loads = signals::stated(&document, &decodes, loads);
     feed.publish(&loads);
     // What a host does once, as for one list: it hands its load monitor's
     // channel and spawns the engine's task.
