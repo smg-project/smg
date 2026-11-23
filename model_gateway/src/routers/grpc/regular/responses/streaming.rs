@@ -79,6 +79,7 @@ use crate::{
                 },
                 stages::{iteration_charge, RateLimitCell},
             },
+            proto_wrapper::ClientGone,
             regular::symphony,
             utils,
         },
@@ -441,8 +442,8 @@ enum BodyRead {
     ClientLeft,
 }
 
-/// The next frame of the chat body `stream`, read for the client at the
-/// receiving end of `tx`'s channel. The relay that turns the chat stream
+/// The next frame of the chat body `stream`, read for the client
+/// `client_gone` waits for. The relay that turns the chat stream
 /// into the Responses stream holds the chat layer's receiver through that
 /// body: parked on a body that stalled mid-stream, it would learn that its
 /// client left only when the body next yields, and the engine request behind
@@ -450,15 +451,17 @@ enum BodyRead {
 /// client's leaving, looked at first so a busy body cannot outrun it; on
 /// [`BodyRead::ClientLeft`] the caller ends its read and drops the body,
 /// and the chat layer ends the engine request the way it does for its own
-/// clients. A background response's `tx` is the sender of its relay, which
+/// clients. A background response's wait is on the sender of its relay, which
 /// closes with the work and not with the client: its reads are the body's
-/// own, and the work outlives the client as it is meant to.
-async fn next_frame(stream: &mut BodyDataStream, tx: &SseSender) -> BodyRead {
-    tokio::select! {
-        biased;
-        () = tx.closed() => BodyRead::ClientLeft,
-        frame = stream.next() => frame.map_or(BodyRead::End, BodyRead::Frame),
-    }
+/// own, and the work outlives the client as it is meant to. `client_gone`
+/// is the wait the relay keeps for one chat body; the order of a read is
+/// [`ClientGone::poll_read`]'s.
+async fn next_frame(stream: &mut BodyDataStream, client_gone: &mut ClientGone) -> BodyRead {
+    std::future::poll_fn(|cx| client_gone.poll_read(cx, |cx| stream.poll_next_unpin(cx)))
+        .await
+        .map_or(BodyRead::ClientLeft, |frame| {
+            frame.map_or(BodyRead::End, BodyRead::Frame)
+        })
 }
 
 /// The record of a stored foreground stream whose client left mid-stream, as
@@ -567,6 +570,7 @@ async fn process_and_transform_sse_stream(
 
     // Convert body to data stream
     let mut stream = body.into_data_stream();
+    let mut client_gone = ClientGone::of(&tx);
 
     let mut terminal_error = None;
     // The client left: met by the body read, by an event it no longer takes,
@@ -574,7 +578,7 @@ async fn process_and_transform_sse_stream(
     let mut client_left = false;
     // Process the stream frame by frame; a frame holds one or more SSE events.
     'frames: loop {
-        let chunk = match next_frame(&mut stream, &tx).await {
+        let chunk = match next_frame(&mut stream, &mut client_gone).await {
             BodyRead::Frame(Ok(chunk)) => chunk,
             BodyRead::Frame(Err(error)) => {
                 terminal_error = Some(stream_read_error(&error));
@@ -1303,6 +1307,7 @@ async fn convert_and_accumulate_stream(
 ) -> Result<ChatCompletionResponse, Value> {
     let mut accumulator = ChatResponseAccumulator::new();
     let mut stream = body.into_data_stream();
+    let mut client_gone = ClientGone::of(tx);
     // The parser supplies a complete name before argument deltas. Retain any
     // preceding id-only deltas until that name tells us who executes the call.
     let mut mcp_indices: HashMap<u32, bool> = HashMap::new();
@@ -1310,7 +1315,7 @@ async fn convert_and_accumulate_stream(
 
     // A frame holds one or more SSE events; every one of them counts.
     'frames: loop {
-        let chunk = match next_frame(&mut stream, tx).await {
+        let chunk = match next_frame(&mut stream, &mut client_gone).await {
             BodyRead::Frame(frame) => frame.map_err(|error| stream_read_error(&error))?,
             BodyRead::End => break,
             // The chat body goes with this return, which ends the generation
@@ -2445,6 +2450,60 @@ mod tests {
         assert!(
             body_tx.is_closed(),
             "the chat body is dropped with the read"
+        );
+    }
+
+    /// The client leaves between two reads of the chat body (while a call is
+    /// named): only a wait the relay kept from its parked read wakes it then.
+    #[test]
+    fn the_wait_a_parked_read_registered_wakes_the_reader_after_that_read() {
+        use std::{
+            cell::Cell,
+            future::Future,
+            sync::atomic::{AtomicUsize, Ordering},
+            task::{Context, Poll, Wake, Waker},
+        };
+
+        struct Wakes(AtomicUsize);
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
+
+        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let body = Body::from_stream(ReceiverStream::new(body_rx));
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        let (tx, rx) = mpsc::channel(64);
+        let rx = Cell::new(Some(rx));
+        let mut read = std::pin::pin!(convert_and_accumulate_stream(
+            body,
+            &mut emitter,
+            &tx,
+            |_| {
+                drop(rx.take());
+                true
+            }
+        ));
+        assert!(read.as_mut().poll(&mut cx).is_pending());
+        let call = json!({"tool_calls":[{"index":0,"id":"call_server","type":"function",
+            "function":{"name":"server_tool","arguments":""}}]});
+        body_tx
+            .try_send(Ok(Bytes::from(chat_event(call, None))))
+            .unwrap();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1, "the frame's wake");
+        let Poll::Ready(Err(error)) = read.as_mut().poll(&mut cx) else {
+            panic!("the read ends at the first read after the client left");
+        };
+        assert_eq!(error["message"], "Client disconnected");
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            2,
+            "the client's leaving wakes the reader through the kept wait"
         );
     }
 
