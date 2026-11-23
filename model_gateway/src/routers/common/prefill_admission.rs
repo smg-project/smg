@@ -89,10 +89,11 @@ pub struct PrefillReservation {
 
 impl PrefillReservation {
     /// This reservation, sent: its load guard is the prefill's, made under
-    /// the admission lock ahead of the prefill's send and before its answer
-    /// was in hand, under the route's own key. It is handed to the answer
-    /// here ([`Placed::sent`]), so the reservation's release is the end of
-    /// the prefill's side.
+    /// the admission lock ahead of the prefill's send, under the route's
+    /// own key. The admission makes it behind the selection, of the
+    /// selected worker alone: it holds the answer as a value it does not
+    /// read. The guard is handed to the answer here ([`Placed::sent`]), so
+    /// the reservation's release is the end of the prefill's side.
     fn sent(mut self, prefill: &Placed) -> Self {
         if let Some(load_guard) = self.load_guard.take() {
             self.load_guard = Some(prefill.sent(load_guard));
@@ -186,9 +187,11 @@ pub enum PrefillAcquireError<E> {
 /// answers a worker ([`Placed`]): the load held is that answer's guard, the
 /// prefill's send being next. With admission disabled it is made here
 /// ([`Placed::guard`]). With admission enabled the reservation's own guard
-/// is handed to the answer ([`PrefillReservation::sent`]); that guard was
-/// made before the answer was in hand, so it counts under `routing_key`
-/// even where the policy engine names a routing value of its own.
+/// is handed to the answer ([`PrefillReservation::sent`]). The admission
+/// made that guard behind the selection, of the selected worker alone
+/// ([`PrefillAdmission::admit`] holds the answer as a value it does not
+/// read), so it counts under `routing_key` even where the policy engine
+/// names a routing value of its own.
 pub(crate) async fn acquire_prefill<C, E, S, P>(
     admission: Option<&PrefillAdmission>,
     routing_key: Option<&str>,
