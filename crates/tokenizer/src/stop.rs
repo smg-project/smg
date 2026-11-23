@@ -478,34 +478,32 @@ impl StopSequenceDecoder {
     /// longest suffix that is still a partial stop sequence.
     fn release(&mut self, out: &mut String) -> SequenceDecoderStep {
         // Token-only fast path: no string stops means no jail is needed.
-        if self.rules.matcher.is_none() {
+        let Some(matcher) = &self.rules.matcher else {
             if self.jail_buffer.is_empty() {
                 return SequenceDecoderStep::Held;
             }
             out.push_str(&self.jail_buffer);
             self.jail_buffer.clear();
             return SequenceDecoderStep::Text;
-        }
+        };
 
         // Check for stop sequences using Aho-Corasick. The jail only ever retains a
         // proper prefix of some pattern, so the buffer is bounded by
         // `longest_pattern + one token of text` and scanning it whole is cheap.
-        if let Some(matcher) = &self.rules.matcher {
-            if let Some(mat) = matcher.automaton.find(Input::new(&self.jail_buffer)) {
-                self.stopped = true;
-                self.matched_stop = Some(self.jail_buffer[mat.start()..mat.end()].to_string());
-                let is_visible = mat.pattern().as_usize() >= self.rules.visible_boundary_idx;
-                // A visible stop sequence is included in the output, a hidden
-                // one excluded.
-                let end = if is_visible { mat.end() } else { mat.start() };
-                out.push_str(&self.jail_buffer[..end]);
-                self.jail_buffer.clear();
-                return if end == 0 {
-                    SequenceDecoderStep::Stopped
-                } else {
-                    SequenceDecoderStep::StoppedWithText
-                };
-            }
+        if let Some(mat) = matcher.automaton.find(Input::new(&self.jail_buffer)) {
+            self.stopped = true;
+            self.matched_stop = Some(self.jail_buffer[mat.start()..mat.end()].to_string());
+            let is_visible = mat.pattern().as_usize() >= self.rules.visible_boundary_idx;
+            // A visible stop sequence is included in the output, a hidden
+            // one excluded.
+            let end = if is_visible { mat.end() } else { mat.start() };
+            out.push_str(&self.jail_buffer[..end]);
+            self.jail_buffer.clear();
+            return if end == 0 {
+                SequenceDecoderStep::Stopped
+            } else {
+                SequenceDecoderStep::StoppedWithText
+            };
         }
 
         // Withhold only the longest suffix that is still a *partial* stop sequence.
