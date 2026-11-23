@@ -994,7 +994,12 @@ impl PDRouter {
                     tokens: tokens.as_deref(),
                     headers: context.headers.as_ref(),
                     rid_key: rid_key.as_deref(),
-                    rid: None,
+                    // The attempt holds the key the route derived of the
+                    // body's id and no copy of the id, so the id it states
+                    // is that key. A key that still ends in a turn or retry
+                    // suffix keys one level coarser than under the classic
+                    // override.
+                    rid: rid_key.as_deref(),
                     cache_namespace,
                     candidate_filter,
                     tried: &tried_before,
@@ -1199,7 +1204,8 @@ impl PDRouter {
                     tokens: tokens.as_deref(),
                     headers,
                     rid_key: rid_key.as_deref(),
-                    rid: None,
+                    // The derived key again, as the selection stated it.
+                    rid: rid_key.as_deref(),
                     cache_namespace,
                     candidate_filter,
                     tried: &tried_before,
@@ -3612,7 +3618,7 @@ mod tests {
         observability::logging::test_support::{test_subscriber, RefusalLineCounter},
         routers::{
             common::{
-                placement::tests::{hearing_pairs_on, Heard},
+                placement::tests::{engine_on, hearing_pairs_on, Heard},
                 sse::SSE_CHANNEL_BUFFER,
             },
             grpc::backend_client::BasicWorkerBuilder,
@@ -9724,6 +9730,100 @@ mod tests {
                 Shape::Parallel => register_pd_pair(router, prefill_url, decode_url),
             }
         }
+    }
+
+    /// A pair request keyed by its body's request id alone reaches the
+    /// engine with its key. Under the document the settings make of
+    /// `consistent_hashing` sides with the sticky override on, both turns of
+    /// a conversation go to one decode engine, and sixteen conversations do
+    /// not all go to one.
+    #[tokio::test]
+    async fn a_pair_request_keyed_by_its_bodys_id_reaches_the_engine_with_its_key() {
+        use smg_policy_controller::document::AppliedSpec;
+
+        use crate::config::types::{RouterConfig, RoutingKeyOverrideConfig, RoutingMode};
+
+        let settings = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            policy: PolicyConfig::ConsistentHashing,
+            routing_key_override: RoutingKeyOverrideConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let policies = PolicyRegistry::for_policy_engine(
+            settings.policy.clone(),
+            settings.routing_key_override.clone(),
+        );
+        let document = settings.policy_document().expect("the settings' document");
+        engine_on(
+            &policies,
+            AppliedSpec::validate(&document).expect("a valid document"),
+        );
+        let router = PDRouter {
+            policy_registry: Arc::new(policies),
+            ..create_test_pd_router()
+        };
+        let prefill_url = healthy_stub(Shape::Sequential, PdSide::Prefill).await;
+        let mut decodes = Vec::new();
+        for _ in 0..4 {
+            let answer = healthy_answer(Shape::Sequential, PdSide::Decode);
+            decodes.push(spawn_recording_stub(answer).await);
+        }
+        let decode_urls: Vec<&str> = decodes.iter().map(|(url, _)| url.as_str()).collect();
+        register_fleet(&router, Shape::Sequential, &prefill_url, &decode_urls);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        // One entry a request: the decode servers it arrived at.
+        let mut reached: Vec<Vec<usize>> = Vec::new();
+        for conversation in 0..16 {
+            for turn in 1..=2 {
+                let request = serde_json::from_value(json!({
+                    "model": "m",
+                    "rid": format!("conv-{conversation}_t{turn}"),
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))
+                .expect("valid chat request");
+                let response = router
+                    .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                reached.push(
+                    decodes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (_, seen))| {
+                            !std::mem::take(&mut *seen.lock().unwrap()).is_empty()
+                        })
+                        .map(|(at, _)| at)
+                        .collect(),
+                );
+            }
+        }
+
+        let apart: Vec<&[Vec<usize>]> = reached
+            .chunks(2)
+            .filter(
+                |turns| !matches!(turns, [first, second] if first.len() == 1 && first == second),
+            )
+            .collect();
+        assert!(
+            apart.is_empty(),
+            "the turns of a conversation went apart: {apart:?}"
+        );
+        let mut engines = reached.concat();
+        engines.sort_unstable();
+        engines.dedup();
+        assert!(
+            engines.len() > 1,
+            "sixteen conversations went to one decode: {engines:?}"
+        );
     }
 
     /// A decode worker's own 500, answered before the side's first byte, is

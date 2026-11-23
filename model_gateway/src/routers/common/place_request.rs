@@ -56,7 +56,8 @@ pub(crate) fn tried_ids(workers: &[Arc<dyn Worker>], tried: &[String], ids: &mut
 ///   and turn suffixes off by its document's own rule. The key classic
 ///   placement derives of the id ([`PlacementInputs::rid_key`]) is not
 ///   handed: it lost its suffixes once, and stands only under the sticky
-///   override.
+///   override. The one exception is the HTTP pair route: its attempt holds
+///   the derived key alone, and states it as the id.
 /// - The route's own rule for a worker (the candidate filter). The engine
 ///   asks it of the worker it picked, where classic placement narrows the
 ///   list by it.
