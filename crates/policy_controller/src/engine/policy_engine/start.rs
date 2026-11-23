@@ -36,7 +36,8 @@ pub struct WorkerData {
     /// crate's registry is one.
     pub registry: Arc<dyn Members>,
     /// The program's load channel: its load monitor's subscription. An
-    /// engine whose document reads no load report keeps none. `None` from a
+    /// engine whose document reads no load report and no named signal, and
+    /// none of whose stages keeps a report, keeps none. `None` from a
     /// program that runs no load monitor at its start: a decision whose
     /// request gives no snapshot reads no load report until the program
     /// hands a channel ([`PolicyEngine::set_loads`]).
@@ -63,9 +64,10 @@ impl PolicyEngine {
     ///   timer on: the engine spawns nothing, and on a runtime with no timer
     ///   the task ends at its first step with a panic. The task runs the
     ///   engine's upkeep off a request's path, keeps the newest load
-    ///   snapshot at hand and tells the document's stages a worker that
-    ///   joined or was removed: an engine whose task is never spawned does
-    ///   none of the three.
+    ///   snapshot at hand, tells the document's stages a worker that
+    ///   joined or was removed, and tells the stages that keep load reports
+    ///   each new one: an engine whose task is never spawned does none of
+    ///   the four.
     ///
     /// Every hand-over of `data` is made when the call returns: no decision
     /// of the engine runs ahead of one. At its first step the task reads

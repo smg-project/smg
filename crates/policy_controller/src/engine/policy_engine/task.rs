@@ -7,7 +7,9 @@
 //! load snapshot at hand, so a decision whose request gives none reads the
 //! engine's and never touches the channel. It tells the document's stages
 //! a worker that joined or was removed, by the registry's events and under
-//! the id the host states of the worker.
+//! the id the host states of the worker. And it tells the stages that keep
+//! load reports ([`Lifecycle::keeps_loads`]) each worker's new report,
+//! ahead of keeping the snapshot that holds it.
 
 use std::{
     fmt,
@@ -26,9 +28,12 @@ use smg_worker::load::state::{LoadReceiver, LoadSnapshot};
 use tokio::time::{self, MissedTickBehavior};
 
 use super::{membership, PolicyEngine};
-use crate::engine::{
-    decision_engine::{DecisionEngine, RequestMaker, SweepOutcome},
-    framework::release,
+use crate::{
+    engine::{
+        decision_engine::{DecisionEngine, RequestMaker, SweepOutcome},
+        framework::release,
+    },
+    stages::Lifecycle,
 };
 
 /// How often the task runs the engine's upkeep.
@@ -41,11 +46,12 @@ pub(super) struct Loads {
     /// ([`PolicyEngine::set_loads`]). The task takes the lock once a
     /// second, and no decision takes it.
     feed: Mutex<(u64, Option<LoadReceiver>)>,
-    /// Whether the host ever handed a channel: a decision of an engine
-    /// handed none reads this one word.
+    /// Whether the host ever handed a channel that decisions read: a
+    /// decision of an engine handed none reads this one word.
     handed: AtomicBool,
-    /// The newest snapshot the engine's task read from the channel. The
-    /// task alone writes it ([`PolicyEngine::run`]).
+    /// The newest snapshot the engine's task kept at hand, behind its
+    /// telling to the stages that keep reports. The task alone writes it
+    /// ([`PolicyEngine::run`]).
     newest: ArcSwapOption<LoadSnapshot>,
 }
 
@@ -60,8 +66,8 @@ impl fmt::Debug for Loads {
 
 impl Loads {
     /// The newest snapshot at hand, for a decision whose request gives
-    /// none: none where the host handed no channel, or the task has not
-    /// read it yet.
+    /// none: none where the host handed no channel, the document reads no
+    /// load report and no named signal, or the task has not read it yet.
     #[inline]
     pub(super) fn newest(&self) -> Option<Guard<Option<Arc<LoadSnapshot>>>> {
         let handed = self.handed.load(Ordering::Relaxed);
@@ -75,10 +81,13 @@ impl Loads {
         (feed.0 != taken).then(|| feed.clone())
     }
 
-    /// Keeps the newest snapshot of `feed` at hand.
-    fn keep(&self, feed: Option<&mut LoadReceiver>) {
+    /// Keeps the newest snapshot of `feed` at hand, behind `tell`, which
+    /// is handed it first: a decision reads no report of it in the
+    /// engine's snapshot until `tell` has ended.
+    fn keep(&self, feed: Option<&mut LoadReceiver>, tell: impl FnOnce(&LoadSnapshot)) {
         if let Some(feed) = feed {
             let newest = Arc::clone(&feed.borrow_and_update());
+            tell(&newest);
             self.newest.store(Some(newest));
         }
     }
@@ -123,7 +132,10 @@ impl PolicyEngine {
     /// ([`Needs::loads`](crate::document::spec::Needs::loads)) and no named
     /// signal
     /// ([`Needs::signal_cells`](crate::document::spec::Needs::signal_cells))
-    /// keeps none, and no decision of it reads a report. A named signal's
+    /// keeps the channel only for its stages that keep reports
+    /// ([`Lifecycle::keeps_loads`]), which the task tells them
+    /// ([`Self::run`]), and keeps none where it has no such stage. No
+    /// decision of it reads a report. A named signal's
     /// values stand in the same reports, so a document that reads one keeps
     /// the channel as one that reads a report does.
     ///
@@ -134,10 +146,14 @@ impl PolicyEngine {
     /// pair's first, and a pair's decode decided again.
     pub fn set_loads(&self, loads: LoadReceiver) {
         let needs = self.spec.needs();
-        if needs.loads || needs.signal_cells {
+        let read = needs.loads || needs.signal_cells;
+        if read || self.spec.engine().keeps_loads() {
             let mut feed = self.loads.feed.lock();
             *feed = (feed.0 + 1, Some(loads));
-            self.loads.handed.store(true, Ordering::Relaxed);
+            // A channel kept for the telling alone is read by no decision.
+            if read {
+                self.loads.handed.store(true, Ordering::Relaxed);
+            }
         }
     }
 
@@ -168,6 +184,21 @@ impl PolicyEngine {
     ///   Until then, and for an engine handed no channel, a decision whose
     ///   request gives no snapshot reads no report. A monitor that ended
     ///   leaves its last snapshot standing until another is handed.
+    /// - Each worker's new load report told to the stages that keep them
+    ///   ([`Lifecycle::keeps_loads`]), ahead of the snapshot that holds it
+    ///   being kept at hand: for the workers the task told them as joined,
+    ///   under the id of the join, where the report's sample instant is
+    ///   not the one last told of the worker. A telling hears the
+    ///   registry's words that stand ready first. A worker told as joined
+    ///   behind a snapshot is told its report at the next one. The channel
+    ///   keeps one snapshot, so of two reports of one worker the task took
+    ///   no snapshot between, the earlier is told to no stage. A request
+    ///   that gives a snapshot of its own can show its decision a report
+    ///   ahead of the telling. A stage's panic at a report, and a report's
+    ///   conversion that panics, are held and counted
+    ///   ([`Self::upkeep_faults`]): that report counts as told, for that
+    ///   stage or for all, and the task goes on. A stage that waits at a
+    ///   report holds back the task's other work.
     /// - A worker that joined or was removed told to the document's
     ///   stages, by the events of the registry the host handed
     ///   ([`Self::set_registry`]) and under the id the host states of the
@@ -182,14 +213,18 @@ impl PolicyEngine {
     }
 
     /// How many steps of the engine's own task panicked ([`Self::run`]): a
-    /// run of the upkeep, or a step of the registry's follow in the host's
-    /// own code. Each was held, and the task went on. While the upkeep's
+    /// run of the upkeep, a step of the registry's follow in the host's own
+    /// code, a stage's hearing of a load report, or a report's conversion
+    /// for the stages. Each was held, and the task went on. While
+    /// the upkeep's
     /// panics raise the count it does not run whole: session keys past
     /// their end can stay on file, though every request is still answered.
     /// While the follow's raise it, a join whose answer of the host
     /// panicked is lost until a whole read of the registry succeeds. A
     /// removal asks the host nothing and is still told. A host whose code
-    /// panics at one worker every time fails every whole read.
+    /// panics at one worker every time fails every whole read. A stage
+    /// that panics at a load report keeps of it what it wrote ahead of the
+    /// panic, and a report whose conversion panics is told to no stage.
     #[must_use]
     pub fn upkeep_faults(&self) -> u64 {
         self.upkeep_faults.load(Ordering::Relaxed)
@@ -225,15 +260,19 @@ impl PolicyEngine {
                     // Dated at this run, not at the second its tick was due.
                     let now = time::Instant::now().into_std();
                     let _swept = self.held(|| upkeep(now));
+                    // Ahead of a hand-over's telling: it tells the reports
+                    // of the workers the follow told as joined.
+                    self.follow_registry(&mut members);
                     if let Some(handed) = self.loads.handed_past(taken) {
                         (taken, feed) = handed;
-                        self.loads.keep(feed.as_mut());
+                        let tell = |newest: &_| self.tell_loads(&mut members, newest);
+                        self.loads.keep(feed.as_mut(), tell);
                     }
-                    self.follow_registry(&mut members);
                 }
                 went_on = published(feed.as_mut()) => {
                     if went_on {
-                        self.loads.keep(feed.as_mut());
+                        let tell = |newest: &_| self.tell_loads(&mut members, newest);
+                        self.loads.keep(feed.as_mut(), tell);
                     } else {
                         feed = None;
                     }

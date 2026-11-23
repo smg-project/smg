@@ -520,7 +520,8 @@ pub struct PolicyEngine {
     epochs: AtomicU64,    // how many list values were made
     faults: AtomicU64,    // decisions that panicked
     unheard: AtomicU64,   // lease events that panicked inside a stage
-    upkeep_faults: AtomicU64, // steps of the engine's own task that panicked: the upkeep, the registry's follow
+    upkeep_faults: AtomicU64, // steps of the engine's own task that panicked: the upkeep, the registry's follow,
+                          // a telling of load reports
     loads: task::Loads,   // the host's load channel, once handed, and the newest load snapshot
                           // the engine's own task keeps at hand
 }
@@ -938,9 +939,9 @@ At start:
 | The host does | With |
 |---|---|
 | starts the engine with its own data, once | `PolicyEngine::start(spec, WorkerData { registry, loads, cache_indexes })`. It builds the engine from the document and takes the host's worker registry (the host implements `Members`, and the worker crate's registry is one), its load monitor's channel and its indexes of cache events (the host implements `CacheIndexes` and `CacheIndex`). The same hand-over also lends the token tree, where the host keeps one (`CacheIndexes::token_tree`). A host with no load monitor or no index says `None`. It answers the engine, which lives as long as the process, and the engine's own task |
-| spawns the task the start answered, once | on a runtime of its choice, which needs its timer on: the upkeep once a second, the newest load snapshot kept at hand, and the follow of the registry, which tells the policies a worker that joined or was removed (the table below) |
+| spawns the task the start answered, once | on a runtime of its choice, which needs its timer on: the upkeep once a second, the newest load snapshot kept at hand, the follow of the registry, which tells the policies a worker that joined or was removed (the table below), and each new load report told to the policies that keep them |
 | keeps an empty cell beside each published worker list | a `ListCell` in its value of a membership generation, lent with the list as a `LentList`, with `facts` where the host knows a fact of its workers that their objects do not hold |
-| hands its load monitor's channel again where it builds another monitor | `engine.set_loads(channel)`; an engine whose document reads no load report and no named signal keeps none |
+| hands its load monitor's channel again where it builds another monitor | `engine.set_loads(channel)`; an engine whose document reads no load report and no named signal, and none of whose policies keeps a report, keeps none |
 
 A caller that builds its engine with `PolicyEngine::new(spec)`, as the crate's own cases and bench
 do over lists made by hand, makes each hand-over itself: `engine.set_registry(registry)`, or with
@@ -1051,12 +1052,19 @@ nothing. The call is marked `#[must_use]`, with the reason that the task does no
 spawned. The start takes no worker lists: each request gives its own, and the engine's task reads
 none.
 
-The engine's background task does what a host did by hand. Three of its jobs are built
+The engine's background task does what a host did by hand. Four of its jobs are built
 (`PolicyEngine::run`): the upkeep once a second, and the newest load snapshot kept at hand,
 swapped when the monitor publishes one, so that a decision reads it without touching the
 channel. The third is a worker that joined or was removed told to the policies, read from the events of the registry the host hands at the start (section 8.1). A host that
 builds another load monitor hands its channel again (`engine.set_loads`): a channel ends with
 its monitor.
+
+The fourth job serves a policy that keeps a number of each worker's load report
+(`Lifecycle::keeps_loads`). At each load snapshot the task takes, it tells such a policy the
+reports that are new in it, for the workers it follows in the host's registry, and only then keeps
+the snapshot at hand. A report is new where its sample instant is not the one the task told last
+of its worker. The channel keeps one snapshot, so of two reports of one worker the task took no
+snapshot between, the earlier is told to no policy.
 
 The host keeps one empty cell beside each worker list it publishes. That is one field in the
 host's `Generation` type. The engine fills the cell at the list's first decision.

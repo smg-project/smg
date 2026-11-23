@@ -58,6 +58,7 @@ mod signals;
 mod single;
 pub(super) mod start;
 mod task;
+mod told_loads;
 mod with_shadow;
 
 use std::{
@@ -137,8 +138,8 @@ pub struct PolicyEngine {
     /// stage that heard them.
     unheard: AtomicU64,
     /// How many steps of the engine's own task panicked: a run of the
-    /// upkeep, or a step of the registry's follow
-    /// ([`Self::upkeep_faults`]).
+    /// upkeep, a step of the registry's follow, or a telling of load
+    /// reports ([`Self::upkeep_faults`]).
     upkeep_faults: AtomicU64,
     /// The id of the last lease issued. A pick that is issued one writes
     /// it: one atomic step, on cache lines of its own.

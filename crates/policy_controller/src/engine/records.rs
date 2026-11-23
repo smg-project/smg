@@ -77,7 +77,7 @@ use rustc_hash::FxHashMap;
 use smg_worker::{
     identity::basic::Worker,
     load::state::LoadSnapshot,
-    worker::{WorkerLoadResponse, WorkerStatus},
+    worker::{WorkerLoadResponse, WorkerSpec, WorkerStatus},
 };
 
 use super::{
@@ -85,7 +85,7 @@ use super::{
     demands::{DemandFacts, Demands, UnmetDemand},
     framework::{Engine, Scratch},
     view::{
-        Candidate, Constraints, Engines, FixedFacts, Health, OverloadRegime, PoolFacts,
+        Candidate, Constraints, Engines, FixedFacts, Health, LoadRow, OverloadRegime, PoolFacts,
         RequestFacts, Role, SignalSource, WireModes, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS,
     },
 };
@@ -327,16 +327,39 @@ fn report_into(
     let Some((report, sampled_at)) = loads.report(worker.url()) else {
         return false;
     };
-    // The conversion is asked the age of a report at its own sample.
-    row.load = Some(load_row(
-        report,
-        row.role,
-        sampled_at,
-        sampled_at,
-        SignalSource::Poll,
-    ));
-    row.load_sampled_at_micros = clock.micros(sampled_at);
+    let (load, sampled_at_micros) = stated_report(report, sampled_at, row.role, clock);
+    row.load = Some(load);
+    row.load_sampled_at_micros = sampled_at_micros;
     true
+}
+
+/// A worker's role as its record states it, by its registration: one
+/// reading for a list's record and for the report a stage is told.
+pub(super) fn stated_role(spec: &WorkerSpec) -> Role {
+    Role::from(spec.worker_type)
+}
+
+/// A worker's rank as its record states it, by its registration, and the
+/// first where it states none: one reading for a list's record and for the
+/// report a stage is told.
+pub(super) fn stated_rank(spec: &WorkerSpec) -> u16 {
+    u16::try_from(spec.dp_rank.unwrap_or(0)).unwrap_or(u16::MAX)
+}
+
+/// A worker's report as a record states it: the row of a worker of `role`,
+/// converted at the report's own sample ([`load_row`]), and the sample's
+/// instant on `clock`. One conversion for a list's record and for the
+/// report a stage is told ([`Signal::Load`](crate::tracking::lease::Signal)).
+#[inline]
+pub(super) fn stated_report(
+    report: &WorkerLoadResponse,
+    sampled_at: Instant,
+    role: Role,
+    clock: &DecisionClock,
+) -> (LoadRow, u64) {
+    // The conversion is asked the age of a report at its own sample.
+    let row = load_row(report, role, sampled_at, sampled_at, SignalSource::Poll);
+    (row, clock.micros(sampled_at))
 }
 
 /// The records of one list with each worker's report written, as one load
@@ -536,10 +559,10 @@ impl PoolRecords {
                 Candidate {
                     position,
                     id: facts.id_or(address),
-                    role: Role::from(spec.worker_type),
+                    role: stated_role(spec),
                     // Values wider than a record's fields take the largest
                     // value they hold.
-                    dp_rank: u16::try_from(spec.dp_rank.unwrap_or(0)).unwrap_or(u16::MAX),
+                    dp_rank: stated_rank(spec),
                     dp_size: u16::try_from(spec.dp_size.unwrap_or(1)).unwrap_or(u16::MAX),
                     wire_modes: WireModes::from(spec.connection_mode),
                     engine_kind: listed.map_or(0, |listed| listed.engine_kind),
