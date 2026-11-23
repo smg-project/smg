@@ -856,9 +856,6 @@ pub(super) struct Derivation {
     /// The rule's verdict on each prefill slot beside each decode slot.
     verdicts: Vec<Vec<Verdict>>,
     work: Work,
-    /// How many whole derivations made what is kept.
-    #[cfg(test)]
-    wholes: usize,
 }
 
 impl Derivation {
@@ -871,10 +868,6 @@ impl Derivation {
         decodes: &P,
         mode: Pairing,
     ) -> PairClasses {
-        #[cfg(test)]
-        {
-            self.wholes += 1;
-        }
         let Self {
             sides: [prefill, decode],
             verdicts,
