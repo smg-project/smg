@@ -921,10 +921,10 @@ impl WorkerService {
         // A registration in flight holds its id. One that failed has released
         // it: the queue keeps its failed status under the id until its
         // finished statuses age out.
-        let in_flight = self
-            .worker_registry
-            .get_url_by_id(&worker_id)
-            .and_then(|worker_url| job_queue.get_status(&worker_url));
+        let url = self.worker_registry.get_url_by_id(&worker_id);
+        let in_flight = url
+            .as_deref()
+            .and_then(|worker_url| job_queue.get_status(worker_url));
         let failed = || {
             job_queue
                 .get_status(worker_id.as_str())
@@ -939,6 +939,22 @@ impl WorkerService {
                 status.worker_url.clone(),
                 Some(status),
             )));
+        }
+
+        // A registered data-parallel group stands under its rank URLs, none
+        // under the id its POST answered. The read of that id answers with
+        // the least ready rank, so a client that polls it reads healthy once
+        // every rank is. Each rank is read once, into its view, so the
+        // health compared is the health answered.
+        let group = url.and_then(|url| {
+            find_workers_by_url(&self.worker_registry, &url)
+                .iter()
+                .map(worker_to_info)
+                .min_by_key(|rank| rank.is_healthy)
+        });
+        if let Some(mut worker_info) = group {
+            worker_info.id = worker_id.as_str().to_string();
+            return Ok(GetWorkerResponse(worker_info));
         }
 
         Err(WorkerServiceError::NotFound {
@@ -1338,6 +1354,55 @@ mod tests {
 
         // The 202 was never sent, so nothing may keep the URL reserved (#1533).
         assert!(registry.get_url_by_id(&reserved).is_none());
+    }
+
+    /// A registered data-parallel group stands under its rank URLs, none
+    /// under the id its `POST` answered. The read of that id answers from
+    /// the ranks, the least ready one, where it answered 404.
+    #[tokio::test]
+    async fn get_worker_reads_a_registered_data_parallel_group_by_the_id_of_its_post() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let queue = Arc::new(std::sync::OnceLock::new());
+        queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                std::sync::Weak::new(),
+            ))
+            .ok();
+        let service = WorkerService::new(Arc::clone(&registry), queue, RouterConfig::default());
+        let url = "grpc://10.0.0.7:8000";
+        let id = registry.reserve_id_for_url(url);
+        for rank in 0..2 {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("m"))
+                .dp_config(rank, 2)
+                .build();
+            worker.set_status(WorkerStatus::Ready);
+            registry
+                .register(Arc::new(worker))
+                .expect("a rank registers");
+        }
+
+        let GetWorkerResponse(group) = service
+            .get_worker(id.as_str())
+            .expect("the ranks answer for the id of the POST");
+        assert_eq!(group.id, id.as_str());
+        assert!(group.is_healthy, "every rank is ready");
+
+        // The lookup's second rank, so that a read of the first one found
+        // would still say healthy.
+        let not_ready = find_workers_by_url(&registry, url)[1].clone();
+        not_ready.set_status(WorkerStatus::NotReady);
+        let GetWorkerResponse(group) = service
+            .get_worker(id.as_str())
+            .expect("the ranks answer for the id of the POST");
+        assert!(!group.is_healthy, "one rank is not ready");
+        assert_eq!(
+            group.spec.url,
+            not_ready.url(),
+            "the view is the not-ready rank's"
+        );
     }
 
     /// The job a `POST` of `url` claims the queue with (the claim reads the
