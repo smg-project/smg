@@ -720,6 +720,33 @@ async fn polled_once(stop: std::pin::Pin<&mut impl std::future::Future<Output = 
     }
 }
 
+/// A start behind a stop that was dropped at its first wait ends what that
+/// stop left standing: the first start's eviction flusher and liveness
+/// sweep, whose handles it writes over, and the event task whose handle
+/// the stop put back. The next stop ends every task of the second start,
+/// and no task of either start holds the monitor.
+#[tokio::test]
+async fn a_start_behind_a_dropped_stop_ends_the_tasks_it_replaces() {
+    let (registry, monitor) = build_monitor();
+    registry
+        .register(ready_worker("http://w1:8080", "llama-3"))
+        .unwrap();
+    monitor.start_event_loop();
+    {
+        let stop = monitor.stop();
+        tokio::pin!(stop);
+        assert!(!polled_once(stop.as_mut()).await, "the stop ended");
+    }
+
+    monitor.start_event_loop();
+    monitor.stop().await;
+    assert_eq!(
+        Arc::weak_count(&monitor),
+        0,
+        "a task of the first start outlived the stop"
+    );
+}
+
 /// A start made while a stop waits writes its event task's handle into the
 /// slot, and the stop, dropped then, leaves it there: the next stop ends
 /// the task that start made. The stop is polled once: the event task is

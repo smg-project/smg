@@ -1307,6 +1307,11 @@ impl<G: Generation> WorkerMonitor<G> {
     /// is already in the snapshot (because it ran on this thread) or
     /// arrives as a `Registered` event that the loop applies on top of
     /// the snapshot.
+    ///
+    /// A start ends what it replaces. Where a slot still holds the handle
+    /// of an earlier start's event task, eviction flusher or liveness
+    /// sweep, that task is told to end and the new task's handle takes
+    /// the slot. The groups' loops end at the rebuild from the registry.
     pub fn start_event_loop(self: &Arc<Self>) {
         // Capture the receiver before reconciling so events that fire
         // during reconcile are buffered, not lost.
@@ -1332,7 +1337,7 @@ impl<G: Generation> WorkerMonitor<G> {
             run_event_loop(monitor, events_rx).await;
         });
 
-        *self.event_task.lock() = Some(handle);
+        replace(&self.event_task, handle);
 
         // The debounced eviction flusher: holds the load state strongly (it
         // is cheap and monitor-independent) and the monitor weakly, for the
@@ -1347,7 +1352,7 @@ impl<G: Generation> WorkerMonitor<G> {
             eviction_flush_loop(load_state, monitor).await;
         });
 
-        *self.eviction_flush_task.lock() = Some(flush_handle);
+        replace(&self.eviction_flush_task, flush_handle);
 
         // The liveness sweep: vetoes a worker that stayed silent for the stall
         // threshold after a transport failure (see `health::liveness::sweep`).
@@ -1359,7 +1364,7 @@ impl<G: Generation> WorkerMonitor<G> {
         let sweep_handle = tokio::spawn(async move {
             liveness_sweep_loop(monitor).await;
         });
-        *self.liveness_sweep_task.lock() = Some(sweep_handle);
+        replace(&self.liveness_sweep_task, sweep_handle);
     }
 
     /// End what [`Self::start_event_loop`] started, for a host that reads
@@ -1402,11 +1407,12 @@ impl<G: Generation> WorkerMonitor<G> {
     /// groups it takes. A stop dropped at a later wait has told every other
     /// task to end. It has reset nothing: a later stop does.
     ///
-    /// A host makes its stops and starts in turn, and a start behind a
-    /// stop's end or its drop: a start writes its tasks' handles over those
-    /// of tasks that still stand, and no stop ends a task with no handle.
-    /// A stop dropped behind such a start leaves the start's event task
-    /// its slot.
+    /// A host makes its stops and starts in turn. A start behind a stop
+    /// that was dropped ends what that stop left standing
+    /// ([`Self::start_event_loop`]), so no task is left with no handle. A
+    /// start beside a stop that still waits is no turn: that stop ends the
+    /// start's other tasks and leaves its event task, with its handle in
+    /// the slot.
     ///
     /// Called by no task of the monitor: the call waits for each of them.
     pub async fn stop(&self) {
@@ -2231,6 +2237,15 @@ impl Drop for Awaited<'_> {
                 *slot = Some(handle);
             }
         }
+    }
+}
+
+/// Write a task's handle into its slot, and tell the task the slot still
+/// held to end: a start ends what it replaces
+/// ([`WorkerMonitor::start_event_loop`]).
+fn replace(slot: &Mutex<Option<JoinHandle<()>>>, handle: JoinHandle<()>) {
+    if let Some(replaced) = slot.lock().replace(handle) {
+        replaced.abort();
     }
 }
 
