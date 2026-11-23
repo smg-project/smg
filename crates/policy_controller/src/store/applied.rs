@@ -76,3 +76,38 @@ impl Deref for Applied {
         spec
     }
 }
+
+#[cfg(all(test, feature = "in-process"))]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use crate::{
+        document::{AppliedSpec, PolicySpec},
+        store::MemoryStore,
+    };
+
+    /// Every engine a store builds reads the store's own clock: an instant
+    /// reads alike in the store and under each document it applies. An apply
+    /// hands a profile's count of sends to the next document's engine, which
+    /// reads their stamps on the clock they were written on. An engine that
+    /// started a clock of its own would read a send of the last second as one
+    /// of the future, by the standing document's age.
+    #[test]
+    fn every_engine_a_store_builds_reads_the_stores_clock() {
+        let store = MemoryStore::new();
+        let at = Instant::now() + Duration::from_secs(5);
+        let engines =
+            |store: &MemoryStore| store.deciding(|world| world.front().clock().micros(at));
+        for number in 1..=3 {
+            let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+            document.generation = number;
+            let spec = AppliedSpec::validate(&document).expect("a preset validates");
+            store.apply(spec).expect("above the standing one");
+            assert_eq!(
+                engines(&store),
+                store.micros(at),
+                "under generation {number}"
+            );
+        }
+    }
+}

@@ -1439,9 +1439,12 @@ The asking gateway's reach, its wires and its standing vetoes are stated to the 
 of the list. A new document is a new engine object: its session pins and its record of sent
 prompts start empty, and that record is told no worker's leave. A sessions rule's cap counts no
 request of a key: a key stays on its worker past the cap, as under a rule with no cap. A
-registration, a drain or a deregistration reaches a decision at the next pass of the task that
-follows the worker records, a moment after its call answers, and a controller that starts over
-standing rows answers no worker until that pass ends.
+registration, a drain or a deregistration is on the worker objects when its call answers: a
+decision behind the acknowledgment reads the fleet the call left. A controller that starts over
+standing rows holds their worker objects before it serves.
+
+A standby's applied records reach its worker objects at the next pass of the task that follows the
+worker records. A replica that takes the lead reads its last leader's last change at that pass.
 
 ### 10.3 The controller's worker data **[partly]**
 

@@ -835,6 +835,10 @@ impl Controller {
             ..
         } = self;
         let store = Arc::clone(&shared.store);
+        // The worker objects stand at the store's end before a listener
+        // serves: a controller that starts over standing rows decides its
+        // first request over them. The follower's task goes on from here.
+        workers.holder().follow(&*store);
         // The listeners' close is one word, and an open decide stream hears
         // it too: the word is `Shared`'s.
         let stop = shared.stop.clone();
@@ -1507,6 +1511,35 @@ mod tests {
         }
         assert_ne!(starts[0].seq, starts[1].seq, "two runs start apart");
         assert!(starts.iter().all(|start| start.seq != 0 && start.term == 0));
+    }
+
+    /// A controller that starts over standing rows holds their worker
+    /// objects before a listener serves. The serve follows the store to its
+    /// end ahead of its listeners' tasks: one poll of it, which runs no task
+    /// it spawned, leaves the holder with the standing worker, and a
+    /// decision over the list the holder lends names it. Left to the
+    /// follower's task alone, a start over a large fleet answered its first
+    /// requests no worker.
+    #[tokio::test]
+    async fn a_start_over_standing_rows_holds_their_worker_objects_before_it_serves() {
+        use crate::engine::view::{Role, WireModes};
+
+        let controller = Controller::bind(valid()).await.expect("the listeners bind");
+        let store = Arc::clone(&controller.shared.store);
+        let objects = controller.workers.holder();
+        store
+            .apply(bed::preset("round_robin", 1))
+            .expect("above the unbound start");
+        let standing = bed::ready(&store, "w0", bed::MODEL, Role::Single, WireModes::NONE);
+        assert!(objects.is_empty(), "no object stands before the serve");
+        let mut serve = std::pin::pin!(controller.serve(pending()));
+        tokio::select! {
+            biased;
+            served = &mut serve => panic!("the serve stands: {served:?}"),
+            () = std::future::ready(()) => {}
+        }
+        let named = bed::lent_pick(&store, &objects, bed::frame(1, 1));
+        assert_eq!(named, Some(standing));
     }
 
     /// The thread gone at its take, before the serve read ready, and at its

@@ -1029,10 +1029,13 @@ impl Deciding {
                 // No other refusal reaches a single request here yet: one
                 // that did would be no panic, and is counted as none.
                 Err(
-                    DecisionRefused::PairSide
+                    refused @ (DecisionRefused::PairSide
                     | DecisionRefused::Unleased
-                    | DecisionRefused::Decode(_),
-                ) => return Err(Reason::Unspecified),
+                    | DecisionRefused::Decode(_)),
+                ) => {
+                    debug_assert!(false, "a single request's decision refused: {refused:?}");
+                    return Err(Reason::Unspecified);
+                }
             };
             let filed = frame_decision::issue(store, world, &taken, term, &decision, booked);
             // No pick, while the start's document of a replica under a
@@ -1609,6 +1612,35 @@ pub(crate) mod tests {
     ) -> DecisionCall<'a, Checked> {
         let taken = DecisionCall::at(request, gateway, received, now);
         taken.expect("budget is left").placed(place)
+    }
+
+    /// The worker the in-process front names first for `frame`, over the
+    /// list `objects` lends as it stands. No follow is made here: the
+    /// answer reads what the holder held when it was asked. `None` where
+    /// the front names no worker.
+    pub(crate) fn lent_pick(
+        store: &MemoryStore,
+        objects: &Objects<Members>,
+        frame: proto::DecideRequest,
+    ) -> Option<WorkerId> {
+        let request = checked(frame);
+        store.deciding(|world| {
+            let mut lists = wire::Lists::default();
+            let read = lists.of(&request);
+            let generation = objects.registry().model_generation(request.model());
+            let list = generation
+                .as_deref()
+                .map_or(WorkerLists::None, |generation| {
+                    WorkerLists::Single(objects.lent(generation, Role::Single))
+                });
+            let maker = FrameRequest::new(&request, &read, BUDGET, list);
+            let decided = world.front().decide_without_lease(&maker, Instant::now());
+            let (decision, _) = decided.expect("the engine decides");
+            decision
+                .pick()
+                .and_then(|pick| pick.targets.first())
+                .map(|target| target.id)
+        })
     }
 
     impl Bed {
