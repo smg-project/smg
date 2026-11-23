@@ -997,6 +997,7 @@ mod tests {
         engine::view::{LoadRow, WireModes},
         service::{
             controller::{
+                decision_slots::tests::followed,
                 election::LeasePlace,
                 replication::{journaled, journaled_from, parts, Replication},
             },
@@ -1893,6 +1894,7 @@ mod tests {
         let journal = journaled(&LeasePlace::File("shared".into()), 1);
         let (id, address) = ("standby-0".to_owned(), "127.0.0.1:1".to_owned());
         let catalog = Arc::new(crate::stages::StageRegistry::builtin());
+        let journal = followed(journal);
         let shared = Shared::new(id, address, &elector, stood, journal, catalog, 1)
             .expect("the deciders start");
         let mut standby = Standby::new(Arc::new(shared), bed.addr.port());

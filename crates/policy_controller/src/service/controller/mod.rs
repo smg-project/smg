@@ -43,9 +43,8 @@ mod decision_slots;
 mod discovery;
 pub(crate) mod election;
 mod floor;
-#[cfg(feature = "in-process")]
+mod frame_decision;
 mod frame_request;
-#[cfg(all(feature = "in-process", feature = "worker-host"))]
 mod gateway_places;
 mod gateways;
 mod generations;
@@ -479,7 +478,7 @@ impl Controller {
             address.unwrap_or_default(),
             &elector,
             stood,
-            journal,
+            (journal.0, journal.1, workers.holder()),
             Arc::clone(&catalog),
             config.decide_shards,
         )

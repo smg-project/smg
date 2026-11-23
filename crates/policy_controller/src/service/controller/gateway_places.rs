@@ -15,7 +15,8 @@
 //! - **Wires.** A gateway that states wires takes the workers that state
 //!   one of them. A worker that states none shares none. A gateway that
 //!   states none is held to none. The stated set of a worker decides, not
-//!   the one wire its object speaks ([`ListReach`]).
+//!   the one wire its object speaks ([`ListReach`]). The workers a
+//!   gateway's wires take are counted ([`GatewayPlaces::undialed`]).
 //! - **Vetoes.** A standing veto of the gateway on a worker it may take
 //!   holds that worker's position back, and holds it for good while the
 //!   veto's hold stands ([`StandingVeto`]). A veto on a worker the list
@@ -58,13 +59,6 @@ pub(crate) struct Asking {
 
 impl Asking {
     /// What `frame` says of `gateway`, the gateway whose stream carried it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "a deciding thread asks it of each frame once it decides by the engine over worker lists"
-        )
-    )]
     pub(crate) fn of(gateway: GatewayId, frame: &Checked) -> Self {
         Self {
             gateway,
@@ -105,31 +99,20 @@ pub(crate) struct Held<'a> {
 /// One deciding thread's buffers for the places of its frames: kept from
 /// frame to frame, so a frame that narrows allocates nothing once they
 /// have grown.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "a deciding thread asks it of each frame once it decides by the engine over worker lists"
-    )
-)]
 #[derive(Debug, Default)]
 pub(crate) struct GatewayPlaces {
     places: Vec<u32>,
     stalled: Vec<u32>,
     held: Vec<u32>,
+    /// What [`Self::undialed`] answers: written by each [`Self::taken`].
+    undialed: u64,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "a deciding thread asks it of each frame once it decides by the engine over worker lists"
-    )
-)]
 impl GatewayPlaces {
     /// What `asking` may take of the list whose workers' reach is `reach`
     /// and whose records are `records`, under the gateway's standing
-    /// `vetoes`, read by worker id.
+    /// `vetoes`, read by worker id. The workers its wires take are counted
+    /// for [`Self::undialed`].
     pub(crate) fn taken<'a>(
         &'a mut self,
         reach: &ListReach,
@@ -141,9 +124,10 @@ impl GatewayPlaces {
         self.places.clear();
         self.stalled.clear();
         self.held.clear();
+        self.undialed = 0;
         let mut narrowed = false;
         if asking.subset == Some(0) || !reach.whole(asking.wires) {
-            let mut dialed = false;
+            let mut dialed = 0_usize;
             for (place, worker) in (0_u32..).zip(reach.workers()) {
                 let dials = match worker.from {
                     Reachability::Any => true,
@@ -152,7 +136,7 @@ impl GatewayPlaces {
                 if !dials {
                     continue;
                 }
-                dialed = true;
+                dialed += 1;
                 if asking
                     .wires
                     .is_none_or(|wires| worker.wires.intersects(wires))
@@ -160,12 +144,15 @@ impl GatewayPlaces {
                     self.places.push(place);
                 }
             }
-            if !dialed {
+            if dialed == 0 {
                 return Taken::Unreached;
             }
+            // A hint of 0 takes every worker ahead of the wires: they
+            // have none to take.
             if asking.subset == Some(0) {
                 return Taken::Emptied(SUBSET_HINT);
             }
+            self.undialed = (dialed - self.places.len()) as u64;
             if self.places.is_empty() {
                 return Taken::Emptied(WIRES);
             }
@@ -193,6 +180,13 @@ impl GatewayPlaces {
             stalled: &self.stalled,
             held: &self.held,
         })
+    }
+
+    /// How many workers the wires of the last [`Self::taken`]'s gateway
+    /// took: the workers it dials that share no wire with it. None under a
+    /// hint of 0, and none for a gateway that states no wires.
+    pub(crate) fn undialed(&self) -> u64 {
+        self.undialed
     }
 }
 

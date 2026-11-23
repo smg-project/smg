@@ -65,6 +65,7 @@
 //!
 //! [`LoadRow`]: crate::engine::view::LoadRow
 
+pub(crate) mod applied;
 pub(crate) mod encoding;
 pub(crate) mod health;
 pub(crate) mod index;

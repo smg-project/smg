@@ -105,6 +105,8 @@ use std::{
 
 use rustc_hash::FxHashMap;
 
+#[cfg(feature = "in-process")]
+use crate::engine::policy_engine::PolicyEngine;
 use crate::{
     document::spec::{AppliedSpec, IndexKind, Pairing, ViewListPositions},
     engine::{
@@ -120,6 +122,7 @@ use crate::{
     load::signals::{SignalCell, SignalCells},
     stages::lifecycle::Lifecycle,
     store::{
+        applied::Applied,
         encoding::{EncodeClasses, EncodeMember},
         health::LeaderBits,
         index::{AffinityRowsBuffers, KvTables, PoolIndex, Predict, Reading},
@@ -880,10 +883,10 @@ type PoolVetoes = Arc<[GatewayRun]>;
 /// nothing of a pool's rows, so this reader can stand on the writer's own
 /// lists, which are by worker id ([`Vetoes`]), and no caller changes.
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "controller")),
     expect(
         dead_code,
-        reason = "a decision over worker lists reads its gateway's vetoes here once a controller makes one"
+        reason = "a controller's decision over worker lists reads its gateway's vetoes here"
     )
 )]
 #[derive(Clone, Copy, Debug)]
@@ -896,10 +899,10 @@ pub(crate) struct GatewayVetoes<'a> {
 /// rule lifts the veto, as none lifts an open breaker. From the hold's end
 /// to the veto's own the worker is doubted alone.
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "controller")),
     expect(
         dead_code,
-        reason = "a decision over worker lists reads its gateway's vetoes here once a controller makes one"
+        reason = "a controller's decision over worker lists reads its gateway's vetoes here"
     )
 )]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -909,10 +912,10 @@ pub(crate) struct StandingVeto {
 }
 
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "controller")),
     expect(
         dead_code,
-        reason = "a decision over worker lists reads its gateway's vetoes here once a controller makes one"
+        reason = "a controller's decision over worker lists reads its gateway's vetoes here"
     )
 )]
 impl<'a> GatewayVetoes<'a> {
@@ -1202,7 +1205,7 @@ pub struct StoreSnapshot {
     overload_epoch: u64,
     /// The generation this publication was made under: its engine and its
     /// number, read with the rows in one load.
-    spec: Arc<AppliedSpec>,
+    spec: Arc<Applied>,
     /// The served decider reads this with the world, before following
     /// the pointer to the generation.
     #[cfg(feature = "controller")]
@@ -1249,6 +1252,19 @@ impl StoreSnapshot {
     /// owned world, whose shared count a deciding thread would write.
     pub fn spec(&self) -> &AppliedSpec {
         &self.spec
+    }
+
+    /// The front that decides under this publication's document: the
+    /// engine object whose stages the store tells the words of a lease
+    /// ([`Applied`]). Handed under the borrow of the world, as the document
+    /// is.
+    #[cfg(feature = "in-process")]
+    #[cfg_attr(
+        not(feature = "controller"),
+        expect(dead_code, reason = "a controller's deciding thread asks it")
+    )]
+    pub(crate) fn front(&self) -> &PolicyEngine {
+        self.spec.front()
     }
 
     #[cfg(feature = "controller")]
@@ -1809,10 +1825,10 @@ impl StoreSnapshot {
     /// worker that list does not hold: a pool names a worker another
     /// gateway alone reaches, and a list can be of another membership.
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "controller")),
         expect(
             dead_code,
-            reason = "a decision over worker lists reads its gateway's vetoes here once a controller makes one"
+            reason = "a controller's decision over worker lists reads its gateway's vetoes here"
         )
     )]
     pub(crate) fn gateway_vetoes(
@@ -2931,7 +2947,7 @@ pub(super) struct Writer {
     pool_vetoes: Arc<[PoolVetoes]>,
     /// The generation every world is published under until the next is
     /// applied: the unbound one at the start.
-    spec: Arc<AppliedSpec>,
+    spec: Arc<Applied>,
     /// Each pool's standing in its model's index: made by a membership
     /// write, its warming rows read again by a window's publication.
     indexes: Arc<[Option<Arc<PoolIndex>>]>,
@@ -2954,7 +2970,7 @@ pub(super) struct Writer {
     /// frees no engine, the next apply does. Its whole engine stays
     /// resident that long, its session table included, as it stood when
     /// it was replaced.
-    retired: Option<Arc<AppliedSpec>>,
+    retired: Option<Arc<Applied>>,
     /// The engines of the membership, as the overload verdict reads them.
     engines: Vec<EngineRows>,
     /// Every engine's rows in one list, an engine's together. A membership
@@ -3048,7 +3064,7 @@ impl Writer {
             counts: Arc::default(),
             vetoes: Arc::default(),
             pool_vetoes: Arc::default(),
-            spec: Arc::new(AppliedSpec::unbound()),
+            spec: Arc::new(Applied::new(AppliedSpec::unbound())),
             indexes: Arc::default(),
             reading: Reading::default(),
             lanes: 0,
@@ -3154,11 +3170,11 @@ impl Writer {
     /// goes with that world, at the publication that lets it go.
     pub(super) fn apply<'a>(
         &mut self,
-        spec: Arc<AppliedSpec>,
+        spec: Arc<Applied>,
         epoch: u64,
         members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot, LeaderBits)>,
         on_file: impl OnFile,
-    ) -> Result<(Arc<StoreSnapshot>, Option<Arc<AppliedSpec>>), StaleGeneration> {
+    ) -> Result<(Arc<StoreSnapshot>, Option<Arc<Applied>>), StaleGeneration> {
         let standing = self.spec.generation();
         if spec.generation() <= standing {
             return Err(StaleGeneration {

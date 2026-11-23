@@ -60,13 +60,6 @@ use crate::{
 /// lists: the frame, its lists as its decider read them, what is left of
 /// its budget, the worker lists of its model, and the places of a single
 /// request's list its gateway may take.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "a deciding thread makes one of each frame once it decides by the engine over worker lists"
-    )
-)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FrameRequest<'a> {
     frame: &'a Checked,
@@ -82,13 +75,6 @@ pub(crate) struct FrameRequest<'a> {
     held: &'a [u32],
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "a deciding thread makes one of each frame once it decides by the engine over worker lists"
-    )
-)]
 impl<'a> FrameRequest<'a> {
     /// `frame` as a request over `workers`, the lists its controller hands
     /// for the frame's model, with `left` of its budget at the decision.
@@ -99,6 +85,10 @@ impl<'a> FrameRequest<'a> {
     ///
     /// The request may take every place of its list, and no position is
     /// held back ([`Self::held_to`]).
+    ///
+    /// `left` is a microsecond or more. A frame with less left is answered
+    /// where its decider takes it, and no request is made of it: a request
+    /// that states a budget of 0 says that its frame states none.
     pub(crate) fn new(
         frame: &'a Checked,
         lists: &'a FrameLists<'a>,
