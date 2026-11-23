@@ -1,7 +1,8 @@
 //! The holder of a replica's worker objects: it follows the store's
-//! membership and writes the registry. A host can also ask it to follow
-//! the rows' status, or to build each object with the thresholds its own
-//! load monitor judges overload by.
+//! membership and writes the registry. A leader's door writes a row through
+//! it, and the store follows that write ([`mod@write`]). A host can also ask it
+//! to follow the rows' status, or to build each object with the thresholds
+//! its own load monitor judges overload by.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -44,6 +45,7 @@ use crate::{
 };
 
 mod host_count;
+mod write;
 
 /// The row an object stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,8 +161,9 @@ impl Held {
 /// A replica's worker objects: for every row of the membership store that
 /// stands one object in the registry, and none beside.
 ///
-/// [`Self::follow`] is the one path, on a leader and on a standby: it reads
-/// what the store's membership did since its last read. It builds the
+/// [`Self::follow`] reads what the store's membership did since its last
+/// read: every change on a standby, and on a leader each change no door
+/// wrote through the holder, a status change among them. It builds the
 /// object of a row that arrived, drops the object of a row that went, and
 /// replaces the object of a row whose facts changed under the same id in
 /// the registry. A new incarnation of a key gets a new object and id,
@@ -253,8 +256,13 @@ pub struct Objects<G> {
     handing: Mutex<()>,
     /// How many lays found no object handed in where the host hands them.
     unhanded: AtomicU64,
-    /// Where the last read ended. Held through a read: one follows at a
-    /// time.
+    /// Where the last read ended. Held through a read and through a write
+    /// of the holder's own ([`mod@write`]): one follows or writes at a time.
+    ///
+    /// The order of the locks, said here once: a door's turn, then this
+    /// one, then the store's membership lock. Nothing that holds this one
+    /// takes a door's turn, and no lock of the store is held over a write
+    /// of the registry.
     read_to: Mutex<Place>,
     held: RwLock<Held>,
     /// How many times a kept object's entry moved in place in what a
@@ -642,13 +650,6 @@ impl<G: Generation> Objects<G> {
     /// ([`Self::unhanded`]) states its key, role, models, labels, cache
     /// block size and bootstrap port as it was handed in, and as the
     /// engine the address it dials, where the moved row names one.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the controller's service reads it once its worker objects lead"
-        )
-    )]
     pub(crate) fn row_of(&self, object: &ObjectId) -> Option<WorkerRow> {
         let held = self.held.read();
         held.rows

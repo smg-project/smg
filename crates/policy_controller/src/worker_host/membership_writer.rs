@@ -289,6 +289,26 @@ pub trait MembershipWriter: Send + Sync + 'static {
 pub(crate) trait Turn {
     fn store(&self) -> &MemoryStore;
 
+    /// The turn's write of a registration's facts: the store's own
+    /// ([`WorkersStore::upsert_by`]), unless the door's worker objects
+    /// decide a row's write. `None` where another writer moved the row
+    /// under the turn.
+    fn upsert(&self, facts: WorkerFacts, maker: Registrant) -> Option<MembershipChange> {
+        Some(self.store().upsert_by(facts, maker))
+    }
+
+    /// The turn's write of a patch, as [`Self::upsert`] writes a
+    /// registration ([`WorkersStore::patch`]).
+    fn patch(&self, id: WorkerId, patch: WorkerPatch, revision: u64) -> Option<MembershipChange> {
+        self.store().patch(id, patch, revision)
+    }
+
+    /// The turn's removal of a row, as [`Self::upsert`] writes a
+    /// registration ([`WorkersStore::remove`]).
+    fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
+        self.store().remove(id, revision)
+    }
+
     /// Check the term ahead of a write. A registration asks before each
     /// row it writes and each row it removes.
     fn check_term(&self) -> Result<(), MembershipWriteRefused> {
@@ -610,7 +630,7 @@ pub(crate) fn lay_ready(
     for row in left {
         turn.check_term()?;
         let wrote = changed(
-            store.remove(row.id, row.revision),
+            turn.remove(row.id, row.revision),
             MembershipWriteOutcome::Removed,
         )?;
         turn.told(wrote);
@@ -636,7 +656,8 @@ fn write_row(
     }
     let store = turn.store();
     let probes = facts.health.probes;
-    let change = store.upsert_by(facts, maker.clone());
+    let change = turn.upsert(facts, maker.clone());
+    let change = change.ok_or(MembershipWriteRefused::Moved)?;
     let wrote = match change {
         MembershipChange::Registered { id } => MembershipWriteOutcome::Registered(id),
         MembershipChange::Relabelled { id } | MembershipChange::Resized { id } => {
@@ -727,14 +748,14 @@ pub(crate) fn drain(
 
 /// Remove the guarded row while the door holds its turn.
 pub(crate) fn take(
-    store: &MemoryStore,
+    turn: &impl Turn,
     by: Remover<'_>,
     url: &str,
     seen: RowRevision,
 ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
-    let row = removal_row(store, by, url, seen)?;
+    let row = removal_row(turn.store(), by, url, seen)?;
     changed(
-        store.remove(row.id, row.revision),
+        turn.remove(row.id, row.revision),
         MembershipWriteOutcome::Removed,
     )
 }
@@ -807,14 +828,17 @@ fn refresh_stated(
     // is asked ahead of it.
     turn.check_term()?;
     if pairing_moved {
-        return match store.upsert_by(stated, row.maker) {
-            MembershipChange::Relabelled { id } | MembershipChange::Resized { id } => {
+        return match turn.upsert(stated, row.maker) {
+            Some(MembershipChange::Relabelled { id } | MembershipChange::Resized { id }) => {
                 Ok(MembershipWriteOutcome::InPlace(id))
             }
-            MembershipChange::Registered { .. }
-            | MembershipChange::Replaced { .. }
-            | MembershipChange::Removed { .. }
-            | MembershipChange::StatusChanged { .. } => Err(MembershipWriteRefused::Moved),
+            Some(
+                MembershipChange::Registered { .. }
+                | MembershipChange::Replaced { .. }
+                | MembershipChange::Removed { .. }
+                | MembershipChange::StatusChanged { .. },
+            )
+            | None => Err(MembershipWriteRefused::Moved),
         };
     }
     let patch = WorkerPatch {
@@ -822,7 +846,7 @@ fn refresh_stated(
         ..WorkerPatch::default()
     };
     changed(
-        store.patch(row.id, patch, row.revision),
+        turn.patch(row.id, patch, row.revision),
         MembershipWriteOutcome::InPlace,
     )
 }
@@ -949,7 +973,7 @@ impl MembershipWriter for StoreMembershipWriter {
         seen: RowRevision,
     ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.call(
-            || take(&self.store, by, url, seen),
+            || take(self, by, url, seen),
             MembershipWriteOutcome::changed,
         )
     }
