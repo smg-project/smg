@@ -418,7 +418,7 @@ impl PolicyRegistry {
     /// ([`Self::with_override`]), or the one that makes no classic policy
     /// where the configuration runs the policy controller
     /// ([`Self::for_policy_engine`]), under the pairing mode in force
-    /// ([`RouterConfig::pd_pairing_in_force`]): a supplied document's own
+    /// (`RouterConfig::pd_pairing_in_force`): a supplied document's own
     /// where the policy controller runs one, else the configuration's. The
     /// one place that reads the option for the registry.
     pub fn of_config(config: &RouterConfig) -> Self {
