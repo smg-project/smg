@@ -3773,19 +3773,10 @@ pub fn expand_to_square(image: &DynamicImage, background: Rgb<u8>) -> DynamicIma
     }
 }
 
-/// Pillow-exact `ImageOps.pad` with default centering (0.5, 0.5):
-/// aspect-preserving BICUBIC `contain` fit into `(out_w, out_h)`, then a
-/// centered paste onto a `color` canvas. Matches Pillow 12.x source: `contain`
-/// adjusts at most one dimension using Python `round()` (exact
-/// round-half-to-even, so `471.49999999999994` rounds to 471 like Python and
-/// not up like an epsilon tie test would) and `pad` pastes at
-/// `round((size - resized) * 0.5)` along the padded axis.
-///
-/// The image is treated as RGB (`to_rgb8`): an alpha channel is dropped, not
-/// premultiplied; callers that need Pillow's RGBA behaviour must flatten
-/// first. An aspect ratio so extreme that the contained dimension rounds to
-/// zero is an error, as it is in Pillow (`height and width must be > 0`).
-pub fn pad_to_size_pil(
+/// [`pad_to_size_pil_rgb`] over a decoded image, which is treated as RGB
+/// (`to_rgb8`): an alpha channel is dropped, not premultiplied.
+#[cfg(test)]
+fn pad_to_size_pil(
     image: &DynamicImage,
     out_w: u32,
     out_h: u32,
@@ -3795,9 +3786,19 @@ pub fn pad_to_size_pil(
     pad_to_size_pil_rgb(&data, w as u32, h as u32, out_w, out_h, color).map(DynamicImage::ImageRgb8)
 }
 
-/// [`pad_to_size_pil`] over interleaved RGB bytes (`width` x `height`): the
-/// same geometry, the contained image resized once and its rows copied into
-/// the canvas (the paste of an opaque image is a copy).
+/// Pillow-exact `ImageOps.pad` with default centering (0.5, 0.5) over
+/// interleaved RGB bytes (`width` x `height`): aspect-preserving BICUBIC
+/// `contain` fit into `(out_w, out_h)`, then a centered paste onto a `color`
+/// canvas. Matches Pillow 12.x source: `contain` adjusts at most one dimension
+/// using Python `round()` (exact round-half-to-even, so `471.49999999999994`
+/// rounds to 471 like Python and not up like an epsilon tie test would) and
+/// `pad` pastes at `round((size - resized) * 0.5)` along the padded axis.
+///
+/// The contained image is resized once. When the fit leaves room on one axis,
+/// its rows are copied into the canvas (the paste of an opaque image is a
+/// copy); when it fills the target, it is returned without a canvas. An aspect
+/// ratio so extreme that the contained dimension rounds to zero is an error,
+/// as it is in Pillow (`height and width must be > 0`).
 pub fn pad_to_size_pil_rgb(
     data: &[u8],
     width: u32,
