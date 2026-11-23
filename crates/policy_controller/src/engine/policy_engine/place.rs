@@ -1452,8 +1452,9 @@ impl PolicyEngine {
     /// A decision that is given up has written what its stages write as
     /// they decide, and its release takes none of that back: the tokens a
     /// `bucket` profile books on a worker a prefill decision listed, a new
-    /// session's claim of its worker. A decision whose later target is
-    /// taken has written for its first target all the same.
+    /// session's claim of its worker, the move of a session's pin at its
+    /// cap. A decision whose later target is taken has written for its
+    /// first target all the same.
     ///
     /// Where a prompt went is written otherwise, in the record of sent
     /// prefixes a `cache_aware` profile keeps and in a token tree the

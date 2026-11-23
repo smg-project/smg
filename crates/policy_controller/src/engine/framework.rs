@@ -6276,7 +6276,10 @@ impl Engine {
     /// routable pin is placed by the stages. The stages are the profile's own
     /// under `delegate`, else the assignment's, and `placing` names which:
     /// the binding's placing assignment, not the rule's declared one. The
-    /// pin is written by the dispatch (`on_dispatched`), never here.
+    /// pin is written by the dispatch (`on_dispatched`). Two writes come
+    /// ahead of it here, the live decision's alone: a key with no routable
+    /// pin claims the worker it is placed on, and a pin at the cap moves to
+    /// the worker a respill takes ([`Self::moved`]).
     ///
     /// `KEPT` is the form of a profile that places by the session key, under
     /// a binding that steers ([`Engine::keep`]): the pin's test reads the
@@ -6374,7 +6377,7 @@ impl Engine {
                 if let Some(respilled) = self.respill(
                     profile, index, rule, placing, facts, pool, candidates, cx, buf, c.id,
                 ) {
-                    return respilled;
+                    return self.moved::<WRITE_SESSIONS>(facts, respilled);
                 }
             }
             let mut targets = Targets::new();
@@ -6453,7 +6456,7 @@ impl Engine {
                             profile, index, rule, placing, facts, pool, set, cx, buf, all_vetoed,
                             first,
                         ) {
-                            return handed;
+                            return self.moved::<WRITE_SESSIONS>(facts, handed);
                         }
                     }
                     return decision;
@@ -6519,7 +6522,7 @@ impl Engine {
                                     profile, index, rule, placing, facts, pool, set, cx, buf,
                                     all_vetoed, owner,
                                 ) {
-                                    return handed;
+                                    return self.moved::<WRITE_SESSIONS>(facts, handed);
                                 }
                             }
                         }
@@ -6528,6 +6531,33 @@ impl Engine {
             }
         }
         decision
+    }
+
+    /// A respill's move, written where the request is decided: the worker a
+    /// pin at its cap hands the key on to leads the key's pins from this
+    /// decision on ([`SessionTable::respilled`]), ahead of the request's
+    /// dispatch. A gateway's sticky map moves a pin where it selects the
+    /// worker, so the key's next request, decided ahead of that dispatch,
+    /// follows the move there too. The live decision's alone: with
+    /// `WRITE_SESSIONS` off the decision is a shadow's and writes no pin.
+    /// A placement on the pin again, and one on another worker at the cap,
+    /// move no pin ([`Self::respill`]).
+    #[inline]
+    fn moved<const WRITE_SESSIONS: bool>(
+        &self,
+        facts: &RequestFacts<'_>,
+        handed: Decision,
+    ) -> Decision {
+        if WRITE_SESSIONS {
+            if let Decision::Pick(pick) = &handed {
+                if pick.session_verdict == SessionVerdict::Respill {
+                    if let Some(first) = pick.targets.first() {
+                        self.sessions.respilled(facts.session(), first.id);
+                    }
+                }
+            }
+        }
+        handed
     }
 
     /// A request of a profile whose picker leaves the placement to the
@@ -6601,9 +6631,10 @@ impl Engine {
     /// may move, not where a request may go. A placement on `pin` again is
     /// the pin taken ([`SessionVerdict::Pinned`]), and the decision names no
     /// other target: at the cap a pin moves by a respill alone. One on
-    /// another worker under the cap is marked [`SessionVerdict::Respill`],
-    /// and its commit fronts that worker, whichever of its targets it lands
-    /// on: a respill's alternates are the workers under the cap alone. One on
+    /// another worker under the cap is marked [`SessionVerdict::Respill`].
+    /// The live decision fronts that worker at once ([`Self::moved`]), and
+    /// its commit fronts the worker it lands on, whichever of its targets:
+    /// a respill's alternates are the workers under the cap alone. One on
     /// another worker at the cap carries no verdict: its commit moves no
     /// pin. `None` where no survivor stands. A pin the decision follows
     /// asks in its form's order ([`Self::hand_on`]).
@@ -8622,9 +8653,10 @@ mod tests {
         assert_eq!(first_of(&shadow), Some(rows[1].id));
     }
 
-    /// A respill's commit fronts the worker it landed on. The shadow asked
-    /// behind it still reads the pin at its cap, and hands the key on by its
-    /// own stages.
+    /// A live respill fronts the worker it takes where it is decided, and
+    /// its commit fronts the worker it landed on. The shadow asked behind
+    /// it still reads the pin at its cap, and hands the key on by its own
+    /// stages: a respill of its own, which moves no pin.
     #[test]
     fn shadow_behind_a_respills_commit_hands_the_key_on_by_its_own_stages() {
         let engine = with_shadow(by_sessions(), Some(SESSIONS));
@@ -8644,15 +8676,20 @@ mod tests {
             live.pick().map(|pick| pick.session_verdict),
             Some(SessionVerdict::Respill)
         );
+        let moved = Some([rows[1].id, rows[0].id]);
+        let pins = || engine.sessions().pins(facts.session());
+        assert_eq!(pins(), moved, "ahead of the live commit");
         assert_eq!(commit(&engine, &facts, &live, 0), rows[1].id);
-        assert_eq!(
-            engine.sessions().pins(facts.session()),
-            Some([rows[1].id, rows[0].id])
-        );
+        assert_eq!(pins(), moved);
         let shadow = engine
             .shadow(&facts, &pool, &rows, &cx, &mut scratch)
             .expect("a shadow decision");
         assert_eq!(first_of(&shadow), Some(rows[2].id));
+        assert_eq!(
+            shadow.pick().map(|pick| pick.session_verdict),
+            Some(SessionVerdict::Respill)
+        );
+        assert_eq!(pins(), moved, "the shadow's respill moves no pin");
     }
 
     /// A claim's commit on an alternate withdraws the claim and fronts the
@@ -14494,7 +14531,9 @@ mod tests {
     /// A respill's commit fronts the worker it lands on, the first target or
     /// an alternate behind it. So no worker at the cap stands among a
     /// respill's targets: the pinned worker and a peer at the cap leave the
-    /// list, and an alternate's dispatch moves the pin under the cap.
+    /// list, and an alternate's dispatch moves the pin under the cap. The
+    /// alternate then leads, and the worker the decision first took, which
+    /// it fronted where it was made, stands behind it.
     #[test]
     fn a_respill_names_no_alternate_at_the_cap() {
         let engine = session_engine(SESSIONS);
@@ -14524,12 +14563,62 @@ mod tests {
             ..Lease::default()
         };
         engine.on_dispatched(&lease, &alternate, Side::Single, 0);
+        let first = pick.targets.as_slice()[0];
+        assert_eq!(
+            engine.sessions().pins(session(7)),
+            Some([alternate.id, first.id]),
+            "the alternate, then the worker first taken"
+        );
         pool[0].session_in_flight = 0;
         assert_eq!(
             place_keyed(&engine, &pool, 7, 30).position,
             3,
             "the pin moved under the cap"
         );
+    }
+
+    /// A respill fronts the worker it takes where it is decided, ahead of
+    /// its dispatch: the key's next request follows the move under the cap,
+    /// as a gateway's sticky map moves a pin where it selects the worker.
+    /// The commit on that worker finds the pins in place.
+    #[test]
+    fn a_respill_fronts_its_worker_where_it_is_decided() {
+        let engine = session_engine(SESSIONS);
+        let mut pool = vec![candidate(0, 0), candidate(1, 1), candidate(2, 2)];
+        let home = place_keyed(&engine, &pool, 7, 10);
+        assert_eq!(home.position, 0);
+        let pins = || engine.sessions().pins(session(7));
+        // The pin at the cap and the busiest, and every other worker at the
+        // cap too: the placement carries no verdict and moves no pin.
+        pool[0].in_flight = 9;
+        for row in &mut pool {
+            row.session_in_flight = 2;
+        }
+        let over = decide_keyed(&engine, &pool, 7, 15);
+        let pick = over.pick().expect("a placement at the cap");
+        assert_eq!(pick.session_verdict, SessionVerdict::None);
+        assert_eq!(pins(), Some([home.id, WorkerId(0)]), "no verdict");
+        // The others under the cap: the respill takes the second row.
+        (pool[1].session_in_flight, pool[2].session_in_flight) = (0, 0);
+        let respill = decide_keyed(&engine, &pool, 7, 20);
+        let pick = respill.pick().expect("the respill places");
+        assert_eq!(pick.session_verdict, SessionVerdict::Respill);
+        let taken = *pick.targets.first().expect("a target");
+        assert_eq!(taken.position, 1);
+        assert_eq!(pins(), Some([taken.id, home.id]), "ahead of its dispatch");
+        // The key's next request, decided ahead of that dispatch.
+        let next = decide_keyed(&engine, &pool, 7, 30);
+        let pick = next.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+        assert_eq!(pick.targets.first().map(|target| target.id), Some(taken.id));
+        let lease = Lease {
+            session: session(7),
+            session_verdict: SessionVerdict::Respill,
+            issued_micros: 20,
+            ..Lease::default()
+        };
+        engine.on_dispatched(&lease, &taken, Side::Single, 0);
+        assert_eq!(pins(), Some([taken.id, home.id]), "behind its dispatch");
     }
 
     /// The pin taken again at the cap is the decision's one target. A
