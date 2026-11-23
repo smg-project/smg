@@ -101,12 +101,11 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
             "the first host with a standby beside the load adapter brings its event",
         ),
     ),
+    // No host calls it.
     (
         "LoadSink",
         "evict_unready",
-        EntryReplication::Rebuilt(
-            "each replica's collector says its own reset, under its own lead",
-        ),
+        EntryReplication::Rebuilt("each replica's caller says its own reset, under its own lead"),
     ),
     ("LoadSink", "publish_due", EntryReplication::Read),
     ("LoadSink", "publish", EntryReplication::Rebuilt(PUBLISHED)),
