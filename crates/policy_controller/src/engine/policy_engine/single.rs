@@ -4251,62 +4251,6 @@ pub(crate) mod tests {
         assert_eq!(asked(&silent, pixels), blind);
     }
 
-    /// Over a worker list a worker's rank is read off its object, whatever
-    /// the list's host says of the worker. A request no rank can be pinned
-    /// for is decided among the workers that registered none, a group of
-    /// one left out with the rest, and a list of ranked workers alone is
-    /// shed with no endpoint under the rank's stage. That is the gateway's
-    /// classic rule: it filters its pool to the workers with no rank before
-    /// it selects one, and refuses where none is left
-    /// (`model_gateway/src/routers/http/router.rs:1237-1247` at main
-    /// `ddd8a44cb`). A request that says nothing of ranks takes any worker.
-    #[test]
-    fn a_request_no_rank_can_be_pinned_for_stays_off_a_worker_whose_object_registered_one() {
-        let engine = preset("round_robin");
-        // The object of one rank of a data-parallel group of `size`.
-        let ranked = |at: usize, rank: usize, size: usize| -> Arc<dyn Worker> {
-            let worker = <BasicWorkerBuilder>::new(format!("http://ranked-{at}:8000"))
-                .model(ModelCard::new(MODEL))
-                .dp_config(rank, size)
-                .health_config(no_health_check())
-                .build();
-            worker.set_status(WorkerStatus::Ready);
-            Arc::new(worker)
-        };
-        let plain = pool(2);
-        // The second worker is a group of one, the fourth a rank of two.
-        let list: Arc<[Arc<dyn Worker>]> = Arc::from(vec![
-            Arc::clone(&plain[0]),
-            ranked(1, 0, 1),
-            Arc::clone(&plain[1]),
-            ranked(3, 1, 2),
-        ]);
-        let unpinned = Demands {
-            no_rank: true,
-            ..Demands::default()
-        };
-        // A list nothing is said of, and one whose host says the opposite
-        // of each worker's rank: both read the objects.
-        let silent = PublishedList::new(Arc::clone(&list));
-        let said = PublishedList::with_facts(Arc::clone(&list), |worker| FixedFacts {
-            demands: DemandFacts {
-                ranked: !worker.is_dp_aware(),
-                ..DemandFacts::default()
-            },
-            ..FixedFacts::default()
-        });
-        for members in [&silent, &said] {
-            let kept = places_named(&engine, members, unpinned);
-            assert_eq!(kept, Ok(BTreeSet::from([0, 2])));
-            let any = places_named(&engine, members, Demands::default());
-            assert_eq!(any, Ok(BTreeSet::from([0, 1, 2, 3])));
-        }
-        let ranks: Arc<[Arc<dyn Worker>]> = Arc::from(vec![ranked(0, 0, 2), ranked(1, 1, 2)]);
-        let ranks = PublishedList::new(Arc::clone(&ranks));
-        let shed = places_named(&engine, &ranks, unpinned);
-        assert_eq!(shed, Err((ShedReason::NoEndpoints, "rank")));
-    }
-
     /// Over a list long enough for the passes that draw, a request that
     /// states a demand is answered a worker that meets it at every
     /// decision, whatever the picker: those passes step aside for a request

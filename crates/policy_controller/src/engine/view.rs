@@ -973,9 +973,7 @@ pub struct FixedFacts {
     /// find none and every key would go by its position alone.
     pub id: Option<WorkerId>,
     /// What the worker states for a request's hard demands: its entry of
-    /// the column beside the records. Whether the worker registered a
-    /// rank ([`DemandFacts::ranked`]) is not said here: the worker's
-    /// object holds it, and the records read it there.
+    /// the column beside the records.
     pub demands: DemandFacts,
 }
 
