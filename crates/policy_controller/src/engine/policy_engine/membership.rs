@@ -28,6 +28,13 @@
 //! id at its join, so a worker inherits nothing of a life the channel
 //! dropped.
 //!
+//! A new document's stages are told the workers that stand by the call
+//! that puts it in force, on its caller's thread ([`PolicyEngine::apply`]):
+//! each as joined, then the ids that stand. The follow owes a whole read
+//! behind it, at the task's next upkeep. It tells nothing of a worker it
+//! holds as it stands, and writes again what a telling of load reports
+//! reads of each, by the new document's stages.
+//!
 //! The events the channel kept come behind that read and may be older than
 //! it, and a registry can say a registration ahead of the removal it
 //! follows. So a removal tells a leave only where it names the worker the
@@ -58,7 +65,10 @@ use std::{
     fmt,
     future::pending,
     mem, ptr,
-    sync::{Arc, OnceLock, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock, Weak,
+    },
     time::Instant,
 };
 
@@ -91,7 +101,11 @@ use crate::{
 /// of its own.
 ///
 /// The engine's own task calls all three. A call that waits holds back the
-/// task's other work: the upkeep, and the newest load snapshot.
+/// task's other work: the upkeep, and the newest load snapshot. A call
+/// that puts a new document in force asks the last two on its caller's
+/// thread ([`PolicyEngine::apply`]), under the lock a change of membership
+/// is told under: neither may call [`PolicyEngine::forget`],
+/// [`PolicyEngine::joined`] or [`PolicyEngine::apply`].
 ///
 /// The follow knows one life of a worker by the object an event or
 /// [`Self::standing`] hands it, and by the state that object keeps
@@ -153,14 +167,39 @@ impl<G: Generation> Members for WorkerRegistry<G> {
     }
 }
 
-/// The registry a host handed the engine ([`PolicyEngine::set_registry`]).
+/// The registry a host handed the engine ([`PolicyEngine::set_registry`]),
+/// and whether the engine's task owes a whole read of it: a new document
+/// was put in force since its last one ([`PolicyEngine::apply`]).
 #[derive(Default)]
-pub(super) struct Handed(OnceLock<Arc<dyn Members>>);
+pub(super) struct Handed(OnceLock<Arc<dyn Members>>, AtomicBool);
 
 impl Handed {
     /// The registry the host handed: none until it hands one.
     pub(super) fn get(&self) -> Option<&Arc<dyn Members>> {
         self.0.get()
+    }
+
+    /// The ids of the workers that stand in the handed registry, each as
+    /// its host states it: what a new document's stages are told ahead of
+    /// its first decision. None where no registry was handed.
+    pub(super) fn standing_ids(&self) -> Option<Vec<WorkerId>> {
+        let registry = self.get()?;
+        let id = |(_, worker): (_, Arc<dyn Worker>)| {
+            registry.facts_of(&worker).id_or(worker_id(worker.as_ref()))
+        };
+        Some(registry.standing().into_iter().map(id).collect())
+    }
+
+    /// A new document is in force: the task reads the registry whole at
+    /// its next step. The word publishes the document stored ahead of it:
+    /// a task that takes the word loads that document or a later one.
+    pub(super) fn owe_read(&self) {
+        self.1.store(true, Ordering::Release);
+    }
+
+    /// Whether a whole read is owed. The answer takes the word back.
+    fn owed(&self) -> bool {
+        self.1.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -412,6 +451,7 @@ impl PolicyEngine {
                 })
             }
         };
+        follow.unread |= self.members.owed();
         if follow.events.is_none() {
             follow.events = self.held(|| follow.registry.events());
         }
@@ -628,7 +668,7 @@ impl PolicyEngine {
         id: WorkerId,
         replaced: bool,
     ) {
-        let record = Held::of(id, worker, self.document.spec.engine().keeps_loads());
+        let record = Held::of(id, worker, self.document.load().spec.engine().keeps_loads());
         if let Some(was) = follow.told.insert(object, record) {
             if was.id == id && (replaced || was.is(worker)) {
                 return;
@@ -706,7 +746,7 @@ impl PolicyEngine {
         }
         let standing: Vec<WorkerId> = follow.under.keys().copied().collect();
         self.affinity.keep(&standing);
-        self.told(&Membership::Snapshot(&standing));
+        self.tell(&Membership::Snapshot(&standing));
     }
 }
 

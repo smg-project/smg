@@ -2541,7 +2541,7 @@ pub(crate) mod tests {
                     let generation = generation.expect("the fleet serves the model");
                     let lent = objects.lent(&generation, Role::Single);
                     let members = front.members_of(lent);
-                    let ids = members.records(front.spec(), front.clock()).ids();
+                    let ids = members.records(front.standing_spec(), front.clock()).ids();
                     let place = |worker: &WorkerId| {
                         let at = ids.iter().position(|id| id == worker);
                         u32::try_from(at.expect("a worker of the list")).expect("a short list")

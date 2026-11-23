@@ -419,7 +419,7 @@ fn the_three_lists_records_read_the_load_reports_their_host_hands() {
 fn prompt(engine: &PolicyEngine, first: u32) -> PromptHashes {
     let tokens: Vec<u32> = (first..first + 64).collect();
     let seeds = HashSeeds::PLAIN;
-    PromptHashes::under_document(engine.spec(), Some(16), Some(&tokens), None, seeds)
+    PromptHashes::under_document(&engine.spec(), Some(16), Some(&tokens), None, seeds)
 }
 
 /// Under `cache_aware` on the pair's two sides, a prompt sent to an encode
@@ -2269,7 +2269,7 @@ fn equal_keys_are_placed_on_one_encoder() {
     let lists = host.lists(said);
     let asks = host.asks(said);
     let (engine, now) = (&host.engine, Instant::now());
-    let spec = engine.spec();
+    let spec = engine.standing_spec();
     let ids = [0, 1].map(|at| worker_id(host.worker(2, at).as_ref()));
     let mut placed = EncodePlaced::new();
     let mut seen = BTreeSet::new();

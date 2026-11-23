@@ -22,7 +22,7 @@ use std::{ops::Deref, time::Instant};
 
 use crate::document::spec::AppliedSpec;
 #[cfg(feature = "in-process")]
-use crate::engine::policy_engine::PolicyEngine;
+use crate::engine::policy_engine::{PolicyEngine, SpecHandle};
 
 /// One applied document as its store holds it: the engine that decides
 /// under it, where the build holds the in-process front, and the document
@@ -31,6 +31,10 @@ use crate::engine::policy_engine::PolicyEngine;
 pub(crate) struct Applied {
     #[cfg(feature = "in-process")]
     engine: PolicyEngine,
+    /// The engine's document, held for as long as the engine: a store
+    /// puts no second document in force on it.
+    #[cfg(feature = "in-process")]
+    spec: SpecHandle,
     #[cfg(not(feature = "in-process"))]
     spec: AppliedSpec,
 }
@@ -41,8 +45,10 @@ impl Applied {
     /// reads that clock.
     pub(crate) fn new(spec: AppliedSpec, origin: Instant) -> Self {
         #[cfg(feature = "in-process")]
-        let applied = Self {
-            engine: PolicyEngine::with_origin(spec, origin),
+        let applied = {
+            let engine = PolicyEngine::with_origin(spec, origin);
+            let spec = engine.spec();
+            Self { engine, spec }
         };
         #[cfg(not(feature = "in-process"))]
         let applied = {
@@ -69,11 +75,7 @@ impl Deref for Applied {
     type Target = AppliedSpec;
 
     fn deref(&self) -> &AppliedSpec {
-        #[cfg(feature = "in-process")]
-        let spec = self.engine.spec();
-        #[cfg(not(feature = "in-process"))]
-        let spec = &self.spec;
-        spec
+        &self.spec
     }
 }
 

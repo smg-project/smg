@@ -696,15 +696,18 @@ The engine is in `engine/`.
 
 ### 5.1 The engine object **[built]**
 
-A gateway has one engine object. It is built once from the policy document and holds the
-document's stages and what they remember. It holds no worker of its own: the registry that its
+A gateway has one engine object. It is built once, from the policy document in force at its start,
+and holds the document's stages and what they remember. A later document is put in force on the
+same object (`PolicyEngine::apply`): the engine holds its document as one value and replaces it
+whole, and a decision reads one document from its entry to its end. The session table and the
+record of sent prompts stand across the call. It holds no worker of its own: the registry that its
 host hands it (section 8.1) holds them. A controller builds a new engine object for each document
 it applies (section 10.2).
 
 ```rust
 // engine/policy_engine.rs
 pub struct PolicyEngine {
-    document: InForce,    // the validated document (profiles, bindings, stage objects and their state), its
+    document: ArcSwap<InForce>, // the validated document (profiles, bindings, stage objects and their state), its
                           // number, what is read of it once (which lease events its stages need) and its
                           // shadow counts
     clock: DecisionClock, // one clock for every decision and every load report's age
@@ -1171,8 +1174,9 @@ with each event (`DecisionEngine::say`). The crate has a guard for that, `Decisi
 `released`, and releases at its drop. A controller keeps its leases in a file. It lends a single
 request's lease back from that file in the guard's form, so one rule tells a single request's
 events under either host (`lease_events::single`). The host says who hears: behind a new
-document the engine that issued the lease is gone, and the standing one counts the send. A pair's
-events on a controller are told by the controller's own code.
+document the engine that issued the lease is gone, and the standing one counts the send. In a
+gateway's own process a word of a lease issued under another document is told to nobody. A
+pair's events on a controller are told by the controller's own code.
 
 What an event does:
 
@@ -1273,8 +1277,14 @@ A host's start has these steps.
    task fills a list's cell behind the registry's word of the membership change. A later call is
    ignored.
 5. **It hands its load monitor's channel again where it builds another monitor**:
-   `engine.set_loads(channel)`. An engine keeps no channel where its document reads no load
-   report and no named signal, and none of its policies keeps a report.
+   `engine.set_loads(channel)`. The engine keeps the channel under any document. Its task keeps no
+   snapshot where the document reads no load report and no named signal, and none of its
+   policies keeps a report.
+6. **It puts a later document in force on the running engine**: `engine.apply(spec)`, refused
+   where the document's generation is not above the standing one. The next decision runs under
+   it, and a decision under way ends under the one it began under. The session table and the
+   record of sent prompts stand. The new document's policies are told the workers that stand
+   before the call returns.
 
 A caller that builds its engine with `PolicyEngine::new(spec)`, as the crate's own cases and
 bench do over lists made by hand, makes each hand-over itself:

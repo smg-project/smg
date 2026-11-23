@@ -345,7 +345,8 @@ impl<'a> PairLists<'a> {
         request: &mut Request<'_>,
         held: Option<&Target>,
     ) -> Decision {
-        let engine = engine.loaded();
+        let document = engine.in_force();
+        let engine = engine.under(&document);
         let sides = (
             engine.members_of(self.prefill),
             engine.members_of(self.decode),
@@ -1104,7 +1105,9 @@ pub(super) fn decided(
 /// call ([`issue_decode_caught`]). Either issue is told under a catch of
 /// its own: a stage that panics at it costs the call nothing. A lease's
 /// dispatch is due as a single's. A decision that picks no pair issues
-/// nothing.
+/// nothing. Behind a held lease of another document than the one that
+/// decides, the side is leased and no stage hears its issue: no later
+/// word of that lease reaches a stage ([`PolicyEngine::apply`]).
 // In line at its two callers: as a call it costs a pair's decision 33
 // instructions, counted with Callgrind.
 #[inline(always)]
@@ -1122,6 +1125,9 @@ pub(super) fn issued(
             let id = LeaseId(own.leases.0.fetch_add(1, Ordering::Relaxed) + 1);
             issue_caught(own, facts, &decision, id, later)
         }),
+        Some(held) if held.lease.generation != own.document.spec.generation() => {
+            decode_side(facts, &decision, held.lease).map(|decode| (decode, decode.session))
+        }
         Some(held) => issue_decode_caught(own, facts, &decision, held.lease)
             .map(|decode| (decode, decode.session)),
     };
@@ -1271,6 +1277,14 @@ mod tests {
     /// [`hearing`], its prefill side picking through `prefill` where a case
     /// names one, which is added to the catalog.
     fn hearing_with(prefill: Option<OwnPicker>) -> (AppliedSpec, Arc<Mutex<Vec<Word>>>) {
+        hearing_under(3, prefill)
+    }
+
+    /// [`hearing_with`] under the generation `number`.
+    fn hearing_under(
+        number: u64,
+        prefill: Option<OwnPicker>,
+    ) -> (AppliedSpec, Arc<Mutex<Vec<Word>>>) {
         let heard = Arc::new(Mutex::new(Vec::new()));
         let kept = Arc::clone(&heard);
         let mut catalog = StageRegistry::builtin();
@@ -1279,7 +1293,7 @@ mod tests {
             .expect("a free picker name");
         let mut document =
             PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets");
-        document.generation = 3;
+        document.generation = number;
         let decode = document.profiles.get_mut("decode");
         decode.expect("the decode profile").pick = "hears".into();
         if let Some((name, stage)) = prefill {
@@ -4608,7 +4622,7 @@ mod tests {
 
         let maker = FromDocument {
             asks,
-            document: host.engine.spec(),
+            document: host.engine.standing_spec(),
         };
         let answer = host
             .engine
@@ -4628,6 +4642,50 @@ mod tests {
             trace.generation, trace.seed,
             "the trace names the generation handed to the maker"
         );
+    }
+
+    /// A pair's decode asked again behind a new document is decided under
+    /// that document, and its side is leased as the pair's first lease
+    /// states it. No stage hears the issue: the pair's lease is the first
+    /// document's, and no later word of it reaches a stage, so a stage
+    /// that heard the issue would never hear the side end.
+    #[test]
+    fn a_decode_asked_again_behind_a_new_document_tells_no_stage_its_issue() {
+        let host = Host::of(1, 1);
+        let classes = every(1, 1);
+        let asks = host.asks(&classes, true);
+        let first = leased(&host, &asks, Instant::now());
+        let target = first_target(&first.decision);
+        let lease = first.lease.expect("the prefill lease").lease;
+        let held = HeldDecision {
+            decision: &first.decision,
+            lease: &lease,
+            index: 0,
+            target: &target,
+            decode: HeldDecode {
+                session: first.decode_session,
+                tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
+                chosen: true,
+            },
+        };
+        host.words();
+        let (next, later) = hearing_under(4, None);
+        let applied = host.engine.apply(next);
+        applied.expect("a number above the standing one");
+
+        let local = Default::default();
+        let again = host
+            .engine
+            .decide_decode_under(local, &asks, &held, Instant::now());
+        let again = again.expect("a decode decision");
+        let side = again.lease.expect("the side's lease all the same").lease;
+        assert_eq!((side.side, side.generation), (Side::Decode, 3));
+        let decided_under = again.decision.trace().generation;
+        assert_eq!(decided_under, 4, "the document in force decides");
+        assert!(host.words().is_empty(), "the first document hears nothing");
+        assert!(later.lock().is_empty(), "no stage is told the issue");
     }
 
     /// A caller held to the decodes it reaches (`decode_places`) is paired
@@ -4839,7 +4897,7 @@ mod tests {
         let tokens: Vec<u32> = (first..first + 64).collect();
         let spec = host.engine.spec();
         let seeds = HashSeeds::PLAIN;
-        let hashes = PromptHashes::under_document(spec, Some(16), Some(&tokens), None, seeds);
+        let hashes = PromptHashes::under_document(&spec, Some(16), Some(&tokens), None, seeds);
         let mut read = RequestFacts::default();
         hashes.write_to(&mut read);
         assert_eq!(read.block_hashes.len(), 4, "four hashed blocks");
