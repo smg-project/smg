@@ -238,7 +238,7 @@ fn both_engines_pick_the_one_pair_of_one_fleet() {
     // classes alone say who pairs.
     let (spec, engine) = (applied(), PolicyEngine::new(applied()));
     let generation = replica.generation();
-    let lent = |role: Role| engine.members_of(replica.objects.lent(&generation, role));
+    let lent = |role: Role| replica.objects.lent(&generation, role);
     let lists = PairLists {
         prefill: lent(Role::Prefill),
         decode: lent(Role::Decode),
@@ -253,7 +253,7 @@ fn both_engines_pick_the_one_pair_of_one_fleet() {
     };
     assert!(OpenAdmission.has_capacity(0) && OpenAdmission.has_room(1));
     let (mut request, now) = (asked(), Instant::now());
-    let over_lists = lists.decide(&spec, None, engine.clock(), now, &mut request, None);
+    let over_lists = lists.decide(&engine, None, now, &mut request, None);
     assert_eq!(picked(&over_lists), the_pair, "over the lists lent");
 
     let store = Arc::new(replica.store);

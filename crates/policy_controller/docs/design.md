@@ -530,22 +530,21 @@ It compiles under the crate feature `in-process`.
 
 ### 5.2 The engine's value for one worker list **[built]**
 
-For each list the registry publishes, the engine keeps one value. The host asks for it once, when
-the list is published (`PolicyEngine::pool_members`), and keeps it beside the list. When the
-membership changes the registry publishes a new list, the host asks again, and the old value is
+For each list the registry publishes, the engine keeps one value. The host keeps an empty cell
+beside each list it publishes (`ListCell`) and lends the two together with each request (`LentList`). The engine makes its value into the cell inside the first decision that asks the list, and reads it there from then on. When the
+membership changes the registry publishes a new list with an empty cell, and the old value is
 dropped with the old list.
 
-A host that knows a fact of its workers that their objects do not hold asks through
-`PolicyEngine::pool_members_with_fixed_facts` instead. It says the fact once for each worker, at
-that call, and the engine writes it into the worker's record (5.3). Three such facts stand today:
+A host that knows a fact of its workers that their objects do not hold lends it with the list
+(`LentList::facts`). It lends one fact for each worker, in the list's order,
+and the engine writes it into the worker's record (5.3) where it fills the cell. Three such facts stand today:
 whether a worker takes images, the id the host knows the worker by where it keeps ids of its own,
 and what the worker states for a request's hard demands, which stands in a column beside the
-records. That entry makes the list's records at the call, where `pool_members` leaves them to
-their first use.
+records. The fill makes the list's records.
 
 ```rust
 // engine/policy_engine.rs
-pub struct PoolMembers {
+pub(crate) struct PoolMembers {
     workers: Arc<[Arc<dyn Worker>]>, // the host's own list of worker objects, shared, not copied
     rotation: OwnWord,               // round robin's counter for this list
     records: OnceLock<PoolRecords>,  // the unchanging half of each worker's record (5.3)
@@ -934,7 +933,7 @@ At start:
 |---|---|
 | starts the engine with its own data, once | `PolicyEngine::start(spec, WorkerData { registry, loads, cache_indexes })`. It builds the engine from the document and takes the host's worker registry (the host implements `Members`, and the worker crate's registry is one), its load monitor's channel and its indexes of cache events (the host implements `CacheIndexes` and `CacheIndex`). The same hand-over also lends the token tree, where the host keeps one (`CacheIndexes::token_tree`). A host with no load monitor or no index says `None`. It answers the engine, which lives as long as the process, and the engine's own task |
 | spawns the task the start answered, once | on a runtime of its choice, which needs its timer on: the upkeep once a second, the newest load snapshot kept at hand, and the follow of the registry, which tells the policies a worker that joined or was removed (the table below) |
-| keeps the engine's value beside each published worker list | `engine.pool_members(list)`, or `engine.pool_members_with_fixed_facts(list, facts_of)` where the host knows a fact of its workers that their objects do not hold |
+| keeps an empty cell beside each published worker list | a `ListCell` in its value of a membership generation, lent with the list as a `LentList`, with `facts` where the host knows a fact of its workers that their objects do not hold |
 | hands its load monitor's channel again where it builds another monitor | `engine.set_loads(channel)`; an engine whose document reads no load report and no named signal keeps none |
 
 A caller that builds its engine with `PolicyEngine::new(spec)`, as the crate's own cases and bench
@@ -986,7 +985,7 @@ pub trait RequestMaker {
 
 pub enum WorkerLists<'a> {
     None,
-    Single(&'a PoolMembers), // one list for a single request
+    Single(LentList<'a>),    // one list for a single request, lent with its cell
     Pair(PairLists<'a>),     // a pair's prefill list and decode list
     Encode(EncodeLists<'a>), // an encode request's three lists: its pair's two and its encoders
 }
@@ -1055,6 +1054,9 @@ its monitor.
 
 The host keeps one empty cell beside each worker list it publishes. That is one field in the
 host's `Generation` type. The engine fills the cell at the list's first decision.
+
+The cell is built. A request's `WorkerLists` name each list as a `LentList`, and the decision
+that needs a list asks its cell. The start does not take the lists' trait yet.
 
 **2. For each request, one call.**
 

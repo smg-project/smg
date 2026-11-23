@@ -703,8 +703,8 @@ mod sends {
     use smg_policy_controller::{
         document::{AppliedSpec, Assignment},
         engine::{
-            Constraints, Identity, PlacedBy, PolicyEngine, PoolMembers, Request, RequestFacts,
-            RequestMaker, WorkerLists,
+            Constraints, Identity, LentList, ListCell, PlacedBy, PolicyEngine, Request,
+            RequestFacts, RequestMaker, WorkerLists,
         },
         store::GatewayId,
         tracking::{self, DecisionGuard, TransportClass},
@@ -735,10 +735,11 @@ mod sends {
         PolicyEngine::new(AppliedSpec::validate(&document).expect("the document validates"))
     }
 
-    /// A request stated ahead, with the list and the reports its host hands.
+    /// A request stated ahead, with the list its host lends and the reports
+    /// it hands.
     struct Asks<'a> {
         request: Request<'a>,
-        members: &'a PoolMembers,
+        members: LentList<'a>,
         loads: &'a Arc<LoadSnapshot>,
     }
 
@@ -767,6 +768,16 @@ mod sends {
     /// A request in flight: the guards of the engines that decided it, the
     /// place it went to and its key.
     type Sent<'e> = (Vec<DecisionGuard<&'e PolicyEngine>>, usize, &'static str);
+
+    /// `list` lent with `cell`, the cell its host keeps beside it: the host
+    /// states nothing of its workers.
+    fn lent<'a>(list: &'a Arc<[Arc<dyn Worker>]>, cell: &'a ListCell) -> LentList<'a> {
+        LentList {
+            workers: list,
+            cell,
+            facts: None,
+        }
+    }
 
     /// A gateway's side of its engines: one list of worker objects, the
     /// reports a decision reads of them, and the requests in flight.
@@ -818,7 +829,7 @@ mod sends {
         fn decide(
             &self,
             engine: &'e PolicyEngine,
-            members: &PoolMembers,
+            members: LentList<'_>,
             (key, tokens, nth): (&'static str, u32, u32),
         ) -> Decided<'e> {
             let session_key = match key {
@@ -874,7 +885,7 @@ mod sends {
         fn send(
             &mut self,
             engine: &'e PolicyEngine,
-            members: &PoolMembers,
+            members: LentList<'_>,
             asked: (&'static str, u32, u32),
         ) -> (usize, PlacedBy) {
             let (guard, place, by) = self.decide(engine, members, asked);
@@ -933,25 +944,26 @@ mod sends {
         for policy in ["least_load", "power_of_two"] {
             let engine = engine(policy, true);
             let mut host = Host::new(&[0, 5_000]);
-            let members = engine.pool_members(&host.list);
-            let first = host.send(&engine, &members, ("k1", 1_000, 0));
+            let (list, cell) = (Arc::clone(&host.list), ListCell::default());
+            let members = lent(&list, &cell);
+            let first = host.send(&engine, members, ("k1", 1_000, 0));
             assert_eq!(first, (0, PlacedBy::Stages), "{policy}: a new key");
-            let pinned = host.send(&engine, &members, ("k1", 10_000, 1));
+            let pinned = host.send(&engine, members, ("k1", 10_000, 1));
             assert_eq!(pinned, (0, PlacedBy::Rule), "{policy}: its pin");
-            let (_, place, _) = host.decide(&engine, &members, ("", 1_000, 2));
+            let (_, place, _) = host.decide(&engine, members, ("", 1_000, 2));
             assert_eq!(
                 place, 0,
                 "{policy}: the pinned request is no send of the policy's"
             );
             host.loads = Host::reports(host.start, &[0, 1_500]);
-            let (_, place, _) = host.decide(&engine, &members, ("", 1_000, 3));
+            let (_, place, _) = host.decide(&engine, members, ("", 1_000, 3));
             assert_eq!(
                 place, 1,
                 "{policy}: the pinned request weighs as one in flight"
             );
             let pinned = host.held.pop_back().expect("the pinned request");
             host.ended(pinned, 4);
-            let (_, place, _) = host.decide(&engine, &members, ("", 1_000, 4));
+            let (_, place, _) = host.decide(&engine, members, ("", 1_000, 4));
             assert_eq!(place, 0, "{policy}: an ended pinned request weighs nothing");
         }
     }
@@ -976,8 +988,10 @@ mod sends {
             let (keyed, alone) = (engine("least_load", true), engine("least_load", false));
             let queued: Vec<i32> = (0..workers).map(|at| at * 700).collect();
             let mut host = Host::new(&queued);
-            let members = keyed.pool_members(&host.list);
-            let twin = alone.pool_members(&host.list);
+            // One list with its cell, lent to both engines: each reads its
+            // own value of it.
+            let (list, cell) = (Arc::clone(&host.list), ListCell::default());
+            let members = lent(&list, &cell);
             let (mut pinned, mut behind, mut ended) = (0, 0, 0);
             for nth in 0..48_u32 {
                 if nth >= 8 && nth % 2 == 0 {
@@ -987,12 +1001,12 @@ mod sends {
                 }
                 let key = ["k0", "k1", "k2", "k3", "k4", ""][nth as usize % 6];
                 let tokens = [1_000, 12_000, 3_000, 20_000, 500][nth as usize % 5];
-                let (guard, place, by) = host.decide(&keyed, &members, (key, tokens, nth));
+                let (guard, place, by) = host.decide(&keyed, members, (key, tokens, nth));
                 let mut guards = vec![guard];
                 if by == PlacedBy::Rule {
                     pinned += 1;
                 } else {
-                    let (asked, twin_place, _) = host.decide(&alone, &twin, ("", tokens, nth));
+                    let (asked, twin_place, _) = host.decide(&alone, members, ("", tokens, nth));
                     assert_eq!(
                         place, twin_place,
                         "{workers} workers: request {nth}, {key:?}"

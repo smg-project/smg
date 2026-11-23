@@ -3067,7 +3067,7 @@ pub(super) mod tests {
                 holder.follow::<MemoryStore>(&store);
                 let registry = holder.registry();
                 let generation = registry.model_generation(MODEL).expect("a generation");
-                let lent = |role: Role| engine.members_of(holder.lent(&generation, role));
+                let lent = |role: Role| holder.lent(&generation, role);
                 let classes = holder.pair_classes(&generation, Pairing::Strict);
                 let lists = PairLists {
                     prefill: lent(Role::Prefill),
@@ -3155,7 +3155,7 @@ pub(super) mod tests {
                 holder.follow::<MemoryStore>(&store);
                 let registry = holder.registry();
                 let generation = registry.model_generation(MODEL).expect("a generation");
-                let list = engine.members_of(holder.lent(&generation, Role::Single));
+                let list = holder.lent(&generation, Role::Single);
                 let mut asked = request(Phase::Single);
                 asked.constraints.demands = Demands {
                     vision,

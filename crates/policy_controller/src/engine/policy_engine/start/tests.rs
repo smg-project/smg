@@ -14,6 +14,7 @@ use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
         decision_engine::DecisionEngine,
+        list_cell::tests::PublishedList,
         policy_engine::{
             membership::tests::{
                 handed, id, in_id_order, register, registry, remove, told, Registry,
@@ -21,7 +22,7 @@ use crate::{
             overlap::{CacheIndex, CacheIndexes},
             single::tests::hearing_spec,
             task::tests::{asks, monitor, picked, reports, settle, spawned, url, MODEL},
-            PolicyEngine, PoolMembers,
+            PolicyEngine,
         },
         prompt_hashes::HashSeeds,
         view::RequestFacts,
@@ -94,7 +95,7 @@ fn store(index: &ChainIndex, at: usize, hashes: &[u64]) {
 
 /// How many of 64 requests of as many seeds each worker of `members` is
 /// named for. No request gives a load snapshot of its own.
-fn spread(engine: &PolicyEngine, members: &PoolMembers) -> Vec<u32> {
+fn spread(engine: &PolicyEngine, members: &PublishedList) -> Vec<u32> {
     let mut named = vec![0_u32; members.workers().len()];
     for seed in 0..64 {
         named[picked(engine, &asks(seed, members, None)) as usize] += 1;
@@ -122,7 +123,7 @@ async fn a_started_engine_reads_the_load_channel_it_was_handed() {
     let (engine, task) = PolicyEngine::start(preset("least_load"), data);
     settle().await;
     let list = list(&registry);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let unread = spread(engine, &members);
     assert!(unread.iter().all(|&picks| picks > 0), "{unread:?}");
 
@@ -195,7 +196,7 @@ async fn a_started_engine_reads_the_cache_indexes_it_was_handed() {
     store(&index, 5, blocks);
 
     let list = list(&registry);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     for seed in 0..32 {
         let mut asked = asks(seed, &members, None);
         hashes.write_to(&mut asked.request.facts);
@@ -220,7 +221,7 @@ async fn an_engine_started_with_no_channel_and_no_index_decides_without_them() {
     let (engine, task) = PolicyEngine::start(preset("least_load"), data);
     let task = spawned(task).await;
     let list = list(&registry);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let unread = spread(engine, &members);
     assert!(unread.iter().all(|&picks| picks > 0), "{unread:?}");
     assert_eq!(engine.affinity().block_size(MODEL), None);
@@ -248,7 +249,7 @@ async fn a_started_engine_outlives_the_frame_that_started_it() {
 
     let list = list(&registry);
     let request = thread::spawn(move || {
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let asks = asks(7, &members, None);
         let now = Instant::now();
         let decided = DecisionGuard::decide_under(engine, GatewayId::LOCAL, &asks, now);
@@ -300,7 +301,7 @@ fn a_task_spawned_on_a_runtime_with_no_timer_ends_with_a_panic() {
     assert!(ended.expect_err("the task ended").is_panic());
 
     let list = list(&registry);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let named = spread(engine, &members);
     assert!(named.iter().all(|&picks| picks > 0), "{named:?}");
 }

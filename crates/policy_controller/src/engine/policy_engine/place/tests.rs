@@ -27,6 +27,7 @@ use crate::{
         decision::{Queue, ShadowKind, Shed, Target, Targets, Trace},
         decision_engine::Decided,
         framework::{Filter, Picker, Place, TieBand},
+        list_cell::tests::PublishedList,
         records::worker_id,
         view::{fingerprint, Candidate, FixedFacts, HashKind},
         EncodeLists, PairAdmission, PairLists, PartnerClasses,
@@ -161,10 +162,10 @@ impl PairAdmission for Open {
 
 /// A pair's two lists, both `members`, under `classes`: every worker is
 /// admitted and neither side is held to places.
-fn pair_of<'a>(members: &'a PoolMembers, classes: &'a PartnerClasses) -> PairLists<'a> {
+fn pair_of<'a>(members: &'a PublishedList, classes: &'a PartnerClasses) -> PairLists<'a> {
     PairLists {
-        prefill: members,
-        decode: members,
+        prefill: members.lent(),
+        decode: members.lent(),
         classes,
         admission: &Open,
         prefill_places: None,
@@ -326,7 +327,7 @@ fn a_request_is_made_of_what_its_caller_states() {
     // A request with a pair's two lists is made, and says it is plain, at
     // its prefill.
     let list = pool(2);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
     let pair = pair_of(&members, &classes);
     let paired = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
@@ -451,14 +452,14 @@ fn the_prompts_blocks_are_hashed_under_its_partition_once() {
 fn a_plain_request_says_so_and_is_answered_a_place() {
     let engine = preset("round_robin");
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let tokens = [7_u32; 40];
     let plain = PlaceRequest {
         prompt: Prompt {
             tokens: Some(&tokens),
             ..Prompt::NONE
         },
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let said = Made::new(&engine, &plain, &[]).plain();
     assert_eq!(
@@ -652,12 +653,12 @@ fn a_plain_request_is_placed_on_the_worker_at_its_place() {
     let alone = matches!(engine.place_for(MODEL, Phase::Single), Place::Alone(_));
     assert!(alone, "one pick decides the place");
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let headers = [("x-conversation", "talk-7")];
     let request = PlaceRequest {
         headers: &headers,
         request_id: Some("request-1"),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let mut turns = [0_u32; 4];
     for _ in 0..8 {
@@ -695,8 +696,8 @@ fn spared(name: &str) -> &'static PolicyEngine {
 /// request keeps it.
 fn placed(engine: &'static PolicyEngine) -> Placement<'static> {
     let list = pool(4);
-    let members = engine.pool_members(&list);
-    let request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+    let members = PublishedList::new(Arc::clone(&list));
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
     engine.place(&request).expect("a placement").kept()
 }
 
@@ -738,8 +739,8 @@ fn placing_a_request_asks_the_table_of_names_for_nothing() {
     for name in ["round_robin", "random"] {
         let engine = hosted(preset(name));
         let list = pool(4);
-        let members = engine.pool_members(&list);
-        let request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+        let members = PublishedList::new(Arc::clone(&list));
+        let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
         let before = asked();
         for _ in 0..8 {
             let placement = engine.place(&request).expect("a placement");
@@ -760,14 +761,14 @@ fn a_caller_that_states_worker_ids_is_told_in_a_debug_build() {
     let engine = hosted(preset("round_robin"));
     let list = pool(2);
     let mut stated = 6;
-    let members = engine.pool_members_with_fixed_facts(&list, |_| {
+    let members = PublishedList::with_facts(Arc::clone(&list), |_| {
         stated += 1;
         FixedFacts {
             id: Some(WorkerId(stated)),
             ..FixedFacts::default()
         }
     });
-    let request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
     let _ = engine.place(&request);
 }
 
@@ -782,7 +783,7 @@ fn a_caller_that_states_worker_ids_is_told_in_a_debug_build() {
 async fn a_decision_reads_the_load_snapshot_the_engines_task_keeps() {
     let engine = hosted(preset("least_load"));
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let reports: HashMap<_, _> = (0..4)
         .map(|at| {
             let queued = if at == 2 { 0 } else { 90_000 };
@@ -801,7 +802,7 @@ async fn a_decision_reads_the_load_snapshot_the_engines_task_keeps() {
     let task = tokio::spawn(engine.run());
     // The task's first step takes the channel and keeps its snapshot.
     sleep(Duration::from_millis(1)).await;
-    let request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
     for turn in 0..16 {
         let placement = engine.place(&request).expect("a placement");
         assert!(Arc::ptr_eq(&placement.worker, &list[2]), "turn {turn}");
@@ -821,12 +822,12 @@ async fn a_decision_reads_the_load_snapshot_the_engines_task_keeps() {
 fn a_retry_is_placed_past_the_worker_it_tried() {
     let engine = hosted(preset("round_robin"));
     let list = pool(2);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let tried = [worker_id(list[0].as_ref())];
     let retry = PlaceRequest {
         attempt: 1,
         tried: &tried,
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     for _ in 0..4 {
         let placement = engine.place(&retry).expect("a placement");
@@ -850,11 +851,11 @@ fn a_retry_is_placed_past_the_worker_it_tried() {
 fn the_first_target_that_can_be_sent_to_is_taken() {
     let (engine, heard) = in_order(false);
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     for worker in &list[..2] {
         worker.set_status(WorkerStatus::NotReady);
     }
-    let request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
     let mut placement = engine.place(&request).expect("a placement");
     let (first, taken) = (worker_id(list[0].as_ref()), worker_id(list[2].as_ref()));
     assert!(Arc::ptr_eq(&placement.worker, &list[2]));
@@ -889,8 +890,8 @@ fn a_decision_no_target_of_which_can_be_sent_to_is_given_up_by_name() {
     for worker in list.iter() {
         worker.set_status(WorkerStatus::NotReady);
     }
-    let members = engine.pool_members(&list);
-    let request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+    let members = PublishedList::new(Arc::clone(&list));
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
     assert_eq!(engine.place(&request).err(), Some(Unplaced::NoWorkers));
     let first = worker_id(list[0].as_ref());
     assert_eq!(
@@ -903,8 +904,8 @@ fn a_decision_no_target_of_which_can_be_sent_to_is_given_up_by_name() {
     let filters = &mut profile.expect("the preset's profile").filter;
     filters.retain(|filter| *filter != FilterSpec::Name("healthy".to_owned()));
     let quiet = hosted(engine_of(&document));
-    let members = quiet.pool_members(&list);
-    let request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+    let members = PublishedList::new(Arc::clone(&list));
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
     assert_eq!(quiet.place(&request).err(), Some(Unplaced::NoWorkers));
     assert_eq!((quiet.faults(), quiet.unheard()), (0, 0));
 }
@@ -936,9 +937,9 @@ fn a_call_decides_again_past_the_targets_it_could_not_send_to() {
     for worker in &list[..8] {
         worker.set_status(WorkerStatus::NotReady);
     }
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let id = |at: usize| worker_id(list[at].as_ref());
-    let request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
     let mut placement = engine.place(&request).expect("a placement");
     assert!(Arc::ptr_eq(&placement.worker, &list[8]));
     placement.sent(Side::Single);
@@ -954,7 +955,7 @@ fn a_call_decides_again_past_the_targets_it_could_not_send_to() {
     let retry = PlaceRequest {
         attempt: 1,
         tried: &tried,
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let placement = engine.place(&retry).expect("a placement");
     assert!(Arc::ptr_eq(&placement.worker, &list[9]));
@@ -982,9 +983,9 @@ fn a_call_makes_three_decisions_at_most() {
     for worker in &list[..12] {
         worker.set_status(WorkerStatus::NotReady);
     }
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let id = |at: usize| worker_id(list[at].as_ref());
-    let request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
     assert_eq!(engine.place(&request).err(), Some(Unplaced::NoWorkers));
     assert_eq!(
         heard.lock().as_slice(),
@@ -1004,7 +1005,7 @@ fn a_call_makes_three_decisions_at_most() {
 fn the_routes_rule_is_asked_of_the_pick_alone_while_it_admits_it() {
     let engine = hosted(preset("round_robin"));
     let list = pool(8);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let asked = RefCell::new(Vec::new());
     let admits = |worker: &dyn Worker| {
         asked.borrow_mut().push(worker_id(worker));
@@ -1012,7 +1013,7 @@ fn the_routes_rule_is_asked_of_the_pick_alone_while_it_admits_it() {
     };
     let request = PlaceRequest {
         admits: Some(&admits),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     for turn in 1..=8 {
         let placement = engine.place(&request).expect("a placement");
@@ -1040,7 +1041,7 @@ fn a_worker_the_routes_rule_refuses_is_passed_over() {
     // call's second decision, which is held to it.
     let engine = hosted(preset("passthrough"));
     let list = pool(6);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let id = |at: usize| worker_id(list[at].as_ref());
     let sixth = id(5);
     let asked = RefCell::new(Vec::new());
@@ -1050,7 +1051,7 @@ fn a_worker_the_routes_rule_refuses_is_passed_over() {
     };
     let request = PlaceRequest {
         admits: Some(&admits),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let placement = engine.place(&request).expect("a placement");
     assert!(Arc::ptr_eq(&placement.worker, &list[5]));
@@ -1062,7 +1063,7 @@ fn a_worker_the_routes_rule_refuses_is_passed_over() {
     let (engine, heard) = in_order(false);
     let list = pool(8);
     list[0].set_status(WorkerStatus::NotReady);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let id = |at: usize| worker_id(list[at].as_ref());
     let sixth = id(5);
     let asked = RefCell::new(Vec::new());
@@ -1072,7 +1073,7 @@ fn a_worker_the_routes_rule_refuses_is_passed_over() {
     };
     let request = PlaceRequest {
         admits: Some(&admits),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let mut placement = engine.place(&request).expect("a placement");
     assert!(Arc::ptr_eq(&placement.worker, &list[5]));
@@ -1097,7 +1098,7 @@ fn a_worker_the_routes_rule_refuses_is_passed_over() {
 fn the_one_worker_a_rule_takes_in_a_long_list_is_found_by_the_second_decision() {
     let (engine, heard) = in_order(false);
     let list = pool(16);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let id = |at: usize| worker_id(list[at].as_ref());
     let far = id(14);
     let calls = Cell::new(0);
@@ -1107,7 +1108,7 @@ fn the_one_worker_a_rule_takes_in_a_long_list_is_found_by_the_second_decision() 
     };
     let request = PlaceRequest {
         admits: Some(&admits),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let placement = engine.place(&request).expect("a placement");
     assert!(Arc::ptr_eq(&placement.worker, &list[14]));
@@ -1132,7 +1133,7 @@ fn the_one_worker_a_rule_takes_in_a_long_list_is_found_by_the_second_decision() 
 fn the_rules_only_worker_is_placed_though_tried_or_overloaded() {
     let engine = hosted(preset("passthrough"));
     let list = pool(5);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let only = worker_id(list[4].as_ref());
     let admits = |worker: &dyn Worker| worker_id(worker) == only;
     let tried = [only];
@@ -1140,7 +1141,7 @@ fn the_rules_only_worker_is_placed_though_tried_or_overloaded() {
         attempt: 1,
         tried: &tried,
         admits: Some(&admits),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let placement = engine.place(&retry).expect("a placement");
     assert!(Arc::ptr_eq(&placement.worker, &list[4]), "tried, and alone");
@@ -1149,7 +1150,7 @@ fn the_rules_only_worker_is_placed_though_tried_or_overloaded() {
     list[4].set_overloaded(true);
     let first = PlaceRequest {
         admits: Some(&admits),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let placement = engine.place(&first).expect("a placement");
     assert!(Arc::ptr_eq(&placement.worker, &list[4]), "the fallback");
@@ -1161,10 +1162,10 @@ fn the_rules_only_worker_is_placed_though_tried_or_overloaded() {
         ..OverloadSpec::default()
     });
     let shedding = hosted(engine_of(&document));
-    let members = shedding.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let first = PlaceRequest {
         admits: Some(&admits),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let Some(Unplaced::Shed { reason, .. }) = shedding.place(&first).err() else {
         panic!("a shed");
@@ -1186,7 +1187,7 @@ fn a_rule_that_takes_no_worker_is_shed_under_its_name() {
     let (engine, heard) = in_order(false);
     let list = pool(6);
     list[5].set_status(WorkerStatus::NotReady);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let id = |at: usize| worker_id(list[at].as_ref());
     let asked = RefCell::new(Vec::new());
     let admits = |worker: &dyn Worker| {
@@ -1195,7 +1196,7 @@ fn a_rule_that_takes_no_worker_is_shed_under_its_name() {
     };
     let request = PlaceRequest {
         admits: Some(&admits),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let shed = Unplaced::Shed {
         reason: ShedReason::NoEndpoints,
@@ -1218,12 +1219,12 @@ fn a_rule_whose_workers_are_not_ready_is_answered_by_the_decision() {
     let engine = hosted(preset("round_robin"));
     let list = pool(4);
     list[3].set_status(WorkerStatus::NotReady);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let last = worker_id(list[3].as_ref());
     let admits = |worker: &dyn Worker| worker_id(worker) == last;
     let request = PlaceRequest {
         admits: Some(&admits),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let Some(Unplaced::Shed {
         reason, emptied_by, ..
@@ -1243,17 +1244,17 @@ fn the_places_a_rule_takes_are_ascending_and_hold_every_later_pick() {
     let engine = hosted(preset("random"));
     let list = pool(64);
     list[3].set_status(WorkerStatus::NotReady);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let thirds = || (0..64).step_by(3);
     let taken: BTreeSet<WorkerId> = thirds().map(|at| worker_id(list[at].as_ref())).collect();
     let admits = |worker: &dyn Worker| taken.contains(&worker_id(worker));
     let request = PlaceRequest {
         admits: Some(&admits),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let mut call = Call::default();
     call.missed.push(worker_id(list[1].as_ref()));
-    hold_to_rule(&request, Some(&members), &mut call).expect("the rule takes workers");
+    hold_to_rule(&request, Some(members.lent()), &mut call).expect("the rule takes workers");
     let places: Vec<u32> = thirds().map(|at| at as u32).collect();
     assert_eq!(call.admitted.as_deref(), Some(&places[..]));
 
@@ -1280,13 +1281,13 @@ fn a_keyed_request_whose_owner_the_rule_refuses_stays_on_one_worker() {
     for policy in ["manual", "consistent_hashing"] {
         let engine = hosted(preset(policy));
         let list = pool(16);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let mut by_list = 0;
         for key in ["talk-1", "talk-2", "talk-3", "talk-4", "talk-5", "talk-6"] {
             let headers = [(MANUAL_SESSION_HEADER, key)];
             let keyed = PlaceRequest {
                 headers: &headers,
-                ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+                ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
             };
             let owner = engine.place(&keyed).expect("a placement").id();
             let calls = Cell::new(0);
@@ -1329,12 +1330,12 @@ fn a_later_decision_is_given_what_the_call_has_left_of_the_budget() {
     };
     let (engine, heard, budgets) = in_order_budgets(false);
     let list = pool(8);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let admits = slow(&list);
     let request = PlaceRequest {
         budget_micros: 10_000_000,
         admits: Some(&admits),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let placement = engine.place(&request).expect("a placement");
     assert!(Arc::ptr_eq(&placement.worker, &list[6]));
@@ -1360,7 +1361,7 @@ fn a_later_decision_is_given_what_the_call_has_left_of_the_budget() {
     let first = worker_id(list[0].as_ref());
     assert_eq!(heard.lock().as_slice(), given_up(first), "one decision");
 
-    let unbounded = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+    let unbounded = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
     let mut call = Call::default();
     assert_eq!(call.left(&unbounded), Ok(0));
     assert!(
@@ -1377,7 +1378,7 @@ fn a_later_decision_is_given_what_the_call_has_left_of_the_budget() {
 fn a_rule_that_changes_its_answer_places_no_request_on_a_refused_pick() {
     let (engine, heard) = in_order(false);
     let list = pool(8);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let id = |at: usize| worker_id(list[at].as_ref());
     let calls = Cell::new(0);
     // Calls 5 to 12 are the list's walk: the sixth worker is taken there,
@@ -1388,7 +1389,7 @@ fn a_rule_that_changes_its_answer_places_no_request_on_a_refused_pick() {
     };
     let request = PlaceRequest {
         admits: Some(&admits),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     assert_eq!(engine.place(&request).err(), Some(Unplaced::NoWorkers));
     assert_eq!(calls.get(), 4 + 8 + 2, "the list is asked once");
@@ -1415,7 +1416,7 @@ fn a_call_whose_third_decision_finds_the_rules_workers_makes_a_fourth() {
     for worker in &list[..8] {
         worker.set_status(WorkerStatus::NotReady);
     }
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let id = |at: usize| worker_id(list[at].as_ref());
     let far = id(12);
     let calls = Cell::new(0);
@@ -1425,7 +1426,7 @@ fn a_call_whose_third_decision_finds_the_rules_workers_makes_a_fourth() {
     };
     let request = PlaceRequest {
         admits: Some(&admits),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let placement = engine.place(&request).expect("a placement");
     assert!(Arc::ptr_eq(&placement.worker, &list[12]));
@@ -1460,7 +1461,7 @@ fn a_call_whose_third_decision_finds_the_rules_workers_makes_a_fourth() {
 fn a_rule_that_panics_at_the_list_leaves_no_lease_behind() {
     let (engine, heard) = in_order(false);
     let list = pool(6);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let first = worker_id(list[0].as_ref());
     let calls = Cell::new(0);
     // The four picks are refused, and the list's first worker panics.
@@ -1471,7 +1472,7 @@ fn a_rule_that_panics_at_the_list_leaves_no_lease_behind() {
     };
     let request = PlaceRequest {
         admits: Some(&admits),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let placed = catch_unwind(AssertUnwindSafe(|| engine.place(&request).is_ok()));
     assert!(placed.is_err(), "the rule's panic reaches the caller");
@@ -1522,8 +1523,8 @@ fn an_ask_is_made_of_what_its_call_handed_on() {
 fn a_request_with_no_worker_is_answered_why() {
     let engine = hosted(preset("round_robin"));
     let list = pool(2);
-    let members = engine.pool_members(&list);
-    let lists = WorkerLists::Single(&members);
+    let members = PublishedList::new(Arc::clone(&list));
+    let lists = WorkerLists::Single(members.lent());
     let shed = |reason, emptied_by| {
         Some(Unplaced::Shed {
             reason,
@@ -1588,8 +1589,8 @@ fn a_request_with_no_worker_is_answered_why() {
 
     let (faulty, _) = in_order(true);
     let list = pool(2);
-    let members = faulty.pool_members(&list);
-    let request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+    let members = PublishedList::new(Arc::clone(&list));
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
     assert_eq!(
         faulty.place(&request).err(),
         Some(Unplaced::Refused(DecisionRefused::Faulted))
@@ -1607,10 +1608,10 @@ fn a_request_with_no_worker_is_answered_why() {
 fn a_placement_names_the_routing_value_its_document_derived() {
     let engine = hosted(keyed());
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let by_id = PlaceRequest {
         request_id: Some("request-1"),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let placement = engine.place(&by_id).expect("a placement");
     assert_eq!(placement.routing_key, Some("request-1"));
@@ -1620,7 +1621,7 @@ fn a_placement_names_the_routing_value_its_document_derived() {
     let headers = [("x-conversation", "talk-7")];
     let by_header = PlaceRequest {
         headers: &headers,
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let placement = engine.place(&by_header).expect("a placement");
     assert_eq!(placement.routing_key, None);
@@ -1661,7 +1662,7 @@ fn a_request_that_lends_its_ring_goes_where_that_rings_walk_reaches() {
 /// under `engine`.
 fn lent_ring_places(engine: &'static PolicyEngine) {
     let list = pool(8);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let order = [6, 1, 4, 0, 7, 2, 5, 3];
     let ring = Lent(order.iter().map(|&at| list[at].url().to_owned()).collect());
     // The worker the ring's walk reaches first from where `text` stands.
@@ -1670,7 +1671,7 @@ fn lent_ring_places(engine: &'static PolicyEngine) {
         let request = PlaceRequest {
             headers,
             ring,
-            ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
         };
         let placement = engine.place(&request).expect("a placement");
         let worker = |held: &Arc<dyn Worker>| Arc::ptr_eq(held, &placement.worker);
@@ -1681,7 +1682,7 @@ fn lent_ring_places(engine: &'static PolicyEngine) {
         let request = PlaceRequest {
             headers,
             ring,
-            ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
         };
         let made = Made::new(engine, &request, &[]);
         let facts = made.make(engine.spec()).facts;
@@ -1717,7 +1718,7 @@ fn lent_ring_places(engine: &'static PolicyEngine) {
             headers: &headers,
             ring: Some(&ring),
             admits: Some(&admits),
-            ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
         };
         let placement = engine.place(&ruled).expect("a placement");
         assert!(Arc::ptr_eq(&placement.worker, &list[along(5)]), "{key}");
@@ -1747,14 +1748,14 @@ impl LentRing for Asked {
 fn a_requests_key_is_asked_of_the_lent_ring_once() {
     let engine = hosted(preset("consistent_hashing"));
     let list = pool(2);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let order = vec![list[1].url().to_owned(), list[0].url().to_owned()];
     let ring = Asked(Lent(order), AtomicU32::new(0));
     let headers = [("x-smg-routing-key", "conv-1")];
     let request = PlaceRequest {
         headers: &headers,
         ring: Some(&ring),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let made = Made::new(engine, &request, &[]);
     let first = made.make(engine.spec()).facts.ring_positions.to_vec();
@@ -1785,7 +1786,7 @@ fn a_shadow_of_another_ring_form_is_lent_no_ring() {
     document.generation = 1;
     let engine = hosted(engine_of(&document));
     let list = pool(2);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let ring = Lent(vec![list[0].url().to_owned()]);
     list[0].increment_load();
     list[0].increment_load();
@@ -1793,7 +1794,7 @@ fn a_shadow_of_another_ring_form_is_lent_no_ring() {
     let request = PlaceRequest {
         headers: &headers,
         ring: Some(&ring),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let placement = engine.place(&request).expect("a placement");
     assert!(Arc::ptr_eq(&placement.worker, &list[0]), "the ring's owner");
@@ -1830,7 +1831,7 @@ fn a_request_under_the_prefix_form_is_lent_no_ring() {
     for name in ["prefix_hash", "random"] {
         let engine = hosted(preset(name));
         let list = pool(8);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let request = |ring: Option<&'static dyn LentRing>| PlaceRequest {
             prompt: Prompt {
                 tokens: Some(&tokens),
@@ -1838,7 +1839,7 @@ fn a_request_under_the_prefix_form_is_lent_no_ring() {
             },
             headers: &headers,
             ring,
-            ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
         };
         let placed = |request: &PlaceRequest<'_>| {
             let placement = engine.place(request).expect("a placement");
@@ -1871,7 +1872,7 @@ fn a_pairs_request_is_lent_the_ring_a_side_of_it_places_by() {
     let stated = |prefill: &str, decode: &str, ring: &dyn LentRing| {
         let document = PolicySpec::pair_presets(prefill, decode);
         let engine = engine_of(&document.expect("the pair presets"));
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
         let pair = pair_of(&members, &classes);
         let request = PlaceRequest {
@@ -1936,12 +1937,12 @@ fn a_stage_is_shown_the_headers_the_documents_view_lists() {
     let spec = AppliedSpec::validate_in(&document, &stages, &[]);
     let engine = hosted(PolicyEngine::new(spec.expect("the stages hold the filter")));
     let list = pool(2);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     // The stage that left the request no worker; none where it is placed.
     let emptied_by = |headers: &dyn HeaderRead| {
         let request = PlaceRequest {
             headers,
-            ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
         };
         match engine.place(&request) {
             Ok(_) => None,

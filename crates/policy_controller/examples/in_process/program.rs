@@ -26,8 +26,7 @@ use smg_policy_controller::{
         RoutingSettings,
     },
     engine::{
-        HeaderRead, LentList, ListCell, PlaceRequest, PolicyEngine, PoolMembers, Unplaced,
-        WorkerId, WorkerLists,
+        HeaderRead, LentList, ListCell, PlaceRequest, PolicyEngine, Unplaced, WorkerId, WorkerLists,
     },
     tracking::{Outcome, Placement, Side, TransportClass},
 };
@@ -120,12 +119,6 @@ impl Engine {
     /// The one call for a request.
     fn place<'a>(&self, request: &PlaceRequest<'a>) -> Result<Placement<'a>, Unplaced> {
         self.0.place(request)
-    }
-
-    /// The engine's value of a lent list. Owed: a request lends each list
-    /// with its cell, and the call for a request asks the cell.
-    fn members_of<'a>(&self, lent: LentList<'a>) -> &'a PoolMembers {
-        self.0.members_of(lent)
     }
 
     /// A worker left. Owed: the engine's own task follows the registry's
@@ -260,9 +253,7 @@ impl Program {
     /// Why the engine named no worker.
     pub fn place(&self, asked: &Asked<'_>, tried: &[WorkerId]) -> Result<InFlight, Unplaced> {
         let lists = self.published(asked.model);
-        let members = lists
-            .as_deref()
-            .map(|lists| self.engine.members_of(lists.lent()));
+        let lent = lists.as_deref().map(Lists::lent);
         let headers: &dyn HeaderRead = match asked.headers {
             Some(headers) => headers,
             None => &(),
@@ -273,7 +264,7 @@ impl Program {
             tried,
             ..PlaceRequest::of(
                 asked.model,
-                members.map_or(WorkerLists::None, WorkerLists::Single),
+                lent.map_or(WorkerLists::None, WorkerLists::Single),
             )
         };
         let placement = self.engine.place(&request)?;

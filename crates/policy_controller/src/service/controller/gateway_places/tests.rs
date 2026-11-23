@@ -22,6 +22,7 @@ use crate::{
     engine::{
         decision::{SUBSET_HINT, WIRES},
         decision_engine::{Decided, DecisionEngine, WorkerLists},
+        list_cell::tests::PublishedList,
         policy_engine::{PolicyEngine, PoolMembers},
         view::{Candidate, FixedFacts, Role, WireModes, WorkerId},
     },
@@ -511,14 +512,15 @@ fn compared(fleet: &[Reach], vetoes: &[(GatewayId, usize, bool)]) -> Met {
     let engine = engine("random");
     let workers = pool(fleet.len());
     let mut place = 0;
-    let members = engine.pool_members_with_fixed_facts(&workers, |_| {
+    let members = PublishedList::with_facts(Arc::clone(&workers), |_| {
         place += 1;
         FixedFacts {
             id: ids.get(place - 1).copied(),
             ..FixedFacts::default()
         }
     });
-    let records = members.records(engine.spec(), engine.clock());
+    let made = engine.members_of(members.lent());
+    let records = made.records(engine.spec(), engine.clock());
     assert_eq!(records.ids(), ids.as_slice());
     let reach = ListReach::new(fleet.iter().copied());
 
@@ -606,7 +608,7 @@ fn compared(fleet: &[Reach], vetoes: &[(GatewayId, usize, bool)]) -> Met {
                         &frame,
                         &read,
                         Duration::from_millis(2),
-                        WorkerLists::Single(&members),
+                        WorkerLists::Single(members.lent()),
                     )
                     .held_to(held.places, held.stalled, held.held);
                     let answer = engine.decide_under(gateway, &maker, t0).expect("an answer");

@@ -1168,7 +1168,8 @@ mod over_lists {
         document::AppliedSpec,
         engine::{
             decision_engine::{Request, RequestMaker, WorkerLists},
-            policy_engine::{PolicyEngine, PoolMembers},
+            list_cell::tests::PublishedList,
+            policy_engine::PolicyEngine,
             Constraints, RequestFacts,
         },
         store::GatewayId,
@@ -1176,7 +1177,7 @@ mod over_lists {
     };
 
     /// A request stated ahead, with the list its host hands for it.
-    struct Asks<'a>(Request<'a>, &'a PoolMembers);
+    struct Asks<'a>(Request<'a>, &'a PublishedList);
 
     impl RequestMaker for Asks<'_> {
         fn model(&self) -> &str {
@@ -1188,20 +1189,20 @@ mod over_lists {
         }
 
         fn workers(&self) -> WorkerLists<'_> {
-            WorkerLists::Single(self.1)
+            WorkerLists::Single(self.1.lent())
         }
     }
 
     /// The engine of the standing document, two ready workers as it reads
     /// their list, and the document's readers.
-    fn bed() -> (PolicyEngine, PoolMembers, Readers) {
+    fn bed() -> (PolicyEngine, PublishedList, Readers) {
         let (catalog, readers) = catalog();
         let engine = PolicyEngine::new(validated(&document(None), &catalog));
         let list: Arc<[Arc<dyn Worker>]> = ["http://first:8000", "http://second:8000"]
             .iter()
             .map(|url| ready_worker(url, POOL))
             .collect();
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(list);
         (engine, members, readers)
     }
 
@@ -1209,7 +1210,7 @@ mod over_lists {
     /// by its handle.
     fn decide<'a>(
         engine: &'a PolicyEngine,
-        members: &PoolMembers,
+        members: &PublishedList,
         id: &[u8],
         now: Instant,
     ) -> DecisionGuard<&'a PolicyEngine> {

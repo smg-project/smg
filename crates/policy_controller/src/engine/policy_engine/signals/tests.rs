@@ -32,7 +32,8 @@ use crate::{
         decision::{Decision, ShadowKind},
         decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
         framework::{Scorer, TieBand},
-        policy_engine::{PolicyEngine, PoolMembers},
+        list_cell::tests::PublishedList,
+        policy_engine::PolicyEngine,
         sticky_sessions::SessionVerdict,
         view::{Candidate, Constraints, Identity, RequestFacts, WorkerId},
     },
@@ -361,7 +362,7 @@ fn published(monitor: &Arc<WorkerMonitor<Members>>, channel: &LoadReceiver) -> A
 /// it, where it gives one.
 struct Asks<'a> {
     request: Request<'a>,
-    members: &'a PoolMembers,
+    members: &'a PublishedList,
     loads: Option<Arc<LoadSnapshot>>,
 }
 
@@ -375,7 +376,7 @@ impl RequestMaker for Asks<'_> {
     }
 
     fn workers(&self) -> WorkerLists<'_> {
-        WorkerLists::Single(self.members)
+        WorkerLists::Single(self.members.lent())
     }
 
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
@@ -384,7 +385,7 @@ impl RequestMaker for Asks<'_> {
 }
 
 /// A request of `seed` over `members` that gives `loads`.
-fn asks<'a>(seed: u64, members: &'a PoolMembers, loads: Option<&Arc<LoadSnapshot>>) -> Asks<'a> {
+fn asks<'a>(seed: u64, members: &'a PublishedList, loads: Option<&Arc<LoadSnapshot>>) -> Asks<'a> {
     Asks {
         request: Request {
             id: b"request",
@@ -444,7 +445,7 @@ fn served(worker: WorkerId) -> Outcome {
 fn each_workers_stated_value_is_read_at_its_place_in_the_list() {
     let built = built(&reads("", "best"));
     let list = pool(4);
-    let members = built.engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let both = vec![
         stated("other", "tokens", 1.0),
         stated("held", "tokens", 20.0),
@@ -471,7 +472,7 @@ fn each_workers_stated_value_is_read_at_its_place_in_the_list() {
 fn cells_a_caller_put_on_the_request_are_not_read() {
     let built = built(&reads("", "best"));
     let list = pool(4);
-    let members = built.engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let callers = SignalCell {
         value: 7.0,
         sampled_at_micros: 0,
@@ -494,7 +495,7 @@ fn cells_a_caller_put_on_the_request_are_not_read() {
 fn a_value_under_another_unit_or_out_of_range_is_not_read() {
     let built = built(&reads("", "best"));
     let list = pool(8);
-    let members = built.engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let under = |unit: &str, value: f64| report(vec![stated("held", unit, value)]);
     let loads = snapshot([
         (0, under("tokens", 1e15)),
@@ -532,7 +533,7 @@ fn a_value_under_another_unit_or_out_of_range_is_not_read() {
 fn a_value_ends_by_its_signals_maximum_age_from_its_own_sample() {
     let built = built(&reads(r#","max_age_ms":500"#, "best"));
     let list = pool(2);
-    let members = built.engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let sampled = Instant::now();
     let at = |values| WorkerLoadResponse {
         sampled_at: Some(sampled),
@@ -576,7 +577,7 @@ fn a_report_of_several_ranks_gives_no_value() {
         let signal = format!(r#","max_age_ms":500,"across_ranks":"{across}""#);
         let built = built(&reads(&signal, "best"));
         let list = pool(4);
-        let members = built.engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let now = Instant::now();
         let merged = WorkerLoadResponse {
             version: "1".into(),
@@ -617,7 +618,7 @@ fn a_rule_of_the_two_token_counts_keeps_the_workers_the_request_fits() {
                                "score":["least-requests"],"pick":"best"}}}}}}"#
     ));
     let list = pool(4);
-    let members = built.engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     // A request of 200 tokens fits the second worker alone, and then the
     // third alone. The fourth has no report.
     for (fits, used) in [(1, [900, 100, 950]), (2, [801, 900, 800])] {
@@ -640,16 +641,41 @@ fn a_rule_of_the_two_token_counts_keeps_the_workers_the_request_fits() {
 fn a_lists_cells_are_made_once_a_snapshot() {
     let built = built(&reads("", "best"));
     let list = pool(4);
-    let members = built.engine.pool_members(&list);
-    assert_eq!(members.conversions(), 0);
+    let members = PublishedList::new(Arc::clone(&list));
+    assert_eq!(built.engine.conversions(members.lent()), 0);
     for (nth, base) in [(1, 10.0), (2, 20.0)] {
         let loads = stepped(4, base);
         for seed in 0..32 {
             let read = read_at(&built, &asks(seed, &members, Some(&loads)), Instant::now());
             assert_eq!(read, stepped_values(base), "seed {seed}");
         }
-        assert_eq!(members.conversions(), nth, "one conversion a snapshot");
+        assert_eq!(
+            built.engine.conversions(members.lent()),
+            nth,
+            "one conversion a snapshot"
+        );
     }
+}
+
+/// The count of a list's conversions is one document's. An engine that
+/// made no value of a list counts none where another engine, made before
+/// it, converted the list's reports under its own document. The count
+/// makes no value: a list no engine decided over keeps an empty cell.
+#[test]
+fn a_lists_conversions_are_counted_under_the_asking_engines_document() {
+    let (older, newer) = (built(&reads("", "best")), built(&reads("", "best")));
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    let (loads, now) = (stepped(4, 10.0), Instant::now());
+    let counts = || [&older, &newer].map(|built| built.engine.conversions(members.lent()));
+    assert_eq!(counts(), [0, 0], "no engine decided over the list");
+    assert!(!members.filled(), "a count makes no value");
+    let made = newer.engine.values_made();
+    let _ = read_at(&older, &asks(7, &members, Some(&loads)), now);
+    assert_eq!(counts(), [1, 0], "the newer engine made no value of it");
+    assert_eq!(newer.engine.values_made(), made, "and its count made none");
+    let _ = read_at(&newer, &asks(7, &members, Some(&loads)), now);
+    assert_eq!(counts(), [1, 1], "each under its own document");
 }
 
 /// A decision that draws first reads the drawn workers' own values: the
@@ -659,7 +685,7 @@ fn a_lists_cells_are_made_once_a_snapshot() {
 fn a_draw_reads_the_drawn_workers_own_values() {
     let built = built(&reads("", "power-of-two"));
     let list = pool(32);
-    let members = built.engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let loads = stepped(32, 100.0);
     let mut asked = [false; 32];
     for seed in 0..256 {
@@ -683,7 +709,11 @@ fn a_draw_reads_the_drawn_workers_own_values() {
     }
     let reached = asked.iter().filter(|&&asked| asked).count();
     assert!(reached > 16, "the draws reached {reached} of 32 workers");
-    assert_eq!(members.conversions(), 1, "one conversion for every draw");
+    assert_eq!(
+        built.engine.conversions(members.lent()),
+        1,
+        "one conversion for every draw"
+    );
 }
 
 /// A session's pin is followed where its worker's signal says the request
@@ -707,7 +737,7 @@ fn a_pins_worker_is_asked_its_signal_ahead_of_the_pass_over_the_list() {
     filters.push(serde_json::from_str(ROOM).expect("a filter"));
     let engine = built_of(&document).engine;
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
 
     // The third worker alone has room: the key's first request is placed
     // there, and its dispatch pins the key.
@@ -755,7 +785,7 @@ fn a_profile_that_reads_no_signal_is_lent_no_cells() {
                         {{"match":{{"model":"*"}},"profile":"reads"}}]}}"#
     ));
     let list = pool(4);
-    let members = built.engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let loads = stepped(4, 10.0);
     let mut plain = asks(7, &members, Some(&loads));
     plain.request.facts.model = PLAIN_MODEL;
@@ -764,14 +794,14 @@ fn a_profile_that_reads_no_signal_is_lent_no_cells() {
     }
     assert_eq!(*built.seen.lock(), [false; 2], "no cells in its facts");
     assert!(built.read.lock().is_empty());
-    assert_eq!(members.conversions(), 1);
+    assert_eq!(built.engine.conversions(members.lent()), 1);
 
     for _ in 0..2 {
         let read = read_at(&built, &asks(7, &members, Some(&loads)), Instant::now());
         assert_eq!(read, stepped_values(10.0));
     }
     assert_eq!(
-        members.conversions(),
+        built.engine.conversions(members.lent()),
         1,
         "the cells the first decision left"
     );
@@ -779,7 +809,7 @@ fn a_profile_that_reads_no_signal_is_lent_no_cells() {
     // In the other order over another value of the list, the list's word
     // is of the model that reads the signal: the other model's request is
     // still lent no cells.
-    let members = built.engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let read = read_at(&built, &asks(7, &members, Some(&loads)), Instant::now());
     assert_eq!(read, stepped_values(10.0));
     let mut plain = asks(7, &members, Some(&loads));
@@ -804,7 +834,7 @@ fn a_cost_term_of_a_named_signal_names_the_worker_that_states_the_least() {
                              "pick":"best"}}}"#,
     );
     let list = pool(4);
-    let members = built.engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     for least in 0..4 {
         let value = |at| if at == least { 10.0 } else { 500.0 };
         let loads = snapshot((0..4).map(|at| (at, report(held(value(at))))));
@@ -823,7 +853,7 @@ fn a_cost_term_of_a_named_signal_names_the_worker_that_states_the_least() {
 fn the_entry_that_issues_no_lease_is_lent_the_cells_too() {
     let built = built(&reads("", "best"));
     let list = pool(4);
-    let members = built.engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let loads = stepped(4, 10.0);
     let asks = asks(7, &members, Some(&loads));
     let decided = built.engine.decide_without_lease(&asks, Instant::now());
@@ -848,7 +878,7 @@ fn a_shadow_profile_reads_the_cells_its_live_decision_was_lent() {
     document.bindings[0].shadow = Some(ShadowSpec::Profile("reads".into()));
     let built = built_of(&document);
     let list = pool(4);
-    let members = built.engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let loads = stepped(4, 10.0);
     let read = read_at(&built, &asks(7, &members, Some(&loads)), Instant::now());
     assert_eq!(read, stepped_values(10.0), "what the shadow's stage read");
@@ -871,7 +901,7 @@ fn a_lease_is_issued_at_its_decisions_instant_where_cells_were_lent() {
                         {{"match":{{"model":"*"}},"profile":"reads"}}]}}"#
     ));
     let list = pool(4);
-    let members = built.engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let loads = stepped(4, 10.0);
     let now = Instant::now() + Duration::from_secs(1);
     let mut plain = asks(7, &members, Some(&loads));
@@ -897,7 +927,7 @@ fn a_lease_is_issued_at_its_decisions_instant_where_cells_were_lent() {
 async fn each_rank_that_is_a_row_reads_its_own_pushed_values() {
     let built = built(&reads(r#","max_age_ms":1000"#, "best"));
     let list: Arc<[Arc<dyn Worker>]> = [0, 1].map(rank_row).into();
-    let members = built.engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let (monitor, channel) = monitor_over(&list);
     let start = Instant::now();
     monitor.apply_pushed_load(&list[0], 0, &pushes(5.0), start);
@@ -928,7 +958,7 @@ async fn each_rank_that_is_a_row_reads_its_own_pushed_values() {
 async fn a_worker_that_pushes_over_several_ranks_gives_no_value() {
     let built = built(&reads(r#","max_age_ms":1000,"across_ranks":"max""#, "best"));
     let list = pool(2);
-    let members = built.engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let (monitor, channel) = monitor_over(&list);
     let start = Instant::now();
     monitor.apply_pushed_load(&list[0], 0, &pushes(5.0), start);

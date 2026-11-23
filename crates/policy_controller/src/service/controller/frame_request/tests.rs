@@ -21,8 +21,9 @@ use crate::{
     engine::{
         decision::{Decision, ShedReason, MAX_TARGETS, SUBSET_HINT},
         decision_engine::{Decided, Plain, Request, RequestMaker, WorkerLists},
+        list_cell::tests::PublishedList,
         pair_classes::PartnerClasses,
-        policy_engine::{PolicyEngine, PoolMembers},
+        policy_engine::PolicyEngine,
         view::{
             fingerprint, Constraints, FixedFacts, HashKind, Header, Identity, MediaCounts, Phase,
             RequestFacts, WireModes, WorkerId,
@@ -105,7 +106,7 @@ fn frame_of(seed: u64, edit: impl FnOnce(&mut proto::DecideRequest)) -> Checked 
 /// whole: what a frame's maker is held against.
 struct Stated<'a> {
     request: Request<'a>,
-    members: &'a PoolMembers,
+    members: &'a PublishedList,
 }
 
 impl RequestMaker for Stated<'_> {
@@ -118,7 +119,7 @@ impl RequestMaker for Stated<'_> {
     }
 
     fn workers(&self) -> WorkerLists<'_> {
-        WorkerLists::Single(self.members)
+        WorkerLists::Single(self.members.lent())
     }
 }
 
@@ -330,11 +331,11 @@ fn a_later_frames_request_holds_nothing_of_an_earlier_frames_lists() {
 fn a_frames_decision_names_its_alternates() {
     let engine = engine("round_robin");
     let list = pool(6);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let frame = frame_of(7, |_| {});
     let mut buffers = Lists::default();
     let lists = buffers.of(&frame);
-    let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::Single(&members));
+    let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::Single(members.lent()));
     assert_eq!(maker.plain(), None);
 
     let now = Instant::now();
@@ -416,7 +417,7 @@ fn the_hashes_are_cut_in_blocks_of_the_frames_own_size_and_kind() {
 fn a_hint_of_0_reaches_the_engine_which_refuses_a_single_request_not_answered_for_it() {
     let engine = engine("random");
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let frame = frame_of(7, |frame| {
         frame.constraints = Some(proto::Constraints {
             subset_hint: Some(0),
@@ -425,7 +426,7 @@ fn a_hint_of_0_reaches_the_engine_which_refuses_a_single_request_not_answered_fo
     });
     let mut buffers = Lists::default();
     let lists = buffers.of(&frame);
-    let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::Single(&members));
+    let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::Single(members.lent()));
     let spec = applied(&preset("random"));
     assert_eq!(maker.make(&spec).constraints.subset_hint, Some(0));
     assert_eq!(
@@ -452,15 +453,15 @@ fn a_pairs_frame_is_decided_over_its_two_lists_and_shed_where_it_hints_0() {
     let prefills = side("prefill", WorkerType::Prefill, 2);
     let decodes = side("decode", WorkerType::Decode, 3);
     let (prefill, decode) = (
-        engine.pool_members(&prefills),
-        engine.pool_members(&decodes),
+        PublishedList::new(Arc::clone(&prefills)),
+        PublishedList::new(Arc::clone(&decodes)),
     );
     // Every prefill pairs with every decode.
     let all = [0_u32, 1, 2];
     let classes = PartnerClasses::number(3, [&all[..], &all[..]]);
     let pair = PairLists {
-        prefill: &prefill,
-        decode: &decode,
+        prefill: prefill.lent(),
+        decode: decode.lent(),
         classes: &classes,
         admission: &Open,
         prefill_places: None,
@@ -511,16 +512,16 @@ fn a_frame_names_a_worker_by_the_stores_id_over_a_list_that_states_it() {
     // The store's id of the worker at each place of the list.
     let stored = |place: usize| WorkerId(1_000 + place as u64);
     let mut place = 0;
-    let stating = engine.pool_members_with_fixed_facts(&list, |_| {
+    let stating = PublishedList::with_facts(Arc::clone(&list), |_| {
         place += 1;
         FixedFacts {
             id: Some(stored(place - 1)),
             ..FixedFacts::default()
         }
     });
-    let silent = engine.pool_members(&list);
+    let silent = PublishedList::new(Arc::clone(&list));
     let now = Instant::now();
-    let asked = |members: &PoolMembers, seed: u64| {
+    let asked = |members: &PublishedList, seed: u64| {
         let frame = frame_of(seed, |frame| {
             frame.constraints = Some(proto::Constraints {
                 excluded: vec![stored(1).0, stored(2).0],
@@ -529,7 +530,7 @@ fn a_frame_names_a_worker_by_the_stores_id_over_a_list_that_states_it() {
         });
         let mut buffers = Lists::default();
         let lists = buffers.of(&frame);
-        let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::Single(members));
+        let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::Single(members.lent()));
         let Decided::Whole(whole, _) = decided(&engine, &maker, now) else {
             panic!("a whole decision");
         };
@@ -558,7 +559,7 @@ fn a_frame_names_a_worker_by_the_stores_id_over_a_list_that_states_it() {
 fn a_positive_subset_hint_reaches_no_stage() {
     let engine = engine("random");
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let now = Instant::now();
     let asked = |seed: u64, hint: Option<u32>| {
         let frame = frame_of(seed, |frame| {
@@ -569,7 +570,7 @@ fn a_positive_subset_hint_reaches_no_stage() {
         });
         let mut buffers = Lists::default();
         let lists = buffers.of(&frame);
-        let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::Single(&members));
+        let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::Single(members.lent()));
         places(&decided(&engine, &maker, now))
     };
     for seed in 0..16 {
@@ -606,13 +607,16 @@ fn a_frame_and_the_equal_request_stated_ahead_decide_alike() {
     for name in ["round_robin", "random", "power_of_two"] {
         let (by_frame, by_request) = (engine(name), engine(name));
         let list = pool(8);
-        let (framed, stated) = (by_frame.pool_members(&list), by_request.pool_members(&list));
+        let (framed, stated) = (
+            PublishedList::new(Arc::clone(&list)),
+            PublishedList::new(Arc::clone(&list)),
+        );
         let now = Instant::now();
         for seed in 0..64 {
             let frame = frame_of(seed, |_| {});
             let mut buffers = Lists::default();
             let lists = buffers.of(&frame);
-            let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::Single(&framed));
+            let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::Single(framed.lent()));
             let request = Stated {
                 request: Request {
                     id: &[1],

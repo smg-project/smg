@@ -14,7 +14,8 @@ use crate::{
     engine::{
         decision::Decision,
         decision_engine::{DecideOutcome, DecisionEngine, Request, RequestMaker, WorkerLists},
-        policy_engine::{PolicyEngine, PoolMembers},
+        list_cell::tests::PublishedList,
+        policy_engine::PolicyEngine,
         records,
         sticky_sessions::{shards_for_this_host, SessionVerdict},
         view::{Constraints, Identity, Phase, PinSource, RequestFacts, Session, WorkerId},
@@ -45,7 +46,7 @@ fn pool(workers: usize) -> Arc<[Arc<dyn Worker>]> {
 /// A request stated ahead, with the list its host hands for it.
 struct Asks<'a> {
     request: Request<'a>,
-    members: &'a PoolMembers,
+    members: &'a PublishedList,
 }
 
 impl RequestMaker for Asks<'_> {
@@ -58,13 +59,13 @@ impl RequestMaker for Asks<'_> {
     }
 
     fn workers(&self) -> WorkerLists<'_> {
-        WorkerLists::Single(self.members)
+        WorkerLists::Single(self.members.lent())
     }
 }
 
 /// A request of the session key `key`, with no key where it is `0`, over
 /// `members`.
-fn keyed(key: u64, members: &PoolMembers) -> Asks<'_> {
+fn keyed(key: u64, members: &PublishedList) -> Asks<'_> {
     Asks {
         request: Request {
             id: b"request",
@@ -121,7 +122,7 @@ fn served(worker: WorkerId) -> Outcome {
 fn a_rings_keyed_request_goes_to_the_workers_its_callers_ring_reaches() {
     let engine = preset("consistent_hashing");
     let list = pool(8);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let order = [5, 2, 7, 0, 3, 6, 1, 4];
     let ring = InOrder(order.iter().map(|&at| list[at].url().to_owned()).collect());
     let places = |asks: &Asks<'_>| -> Vec<u32> {
@@ -147,7 +148,7 @@ fn a_rings_keyed_request_goes_to_the_workers_its_callers_ring_reaches() {
 fn a_key_an_empty_lent_ring_places_goes_to_the_ready_worker_at_its_position() {
     let engine = preset("consistent_hashing");
     let list = pool(8);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let ring = InOrder(Vec::new());
     let mut asks = keyed(9, &members);
     asks.request.facts.ring = Some(&ring);
@@ -165,7 +166,7 @@ fn a_key_an_empty_lent_ring_places_goes_to_the_ready_worker_at_its_position() {
 struct Derives<'a> {
     headers: &'a [(&'a str, &'a [u8])],
     ring: &'a InOrder,
-    members: &'a PoolMembers,
+    members: &'a PublishedList,
     /// Where the key stands, found while the request is made and kept
     /// here: the request's facts borrow it for as long as it stands.
     position: OnceCell<u64>,
@@ -203,7 +204,7 @@ impl RequestMaker for Derives<'_> {
     }
 
     fn workers(&self) -> WorkerLists<'_> {
-        WorkerLists::Single(self.members)
+        WorkerLists::Single(self.members.lent())
     }
 }
 
@@ -221,7 +222,7 @@ impl RequestMaker for Derives<'_> {
 fn a_requests_headers_place_it_on_the_ring_its_caller_lends() {
     let engine = preset("consistent_hashing");
     let list = pool(8);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let order = [6, 1, 4, 0, 7, 2, 5, 3];
     let ring = InOrder(order.iter().map(|&at| list[at].url().to_owned()).collect());
     // The four workers the ring reaches from where `text` stands on it.
@@ -274,7 +275,7 @@ fn a_rings_keyed_request_keeps_its_keys_workers_whatever_its_seed() {
     for ring in ["consistent_hashing", "prefix_hash"] {
         let engine = preset(ring);
         let list = pool(8);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let named = |key: u64, seed: u64| {
             let mut asks = keyed(key, &members);
             asks.request.facts.seed = seed;
@@ -309,7 +310,7 @@ fn a_worker_that_left_its_list_moves_no_other_key() {
     for ring in ["consistent_hashing", "prefix_hash"] {
         let (seen, fresh) = (preset(ring), preset(ring));
         let named = |engine: &PolicyEngine, list: &Arc<[Arc<dyn Worker>]>, key: u64| {
-            let members = engine.pool_members(list);
+            let members = PublishedList::new(Arc::clone(list));
             targets(&decided(engine, &keyed(key, &members)).decision)
         };
         // The stage's ring learns all eight workers.
@@ -336,7 +337,7 @@ fn a_worker_that_left_its_list_moves_no_other_key() {
 fn a_sessions_pin_is_made_at_the_dispatch_and_followed_with_no_pass_over_the_list() {
     let engine = preset("manual");
     let list = pool(16);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let now = Instant::now();
     let asks = keyed(41, &members);
     let mut first =
@@ -380,7 +381,7 @@ fn a_sessions_pin_is_made_at_the_dispatch_and_followed_with_no_pass_over_the_lis
 fn the_engines_pass_drops_the_session_keys_past_their_end() {
     let engine = preset("manual");
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let now = Instant::now();
     let asks = keyed(51, &members);
     let mut first =
@@ -413,7 +414,7 @@ fn a_key_idle_past_its_time_keeps_its_worker_until_the_sweep() {
     (rule.ttl_s, rule.sweep_s) = (60, 3_600);
     let engine = PolicyEngine::new(AppliedSpec::validate(&document).expect("it validates"));
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let (asks, now) = (keyed(61, &members), Instant::now());
     // A request of the key, dispatched and served: what its rule did, and where.
     let served_at = |secs: u64| {
@@ -450,7 +451,10 @@ impl PinSource for Elsewhere {
 fn a_request_that_lends_pins_of_record_is_decided_as_one_that_lends_none() {
     let (engine, twin) = (preset("manual"), preset("manual"));
     let list = pool(16);
-    let (members, others) = (engine.pool_members(&list), twin.pool_members(&list));
+    let (members, others) = (
+        PublishedList::new(Arc::clone(&list)),
+        PublishedList::new(Arc::clone(&list)),
+    );
     // The whole pass places the key, then the key's pin is followed.
     let twice = |engine: &PolicyEngine, asks: &Asks<'_>| {
         [(); 2].map(|()| targets(&decided(engine, asks).decision))

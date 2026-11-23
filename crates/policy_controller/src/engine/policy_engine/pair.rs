@@ -8,9 +8,10 @@
 //! the records of its host's two lists, and tell the document's stages each
 //! word of a pair's lease, a side at a time.
 //!
-//! **The lists.** A host hands its two lists for one decision
-//! ([`PairLists`]): the engine's value of each, the pair class of every
-//! worker, and its own reads of its admission. A decision writes one
+//! **The lists.** A host lends its two lists for one decision
+//! ([`PairLists`]): each list with its cell, the pair class of every
+//! worker, and its own reads of its admission. The engine asks each side's
+//! cell for its own value of the list, once a decision. A decision writes one
 //! record for each worker of the prefill list and of the decode list, each
 //! in its list's order, as the workers stand at that call
 //! ([`PoolRecords::write`](crate::engine::records::PoolRecords::write)).
@@ -61,14 +62,14 @@ use smg_worker::load::state::LoadSnapshot;
 
 use super::{single, PolicyEngine, PoolMembers};
 use crate::{
-    document::spec::AppliedSpec,
     engine::{
         decision::{shed, Decision, ShedReason, Target, SUBSET_HINT, WIRES},
         decision_engine::{DecideOutcome, HeldDecision, Leased, Request},
         framework::{release, Engine, PairPools, Scratch},
         lease_events,
+        list_cell::LentList,
         pair_classes::PartnerClasses,
-        records::{vetoes, DecisionClock, Live},
+        records::{vetoes, Live},
         view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, Session},
     },
     stages::Lifecycle,
@@ -102,9 +103,9 @@ pub trait PairAdmission: fmt::Debug {
     fn has_room(&self, decode: usize) -> bool;
 }
 
-/// A pair's two lists as their host holds them for one decision: the
-/// engine's value of each list, the pair class of every worker of the two,
-/// and the host's reads of its own admission. A decision names a prefill by
+/// A pair's two lists as their host lends them for one decision: each list
+/// with its cell, the pair class of every worker of the two, and the
+/// host's reads of its own admission. A decision names a prefill by
 /// its place in the prefill list and a decode by its place in the decode
 /// list, so the host finds both workers with no lookup by id.
 ///
@@ -122,9 +123,9 @@ pub trait PairAdmission: fmt::Debug {
 #[derive(Clone, Copy, Debug)]
 pub struct PairLists<'a> {
     /// The prefills.
-    pub prefill: &'a PoolMembers,
+    pub prefill: LentList<'a>,
     /// The decodes.
-    pub decode: &'a PoolMembers,
+    pub decode: LentList<'a>,
     /// The pair class of each worker by its place in its list, and the
     /// table of the classes that pair.
     pub classes: &'a PartnerClasses,
@@ -239,9 +240,12 @@ impl<'a> PairLists<'a> {
     /// entry over the prefill's partners, handed the decode the target
     /// names, which a profile that keeps its pick answers again.
     ///
+    /// `engine` decides it: under its document, on its clock, and over its
+    /// own value of each list, which it asks of the list's cell.
+    ///
     /// `request` is the pair's, as its host made it for the prefill phase.
-    /// This call's instant is written into its facts: `now` on `clock`, the
-    /// clock the records' sample instants stand on.
+    /// This call's instant is written into its facts: `now` on the engine's
+    /// clock, the clock the records' sample instants stand on.
     ///
     /// Prefills that are all at their admission limit shed a first
     /// decision, which reads as a request that waits ([`prefills_full`]).
@@ -251,13 +255,31 @@ impl<'a> PairLists<'a> {
     /// ([`Request::facts`]), and a stage reads the number as the time left.
     pub fn decide(
         &self,
-        spec: &AppliedSpec,
+        engine: &PolicyEngine,
         loads: Option<&Arc<LoadSnapshot>>,
-        clock: &DecisionClock,
         now: Instant,
         request: &mut Request<'_>,
         held: Option<&Target>,
     ) -> Decision {
+        let sides = (
+            engine.members_of(self.prefill),
+            engine.members_of(self.decode),
+        );
+        self.decide_over(engine, sides, loads, now, request, held)
+    }
+
+    /// [`Self::decide`] over the engine's values of the two lists, which
+    /// its caller asked of their cells.
+    pub(super) fn decide_over(
+        &self,
+        engine: &PolicyEngine,
+        (prefill, decode): (&PoolMembers, &PoolMembers),
+        loads: Option<&Arc<LoadSnapshot>>,
+        now: Instant,
+        request: &mut Request<'_>,
+        held: Option<&Target>,
+    ) -> Decision {
+        let (spec, clock) = (&engine.spec, &engine.clock);
         // One value for both lists' records: this call's instant on the
         // clock and the host's snapshot, as the host holds it. No session
         // key's text is handed to it: a pair's records carry no count of a
@@ -280,9 +302,9 @@ impl<'a> PairLists<'a> {
         ];
         let decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;
-            let (workers, records) = (self.prefill.workers(), self.prefill.records(spec, clock));
+            let (workers, records) = (prefill.workers(), prefill.records(spec, clock));
             let (prefills, prefill_facts) = records.write(workers, &live, prefills);
-            let (workers, records) = (self.decode.workers(), self.decode.records(spec, clock));
+            let (workers, records) = (decode.workers(), decode.records(spec, clock));
             let (decodes, decode_facts) = records.write(workers, &live, decodes);
             stamp(prefills, decodes, self.classes, self.admission);
             let (engine, scratch) = (spec.engine(), &mut buffers.scratch);
@@ -614,13 +636,14 @@ pub(super) fn decide(
     loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
 ) -> Decision {
+    // The engine's own value of each list, asked of the list's cell once.
+    let sides = (own.members_of(lists.prefill), own.members_of(lists.decode));
     let wires = request.constraints.wire_modes;
-    let dialed = lists.prefill.wires().union(lists.decode.wires());
+    let dialed = sides.0.wires().union(sides.1.wires());
     if !wires.is_empty() && !wires.contains(dialed) {
         return single::declined(own, request, WIRES);
     }
-    let spec = &own.spec;
-    lists.decide(spec, loads, &own.clock, now, request, target)
+    lists.decide_over(own, sides, loads, now, request, target)
 }
 
 /// One decision of a pair by `own`, the engine of a gateway's own process,
@@ -697,12 +720,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        document::spec::PolicySpec,
+        document::spec::{AppliedSpec, PolicySpec},
         engine::{
             decision::{Pair, Pick, Target, Targets},
             decision_engine::{DecisionEngine, HeldDecode, RequestMaker, WorkerLists},
             demands::Demands,
             framework::{Filter, Picker, TieBand},
+            list_cell::tests::PublishedList,
             records::worker_id,
             sticky_sessions::{DecodeVerdict, SessionVerdict},
             store_backed_engine::{
@@ -1293,15 +1317,14 @@ mod tests {
         }
     }
 
-    /// A host's two lists of ready workers with the engine's value of each,
-    /// under the engine of the stock pair document and its clock.
+    /// A host's two lists of ready workers as it publishes them, each with
+    /// its cell, under the engine of the stock pair document.
     struct Host {
         engine: PolicyEngine,
         heard: Arc<Mutex<Vec<Word>>>,
-        clock: DecisionClock,
         prefills: Arc<[Arc<dyn Worker>]>,
         decodes: Arc<[Arc<dyn Worker>]>,
-        members: [PoolMembers; 2],
+        lists: [PublishedList; 2],
     }
 
     /// A pair's request stated ahead, with the lists its host hands for it
@@ -1354,17 +1377,13 @@ mod tests {
             decodes: Arc<[Arc<dyn Worker>]>,
         ) -> Self {
             let engine = PolicyEngine::new(spec);
-            let members = [
-                engine.pool_members(&prefills),
-                engine.pool_members(&decodes),
-            ];
+            let lists = [&prefills, &decodes].map(|list| PublishedList::new(Arc::clone(list)));
             Self {
                 engine,
                 heard,
-                clock: DecisionClock::new(),
                 prefills,
                 decodes,
-                members,
+                lists,
             }
         }
 
@@ -1379,21 +1398,19 @@ mod tests {
                 profile.filter.clear();
             }
             let spec = AppliedSpec::validate(&document).expect("a valid document");
+            // The lists stand: each cell makes the new engine's value at
+            // its first ask.
             host.engine = PolicyEngine::new(spec);
-            host.members = [
-                host.engine.pool_members(&host.prefills),
-                host.engine.pool_members(&host.decodes),
-            ];
             host
         }
 
         /// The host's keyed request for a pair over its lists, every pair
         /// open, its decode sent `later` or with its prefill.
         fn asks<'a>(&'a self, classes: &'a PartnerClasses, later: bool) -> Asks<'a> {
-            let [prefill, decode] = &self.members;
+            let [prefill, decode] = &self.lists;
             let lists = PairLists {
-                prefill,
-                decode,
+                prefill: prefill.lent(),
+                decode: decode.lent(),
                 classes,
                 admission: &OPEN,
                 prefill_places: None,
@@ -1489,12 +1506,12 @@ mod tests {
             places: [Option<&[u32]>; 2],
             vetoes: [[&[u32]; 2]; 2],
         ) -> Decision {
-            let [prefill, decode] = &self.members;
+            let [prefill, decode] = &self.lists;
             let classes = every(self.prefills.len(), self.decodes.len() as u32);
             let [[prefill_stalled, prefill_held], [decode_stalled, decode_held]] = vetoes;
             let lists = PairLists {
-                prefill,
-                decode,
+                prefill: prefill.lent(),
+                decode: decode.lent(),
                 classes: &classes,
                 admission,
                 prefill_places: places[0],
@@ -1509,9 +1526,9 @@ mod tests {
                 facts: RequestFacts { seed, ..facts() },
                 constraints,
             };
-            let (spec, now) = (self.engine.spec(), Instant::now());
-            let decision = lists.decide(spec, None, &self.clock, now, &mut request, held);
-            assert_eq!(request.facts.now_micros, self.clock.micros(now));
+            let (engine, now) = (&self.engine, Instant::now());
+            let decision = lists.decide(engine, None, now, &mut request, held);
+            assert_eq!(request.facts.now_micros, engine.clock().micros(now));
             decision
         }
 
@@ -2165,11 +2182,11 @@ mod tests {
         // The pair a keyed request is placed on where it stands at
         // `position` of the ring lent.
         let placed = |ring: &InOrder, position: u64| {
-            let [prefill, decode] = &host.members;
+            let [prefill, decode] = &host.lists;
             let classes = every(3, 3);
             let lists = PairLists {
-                prefill,
-                decode,
+                prefill: prefill.lent(),
+                decode: decode.lent(),
                 classes: &classes,
                 admission: &OPEN,
                 prefill_places: None,
@@ -2190,8 +2207,8 @@ mod tests {
                 facts,
                 constraints: Constraints::default(),
             };
-            let (spec, now) = (host.engine.spec(), Instant::now());
-            host.picked(&lists.decide(spec, None, &host.clock, now, &mut request, None))
+            let now = Instant::now();
+            host.picked(&lists.decide(&host.engine, None, now, &mut request, None))
         };
         // The model's one ring holds both lists' workers: each side takes
         // the first worker of its own list that the walk reaches.
@@ -2235,8 +2252,8 @@ mod tests {
                 ring_positions: &positions,
                 ..keyed()
             };
-            let (spec, now) = (host.engine.spec(), Instant::now());
-            host.picked(&lists.decide(spec, None, &host.clock, now, &mut request, None))
+            let now = Instant::now();
+            host.picked(&lists.decide(&host.engine, None, now, &mut request, None))
         };
         assert_eq!(placed(0), (2, 1));
         assert_eq!(placed(3), (0, 2));
@@ -2784,9 +2801,10 @@ mod tests {
             dialed("prefill", WorkerType::Prefill, ConnectionMode::Http),
             dialed("decode", WorkerType::Decode, ConnectionMode::Grpc),
         );
-        let [prefills, decodes] = &host.members;
+        let [prefills, decodes] = &host.lists;
+        let wires = |list: &PublishedList| host.engine.members_of(list.lent()).wires();
         assert_eq!(
-            (prefills.wires(), decodes.wires()),
+            (wires(prefills), wires(decodes)),
             (WireModes::HTTP, WireModes::GRPC)
         );
         let classes = every(2, 2);

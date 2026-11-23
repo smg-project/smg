@@ -270,7 +270,8 @@ mod tests {
             decision::{Decision, Target, Targets},
             decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
             framework::{Picker, TieBand},
-            policy_engine::{PolicyEngine, PoolMembers},
+            list_cell::tests::PublishedList,
+            policy_engine::PolicyEngine,
             view::{Candidate, Constraints, Phase, RequestFacts},
             PairAdmission, PairLists, PartnerClasses,
         },
@@ -410,13 +411,13 @@ mod tests {
 
     /// A host: its engine for the life of the process, under a document
     /// whose `profile` picks through [`Hears`], the words that stage heard,
-    /// and one prefill and one decode worker with the engine's value of
-    /// each one's list.
+    /// and one prefill and one decode worker, each one's list published
+    /// with its cell.
     struct Host {
         engine: &'static PolicyEngine,
         heard: Arc<Mutex<Vec<Word>>>,
         workers: [Arc<dyn Worker>; 2],
-        members: [PoolMembers; 2],
+        lists: [PublishedList; 2],
     }
 
     impl Host {
@@ -446,14 +447,14 @@ mod tests {
                 worker("prefill", WorkerType::Prefill),
                 worker("decode", WorkerType::Decode),
             ];
-            let members = workers
+            let lists = workers
                 .each_ref()
-                .map(|worker| engine.pool_members(&Arc::from([Arc::clone(worker)])));
+                .map(|worker| PublishedList::new(Arc::from([Arc::clone(worker)])));
             Self {
                 engine,
                 heard,
                 workers,
-                members,
+                lists,
             }
         }
 
@@ -484,10 +485,10 @@ mod tests {
         /// `classes`: every worker is admitted, and no side is held to
         /// places.
         fn lists<'a>(&'a self, classes: &'a PartnerClasses) -> WorkerLists<'a> {
-            let [prefill, decode] = &self.members;
+            let [prefill, decode] = &self.lists;
             WorkerLists::Pair(PairLists {
-                prefill,
-                decode,
+                prefill: prefill.lent(),
+                decode: decode.lent(),
                 classes,
                 admission: &Open,
                 prefill_places: None,
@@ -512,7 +513,7 @@ mod tests {
 
         /// A single request placed on the host's first worker, leased.
         fn single(&self) -> PlacementSide {
-            let lists = WorkerLists::Single(&self.members[0]);
+            let lists = WorkerLists::Single(self.lists[0].lent());
             let placement = placed(self.engine, &self.workers, lists, false);
             assert!(placement.owes_events());
             let (side, none) = placement.sides();
@@ -812,8 +813,13 @@ mod tests {
         let spec = AppliedSpec::validate(&plain).expect("the document validates");
         let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(spec)));
         let list: Arc<[Arc<dyn Worker>]> = Arc::from([Arc::clone(&host.workers[0])]);
-        let members = engine.pool_members(&list);
-        let placement = placed(engine, &host.workers, WorkerLists::Single(&members), false);
+        let members = PublishedList::new(list);
+        let placement = placed(
+            engine,
+            &host.workers,
+            WorkerLists::Single(members.lent()),
+            false,
+        );
         assert!(!placement.owes_events());
         let (mut side, none) = placement.sides();
         assert!(none.is_none());

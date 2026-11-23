@@ -61,7 +61,7 @@ impl PolicyEngine {
         let mut taken = None;
         let placed = held.decode_placed_under(&made, Instant::now(), |target| {
             let place = target.pair.map(|pair| pair.decode_position as usize);
-            let worker = place.and_then(|place| decodes?.workers().get(place));
+            let worker = place.and_then(|place| decodes?.workers.get(place));
             debug_assert_eq!(
                 worker.map(|worker| worker_id(worker.as_ref())),
                 worker.and(target.pair).map(|pair| pair.decode_id),

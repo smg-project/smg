@@ -449,14 +449,14 @@ mod tests {
         use crate::{
             document::spec::{AppliedSpec, PolicySpec},
             engine::{
-                Constraints, Decided, PolicyEngine, PoolMembers, Request, RequestFacts,
-                RequestMaker, Role, WorkerLists,
+                Constraints, Decided, LentList, PolicyEngine, Request, RequestFacts, RequestMaker,
+                Role, WorkerLists,
             },
             store::WorkerStatus,
         };
 
         /// A single request with the list its host hands for it.
-        struct Asks<'a>(Request<'a>, &'a PoolMembers);
+        struct Asks<'a>(Request<'a>, LentList<'a>);
 
         impl RequestMaker for Asks<'_> {
             fn model(&self) -> &str {
@@ -506,7 +506,7 @@ mod tests {
             },
             constraints: Constraints::default(),
         };
-        let asks = Asks(request, engine.members_of(list));
+        let asks = Asks(request, list);
         let taken = || match engine.decide_at(&asks, Instant::now).expect("an answer") {
             Decided::Alone(pick) => ids[pick.place as usize],
             Decided::Whole(decided, _) => {

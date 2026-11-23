@@ -34,6 +34,7 @@ use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
         decision_engine::DecisionEngine,
+        list_cell::tests::PublishedList,
         policy_engine::{
             single::tests::{decided, hearing, pool, request, Asks, Heard},
             PolicyEngine,
@@ -812,7 +813,7 @@ fn a_join_and_a_leave_of_the_follow_forget_the_ids_sent_prefixes() {
     engine.set_registry(handed(&registry));
     let mut follow = started(&engine).expect("a registry was handed");
     let list = pool(8);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let sent = |prompt: u32, seed: u64| {
         let tokens: Vec<u32> = (prompt * 100_000..prompt * 100_000 + 1_024).collect();
         let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
@@ -864,7 +865,7 @@ fn a_whole_read_forgets_the_sent_prefixes_of_an_id_that_stands_no_more() {
     engine.set_registry(handed(&registry));
     let mut follow = started(&engine).expect("a registry was handed");
     let list = pool(8);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let sent = |prompt: u32, seed: u64| {
         let tokens: Vec<u32> = (prompt * 100_000..prompt * 100_000 + 1_024).collect();
         let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);

@@ -40,7 +40,8 @@ use crate::{
         decision_engine::{Decided, DecisionEngine, DecisionRefused, Request},
         demands::Demands,
         framework::{Picker, ShadowRows, TieBand},
-        policy_engine::{PolicyEngine, PoolMembers},
+        list_cell::tests::PublishedList,
+        policy_engine::PolicyEngine,
         prompt_hashes::HashSeeds,
         records::worker_id,
         shadow::{Shadowed, SHADOW_FLOOR},
@@ -64,7 +65,7 @@ fn request<'a>(seed: u64) -> Request<'a> {
 
 /// The whole decision of `request` over a value `engine` makes of `list`.
 fn placed(engine: &PolicyEngine, list: &Arc<[Arc<dyn Worker>]>, request: Request<'_>) -> Decision {
-    let members = engine.pool_members(list);
+    let members = PublishedList::new(Arc::clone(list));
     decided(engine, &Asks::of(request, Some(&members))).decision
 }
 
@@ -262,7 +263,7 @@ fn bed(live: Rule, shadow: Rule) -> (PolicyEngine, Seen) {
 fn a_shadow_that_picks_another_worker_is_counted_and_the_live_answer_served() {
     let list = pool(3);
     let (engine, seen) = bed(Rule::Place(0), Rule::Place(1));
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let answer = decided(&engine, &Asks::of(request(7), Some(&members)));
     assert_eq!(kinds(&engine), [0, 1, 0, 0]);
     assert_eq!(seen.shadows(), 1);
@@ -296,7 +297,7 @@ fn a_shadow_of_another_outcome_changes_nothing_of_the_live_answer() {
     assert_eq!(kinds(&engine), [0, 0, 1, 0]);
 
     let (engine, seen) = bed(Rule::Nobody, Rule::Place(0));
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let answer = decided(&engine, &Asks::of(request(7), Some(&members)));
     assert!(matches!(answer.decision, Decision::Shed(_)), "{answer:?}");
     assert!(answer.lease.is_none());
@@ -367,7 +368,7 @@ fn a_shadow_that_panics_leaves_the_live_answer_and_counts_a_fault() {
     let list = pool(3);
     let (unshadowed, _) = bed_of("random", Rule::Place(0), None, |_| {});
     let (engine, seen) = bed(Rule::Place(0), Rule::Panics);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     for faults in 1..=2 {
         let answer = decided(&engine, &Asks::of(request(7), Some(&members)));
         assert_eq!(answer.decision, placed(&unshadowed, &list, request(7)));
@@ -387,7 +388,7 @@ fn a_shadow_that_panics_leaves_the_live_answer_and_counts_a_fault() {
 fn a_decision_whose_issue_panics_counts_no_shadow() {
     let list = pool(3);
     let (engine, seen) = bed(Rule::IssuePanics, Rule::Place(1));
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let asks = Asks::of(request(7), Some(&members));
     let refused = engine.decide_under(GatewayId::LOCAL, &asks, Instant::now());
     assert!(matches!(refused, Err(DecisionRefused::Faulted)));
@@ -405,7 +406,7 @@ fn a_decision_whose_issue_panics_counts_no_shadow() {
 fn a_decision_without_a_lease_answers_what_its_shadow_said() {
     let list = pool(3);
     let (engine, seen) = bed(Rule::Place(0), Rule::Place(1));
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let asks = Asks::of(request(7), Some(&members));
     let answer = engine.decide_without_lease(&asks, Instant::now());
     let (alone, said) = answer.expect("a decision");
@@ -437,7 +438,7 @@ fn a_decision_without_a_lease_answers_what_its_shadow_said() {
 fn a_shadow_beside_a_decision_without_a_lease_is_counted_by_its_caller() {
     let list = pool(3);
     let (engine, seen) = bed(Rule::Place(0), Rule::Place(1));
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let asks = Asks::of(request(7), Some(&members));
     let answer = engine.decide_without_lease(&asks, Instant::now());
     let (_, said) = answer.expect("a decision");
@@ -455,7 +456,7 @@ fn a_shadow_beside_a_decision_without_a_lease_is_counted_by_its_caller() {
     assert_eq!(kinds(&engine), [0, 1, 0, 0]);
 
     let (unshadowed, seen) = bed_of("random", Rule::Place(0), None, |_| {});
-    let members = unshadowed.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let asks = Asks::of(request(7), Some(&members));
     let answer = unshadowed.decide_without_lease(&asks, Instant::now());
     let (_, none) = answer.expect("a decision");
@@ -473,7 +474,7 @@ fn a_shadow_beside_a_decision_without_a_lease_is_counted_by_its_caller() {
 fn a_shed_without_a_lease_answers_its_shadows_word_for_the_count() {
     let list = pool(3);
     let (engine, seen) = bed(Rule::Nobody, Rule::Place(0));
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let asks = Asks::of(request(7), Some(&members));
     let answer = engine.decide_without_lease(&asks, Instant::now());
     let (shed, said) = answer.expect("a decision");
@@ -498,7 +499,7 @@ fn a_shed_without_a_lease_answers_its_shadows_word_for_the_count() {
 fn a_shadow_decides_under_its_requests_constraints() {
     let list = pool(3);
     let (engine, seen) = bed(Rule::Place(0), Rule::Place(0));
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let unreached = [worker_id(list[0].as_ref())];
     let mut asked = request(7);
     asked.constraints.excluded = &unreached;
@@ -516,14 +517,15 @@ fn a_shadow_decides_under_its_requests_constraints() {
 fn what_a_shadow_said_names_its_binding_its_kind_and_its_first_target() {
     let list = pool(3);
     let (engine, _) = bed(Rule::Place(0), Rule::Place(1));
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let word = engine.spec().engine().shadow_for(MODEL, Phase::Single);
     let word = word.expect("the binding's shadow");
     let mut asked = request(7);
     // The request's maker, which names no entry in a token tree.
     let maker = Asks::of(asked, Some(&members));
     let now = Instant::now();
-    let (decision, said) = super::decide(&engine, &mut asked, &members, &maker, None, now, word);
+    let made = engine.members_of(members.lent());
+    let (decision, said) = super::decide(&engine, &mut asked, made, &maker, None, now, word);
     // The shadow's picker takes the row behind the live pick's: the live
     // pick's alternate.
     let pick = decision.pick().expect("a pick");
@@ -559,7 +561,7 @@ fn a_shadow_equal_to_the_live_profile_agrees_at_every_seed() {
     let snapshot = LoadSnapshot::from_loads_for_test(reports.collect());
     let stages = StageRegistry::builtin();
     let answer = |engine: &PolicyEngine, loads: &Option<Arc<LoadSnapshot>>, seed: u64| {
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let asks = Asks {
             loads: loads.clone(),
             ..Asks::of(request(seed), Some(&members))
@@ -602,7 +604,7 @@ fn a_plain_request_of_a_binding_with_a_shadow_takes_the_whole_decision() {
     named.shadow = None;
     document.bindings.insert(0, named);
     let engine = engine_of(document, &stages);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
 
     let asks = Asks::of(request(7), Some(&members));
     let mut seen = [0_u32; 4];
@@ -616,7 +618,7 @@ fn a_plain_request_of_a_binding_with_a_shadow_takes_the_whole_decision() {
 
     // The first binding names no shadow: a list of its model is another
     // value, as a gateway's list is one model's.
-    let other = engine.pool_members(&list);
+    let other = PublishedList::new(Arc::clone(&list));
     let mut unshadowed = request(7);
     unshadowed.facts.model = "alpha-1";
     let asks = Asks::of(unshadowed, Some(&other));
@@ -662,10 +664,13 @@ fn a_shadow_writes_nothing_to_the_record_of_sent_prefixes() {
     assert_eq!(word, Some((0, ShadowRows::Unnamed)));
 
     let list = pool(8);
-    let (members, plain) = (engine.pool_members(&list), unshadowed.pool_members(&list));
+    let (members, plain) = (
+        PublishedList::new(Arc::clone(&list)),
+        PublishedList::new(Arc::clone(&list)),
+    );
     let prompt = |start: u32| (start..start + 1_024).collect::<Vec<u32>>();
     let sent = |tokens: &[u32], seed: u64| {
-        let answer = |engine: &PolicyEngine, members: &PoolMembers| {
+        let answer = |engine: &PolicyEngine, members: &PublishedList| {
             let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
             let mut asked = request(seed);
             hashes.write_to(&mut asked.facts);
@@ -717,7 +722,7 @@ fn a_shadow_that_reads_no_affinity_runs_without_the_live_profiles_rows() {
     assert_eq!(word, Some((0, ShadowRows::Unnamed)));
 
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let tokens: Vec<u32> = (0..1_024).collect();
     let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
     for seed in 0..2 {
@@ -750,7 +755,7 @@ fn a_shadow_that_reads_the_live_profiles_rows_is_handed_them() {
     assert_eq!(word, Some((0, ShadowRows::Same)));
 
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let tokens: Vec<u32> = (0..1_024).collect();
     let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
     for seed in 0..2 {
@@ -825,7 +830,7 @@ fn a_shadow_under_a_sessions_rule_moves_no_session_pin() {
         rule.expect("the preset's rule").assignment = Assignment::Delegate;
     });
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let mut keyed = request(7);
     keyed.facts.session_key = Identity::hashed(7);
     let asks = Asks::of(keyed, Some(&members));
@@ -876,7 +881,7 @@ fn the_shadow_counts_of_every_thread_are_read_as_one() {
     thread::scope(|scope| {
         for _ in 0..4 {
             scope.spawn(|| {
-                let members = engine.pool_members(&list);
+                let members = PublishedList::new(Arc::clone(&list));
                 let asks = Asks::of(request(7), Some(&members));
                 for _ in 0..25 {
                     let _ = decided(&engine, &asks);

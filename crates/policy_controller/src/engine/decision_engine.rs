@@ -28,7 +28,9 @@
 //!   document states does not start under that document.
 //! - No pick waits on another's. State every pick shares (the session
 //!   table, the dispatch credit, a pool's turn) moves under an atomic or a
-//!   lock no decision holds across its stages.
+//!   lock no decision holds across its stages. One wait is a list's: the
+//!   decisions that meet at a list's first ask wait for the one that fills
+//!   its cell (`ListCell`).
 
 use std::time::Instant;
 #[cfg(feature = "in-process")]
@@ -188,10 +190,17 @@ pub struct Plain {
     pub prompt_tokens: u32,
 }
 
-/// The workers a request may be sent to, as its host holds them for one
-/// decision. A list is the host's own, read once for the decision: the host
-/// finds a target's worker at the target's position in the list it handed,
-/// with no lookup by id.
+/// The workers a request may be sent to, as its host lends them for one
+/// decision: each list with the cell the host keeps beside it
+/// ([`LentList`](super::list_cell::LentList)). The engine asks a cell for
+/// its own value of the list inside the decision, where it decides over
+/// the list, under the document it decides under: a host holds no value of
+/// a list and asks the engine for none. A plain single request that one
+/// pick does not decide lends its list again behind its making, since a
+/// maker may name its list while it makes the request: a cell the pick
+/// asked is not asked again.
+/// A list is the host's own: the host finds a target's worker at the
+/// target's position in the list it lent, with no lookup by id.
 #[cfg(feature = "in-process")]
 #[derive(Clone, Copy, Debug, Default)]
 pub enum WorkerLists<'a> {
@@ -199,7 +208,7 @@ pub enum WorkerLists<'a> {
     #[default]
     None,
     /// A single request's list.
-    Single(&'a super::policy_engine::PoolMembers),
+    Single(super::list_cell::LentList<'a>),
     /// A pair's two lists, its prefills and its decodes, with the pair
     /// classes of their workers and the host's reads of its admission.
     Pair(super::policy_engine::pair::PairLists<'a>),

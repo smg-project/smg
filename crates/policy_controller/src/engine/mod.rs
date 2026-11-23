@@ -74,7 +74,7 @@ pub use policy_engine::place::{HeaderRead, PlaceRequest, Prompt, Unplaced, Worke
 #[cfg(feature = "in-process")]
 pub use policy_engine::start::WorkerData;
 #[cfg(feature = "in-process")]
-pub use policy_engine::{PolicyEngine, PoolMembers};
+pub use policy_engine::PolicyEngine;
 pub use prompt_hashes::{HashSeeds, PromptHashes};
 #[cfg(feature = "in-process")]
 pub use records::{decide, worker_id, worker_rank, DecisionClock, Live, PoolRecords};

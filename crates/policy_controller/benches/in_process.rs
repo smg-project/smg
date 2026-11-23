@@ -85,7 +85,7 @@ use parking_lot::{Condvar, Mutex};
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec, ShadowSpec},
     engine::{
-        Constraints, Decided, Identity, Phase, Plain, PolicyEngine, PoolMembers, Request,
+        Constraints, Decided, Identity, LentList, ListCell, Phase, Plain, PolicyEngine, Request,
         RequestFacts, RequestMaker, TokenKey, WorkerId, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
@@ -514,7 +514,7 @@ impl RequestMaker for Stated<'_> {
     }
 
     fn workers(&self) -> WorkerLists<'_> {
-        WorkerLists::Single(&self.host.members)
+        WorkerLists::Single(self.host.list.lent())
     }
 
     fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
@@ -523,17 +523,48 @@ impl RequestMaker for Stated<'_> {
     }
 }
 
-/// A list of worker objects as a host keeps it: the engine, which stands
-/// as long as the process, with what it keeps of the list, and the cell's
-/// request.
+/// A list of worker objects as a host publishes it: the list, and the cell
+/// the host keeps beside it.
+struct Published {
+    workers: Arc<[Arc<dyn Worker>]>,
+    cell: ListCell,
+}
+
+impl Published {
+    /// `workers` published: the cell beside them is empty.
+    fn of(workers: &Arc<[Arc<dyn Worker>]>) -> Self {
+        Self {
+            workers: Arc::clone(workers),
+            cell: ListCell::default(),
+        }
+    }
+
+    /// The list, lent with its cell: the host states nothing of its
+    /// workers.
+    fn lent(&self) -> LentList<'_> {
+        LentList {
+            workers: &self.workers,
+            cell: &self.cell,
+            facts: None,
+        }
+    }
+}
+
+/// What a host keeps for one list: the engine, which stands as long as the
+/// process, the list as published, and the bench cell's request.
 struct Host {
     engine: &'static PolicyEngine,
-    members: PoolMembers,
+    list: Published,
     request: fn(u64) -> Request<'static>,
     plain: Option<Plain>,
 }
 
 impl Host {
+    /// How many times the list's reports were converted so far.
+    fn conversions(&self) -> u64 {
+        self.engine.conversions(self.list.lent())
+    }
+
     /// One request by the engine's one entry: the place in the list it was
     /// sent to, with the dispatch and the end told where a decision is leased.
     fn place(&self, seed: u64, prompt: Option<&conversations::Turn<'_>>) -> Option<u32> {
@@ -648,7 +679,6 @@ fn main() {
     let spec = AppliedSpec::validate(&document).expect("a valid document");
     let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(spec)));
     behind(engine);
-    let members = engine.pool_members(&workers);
     let mut receiver = None;
     let feed = TestFeed::attached_to(|loads| receiver = loads);
     let loads = reports(&workers);
@@ -662,11 +692,11 @@ fn main() {
     upkeep.spawn(engine.run());
     let host = Host {
         engine,
-        members,
+        list: Published::of(&workers),
         request,
         plain: request(0).plain(),
     };
-    let (publish, converted) = (|| feed.publish(&loads), || host.members.conversions());
+    let (publish, converted) = (|| feed.publish(&loads), || host.conversions());
     // The one call a host makes for a request, where the run asks it.
     if place::asked(&run, &host) {
         let rule = ruled::stated(&run);

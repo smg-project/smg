@@ -20,11 +20,12 @@ use smg_worker::{
 
 use super::*;
 use crate::{
-    document::spec::PolicySpec,
+    document::spec::{AppliedSpec, PolicySpec},
     engine::{
         decision::{LiftedVeto, ShedReason, Targets, SUBSET_HINT},
         decision_engine::{DecisionEngine, HeldDecision, HeldDecode},
         framework::{DecisionScope, Filter, Picker, TieBand},
+        list_cell::tests::PublishedList,
         pair_classes::PartnerClasses,
         policy_engine::pair::PairAdmission,
         records::worker_id,
@@ -53,8 +54,8 @@ impl PairAdmission for Gates {
     }
 }
 
-/// A host's three lists of ready workers with the engine's value of each:
-/// the prefills (list `0`), the decodes (`1`), the encoders (`2`). Every
+/// A host's three lists of ready workers as it publishes them, each with
+/// its cell: the prefills (list `0`), the decodes (`1`), the encoders (`2`). Every
 /// prefill pairs with every decode and every gate is open, until a case
 /// says otherwise, under the stock encode document.
 /// `loads` is the snapshot of load reports the host hands with a decision.
@@ -66,7 +67,7 @@ impl PairAdmission for Gates {
 /// itself: its stalled places, and those a hold stands on.
 struct Host {
     engine: PolicyEngine,
-    members: [PoolMembers; 3],
+    lists: [PublishedList; 3],
     partners: PartnerClasses,
     gates: Gates,
     loads: Option<Arc<LoadSnapshot>>,
@@ -146,20 +147,20 @@ impl Host {
         let counts = [prefills, decodes, encoders];
         // The host says of its workers that the first encoder takes images.
         let sees = url(2, 0);
-        let members = [0, 1, 2].map(|list| {
+        let lists = [0, 1, 2].map(|list| {
             let ready = |place| ready_worker(&url(list, place), "model-a");
             let workers = (0..counts[list]).map(ready).collect();
             let facts_of = |worker: &Arc<dyn Worker>| FixedFacts {
                 vision: worker.url() == sees,
                 ..FixedFacts::default()
             };
-            engine.pool_members_with_fixed_facts(&workers, facts_of)
+            PublishedList::with_facts(workers, facts_of)
         });
         let all: Vec<u32> = (0..decodes as u32).collect();
         let partners = PartnerClasses::number(decodes, (0..prefills).map(|_| all.as_slice()));
         Self {
             engine,
-            members,
+            lists,
             partners,
             gates: Gates(|_| true, |_| true),
             loads: None,
@@ -173,26 +174,26 @@ impl Host {
 
     /// The worker at `place` of list `list`.
     fn worker(&self, list: usize, place: usize) -> &Arc<dyn Worker> {
-        &self.members[list].workers()[place]
+        &self.lists[list].workers()[place]
     }
 
     /// The host says of the decode at `place` alone that it takes images.
     fn says_the_decode_takes_images(&mut self, place: usize) {
-        let (decodes, sees) = (Arc::clone(self.members[1].workers()), url(1, place));
+        let (decodes, sees) = (Arc::clone(self.lists[1].workers()), url(1, place));
         let facts_of = |worker: &Arc<dyn Worker>| FixedFacts {
             vision: worker.url() == sees,
             ..FixedFacts::default()
         };
-        self.members[1] = (self.engine).pool_members_with_fixed_facts(&decodes, facts_of);
+        self.lists[1] = PublishedList::with_facts(decodes, facts_of);
     }
 
     /// The host's three lists, with what it says of its encoders and of its
     /// prefills.
     fn lists<'a>(&'a self, said: (&'a [EncoderFacts], &'a [u32])) -> EncodeLists<'a> {
-        let [prefill, decode, encoders] = &self.members;
+        let [prefill, decode, encoders] = &self.lists;
         let pair = PairLists {
-            prefill,
-            decode,
+            prefill: prefill.lent(),
+            decode: decode.lent(),
             classes: &self.partners,
             admission: &self.gates,
             prefill_places: self.places[0].as_deref(),
@@ -204,7 +205,7 @@ impl Host {
         };
         EncodeLists {
             pair,
-            encoders,
+            encoders: encoders.lent(),
             facts: said.0,
             prefill_classes: said.1,
         }
@@ -269,10 +270,10 @@ impl Host {
             keys,
             ..EncodeItems::default()
         };
-        let (spec, clock, now) = (self.engine.spec(), self.engine.clock(), Instant::now());
+        let (engine, now) = (&self.engine, Instant::now());
         let loads = self.loads.as_ref();
-        let decision = lists.decide(spec, loads, clock, now, &mut request, items, placed);
-        assert_eq!(request.facts.now_micros, clock.micros(now));
+        let decision = lists.decide(engine, loads, now, &mut request, items, placed);
+        assert_eq!(request.facts.now_micros, engine.clock().micros(now));
         let named = |list: usize, place: u32, id| {
             assert_eq!(worker_id(self.worker(list, place as usize).as_ref()), id);
             place as usize
@@ -362,6 +363,51 @@ fn a_request_that_states_a_subset_hint_is_shed_as_its_pair_and_places_no_key() {
     assert_eq!((prefill, encoders), (Some(0), vec![0]));
     let (decision, _, encoders) = host.decide(said, &keys, Some(0), &mut placed);
     assert_eq!((gap(&decision), encoders.len()), (Some(SUBSET_HINT), 0));
+}
+
+/// The encoders' cell is asked where an encoder's rows are read, and by no
+/// answer that reads none. A request its pair alone answers, one whose
+/// pair is held to places, and one with no item that its wires decline
+/// each leave the cell of a list no decision read empty: none of them
+/// pays the fill of a list it does not read. The first decision over the
+/// three lists fills it.
+#[test]
+fn an_answer_that_reads_no_encoder_fills_no_encoders_cell() {
+    let said = (&[of(1)][..], &[1][..]);
+    let keys = [Identity::plain("item")];
+    let mut placed = EncodePlaced::new();
+    let host = Host::of(1, 1, 1);
+    let (decision, _, _) = host.decide(said, &keys, Some(0), &mut placed);
+    assert_eq!(gap(&decision), Some(SUBSET_HINT));
+    assert!(!host.lists[2].filled(), "the pair's answer read no encoder");
+    let mut held = Host::of(1, 1, 1);
+    held.places = [Some(vec![0]), None];
+    let (decision, _, _) = held.decide(said, &keys, None, &mut placed);
+    assert_eq!(declined_under(&decision), Some("places"));
+    assert!(
+        !held.lists[2].filled(),
+        "the places' refusal read no encoder"
+    );
+    // The prefills' first worker is dialed over gRPC, and the request
+    // states HTTP and no item.
+    let (mut wired, _) = hearing(2, 2, 2);
+    wired.lists[0] = first_dialed_over_grpc(&wired, 0);
+    let of_two = (&[of(1), of(1)][..], &[1, 1][..]);
+    let asks = Asks {
+        wires: WireModes::HTTP,
+        ..wired.asks(of_two)
+    };
+    let (entry, none, now) = (&wired.engine, EncodeItems::default(), Instant::now());
+    let decided = entry.decide_encode_at(&asks, none, &mut placed, || now);
+    let (decided, _) = decided.expect("a decision");
+    assert_eq!(declined_under(&decided.decision), Some(WIRES));
+    assert!(
+        !wired.lists[2].filled(),
+        "the wires' refusal read no encoder"
+    );
+    let (_, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert_eq!((prefill, encoders), (Some(0), vec![0]));
+    assert!(host.lists[2].filled(), "the decision read the encoders");
 }
 
 /// An encode request's pair is held to no places of its two lists: the
@@ -902,7 +948,7 @@ fn a_request_shed_or_declined_by_its_wires_issues_nothing_and_places_no_key() {
     // gRPC. Every other worker of the three is dialed over HTTP.
     for list in 0..3 {
         let (mut host, heard) = hearing(2, 2, 2);
-        host.members[list] = first_dialed_over_grpc(&host, list);
+        host.lists[list] = first_dialed_over_grpc(&host, list);
         let held_to = |wires| Asks {
             wires,
             ..host.asks(said)
@@ -946,8 +992,8 @@ fn a_request_shed_or_declined_by_its_wires_issues_nothing_and_places_no_key() {
 }
 
 /// `host`'s list `list` with its first worker dialed over gRPC, as the
-/// host's engine keeps a list: its other worker stays.
-fn first_dialed_over_grpc(host: &Host, list: usize) -> PoolMembers {
+/// host publishes a list: its other worker stays.
+fn first_dialed_over_grpc(host: &Host, list: usize) -> PublishedList {
     let dialed = <BasicWorkerBuilder>::new(format!("grpc://list-{list}-worker-0:9000"))
         .worker_type(WorkerType::Regular)
         .connection_mode(ConnectionMode::Grpc)
@@ -958,8 +1004,7 @@ fn first_dialed_over_grpc(host: &Host, list: usize) -> PoolMembers {
     let dialed: Arc<dyn Worker> = Arc::new(dialed);
     let stays = Arc::clone(host.worker(list, 1));
     let workers: Arc<[Arc<dyn Worker>]> = Arc::new([dialed, stays]);
-    let plain = |_: &Arc<dyn Worker>| FixedFacts::default();
-    host.engine.pool_members_with_fixed_facts(&workers, plain)
+    PublishedList::new(workers)
 }
 
 /// A decision that panics behind its first placed key leaves no key

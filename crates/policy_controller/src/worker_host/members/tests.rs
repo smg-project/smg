@@ -17,7 +17,7 @@ use super::*;
 use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
-        Constraints, PolicyEngine, PoolMembers, Request, RequestFacts, RequestMaker, WorkerId,
+        Constraints, LentList, PolicyEngine, Request, RequestFacts, RequestMaker, WorkerId,
         WorkerLists,
     },
     store::{MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
@@ -103,7 +103,7 @@ fn engine() -> PolicyEngine {
 }
 
 /// A single request with the list its host hands for it.
-struct Asks<'a>(Request<'a>, &'a PoolMembers);
+struct Asks<'a>(Request<'a>, LentList<'a>);
 
 impl RequestMaker for Asks<'_> {
     fn model(&self) -> &str {
@@ -195,7 +195,7 @@ fn a_decision_over_a_lent_list_names_its_targets_by_their_rows_ids() {
         },
         constraints: Constraints::default(),
     };
-    let asks = Asks(retry, engine.members_of(list));
+    let asks = Asks(retry, list);
     for _ in 0..4 {
         let answered = engine.decide_at(&asks, Instant::now).expect("an answer");
         let (whole, _) = answered.whole().expect("a whole decision");
