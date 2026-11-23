@@ -22,7 +22,7 @@ use parking_lot::Mutex;
 use rand::RngExt;
 use smg_policy_controller::{
     engine::{
-        PairAdmission, PairLists, PlaceRequest, PolicyEngine, PoolMembers, Unplaced, WorkerLists,
+        LentList, PairAdmission, PairLists, PlaceRequest, PolicyEngine, Unplaced, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
     tracking::{Placement, PlacementSide},
@@ -859,8 +859,8 @@ fn report_unplaced(model_id: &str, unplaced: &Unplaced, placed_none: &'static st
     }
 }
 
-/// The policy engine's answer for a single request over `members`, the
-/// engine's value of the request's list: what `inputs` state of the request
+/// The policy engine's answer for a single request over `lent`, the
+/// request's list with its cell: what `inputs` state of the request
 /// is handed as the engine reads it ([`place_request`]), with `ring`, the
 /// model's hash ring ([`ModelRing`]), and the engine places the request
 /// with one call. `None` where the engine names no worker.
@@ -875,13 +875,13 @@ fn placed_by_engine(
     engine: &'static PolicyEngine,
     policies: &PolicyRegistry,
     model_id: &str,
-    members: &PoolMembers,
+    lent: LentList<'_>,
     ring: Option<&dyn LentRing>,
     inputs: PlacementInputs<'_>,
 ) -> Option<Placed> {
     let mut tried = TriedIds::new();
-    tried_ids(members.workers(), inputs.tried, &mut tried);
-    let mut request = place_request(model_id, WorkerLists::Single(members), inputs, &tried);
+    tried_ids(lent.workers, inputs.tried, &mut tried);
+    let mut request = place_request(model_id, WorkerLists::Single(lent), inputs, &tried);
     request.ring = ring;
     match engine.place(&request) {
         Ok(placement) => {
@@ -941,9 +941,9 @@ fn single_of_by_engine(
 ) -> Option<Placed> {
     let ring = ModelRing::of(engine, policies, model_id, snapshot);
     let ring = ring.lent();
-    let members = engine.members_of(snapshot.lent(pool));
+    let lent = snapshot.lent(pool);
     if wire.is_none() {
-        return placed_by_engine(engine, policies, model_id, members, ring, inputs);
+        return placed_by_engine(engine, policies, model_id, lent, ring, inputs);
     }
     let own = inputs.candidate_filter;
     let on_wire = move |worker: &dyn Worker| {
@@ -953,7 +953,7 @@ fn single_of_by_engine(
         candidate_filter: Some(&on_wire),
         ..inputs
     };
-    placed_by_engine(engine, policies, model_id, members, ring, inputs)
+    placed_by_engine(engine, policies, model_id, lent, ring, inputs)
 }
 
 /// [`select_from`] where the gateway started the policy engine, out of
@@ -979,7 +979,7 @@ fn from_by_engine(
     let snapshot = registry.get_routing_snapshot(model_id);
     let ring = ModelRing::of(engine, policies, model_id, &snapshot);
     let ring = ring.lent();
-    let members = engine.members_of(snapshot.lent(pool));
+    let lent = snapshot.lent(pool);
     let own = inputs.candidate_filter;
     let in_slice = move |worker: &dyn Worker| {
         let at = std::ptr::from_ref(worker);
@@ -990,7 +990,7 @@ fn from_by_engine(
         candidate_filter: Some(&in_slice),
         ..inputs
     };
-    placed_by_engine(engine, policies, model_id, members, ring, inputs)
+    placed_by_engine(engine, policies, model_id, lent, ring, inputs)
 }
 
 /// Pick one worker for `model_id` from `pool`, or `None` when nothing is
@@ -2078,7 +2078,7 @@ impl PairAdmission for PairGates<'_> {
 }
 
 /// The policy engine's request for a pair over the two pools of `pairs`,
-/// handed to `ask`: the engine's value of each pool
+/// handed to `ask`: each pool's list with its cell
 /// ([`PdPairIndex::lent`]), the index's pair classes
 /// ([`PdPairIndex::classes`]) and this gateway's two admission reads
 /// ([`PairGates`]), on the hash ring the registry answers for the model now
@@ -2112,7 +2112,7 @@ fn with_pair_request<R>(
     inputs: PlacementInputs<'_>,
     ask: impl FnOnce(&PlaceRequest<'_>) -> R,
 ) -> R {
-    let [prefill, decode] = pairs.lent().map(|lent| engine.members_of(lent));
+    let [prefill, decode] = pairs.lent();
     let on_wire = |pool: &[Arc<dyn Worker>]| -> Option<Vec<u32>> {
         wire.is_some().then(|| {
             (0u32..)
@@ -2122,10 +2122,10 @@ fn with_pair_request<R>(
                 .collect()
         })
     };
-    let (prefill_places, decode_places) = (on_wire(prefill.workers()), on_wire(decode.workers()));
+    let (prefill_places, decode_places) = (on_wire(prefill.workers), on_wire(decode.workers));
     let gates = PairGates {
-        prefills: prefill.workers(),
-        decodes: decode.workers(),
+        prefills: prefill.workers,
+        decodes: decode.workers,
         capacity: prefill_capacity,
     };
     let lists = PairLists {
@@ -2144,8 +2144,8 @@ fn with_pair_request<R>(
     };
     // A failed attempt lists both its engines, whichever side failed.
     let (mut tried, mut decodes_tried) = (TriedIds::new(), TriedIds::new());
-    tried_ids(prefill.workers(), inputs.tried, &mut tried);
-    tried_ids(decode.workers(), inputs.tried, &mut decodes_tried);
+    tried_ids(prefill.workers, inputs.tried, &mut tried);
+    tried_ids(decode.workers, inputs.tried, &mut decodes_tried);
     tried.append(&mut decodes_tried);
     let ring = ModelRing::read(engine, policies, registry, model_id);
     let mut request = place_request(model_id, WorkerLists::Pair(lists), inputs, &tried);

@@ -110,10 +110,7 @@ fn seeds(namespace: Option<CacheNamespace>) -> HashSeeds {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
     use openai_protocol::common::CachePartition;
-    use smg_policy_controller::{
-        document::{AppliedSpec, PolicySpec},
-        engine::PolicyEngine,
-    };
+    use smg_policy_controller::engine::{LentList, ListCell};
 
     use super::*;
     use crate::routers::grpc::backend_client::BasicWorkerBuilder;
@@ -126,11 +123,6 @@ mod tests {
 
     fn ranked(url: &str, rank: usize) -> Arc<dyn Worker> {
         Arc::new(BasicWorkerBuilder::new(url).dp_config(rank, 2).build())
-    }
-
-    fn engine() -> PolicyEngine {
-        let document = PolicySpec::preset("round_robin").expect("a preset's name");
-        PolicyEngine::new(AppliedSpec::validate(&document).expect("a valid document"))
     }
 
     /// Each input a placement function takes reaches the engine under the
@@ -148,7 +140,12 @@ mod tests {
         };
         let namespace = CacheNamespace::derive(&partition).expect("a partition");
         let fleet: Arc<[Arc<dyn Worker>]> = Arc::from([worker("http://a:1"), worker("http://b:1")]);
-        let members = engine().pool_members(&fleet);
+        let cell = ListCell::default();
+        let lent = LentList {
+            workers: &fleet,
+            cell: &cell,
+            facts: None,
+        };
         let filter = |candidate: &dyn Worker| candidate.url() == "http://b:1";
         let engines = ["http://a:1".to_owned()];
         let mut ids = TriedIds::new();
@@ -163,12 +160,16 @@ mod tests {
             candidate_filter: Some(&filter),
             tried: &engines,
         };
-        let request = place_request(MODEL, WorkerLists::Single(&members), inputs, &ids);
+        let request = place_request(MODEL, WorkerLists::Single(lent), inputs, &ids);
 
         assert_eq!(request.model, MODEL);
         assert!(
-            matches!(request.lists, WorkerLists::Single(list) if std::ptr::eq(list, &members)),
-            "the list its caller handed"
+            matches!(
+                request.lists,
+                WorkerLists::Single(list)
+                    if std::ptr::eq(list.workers, &fleet) && std::ptr::eq(list.cell, &cell)
+            ),
+            "the list its caller handed, with its cell"
         );
         assert_eq!(request.prompt.tokens, Some(&tokens[..]));
         assert_eq!(request.prompt.text, Some("a prompt"));
