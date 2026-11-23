@@ -1,7 +1,9 @@
 //! What the gateway's start hands the policy engine it starts: the worker
 //! registry, whose events the engine's task follows, and the monitor of the
 //! workers' cache events. And what a start under a supplied document builds
-//! its worker objects with: the overload thresholds of its own settings.
+//! its worker objects with: the overload thresholds of its own settings,
+//! under the switch that document's bindings say, with the routes' shed word
+//! theirs too.
 
 use std::{
     sync::{Arc, Mutex},
@@ -13,12 +15,15 @@ use smg_grpc_client::common_proto::{
     kv_cache_event::Data, KvBlock, KvBlocksStored, KvCacheEvent, KvEventBatch,
 };
 use smg_policy_controller::{
-    document::PolicySpec,
+    document::{OverloadSpec, PolicySpec},
     engine::{Candidate, RequestFacts, Scorer, TieBand, WorkerId},
     stages::{Lifecycle, StageRegistry},
     tracking::{EventKind, EventSet, Membership},
 };
-use smg_worker::identity::basic::{ConnectionMode, WorkerType};
+use smg_worker::{
+    health::overload::OverloadThresholds,
+    identity::basic::{ConnectionMode, WorkerType},
+};
 
 use super::super::{build_app_context, Extensions, ServerConfig};
 use crate::{
@@ -177,6 +182,120 @@ async fn the_started_gateway_builds_its_workers_with_its_own_overload_thresholds
     let built = app.registration_settings.overload_defaults;
     assert_eq!(built.waiting_requests, Some(32));
     assert_eq!(built.token_usage, Some(0.9));
+}
+
+/// The stock document with one binding for each of `blocks`, under that
+/// `overload` block: the last binding is the stock one, and each binding
+/// ahead of it matches a model of its own.
+fn bound(blocks: &[OverloadSpec]) -> PolicySpec {
+    let mut document = PolicySpec::preset("round_robin").expect("a stock policy");
+    let stock = document.bindings.remove(0);
+    let ahead = blocks.len().saturating_sub(1);
+    document.bindings = blocks
+        .iter()
+        .enumerate()
+        .map(|(at, block)| {
+            let mut binding = stock.clone();
+            if at < ahead {
+                binding.matcher.model = format!("model-{at}");
+            }
+            binding.overload = Some(block.clone());
+            binding
+        })
+        .collect();
+    document
+}
+
+/// A gateway that runs `document` under the policy controller with these
+/// two overload thresholds of its own.
+fn under(document: PolicySpec, waiting: Option<usize>, usage: Option<f64>) -> ServerConfig {
+    ServerConfig::minimal(RouterConfig {
+        policy_controller: true,
+        policy_spec: Some(document),
+        worker_overload_waiting_requests: waiting,
+        worker_overload_token_usage: usage,
+        ..RouterConfig::default()
+    })
+}
+
+/// An `overload` block that says `enabled` and `shed`.
+fn said(enabled: bool, shed: bool) -> OverloadSpec {
+    OverloadSpec {
+        enabled,
+        shed_when_all_vetoed: shed,
+        ..OverloadSpec::default()
+    }
+}
+
+/// A gateway started under a supplied document reads the overload veto's
+/// two words from that document, once. Bindings that switch the block off
+/// leave the registration settings every worker object is built from no
+/// default threshold, whatever the two threshold settings say, and the
+/// registry the routes ask sheds by the document's word. Both thresholds at
+/// none agree with such a document.
+#[tokio::test]
+async fn the_started_gateway_reads_its_documents_overload_switch_and_shed_word() {
+    for (waiting, usage) in [(Some(32), Some(0.9)), (None, None)] {
+        let off_and_shed = bound(&[said(false, true)]);
+        let app = build_app_context(&under(off_and_shed, waiting, usage), Extensions::new())
+            .await
+            .expect("the gateway starts");
+        assert_eq!(
+            app.registration_settings.overload_defaults,
+            OverloadThresholds::default()
+        );
+        assert!(app.worker_registry.overload_shed_enabled());
+    }
+
+    // A block that is on leaves the thresholds standing, one of them at none
+    // too, and a document that says no shed leaves the shed word off.
+    for (waiting, usage) in [(Some(32), Some(0.9)), (Some(32), None)] {
+        let on = bound(&[said(true, false)]);
+        let app = build_app_context(&under(on, waiting, usage), Extensions::new())
+            .await
+            .expect("the gateway starts");
+        assert_eq!(
+            app.registration_settings.overload_defaults,
+            OverloadThresholds {
+                waiting_requests: waiting,
+                token_usage: usage,
+            }
+        );
+        assert!(!app.worker_registry.overload_shed_enabled());
+    }
+}
+
+/// A worker object has one default set of thresholds. A supplied document
+/// whose bindings differ on the overload switch ends the start, in the
+/// refusal's own words, and so does one whose bindings differ on the shed
+/// word. So does a document whose block is on over a gateway whose two
+/// thresholds are both none: the switch would switch nothing on, and the
+/// refusal names the two settings and the two ways out.
+#[tokio::test]
+async fn a_document_whose_overload_words_this_gateway_refuses_ends_the_start() {
+    let stated = (Some(32), Some(0.9));
+    for (blocks, (waiting, usage), refusal) in [
+        (
+            vec![said(true, false), said(false, false)],
+            stated,
+            "policy controller: bindings[1].overload.enabled = false is not the true bindings[0] says, by its block or the block's default: a gateway builds its workers with one default set of overload thresholds, so the bindings of its document say one word",
+        ),
+        (
+            vec![said(true, false), said(true, true)],
+            stated,
+            "policy controller: bindings[1].overload.shed_when_all_vetoed = true is not the false bindings[0] says, by its block or the block's default: a gateway's routes read one shed word for the process, so the bindings of its document say one word",
+        ),
+        (
+            vec![said(true, false)],
+            (None, None),
+            "policy controller: worker_overload_waiting_requests and worker_overload_token_usage are both none beside a policy document whose overload block is on: a gateway with no default threshold vetoes by none; state a threshold, or switch the block off in the document",
+        ),
+    ] {
+        let refused = build_app_context(&under(bound(&blocks), waiting, usage), Extensions::new())
+            .await
+            .err();
+        assert_eq!(refused.as_deref(), Some(refusal));
+    }
 }
 
 /// The token ids of prompt `number`: as many as [`BLOCKS`] blocks hold.

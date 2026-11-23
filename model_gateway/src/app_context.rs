@@ -730,6 +730,13 @@ impl AppContextBuilder {
         // words. The engine is started last, from the document that was
         // checked here.
         let policy = Self::policy_in_force(&router_config, policy_stages.as_ref())?;
+        // The overload veto's two words are read once below, where the
+        // registration settings are made and the registry's shed word is set.
+        // A supplied document this gateway refuses for them ends the start
+        // here, behind the document's own check and in the same form.
+        router_config
+            .supplied_overload_words()
+            .map_err(|refused| format!("policy controller: {refused}"))?;
         // A served model aliased under a vendor name keeps that vendor's
         // contract profile after the alias is resolved into the served name.
         ProviderProfile::register_model_aliases(
@@ -1004,8 +1011,10 @@ impl AppContextBuilder {
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(shed_retry_after_secs(config.load_monitor_interval()));
+        // The shed word in force: a supplied document's own where the policy
+        // controller runs one, else the configuration's.
         if let Some(registry) = self.worker_registry.as_ref() {
-            registry.set_overload_shed(config.worker_overload_shed);
+            registry.set_overload_shed(config.overload_words_in_force().shed);
         }
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.

@@ -1986,7 +1986,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | Part | Mark | What is missing |
 |---|---|---|
 | The policy document: profiles, bindings by model and phase, plans, a binding's shed word and its refusal of an overload number, routing key, sessions | **[built]** | |
-| A binding's overload switch (`overload.enabled`) under worker objects | **[planned]** | no host reads it there yet: one word for the bindings a host runs, read where the host builds its workers' default (decision 10) |
+| A binding's overload switch (`overload.enabled`) under worker objects | **[partly]** | a gateway that runs a supplied document reads it at its start, where it builds its workers' default: one word for the bindings a host runs (decision 10); a controller does not read it there yet |
 | Bindings by tenant, priority, header, prompt size, labels; a session id issued by the engine (`issue_session_id`) | **[planned]** | in the schema; a document that writes one is refused as not in this build |
 | `canary`, `override: allowed`, `admission` | **[planned]** | in the schema; a document that writes one is refused, and the error names the field |
 | `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; a pair's shadows run in no engine, and `explain.sample` is kept by the served controller alone (decision 7) |
@@ -2176,11 +2176,13 @@ policies have it. What that leaves of a binding's block:
   document too.
 - **Its shed word [built].** A binding keeps whether a request is shed when every worker is
   vetoed. A decision reads it.
-- **Its switch [planned].** Whether the program's default vetoes at all is one word for the
+- **Its switch [partly].** Whether the program's default vetoes at all is one word for the
   bindings a host runs, because a worker object has one default. The host reads it where it
-  builds that default, a gateway and a controller alike. A gateway refuses a document whose
-  bindings disagree on it, or on the shed word, which its routes read once for the process. A
-  worker's own thresholds veto either way.
+  builds that default. A gateway that runs a supplied document reads it at its start, and
+  refuses a document whose bindings disagree on it, or on the shed word, which its routes read
+  once for the process. A binding with no block says the defaults. A controller's reader of the
+  switch is planned: it does not read it on its worker objects yet. A worker's own thresholds
+  veto either way.
 
 ### Decision 11: the crate in CI and in the published set
 
