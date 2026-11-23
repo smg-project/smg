@@ -1020,25 +1020,28 @@ impl AppContextBuilder {
     /// against `stages`. A host's table holds the stock stages and the
     /// host's own, so a supplied document may name both. With no table the
     /// document is validated against the stock one. `None` where the
-    /// configuration leaves the classic policies in place
-    /// (`RouterConfig::policy_engine_decides`): the option is off, or it is
-    /// on in a gateway whose every router is one provider's. That gateway
-    /// places its requests by no routing policy, so the option moves
-    /// nothing there, and this start says so in one log line.
+    /// configuration leaves the classic policies in place.
     ///
     /// A document that is refused ends the start with the refusal's own
     /// words, before a store is opened and before the gateway listens.
+    ///
+    /// The classic policies stay in place with the option off, and with it
+    /// on in a gateway whose every router is one provider's
+    /// (`RouterConfig::policy_engine_decides`). That gateway places its
+    /// requests by no routing policy, so the option moves nothing there,
+    /// and this start says so in one log line.
     fn policy_in_force(
         config: &RouterConfig,
         stages: Option<&StageRegistry>,
     ) -> Result<Option<AppliedSpec>, String> {
+        if !config.policy_controller {
+            return Ok(None);
+        }
         if !config.policy_engine_decides() {
-            if config.policy_controller {
-                info!(
-                    "Policy controller on and placing no request: mode = {} places its requests by no routing policy",
-                    config.mode_type()
-                );
-            }
+            info!(
+                "Policy controller on and placing no request: mode = {} places its requests by no routing policy",
+                config.mode_type()
+            );
             return Ok(None);
         }
         let document = config
