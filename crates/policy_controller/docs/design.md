@@ -775,11 +775,10 @@ shadow. On main two pickers say so: round robin and `passthrough`.
    list, every worker of the list serves the protocols the request states, and the list's model
    is bound to a profile that one pick decides, the picker names a worker by its own rule and the
    engine answers with its position. Round robin adds one to the list's counter and takes the
-   worker it lands on if that worker is eligible. Past a refused worker it takes one more turn
-   for each 32 workers of the list, eight more at the most. Where its turns name no worker, the
-   engine reads the list once and the rotation picks among the eligible workers. `passthrough`
-   takes the first eligible worker in the list's order. Where no worker of the list is eligible,
-   the request takes the full path.
+   worker it lands on if that worker is eligible. Where it is not, the engine reads the list once
+   and the rotation picks among the eligible workers. `passthrough` takes the first eligible
+   worker in the list's order. Where no worker of the list is eligible, the request takes the
+   full path.
 2. If no stage of the document needs lease events, that is all. No request is built, no clock is
    read, no lease exists, and the host owes the engine nothing more.
 
@@ -963,7 +962,7 @@ the decode side adds `has-room`.
 |---|---|---|---|
 | `random` | none | `random` | nothing: it draws from the decision's seed |
 | `passthrough` | none | `passthrough` | nothing: the first survivor |
-| `round_robin` | none | `round-robin` | one counter for each worker list, which the one pick and a single request's draw over 16 workers or more both turn; in a fixed table, one rotation for each set of surviving workers and one for each pool whose draw is handed no list counter |
+| `round_robin` | none | `round-robin` | one counter for each worker list, which the one pick and a first attempt's whole decision both turn, at every list size; in a fixed table, one rotation for each set of surviving workers, which a refused turn, a retry and a request held to places turn, and one for each pool whose draw is handed no list counter |
 | `power_of_two` | `least-load` | `power-of-two` | what was dispatched to each worker since its last load report |
 | `least_load` | `least-load` | `best` | the same |
 | `consistent_hashing` | `consistent-hash` | `best` | nothing where the host lends its ring and states the request's place; else one hash ring, of the workers its decisions have read |

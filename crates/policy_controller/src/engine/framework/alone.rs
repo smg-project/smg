@@ -292,10 +292,12 @@ impl Engine {
         if let Some(weighted) = profile.scorers.first() {
             return Some(InTheWay::Scorer(weighted.scorer.name()));
         }
+        // The turns' mark says how the picker's draw picks: it asks no
+        // more of a decision than the draw's mark it stands beside.
         let asks_more = self
             .marks
             .get(usize::from(index))
-            .is_none_or(|marks| marks.0 & !Marks::DRAWS_FIRST != 0);
+            .is_none_or(|marks| marks.0 & !(Marks::DRAWS_FIRST | Marks::TURNS) != 0);
         if asks_more || !profile.picker.picks_alone() {
             return Some(InTheWay::Picker(profile.picker.name()));
         }

@@ -17,7 +17,7 @@ use crate::{
     policies::standard_filters,
     stages::{
         lifecycle::Lifecycle,
-        pickers::{pool_turns, push_drawn, target_of},
+        pickers::{push_drawn, target_of},
     },
     Draw,
 };
@@ -240,11 +240,14 @@ impl Picker for RoundRobin {
     }
 
     /// The pool's own turn by the pool's own word: one step of the word and
-    /// one read of the worker the turn lands on. A turn that lands on a
-    /// refused worker takes the pool's next turn, as many turns as the
-    /// pool's size earns (`pool_turns`), and the first worker kept is the
-    /// pick. No table is looked up: the caller keeps the pool's rotation
-    /// beside the pool.
+    /// one read of the worker the turn lands on, which is the pick where
+    /// the caller keeps it. A turn that lands on a refused worker picks
+    /// nobody: the caller reads the pool whole, and the workers that pass
+    /// take turns by their own rotation ([`Picker::pick_among`]). The turn
+    /// is not handed to the next worker of the list: a whole decision's
+    /// turn is not either ([`Self::draw_first`]), so a list's requests take
+    /// their workers by one rule. No table is looked up: the caller keeps
+    /// the pool's rotation beside the pool.
     fn pick_alone(
         &self,
         pool: &PoolWord<'_>,
@@ -254,13 +257,8 @@ impl Picker for RoundRobin {
         if rows == 0 {
             return None;
         }
-        for _ in 0..pool_turns(rows) {
-            let turn = pool.word.fetch_add(1, Ordering::Relaxed) as usize % rows;
-            if keep(turn) {
-                return Some(turn);
-            }
-        }
-        None
+        let turn = pool.word.fetch_add(1, Ordering::Relaxed) as usize % rows;
+        keep(turn).then_some(turn)
     }
 
     /// The set's own turn, in the table every rotation of a set lives in.
@@ -282,6 +280,11 @@ impl Picker for RoundRobin {
     /// turns. Where none is lent the rotation is the one the pool's name
     /// finds: its model, the request's phase, its membership epoch, the
     /// list the host names and its size.
+    ///
+    /// A retry takes no turn of the pool. The workers it may take are the
+    /// ones it has not tried, a part of the list, and the turn is a request's
+    /// whose workers are the list whole: the whole pass turns the rotation
+    /// of the workers the retry is left.
     fn draw_first(
         &self,
         facts: &RequestFacts<'_>,
@@ -292,7 +295,7 @@ impl Picker for RoundRobin {
         _: &mut Draw,
     ) -> bool {
         let rows = candidates.len();
-        if rows == 0 {
+        if rows == 0 || !facts.tried.is_empty() {
             return false;
         }
         let turn = match pool.word {
