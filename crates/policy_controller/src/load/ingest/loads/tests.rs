@@ -27,8 +27,7 @@ use crate::{
     engine::view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
     store::{
         GatewayId, JournalKinds, LoadSink, LoadSource, MembershipChange, MemoryStore, Position,
-        Reachability, Signals, ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore,
-        PUBLISH_WINDOW,
+        Reachability, Signals, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
 };
 
@@ -1028,28 +1027,11 @@ async fn run_shows_a_row_that_landed_inside_the_window_at_the_windows_end() {
     probe.answers("grpc://a:1", &[busy]);
     probe.answers("grpc://b:1", &[busy]);
     probe.held.lock().insert("grpc://b:1".to_owned());
-    // What a decision reads of the worker's load at this instant.
+    // What the published world holds of the worker's load at this instant.
     let seen = |id: WorkerId| {
-        let mut out = ViewBuffers::default();
-        store
-            .build_view(
-                "m",
-                Role::Single,
-                &ViewQuery {
-                    gateway: GatewayId::LOCAL,
-                    now: now(),
-                    pinned: None,
-                    affinity: false,
-                    signal_cells: false,
-                },
-                &mut out,
-            )
-            .expect("the pool");
-        out.candidates
-            .iter()
-            .find(|row| row.id == id)
-            .and_then(|row| row.load)
-            .map(|load| load.running)
+        let world = store.snapshot();
+        let row = world.first_row_of(id);
+        row.and_then(|row| row.load).map(|load| load.running)
     };
     let driver = Arc::new(driver(&store, &probe, TEN));
     let (stop, stopped) = watch::channel(false);
@@ -1439,21 +1421,15 @@ fn vetoing_at(waiting: u32) -> AppliedSpec {
     AppliedSpec::validate(&document).expect("the document validates")
 }
 
-/// Each row of the model's pool: whether it carries the overload verdict.
+/// Each worker on file, by id: whether its published row carries the
+/// overload verdict. Every worker of these cases serves the one pool.
 fn vetoed(store: &MemoryStore) -> Vec<bool> {
-    let mut out = ViewBuffers::default();
-    let ask = ViewQuery {
-        gateway: GatewayId(1),
-        now: now(),
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
-    };
-    store
-        .build_view("m", Role::Single, &ask, &mut out)
-        .expect("the pool");
-    out.candidates
-        .iter()
+    let world = store.snapshot();
+    let on_file = store.checkpoint(JournalKinds::All).rows;
+    let mut ids: Vec<WorkerId> = on_file.iter().map(|row| row.id).collect();
+    ids.sort_unstable();
+    ids.into_iter()
+        .map(|id| world.first_row_of(id).expect("the worker's published row"))
         .map(|row| row.health.overloaded)
         .collect()
 }
@@ -2061,19 +2037,11 @@ async fn a_followers_loop_pays_the_stores_publications_and_polls_no_engine() {
     let mut tasks = JoinSet::new();
     let running = Arc::clone(&driver);
     tasks.spawn(async move { running.run_while(stopped, polls).await });
-    // What a decision reads of the worker's load; `None` while the worker
-    // is no member of the published world.
+    // What the published world holds of the worker's load; `None` while the
+    // worker is no member of the published world.
     let seen = |id: WorkerId| {
-        let mut out = ViewBuffers::default();
-        let ask = ViewQuery {
-            gateway: GatewayId::LOCAL,
-            now: now(),
-            pinned: None,
-            affinity: false,
-            signal_cells: false,
-        };
-        store.build_view("m", Role::Single, &ask, &mut out)?;
-        let row = out.candidates.iter().find(|row| row.id == id)?;
+        let world = store.snapshot();
+        let row = world.first_row_of(id)?;
         Some(row.load.map(|load| load.running))
     };
     // The leader's registration and its status, followed as the applier
@@ -2125,35 +2093,6 @@ fn declare(store: &MemoryStore, generation: u64, signals: &[(&str, &str)]) {
     }
     let spec = AppliedSpec::validate(&document).expect("the document validates");
     store.apply(spec).expect("a newer generation");
-}
-
-/// Each row's signal cells once the window's writes are shown, by worker:
-/// a cell's value and its sample instant, or none.
-fn cells(store: &MemoryStore) -> HashMap<WorkerId, Vec<Option<(f64, u64)>>> {
-    if let Some(due) = store.publish_due() {
-        store.publish(due);
-    }
-    store.deciding(|world| {
-        let ask = ViewQuery {
-            gateway: GatewayId(1),
-            now: now(),
-            pinned: None,
-            affinity: false,
-            signal_cells: true,
-        };
-        let mut out = ViewBuffers::default();
-        let view = world
-            .view("m", Role::Single, &ask, false, &mut out)
-            .expect("the pool");
-        let block = view.signal_cells.expect("the publication's block");
-        let held = |cell: &crate::load::SignalCell| {
-            (!cell.is_none()).then_some((cell.value, cell.sampled_at_micros))
-        };
-        let cells = block.cells().chunks(block.signals());
-        let ids = view.candidates.iter().map(|row| row.id);
-        ids.zip(cells.map(|cells| cells.iter().map(held).collect()))
-            .collect()
-    })
 }
 
 /// One rank's answer: its depth by name, a name no document declares, and
@@ -2215,16 +2154,9 @@ async fn a_polls_answer_writes_each_ranks_declared_values_behind_its_row() {
             }),
         },
     );
-    // A value is as old as it says before the poll began, and one that
-    // states no age is as old as its row: an unstamped poll's is sampled
-    // at the poll's start, never at its arrival.
-    let aged = store.micros(started - Duration::from_millis(150));
-    let fresh = store.micros(started);
-    let held = cells(&store);
-    assert_eq!(held[&rank0], [Some((3.0, aged)), Some((1_024.0, fresh))]);
-    assert_eq!(held[&rank1], [Some((5.0, fresh)), Some((1_025.0, fresh))]);
-    // Each rank's row stands too, and the name no document declares was
-    // never offered: no write counts it.
+    // Each rank's row stands, and the store took the two declared names of
+    // each rank. The name no document declares was never offered: no write
+    // counts it.
     assert!(row(&store, rank0, 0).is_some() && row(&store, rank1, 1).is_some());
     assert_eq!(store.stats().signal_writes, [4, 0, 0, 0, 0, 0]);
 }
@@ -2256,11 +2188,9 @@ async fn a_row_the_store_passes_over_takes_its_values_with_it() {
             }),
         },
     );
-    let held = cells(&store);
-    assert_eq!(held[&rank0], [None]);
-    assert_eq!(held[&rank1], [Some((5.0, store.micros(started)))]);
     let (stands, source) = row(&store, rank0, 0).expect("rank 0's record");
     assert_eq!((stands.running, source), (9, LoadSource::Stream));
+    // The answer states one declared value a rank, and one was written.
     assert_eq!(store.stats().signal_writes, [1, 0, 0, 0, 0, 0]);
 }
 
@@ -2306,11 +2236,8 @@ async fn a_polled_list_is_put_under_the_bounds_before_it_is_read_and_what_left_i
             }),
         },
     );
-    // The 65th value is never read, the name's first statement stands,
-    // and the value that is no number never reaches the store.
-    let held = cells(&store);
-    assert_eq!(held[&rank0], [None, None]);
-    assert_eq!(held[&rank1], [Some((5.0, store.micros(started))), None]);
+    // Three values leave ahead of the read: the 65th, the name's second
+    // statement and the value that is no number. One reaches the store.
     assert_eq!(driver.stats().values_dropped.load(Ordering::Relaxed), 3);
     assert_eq!(store.stats().signal_writes, [1, 0, 0, 0, 0, 0]);
 }

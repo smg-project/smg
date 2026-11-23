@@ -1440,9 +1440,9 @@ impl MemoryStore {
             && self.loads.try_lock().is_some()
     }
 
-    /// The KV tables, for the index's cases.
+    /// The KV tables, for the cases of the index and of its feed.
     #[cfg(test)]
-    pub(super) fn kv(&self) -> &KvTables {
+    pub(crate) fn kv(&self) -> &KvTables {
         &self.kv
     }
 

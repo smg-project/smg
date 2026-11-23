@@ -22,8 +22,8 @@ use crate::{
         identity, pairing::PairingDescriptor, BatchFacts, BatchOutcome, ContentHash, GatewayId,
         HealthSink, Journal, JournalKinds, KvEvent, KvEventSink, LeasesStore, LoadSample, LoadSink,
         LoadSource, MembershipChange, MembershipTail, MemoryStore, OutsideLists, Position,
-        SequenceHash, Signals, StoreCheckpoint, StoredBlock, ViewBuffers, ViewQuery, WorkerFacts,
-        WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+        SequenceHash, Signals, StoreCheckpoint, StoredBlock, WorkerFacts, WorkerPatch, WorkerRow,
+        WorkerStatus, WorkersStore,
     },
     tracking::lease::TransportClass,
 };
@@ -977,35 +977,18 @@ fn later() -> Instant {
     Instant::now() + Duration::from_secs(READS.fetch_add(1, Ordering::SeqCst) + 1)
 }
 
-/// What a decision of gateway 1 reads of the pool at `at`, once every
-/// folded load row is published: each row's id, width, health bits and load
-/// row. The row's age is set aside: a store counts it from its own origin,
-/// so two stores publish one report a millisecond apart.
+/// What the store's world holds of each worker on file at `at`, once every
+/// folded load row is published: the id, width, health bits and load row of
+/// its published row, by id. A worker no pool lists has none.
 fn pool(store: &MemoryStore, at: Instant) -> Vec<(WorkerId, u16, Health, Option<LoadRow>)> {
     store.publish(at);
-    let ask = ViewQuery {
-        gateway: GatewayId(1),
-        now: at,
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
-    };
-    let mut out = ViewBuffers::default();
-    if store
-        .build_view("m", Role::Single, &ask, &mut out)
-        .is_none()
-    {
-        return Vec::new();
-    }
-    out.candidates
-        .iter()
-        .map(|row| {
-            let load = row.load.map(|load| LoadRow {
-                report_age_ms: 0,
-                ..load
-            });
-            (row.id, row.dp_size, row.health, load)
-        })
+    let world = store.snapshot();
+    let on_file = store.checkpoint(JournalKinds::All).rows;
+    let mut ids: Vec<WorkerId> = on_file.iter().map(|row| row.id).collect();
+    ids.sort_unstable();
+    ids.into_iter()
+        .filter_map(|id| world.first_row_of(id))
+        .map(|row| (row.id, row.dp_size, row.health, row.load))
         .collect()
 }
 
@@ -1342,17 +1325,22 @@ fn a_restore_leaves_nothing_of_the_tables_it_replaces() {
     store.record(gone, 0, running(1), now, LoadSource::Stream);
     HealthSink::completed(&store, ASKER, kept, TransportClass::Ok, now);
     store.gateway_veto(ASKER, kept, Some(now + Duration::from_secs(3_600)));
-    let stalled = |store: &MemoryStore| {
-        let rows = pool(store, later());
-        rows.iter()
-            .any(|(id, _, health, _)| *id == kept && health.breaker_open)
+    // Whether the published world hands the asker a held veto on the row.
+    let held = |store: &MemoryStore| {
+        let at = later();
+        store.publish(at);
+        let world = store.snapshot();
+        let mut standing = world
+            .gateway_vetoes("m", Role::Single, ASKER)
+            .standing_at(at);
+        standing.any(|veto| veto.id == kept && veto.held)
     };
-    assert!(stalled(&store));
+    assert!(held(&store));
     assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
     assert!(WorkersStore::get(&store, gone).is_none());
     assert!(store.load(gone, 0).is_none());
     assert!(!store.vetoed(ASKER, kept, now), "the veto in the table");
-    assert!(!stalled(&store), "the veto in the world");
+    assert!(!held(&store), "the veto in the world");
     assert!(!store.completed_ok_since(ASKER, kept, now));
     // A watcher of the store that was reads no change across the restore.
     assert_eq!(store.changes_since(0), MembershipTail::SnapshotRequired);
@@ -1762,24 +1750,18 @@ fn pair_facts(key: &str, role: Role, transport: Option<&str>) -> WorkerFacts {
     }
 }
 
-/// The id and the pair class of every prefill row and then every decode row
-/// of the model, as views of the store's world read them.
+/// The id and the pair class of every prefill and then every decode the
+/// model's classes name, each as its published row carries it.
 fn pair_rows(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
-    let ask = ViewQuery {
-        gateway: GatewayId(1),
-        now: Instant::now(),
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
+    let world = store.snapshot();
+    let Some(classes) = world.pairs("m") else {
+        return Vec::new();
     };
-    let mut out = ViewBuffers::default();
-    let mut rows = Vec::new();
-    for role in [Role::Prefill, Role::Decode] {
-        if store.build_view("m", role, &ask, &mut out).is_some() {
-            rows.extend(out.candidates.iter().map(|row| (row.id, row.pair_class)));
-        }
-    }
-    rows
+    let named = classes.prefills().iter().chain(classes.decodes());
+    named
+        .filter_map(|&(id, _)| world.first_row_of(id))
+        .map(|row| (row.id, row.pair_class))
+        .collect()
 }
 
 #[test]
