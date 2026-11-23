@@ -501,7 +501,10 @@ request goes to.
 - **[planned]** A request given as text is decided the same way in the host's string tree.
 - **[planned]** The hash table leaves the single decision. Until then a model with an index of
   cache events reads the index and the hash table together, as today.
-- A prefill-decode pair reads no record of sent prefixes in the engine today. Classic keeps
+- **[built]** A prefill-decode pair decided over worker lists reads the hash table and the
+  host's index of cache events for each side, by the side's own list, and writes each side's
+  pick into the hash table. An encode request's pair reads neither yet.
+  Classic keeps
   trees for each side. **[planned]** The engine reads the host's trees for each side.
 
 A decision of the engine publishes no insert to other gateways.

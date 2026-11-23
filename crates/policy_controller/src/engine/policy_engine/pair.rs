@@ -61,6 +61,14 @@
 //! stage takes what it takes of its own state, where it scores a record by
 //! its report and where it hears a word.
 //!
+//! **Who holds the prompt.** A side whose phase reads affinity is handed
+//! its own list's column for the decision ([`overlap::column`]): what each
+//! worker of the side holds of the request, by the host's index of cache
+//! events and by the record of sent prefixes, read at the side's phase.
+//! Behind a pick its profile is told of, each side's record keeps where
+//! the prompt went ([`overlap::record_prefix`]). The decode asked again
+//! reads the decodes' column alone.
+//!
 //! **Named signals.** Under a document a stage of which reads a named
 //! signal, a side whose profile reads one is lent its own list's signal
 //! cells, of the snapshot the decision holds ([`signals::sides`]). They are
@@ -78,7 +86,7 @@ use std::{
 
 use smg_worker::load::state::LoadSnapshot;
 
-use super::{signals, single, Loaded, PolicyEngine, PoolMembers};
+use super::{overlap, signals, single, Loaded, PolicyEngine, PoolMembers};
 use crate::{
     engine::{
         decision::{shed, Decision, ShedReason, Target, SUBSET_HINT, WIRES},
@@ -89,7 +97,10 @@ use crate::{
         list_cell::LentList,
         pair_classes::PartnerClasses,
         records::{vetoes, HeldCells, Live, PoolRecords},
-        view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role, Session, WorkerId},
+        view::{
+            AffinityFacts, Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role, Session,
+            WorkerId,
+        },
     },
     stages::Lifecycle,
     tracking::lease::{Lease, LeaseId, LeaseKind, Side, DISPATCH_TTL},
@@ -384,6 +395,9 @@ impl<'a> PairLists<'a> {
         judged: bool,
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
+        // The host's indexes of cache events and the records of sent
+        // prefixes, which a side's column is read from.
+        let kept = &engine.affinity;
         // One value for both lists' records: this call's instant on the
         // clock and the host's snapshot, as the host holds it. No session
         // key's text is handed to it: a pair's records carry no count of a
@@ -478,15 +492,43 @@ impl<'a> PairLists<'a> {
                     .map(|side| side.as_ref().and_then(HeldCells::cells)),
                 None => [None; 2],
             };
+            // A side whose phase reads who holds the prompt is handed its
+            // own list's column, read at the side's phase. The decode
+            // asked again reads the decodes' alone: its prefill ran
+            // already. A side whose phase reads none pays this one test.
+            let [prefill_column, decode_column] = &mut buffers.columns;
+            let fill = |side: &PoolMembers, records: &PoolRecords, phase, column| {
+                let (workers, ids) = (side.workers(), records.ids());
+                overlap::column(
+                    kept,
+                    side.affinity(),
+                    spec,
+                    workers,
+                    ids,
+                    phase,
+                    facts,
+                    column,
+                )
+            };
+            let reads = |phase| engine.needs_for_phase(phase).affinity;
+            prefill_column.clear();
+            let prefill_read = (held.is_none() && reads(Phase::Prefill))
+                .then(|| fill(prefill, prefill_records, Phase::Prefill, prefill_column))
+                .flatten();
+            decode_column.clear();
+            let decode_read = reads(Phase::Decode)
+                .then(|| fill(decode, decode_records, Phase::Decode, decode_column))
+                .flatten();
             let pools = PairPools {
                 prefills,
                 decodes,
+                prefill_affinity: prefill_column.as_slice(),
+                decode_affinity: decode_column.as_slice(),
                 prefill_signal_cells,
                 decode_signal_cells,
                 table: self.classes.table(),
-                ..PairPools::default()
             };
-            match held {
+            let decision = match held {
                 None => {
                     let sides = (cx, [prefill_side, decode_side]);
                     decide_records(engine, facts, sides, &prefill_facts, pools, scratch)
@@ -495,7 +537,23 @@ impl<'a> PairLists<'a> {
                     let side = (cx, decode_side);
                     decide_decode_records(engine, facts, side, &decode_facts, pools, held, scratch)
                 }
+            };
+            // Behind a pick its profile is told of, each side's record of
+            // sent prefixes keeps where the prompt went. A pair neither
+            // side of which read its record asks nothing of the pick.
+            let read = prefill_read.is_some() || decode_read.is_some();
+            let told = read.then(|| overlap::told_target(&decision)).flatten();
+            if let Some(first) = told {
+                if let Some(read) = prefill_read {
+                    let pool = prefill.affinity();
+                    overlap::record_prefix(pool, Phase::Prefill, facts, read, first.id);
+                }
+                if let (Some(read), Some(pair)) = (decode_read, first.pair) {
+                    let pool = decode.affinity();
+                    overlap::record_prefix(pool, Phase::Decode, facts, read, pair.decode_id);
+                }
             }
+            decision
         };
         let decision = BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
             Ok(mut buffers) => decide(&mut buffers),
@@ -549,12 +607,15 @@ pub(super) fn tried_engines(
 /// leaves them as they were. A pair that states a hard demand keeps each
 /// side's places that meet it here, the prefills' first: such a request
 /// allocates nothing once each list has grown to its side.
+/// A side whose phase reads who holds the prompt keeps its list's column
+/// here, the prefills' first.
 #[derive(Debug, Default)]
 pub(super) struct Buffers {
     pub(super) rows: [Vec<Candidate>; 2],
     pub(super) encoders: Vec<Candidate>,
     pub(super) scratch: Scratch,
     meeting: [Vec<u32>; 2],
+    columns: [Vec<AffinityFacts>; 2],
 }
 
 thread_local! {
@@ -949,6 +1010,7 @@ mod tests {
             demands::DemandFacts,
             framework::{Filter, Picker, TieBand},
             list_cell::tests::PublishedList,
+            prompt_hashes::{HashSeeds, PromptHashes},
             records::worker_id,
             sticky_sessions::{DecodeVerdict, SessionVerdict},
             view::{FixedFacts, Identity, WireModes},
@@ -4444,5 +4506,97 @@ mod tests {
             BTreeSet::from([1]),
             "the tried decode's engine"
         );
+    }
+
+    /// A host of four prefills and four decodes under the stock policies
+    /// `prefill` and `decode` of a pair's two sides.
+    fn host_under(prefill: &str, decode: &str) -> Host {
+        let mut document = PolicySpec::pair_presets(prefill, decode).expect("the pair presets");
+        document.generation = 3;
+        let spec = AppliedSpec::validate(&document).expect("a valid document");
+        Host::under((spec, Arc::default()), 4, 4)
+    }
+
+    /// A prompt of four whole blocks as its host hashes it, its tokens
+    /// counted from `first`.
+    fn prompt(host: &Host, first: u32) -> PromptHashes {
+        let tokens: Vec<u32> = (first..first + 64).collect();
+        let spec = host.engine.spec();
+        let seeds = HashSeeds::PLAIN;
+        let hashes = PromptHashes::under_document(spec, Some(16), Some(&tokens), None, seeds);
+        let mut read = RequestFacts::default();
+        hashes.write_to(&mut read);
+        assert_eq!(read.block_hashes.len(), 4, "four hashed blocks");
+        hashes
+    }
+
+    /// One decision of a pair for the prompt `hashes`, drawing by `seed`:
+    /// the pair's first, or the decode's again behind `held`.
+    fn decide_prompt(
+        host: &Host,
+        hashes: &PromptHashes,
+        seed: u64,
+        held: Option<&Target>,
+    ) -> Decision {
+        let classes = every(host.prefills.len(), host.decodes.len() as u32);
+        let Asks(mut request, lists, _) = host.asks(&classes, false);
+        request.facts = RequestFacts { seed, ..facts() };
+        hashes.write_to(&mut request.facts);
+        lists.decide(&host.engine, None, Instant::now(), &mut request, held)
+    }
+
+    /// Under `cache_aware` on both sides, a prompt sent to a pair goes to
+    /// that pair again under any draw: each side reads its own list's
+    /// column of who was sent the prompt, and its pick is written behind
+    /// it. Prompts nobody was sent are placed by their draws, on more than
+    /// one pair.
+    #[test]
+    fn a_prompt_sent_to_a_pair_goes_to_that_pair_again() {
+        let host = host_under("cache_aware", "cache_aware");
+        let sent = prompt(&host, 1_000);
+        let first = host.picked(&decide_prompt(&host, &sent, 1, None));
+        for seed in 2..34 {
+            let again = host.picked(&decide_prompt(&host, &sent, seed, None));
+            assert_eq!(again, first, "seed {seed}");
+        }
+        let fresh: BTreeSet<(usize, usize)> = (0..32_u32)
+            .map(|at| {
+                let unsent = prompt(&host, 100_000 + 1_000 * at);
+                host.picked(&decide_prompt(&host, &unsent, u64::from(at), None))
+            })
+            .collect();
+        assert!(fresh.len() > 1, "{fresh:?}");
+    }
+
+    /// The decode asked again behind a held prefill reads the decodes'
+    /// column: it goes to the decode its prompt was sent to, under any
+    /// draw.
+    #[test]
+    fn the_decode_asked_again_goes_to_the_decode_its_prompt_was_sent_to() {
+        let host = host_under("cache_aware", "cache_aware");
+        let sent = prompt(&host, 1_000);
+        let (prefill, decode) = host.picked(&decide_prompt(&host, &sent, 1, None));
+        let held = prefill_alone(worker_id(host.prefills[prefill].as_ref()));
+        for seed in 2..34 {
+            let again = decide_prompt(&host, &sent, seed, Some(&held));
+            assert_eq!(host.picked(&again), (prefill, decode), "seed {seed}");
+        }
+    }
+
+    /// A side reads its own list's column and no other's: with
+    /// `cache_aware` on the prefills and `round_robin` on the decodes, a
+    /// prompt's prefill stays and its decodes take their turns.
+    #[test]
+    fn a_side_that_reads_no_affinity_keeps_its_own_rule() {
+        let host = host_under("cache_aware", "round_robin");
+        let sent = prompt(&host, 1_000);
+        let (prefill, _) = host.picked(&decide_prompt(&host, &sent, 1, None));
+        let mut decodes = BTreeSet::new();
+        for seed in 2..10 {
+            let again = host.picked(&decide_prompt(&host, &sent, seed, None));
+            assert_eq!(again.0, prefill, "seed {seed}");
+            decodes.insert(again.1);
+        }
+        assert_eq!(decodes.len(), 4, "{decodes:?}");
     }
 }
