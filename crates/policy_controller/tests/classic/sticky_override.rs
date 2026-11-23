@@ -991,7 +991,7 @@ mod sends {
             // own value of it.
             let (list, cell) = (Arc::clone(&host.list), ListCell::default());
             let members = lent(&list, &cell);
-            let (mut pinned, mut behind, mut ended) = (0, 0, 0);
+            let (mut pinned, mut behind, mut ended, mut capped) = (0, 0, 0, 0);
             for nth in 0..48_u32 {
                 if nth >= 8 && nth % 2 == 0 {
                     let oldest = host.held.pop_front().expect("a request in flight");
@@ -1000,6 +1000,10 @@ mod sends {
                 }
                 let key = ["k0", "k1", "k2", "k3", "k4", ""][nth as usize % 6];
                 let tokens = [1_000, 12_000, 3_000, 20_000, 500][nth as usize % 5];
+                // Two of the key's requests stand on one worker: the cap of
+                // the override's rule.
+                let two = |worker: &Arc<dyn Worker>| worker.routing_key_inflight(key) >= 2;
+                let at_cap = !key.is_empty() && host.list.iter().any(two);
                 let (guard, place, by) = host.decide(&keyed, members, (key, tokens, nth));
                 let mut guards = vec![guard];
                 if by == PlacedBy::Rule {
@@ -1012,13 +1016,20 @@ mod sends {
                     );
                     guards.push(asked);
                     behind += u32::from(pinned > 0);
+                    // The policy is asked of a key at its first request,
+                    // which is among the first six, and at its cap.
+                    assert!(
+                        key.is_empty() || nth < 6 || at_cap,
+                        "{workers} workers: request {nth}, {key:?}: a pin under its cap"
+                    );
+                    capped += u32::from(at_cap);
                 }
                 host.sent(guards, (key, nth), place);
             }
             assert!(
-                pinned >= 8 && behind >= 8 && ended >= 8,
+                pinned >= 8 && behind >= 8 && ended >= 8 && capped >= 8,
                 "{workers} workers: {pinned} pinned requests, {behind} placed behind one, \
-                 {ended} pinned requests ended"
+                 {ended} pinned requests ended, {capped} keyed requests at their cap"
             );
         }
     }

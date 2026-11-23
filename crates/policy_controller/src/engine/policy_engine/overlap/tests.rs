@@ -229,6 +229,16 @@ fn picked(position: u32, id: WorkerId) -> Decision {
     })
 }
 
+/// [`picked`] as the binding's sessions rule places it alone, under the
+/// rule's word of a request it places.
+fn ruled(position: u32, id: WorkerId, kept: RulePlaced) -> Decision {
+    let mut decision = picked(position, id);
+    if let Decision::Pick(pick) = &mut decision {
+        pick.targets.by_rule(kept);
+    }
+    decision
+}
+
 fn shed() -> Decision {
     Decision::Shed(Shed {
         reason: ShedReason::PolicyDeclined,
@@ -484,17 +494,20 @@ fn the_record_names_the_worker_a_prefix_was_sent_to() {
     assert_eq!(bed.affinity.left_out(), 0);
 }
 
-/// A pick the binding's sessions rule placed alone leaves no prefix in the
-/// record, at either of its writes: the one behind a decision named its
-/// rows, and the one behind a decision handed the column whole. The same
-/// pick by the profile's stages is recorded at both. A profile that is
-/// named no row keeps no record of its own: its list keeps one for a shadow
-/// that is named rows, and the column shows what that record holds. A
-/// gateway's sticky map hands a request it places to no policy, so the
-/// policy's record never takes it
+/// A pick the binding's sessions rule placed alone is recorded by the
+/// rule's own word of it, at both of the record's writes: the one behind a
+/// decision named its rows, and the one behind a decision handed the column
+/// whole. A pick the rule keeps from the profile leaves no prefix. One that
+/// is the profile's own, the rule's default, is written as a pick by the
+/// profile's stages is. The lookup returns the answer it is handed either
+/// way: a pin the keyed entry followed passes through it with its answer
+/// made. A profile that is named no row keeps no record of its own: its
+/// list keeps one for a shadow that is named rows, and the column shows
+/// what that record holds. A gateway's sticky map hands a request it places
+/// to no policy, so the policy's record never takes it
 /// (`model_gateway/src/policies/registry.rs:543-546`, `:589-590`).
 #[test]
-fn a_pick_the_sessions_rule_placed_is_recorded_at_neither_write() {
+fn a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word_at_both_writes() {
     for whole in [false, true] {
         let spec = if whole {
             // The shadow is the preset's profile, named rows. The live
@@ -527,18 +540,18 @@ fn a_pick_the_sessions_rule_placed_is_recorded_at_neither_write() {
         assert!(record.is_some(), "whole: {whole}: the list keeps a record");
         let (affinity, _, _) = hosted(false);
         let bed = Bed::new(affinity, spec, 4);
-        let asked = prompt(1_000, 4);
-        // One decision of the prompt by `answer`, and the blocks the record
-        // held for each worker when it was asked.
-        let decided = |answer: &dyn Fn() -> Decision| {
+        // One decision of `asked` answered `answer`: the blocks the record
+        // held for each worker when it was asked. The lookup returns the
+        // answer it was handed.
+        let decided = |asked: &PromptHashes, answer: Decision| {
             let mut held = vec![0; bed.ids.len()];
-            decide(
+            let returned = decide(
                 &bed.affinity,
                 &bed.pool,
                 &bed.spec,
                 &bed.workers,
                 &bed.ids,
-                &mut request(&asked, 7, NOW),
+                &mut request(asked, 7, NOW),
                 |_| None,
                 |_| true,
                 |facts| {
@@ -555,23 +568,30 @@ fn a_pick_the_sessions_rule_placed_is_recorded_at_neither_write() {
                             }
                         }
                     }
-                    answer()
+                    answer
                 },
             );
+            assert_eq!(returned, answer, "whole: {whole}: the answer handed");
             held
         };
-        let by_stages = || picked(1, bed.ids[1]);
-        let by_rule = || {
-            let mut decision = by_stages();
-            if let Decision::Pick(pick) = &mut decision {
-                pick.targets.by_rule(RulePlaced::Told);
-            }
-            decision
-        };
-        assert_eq!(decided(&by_rule), [0; 4], "whole: {whole}");
-        assert_eq!(decided(&by_rule), [0; 4], "whole: {whole}: the rule's pick");
-        assert_eq!(decided(&by_stages), [0; 4], "whole: {whole}");
-        assert_eq!(decided(&shed), [0, 4, 0, 0], "whole: {whole}: the stages'");
+        let (kept, own) = (prompt(1_000, 4), prompt(2_000, 4));
+        // Kept from the profile: nothing is written, at one decision or two.
+        let untold = ruled(1, bed.ids[1], RulePlaced::Untold);
+        assert_eq!(decided(&kept, untold), [0; 4], "whole: {whole}");
+        assert_eq!(decided(&kept, untold), [0; 4], "whole: {whole}: kept");
+        assert_eq!(decided(&kept, shed()), [0; 4], "whole: {whole}: kept twice");
+        // The profile's own: written for the rule's worker.
+        let told = ruled(1, bed.ids[1], RulePlaced::Told);
+        assert_eq!(decided(&own, told), [0; 4], "whole: {whole}");
+        assert_eq!(decided(&own, shed()), [0, 4, 0, 0], "whole: {whole}: told");
+        // The stages' pick of the first prompt is written as that one was.
+        let by_stages = picked(2, bed.ids[2]);
+        assert_eq!(decided(&kept, by_stages), [0; 4], "whole: {whole}");
+        assert_eq!(
+            decided(&kept, shed()),
+            [0, 0, 4, 0],
+            "whole: {whole}: the stages'"
+        );
     }
 }
 
@@ -586,26 +606,28 @@ fn an_entrys_debug_form_holds_no_token() {
     assert_eq!(format!("{key:?}"), "TokenKey { tokens: 2, marker: 1 }");
 }
 
-/// A pick the binding's sessions rule placed alone leaves no prompt in the
-/// host's token tree, as it leaves none in the record of hashed prefixes
-/// ([`a_pick_the_sessions_rule_placed_is_recorded_at_neither_write`]). The
-/// same pick by the profile's stages is written. A gateway's sticky map
-/// hands a request it places to no policy, so the policy's tree never takes
-/// that request's prompt
+/// The host's token tree takes the prompt of a pick the binding's sessions
+/// rule placed alone by the rule's own word of it, as the record of hashed
+/// prefixes does
+/// ([`a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word_at_both_writes`]).
+/// A pick the rule keeps from the profile leaves no prompt in the tree. One
+/// that is the profile's own is written as a pick by the profile's stages
+/// is. The lookup returns the answer it is handed either way. A gateway's
+/// sticky map hands a request it places to no policy, so the policy's tree
+/// never takes that request's prompt
 /// (`model_gateway/src/policies/registry.rs:543-546`, `:589-590`).
 #[test]
-fn a_pick_the_sessions_rule_placed_is_written_to_no_tree() {
+fn a_pick_the_sessions_rule_placed_is_written_to_a_tree_by_the_rules_word() {
     let (affinity, _tree) = lending(false);
     let bed = Bed::new(affinity, preset("cache_aware"), 4);
-    let asked = tokens(1_000, 4);
-    let hashes = hashed(&asked);
-    // One decision of the prompt by `answer`, inside the host's tree.
-    let decided = |answer: &dyn Fn() -> Decision| {
+    // One decision of the prompt answered `answer`, inside the host's tree.
+    let decided = |asked: &[u32], answer: Decision| {
+        let hashes = hashed(asked);
         let key = TokenKey {
-            tokens: Cow::Borrowed(&asked),
+            tokens: Cow::Borrowed(asked),
             marker: 0,
         };
-        decide(
+        let returned = decide(
             &bed.affinity,
             &bed.pool,
             &bed.spec,
@@ -614,21 +636,20 @@ fn a_pick_the_sessions_rule_placed_is_written_to_no_tree() {
             &mut request(&hashes, 7, NOW),
             |_| Some(key),
             |_| true,
-            |_| answer(),
+            |_| answer,
         );
+        assert_eq!(returned, answer, "the answer handed");
     };
-    let by_stages = || picked(1, bed.ids[1]);
-    let by_rule = || {
-        let mut decision = by_stages();
-        if let Decision::Pick(pick) = &mut decision {
-            pick.targets.by_rule(RulePlaced::Told);
-        }
-        decision
-    };
-    decided(&by_rule);
-    assert!(bed.keyed(&asked, 0, None).is_empty(), "the rule's pick");
-    decided(&by_stages);
-    assert_eq!(bed.keyed(&asked, 0, None), [(1, 0, 4)], "the stages'");
+    let (kept, own) = (tokens(1_000, 4), tokens(2_000, 4));
+    decided(&kept, ruled(1, bed.ids[1], RulePlaced::Untold));
+    assert!(
+        bed.keyed(&kept, 0, None).is_empty(),
+        "kept from the profile"
+    );
+    decided(&own, ruled(1, bed.ids[1], RulePlaced::Told));
+    assert_eq!(bed.keyed(&own, 0, None), [(1, 0, 4)], "the rule's, told");
+    decided(&kept, picked(2, bed.ids[2]));
+    assert_eq!(bed.keyed(&kept, 0, None), [(2, 0, 4)], "the stages'");
 }
 
 /// A request whose host names its entry is decided inside the host's token

@@ -33,6 +33,8 @@ use crate::{
 };
 
 const MODEL: &str = "model-a";
+/// Every place of a list of three workers.
+const EVERY: [u32; 3] = [0, 1, 2];
 
 /// The issues and the dispatches a stage heard.
 #[derive(Debug, Default)]
@@ -142,18 +144,24 @@ type Held<'e> = Vec<DecisionGuard<&'e PolicyEngine>>;
 
 /// One request of `key`, with no key where it is empty, sent to the target
 /// at `take` of its pick as its host sends it: the dispatch is said, and
-/// the worker object counts the request and its key. The request stays in
-/// flight in `held`. The place it went to, and who placed it.
+/// the worker object counts the request and its key. Where `places` says
+/// so its host holds the request to every place of its list, which makes
+/// it the whole decision's to answer. The request stays in flight in
+/// `held`. The place it went to, and who placed it.
 fn sent<'e>(
     engine: &'e PolicyEngine,
     list: &[Arc<dyn Worker>],
     members: &PublishedList,
-    (key, take): (&'static str, usize),
+    (key, take, places): (&'static str, usize, bool),
     held: &mut Held<'e>,
 ) -> (usize, PlacedBy) {
     let session_key = match key {
         "" => Identity::NONE,
         key => Identity::plain(key),
+    };
+    let constraints = Constraints {
+        places: places.then_some(&EVERY[..]),
+        ..Constraints::default()
     };
     let asks = Asks {
         request: Request {
@@ -165,7 +173,7 @@ fn sent<'e>(
                 session_key,
                 ..RequestFacts::default()
             },
-            constraints: Constraints::default(),
+            constraints,
         },
         members,
     };
@@ -194,11 +202,13 @@ fn three_workers() -> Arc<[Arc<dyn Worker>]> {
 /// Under a rule that keeps what it places from the profile, a stage hears
 /// the issue and the dispatch of a request it placed, and neither of one
 /// the rule placed alone: a pin of the key followed, a key the rule's own
-/// assignment places, a pin at its cap that assignment places again, and a
-/// second target of such a pick that its host takes. Under the rule's
-/// default word the stage hears every one of those. The session table
-/// hears each dispatch under either word: the key's next request follows
-/// the worker the dispatch went to, also where that dispatch moved the pin.
+/// assignment places, a pin at its cap that assignment places again, a
+/// second target of such a pick that its host takes, and a pin the whole
+/// decision follows for a request its host holds to places of its list.
+/// Under the rule's default word the stage hears every one of those. The
+/// session table hears each dispatch under either word: the key's next
+/// request follows the worker the dispatch went to, also where that
+/// dispatch moved the pin.
 ///
 /// A gateway's sticky map keeps a request it places from the gateway's
 /// policy in the same way (`model_gateway/src/policies/registry.rs`, lines
@@ -217,7 +227,7 @@ fn a_stage_hears_no_issue_and_no_dispatch_of_a_request_its_rule_keeps_from_it() 
         // What the stage has heard by now: a request it placed, and under
         // the rule's default word every request.
         let mut told = (0, 0);
-        let mut send = |asked: (&'static str, usize), placed: PlacedBy, what: &str| {
+        let mut send = |asked: (&'static str, usize, bool), placed: PlacedBy, what: &str| {
             let (place, by) = sent(&engine, &list, &members, asked, &mut held);
             assert_eq!(by, placed, "{case}: {what}");
             if by == PlacedBy::Stages || kept == RulePlaced::Told {
@@ -234,10 +244,10 @@ fn a_stage_hears_no_issue_and_no_dispatch_of_a_request_its_rule_keeps_from_it() 
         } else {
             PlacedBy::Stages
         };
-        let first = send(("a-key", 0), placed, "a new key");
+        let first = send(("a-key", 0, false), placed, "a new key");
         // The key's pin is followed.
         assert_eq!(
-            send(("a-key", 0), PlacedBy::Rule, "its pin"),
+            send(("a-key", 0, false), PlacedBy::Rule, "its pin"),
             first,
             "{case}"
         );
@@ -245,19 +255,29 @@ fn a_stage_hears_no_issue_and_no_dispatch_of_a_request_its_rule_keeps_from_it() 
             // Two requests of the key stand on its worker, the rule's cap:
             // the rule's own assignment places the next on another worker,
             // and that dispatch moves the pin there.
-            let second = send(("a-key", 0), PlacedBy::Rule, "at the cap");
+            let second = send(("a-key", 0, false), PlacedBy::Rule, "at the cap");
             assert_ne!(second, first, "{case}: at the cap");
-            let next = send(("a-key", 0), PlacedBy::Rule, "the moved pin");
+            let next = send(("a-key", 0, false), PlacedBy::Rule, "the moved pin");
             assert_eq!(next, second, "{case}");
             // The host takes the second target of a key the rule's
             // assignment places: the request is the rule's as the first
             // target's is, and its dispatch pins the key where it went.
-            let taken = send(("b-key", 1), PlacedBy::Rule, "a second target");
-            let next = send(("b-key", 0), PlacedBy::Rule, "the pin it made");
+            let taken = send(("b-key", 1, false), PlacedBy::Rule, "a second target");
+            let next = send(("b-key", 0, false), PlacedBy::Rule, "the pin it made");
             assert_eq!(next, taken, "{case}");
         }
+        // A request held to places of its list is the whole decision's to
+        // answer: it follows the key's pin there, and the pick says the
+        // rule's word as the pin followed by one record does.
+        let third = send(("c-key", 0, false), placed, "a third key");
+        let held_to = send(
+            ("c-key", 0, true),
+            PlacedBy::Rule,
+            "its pin, held to places",
+        );
+        assert_eq!(held_to, third, "{case}");
         // A request with no key is the stages'.
-        send(("", 0), PlacedBy::Stages, "no key");
+        send(("", 0, false), PlacedBy::Stages, "no key");
     }
 }
 
@@ -296,7 +316,7 @@ fn the_end_of_a_request_kept_from_the_profile_moves_no_count_of_a_stock_stage() 
         // session table: a request with no key leaves the table alone.
         let counts = || format!("{:?}", engine.spec().engine());
         let before = counts();
-        let (_, by) = sent(&engine, &list, &members, ("", 0), &mut held);
+        let (_, by) = sent(&engine, &list, &members, ("", 0, false), &mut held);
         assert_eq!(by, PlacedBy::Stages, "{name}");
         let moved = counts() != before;
         assert_eq!(moved, counts_singles, "{name}: a request the stages placed");
@@ -304,7 +324,7 @@ fn the_end_of_a_request_kept_from_the_profile_moves_no_count_of_a_stock_stage() 
         // next follows the pin, which the rule keeps from the profile.
         for key in ["a-key", "b-key", "c-key"] {
             for placed in [PlacedBy::Stages, PlacedBy::Rule] {
-                let (_, by) = sent(&engine, &list, &members, (key, 0), &mut held);
+                let (_, by) = sent(&engine, &list, &members, (key, 0, false), &mut held);
                 assert_eq!(by, placed, "{name}: {key}");
             }
         }

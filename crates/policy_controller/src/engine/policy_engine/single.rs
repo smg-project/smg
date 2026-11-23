@@ -313,6 +313,13 @@ pub(super) fn decide(
 /// or a retry's ([`retried`]): by the rows the key names where they answer,
 /// and else the whole decision, run as `whole` states.
 ///
+/// A pin the keyed entry followed is the answer either way. Where its rule
+/// keeps it from the profile ([`lease_events::stages_hear`]) it is returned
+/// as it stands. Where it is the profile's own it is handed through the
+/// lookup that names a request's holders ([`handed_on`]), so its prompt is
+/// handed on as behind any pick, and by the rule's word a followed pin is
+/// recorded the same on both its paths.
+///
 /// In line at both its callers: a first attempt calls nothing for it.
 /// `RETRY` says which caller's instance this is, [`retried`]'s or
 /// [`decide`]'s. Each instance so has one caller, and the compiler keeps
@@ -343,7 +350,12 @@ fn by_facts<const RETRY: bool>(
     // A keyed request is decided by the rows its key names, where they say
     // what the whole pass would: its key's pin.
     match keys::decide(engine, records, workers, live, facts, cx) {
-        Some(keyed) => keyed,
+        // A pin its rule keeps from the profile: no holder is named for it
+        // and nothing is kept of where its prompt went.
+        Some(keyed) if !lease_events::stages_hear(&keyed) => keyed,
+        // A pin that is the profile's own goes through the same lookup with
+        // its answer made.
+        Some(keyed) => handed_on(own, members, records, facts, maker, keyed),
         // A profile whose stages read who holds the prompt is named its
         // rows from the gateway's own data, at the decision's instant the
         // keyed entry wrote, and its pick is recorded behind it; any other
@@ -360,6 +372,43 @@ fn by_facts<const RETRY: bool>(
             |facts| whole.decide(engine, records, workers, live, facts, cx),
         ),
     }
+}
+
+/// A pin the keyed entry followed that is the profile's own
+/// ([`lease_events::stages_hear`]), handed through the lookup that names a
+/// request's holders ([`overlap::decide`]) with `keyed`, its answer, in the
+/// whole decision's place. The lookup returns that answer as it was handed:
+/// no stage is asked again and no row is written for a decision's pass.
+/// Where the profile's stages read who holds the prompt, the lookup does
+/// behind this answer what it does behind any pick. It hands the prompt to
+/// the record of sent prefixes, or to the host's token tree by the entry
+/// and the target its maker names. It may also be the one decision a second
+/// that reads its list's table again, and a tree's match marks the path it
+/// walked as used. Where no binding of the phase reads affinity, the lookup
+/// is one test.
+///
+/// Out of line: its code stays off the path of a request with no pin, and
+/// of a pin its rule keeps from the profile.
+#[inline(never)]
+fn handed_on(
+    own: &PolicyEngine,
+    members: &PoolMembers,
+    records: &PoolRecords,
+    facts: &mut RequestFacts<'_>,
+    maker: &(impl RequestMaker + ?Sized),
+    keyed: Decision,
+) -> Decision {
+    overlap::decide(
+        &own.affinity,
+        members.affinity(),
+        own.spec(),
+        members.workers(),
+        records.ids(),
+        facts,
+        |page| maker.token_key(page),
+        |target| maker.sends_to(target),
+        |_| keyed,
+    )
 }
 
 /// A retry's decision over a list where an engine holds several workers.
@@ -539,7 +588,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::{
         document::spec::{
-            AppliedSpec, Assignment, PolicySpec, ScoreStage, ShadowSpec, WarmupSliceParams,
+            AppliedSpec, Assignment, PolicySpec, RulePlaced, ScoreStage, ShadowSpec,
+            WarmupSliceParams,
         },
         engine::{
             decision::{LiftedVeto, PlacedBy, Target, Targets, MAX_TARGETS},
@@ -1868,110 +1918,192 @@ pub(crate) mod tests {
         }
     }
 
+    /// The document of the default policy's profile under the stock
+    /// sessions rule, a new key placed by the profile's own stages, and
+    /// `kept`, the rule's word of a request it places alone.
+    fn default_under_sessions(kept: RulePlaced) -> AppliedSpec {
+        let mut document = PolicySpec::preset("manual").expect("a built-in preset");
+        let default = PolicySpec::preset("cache_aware").expect("a built-in preset");
+        document.profiles = default.profiles;
+        let binding = &mut document.bindings[0];
+        binding.profile = Some("cache_aware".into());
+        let rule = binding.sessions.as_mut().expect("the stock rule");
+        rule.assignment = Assignment::Delegate;
+        rule.rule_placed = kept;
+        document.generation = 1;
+        AppliedSpec::validate(&document).expect("the document validates")
+    }
+
+    /// What `engine`'s record of sent prefixes holds of the prompt `tokens`
+    /// for each worker of `list`, in blocks: what a decision of the same
+    /// lookup is named. The read's own answer picks nobody, so it writes
+    /// nothing.
+    fn recorded(engine: &PolicyEngine, list: &[Arc<dyn Worker>], tokens: &[u32]) -> Vec<u32> {
+        let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+        let mut asked = request();
+        asked.facts.now_micros = engine.clock.micros(Instant::now());
+        hashes.write_to(&mut asked.facts);
+        let nobody = over_none(engine, &asked);
+        let ids: Vec<WorkerId> = list
+            .iter()
+            .map(|worker| worker_id(worker.as_ref()))
+            .collect();
+        let mut held = vec![0; list.len()];
+        overlap::decide(
+            engine.affinity(),
+            &overlap::PoolAffinity::default(),
+            engine.spec(),
+            list,
+            &ids,
+            &mut asked.facts,
+            |_| None,
+            |_| true,
+            |facts| {
+                match facts.named {
+                    Some(rows) => {
+                        for holder in rows.holders {
+                            held[holder.row as usize] = holder.predicted_blocks;
+                        }
+                    }
+                    None => {
+                        for (row, worker) in facts.affinity.iter().enumerate() {
+                            held[row] = worker.predicted_blocks;
+                        }
+                    }
+                }
+                nobody
+            },
+        );
+        held
+    }
+
+    /// A prompt of 64 blocks held by the worker at `place` of eight alone,
+    /// as [`recorded`] reads it.
+    fn held_at(place: u32) -> Vec<u32> {
+        let mut held = vec![0; 8];
+        held[place as usize] = 64;
+        held
+    }
+
     /// The default policy under a sessions rule. A key's first request is
-    /// placed by the whole pass, and its dispatch makes the key's pin. The
-    /// key's next request follows that pin by one worker's record: no pass
-    /// over the list runs and nobody is named its prompt's holder, so the
-    /// prompt of a pinned request is recorded for no worker, as a gateway's
-    /// own sticky map keeps a pinned request from its policy. A request of
-    /// that prompt that carries no key is then placed by the policy, and
-    /// not held to the pin's worker. A pinned worker that is not ready
-    /// gives the key back to the whole pass.
+    /// placed by the whole decision, and its dispatch makes the key's pin.
+    /// The key's next request follows that pin by one worker's record under
+    /// either word of the rule: the whole decision does not run, so no
+    /// stage is asked and no row is written for its pass. What is kept of
+    /// that request's prompt is by the rule's word.
+    ///
+    /// Where the rule keeps the request from the profile the record takes
+    /// nothing of its prompt, as a gateway's own sticky map keeps a pinned
+    /// request from its policy. Where the request is the profile's own, the
+    /// rule's default, its pick goes through the lookup that names a
+    /// request's holders with the answer made. The record then holds the
+    /// prompt for the pin's worker alone, and the prompt goes back there
+    /// with no key. The pick is the one made under the other word but for
+    /// the word itself.
+    ///
+    /// A pinned worker that is not ready gives the key back to the whole
+    /// decision.
     #[test]
     fn the_default_policy_follows_a_sessions_pin_by_one_record() {
-        // The stock sessions rule over the default policy's profile, a
-        // new key placed by the profile's own stages.
-        let engine = {
-            let mut document = PolicySpec::preset("manual").expect("a built-in preset");
-            let default = PolicySpec::preset("cache_aware").expect("a built-in preset");
-            document.profiles = default.profiles;
-            let binding = &mut document.bindings[0];
-            binding.profile = Some("cache_aware".into());
-            let rule = binding.sessions.as_mut().expect("the stock rule");
-            rule.assignment = Assignment::Delegate;
-            document.generation = 1;
-            PolicyEngine::new(AppliedSpec::validate(&document).expect("the document validates"))
-        };
-        let list = pool(8);
-        let members = PublishedList::new(Arc::clone(&list));
-        let prompt = |first: u32| (first..first + 1_024).collect::<Vec<u32>>();
-        // One request of `tokens` under the session key `key`, with no key
-        // where it is `0`, sent to its first target and served there: the
-        // place it went to, what the decision did with its key, and
-        // whether no pass over the list ran.
-        let sent = |tokens: &[u32], key: u64, seed: u64| {
-            let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
-            let mut asked = request();
-            asked.facts.seed = seed;
-            asked.facts.session_key = Identity::hashed(key);
-            hashes.write_to(&mut asked.facts);
-            let asks = Asks::of(asked, Some(&members));
-            let now = Instant::now();
-            let mut guard = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now)
-                .expect("a decision");
-            let pick = *guard.decision().pick().expect("a pick");
-            let target = guard.take(0).expect("the first target");
-            guard.dispatched(now);
-            guard.completed(
-                &Outcome {
-                    side: Side::Single,
-                    served: target.id,
-                    status: 200,
-                    class: TransportClass::Ok,
-                    ttft_micros: 0,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    duration_micros: 0,
-                },
-                now,
-            );
-            (
-                target.position,
-                pick.session_verdict,
-                pick.trace.drew_first(),
-            )
-        };
-        let fresh = |key: u32| prompt(key * 100_000 + 50_000);
-        let (mut pins, mut passed) = (Vec::new(), Vec::new());
-        for key in 1..=6_u32 {
-            // The key's first request: the whole pass places it by its
-            // seed, over idle workers, and claims it.
-            let seed = u64::from(key);
-            let (pin, verdict, unpassed) = sent(&prompt(key * 100_000), seed, seed);
-            assert!(matches!(verdict, SessionVerdict::Claimed(_)), "key {key}");
-            assert!(!unpassed, "key {key}: the whole pass places a new key");
-            // Its next request, of a prompt nobody was sent: the pin.
-            let (went, verdict, unpassed) = sent(&fresh(key), seed, 1);
-            assert_eq!((went, verdict), (pin, SessionVerdict::Pinned), "key {key}");
-            if !unpassed {
-                passed.push(key);
+        // The pinned requests' picks under the rule's word `kept`, a key
+        // each.
+        let followed = |kept: RulePlaced| {
+            let engine = PolicyEngine::new(default_under_sessions(kept));
+            let list = pool(8);
+            let members = PublishedList::new(Arc::clone(&list));
+            let prompt = |first: u32| (first..first + 1_024).collect::<Vec<u32>>();
+            // One request of `tokens` under the session key `key`, with no
+            // key where it is `0`, sent to its first target and served
+            // there: the place it went to and its pick.
+            let sent = |tokens: &[u32], key: u64, seed: u64| {
+                let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+                let mut asked = request();
+                asked.facts.seed = seed;
+                asked.facts.session_key = Identity::hashed(key);
+                hashes.write_to(&mut asked.facts);
+                let asks = Asks::of(asked, Some(&members));
+                let now = Instant::now();
+                let mut guard = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now)
+                    .expect("a decision");
+                let pick = *guard.decision().pick().expect("a pick");
+                let target = guard.take(0).expect("the first target");
+                guard.dispatched(now);
+                guard.completed(
+                    &Outcome {
+                        side: Side::Single,
+                        served: target.id,
+                        status: 200,
+                        class: TransportClass::Ok,
+                        ttft_micros: 0,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                        duration_micros: 0,
+                    },
+                    now,
+                );
+                (target.position, pick)
+            };
+            let fresh = |key: u32| prompt(key * 100_000 + 50_000);
+            let (mut pins, mut picks) = (Vec::new(), Vec::new());
+            for key in 1..=6_u32 {
+                // The key's first request: the whole decision places it by
+                // its seed, over idle workers, and claims it.
+                let seed = u64::from(key);
+                let (pin, pick) = sent(&prompt(key * 100_000), seed, seed);
+                let claimed = matches!(pick.session_verdict, SessionVerdict::Claimed(_));
+                assert!(claimed, "{kept:?}: key {key}");
+                let whole = !pick.trace.drew_first();
+                assert!(
+                    whole,
+                    "{kept:?}: key {key}: a new key is the whole decision's"
+                );
+                // Its next request, of a prompt nobody was sent: the pin,
+                // followed by its one worker's record.
+                let (went, pick) = sent(&fresh(key), seed, 1);
+                let answered = (went, pick.session_verdict, pick.placed_by());
+                let pinned = (pin, SessionVerdict::Pinned, PlacedBy::Rule);
+                assert_eq!(answered, pinned, "{kept:?}: key {key}");
+                let whole = !pick.trace.drew_first();
+                assert!(!whole, "{kept:?}: key {key}: the whole decision ran");
+                // What the record holds of the pinned request's prompt.
+                let held = recorded(&engine, &list, &fresh(key));
+                match kept {
+                    RulePlaced::Untold => assert_eq!(held, [0; 8], "key {key}: kept"),
+                    RulePlaced::Told => assert_eq!(held, held_at(pin), "key {key}: told"),
+                }
+                pins.push(pin);
+                picks.push(pick);
             }
-            pins.push(pin);
-        }
-        assert!(
-            pins.iter().any(|pin| *pin != pins[0]),
-            "the keys are pinned to more workers than one: {pins:?}"
-        );
-        // The pinned requests' prompts were recorded for nobody: a request
-        // of one that carries no key is placed by its seed, over idle
-        // workers, and not held to the pin's worker.
-        let elsewhere = (1..=6_u32)
-            .filter(|&key| sent(&fresh(key), 0, u64::from(key) + 40).0 != pins[key as usize - 1])
-            .count();
-        assert!(
-            elsewhere > 0,
-            "each of six prompts went back to its pin's worker: {pins:?}"
-        );
-        // Each pin was followed by its one worker's record.
-        assert!(
-            passed.is_empty(),
-            "a pass over the list ran for the pinned requests of keys {passed:?}"
-        );
-        // A pin whose worker is not ready is the whole pass's to place anew.
-        list[pins[0] as usize].set_status(WorkerStatus::NotReady);
-        let (moved, _, unpassed) = sent(&prompt(100_000), 1, 3);
-        assert!(!unpassed, "the whole pass places the key anew");
-        assert_ne!(moved, pins[0]);
+            assert!(
+                pins.iter().any(|pin| *pin != pins[0]),
+                "{kept:?}: the keys are pinned to more workers than one: {pins:?}"
+            );
+            if kept == RulePlaced::Told {
+                // A recorded prompt goes back to its pin's worker with no
+                // key.
+                for key in 1..=6_u32 {
+                    let (went, _) = sent(&fresh(key), 0, u64::from(key) + 40);
+                    assert_eq!(went, pins[key as usize - 1], "key {key}: no key");
+                }
+            }
+            // A pin whose worker is not ready is the whole decision's to
+            // place anew.
+            list[pins[0] as usize].set_status(WorkerStatus::NotReady);
+            let (moved, pick) = sent(&prompt(100_000), 1, 3);
+            let whole = !pick.trace.drew_first();
+            assert!(whole, "{kept:?}: the whole decision places the key anew");
+            assert_ne!(moved, pins[0], "{kept:?}");
+            picks
+        };
+        let (kept, own) = (followed(RulePlaced::Untold), followed(RulePlaced::Told));
+        // The hand-over returns the keyed entry's answer. The first key's
+        // pinned request met both engines alike: the pick that went through
+        // the lookup and the one that did not differ by the rule's word
+        // alone.
+        let mut twin = kept[0];
+        twin.targets.by_rule(RulePlaced::Told);
+        assert_eq!(twin, own[0]);
+        assert_ne!(kept[0], own[0], "the rule's word is on the pick");
     }
 
     /// A request stated ahead by a maker that states no plain request
@@ -2198,30 +2330,71 @@ pub(crate) mod tests {
         }
     }
 
-    /// A request its sessions rule places alone says so on its pick and
-    /// leaves no prompt in the record, in three forms. A pin followed by its
-    /// one worker's record. A pin the whole pass follows, under a binding
-    /// with a shadow. And a key's first request under a rule whose own
-    /// assignment places it, where no stage of the profile is asked. A
-    /// gateway's sticky map hands none of the three to its policy, so the
-    /// policy's record never sees the prompt
-    /// (`model_gateway/src/policies/registry.rs:540-546` for a pin under
-    /// its cap, `:589-590` for the map's own assignment). A request of that
-    /// prompt that carries no key is then placed by the policy, and not
-    /// held to the session's worker. The first form's pin is followed ahead
-    /// of every write of the record, so that form holds the word alone: the
-    /// two others hold the record, and run again under a profile that reads
-    /// the column whole, where the record's other write stands. No recorded
+    /// A request its sessions rule places alone says so on its pick, and its
+    /// prompt is recorded by the rule's own word of it, in four forms. A pin
+    /// followed by its one worker's record. A pin the whole decision
+    /// follows: for a request held to places of its list, and under a
+    /// binding with a shadow. And a key's first request under a rule whose
+    /// own assignment places it behind the profile's filters, where no
+    /// scorer and no picker of the profile is asked.
+    ///
+    /// Where the rule keeps what it places from the profile no form leaves
+    /// a block of the prompt in the record: a gateway's sticky map hands
+    /// none of them to its policy, so the policy's record never sees the
+    /// prompt (`model_gateway/src/policies/registry.rs:540-546` for a pin
+    /// under its cap, `:589-590` for the map's own assignment). Where the
+    /// request is the profile's own, the rule's default, every form leaves
+    /// the whole prompt for the session's worker and for no other, the pin
+    /// by one record as the pin the whole decision follows. That prompt
+    /// then goes back to the session's worker with no key.
+    ///
+    /// The forms under a shadow run again under a profile that reads the
+    /// column whole, where the record's other write stands. No recorded
     /// sheet runs this.
     #[test]
-    fn a_request_its_sessions_rule_places_alone_records_no_prompt() {
-        for (form, shadowed, assignment, whole) in [
-            ("a pin by one record", false, Assignment::Delegate, false),
-            ("a shadow", true, Assignment::Delegate, false),
-            ("the rule's assignment", false, Assignment::Random, false),
-            ("a shadow, the column", true, Assignment::Delegate, true),
-            ("the rule's, the column", true, Assignment::Random, true),
-        ] {
+    fn a_request_its_sessions_rule_places_alone_is_recorded_by_the_rules_word() {
+        let forms = [
+            (
+                "a pin by one record",
+                false,
+                false,
+                Assignment::Delegate,
+                false,
+            ),
+            (
+                "a pin held to places",
+                false,
+                true,
+                Assignment::Delegate,
+                false,
+            ),
+            ("a shadow", true, false, Assignment::Delegate, false),
+            (
+                "the rule's assignment",
+                false,
+                false,
+                Assignment::Random,
+                false,
+            ),
+            (
+                "a shadow, the column",
+                true,
+                false,
+                Assignment::Delegate,
+                true,
+            ),
+            (
+                "the rule's, the column",
+                true,
+                false,
+                Assignment::Random,
+                true,
+            ),
+        ];
+        let words = [RulePlaced::Untold, RulePlaced::Told];
+        for (kept, form) in words.into_iter().flat_map(|w| forms.map(|f| (w, f))) {
+            let (form, shadowed, held, assignment, whole) = form;
+            let case = format!("{kept:?}, {form}");
             let engine = {
                 let mut document = PolicySpec::preset("manual").expect("a built-in preset");
                 let default = PolicySpec::preset("cache_aware").expect("a built-in preset");
@@ -2230,6 +2403,7 @@ pub(crate) mod tests {
                 binding.profile = Some("cache_aware".into());
                 let rule = binding.sessions.as_mut().expect("the stock rule");
                 rule.assignment = assignment;
+                rule.rule_placed = kept;
                 if shadowed {
                     let twin = document.profiles["cache_aware"].clone();
                     document.profiles.insert("twin".into(), twin);
@@ -2252,21 +2426,26 @@ pub(crate) mod tests {
                 document.generation = 1;
                 let applied = AppliedSpec::validate(&document).expect("the document validates");
                 let cap = applied.engine().affinity_rows_cap(MODEL, Phase::Single);
-                assert_eq!(cap == 0, whole, "{form}: the form of the record's write");
+                assert_eq!(cap == 0, whole, "{case}: the form of the record's write");
                 let record = applied.engine().pool_record_for(MODEL, Phase::Single);
-                assert!(record.is_some(), "{form}: the list keeps a record");
+                assert!(record.is_some(), "{case}: the list keeps a record");
                 PolicyEngine::new(applied)
             };
             let list = pool(8);
             let members = PublishedList::new(Arc::clone(&list));
+            let every: Vec<u32> = (0..8).collect();
             let prompt = |first: u32| (first..first + 1_024).collect::<Vec<u32>>();
-            // One request sent to its first target and served there: the
-            // place it went to, and who placed it.
-            let sent = |tokens: &[u32], key: u64, seed: u64| {
+            // One request sent to its first target and served there, held
+            // to every place of its list where `held`: the place it went
+            // to, who placed it, and whether the whole decision ran.
+            let sent = |tokens: &[u32], key: u64, seed: u64, held: bool| {
                 let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
                 let mut asked = request();
                 asked.facts.seed = seed;
                 asked.facts.session_key = Identity::hashed(key);
+                if held {
+                    asked.constraints.places = Some(&every);
+                }
                 hashes.write_to(&mut asked.facts);
                 let asks = Asks::of(asked, Some(&members));
                 let now = Instant::now();
@@ -2288,35 +2467,186 @@ pub(crate) mod tests {
                     },
                     now,
                 );
-                (target.position, pick.placed_by(), pick.trace.drew_first())
+                (target.position, pick.placed_by(), !pick.trace.drew_first())
             };
-            let mut held = 0;
             for key in 1..=6_u32 {
                 let seed = u64::from(key);
                 // The key's first request, then one of a prompt nobody was
                 // sent: the rule alone places the one this form is about.
-                let (first, by, _) = sent(&prompt(key * 100_000), seed, seed);
+                let (first, by, _) = sent(&prompt(key * 100_000), seed, seed, false);
                 let fresh = prompt(key * 100_000 + 50_000);
                 let asked = if assignment == Assignment::Delegate {
-                    assert_eq!(by, PlacedBy::Stages, "{form}: the stages place a new key");
-                    let (went, by, unpassed) = sent(&fresh, seed, 1);
-                    assert_eq!((went, by), (first, PlacedBy::Rule), "{form}: key {key}");
-                    // The whole pass follows the pin under a shadow alone.
-                    assert_eq!(unpassed, !shadowed, "{form}: key {key}");
+                    assert_eq!(by, PlacedBy::Stages, "{case}: the stages place a new key");
+                    let (went, by, whole) = sent(&fresh, seed, 1, held);
+                    assert_eq!((went, by), (first, PlacedBy::Rule), "{case}: key {key}");
+                    // The whole decision follows the pin of a request held
+                    // to places, and every pin under a shadow.
+                    assert_eq!(whole, shadowed || held, "{case}: key {key}");
                     fresh
                 } else {
-                    assert_eq!(by, PlacedBy::Rule, "{form}: key {key}");
+                    assert_eq!(by, PlacedBy::Rule, "{case}: key {key}");
                     prompt(key * 100_000)
                 };
-                // The same prompt with no key: the policy places it.
-                let (went, by, _) = sent(&asked, 0, seed + 40);
-                assert_eq!(by, PlacedBy::Stages, "{form}: no key");
-                held += u32::from(went == first);
+                // What the record holds of the prompt the rule placed.
+                let kept_of = recorded(&engine, &list, &asked);
+                match kept {
+                    RulePlaced::Untold => assert_eq!(kept_of, [0; 8], "{case}: key {key}"),
+                    RulePlaced::Told => assert_eq!(kept_of, held_at(first), "{case}: key {key}"),
+                }
+                // The same prompt with no key: the policy places it, on the
+                // session's worker where the record holds it there.
+                let (went, by, _) = sent(&asked, 0, seed + 40, false);
+                assert_eq!(by, PlacedBy::Stages, "{case}: no key");
+                if kept == RulePlaced::Told {
+                    assert_eq!(went, first, "{case}: key {key}: no key");
+                }
             }
-            assert!(
-                held < 6,
-                "{form}: each of six prompts went back to its session's worker"
-            );
+        }
+    }
+
+    /// [`Asks`] of a host that names the request's entry in its token tree
+    /// and says whether it sends to a target of the pick: `to` for each.
+    /// `page` is the tree's page it was last asked the entry by, zero while
+    /// it was not asked.
+    struct Sends<'a> {
+        asks: Asks<'a>,
+        to: bool,
+        page: Cell<usize>,
+    }
+
+    impl RequestMaker for Sends<'_> {
+        fn model(&self) -> &str {
+            self.asks.model()
+        }
+
+        fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+            self.asks.make(spec)
+        }
+
+        fn plain(&self) -> Option<Plain> {
+            self.asks.plain()
+        }
+
+        fn workers(&self) -> WorkerLists<'_> {
+            self.asks.workers()
+        }
+
+        fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
+            self.asks.loads()
+        }
+
+        fn token_key(&self, page: usize) -> Option<TokenKey<'_>> {
+            self.page.set(page);
+            self.asks.token_key(page)
+        }
+
+        fn sends_to(&self, _: &Target) -> bool {
+            self.to
+        }
+    }
+
+    /// A pin followed under a host that lends its token tree and names each
+    /// request's entry there. Where the rule keeps the request from the
+    /// profile its pin returns ahead of the lookup: the host is not asked
+    /// for the entry and the tree holds no token of the prompt. Where the
+    /// request is the profile's own the host is asked once, by the tree's
+    /// own page, and the whole decision does not run. The tree then holds
+    /// the whole prompt for the pin's worker alone, and none of a prompt
+    /// whose host says it does not send to that worker: the hand-over asks
+    /// the request's own maker which target its caller takes.
+    #[test]
+    fn a_followed_pin_is_stored_in_a_lent_tree_by_the_rules_word() {
+        for kept in [RulePlaced::Untold, RulePlaced::Told] {
+            let (engine, tree) = lending(default_under_sessions(kept));
+            let list = pool(8);
+            let members = PublishedList::new(Arc::clone(&list));
+            let prompt = |first: u32| (first..first + 1_024).collect::<Vec<u32>>();
+            // One request of `tokens`, which its host names as its entry,
+            // sent to its first target and served there. Its host sends to
+            // a target of its pick where `to`. The place it went to, its
+            // pick, how often its host was asked for the entry, and by
+            // which page.
+            let sent = |tokens: &[u32], key: u64, seed: u64, to: bool| {
+                let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+                let mut asked = request();
+                asked.facts.seed = seed;
+                asked.facts.session_key = Identity::hashed(key);
+                hashes.write_to(&mut asked.facts);
+                let asks = Asks {
+                    key: Some(tokens),
+                    ..Asks::of(asked, Some(&members))
+                };
+                let host = Sends {
+                    asks,
+                    to,
+                    page: Cell::new(0),
+                };
+                let now = Instant::now();
+                let mut guard = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &host, now)
+                    .expect("a decision");
+                let pick = *guard.decision().pick().expect("a pick");
+                let target = guard.take(0).expect("the first target");
+                guard.dispatched(now);
+                guard.completed(
+                    &Outcome {
+                        side: Side::Single,
+                        served: target.id,
+                        status: 200,
+                        class: TransportClass::Ok,
+                        ttft_micros: 0,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                        duration_micros: 0,
+                    },
+                    now,
+                );
+                (
+                    target.position,
+                    pick,
+                    (host.asks.keyed.get(), host.page.get()),
+                )
+            };
+            // The tokens of a prompt the tree holds, and the workers that
+            // hold them.
+            let stored = |tokens: &[u32]| {
+                let found = tree.match_prefix_with_counts(tokens);
+                (found.matched_token_count, found.matched_tenants)
+            };
+            let own = kept == RulePlaced::Told;
+            for key in 1..=6_u32 {
+                let seed = u64::from(key);
+                let (pin, _, entry) = sent(&prompt(key * 100_000), seed, seed, true);
+                assert_eq!(entry, (1, 16), "{kept:?}: key {key}: a new key's entry");
+                let at = vec![TenantId::from(list[pin as usize].url())];
+                // The key's pin, of a prompt nobody was sent.
+                let fresh = prompt(key * 100_000 + 50_000);
+                let (went, pick, entry) = sent(&fresh, seed, 1, true);
+                assert_eq!(
+                    (went, pick.placed_by()),
+                    (pin, PlacedBy::Rule),
+                    "{kept:?}: key {key}"
+                );
+                let whole = !pick.trace.drew_first();
+                assert!(!whole, "{kept:?}: key {key}: the whole decision ran");
+                if own {
+                    assert_eq!(
+                        entry,
+                        (1, 16),
+                        "key {key}: the pin's entry, by the tree's page"
+                    );
+                    assert_eq!(stored(&fresh), (1_024, at), "key {key}: the pin's prompt");
+                } else {
+                    assert_eq!(entry, (0, 0), "key {key}: a kept pin's entry");
+                    assert_eq!(stored(&fresh), (0, Vec::new()), "key {key}: a kept prompt");
+                }
+                // The key's pin again, of a prompt its host does not send to
+                // the pin's worker: the tree takes none of it.
+                let refused = prompt(key * 100_000 + 70_000);
+                let (went, _, entry) = sent(&refused, seed, 2, false);
+                assert_eq!(went, pin, "{kept:?}: key {key}");
+                assert_eq!(entry.0, u32::from(own), "{kept:?}: key {key}: the entry");
+                assert_eq!(stored(&refused), (0, Vec::new()), "{kept:?}: key {key}");
+            }
         }
     }
 

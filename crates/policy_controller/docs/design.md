@@ -919,13 +919,18 @@ What an event does:
 A sessions rule places some requests alone, with no stage asked: it follows a pin of the request's
 key, or its own assignment places the key. The rule says whether such a request is the profile's
 own (`rule_placed`). Under `told`, the default, it is: the stages hear its issue and its dispatch,
-and the profile counts it among its sends. Under `untold` it is kept from the profile: no stage
-hears its issue or its dispatch, and no profile counts it. The session's pin still follows its
-dispatch, and its completion and its release are told as any request's, so a stage matches an end
-by the lease's id. The routing settings write `untold` for the sticky override's rule alone: a
-gateway's sticky map keeps a request it places from the gateway's policy. The kept engine keeps
-the word on the pick. A controller that tells a dispatch off a lease on file has no such word
-yet: it takes the document, and its stages hear such a request as any other.
+the profile counts it among its sends, and its prompt is recorded as behind any pick. Under
+`untold` it is kept from the profile: no stage hears its issue or its dispatch, no profile counts
+it, and neither the engine's record of sent prefixes nor a lent token tree takes its prompt. The
+session's pin still follows its dispatch, and its completion and its release are told as any
+request's, so a stage matches an end by the lease's id. The routing settings write `untold` for
+the sticky override's rule alone: a gateway's sticky map keeps a request it places from the
+gateway's policy. The kept engine keeps the word on the pick, and one function reads it
+(`lease_events::stages_hear`) at four places: a single's lease words, the record's two writes, the
+tree's store, and the hand-over of a pin followed by one row. Such a pin that is the profile's own
+goes through the lookup that names a request's holders with its answer made, so its prompt is
+recorded as a pin's the whole decision follows. A controller that tells a dispatch off a lease on
+file has no such word yet: it takes the document, and its stages hear such a request as any other.
 
 Upkeep, about once a second (`sweep`): expired session keys are removed, and the record of sent
 prefixes gets a bounded step of clean-up.

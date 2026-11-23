@@ -492,21 +492,18 @@ impl Overlap {
 /// the profile asked, where it follows a pin of the request's key, and
 /// where its own assignment places the key.
 ///
-/// Two readers stand in a host that keeps what a profile's stages did
-/// with a request: the write of the record of sent prompts, and the store of
-/// a prompt in a lent token tree. Neither keeps anything behind a pick the
-/// rule placed, as a gateway's sticky map keeps a request it places from the
-/// gateway's policy.
+/// What a host in a gateway's own process does with a pick the rule placed
+/// is the rule's own word beside this one ([`RulePlaced`]), read through
+/// one function (`lease_events::stages_hear`). Under `untold` no stage
+/// hears the issue or the dispatch of such a single request, the record of
+/// sent prompts takes no entry behind it and a lent token tree stores no
+/// prompt for it, as a gateway's sticky map keeps a request it places from
+/// the gateway's policy. Under `told`, the default, the stages hear both
+/// and where the prompt went is kept as behind any pick. The session table
+/// hears the dispatch under either.
 ///
-/// A third tells a single request's lease to the stages in a gateway's own
-/// process (`lease_events::stages_hear`). It reads the rule's own word
-/// beside this one ([`RulePlaced`]): under `untold` no stage hears the
-/// issue or the dispatch of a pick the rule placed, and under `told`, the
-/// default, the stages hear both. The session table hears the dispatch
-/// under either.
-///
-/// The word does not cross the crate's frame: no wire message carries it,
-/// since the record is written where the decision is made.
+/// Who placed a pick does not cross the crate's frame: no wire message
+/// carries it, since the record is written where the decision is made.
 ///
 /// It shares one byte with the rule's word (`Pick::untold`), the one a
 /// pick's targets had spare between their count and what is stated of the
@@ -565,8 +562,9 @@ impl Pick {
 
     /// Whether the pick is kept from the profile: the binding's sessions
     /// rule placed it alone, and the rule says such a request is none of
-    /// the profile's own ([`RulePlaced::Untold`]). Its one reader tells a
-    /// lease's words in a gateway's own process.
+    /// the profile's own ([`RulePlaced::Untold`]). Its one reader stands in
+    /// a gateway's own process (`lease_events::stages_hear`): the words of
+    /// a lease and what is kept of where a prompt went both ask it.
     #[cfg(any(test, feature = "in-process"))]
     pub(crate) const fn untold(&self) -> bool {
         matches!(self.targets.placing, Placing::RuleUntold)

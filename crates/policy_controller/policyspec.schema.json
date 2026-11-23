@@ -1725,7 +1725,7 @@
           "default": "original"
         },
         "rule_placed": {
-          "description": "Whether a request this rule placed alone is the profile's own\n(default `told`). Under `untold` no stage hears that request's issue\nor its dispatch, and it is none of the profile's sends. The session\ntable still hears its dispatch, and the stages its completion and\nits release. A host that tells a lease's words off its file keeps\nno such word of a pick: it takes the rule, and tells such a request\nas it tells any other.",
+          "description": "Whether a single request this rule placed alone is the profile's\nown (default `told`). Under `untold` no stage hears that request's\nissue or its dispatch, it is none of the profile's sends, and\nneither the engine's record of sent prefixes nor a lent token tree\ntakes its prompt. The session table still hears its dispatch,\nand the stages its completion and its release. A pair's sides are\ntold under either word. A host that tells a lease's words off its\nfile keeps no such word of a pick: it takes the rule, tells such a\nrequest as it tells any other, and records its prompt as any\nother's.",
           "$ref": "#/$defs/RulePlaced"
         }
       },
@@ -1765,10 +1765,10 @@
       ]
     },
     "RulePlaced": {
-      "description": "Whether a request a sessions rule placed alone is the profile's own: a\npin of the request's key followed, or the rule's own assignment. No\nstage of the profile placed such a request.",
+      "description": "Whether a single request a sessions rule placed alone is the profile's\nown: a pin of the request's key followed, or the rule's own assignment.\nNo stage of the profile placed such a request.",
       "oneOf": [
         {
-          "description": "The profile's own: its stages hear the request's issue and its\ndispatch, and it counts among the profile's sends.",
+          "description": "The profile's own: its stages hear the request's issue and its\ndispatch, it counts among the profile's sends, and its prompt is\nrecorded as behind any pick.",
           "type": "string",
           "const": "told"
         },
