@@ -965,7 +965,8 @@ are a broadcast that drops its oldest for a reader that falls behind: the task t
 registry whole, tells what changed, and last tells the ids that stand, so a stage keeps
 nothing of a worker whose whole life the channel dropped. It does the same behind a channel
 that closed, and at its next upkeep behind every registration, replacement and removal of a
-host that states ids: such a host may have stated an id of a worker and taken it back ahead of
+host known to state ids, from the first ask it answers with one: such a host may have stated an
+id of a worker and taken it back ahead of
 the event. The session table is told nothing: a pin on a worker that is gone stands until the
 session's idle time or two other workers end it.
 
@@ -1364,7 +1365,7 @@ the worker crate's structures, and the one engine.
 | workers | records in the store, and worker objects kept in step with them | worker objects in a worker-crate registry; beside each, the code that keeps the objects holds what a registration stated and the object does not hold as stated (10.3); the membership log that watchers and standbys read stays |
 | lists | the store's published copy | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
 | health | the worker crate's health checker over the worker objects, on the leader; each outcome is copied into the store's record | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
-| loads | the crate's own poller and table | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so every worker's loads are read: no new cost against classic, whose gateway hands every worker the same two defaults |
+| loads | the crate's own poller and table | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic, whose gateway hands every worker the same two defaults |
 | cache events | an index of the store's own | the kv-index crate's index, filled by the worker crate's collector |
 | sessions | the store's tables | the engine's session table |
 | leases | the store's lease tables, in memory, one for each deciding thread | stay: a controller must remember what it issued to gateways |

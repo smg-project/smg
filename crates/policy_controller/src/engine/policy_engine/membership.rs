@@ -122,7 +122,7 @@ pub trait Members: Send + Sync {
     /// and each replacement is then told under its own id. A host that
     /// keeps the id by the worker's address answers of the worker that
     /// stands there. An id that stood only between two replacements heard
-    /// together is then told to no stage. So does an id stated of a worker
+    /// together is then told to no stage. So is an id stated of a worker
     /// and taken back ahead of the word of its registration or its
     /// removal. The follow knows a host as one that states ids from the
     /// first ask this answers with one. From then on every registration,

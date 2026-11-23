@@ -740,6 +740,33 @@ fn a_registration_and_a_removal_under_a_host_that_states_ids_owe_a_whole_read() 
     );
 }
 
+/// The follow knows a host as one that states ids from the first ask the
+/// host answers with one, and the word of that ask owes the read too. A
+/// host that has stated nothing owes none at a registration. Then it
+/// states an id of a second worker and registers it: the follow owes a
+/// whole read behind that very word.
+#[test]
+fn the_word_whose_ask_first_answers_with_an_id_owes_a_whole_read() {
+    let registry = registry(0);
+    let host = Stating::over(&registry);
+    let (engine, heard, mut follow) = following(&host);
+    let _ = told(&heard);
+
+    register(&registry, 0);
+    drain(&engine, &mut follow);
+    assert_eq!(told(&heard), [("joined", id(0))]);
+    assert!(!follow.unread, "a host that has stated no id owes no read");
+
+    host.state(1, 9);
+    register(&registry, 1);
+    drain(&engine, &mut follow);
+    assert_eq!(told(&heard), [("joined", WorkerId(9))]);
+    assert!(
+        follow.unread,
+        "the word whose ask first answers with an id owes the read"
+    );
+}
+
 /// Two workers stand under one stated id, and the host gives one of them
 /// another: the id still names the other worker, so no leave of it is
 /// told. The other worker's removal is the id's leave.
