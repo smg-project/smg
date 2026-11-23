@@ -3,7 +3,8 @@
 //! the outcome.
 //!
 //! One way is the store-reading engine's own word, the one a served
-//! controller gives its store ([`tells`]). The other is the rule a guard's
+//! controller gives its store, here with no worker object to ask
+//! ([`open`]). The other is the rule a guard's
 //! lease is told by ([`lease_events::single`]), over the lease as the file
 //! lends it ([`Sides::with_held_single`]). A case runs one order of frames
 //! over a store told each way: the stages are handed the same.
@@ -22,8 +23,8 @@ use std::{
 use parking_lot::Mutex;
 
 use super::{
-    super::{completed, dispatched, open, outcome, released, tells},
-    a_completed, a_dispatched, a_released,
+    super::{completed, dispatched, outcome, released},
+    a_completed, a_dispatched, a_released, open,
 };
 use crate::{
     document::spec::{AppliedSpec, PolicySpec},
@@ -156,9 +157,10 @@ impl Bed {
             .expect("the catalog holds the stage");
         store.apply(spec).expect("a later generation");
         // The first word a store is given stays: a hand opened later gives
-        // the engine's own and changes nothing.
+        // the engine's own where the store holds none, and changes nothing
+        // where it holds one.
         match way {
-            Way::Engine => tells(&store),
+            Way::Engine => {}
             Way::Lent => store.tell_through(told_as_lent),
         }
         Self {

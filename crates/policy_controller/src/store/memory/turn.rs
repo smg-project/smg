@@ -137,8 +137,10 @@
 //! restore, from its start until it has read the ids on file
 //! ([`MemoryStore::restore_from`]). Under a turn come the world's load
 //! (no lock), a stage's own lock, the engine's sessions table, the store's
-//! session counts, the journal's word of a term and the table of the
-//! members no world lists yet, a leaf lock. A standby's restore takes the
+//! session counts, the journal's word of a term, the table of the
+//! members no world lists yet, a leaf lock, and the entry of the worker
+//! objects a host's word to the engine asks, a leaf lock too. A standby's
+//! restore takes the
 //! store's tables under its turns too: the workers', the health's and the
 //! loads', in that order. No path takes one of those and then a turn. A
 //! lifecycle call of a served controller therefore runs under a turn, or
@@ -181,8 +183,10 @@ use crate::{
 /// What tells the engine of a frame applied to a lease on file: the world
 /// the frame is told under, the lease as it stood before the frame, both
 /// its parts, what the frame said, and the decider whose file the lease is
-/// on, where the store's host named its deciders.
-type Teller = fn(&MemoryStore, &StoreSnapshot, &Sides, Said, Option<DecisionSlot>);
+/// on, where the store's host named its deciders. It holds what its host
+/// gave it: a served controller's holds the replica's worker objects.
+type Teller =
+    Arc<dyn Fn(&MemoryStore, &StoreSnapshot, &Sides, Said, Option<DecisionSlot>) + Send + Sync>;
 
 /// One load of the world for a run of words to the engine: the store's
 /// world, loaded at the run's first word and held to its last. A run is
@@ -807,8 +811,14 @@ impl MemoryStore {
         not(any(test, feature = "controller")),
         expect(dead_code, reason = "called by the served controller alone")
     )]
-    pub(crate) fn tell_through(&self, teller: Teller) {
-        self.files.teller.get_or_init(|| teller);
+    pub(crate) fn tell_through(
+        &self,
+        teller: impl Fn(&MemoryStore, &StoreSnapshot, &Sides, Said, Option<DecisionSlot>)
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        self.files.teller.get_or_init(|| Arc::new(teller));
     }
 
     /// A lifecycle call the controller made for a lease panicked and was

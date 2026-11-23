@@ -89,7 +89,6 @@ use tonic::{codegen::tokio_stream::Stream, Status, Streaming};
 use super::{
     decision_slots::{Job, Refused},
     gateways::Presence,
-    lifecycle,
     principal::Principal,
     service::Shared,
     session,
@@ -263,7 +262,7 @@ pub(crate) fn serve<S>(
         let _ = word.wait_for(|stop| *stop).await;
     }));
     let (sender, decided) = mpsc::channel(WINDOW as usize);
-    let hand = lifecycle::open(&shared.store, gateway);
+    let hand = Hand::new(gateway);
     Ok(Answers {
         shared,
         gateway,

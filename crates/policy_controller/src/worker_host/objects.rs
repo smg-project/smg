@@ -696,6 +696,23 @@ impl<G: Generation> Objects<G> {
             .map(|&(_, row)| row)
     }
 
+    /// Whether the row `row` stands at rank `rank`, by the facts its
+    /// object was laid from. `false` for a row the holder holds no object
+    /// for. Asked of the worker a dispatch report names, which may have
+    /// left or changed its rank since its decision. One read of the
+    /// entry under its read lock, a leaf: the caller may hold a turn of
+    /// the leases' files.
+    #[cfg_attr(
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "a controller's word to its engine asks it")
+    )]
+    pub(crate) fn lists_rank(&self, row: WorkerId, rank: u16) -> bool {
+        let held = self.held.read();
+        held.facts
+            .get(&row)
+            .is_some_and(|facts| facts.dp_rank == rank)
+    }
+
     /// How many objects stand.
     pub fn len(&self) -> usize {
         self.held.read().objects.len()
@@ -4113,6 +4130,26 @@ mod tests {
         assert_eq!(replica.objects.rank_row(lower, 1), None);
         assert_eq!(replica.objects.rank_row(upper, 1), None);
         assert_eq!(replica.objects.rank_row(lower, 0), Some(lower));
+    }
+
+    /// A row stands at the rank its facts state and at no other, and at
+    /// none once it left: what a late dispatch report is held against.
+    #[test]
+    fn a_row_stands_at_its_own_rank_until_it_leaves() {
+        let replica = Replica::new();
+        let lower = replica.store.upsert(rank_facts(A, C, 0)).id();
+        let upper = replica.store.upsert(rank_facts(B, C, 1)).id();
+        replica.follow();
+        let objects = &replica.objects;
+        assert!(objects.lists_rank(lower, 0));
+        assert!(objects.lists_rank(upper, 1));
+        assert!(!objects.lists_rank(lower, 1), "another row's rank");
+        assert!(!objects.lists_rank(upper, 0), "another row's rank");
+
+        replica.remove(B);
+        replica.follow();
+        assert!(!objects.lists_rank(upper, 1), "a row that left");
+        assert!(objects.lists_rank(lower, 0));
     }
 
     /// A rank's key that comes back as a new incarnation is another row, and

@@ -16,6 +16,7 @@ use crate::{
         decision::{Decision, Pair, Pick, Target, Targets, Trace},
         decision_slot::DecisionSlot,
         framework::{release, Engine},
+        view::WorkerId,
     },
     stages::lifecycle::Lifecycle,
     store::{GatewayId, HealthSink, MemoryStore, Sides, StoreSnapshot},
@@ -36,11 +37,12 @@ use crate::{
 /// generation `world` holds, whichever generation issued the lease: a
 /// send is the host's, whatever document decided it
 /// ([`Engine::dispatched_sent`]). A count that does not know the rank
-/// the report names enters it only where `world` lists the worker at
-/// that rank ([`StoreSnapshot::lists_rank`]), so a late report enters no rank
-/// behind a removal. A rank a count knows takes the send unasked: a
-/// removal forgets the worker's ranks, and a stale rank of a listed
-/// worker may take a late send that no row reads.
+/// the report names enters it only where `listed` says the worker
+/// stands at that rank. A served controller answers by its replica's
+/// worker objects, the lists its decisions read, so a late report
+/// enters no rank behind a removal. A rank a count knows takes the send
+/// unasked: a removal forgets the worker's ranks, and a stale rank of a
+/// listed worker may take a late send that no row reads.
 /// A dispatch is told on the target its report names by index,
 /// as the record holds the pick, and the lease told names that index:
 /// the record was read before the door wrote it. A report that names no
@@ -71,11 +73,13 @@ pub(crate) fn told(
     found: &Sides,
     said: Said,
     by: Option<DecisionSlot>,
+    listed: impl Fn(WorkerId, u16) -> bool,
 ) -> bool {
     // The lease's own decider acts while its event is told, whichever
     // thread applies the report.
     let _acting = by.map(DecisionSlot::enter);
-    let Err(payload) = catch_unwind(AssertUnwindSafe(|| tell(world, found, said))) else {
+    let told = catch_unwind(AssertUnwindSafe(|| tell(world, found, said, &listed)));
+    let Err(payload) = told else {
         store.call_returned();
         return false;
     };
@@ -96,7 +100,7 @@ pub(crate) fn issuing<'a>(spec: &'a AppliedSpec, lease: &Lease) -> Option<&'a En
 }
 
 /// What [`told`] tells, under its catch.
-fn tell(world: &StoreSnapshot, found: &Sides, said: Said) {
+fn tell(world: &StoreSnapshot, found: &Sides, said: Said, listed: &impl Fn(WorkerId, u16) -> bool) {
     let spec = world.spec();
     let issuing = || issuing(spec, &found.record.lease);
     match said {
@@ -127,7 +131,7 @@ fn tell(world: &StoreSnapshot, found: &Sides, said: Said) {
                 &target,
                 dispatch.side,
                 dispatch.since_decision_micros,
-                || world.lists_rank(id, dp_rank),
+                || listed(id, dp_rank),
             );
             // The table hears first and the stages last. A stage's call
             // that unwinds there leaves the table's entry written.

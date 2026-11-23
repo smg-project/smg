@@ -7541,9 +7541,9 @@ impl Engine {
 
     /// Records a dispatch in each profile tally that stages read. A tally
     /// asks `present` only where the send would enter a rank it does not
-    /// know: the store's door asks its world there, so a late report
-    /// enters no rank behind a removal. An engine whose profiles read no
-    /// sends asks nothing.
+    /// know: a served controller asks its worker objects there, so a late
+    /// report enters no rank behind a removal. An engine whose profiles
+    /// read no sends asks nothing.
     #[inline]
     pub(crate) fn dispatched_sent(
         &self,
