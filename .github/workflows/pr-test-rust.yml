@@ -1512,11 +1512,11 @@ jobs:
             timeout: 36
             test_timeout: 28
             min_selected: 204 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
-          # 21 min end to end on a quiet host (setup ~6 min, tests ~15 min);
-          # under runner contention setup alone reached 9 min and the 24 min
-          # budget cut the run short. Keep ~30% headroom like the other rows.
+          # Cold preparation reached ~22 min before pytest. Budget 30 min for
+          # preparation, the full 24-min test step, and 6 min for diagnostics,
+          # cleanup and headroom within the 60-min job limit.
           - engine: vllm
-            timeout: 32
+            timeout: 60
             test_timeout: 24
             min_selected: 202 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: trtllm
