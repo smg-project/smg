@@ -2141,32 +2141,6 @@ impl StoreSnapshot {
     pub(super) fn standings(&self) -> Arc<[Option<Arc<PoolIndex>>]> {
         Arc::clone(&self.indexes)
     }
-
-    /// The workers of the pool a naming's read is kept within, by id: for
-    /// the cases.
-    #[cfg(test)]
-    pub(crate) fn reached(
-        &self,
-        model: &str,
-        role: Role,
-        naming: &AffinityQuery<'_>,
-    ) -> Vec<WorkerId> {
-        let Some(index) = self.index(model, role) else {
-            return Vec::new();
-        };
-        let (Some(rows), Some(shape), Some(Some(held))) = (
-            self.rows.get(index),
-            self.derived.pools.get(index),
-            self.indexes.get(index),
-        ) else {
-            return Vec::new();
-        };
-        let reached = held.reached(naming, &shape.locals);
-        reached
-            .iter()
-            .filter_map(|&row| rows.get(row as usize).map(|row| row.id))
-            .collect()
-    }
 }
 
 /// Write a veto's bits on each row of `rows` a veto of `run` masks at

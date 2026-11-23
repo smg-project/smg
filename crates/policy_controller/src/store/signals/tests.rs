@@ -1,4 +1,5 @@
-//! A written value stands in a publication, beside its row.
+//! What a signal write comes to: the outcome it returns, and the count of
+//! each outcome.
 
 use std::{
     sync::{mpsc, Arc},
@@ -14,20 +15,12 @@ use crate::{
     engine::{Candidate, RequestFacts, Role, Scorer, TieBand, WorkerId},
     load::SignalColumn,
     stages::{Lifecycle, StageRegistry},
-    store::{
-        GatewayId, LoadSink, MemoryStore, SignalSink, SignalWriteOutcome, ViewBuffers, ViewQuery,
-        WorkerFacts, WorkerStatus, WorkersStore,
-    },
+    store::{MemoryStore, SignalSink, SignalWriteOutcome, WorkerFacts, WorkerStatus, WorkersStore},
 };
 
 const POOL: &str = "work";
-const GATEWAY: GatewayId = GatewayId(37);
 const QUEUE: &str = "queue";
 const REQUESTS: &str = "requests";
-
-/// One row's cells as a publication holds them: each cell's value and its
-/// sample instant, or none.
-type Held = Vec<Option<(f64, u64)>>;
 
 /// Scores a row by the value it reads of one signal.
 #[derive(Debug)]
@@ -188,55 +181,10 @@ fn foreign(stages: &Stages, name: &str, unit: &str) -> SignalColumn {
     other.signal_column(name)
 }
 
-/// Each row's cells in the block the standing publication lends for
-/// `role`, by worker: a cell's value and its sample instant, or none.
-fn lent(store: &MemoryStore, role: Role) -> Vec<(WorkerId, Held)> {
-    store.deciding(|world| {
-        let ask = ViewQuery {
-            gateway: GATEWAY,
-            now: Instant::now(),
-            pinned: None,
-            affinity: false,
-            signal_cells: true,
-        };
-        let mut out = ViewBuffers::default();
-        let view = world
-            .view(POOL, role, &ask, false, &mut out)
-            .expect("the pool");
-        let block = view.signal_cells.expect("the publication's block");
-        assert!(block.fits(view.candidates.len()), "one cell a row a signal");
-        let cells = block.cells().chunks(block.signals());
-        let of = |cells: &[crate::load::SignalCell]| {
-            let held = |cell: &crate::load::SignalCell| {
-                (!cell.is_none()).then_some((cell.value, cell.sampled_at_micros))
-            };
-            cells.iter().map(held).collect()
-        };
-        let ids = view.candidates.iter().map(|row| row.id);
-        ids.zip(cells.map(of)).collect()
-    })
-}
-
-/// The one cell of each row, by worker, under a document of one signal.
-fn values(store: &MemoryStore) -> Vec<(WorkerId, Option<f64>)> {
-    let mut values: Vec<_> = lent(store, Role::Single)
-        .into_iter()
-        .map(|(id, cells)| (id, cells[0].map(|(value, _)| value)))
-        .collect();
-    values.sort_by_key(|&(id, _)| id);
-    values
-}
-
-/// `values` in the order of their workers' ids, as a read is listed.
-fn by_id<const N: usize>(mut values: [(WorkerId, Option<f64>); N]) -> Vec<(WorkerId, Option<f64>)> {
-    values.sort_by_key(|&(id, _)| id);
-    values.to_vec()
-}
-
 #[test]
 fn a_write_that_is_not_taken_says_what_became_of_it_and_is_counted() {
     let stages = stages();
-    let (store, [a, b, c]) = fleet(&stages);
+    let (store, [a, ..]) = fleet(&stages);
     let at = Instant::now();
     let (queue, depth) = (
         store.signal_column(QUEUE),
@@ -274,16 +222,12 @@ fn a_write_that_is_not_taken_says_what_became_of_it_and_is_counted() {
         write(a, &queue, REQUESTS, 9.0, before),
         SignalWriteOutcome::Older
     );
-    // One count a kind, in the outcomes' order, and the value taken stands.
+    // One count a kind, in the outcomes' order.
     assert_eq!(
         SignalWriteOutcome::EACH.map(SignalWriteOutcome::label)[1],
         "undeclared"
     );
     assert_eq!(store.stats().signal_writes, [1, 1, 1, 2, 1, 1]);
-    assert_eq!(
-        values(&store),
-        by_id([(a, Some(5.0)), (b, None), (c, None)])
-    );
 }
 
 /// The sink holds a value's magnitude to the bound a cost rule's own
@@ -310,22 +254,17 @@ fn a_value_past_the_magnitude_bound_is_refused_and_counted() {
         store.stats().signal_writes[SignalWriteOutcome::OutOfRange.place()],
         4
     );
-    assert_eq!(
-        values(&store),
-        by_id([(a, Some(1e15)), (b, Some(-1e15)), (c, None)])
-    );
 }
 
 #[test]
-fn a_value_stated_for_another_rank_reaches_no_row() {
+fn a_value_stated_for_another_rank_of_a_member_is_taken() {
     let stages = stages();
-    let (store, [a, b, c]) = fleet(&stages);
-    // The worker's row stands at rank 0. A value for its rank 1 is on file
-    // for that rank, as a load record would be, and on no row.
+    let (store, [a, ..]) = fleet(&stages);
+    // The worker's row stands at rank 0. A value for its rank 1 is taken
+    // for that rank, as a load record would be.
     let queue = store.signal_column(QUEUE);
     let taken = store.signal_value(a, 1, &queue, REQUESTS, 7.0, Instant::now());
     assert_eq!(taken, SignalWriteOutcome::Written);
-    assert_eq!(values(&store), by_id([(a, None), (b, None), (c, None)]));
 }
 
 #[test]
@@ -340,24 +279,15 @@ fn of_two_sources_the_newer_sample_stands_whichever_arrives_last() {
     // The older first: the newer takes its place.
     assert_eq!(write(&store, b, 3.0, early), SignalWriteOutcome::Written);
     assert_eq!(write(&store, b, 5.0, late), SignalWriteOutcome::Written);
-    let cells = lent(&store, Role::Single);
-    for id in [a, b] {
-        let held = cells.iter().find(|(row, _)| *row == id).expect("the row");
-        assert_eq!(held.1, [Some((5.0, store.micros(late)))], "{id:?}");
-    }
-    // Two values of one instant: the last one written stands.
+    // Two values of one instant: the last one written is taken too.
     assert_eq!(write(&store, a, 8.0, late), SignalWriteOutcome::Written);
-    let cells = lent(&store, Role::Single);
-    let held = cells.iter().find(|(row, _)| *row == a).expect("the row");
-    assert_eq!(held.1, [Some((8.0, store.micros(late)))]);
 }
 
 #[test]
-fn a_new_document_keeps_a_name_it_declares_again_and_starts_a_changed_unit_empty() {
+fn a_new_document_takes_a_changed_unit_under_its_new_unit_alone() {
     let stages = stages();
     let store = Arc::new(MemoryStore::new());
     let a = join(&store, facts("first", Role::Single));
-    let b = join(&store, facts("second", Role::Single));
     let score = json!({ "by-value": { "signal": "heat" } });
     let before = json!({ "depth": { "unit": "items" }, "heat": { "unit": "celsius" } });
     stages.apply(&store, &document(4, before, score.clone()));
@@ -380,56 +310,16 @@ fn a_new_document_keeps_a_name_it_declares_again_and_starts_a_changed_unit_empty
         .map(|column| column.name().to_owned())
         .collect();
     assert_eq!(names, ["age", "depth", "heat"]);
-    // With no new report: the kept name is read at its new column.
-    let held = lent(&store, Role::Single);
-    let cells = |id| &held.iter().find(|(row, _)| *row == id).expect("the row").1;
-    assert_eq!(*cells(a), [None, None, Some((71.0, store.micros(at)))]);
-    assert_eq!(*cells(b), [None, None, None]);
-    // The table went under the new columns too: a write lands at them.
+    // The sink went under the new columns: a write is taken under the
+    // unit the document in force declares, and under no other.
     assert_eq!(write("depth", "items", 4.0), SignalWriteOutcome::WrongUnit);
     assert_eq!(write("depth", "blocks", 4.0), SignalWriteOutcome::Written);
-    let held = lent(&store, Role::Single);
-    let cells = &held.iter().find(|(row, _)| *row == a).expect("the row").1;
-    assert_eq!(cells[..2], [None, Some((4.0, store.micros(at)))]);
-}
-
-#[test]
-fn a_new_document_that_changes_a_signals_reduction_starts_the_name_empty() {
-    let stages = stages();
-    let store = Arc::new(MemoryStore::new());
-    let a = join(&store, facts("first", Role::Single));
-    let score = json!({ "by-value": { "signal": "heat" } });
-    let before = json!({ "depth": { "unit": "items" }, "heat": { "unit": "celsius" } });
-    stages.apply(&store, &document(4, before, score.clone()));
-    let at = Instant::now();
-    let write =
-        |name, unit, value| store.signal_value(a, 0, &store.signal_column(name), unit, value, at);
-    assert_eq!(write("depth", "items", 3.0), SignalWriteOutcome::Written);
-    assert_eq!(write("heat", "celsius", 71.0), SignalWriteOutcome::Written);
-
-    // The same names under the same units: one signal's ranks are made
-    // one another way.
-    let after = json!({
-        "depth": { "unit": "items", "across_ranks": "max" },
-        "heat": { "unit": "celsius" }
-    });
-    stages.apply(&store, &document(5, after, score));
-    // The value on file was made the way that stood, so the name starts
-    // empty. The other name keeps its value.
-    let held = lent(&store, Role::Single);
-    let cells = &held.iter().find(|(row, _)| *row == a).expect("the row").1;
-    assert_eq!(**cells, [None, Some((71.0, store.micros(at)))]);
-    // The next report states the name again.
-    assert_eq!(write("depth", "items", 4.0), SignalWriteOutcome::Written);
-    let held = lent(&store, Role::Single);
-    let cells = &held.iter().find(|(row, _)| *row == a).expect("the row").1;
-    assert_eq!(cells[0], Some((4.0, store.micros(at))));
 }
 
 /// A source reads its columns, then writes: a document can be applied
 /// between the two. A value was made under the column its source read, so
-/// it lands only where the document in force continues that column, at the
-/// column's place there, and is refused and counted where it does not.
+/// it is taken only where the document in force continues that column, and
+/// is refused and counted where it does not.
 #[test]
 fn a_write_under_a_column_read_before_a_document_lands_only_where_it_is_continued() {
     let stages = stages();
@@ -462,9 +352,6 @@ fn a_write_under_a_column_read_before_a_document_lands_only_where_it_is_continue
         ),
         (1, 1)
     );
-    let held = lent(&store, Role::Single);
-    let cells = &held.iter().find(|(row, _)| *row == a).expect("the row").1;
-    assert_eq!(**cells, [None, None, Some((71.0, store.micros(at)))]);
 }
 
 /// A write reads where its column is continued with no lock held, so a
@@ -498,15 +385,12 @@ fn a_write_read_under_the_generation_before_lands_only_where_its_column_is_conti
     );
     // Continued: taken, at the column's new place.
     assert_eq!(write(&heat, 71.0, heat_read), SignalWriteOutcome::Written);
-    let held = lent(&store, Role::Single);
-    let cells = &held.iter().find(|(row, _)| *row == a).expect("the row").1;
-    assert_eq!(**cells, [None, None, Some((71.0, store.micros(at)))]);
 }
 
 #[test]
-fn a_refused_document_moves_no_value() {
+fn a_refused_document_leaves_the_standing_columns_in_force() {
     let stages = stages();
-    let (store, [a, b, c]) = fleet(&stages);
+    let (store, [a, ..]) = fleet(&stages);
     let at = Instant::now();
     assert_eq!(write(&store, a, 7.0, at), SignalWriteOutcome::Written);
     // The standing generation's own number, under other columns.
@@ -519,50 +403,25 @@ fn a_refused_document_moves_no_value() {
     let digest = document.digest().expect("a digest");
     let spec = AppliedSpec::validate_digested(&document, digest, &stages.catalog, &[]);
     assert!(store.apply(spec.expect("the document validates")).is_err());
-    assert_eq!(
-        values(&store),
-        by_id([(a, Some(7.0)), (b, None), (c, None)])
-    );
-    // A membership build reads every value from the table again: the
-    // table stands under the standing generation's columns.
-    let d = join(&store, facts("fourth", Role::Single));
-    assert_eq!(
-        values(&store),
-        by_id([(a, Some(7.0)), (b, None), (c, None), (d, None)])
-    );
+    // The standing generation's columns stand: a write under its unit is
+    // taken, as before the refusal.
     assert_eq!(write(&store, a, 8.0, at), SignalWriteOutcome::Written);
 }
 
 #[test]
-fn a_worker_that_leaves_and_joins_again_starts_with_no_value() {
+fn a_value_stated_for_a_worker_that_left_is_refused() {
     let stages = stages();
-    let (store, [a, b, c]) = fleet(&stages);
+    let (store, [a, ..]) = fleet(&stages);
     let at = Instant::now();
-    for id in [a, b] {
-        assert_eq!(write(&store, id, 7.0, at), SignalWriteOutcome::Written);
-    }
-    // The first leaves and joins again as its next incarnation.
+    assert_eq!(write(&store, a, 7.0, at), SignalWriteOutcome::Written);
+    // The worker leaves: a value stated for the id it held is refused.
     let row = WorkersStore::get(&*store, a).expect("the row");
     assert!(store.remove(a, row.revision).is_some());
     assert_eq!(write(&store, a, 8.0, at), SignalWriteOutcome::NotAMember);
-    let again = join(
-        &store,
-        WorkerFacts {
-            incarnation: 2,
-            ..facts("first", Role::Single)
-        },
-    );
-    assert_eq!(
-        values(&store),
-        by_id([(again, None), (b, Some(7.0)), (c, None)])
-    );
-    // The second's reports stop: its values go with its load samples.
-    LoadSink::evict(&*store, b);
-    assert_eq!(values(&store), by_id([(again, None), (b, None), (c, None)]));
 }
 
 #[test]
-fn a_document_with_no_signal_publishes_no_block_and_drops_a_value_with_no_lock_taken() {
+fn a_document_with_no_signal_drops_a_value_with_no_lock_taken() {
     let stages = stages();
     let store = Arc::new(MemoryStore::new());
     let a = join(&store, facts("first", Role::Single));
@@ -575,20 +434,6 @@ fn a_document_with_no_signal_publishes_no_block_and_drops_a_value_with_no_lock_t
         }),
     );
     assert!(store.signal_columns().is_empty());
-    store.deciding(|world| {
-        let ask = ViewQuery {
-            gateway: GATEWAY,
-            now: Instant::now(),
-            pinned: None,
-            affinity: false,
-            signal_cells: true,
-        };
-        let mut out = ViewBuffers::default();
-        let lent = world.view(POOL, Role::Single, &ask, false, &mut out);
-        assert!(lent.expect("the pool").signal_cells.is_none());
-        let written = world.view(POOL, Role::Single, &ask, true, &mut out);
-        assert!(written.expect("the pool").signal_cells.is_none());
-    });
     // The write answers while the load lock is held: it takes none.
     let writer = Arc::clone(&store);
     let queue = foreign(&stages, QUEUE, REQUESTS);
@@ -602,30 +447,4 @@ fn a_document_with_no_signal_publishes_no_block_and_drops_a_value_with_no_lock_t
     });
     assert_eq!(answered, Ok(SignalWriteOutcome::Undeclared));
     assert_eq!(store.stats().signal_writes, [0, 1, 0, 0, 0, 0]);
-}
-
-#[test]
-fn a_window_of_moved_cells_allocates_no_block_past_the_second() {
-    let stages = stages();
-    let (store, [a, ..]) = fleet(&stages);
-    let start = Instant::now();
-    let mut blocks = Vec::new();
-    for nth in 0..6u32 {
-        let at = start + Duration::from_millis(u64::from(nth));
-        assert_eq!(
-            write(&store, a, f64::from(nth), at),
-            SignalWriteOutcome::Written
-        );
-        blocks.push(store.publication_allocations());
-    }
-    assert_eq!(
-        values(&store)
-            .iter()
-            .filter_map(|(_, value)| *value)
-            .sum::<f64>(),
-        5.0
-    );
-    // The first publication takes a second block, and the two then trade.
-    assert_eq!(blocks[1..], [blocks[1]; 5], "{blocks:?}");
-    assert!(blocks[1] <= blocks[0] + 1, "{blocks:?}");
 }

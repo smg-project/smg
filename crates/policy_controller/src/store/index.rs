@@ -622,8 +622,6 @@ impl Predicted {
             } else {
                 return;
             };
-            #[cfg(test)]
-            seam::at(seam::Point::Guarded);
             // A worker may leave between slices. Its removal clears this
             // word before forgetting under the same guard.
             if !allowed.load(Ordering::Relaxed) {
@@ -870,8 +868,6 @@ impl Tables {
         for _ in 0..Self::ROUNDS {
             seed = Draw::new(seed).next_u64();
             let own = index.own(&within[..words], whole_at);
-            #[cfg(test)]
-            seam::at(seam::Point::Again);
             index.deepest_again(naming, &own[..words], cap, seed, kept);
             // As in the naming: the read before the fence, the asks after.
             fence(Ordering::Acquire);
@@ -949,61 +945,6 @@ impl Tables {
             return false;
         }
         true
-    }
-}
-
-/// A seam for the cases: a hook the naming thread runs once at a point
-/// inside one naming, where a take or a keep lands between the naming's
-/// reads. No case reaches there from outside. In no build but the cases'.
-#[cfg(test)]
-mod seam {
-    use std::cell::RefCell;
-
-    /// Where inside a naming a hook runs.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) enum Point {
-        /// Behind the record's holders named ahead, ahead of the lookup.
-        Recorded,
-        /// Behind the naming's lookup, ahead of its fence and its question.
-        Looked,
-        /// Ahead of a lookup made again, behind the ids it is kept within.
-        Again,
-        /// In a lease's write, not a naming: under the record's guard,
-        /// ahead of the read of the worker's word.
-        Guarded,
-    }
-
-    type Hook = Box<dyn FnOnce()>;
-
-    thread_local! {
-        static HOOK: RefCell<Option<(Point, Hook)>> = const { RefCell::new(None) };
-    }
-
-    /// `hook` runs once, in the next naming of this thread that reaches
-    /// `point`.
-    pub(super) fn set(point: Point, hook: impl FnOnce() + 'static) {
-        HOOK.with(|held| *held.borrow_mut() = Some((point, Box::new(hook))));
-    }
-
-    /// Whether a hook is still set. A case holds that none is behind its
-    /// naming: every step it set ran.
-    pub(super) fn pending() -> bool {
-        HOOK.with(|held| held.borrow().is_some())
-    }
-
-    /// The hook set for `point` runs. It is taken out first: a naming the
-    /// hook itself asks for meets none.
-    pub(super) fn at(point: Point) {
-        let hook = HOOK.with(|held| {
-            let mut held = held.borrow_mut();
-            match &*held {
-                Some((set, _)) if *set == point => held.take(),
-                _ => None,
-            }
-        });
-        if let Some((_, hook)) = hook {
-            hook();
-        }
     }
 }
 
@@ -1154,25 +1095,6 @@ impl PoolIndex {
         }
     }
 
-    /// The rows of the pool a read for `naming` is kept within, by their
-    /// index in the pool, ascending: for the cases.
-    #[cfg(test)]
-    pub(super) fn reached(
-        &self,
-        naming: &AffinityQuery<'_>,
-        locals: &[(u32, GatewayId)],
-    ) -> Vec<u32> {
-        let mut mask = [0u64; MASK_WORDS];
-        let within = self.tables.within(naming, locals, &mut mask);
-        let named = |id: &usize| within[id / 64] & (1 << (id % 64)) != 0;
-        let ids = (0..within.len() * 64).filter(named);
-        let mut rows: Vec<u32> = ids
-            .filter_map(|id| self.tables.row_of.get(id).copied())
-            .collect();
-        rows.sort_unstable();
-        rows
-    }
-
     /// Name the rows of a decision's view for the affinity stages
     /// ([`AffinityRows`]): the request's deepest holders and the pool's
     /// warming rows, each list at most `naming.cap` rows, ascending, by
@@ -1306,8 +1228,6 @@ impl PoolIndex {
         let ahead = self.predict.is_some_and(|predict| predict.ahead);
         if ahead {
             name_record(named, &mut draw);
-            #[cfg(test)]
-            seam::at(seam::Point::Recorded);
         }
         let room = cap.saturating_sub(named.holders.len());
         // An engine's events are token blocks. A request hashed by windows
@@ -1344,8 +1264,6 @@ impl PoolIndex {
                 |under| below(&mut draw, under),
                 &mut named.kept,
             );
-            #[cfg(test)]
-            seam::at(seam::Point::Looked);
             // Every read of the lookup stands before this fence, and the
             // question of what was taken since after it ([`Index`]).
             fence(Ordering::Acquire);
