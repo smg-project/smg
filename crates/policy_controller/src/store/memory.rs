@@ -931,7 +931,7 @@ impl MemoryStore {
     ) -> Result<bool, StaleGeneration> {
         // The writer takes a second reference: when it refuses, the last
         // one is this one, let go after the lock.
-        let spec = Arc::new(Applied::new(spec));
+        let spec = Arc::new(Applied::new(spec, self.origin));
         let generation = spec.generation();
         let before = {
             // Taken before the lock, so dropped after it: the journal

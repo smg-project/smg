@@ -368,6 +368,21 @@ impl PolicyEngine {
         }
     }
 
+    /// [`Self::new`] on the clock of a host that reads one of its own and
+    /// builds an engine for each of its documents: the engine's clock
+    /// starts at `origin`, the host's. An instant then reads alike under
+    /// every document and on the host's clock, so what one document's
+    /// stages stamped and the next takes over, a profile's count of sends
+    /// ([`Engine::succeed`](crate::engine::framework::Engine::succeed)),
+    /// is read on the clock it was written on.
+    #[must_use]
+    pub(crate) fn with_origin(spec: AppliedSpec, origin: Instant) -> Self {
+        Self {
+            clock: DecisionClock::from_origin(origin),
+            ..Self::new(spec)
+        }
+    }
+
     /// What the engine keeps for its affinity stages: the gateway hands its
     /// indexes of cache events here, once, at its start
     /// ([`Affinity::set_indexes`]), and reads the record's own count

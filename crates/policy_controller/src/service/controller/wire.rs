@@ -658,7 +658,7 @@ pub(crate) enum Beside {
     /// lease is the prefill side's under this key: one id, one record, and
     /// at the answer one index and one count of tokens.
     #[cfg_attr(
-        not(test),
+        not(all(test, feature = "client")),
         expect(
             dead_code,
             reason = "a pair's lease is handed over again once a pair is decided over worker lists"

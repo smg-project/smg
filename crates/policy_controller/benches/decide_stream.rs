@@ -149,6 +149,13 @@
 //! the best alone and the next two alike, the best two alike, all three
 //! alike. Two builds are compared where they print one tally.
 //!
+//! A served decision reads no load report yet (`READS_LOADS`): a controller
+//! decides a single request over worker objects, and its engine is lent no
+//! load report. Until it is, the bands hold no row's pool: it moves with
+//! the leases on file, and a row whose pool moves stops the bench. So no
+//! wire row is run, and each kind's line says so. The count cells run:
+//! they read a decision's calls of the allocator, not its pool.
+//!
 //! Every row runs on the allocator the binary registers, under a copy of
 //! its settings (`MALLOC_CONF`). A served decision's frame holds lists
 //! made on a deciding thread and freed on a stream's, and what a list
@@ -553,6 +560,12 @@ mod kernel {
 
 const GATEWAY: &str = "bench-gateway";
 const PRESET: &str = "least_load";
+/// Whether a served decision reads the load reports a row's members stand
+/// in their bands by. A controller's single decision is lent none yet, so
+/// no wire row is run: a row's pool moves with the leases on file, and a
+/// row's guard stops a pool that moves. It turns when a controller's
+/// engine is lent its loads.
+const READS_LOADS: bool = false;
 /// The pair plan of the pair count cell: the plan of the engine's own
 /// pair cells (`pair_classes`), least load on each side.
 const PAIR_PLAN: &str = r#"{
@@ -2357,6 +2370,16 @@ fn main() -> io::Result<()> {
         for cell in ["stream:1:200", "stream:2:200"] {
             count(cell, &mut out)?;
         }
+    }
+    if !READS_LOADS {
+        let kinds = ["round_trip", "offered", "rate", "gateway"];
+        for kind in kinds.into_iter().filter(|kind| all || rows == *kind) {
+            writeln!(
+                out,
+                "policy_decide_stream/{kind} not run: a served decision reads no load report yet"
+            )?;
+        }
+        return Ok(());
     }
     if all || rows == "round_trip" {
         for in_flight in [1, 8, 64] {

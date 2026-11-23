@@ -810,7 +810,8 @@ Main has two engines behind one trait (`DecisionEngine`, `engine/decision_engine
 **The design keeps `PolicyEngine` and removes the store-backed engine [partly].** The controller
 gets worker objects of its own (section 10), so its service calls the same engine a gateway
 calls. The switch is made in steps (decision 5): a single request is decided by `PolicyEngine`
-on main (10.1), a pair's phases follow, and the store-backed engine is deleted behind them.
+on main (10.1), the store-backed engine is deleted right behind that step, and a pair's phases,
+answered `Busy` meanwhile, are then decided by the one engine.
 
 The two engines still share types. `Request`, `DecideOutcome`, `DecisionRefused`, `DecodeRefused`
 and `SweepOutcome` are defined in the trait's file, and `Said` (section 6) beside `Lease`. They
@@ -1416,11 +1417,14 @@ are kept.
 order they registered, where the store's copy was sorted by id. It reads a worker's status, its
 breaker and its stalled bit on the worker object, and the count of requests in flight there, which
 the store steps for each lease on file. A record made of a worker object states one protocol and
-no zone, and of what a worker states for a request's hard demands only whether it takes images.
+no zone.
 The asking gateway's reach, its wires and its standing vetoes are stated to the engine as places
 of the list. A new document is a new engine object: its session pins and its record of sent
 prompts start empty, and that record is told no worker's leave. A sessions rule's cap counts no
-request of a key: a key stays on its worker past the cap, as under a rule with no cap.
+request of a key: a key stays on its worker past the cap, as under a rule with no cap. A
+registration, a drain or a deregistration reaches a decision at the next pass of the task that
+follows the worker records, a moment after its call answers, and a controller that starts over
+standing rows answers no worker until that pass ends.
 
 ### 10.3 The controller's worker data **[partly]**
 
@@ -1433,7 +1437,7 @@ tells the data once more:
 | the worker record | the store's table of records (`store/memory.rs`) | the registration calls; a watcher's and a standby's first copy |
 | a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
 | the worker object | the worker-crate registry | the health checker, the follower of cache events and a single request's decision |
-| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a single request's decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached |
+| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a single request's decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. What the worker states for a request's hard demands is lent with the list, and no frame states a demand yet |
 | the published copy of the records | the store | a pick's booking and a gateway's vetoes; no request is decided over it |
 | the membership log's event | `service/replication/log.rs` | a watcher behind its first copy; a standby |
 
@@ -1805,9 +1809,9 @@ inside the crate only.
 
 **Recommendation: (a).**
 
-**As taken.** The deciding threads were switched for a single request first (section 10.1). A
-request of a prefill, a decode or an encode phase is answered `Busy` until its decision is made
-over worker lists, and the deletion follows that.
+**As taken.** The deciding threads were switched for a single request first (section 10.1). The
+store-backed engine is deleted right behind that step, and a request of a prefill, a decode or an
+encode phase, answered `Busy` meanwhile, is then decided by the one engine over worker lists.
 
 ### Decision 6: a gateway under a controller that gets no answer in time
 

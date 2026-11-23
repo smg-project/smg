@@ -153,6 +153,21 @@ impl DecisionClock {
         }
     }
 
+    /// The clock whose origin is `origin`: for a host that reads a clock of
+    /// its own and builds an engine for each of its documents, so one
+    /// instant reads alike on the host's clock and on every engine's.
+    #[must_use]
+    #[cfg_attr(
+        not(feature = "in-process"),
+        expect(dead_code, reason = "the engine over worker lists takes it")
+    )]
+    pub(crate) fn from_origin(origin: Instant) -> Self {
+        Self {
+            origin,
+            pools: AtomicU64::new(0),
+        }
+    }
+
     /// `at` on this clock: microseconds since its origin, saturating at
     /// both ends.
     #[must_use]

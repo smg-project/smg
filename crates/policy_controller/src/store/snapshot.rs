@@ -1260,7 +1260,7 @@ impl StoreSnapshot {
     /// is.
     #[cfg(feature = "in-process")]
     #[cfg_attr(
-        not(feature = "controller"),
+        not(any(feature = "controller", test)),
         expect(dead_code, reason = "a controller's deciding thread asks it")
     )]
     pub(crate) fn front(&self) -> &PolicyEngine {
@@ -3064,7 +3064,7 @@ impl Writer {
             counts: Arc::default(),
             vetoes: Arc::default(),
             pool_vetoes: Arc::default(),
-            spec: Arc::new(Applied::new(AppliedSpec::unbound())),
+            spec: Arc::new(Applied::new(AppliedSpec::unbound(), origin)),
             indexes: Arc::default(),
             reading: Reading::default(),
             lanes: 0,

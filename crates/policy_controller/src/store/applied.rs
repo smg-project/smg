@@ -12,8 +12,13 @@
 //!
 //! A new document is a new engine object, built by the front's constructor.
 //! Its session table and its record of sent prompts start empty.
+//!
+//! Every engine a store builds reads the store's own clock: the store hands
+//! it its origin. An apply hands a profile's count of sends from the
+//! standing engine to the next, and a lease is dated where the store reads
+//! its file: one instant reads alike under every document and in the store.
 
-use std::ops::Deref;
+use std::{ops::Deref, time::Instant};
 
 use crate::document::spec::AppliedSpec;
 #[cfg(feature = "in-process")]
@@ -31,14 +36,20 @@ pub(crate) struct Applied {
 }
 
 impl Applied {
-    /// `spec` as a store holds it from its apply on.
-    pub(crate) fn new(spec: AppliedSpec) -> Self {
+    /// `spec` as a store holds it from its apply on. `origin` is the origin
+    /// of the store's clock: the engine that decides under the document
+    /// reads that clock.
+    pub(crate) fn new(spec: AppliedSpec, origin: Instant) -> Self {
         #[cfg(feature = "in-process")]
         let applied = Self {
-            engine: PolicyEngine::new(spec),
+            engine: PolicyEngine::with_origin(spec, origin),
         };
         #[cfg(not(feature = "in-process"))]
-        let applied = Self { spec };
+        let applied = {
+            // A build without the front keeps no clock beside the store's.
+            let _ = origin;
+            Self { spec }
+        };
         applied
     }
 
@@ -46,7 +57,7 @@ impl Applied {
     /// whose stages hear the store's words of a lease.
     #[cfg(feature = "in-process")]
     #[cfg_attr(
-        not(feature = "controller"),
+        not(any(feature = "controller", test)),
         expect(dead_code, reason = "a controller's deciding thread asks it")
     )]
     pub(crate) fn front(&self) -> &PolicyEngine {
