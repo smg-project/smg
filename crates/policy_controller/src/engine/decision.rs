@@ -401,7 +401,10 @@ impl Trace {
     /// alone ([`Picker::draw_first`](crate::engine::Picker::draw_first)). No pass
     /// over the pool ran, so the trace counts nothing of the pool:
     /// `survivors` holds no count, which is the mark read here, and `top`
-    /// is of the rows drawn.
+    /// is of the rows drawn. A decision by the rows its key names carries
+    /// the mark with no draw, a pin followed or a ring walked
+    /// ([`Engine::decide_keyed`](crate::engine::Engine::decide_keyed)): no
+    /// pass ran for it either, and `top` is of the rows it hands out.
     pub const fn drew_first(&self) -> bool {
         self.survivors.get().is_none()
     }

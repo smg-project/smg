@@ -615,7 +615,10 @@ impl Iterator for Keys<'_> {
 ///
 /// The owner must be among the rows scored, so the scorer answers for the
 /// pool whole and never row by row ([`Scorer::row_wise`]): a profile that
-/// names it runs its whole pass, with no rows drawn first and no sample.
+/// names it has no rows drawn first and no sample. Its whole pass runs but
+/// for a keyed request the plain ring places by itself, which is decided
+/// by the workers its key reaches ([`Scorer::own`],
+/// [`Scorer::own_by_place`]).
 ///
 /// The ring is the scorer's own, behind a lock its decisions share, unless
 /// the request's caller lent the ring it keeps and says where the request
@@ -1136,6 +1139,76 @@ impl Scorer for ConsistentHash {
             walk_pool::<SHARED>(&ring, marks, key, number, candidates, keep, kept)
         } else {
             walk_pool::<APART>(&ring, marks, key, number, candidates, keep, kept)
+        }
+    }
+
+    /// The walk of the ring the request's caller lent
+    /// ([`RequestFacts::ring`]), for a host that reads a row when the walk
+    /// asks about it. Each worker the ring names is found by its address's
+    /// id, asked of `keep` once, and the first [`MAX_TARGETS`] kept are
+    /// handed out in the ring's order: the rows the pass over the whole
+    /// pool ranks on that ring, in its order.
+    ///
+    /// The walk is the plain ring's, from the first place the request
+    /// states. The bounded-load rule reads every survivor's count, and the
+    /// prefix form states a place for each of its heads: the pass over the
+    /// whole pool places under both.
+    ///
+    /// `0` where the walk decides nothing and the pass over the whole pool
+    /// must: under those two forms, where no ring is lent or no place is
+    /// stated, and where a row of the pool is left not asked once
+    /// [`DRAW_BOUND`] rows were refused, which says nothing of the rows
+    /// behind them, or once the ring ended short of [`MAX_TARGETS`] kept.
+    /// The walk named no place for that row, and the pass over the whole
+    /// pool says what stands behind the ring's workers. A walk that asked
+    /// about every row of the pool decides by the rows it kept, whatever
+    /// it refused. Eleven rows are asked about at most: three kept and
+    /// seven refused ahead of the one that ends the walk.
+    fn own_by_place(
+        &self,
+        facts: &RequestFacts<'_>,
+        rows: usize,
+        place_of: &dyn Fn(WorkerId) -> Option<u32>,
+        keep: &mut dyn FnMut(u32) -> bool,
+    ) -> usize {
+        if self.bounded.is_some() || self.prefix.is_some() {
+            return 0;
+        }
+        let Some((ring, position, _)) = Self::lent(facts) else {
+            return 0;
+        };
+        // The rows met, kept or refused: a row the ring names again is not
+        // asked again.
+        let mut met = [FREE; MAX_TARGETS + DRAW_BOUND as usize];
+        let (mut asked, mut kept, mut refused) = (0usize, 0usize, 0u32);
+        // Whether the walk ended, and whether it ended decided.
+        let (mut ended, mut decided) = (false, false);
+        ring.walk(position, &mut |address| {
+            if ended {
+                return true;
+            }
+            let place = place_of(WorkerId::from_address(address));
+            let Some(place) = place.filter(|place| !met[..asked].contains(place)) else {
+                return false;
+            };
+            if let Some(slot) = met.get_mut(asked) {
+                *slot = place;
+            }
+            asked += 1;
+            if keep(place) {
+                kept += 1;
+            } else {
+                refused += 1;
+            }
+            // Every row was asked: the ring names no other.
+            decided = kept == MAX_TARGETS || asked == rows;
+            ended = decided || refused == DRAW_BOUND;
+            ended
+        });
+        if decided {
+            kept
+        } else {
+            0
         }
     }
 
@@ -2726,5 +2799,77 @@ mod tests {
         assert_eq!(tried_on(&elsewhere, &rule, &[13, 14], &all), [6]);
         let plain = ConsistentHash::new(None);
         assert_eq!(tried_on(&elsewhere, &plain, &[13, 14], &all), [5]);
+    }
+
+    /// The walk by place of `facts`' lent ring over `rows` rows in their
+    /// list's order, the worker `w<n>` at place `n`, where the filters
+    /// refuse the places in `refused`: the places kept, in the order asked,
+    /// and how many the walk says it hands out.
+    fn walked(facts: &RequestFacts<'_>, rows: u32, refused: &[u32]) -> (Vec<u32>, usize) {
+        let ids: Vec<WorkerId> = addressed(rows).iter().map(|row| row.id).collect();
+        let place_of = |id: WorkerId| ids.iter().position(|&own| own == id).map(|at| at as u32);
+        let (mut kept, mut asked) = (Vec::new(), Vec::new());
+        let handed =
+            ConsistentHash::new(None).own_by_place(facts, rows as usize, &place_of, &mut |place| {
+                assert!(!asked.contains(&place), "place {place} asked twice");
+                asked.push(place);
+                let keep = !refused.contains(&place);
+                if keep {
+                    kept.push(place);
+                }
+                keep
+            });
+        (kept, handed)
+    }
+
+    /// A lent ring walked by place hands out the rows the pass over the
+    /// whole pool ranks, in its order, and asks about no row behind them:
+    /// four kept end it, and so does the pool's last row. It decides
+    /// nothing, and the whole pass must, once [`DRAW_BOUND`] rows were
+    /// refused, where the ring ends with a row of the pool not asked,
+    /// where no ring is lent or no place is stated, and under a
+    /// bounded-load rule or the prefix form, which ask about no row.
+    #[test]
+    fn a_lent_ring_walked_by_place_hands_out_the_rows_the_whole_pass_ranks() {
+        let ring = reaches(&[5, 9, 2, 0, 7, 3, 1, 1, 6, 4]);
+        let facts = lent(&ring, &[0]);
+        let rows = addressed(8);
+        for refused in [&[][..], &[5, 2], &[5, 2, 0, 7, 3], &[6, 4, 1]] {
+            let kept: Vec<u32> = (0..8).filter(|row| !refused.contains(row)).collect();
+            let (places, handed) = walked(&facts, 8, refused);
+            assert_eq!(places, ranked(&ring, 0, &rows, &kept), "{refused:?}");
+            assert_eq!(handed, places.len(), "{refused:?}");
+        }
+        // Eight refused say nothing of the rows behind them. Seven do.
+        let long = reaches(&(0..20).collect::<Vec<u32>>());
+        let facts = lent(&long, &[0]);
+        assert_eq!(walked(&facts, 20, &[0, 1, 2, 3, 4, 5, 6, 7]).1, 0);
+        let kept = (vec![7, 8, 9, 10], MAX_TARGETS);
+        assert_eq!(walked(&facts, 20, &[0, 1, 2, 3, 4, 5, 6]), kept);
+        // Eight refused that are the pool's last rows leave none not
+        // asked: the one row kept is the pool's answer.
+        let nine = reaches(&(0..9).collect::<Vec<u32>>());
+        let refused = [1, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(walked(&lent(&nine, &[0]), 9, &refused), (vec![0], 1));
+        // A refused row the ring names again is not asked again, and is
+        // counted once.
+        let again = reaches(&[0, 1, 1, 2]);
+        assert_eq!(walked(&lent(&again, &[0]), 3, &[1]), (vec![0, 2], 2));
+        // A ring of two of three rows names no third: the whole pass says
+        // what stands behind its two.
+        let short = reaches(&[2, 0]);
+        assert_eq!(walked(&lent(&short, &[0]), 3, &[]), (vec![2, 0], 0));
+        assert_eq!(walked(&lent(&short, &[0]), 3, &[1]), (vec![2, 0], 0));
+        // No place stated, no ring lent: no row is asked.
+        for facts in [lent(&ring, &[]), keyed(7)] {
+            assert_eq!(walked(&facts, 8, &[]), (vec![], 0));
+        }
+        let asks: &mut dyn FnMut(u32) -> bool = &mut |_| panic!("a row was asked");
+        for scorer in [bounded(1.25, 10), prefixed(64)] {
+            assert_eq!(
+                scorer.own_by_place(&lent(&ring, &[0]), 8, &|_| Some(0), asks),
+                0
+            );
+        }
     }
 }

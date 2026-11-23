@@ -11,18 +11,19 @@
 //! request: the engine asks it before the request is made, so such a
 //! request is never made.
 //!
-//! **A key's rows, between** ([`keys::decide`]). A request that is made
-//! under a sessions rule is decided by the row its key names: its key's
-//! pin, which is one worker's record. It answers where that row says what
-//! the whole pass would, and nothing where it does not.
+//! **A key's rows, between** ([`keys::decide`]). A keyed request that is
+//! made is decided by the rows its key names: under a sessions rule its
+//! key's pin, which is one worker's record, and under a ring the workers
+//! its key reaches on the ring its caller lent. It answers where those rows
+//! say what the whole pass would, and nothing where they do not.
 //!
 //! **The whole pass, behind them** ([`decide`]). Every other request is made
 //! and put to the engine's whole decision over records written for it from
-//! the gateway's own data ([`records::decide`]): a retry that names the
-//! workers it tried, a list the picker's turns find no eligible worker of,
-//! and a place whose profile scores. The binding's rule for a pool every
-//! worker of which is vetoed, and the test of a tried worker, so have one
-//! home.
+//! the gateway's own data ([`records::decide`]): where no key's rows
+//! answered it, a retry that names the workers it tried, a list the
+//! picker's turns find no eligible worker of, and a place whose profile
+//! scores. The binding's rule for a pool every worker of which is vetoed,
+//! and the test of a tried worker, so have one home.
 //!
 //! **A hard demand** ([`Demands`](crate::engine::Demands)). A request that
 //! states one is held to the places of its list whose worker meets it, by
@@ -348,7 +349,7 @@ fn by_facts<const RETRY: bool>(
     let spec = &own.document.spec;
     let (engine, workers) = (spec.engine(), members.workers());
     // A keyed request is decided by the rows its key names, where they say
-    // what the whole pass would: its key's pin.
+    // what the whole pass would: its key's pin, or its ring's walk.
     match keys::decide(engine, records, workers, live, facts, cx) {
         // A pin its rule keeps from the profile: no holder is named for it
         // and nothing is kept of where its prompt went.

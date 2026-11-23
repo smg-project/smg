@@ -310,6 +310,30 @@ pub trait Scorer: Lifecycle + Debug {
         false
     }
 
+    /// [`Self::own`] for a host that reads a row when it is asked about
+    /// one, and writes none ahead of the decision. The scorer finds the
+    /// request's workers by its own rule and learns from `place_of` where
+    /// each stands in the pool, which holds `rows` rows: `None` for a
+    /// worker that is no row of it, and for an id two rows of it carry,
+    /// which names neither. It asks `keep`, every filter of the profile,
+    /// about each place once, and of as many places as its rule goes
+    /// through: the hook bounds no walk. Returns how many rows it hands
+    /// out: the places `keep` kept, in the order it was asked, the pick
+    /// first and its alternates behind it. They are the rows the profile's
+    /// run over the whole pool hands out, in its order. `0` where it
+    /// places nothing by itself or its rule ran out: the profile's run
+    /// decides. It reads no value of the seed's stream. The default places
+    /// nothing.
+    fn own_by_place(
+        &self,
+        _facts: &RequestFacts<'_>,
+        _rows: usize,
+        _place_of: &dyn Fn(WorkerId) -> Option<u32>,
+        _keep: &mut dyn FnMut(u32) -> bool,
+    ) -> usize {
+        0
+    }
+
     /// How this scorer's values lie ([`ScoreSpread`]), asked once when the
     /// engine is built. A scorer that writes levels is a rank where its weight
     /// outweighs every stage behind it: a plain decision then asks those stages
@@ -3368,10 +3392,11 @@ pub struct Engine {
     /// indexed by [`slot`].
     phase_needs: [Needs; PHASES.len()],
     /// Per phase, whether a binding that covers it under the single plan
-    /// pins a key: the phases whose requests the keyed decision over rows
-    /// read one at a time answers ([`Self::decide_keyed`]), indexed by
-    /// [`slot`]. Every other phase's request is turned away there by this
-    /// one read.
+    /// pins a key, or has a profile whose one scorer places a keyed
+    /// request by itself on a ring: the phases whose requests the keyed
+    /// decision over rows read one at a time answers
+    /// ([`Self::decide_keyed`]), indexed by [`slot`]. Every other phase's
+    /// request is turned away there by this one read.
     keyed: [bool; PHASES.len()],
     /// The session table this engine's decisions read and write: its own,
     /// made with it, or the one its host keeps across documents
@@ -3630,12 +3655,13 @@ impl Marks {
     /// the stages as a draw's.
     const ENGINES: u16 = 1 << 7;
     /// The profile's one scorer places a request by itself
-    /// ([`Scorer::own`]), every filter answers row by row and the picker
-    /// takes the best scores of every row ([`Picker::takes_best`]): a
-    /// picker that narrows first does not follow the scorer's order, and
-    /// its profile runs. Under the mark a request that carries a
-    /// session key, over a pool whose host lists its engines, is the
-    /// scorer's to place ([`run_owned`]).
+    /// ([`Scorer::own`]) and has a finite weight above zero, every filter
+    /// answers row by row and the picker takes the best scores of every
+    /// row ([`Picker::takes_best`]): a picker that narrows first does not
+    /// follow the scorer's order, a weight that orders nothing leaves the
+    /// rows to the picker's draw, and the profile runs. Under the mark a
+    /// request that carries a session key, over a pool whose host lists
+    /// its engines, is the scorer's to place ([`run_owned`]).
     const OWNS: u16 = 1 << 8;
     /// A stage may refuse a request by a report of leases
     /// ([`Filter::refuses_by_reports`]). The engine's run reads nothing of
@@ -3686,7 +3712,7 @@ impl Marks {
             0
         };
         let alone = match &profile.scorers[..] {
-            [stage] => stage.scorer.owns(),
+            [stage] => stage.weight > 0.0 && stage.weight.is_finite() && stage.scorer.owns(),
             _ => false,
         };
         let row_wise = profile.filters.iter().all(|f| f.row_wise());
@@ -4503,6 +4529,12 @@ impl Engine {
         // the phase answers below fold them.
         let profile_needs: Vec<Needs> = profiles.iter().map(Profile::needs).collect();
         let needs = profile_needs.iter().fold(needs, |all, &own| all.or(own));
+        let orders: Vec<Order> = profiles.iter().map(Order::of).collect();
+        let marks: Vec<Marks> = profiles
+            .iter()
+            .zip(&orders)
+            .map(|(profile, &order)| Marks::of(profile, order))
+            .collect();
         // Per phase, the bindings that cover it in the spec's order; a
         // binding behind a catch-all model glob decides no request of the
         // phase and adds nothing (the gateway's own document binds every
@@ -4514,17 +4546,23 @@ impl Engine {
                 .iter()
                 .filter(|b| b.phases.is_empty() || b.phases.contains(&phase))
             {
-                if let Some(&own) =
-                    profile_index(binding, phase).and_then(|i| profile_needs.get(usize::from(i)))
-                {
+                let index = profile_index(binding, phase).map(usize::from);
+                if let Some(&own) = index.and_then(|i| profile_needs.get(i)) {
                     let shadow = shadow_index(binding, phase)
                         .and_then(|i| profile_needs.get(usize::from(i)))
                         .copied()
                         .unwrap_or_default();
-                    // A rule that pins a key: what a keyed decision
-                    // answers for.
+                    // A rule that pins a key, or a profile whose one scorer
+                    // places a keyed request by itself on a ring: what a
+                    // keyed decision answers for. A ring stage that reads
+                    // the pool whole, as under a bounded-load rule, leaves
+                    // its phase to the one test.
+                    let walks = own.ring
+                        && index
+                            .and_then(|i| marks.get(i))
+                            .is_some_and(|marks| marks.owns());
                     keyed[slot(phase)] |=
-                        binding.plan == Plan::Single && binding.sessions.is_some();
+                        binding.plan == Plan::Single && (binding.sessions.is_some() || walks);
                     phase_needs[slot(phase)] = phase_needs[slot(phase)]
                         .or(own)
                         .or(shadow)
@@ -4566,12 +4604,6 @@ impl Engine {
             .with_absence(absence(&bindings))
             .with_shards(session_shards(&bindings));
         let sessions = Arc::new(sessions);
-        let orders: Vec<Order> = profiles.iter().map(Order::of).collect();
-        let marks: Vec<Marks> = profiles
-            .iter()
-            .zip(&orders)
-            .map(|(profile, &order)| Marks::of(profile, order))
-            .collect();
         let keeping = marks.iter().any(|marks| marks.scoped());
         #[cfg(feature = "in-process")]
         let written_draws = profiles

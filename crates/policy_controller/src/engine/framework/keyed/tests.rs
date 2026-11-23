@@ -10,16 +10,19 @@ use super::{
     PoolRows,
 };
 use crate::{
-    document::spec::{AppliedSpec, Assignment, Needs, PolicySpec, Recovery, RulePlaced},
+    document::spec::{
+        AppliedSpec, Assignment, Needs, OverloadSpec, PolicySpec, Recovery, RulePlaced,
+    },
     engine::{
-        decision::{Decision, Overlap},
+        decision::{Decision, Overlap, MAX_TARGETS},
         sticky_sessions::{SessionRule, SessionVerdict},
         view::{
             AffinityFacts, Candidate, Constraints, Health, Identity, PoolFacts, RequestFacts,
             Session, WorkerId,
         },
-        Scratch,
+        Scratch, DRAW_BOUND,
     },
+    policies::consistent_hashing::{ConsistentHash, InOrder},
     stages::{filters::Healthy, lifecycle::Lifecycle, pickers::Best},
     tracking::lease::{Lease, Side},
     Draw,
@@ -92,10 +95,40 @@ fn pool(count: u32, shape: u64, down: usize, over: usize) -> Vec<Candidate> {
         .collect()
 }
 
+/// `rows` as a caller's own list holds them, the row at place `n`
+/// registered at `w<n>` and its id that address's, and the caller's ring of
+/// them, in an order of its own by `shape`.
+fn ringed(rows: &mut [Candidate], shape: u64) -> InOrder {
+    let mut order: Vec<String> = rows
+        .iter_mut()
+        .map(|row| {
+            let address = format!("w{}", row.position);
+            row.id = WorkerId::from_address(&address);
+            address
+        })
+        .collect();
+    let mut draw = Draw::new(shape ^ 0x0a11);
+    for at in (1..order.len()).rev() {
+        order.swap(at, draw.below(at + 1));
+    }
+    InOrder(order)
+}
+
 /// The engine of a stock document, as a gateway's start builds it.
 fn stock(name: &str) -> AppliedSpec {
     let document = PolicySpec::preset(name).expect("a preset");
     AppliedSpec::validate(&document).expect("a preset validates")
+}
+
+/// The stock ring document under a binding that sheds a pool the overload
+/// veto empties: a key then keeps no worker over the veto.
+fn shedding_ring() -> AppliedSpec {
+    let mut document = PolicySpec::preset("consistent_hashing").expect("a preset");
+    document.bindings[0].overload = Some(OverloadSpec {
+        shed_when_all_vetoed: true,
+        ..OverloadSpec::default()
+    });
+    AppliedSpec::validate(&document).expect("the document validates")
 }
 
 /// A filter of a host's own, which the engine folds into no test of its
@@ -115,6 +148,21 @@ impl Filter for Ready {
     fn keep(&self, facts: &RequestFacts<'_>, row: &Candidate, _: &Constraints<'_>) -> bool {
         row.health.healthy && !facts.tried.contains(&row.id)
     }
+}
+
+/// The plain ring under `best` behind a host's own filter, built by hand
+/// at `weight`: no mark of a kept key, and no folded test.
+fn hand_built_ring(weight: f32) -> Engine {
+    let profile = Profile {
+        name: "ring".into(),
+        filters: vec![Box::new(Ready)],
+        scorers: vec![WeightedScorer {
+            scorer: Box::new(ConsistentHash::new(None)),
+            weight,
+        }],
+        picker: Box::new(Best),
+    };
+    Engine::new(vec![profile], vec![single(None)], 1, Needs::default())
 }
 
 /// A binding of every model to profile 0 under the single plan.
@@ -159,6 +207,126 @@ fn answer(decision: &Decision) -> Option<Answer> {
         pick.trace.profile,
         pick.overlap(),
     ))
+}
+
+/// The rows a decision's trace names best, each with its score to the bit.
+fn best(decision: &Decision) -> Vec<(WorkerId, u32)> {
+    let trace = decision.trace();
+    trace.top[..usize::from(trace.top_len)]
+        .iter()
+        .map(|&(id, score)| (id, score.to_bits()))
+        .collect()
+}
+
+/// A ring's keyed request over rows read one at a time is the whole
+/// decision's answer on the ring its caller lent: the same targets in the
+/// same order, the same mark of a lifted veto and the same best rows in the
+/// trace at the same scores, by the stock document, by one whose binding
+/// sheds and by an engine built by hand at a weight whose share of itself
+/// is not one, for a session's key and a client's, over pools with rows
+/// down, over their thresholds, tried, excluded and masked. A decision made
+/// here reads no more rows than its walk met. A kept key whose every row
+/// the walk met is over its
+/// thresholds is the whole decision's, which alone says whether the veto
+/// left the pool nobody: in the pool where every row is over, an answer
+/// given here would lack the mark of the lifted veto. A request that is
+/// lent no ring is the whole decision's, and so is one its host holds to
+/// places of the pool: no row is read for either.
+#[test]
+fn a_rings_walk_over_rows_read_one_at_a_time_is_the_whole_decisions_answer() {
+    let (stock_ring, shedding) = (stock("consistent_hashing"), shedding_ring());
+    let engines: [(&Engine, &str); 3] = [
+        (stock_ring.engine(), "stock"),
+        (shedding.engine(), "shedding"),
+        (&hand_built_ring(41.0), "by hand"),
+    ];
+    for (engine, name) in engines {
+        let (mut decided, mut asked) = (0, 0);
+        for (count, shape, down, over) in [
+            (1, 1, 0, 0),
+            (2, 2, 3, 0),
+            (5, 3, 4, 3),
+            (8, 4, 7, 4),
+            (64, 5, 7, 4),
+            (64, 6, 2, 2),
+            (64, 7, 0, 1),
+            (200, 8, 9, 5),
+        ] {
+            let mut rows = pool(count, shape, down, over);
+            let ring = ringed(&mut rows, shape);
+            let listed = Listed::of(&rows);
+            let pool_facts = facts_of(&rows);
+            let mut draw = Draw::new(shape ^ 0x5eed);
+            let mut scratch = Scratch::new();
+            for turn in 0..400_u64 {
+                let key = draw.next_u64() | 1;
+                // A retry names the workers it tried, the host one it just
+                // failed to reach and a row a standing veto of its masks.
+                let tried: Vec<WorkerId> = (0..turn % 3)
+                    .map(|_| rows[draw.below(rows.len())].id)
+                    .collect();
+                let excluded = [rows[draw.below(rows.len())].id];
+                let stalled = [draw.below(rows.len()) as u32];
+                let cx = Constraints {
+                    excluded: if turn % 5 == 0 { &excluded } else { &[] },
+                    stalled: if turn % 7 == 0 { &stalled } else { &[] },
+                    ..Constraints::default()
+                };
+                let at = [key];
+                let facts = RequestFacts {
+                    model: "m",
+                    session_key: if turn % 4 == 3 {
+                        Identity::NONE
+                    } else {
+                        Identity::hashed(key)
+                    },
+                    client_key: if turn % 4 >= 2 { key ^ 1 } else { 0 },
+                    tried: &tried,
+                    seed: turn,
+                    ring: Some(&ring),
+                    ring_positions: &at,
+                    ..RequestFacts::default()
+                };
+                listed.read();
+                let keyed = engine.decide_keyed(&facts, &listed, &cx);
+                let read = listed.read();
+                let whole = engine.decide(&facts, &pool_facts, &rows, &cx, &mut scratch);
+                asked += 1;
+                if let Some(keyed) = keyed {
+                    assert_eq!(
+                        answer(&keyed),
+                        answer(&whole),
+                        "{name}, turn {turn} over {count} rows"
+                    );
+                    assert_eq!(best(&keyed), best(&whole), "{name}, turn {turn}: best");
+                    assert!(keyed.pick().is_some(), "nothing is shed here");
+                    assert!(read < (MAX_TARGETS as u32) + DRAW_BOUND, "{read} rows read");
+                    assert_eq!(keyed.trace().survivors.get(), None, "no survivor counted");
+                    decided += 1;
+                }
+                let unlent = RequestFacts {
+                    ring: None,
+                    ..facts
+                };
+                assert!(engine.decide_keyed(&unlent, &listed, &cx).is_none());
+                assert_eq!(listed.read(), 0, "{name}: a row read with no ring lent");
+                // A request held to places of the pool is the whole
+                // decision's, which opens its set with them.
+                let places = [(turn % u64::from(count)) as u32];
+                let held = Constraints {
+                    places: Some(&places),
+                    ..cx
+                };
+                assert!(engine.decide_keyed(&facts, &listed, &held).is_none());
+                assert_eq!(listed.read(), 0, "{name}: a row read by its place");
+            }
+        }
+        // Most keyed requests are decided by the rows their walk met.
+        assert!(
+            decided * 2 > asked,
+            "{name}: {decided} of {asked} decided by the walk"
+        );
+    }
 }
 
 /// A sessions rule's request over rows read one at a time: two engines of
@@ -315,7 +483,7 @@ fn a_kept_keys_pin_is_followed_with_the_veto_as_it_stands() {
 /// What is not decided here is left to the whole decision, and nothing is
 /// read or written for it: a key with no pin, a request with no key, a
 /// request that carries an affinity column, a document none of whose
-/// bindings pins a key.
+/// bindings pins a key or walks a ring.
 #[test]
 fn a_request_the_key_does_not_decide_is_left_whole_to_the_whole_decision() {
     let rows = pool(16, 41, 0, 0);
@@ -361,26 +529,40 @@ fn a_request_the_key_does_not_decide_is_left_whole_to_the_whole_decision() {
         assert!(engine.decide_keyed(&left, &listed, &cx).is_none());
         assert_eq!(listed.read(), 0, "no row is read for it");
     }
-    // A document that pins no key is one test.
-    for name in [
-        "round_robin",
-        "least_load",
-        "random",
-        "power_of_two",
-        "consistent_hashing",
-        "prefix_hash",
+    // A document that pins no key and walks no ring is one test: no phase
+    // of it is answered here. The plain ring's phases are, and its request
+    // that is lent no ring is left with no row read. The stock prefix
+    // document ranks its ring beside a second scorer, over the whole pool:
+    // it is one test too.
+    for (name, answered) in [
+        ("round_robin", false),
+        ("least_load", false),
+        ("random", false),
+        ("power_of_two", false),
+        ("consistent_hashing", true),
+        ("prefix_hash", false),
     ] {
         let plain = stock(name);
-        assert!(plain.engine().decide_keyed(&keyed, &listed, &cx).is_none());
+        let engine = plain.engine();
+        assert_eq!(engine.keyed.contains(&true), answered, "{name}");
+        assert!(engine.decide_keyed(&keyed, &listed, &cx).is_none());
         assert_eq!(listed.read(), 0, "{name}");
+    }
+    // A ring at a weight that orders nothing places no request by itself:
+    // its whole pass scores every row alike and the picker draws.
+    for (weight, answered) in [(1.0, true), (0.0, false), (f32::INFINITY, false)] {
+        let ring = hand_built_ring(weight);
+        assert_eq!(ring.keyed.contains(&true), answered, "weight {weight}");
     }
 }
 
 /// A scorer that scores every row alike. Where it is told to, it states
-/// what its pick holds of the request, and it holds a scope.
+/// what its pick holds of the request, it places a keyed request by
+/// itself, on the list's first row, and it holds a scope.
 #[derive(Debug)]
 struct Alike {
     states: bool,
+    owns: bool,
     scoped: bool,
 }
 
@@ -399,6 +581,27 @@ impl Scorer for Alike {
     fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
         out.fill(1.0);
         TieBand::NORMALIZED
+    }
+
+    fn owns(&self) -> bool {
+        self.owns
+    }
+
+    fn own_by_place(
+        &self,
+        _: &RequestFacts<'_>,
+        _: usize,
+        _: &dyn Fn(WorkerId) -> Option<u32>,
+        keep: &mut dyn FnMut(u32) -> bool,
+    ) -> usize {
+        usize::from(self.owns && keep(0))
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            ring: self.owns,
+            ..Needs::default()
+        }
     }
 
     fn states_overlap(&self) -> bool {
@@ -444,6 +647,7 @@ fn a_pin_is_followed_under_a_scorer_that_states_its_picks_holding() {
     for states in [true, false] {
         let stage = Alike {
             states,
+            owns: false,
             scoped: false,
         };
         let profile = profile_of("alike", Box::new(stage));
@@ -479,6 +683,92 @@ fn a_pin_is_followed_under_a_scorer_that_states_its_picks_holding() {
     }
 }
 
+/// A walk is the whole decision's under a scorer that states what its pick
+/// holds of the request: that decision reads the rows for the word. A keyed
+/// request no rule pins is not placed here then, and no row is read. The
+/// same scorer with nothing to state places it by the one row it reads.
+#[test]
+fn a_walk_under_a_scorer_that_states_its_picks_holding_is_left_to_the_whole_decision() {
+    let mut rows = pool(16, 61, 0, 0);
+    let ring = ringed(&mut rows, 61);
+    let listed = Listed::of(&rows);
+    let cx = Constraints::default();
+    for states in [true, false] {
+        let stage = Alike {
+            states,
+            owns: true,
+            scoped: false,
+        };
+        let profile = profile_of("alike", Box::new(stage));
+        let engine = Engine::new(vec![profile], vec![single(None)], 1, Needs::default());
+        let request = RequestFacts {
+            model: "m",
+            session_key: Identity::hashed(9),
+            ring: Some(&ring),
+            ring_positions: &[0],
+            ..RequestFacts::default()
+        };
+        let walked = engine.decide_keyed(&request, &listed, &cx);
+        let places: Option<Vec<u32>> = walked
+            .as_ref()
+            .and_then(Decision::pick)
+            .map(|pick| pick.targets.iter().map(|target| target.position).collect());
+        assert_eq!(places, (!states).then(|| vec![0]), "states: {states}");
+        assert_eq!(listed.read(), u32::from(!states), "states: {states}");
+    }
+}
+
+/// A session key under a sessions rule is the rule's on a ring too. With no
+/// pin that stands nothing is decided here, though the request's caller
+/// lent a ring and says where the key stands on it, and no row is read: the
+/// whole decision places the request and claims its key. The same request
+/// with no session key is no rule's, and the ring's walk decides it as the
+/// whole decision does.
+#[test]
+fn a_sessions_rules_key_with_no_pin_is_not_walked_on_a_lent_ring() {
+    let mut rows = pool(16, 71, 0, 0);
+    let ring = ringed(&mut rows, 71);
+    let listed = Listed::of(&rows);
+    let cx = Constraints::default();
+    let rule = SessionRule {
+        assignment: Assignment::Delegate,
+        inflight_cap: 0,
+        ttl_micros: Some(60_000_000),
+        sweep_micros: 60_000_000,
+        recovery: Recovery::Original,
+        rule_placed: RulePlaced::Told,
+    };
+    let profile = profile_of("ring", Box::new(ConsistentHash::new(None)));
+    let engine = Engine::new(vec![profile], vec![single(Some(rule))], 1, Needs::default());
+    let fresh = RequestFacts {
+        model: "m",
+        session_key: Identity::hashed(9),
+        now_micros: 1_000,
+        ring: Some(&ring),
+        ring_positions: &[0],
+        ..RequestFacts::default()
+    };
+    assert!(engine.decide_keyed(&fresh, &listed, &cx).is_none());
+    assert_eq!(listed.read(), 0, "a row read for a key with no pin");
+    let mut scratch = Scratch::new();
+    let claimed = engine.decide(&fresh, &facts_of(&rows), &rows, &cx, &mut scratch);
+    let verdict = claimed.pick().map(|pick| pick.session_verdict);
+    assert!(
+        matches!(verdict, Some(SessionVerdict::Claimed(_))),
+        "{verdict:?}"
+    );
+    let unkeyed = RequestFacts {
+        session_key: Identity::NONE,
+        client_key: 9,
+        ..fresh
+    };
+    let walked = engine.decide_keyed(&unkeyed, &listed, &cx);
+    let walked = walked.expect("the ring's walk decides it");
+    let whole = engine.decide(&unkeyed, &facts_of(&rows), &rows, &cx, &mut scratch);
+    assert_eq!(answer(&walked), answer(&whole));
+    assert_eq!(listed.read(), MAX_TARGETS as u32, "the walk's rows alone");
+}
+
 /// A standing pin is the whole decision's under a profile one of whose
 /// stages opens a scope, and under a binding with a shadow: no row is read
 /// here for it. Under neither, the same pin is followed by its one row.
@@ -499,6 +789,7 @@ fn a_pin_under_a_scope_or_a_shadow_is_left_to_the_whole_decision() {
         let alike = || {
             let stage = Alike {
                 states: false,
+                owns: false,
                 scoped,
             };
             let mut profile = profile_of("alike", Box::new(stage));
