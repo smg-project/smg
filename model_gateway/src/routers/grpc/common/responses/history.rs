@@ -408,7 +408,9 @@ fn stored_item_as_input(item: &Value) -> Option<ResponseInputOutputItem> {
 
 /// The replayable items of a conversation, its newest
 /// [`MAX_CONVERSATION_HISTORY_ITEMS`] oldest first, as the caller's `tenant`
-/// may see it: a conversation of another tenant is as missing.
+/// may see it: a conversation of another tenant is as missing. An
+/// `item_reference` row of the window is resolved as one of the request's own
+/// is ([`resolve_item_references`], its 404 and its 400 included).
 async fn conversation_items(
     stores: HistoryStores<'_>,
     conversation_id: &str,
@@ -508,23 +510,35 @@ async fn conversation_items(
     // A call the window holds as an `item_reference` row pairs as a stored
     // call does: what the boundary left is resolved before the outputs are
     // matched with their calls.
-    if let Some(first) = items
+    let references: Vec<(usize, ResponseInputOutputItem)> = items
         .iter()
-        .position(|item| matches!(item, ResponseInputOutputItem::ItemReference { .. }))
-    {
-        items = resolve_item_references(stores.responses.as_ref(), items, tenant).await?;
+        .enumerate()
+        .filter(|(_, item)| matches!(item, ResponseInputOutputItem::ItemReference { .. }))
+        .map(|(at, item)| (at, item.clone()))
+        .collect();
+    if !references.is_empty() {
+        let mut marked = resolve_item_references(stores.responses.as_ref(), items, tenant).await?;
+        // Each reference row goes back in front of the item it named, as a
+        // mark: the pair rule passes it by, whatever it takes out.
+        for (at, row) in references.into_iter().rev() {
+            marked.insert(at, row);
+        }
         if !cut {
             // Not after a cut: the boundary may have dropped the output the
-            // first run kept a stored call for.
-            items = without_calls_answered_by(items, &skipped);
+            // first run kept a stored call for, and a run here would take
+            // that call from under the output the request brings.
+            marked = without_calls_answered_by(marked, &skipped);
         }
-        if lost_rows {
-            // An output before the first reference pairs with the calls
-            // before it alone: a call a reference names must not keep an
-            // older output of its id.
-            let rest = items.split_off(first);
-            items = without_outputs_of_missing_calls(items);
-            items.extend(rest);
+        // An output before a reference pairs with the calls before that
+        // reference alone: a call a reference names must not keep an
+        // older output of its id.
+        items = Vec::with_capacity(marked.len());
+        for item in marked {
+            if !matches!(item, ResponseInputOutputItem::ItemReference { .. }) {
+                items.push(item);
+            } else if lost_rows {
+                items = without_outputs_of_missing_calls(items);
+            }
         }
     }
     Ok(if lost_rows {
@@ -1396,7 +1410,7 @@ pub(crate) mod tests {
     /// stored call does: it replays with its output behind a cut and beside
     /// a row the caller may not see, and not at all when its output is such
     /// a row. An output before the reference, of an older call of the id
-    /// that the cut left out, stays out.
+    /// that the cut left out, stays out, behind another reference too.
     #[tokio::test]
     async fn a_call_the_conversation_holds_by_reference_pairs_with_its_output() {
         let pair = ["function_call:call_A", "function_call_output:call_A"];
@@ -1431,6 +1445,13 @@ pub(crate) mod tests {
                 _ => {}
             }
             if older_output {
+                // Behind another reference, to the message before it: the
+                // first reference of the window is not the call's.
+                rows[messages - 1].id = Some(ConversationItemId::from("msg_last"));
+                rows.push(NewConversationItem {
+                    id: None,
+                    ..reference("msg_last")
+                });
                 rows.push(output_row("call_A"));
             }
             rows.extend([reference("fc_1"), output]);
