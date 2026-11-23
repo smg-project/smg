@@ -8,7 +8,7 @@
 //! plugin's stage passes such a request by and counts a failure of its own.
 //! So this engine shows a stage the widest value where the host stated
 //! none. It does so where it takes the request its maker makes
-//! ([`PolicyEngine::made`](super::PolicyEngine::made)), which every entry
+//! ([`Loaded::made`](super::Loaded::made)), which every entry
 //! that makes one calls: a single's and a pair's, with a lease and without.
 //!
 //! The two calls a host makes with no engine above its lists turn a `0`

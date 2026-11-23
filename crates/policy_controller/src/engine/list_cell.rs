@@ -33,7 +33,7 @@ use std::{
 use smg_worker::identity::basic::Worker;
 
 use super::{
-    policy_engine::{PolicyEngine, PoolMembers},
+    policy_engine::{Loaded, PolicyEngine, PoolMembers},
     view::FixedFacts,
 };
 
@@ -97,7 +97,7 @@ struct Made {
 impl Made {
     /// The value of a lent list, made by `engine` under the document whose
     /// number is `under`.
-    fn of(engine: &PolicyEngine, lent: LentList<'_>, under: u64) -> Self {
+    fn of(engine: Loaded<'_, '_>, lent: LentList<'_>, under: u64) -> Self {
         assert!(
             lent.facts
                 .is_none_or(|facts| facts.len() == lent.workers.len()),
@@ -174,7 +174,7 @@ pub trait ModelLists: fmt::Debug + Send + Sync + 'static {
     fn lists_of(&self, model: &str, hand: &mut dyn FnMut(LentList<'_>));
 }
 
-impl PolicyEngine {
+impl Loaded<'_, '_> {
     /// The engine's value of a lent list under the document it decides
     /// under: read from the list's cell, and made into the cell first where
     /// the cell holds none under that document.
@@ -210,8 +210,8 @@ impl PolicyEngine {
     /// check stands in the fill and costs a read nothing: a cell that
     /// holds the value is read with no look at the facts.
     #[inline]
-    pub(crate) fn members_of<'a>(&self, lent: LentList<'a>) -> &'a PoolMembers {
-        let number = self.applied();
+    pub(crate) fn members_of<'a>(self, lent: LentList<'a>) -> &'a PoolMembers {
+        let number = self.document.applied;
         let members = match lent.cell.0.get() {
             // The value the cell took first is read here, in the caller.
             Some(made) if made.under == number => &made.members,
@@ -235,7 +235,7 @@ impl PolicyEngine {
     #[cold]
     #[inline(never)]
     fn found_or_made<'a>(
-        &self,
+        self,
         workers: &'a Arc<[Arc<dyn Worker>]>,
         mut cell: &'a ListCell,
         facts: Option<&'a [FixedFacts]>,
@@ -255,6 +255,19 @@ impl PolicyEngine {
             }
             cell = &made.next;
         }
+    }
+}
+
+impl PolicyEngine {
+    /// [`Loaded::members_of`] under the engine's document: for a caller
+    /// that asks a list's value outside a decision of the engine.
+    #[cfg_attr(
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "a controller's deciding thread calls it")
+    )]
+    #[inline]
+    pub(crate) fn members_of<'a>(&self, lent: LentList<'a>) -> &'a PoolMembers {
+        self.loaded().members_of(lent)
     }
 
     /// The bench's count: how many times the reports of `lent`'s list were
@@ -693,7 +706,7 @@ pub(crate) mod tests {
         };
         let mut cell = ListCell::default();
         for under in 0..20_000 {
-            let mut made = Box::new(Made::of(&engine, lent, under));
+            let mut made = Box::new(Made::of(engine.loaded(), lent, under));
             made.next = cell;
             cell = ListCell(OnceLock::from(made));
         }

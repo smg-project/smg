@@ -467,7 +467,13 @@ fn an_item_whose_encoder_cannot_be_sent_to_is_placed_by_the_calls_next_decision(
     };
     let lists = three.lists((&[PLAIN; 2], &[1]));
     let mut call = Call::default();
-    let asked = ask(engine, &asking(lists, both), &lists, both, &mut call);
+    let asked = ask(
+        engine.loaded(),
+        &asking(lists, both),
+        &lists,
+        both,
+        &mut call,
+    );
     assert!(matches!(asked, Ok(None)), "no placement");
     assert_eq!(call.missed, [three.id(2, 0)]);
 
@@ -475,7 +481,13 @@ fn an_item_whose_encoder_cannot_be_sent_to_is_placed_by_the_calls_next_decision(
     // be sent to.
     trip(&three.workers[0][0]);
     let mut call = Call::default();
-    let asked = ask(engine, &asking(lists, both), &lists, both, &mut call);
+    let asked = ask(
+        engine.loaded(),
+        &asking(lists, both),
+        &lists,
+        both,
+        &mut call,
+    );
     assert!(matches!(asked, Ok(None)), "no placement");
     assert_eq!(call.missed, [three.id(0, 0), three.id(2, 0)]);
 }

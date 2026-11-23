@@ -18,7 +18,7 @@ use smg_worker::load::state::LoadSnapshot;
 use super::{
     pair::{issued, not_decided, stamp, Buffers, PairLists, BUFFERS},
     single::{self, PLACES},
-    PolicyEngine, PoolMembers,
+    Loaded, PolicyEngine, PoolMembers,
 };
 use crate::engine::{
     decision::{shed, Decision, ShedReason, WIRES},
@@ -152,13 +152,14 @@ impl EncodeLists<'_> {
         items: EncodeItems<'_>,
         placed: &mut EncodePlaced,
     ) -> Decision {
+        let engine = engine.loaded();
         let sides = self.asked(engine);
         self.decide_over(engine, sides, None, loads, now, request, items, placed)
     }
 
     /// The engine's own value of each of the pair's two lists, asked of
     /// the list's cell: the prefills', the decodes'.
-    fn asked(&self, engine: &PolicyEngine) -> (&PoolMembers, &PoolMembers) {
+    fn asked(&self, engine: Loaded<'_, '_>) -> (&PoolMembers, &PoolMembers) {
         let pair = &self.pair;
         (
             engine.members_of(pair.prefill),
@@ -177,7 +178,7 @@ impl EncodeLists<'_> {
     )]
     fn decide_over(
         &self,
-        engine: &PolicyEngine,
+        engine: Loaded<'_, '_>,
         (prefill, decode): (&PoolMembers, &PoolMembers),
         encoders: Option<&PoolMembers>,
         loads: Option<&Arc<LoadSnapshot>>,
@@ -304,11 +305,7 @@ impl PolicyEngine {
         placed: &mut EncodePlaced,
         clock: impl FnOnce() -> Instant,
     ) -> Result<(DecideOutcome, bool), DecisionRefused> {
-        self.over_three(maker, placed, |lists, request, loads, placed| {
-            let later = request.constraints.decode_later;
-            let decided = decided(self, lists, request, items, loads, placed, clock());
-            (decided, later)
-        })
+        self.loaded().decide_encode_at(maker, items, placed, clock)
     }
 
     /// [`Self::decide_encode_at`] with nothing its host hears of later: no
@@ -334,18 +331,38 @@ impl PolicyEngine {
         placed: &mut EncodePlaced,
         now: Instant,
     ) -> Result<Decision, DecisionRefused> {
+        let own = self.loaded();
+        own.over_three(maker, placed, |lists, request, loads, placed| {
+            decide(own, lists, request, items, loads, placed, now)
+        })
+    }
+}
+
+impl Loaded<'_, '_> {
+    /// [`PolicyEngine::decide_encode_at`] under the document this value
+    /// holds: for a caller that reads that document further behind the
+    /// decision, as the call that places a request does.
+    pub(super) fn decide_encode_at(
+        self,
+        maker: &impl RequestMaker,
+        items: EncodeItems<'_>,
+        placed: &mut EncodePlaced,
+        clock: impl FnOnce() -> Instant,
+    ) -> Result<(DecideOutcome, bool), DecisionRefused> {
         self.over_three(maker, placed, |lists, request, loads, placed| {
-            decide(self, lists, request, items, loads, placed, now)
+            let later = request.constraints.decode_later;
+            let decided = decided(self, lists, request, items, loads, placed, clock());
+            (decided, later)
         })
     }
 
     /// The request `maker` makes, decided by `decide` over the three lists
     /// the maker hands, with the load reports a pair's first decision
-    /// reads ([`Self::loads_read`]), under the engine's catch. A request of
+    /// reads ([`PolicyEngine::loads_read`]), under the engine's catch. A request of
     /// another phase than `Prefill`, or other lists, is a side sent on its
     /// own. `placed` is left empty where no decision is made.
     fn over_three<R>(
-        &self,
+        self,
         maker: &impl RequestMaker,
         placed: &mut EncodePlaced,
         decide: impl FnOnce(
@@ -403,7 +420,7 @@ impl PolicyEngine {
 /// own facts and no list, so it stands also where no decode takes images.
 #[inline]
 pub(super) fn decide(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     lists: &EncodeLists<'_>,
     request: &mut Request<'_>,
     items: EncodeItems<'_>,
@@ -453,7 +470,7 @@ pub(super) fn decide(
 /// nothing for an encoder: no stage is told of one. A decision that picks
 /// no pair issues nothing.
 pub(super) fn decided(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     lists: &EncodeLists<'_>,
     request: &mut Request<'_>,
     items: EncodeItems<'_>,
