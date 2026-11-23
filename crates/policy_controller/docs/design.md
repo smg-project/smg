@@ -1137,21 +1137,33 @@ runtime.spawn(task);                       // the engine's own background task
 
 The engine lives as long as the process, so a placement holds a plain reference to it.
 
-The start answers the task and the host spawns it on a runtime of its choice: the start spawns
+The start answers the task, and the host spawns it on a runtime of its choice: the start spawns
 nothing. The call is marked `#[must_use]`, with the reason that the task does nothing until it is
-spawned: the compiler warns a caller that drops the whole answer. It does not warn a caller that
-keeps the engine and drops the task, whose engine keeps no load snapshot, runs no upkeep, tells
-the policies no worker and tells no policy a load report. The start takes no worker lists: each
-request gives its own, and the engine's task asks only the lists a host hands it beside the start, to fill their cells (the fifth job below).
+spawned. So the compiler warns a caller that drops the whole answer. It does not warn a caller
+that keeps the engine and drops the task. That caller's engine keeps no load snapshot, runs no
+upkeep, tells the policies no worker, tells no policy a load report and fills no cell ahead of a
+request.
+
+The start takes no worker lists. Each request gives its own. The engine's task asks only the
+lists a host hands it beside the start, to fill their cells (the fifth job below).
 
 The engine's background task does what a host did by hand. Five of its jobs are built
-(`PolicyEngine::run`): the upkeep once a second, and the newest load snapshot kept at hand,
-swapped when the monitor publishes one, so that a decision reads it without touching the
-channel. The third is a worker that joined or was removed told to the policies, read from the events of the registry the host hands at the start (section 8.1). A host that
-builds another load monitor hands its channel again (`engine.set_loads`): a channel ends with
-its monitor. The task's first upkeep runs at its first poll, where it reads the registry and
-takes the load channel: a host relies on both once the task has been polled once, not when the
-start returns.
+(`PolicyEngine::run`):
+
+1. the upkeep, once a second;
+2. the newest load snapshot kept at hand, swapped when the monitor publishes one, so that a
+   decision reads it without touching the channel;
+3. a worker that joined or was removed told to the policies, read from the events of the
+   registry the host hands at the start (section 8.1);
+4. each new load report told to a policy that keeps a number of it;
+5. a model's cells filled ahead of its requests, for a host that handed its lists.
+
+A host that builds another load monitor hands its channel again (`engine.set_loads`): a channel
+ends with its monitor.
+
+The task's first upkeep runs at its first poll, where it reads the registry and takes the load
+channel. So a host relies on both once the task has been polled once, not when the start
+returns.
 
 The fourth job serves a policy that keeps a number of each worker's load report
 (`Lifecycle::keeps_loads`). At each load snapshot the task takes, it tells such a policy the
@@ -1164,15 +1176,49 @@ keeps a signal's column: a stage reads its column's cell (`SignalColumn::told`) 
 call and copies out what it keeps. A report of several ranks states none, and neither plugin view
 carries the values yet.
 
-The fifth job fills a model's cells ahead of its requests, for a host that handed its lists (`PolicyEngine::set_lists`). Behind a word of a registration, a replacement or a removal the task asks the host for the lists of each model the word's worker serves (`ModelLists::lists_of`), and behind a whole read of the registry for those of each model a standing worker serves. It asks each handed list's value, which fills a cell that holds none, so the list's first request reads a filled cell. Words that stand ready together are heard first, and each model is asked once behind the last of them. The upkeep asks what is owed at that minute too, with words still standing. Lists handed behind the task's first poll are owed at its next upkeep, every list that stands once.
+The fifth job fills a model's cells ahead of its requests, for a host that handed its lists
+(`PolicyEngine::set_lists`). The task asks the host for lists (`ModelLists::lists_of`):
 
-The task asks behind a word alone, and it fills the lists that stand at its ask. So six kinds of list are filled ahead only where a later ask of their model finds them, and by their first request otherwise: one a request asks ahead of the task, one published again ahead of the task's ask, one the registry publishes with no event (the worker crate's registry does so where a worker's model cards are refreshed), one of a model its word's worker no longer states, one lent under no model a worker serves, and one the host builds behind the task's ask. A list refused for its facts is held and counted with the task's faults (`PolicyEngine::upkeep_faults`) and costs its own fill alone. A panic of the host's own code where it hands a model's lists is held and counted too, and costs the lists of that model not yet handed. The policies are told the word all the same.
+- behind a word of a registration, a replacement or a removal, for the lists of each model the
+  word's worker serves;
+- behind a whole read of the registry, for the lists of each model a standing worker serves.
+
+It asks each handed list's value, which fills a cell that holds none, so the list's first
+request reads a filled cell. Words that stand ready together are heard first, and each model is
+asked once behind the last of them. The upkeep asks what is owed at that minute too, with words
+still standing. Lists handed behind the task's first poll are owed at its next upkeep, every
+list that stands once.
+
+The task asks behind a word alone, and it fills the lists that stand at its ask. So six kinds
+of list are filled ahead only where a later ask of their model finds them, and by their first
+request otherwise:
+
+- one a request asks ahead of the task;
+- one published again ahead of the task's ask;
+- one the registry publishes with no event (the worker crate's registry does so where a worker's
+  model cards are refreshed);
+- one of a model its word's worker no longer states;
+- one lent under no model a worker serves;
+- one the host builds behind the task's ask.
+
+These faults are held and counted with the task's faults (`PolicyEngine::upkeep_faults`):
+
+- a panic of the host's own code where a worker names its models, which costs that worker's
+  fills alone;
+- a list refused for its facts, which costs its own fill alone;
+- a panic of the host's own code where it hands a model's lists, which costs the lists of that
+  model not yet handed.
+
+The policies are told the word all the same.
 
 The host keeps one empty cell beside each worker list it publishes. That is one field in the
-host's `Generation` type. The engine fills the cell at the list's first ask: the task's where the host handed its lists (the fifth job above), and the first decision's otherwise.
+host's `Generation` type. The engine fills the cell at the list's first ask: the task's where
+the host handed its lists (the fifth job above), and the first decision's otherwise.
 
 The cell is built. A request's `WorkerLists` name each list as a `LentList`, and the decision
-that needs a list asks its cell. The start does not take the lists' trait yet: a host hands its lists by `PolicyEngine::set_lists`, and the field of the start's data comes with the change in which the gateway hands its own lists.
+that needs a list asks its cell. The start does not take the lists' trait yet. A host hands its
+lists by `PolicyEngine::set_lists`, and the field of the start's data comes with the change in
+which the gateway hands its own lists.
 
 **2. For each request, one call.**
 
