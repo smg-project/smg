@@ -325,8 +325,12 @@ fn push_logprobs_view(
                 if at > 0 {
                     buffer.extend_from_slice(b",");
                 }
-                let text = decode(token_id);
-                push_logprob_token(buffer, &text, logprob, Some(text.as_bytes()));
+                let text: &str = if token_id == position.token_id {
+                    &token
+                } else {
+                    &decode(token_id)
+                };
+                push_logprob_token(buffer, text, logprob, Some(text.as_bytes()));
                 buffer.extend_from_slice(b"}");
             }
             buffer.extend_from_slice(b"]}");
