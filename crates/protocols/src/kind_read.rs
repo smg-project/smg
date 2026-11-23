@@ -805,9 +805,11 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for Fitted<T> {
 /// attribute is read by [`fitted`]. What the kinds and the fields would not
 /// read as the derive of the enum does is refused at compile time: the enum
 /// and its variants may carry the attributes of `@known` alone (on a variant a
-/// doc comment and `#[serde(rename = "...")]`), an attribute of a field may
-/// not stand behind `cfg_attr`, which could hide a serde attribute, and a
-/// field may not stand behind `cfg`, which that struct would leave out.
+/// doc comment and `#[serde(rename = "...")]`); an attribute of a field may
+/// neither stand behind `cfg_attr` nor come from another macro as a fragment,
+/// since either could hide a serde attribute; and a field may not stand
+/// behind `cfg`, which that struct would leave out. In a field's type the
+/// enum goes by its name: `Self` there would mean that struct.
 macro_rules! by_kind {
     (@key #[serde(tag = $key:literal)] $($more:tt)*) => { $key };
     (@key #[$($other:tt)*] $($more:tt)*) => { $crate::kind_read::by_kind!(@key $($more)*) };
@@ -826,8 +828,11 @@ macro_rules! by_kind {
     (@f $ctx:tt [$($done:tt)*] [$($names:ident)*] [$($keep:tt)*] #[cfg $($no:tt)*] $($more:tt)*) => {
         compile_error!("by_kind! does not read a field behind cfg")
     };
-    (@f $ctx:tt [$($done:tt)*] [$($names:ident)*] [$($keep:tt)*] #[$($other:tt)*] $($more:tt)*) => {
+    (@f $ctx:tt [$($done:tt)*] [$($names:ident)*] [$($keep:tt)*] #[$attr:ident $($args:tt)*] $($more:tt)*) => {
         $crate::kind_read::by_kind!(@f $ctx [$($done)*] [$($names)*] [$($keep)*] $($more)*)
+    };
+    (@f $ctx:tt [$($done:tt)*] [$($names:ident)*] [$($keep:tt)*] #[$($no:tt)*] $($more:tt)*) => {
+        compile_error!("by_kind! does not read a field attribute whose name it cannot see")
     };
     (@f $ctx:tt [$($done:tt)*] [$($names:ident)*] [] $field:ident : Option<Vec<$item:ty>>, $($more:tt)*) => {
         $crate::kind_read::by_kind!(@f $ctx
