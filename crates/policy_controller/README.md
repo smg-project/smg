@@ -1140,7 +1140,7 @@ bindings:
 
 ## Cost and regression gates
 
-The decision benchmarks time view construction and policy execution separately, typically at 8, 64 and 512 candidates. They cover presets, dispatch credit, overloaded pools, sticky hits and misses, spec validation, cache locality, sampling and prefix keying. The store benchmarks time membership and load writes, publication, view building, update journals, KV ingestion and pairing. Library benches also measure encode placement, pair and encode class construction, concurrent callers, the sent-prefix predictor, election, and both plugin kinds. The `decide_stream` bench measures loopback round-trip percentiles and throughput under offered load, separately from in-process work. [Benchmark sources](benches)
+The decision benchmarks time view construction and policy execution separately, typically at 8, 64 and 512 candidates. They cover presets, dispatch credit, overloaded pools, sticky hits and misses, spec validation, cache locality, sampling and prefix keying. The store benchmarks time membership and load writes, publication, update journals, KV ingestion and pairing. Library benches also measure encode placement, pair and encode class construction, concurrent callers, the sent-prefix predictor, election, and both plugin kinds. The `decide_stream` bench measures loopback round-trip percentiles and throughput under offered load, separately from in-process work. [Benchmark sources](benches)
 
 ```sh
 cargo bench -p smg-policy-controller --locked --bench decision
@@ -1153,8 +1153,8 @@ cargo bench -p smg-policy-controller --locked --bench decision
 | [Bucket](../../.github/bench-gates/policy-engine-bucket.toml) | Bucket decisions, including prefill across models and with stale rows. | 10–20% |
 | [Power of two](../../.github/bench-gates/policy-engine-power-of-two.toml) | The preset's load and count variants. | 10% |
 | [Prefix hash](../../.github/bench-gates/policy-engine-prefix-hash.toml) | Ring owner and load spill paths, with and without boundaries. | 10–15% |
-| [Store](../../.github/bench-gates/policy-store.toml) | Store views, load and membership writes, publication and selected pair and many-model cases. | 10–40% |
-| [Store journal](../../.github/bench-gates/policy-store-journal.toml) | Journaled writes, view build and journal reads. | 10–30% |
+| [Store](../../.github/bench-gates/policy-store.toml) | Load and membership writes, publication and selected pair and many-model cases. | 10–40% |
+| [Store journal](../../.github/bench-gates/policy-store-journal.toml) | Journaled writes and journal reads. | 10–30% |
 | [Gateway policy selection](../../.github/bench-gates/policy-selection.toml) | The gateway's regular placement benchmarks. | 10% |
 
 The gates run three interleaved measurements per side when timing is needed. Each benchmark ID uses the first matching threshold. A time regression must exceed that threshold in the median of the runs, with every changed run slower than every base run. Overlap is reported as suspect. Some gates also repeat suspect measurements or check for executable placement effects before failing a row. Missing gated IDs are detected. These are relative regressions for the measured paths. The plugin and wire round-trip benchmarks have no dedicated policy gate here. [Gate rules and report](../../scripts/bench_gate.py)
