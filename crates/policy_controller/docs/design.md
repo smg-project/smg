@@ -866,28 +866,36 @@ The HTTP status codes belong to the host. The engine only says why.
 ### 5.6 One decision, step by step **[built]**
 
 The host calls `PolicyEngine::decide_at(maker, clock)`. `maker` is the host's object for the
-request (section 8). The call runs on the caller's thread. The engine waits on no lock of its own; a
-stage that keeps state takes its own short lock (one shard of the session table, or the record of
-sent prefixes). A decision that meets the one build of a list's `records`, `wires` or `alone`
-waits for it (5.2).
+request (section 8). The call runs on the caller's thread.
+
+The engine waits on no lock of its own. A stage that keeps state takes its own short lock (one
+shard of the session table, or the record of sent prefixes). A decision that meets the one build
+of a list's `records`, `wires` or `alone` waits for it (5.2).
 
 **The short path.** A request is *plain* when it names no tried or excluded worker and states no
 hint, no demand, no lifted overload veto, no later decode, no held-back worker and no places of its
-list. A profile is decided by *one pick* when its picker needs nothing of the request, it has no
-scorer and no filter beyond the health tests, and its binding has no sessions rule and names no
-shadow. On main three pickers say so: round robin, `random` and `passthrough`.
+list.
 
-1. The engine asks `maker.plain()`. If the request is plain and a single one, the host handed one
-   list, every worker of the list is dialed over a protocol the request states (where it states
-   any), and the list's model
-   is bound to a profile that one pick decides, the picker names a worker by its own rule and the
-   engine answers with its position. Round robin adds one to the list's counter and takes the
-   worker it lands on if that worker is eligible. Where it is not, the engine reads the list once
-   and the rotation picks among the eligible workers. `random` draws a position below the list's
-   size from the calling thread's own draw sequence, and again while the worker drawn is not
-   eligible, eight draws at most. Past them the engine reads the list once and draws among the
-   eligible workers. `passthrough` takes the first eligible worker in the list's order. Where no
-   worker of the list is eligible, the request takes the full path.
+A profile is decided by *one pick* when its picker needs nothing of the request, it has no scorer
+and no filter beyond the health tests, and its binding has no sessions rule and names no shadow.
+On main three pickers say so: round robin, `random` and `passthrough`.
+
+1. The engine asks `maker.plain()`. The request takes the short path where all of this holds:
+   - the request is plain and a single one;
+   - the host handed one list;
+   - every worker of the list is dialed over a protocol the request states (where it states
+     any);
+   - the list's model is bound to a profile that one pick decides.
+
+   The picker then names a worker by its own rule, and the engine answers with its position.
+
+   | Picker | Its rule |
+   |---|---|
+   | round robin | It adds one to the list's counter and takes the worker it lands on if that worker is eligible. Where it is not, the engine reads the list once and the rotation picks among the eligible workers. |
+   | `random` | It draws a position below the list's size from the calling thread's own draw sequence, and again while the worker drawn is not eligible, eight draws at most. Past them the engine reads the list once and draws among the eligible workers. |
+   | `passthrough` | It takes the first eligible worker in the list's order. |
+
+   Where no worker of the list is eligible, the request takes the full path.
 2. If no stage of the document needs lease events, that is all. No request is built, no clock is
    read, no lease exists, and the host owes the engine nothing more.
 
@@ -918,13 +926,16 @@ shadow. On main three pickers say so: round robin, `random` and `passthrough`.
     lease (section 6) and tells the stages, unless a sessions rule keeps the pick from them.
 11. The answer is the decision with its lease.
 
-**A retry** names the workers it tried and takes the full path. Where its list holds several
-workers of one engine, the ranks of a data-parallel engine, the engine over worker lists names
-every worker of a tried worker's engine as tried before the key's pin is read and the filters
-run. So `not-tried` passes the whole engine over while another worker is left, and hands it
-again where none is. A tried worker the list no longer holds names itself alone: the list does
-not say which engine it was a rank of. A pair's retry is widened the same way, each of its two
-lists by its own engines, and an encode request's over its three.
+**A retry** names the workers it tried and takes the full path. How its tried workers are widened:
+
+- Where its list holds several workers of one engine, the ranks of a data-parallel engine, the
+  engine over worker lists names every worker of a tried worker's engine as tried before the
+  key's pin is read and the filters run. So `not-tried` passes the whole engine over while
+  another worker is left, and hands it again where none is.
+- A tried worker the list no longer holds names itself alone: the list does not say which engine
+  it was a rank of.
+- A pair's retry is widened the same way, each of its two lists by its own engines, and an
+  encode request's over its three.
 
 A decision that panics is caught, counted and answered as refused. It never takes the host down.
 
@@ -932,12 +943,17 @@ A request whose host hands no list (`WorkerLists::None`) is decided over no work
 with no endpoint under the stage `none`, and its trace names no profile. A controller hands none
 for a model no worker serves, and for a gateway that dials no worker of the model's list.
 
-What one decision writes: the thread's own buffer; on the short path one atomic add on the list's
-counter; one atomic add for a lease id where a stage needs lease events; a session pin where a
-sessions rule decides; the record of sent prefixes where a cache-affinity profile decides; and,
-once for each new load snapshot and list, the converted load reports, which allocates. On the
-short path it allocates nothing. A draw that looked up load reports counts them toward its list's
-conversion where it takes the list's claim, which it tries and never waits for.
+What one decision writes:
+
+- the thread's own buffer;
+- on the short path, one atomic add on the list's counter;
+- one atomic add for a lease id, where a stage needs lease events;
+- a session pin, where a sessions rule decides;
+- the record of sent prefixes, where a cache-affinity profile decides;
+- once for each new load snapshot and list, the converted load reports, which allocates.
+
+On the short path it allocates nothing. A draw that looked up load reports counts them toward its
+list's conversion where it takes the list's claim, which it tries and never waits for.
 
 ### 5.7 One engine **[partly]**
 
