@@ -1,5 +1,7 @@
 //! The cases of a request with a pair's two lists.
 
+mod decode_again;
+
 use smg_worker::{
     identity::builder::BasicWorkerBuilder,
     test_support::no_health_check,
