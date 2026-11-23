@@ -1189,8 +1189,9 @@ impl PDRouter {
             // asked again, with what the selection read of the request and
             // its rule for a retry, over the pair index as it stands then.
             // The request goes to the decode that answer names. A MoRI-IO
-            // prefill was told its decode's endpoints, so that pair's decode
-            // is not asked.
+            // prefill was told of its decode (that engine's sizes, the rank
+            // both sides go to, and the side channel a WRITE prefill pushes
+            // to), so that pair's decode is not asked.
             let moved_to = parking_lot::Mutex::new(None);
             let ask = |first: &Placed, ahead: WorkerLoadGuard| {
                 let inputs = PlacementInputs {
@@ -9304,6 +9305,15 @@ mod tests {
 
     /// A [`HeldStub`] that answers `reply` as JSON on every path.
     async fn spawn_held_stub(reply: &'static str) -> HeldStub {
+        let reply: Value = serde_json::from_str(reply).expect("a JSON reply");
+        spawn_held_stub_with(move |_| reply.clone()).await
+    }
+
+    /// A [`HeldStub`] that answers, on every path, what `reply` makes of the
+    /// JSON body it was sent.
+    async fn spawn_held_stub_with(
+        reply: impl Fn(&Value) -> Value + Clone + Send + Sync + 'static,
+    ) -> HeldStub {
         let hits = Arc::new(AtomicUsize::new(0));
         let reached = Arc::new(tokio::sync::Notify::new());
         let answers = Arc::new(tokio::sync::Notify::new());
@@ -9312,13 +9322,18 @@ mod tests {
             Arc::clone(&reached),
             Arc::clone(&answers),
         );
-        let app = axum::Router::new().fallback(axum::routing::any(move || {
+        let app = axum::Router::new().fallback(axum::routing::any(move |req: Request| {
             let (hits, reached, answers) = held.clone();
+            let reply = reply.clone();
             async move {
+                let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                let sent: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
                 hits.fetch_add(1, Ordering::SeqCst);
                 reached.notify_one();
                 answers.notified().await;
-                ([(CONTENT_TYPE, "application/json")], reply)
+                axum::Json(reply(&sent))
             }
         }));
         HeldStub {
@@ -9327,6 +9342,25 @@ mod tests {
             reached,
             answers,
         }
+    }
+
+    /// `served` driven beside `meanwhile`, the steps a case takes while its
+    /// request is in flight, with what those steps answer. An answer that
+    /// comes before the steps end fails the case: its steps would wait for
+    /// ever on a server the request never reached.
+    async fn served_beside<T>(
+        served: impl std::future::Future<Output = Response>,
+        meanwhile: impl std::future::Future<Output = T>,
+    ) -> (Response, T) {
+        tokio::pin!(served, meanwhile);
+        let stepped = tokio::select! {
+            biased;
+            stepped = &mut meanwhile => stepped,
+            response = &mut served => {
+                panic!("answered {} before the case's steps ended", response.status())
+            }
+        };
+        (served.await, stepped)
     }
 
     /// The request moves where the answer names another decode. Here the
@@ -9383,7 +9417,7 @@ mod tests {
             second_stub.answers.notify_one();
             (named, other)
         };
-        let (response, (named, other)) = tokio::join!(chat_through(&router, false), leaves);
+        let (response, (named, other)) = served_beside(chat_through(&router, false), leaves).await;
         assert_eq!(response.status(), StatusCode::OK);
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -9410,6 +9444,99 @@ mod tests {
                 "completed Cancelled",
             ]
         );
+    }
+
+    /// A MoRI-IO pair's decode is not asked again behind its prefill: that
+    /// prefill was told of its decode, so the request goes to the decode the
+    /// selection named, whatever became of it while the prefill ran. Here
+    /// that decode stops being ready meanwhile, under a document that picks
+    /// a pair's decode behind its prefill. It is sent the request all the
+    /// same and stays counted for it; the other decode is sent nothing and
+    /// is never counted. The engine hears each side's dispatch and end, the
+    /// decode booked at its send, and no release. Both transfer modes of a
+    /// pair sent prefill first.
+    #[tokio::test]
+    async fn a_moriio_pairs_decode_is_not_asked_again_behind_its_prefill() {
+        for transfer in ["read", "write"] {
+            let prefill_stub = spawn_held_stub_with(|sent| {
+                let minted = sent.pointer("/kv_transfer_params/transfer_id");
+                json!({"kv_transfer_params": stub_handoff(minted.unwrap_or(&Value::Null))})
+            })
+            .await;
+            let first_stub = spawn_held_stub(r#"{"choices":[]}"#).await;
+            let second_stub = spawn_held_stub(r#"{"choices":[]}"#).await;
+
+            let router = single_attempt_router();
+            let heard = hearing_pairs_on(&router.policy_registry, true);
+            for decode in [&first_stub, &second_stub] {
+                register_moriio_pair_with(
+                    &router,
+                    (prefill_stub.url.clone(), Some(transfer)),
+                    (decode.url.clone(), transfer),
+                    &[],
+                );
+            }
+            let [first, second] = [&first_stub, &second_stub].map(|stub| {
+                let worker = router.worker_registry.get_by_url(&stub.url);
+                worker.expect("a registered decode")
+            });
+
+            let meanwhile = async {
+                prefill_stub.reached.notified().await;
+                // The decode the selection named is the one counted from then on.
+                let (named, other) = if first.load() == 1 {
+                    (&first, &second)
+                } else {
+                    (&second, &first)
+                };
+                assert_eq!((named.load(), other.load()), (1, 0), "{transfer}");
+                named.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+                prefill_stub.answers.notify_one();
+
+                tokio::select! {
+                    () = first_stub.reached.notified() => {}
+                    () = second_stub.reached.notified() => {}
+                }
+                assert_eq!(
+                    (named.load(), other.load()),
+                    (1, 0),
+                    "{transfer}: the request stays counted on the decode the selection named"
+                );
+                first_stub.answers.notify_one();
+                second_stub.answers.notify_one();
+                (named, other)
+            };
+            let no_extra = json!({});
+            let served = moriio_call(&router, "/v1/chat/completions", None, &no_extra);
+            let (response, (named, other)) = served_beside(served, meanwhile).await;
+            assert_eq!(response.status(), StatusCode::OK, "{transfer}");
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!((named.load(), other.load()), (0, 0), "{transfer}");
+
+            let sent_to = |worker: &Arc<dyn Worker>| {
+                let stub = if worker.url() == first.url() {
+                    &first_stub
+                } else {
+                    &second_stub
+                };
+                stub.hits.load(Ordering::SeqCst)
+            };
+            assert_eq!((sent_to(named), sent_to(other)), (1, 0), "{transfer}");
+            assert_eq!(
+                *heard.lock().expect("the stage heard"),
+                [
+                    "issued",
+                    "dispatched Prefill",
+                    "issued",
+                    "dispatched Decode",
+                    "completed Cancelled",
+                    "completed Cancelled",
+                ],
+                "{transfer}"
+            );
+        }
     }
 
     /// A decode policy with a favourite: the worker at that address whenever
