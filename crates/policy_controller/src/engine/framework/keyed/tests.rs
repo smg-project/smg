@@ -10,7 +10,7 @@ use super::{
     PoolRows,
 };
 use crate::{
-    document::spec::{AppliedSpec, Assignment, Needs, PolicySpec, Recovery},
+    document::spec::{AppliedSpec, Assignment, Needs, PolicySpec, Recovery, RulePlaced},
     engine::{
         decision::{Decision, Overlap},
         sticky_sessions::{SessionRule, SessionVerdict},
@@ -439,6 +439,7 @@ fn a_pin_is_followed_under_a_scorer_that_states_its_picks_holding() {
         ttl_micros: Some(60_000_000),
         sweep_micros: 60_000_000,
         recovery: Recovery::Original,
+        rule_placed: RulePlaced::Told,
     };
     for states in [true, false] {
         let stage = Alike {
@@ -492,6 +493,7 @@ fn a_pin_under_a_scope_or_a_shadow_is_left_to_the_whole_decision() {
         ttl_micros: Some(60_000_000),
         sweep_micros: 60_000_000,
         recovery: Recovery::Original,
+        rule_placed: RulePlaced::Told,
     };
     for (scoped, shadow) in [(false, None), (true, None), (false, Some(1))] {
         let alike = || {

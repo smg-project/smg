@@ -19,7 +19,7 @@ use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 
 use crate::{
-    document::spec::{Assignment, Recovery},
+    document::spec::{Assignment, Recovery, RulePlaced},
     engine::view::{Session, WorkerId},
 };
 
@@ -40,6 +40,10 @@ pub struct SessionRule {
     /// shortest interval among its rules ([`SessionTable::new`]).
     pub sweep_micros: u64,
     pub recovery: Recovery,
+    /// Whether a request the rule placed alone is the profile's own: a
+    /// pick the rule placed carries the word to the engine that tells the
+    /// stages of it.
+    pub rule_placed: RulePlaced,
 }
 
 impl SessionRule {
@@ -958,6 +962,7 @@ mod tests {
         ttl_micros: Some(1_000),
         sweep_micros: 100,
         recovery: Recovery::Latest,
+        rule_placed: RulePlaced::Told,
     };
 
     const ORIGINAL: SessionRule = SessionRule {

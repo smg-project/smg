@@ -2120,6 +2120,21 @@ pub enum Recovery {
     Latest,
 }
 
+/// Whether a request a sessions rule placed alone is the profile's own: a
+/// pin of the request's key followed, or the rule's own assignment. No
+/// stage of the profile placed such a request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RulePlaced {
+    /// The profile's own: its stages hear the request's issue and its
+    /// dispatch, and it counts among the profile's sends.
+    #[default]
+    Told,
+    /// Kept from the profile, as a gateway's sticky map keeps a request it
+    /// places from the gateway's policy.
+    Untold,
+}
+
 /// Sticky sessions on the binding: a keyed request stays on the worker its
 /// key was first placed on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2169,6 +2184,15 @@ pub struct SessionsSpec {
     /// `original`).
     #[serde(default)]
     pub recovery: Recovery,
+    /// Whether a request this rule placed alone is the profile's own
+    /// (default `told`). Under `untold` no stage hears that request's issue
+    /// or its dispatch, and it is none of the profile's sends. The session
+    /// table still hears its dispatch, and the stages its completion and
+    /// its release. A host that tells a lease's words off its file keeps
+    /// no such word of a pick: it takes the rule, and tells such a request
+    /// as it tells any other.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub rule_placed: RulePlaced,
 }
 
 fn default_ttl_s() -> u32 {
@@ -4723,6 +4747,7 @@ fn session_rule(
             u64::from(sessions.sweep_s) * 1_000_000
         },
         recovery: sessions.recovery,
+        rule_placed: sessions.rule_placed,
     })
 }
 
@@ -7786,6 +7811,7 @@ mod tests {
                 inflight_cap: u16::MAX,
                 issue_session_id: false,
                 recovery: Recovery::Original,
+                rule_placed: RulePlaced::Told,
             }
         );
         assert_eq!(spec.view.headers, ["x-smg-routing-key"]);

@@ -6,20 +6,56 @@
 //! The functions here make, from that, the lease and the target each stage
 //! is told under: [`single`] for a single request and [`pair`] for a pair,
 //! a side at a time. They take no lock and keep nothing.
+//!
+//! A single request its binding's sessions rule keeps from the profile is
+//! told to the session table at its dispatch, and to no stage ahead of its
+//! end ([`stages_hear`]).
 
 use std::time::Instant;
 
-use super::{decision::Target, decision_engine::HeldDecision, framework::Engine, view::Session};
+use super::{
+    decision::{Decision, Target},
+    decision_engine::HeldDecision,
+    framework::Engine,
+    view::Session,
+};
 use crate::{
     stages::Lifecycle,
     tracking::lease::{Lease, Said, Side},
 };
 
+/// Whether the stages hear the issue and the dispatch of a single
+/// request's `decision`, and the profile counts the request among its
+/// sends: of every pick but one its binding's sessions rule placed alone
+/// and keeps from the profile ([`RulePlaced::Untold`]). The rule places a
+/// request alone where it follows a pin of the key, and where its own
+/// assignment places the key.
+///
+/// Under that word no stage placed such a request, and none counts it
+/// among its sends: the session table hears its dispatch, where the key's
+/// pin moves, and no stage hears a word of it ahead of its end. A
+/// gateway's sticky map keeps a request it places from the gateway's
+/// policy in the same way. A stage that prices what it sent a worker
+/// still reads such a request in the count of requests its host holds on
+/// that worker. Under the rule's other word, the default, the request is
+/// the profile's own and every word of it is told.
+///
+/// A pair's sides are not read here: each side keeps a verdict of its own,
+/// and a pick's one word does not say which side the rule placed.
+///
+/// [`RulePlaced::Untold`]: crate::document::spec::RulePlaced::Untold
+#[inline]
+pub(crate) fn stages_hear(decision: &Decision) -> bool {
+    decision.pick().is_none_or(|pick| !pick.untold())
+}
+
 /// Tells `engine`'s stages one word of a single's lease, from what the
 /// request's guard lends back, as a file of leases tells it: a dispatch
 /// under the lease as issued with the index the word names, on the target
 /// taken, by its id and rank; an end under the lease moved to that target;
-/// a release under the lease as issued.
+/// a release under the lease as issued. The dispatch of a pick its
+/// sessions rule keeps from the profile is told to the session table and
+/// to no stage ([`stages_hear`]).
 pub(crate) fn single(engine: &Engine, held: &HeldDecision<'_>, said: Said) {
     match said {
         Said::Dispatched(dispatch, _) => {
@@ -32,12 +68,16 @@ pub(crate) fn single(engine: &Engine, held: &HeldDecision<'_>, said: Said) {
                 dp_rank: held.target.dp_rank,
                 ..Target::default()
             };
-            engine.on_dispatched(
-                &lease,
-                &target,
-                dispatch.side,
-                dispatch.since_decision_micros,
-            );
+            if stages_hear(held.decision) {
+                engine.on_dispatched(
+                    &lease,
+                    &target,
+                    dispatch.side,
+                    dispatch.since_decision_micros,
+                );
+            } else {
+                engine.dispatched_table(&lease, &target, dispatch.side);
+            }
         }
         Said::Completed(outcome) => {
             let lease = Lease {
@@ -188,3 +228,6 @@ pub(crate) fn pair(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

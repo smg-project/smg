@@ -613,7 +613,7 @@ mod tests {
     };
 
     use crate::{
-        document::spec::{Assignment, Needs, OverloadSpec, PolicySpec, Recovery},
+        document::spec::{Assignment, Needs, OverloadSpec, PolicySpec, Recovery, RulePlaced},
         engine::{
             decision::{Decision, LiftedVeto, ShedReason},
             framework::{
@@ -2731,6 +2731,7 @@ mod tests {
             ttl_micros: None,
             sweep_micros: 0,
             recovery: Recovery::Original,
+            rule_placed: RulePlaced::Told,
         };
         let (ringed, _) = ring_with_a_gap(None);
         let (engine, gap) = ring_with_a_gap(Some(rule));
@@ -3103,6 +3104,7 @@ mod tests {
             ttl_micros: None,
             sweep_micros: 0,
             recovery: Recovery::Original,
+            rule_placed: RulePlaced::Told,
         };
         let (ringed, _) = ring_with_a_gap(None);
         let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
@@ -3327,6 +3329,7 @@ mod tests {
             ttl_micros: None,
             sweep_micros: 0,
             recovery: Recovery::Original,
+            rule_placed: RulePlaced::Told,
         };
         let (ringed, _) = ring_with_a_gap(None);
         let (engine, gap) = ring_with_a_gap(Some(rule));
@@ -3374,6 +3377,7 @@ mod tests {
                 ttl_micros: None,
                 sweep_micros: 0,
                 recovery,
+                rule_placed: RulePlaced::Told,
             };
             let (ringed, _) = ring_with_a_gap(None);
             let (engine, gap) = ring_with_a_gap(Some(rule));
@@ -3528,6 +3532,7 @@ mod tests {
             ttl_micros: None,
             sweep_micros: 0,
             recovery: Recovery::Original,
+            rule_placed: RulePlaced::Told,
         };
         let (ringed, _) = ring_with_a_gap(None);
         let pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
@@ -3600,6 +3605,7 @@ mod tests {
             ttl_micros: None,
             sweep_micros: 0,
             recovery: Recovery::Original,
+            rule_placed: RulePlaced::Told,
         };
         let (ringed, _) = ring_with_a_gap(None);
         let pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
@@ -3731,6 +3737,7 @@ mod tests {
             ttl_micros: None,
             sweep_micros: 0,
             recovery: Recovery::Original,
+            rule_placed: RulePlaced::Told,
         };
         let turn = Arc::new(Turn::default());
         let engine = ring_behind(Box::new(Turns(Arc::clone(&turn))), Some(rule));

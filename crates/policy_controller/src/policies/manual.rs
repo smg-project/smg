@@ -3,7 +3,9 @@
 //! ([`SessionTable`](crate::engine::SessionTable)).
 
 use crate::{
-    document::spec::{Assignment, ProfileSpec, Recovery, SessionsSpec, MANUAL_SESSION_HEADER},
+    document::spec::{
+        Assignment, ProfileSpec, Recovery, RulePlaced, SessionsSpec, MANUAL_SESSION_HEADER,
+    },
     engine::{
         decision::Targets,
         framework::{Picker, TieBand},
@@ -31,7 +33,8 @@ pub(crate) fn sessions() -> SessionsSpec {
     // worker back in the lead when it recovers; the idle TTL of four
     // hours swept each minute, as the keyed policy of today. The
     // picker leaves the placement to the rule, so another assignment
-    // is the rule's one field and no other profile.
+    // is the rule's one field and no other profile. A request the rule
+    // places is the profile's own: no stage counts under that picker.
     SessionsSpec {
         sticky_header: MANUAL_SESSION_HEADER.into(),
         headers: vec![],
@@ -41,6 +44,7 @@ pub(crate) fn sessions() -> SessionsSpec {
         inflight_cap: u16::MAX,
         issue_session_id: false,
         recovery: Recovery::Original,
+        rule_placed: RulePlaced::Told,
     }
 }
 
