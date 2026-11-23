@@ -27,7 +27,7 @@ use smg_policy_controller::{
         ShedReason, Unplaced, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
-    tracking::{Placement, PlacementSide},
+    tracking::{Outcome, Placement, PlacementSide, SideEnd, TransportClass},
 };
 use smg_worker::{
     health::overload::{
@@ -488,6 +488,79 @@ pub(crate) fn accepted_by(
     Some(passed.iter().chain(rest).cloned().collect())
 }
 
+/// A handle on one request's end, for whoever reads the request's answer:
+/// the reader reports the answer's status through it ([`Self::report`]),
+/// and may hold it past the request's load guard.
+///
+/// A route asks it of the guard ([`Self::of`]) and tests nothing of who
+/// placed the request. The handle is empty for a guard that keeps no side
+/// of the policy engine's: a classic guard, a guard made ahead of its send
+/// ([`Placed::ahead`]) until [`Placed::sent`] hands it the side, and a
+/// guard made of another ([`WorkerLoadGuard::replicate`]). It is empty
+/// too where no stage of the engine's document takes an outcome. An empty
+/// handle holds nothing, and a report through it says nothing.
+///
+/// Where the handle is not empty, the engine hears the request's end once
+/// the guard and every handle are gone: with the status last reported, or
+/// as it heard it before where nobody reported (a client that left).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RequestEnd(SideEnd);
+
+impl RequestEnd {
+    /// The handle on the end of the request `guard` counts. A classic
+    /// guard pays one test of the word it keeps nothing in.
+    #[inline]
+    pub(crate) fn of(guard: &WorkerLoadGuard) -> Self {
+        match guard.kept() {
+            None => Self::default(),
+            Some(kept) => Self(kept_side_end(kept)),
+        }
+    }
+
+    /// The request ended with `status`, as the reader of its answer took
+    /// it. `answered` says whether the worker itself answered so
+    /// ([`super::attempt_ledger::UpstreamAnswer`]), where the status is no
+    /// transport failure and none the router made.
+    ///
+    /// The outcome is made behind the handle's test: an empty handle pays
+    /// that test, and nothing is asked or classed for it.
+    #[inline]
+    pub(crate) fn report(&self, status: u16, answered: impl FnOnce() -> bool) {
+        if !self.0.is_empty() {
+            reported(&self.0, status, answered());
+        }
+    }
+}
+
+/// [`RequestEnd::of`] for a guard that keeps something, out of line: a
+/// classic guard never comes here.
+#[inline(never)]
+fn kept_side_end(kept: &(dyn std::any::Any + Send + Sync)) -> SideEnd {
+    kept.downcast_ref::<PlacementSide>()
+        .map_or_else(SideEnd::default, PlacementSide::side_end)
+}
+
+/// [`RequestEnd::report`] through a handle a stage hears, out of line.
+#[inline(never)]
+fn reported(end: &SideEnd, status: u16, answered: bool) {
+    end.reported(Outcome::reported(status, transport_class(status, answered)));
+}
+
+/// The class of an end of `status`, the one mapping of the gateway: a
+/// status under 400 is a success, 408 and 504 a timeout, any other 4xx the
+/// client's error. A 5xx is the server's error where the worker answered
+/// it, and a failed connection where the router made it of a transport
+/// failure.
+fn transport_class(status: u16, answered: bool) -> TransportClass {
+    match status {
+        ..400 => TransportClass::Ok,
+        408 | 504 => TransportClass::Timeout,
+        400..500 => TransportClass::ClientError,
+        _ if answered => TransportClass::ServerError,
+        _ => TransportClass::ConnectFailed,
+    }
+}
+
 /// The worker a single-request placement picked, as the placement functions
 /// answer it: the request's worker, and what the request's load guard takes
 /// from the answer ([`Placed::guard`]).
@@ -529,6 +602,12 @@ struct ByEngine {
     /// no guard took tells the engine a release where the answer is
     /// dropped.
     side: Mutex<Option<Box<PlacementSide>>>,
+    /// A handle on that side's end, kept from the send where the route
+    /// made its guard by [`Placed::guard_keeping_end`]: the answer reports
+    /// the request's outcome through it ([`Placed::ended`]) and lets it go
+    /// there. Empty before that send, behind the report, and for a route
+    /// that reports nothing through its answer.
+    end: Mutex<SideEnd>,
     /// The routing value the engine names for the request, which the guard
     /// counts it under. `None` where the engine names none: a value it
     /// keeps as a fingerprint alone, a document that reads no value. The
@@ -589,6 +668,7 @@ impl Placed {
             worker,
             engine: Some(Box::new(ByEngine {
                 side: Mutex::new(side),
+                end: Mutex::default(),
                 routing_key,
                 // A single worker's answer is asked nothing again.
                 stated: Stated::nothing(),
@@ -610,6 +690,7 @@ impl Placed {
             worker,
             engine: Some(Box::new(ByEngine {
                 side: Mutex::new(Some(Box::new(side))),
+                end: Mutex::default(),
                 routing_key: routing_key.map(Box::from),
                 stated,
             })),
@@ -640,6 +721,24 @@ impl Placed {
         match &self.engine {
             None => WorkerLoadGuard::with_key(worker, key),
             Some(engine) => engine.guard(worker, key),
+        }
+    }
+
+    /// [`Self::guard`] for a route that tells the request's outcome through
+    /// this answer ([`Self::ended`]): the answer keeps a handle on the
+    /// request's end from this send to its report. A classic answer keeps
+    /// nothing, and its guard is [`Self::guard`]'s.
+    ///
+    /// The end of a request waits for every handle on it. So an answer that
+    /// keeps one and outlives its guard holds that end back until it
+    /// reports or is dropped: a route that reports nothing through its
+    /// answer makes its guard by [`Self::guard`].
+    #[inline]
+    pub(crate) fn guard_keeping_end(&self, key: Option<&str>) -> WorkerLoadGuard {
+        let worker = Arc::clone(&self.worker);
+        match &self.engine {
+            None => WorkerLoadGuard::with_key(worker, key),
+            Some(engine) => engine.guard_keeping_end(worker, key),
         }
     }
 
@@ -699,6 +798,22 @@ impl Placed {
     #[inline]
     pub(crate) fn owed_behind_prefill(&self) -> bool {
         self.engine.is_some()
+    }
+
+    /// The request this answer placed ended with `status`, as the route
+    /// that keeps the answer takes it at its attempt's account. `answered`
+    /// says whether the worker itself answered so
+    /// ([`super::attempt_ledger::UpstreamAnswer`]): it is asked only where
+    /// the policy engine hears the outcome. A classic answer pays the test
+    /// of its one empty word.
+    ///
+    /// It needs the guard made by [`Self::guard_keeping_end`]: behind any
+    /// other guard the answer keeps no handle, and this says nothing.
+    #[inline]
+    pub(crate) fn ended(&self, status: u16, answered: impl FnOnce() -> bool) {
+        if let Some(engine) = &self.engine {
+            engine.ended(status, answered);
+        }
     }
 
     /// This answer's worker, and what the answer still owes its send
@@ -780,17 +895,46 @@ impl ByEngine {
         self.sent(WorkerLoadGuard::with_key(worker, self.key(key)))
     }
 
+    /// [`Self::guard`] with a handle on the request's end kept by the
+    /// answer ([`Placed::guard_keeping_end`]), out of line as it is.
+    #[inline(never)]
+    fn guard_keeping_end(&self, worker: Arc<dyn Worker>, key: Option<&str>) -> WorkerLoadGuard {
+        self.send(WorkerLoadGuard::with_key(worker, self.key(key)), true)
+    }
+
     /// The send of a request the policy engine placed, out of line as
-    /// [`Self::guard`] is: the first guard sent takes the engine's side of
-    /// the request and tells the engine the dispatch.
+    /// [`Self::guard`] is.
     #[inline(never)]
     fn sent(&self, guard: WorkerLoadGuard) -> WorkerLoadGuard {
+        self.send(guard, false)
+    }
+
+    /// The first guard sent takes the engine's side of the request and
+    /// tells the engine the dispatch. With `keeping_end` the answer keeps a
+    /// handle on that side's end, for its own report.
+    fn send(&self, guard: WorkerLoadGuard, keeping_end: bool) -> WorkerLoadGuard {
         match self.side.lock().take() {
             Some(mut side) => {
                 side.sent();
+                if keeping_end {
+                    *self.end.lock() = side.side_end();
+                }
                 guard.keeping(side)
             }
             None => guard,
+        }
+    }
+
+    /// [`Placed::ended`] for a request the policy engine placed, out of
+    /// line: a classic placement never comes here. The handle leaves the
+    /// answer with the report, so an answer that outlives its request
+    /// holds no end back. A side that never went out has no handle: it
+    /// ends as a release. The status is classed behind the handle's test.
+    #[inline(never)]
+    fn ended(&self, status: u16, answered: impl FnOnce() -> bool) {
+        let end = std::mem::take(&mut *self.end.lock());
+        if !end.is_empty() {
+            reported(&end, status, answered());
         }
     }
 
@@ -7028,7 +7172,13 @@ pub(crate) mod tests {
         }
 
         fn on_completed(&self, _: &Lease, outcome: &Outcome) {
-            self.note(format!("completed {:?}", outcome.class));
+            // An end nobody reported states no status, and is noted by its
+            // class alone.
+            let status = match outcome.status {
+                0 => String::new(),
+                status => format!(" {status}"),
+            };
+            self.note(format!("completed {:?}{status}", outcome.class));
         }
 
         fn on_released(&self, _: &Lease, reason: ReleaseReason) {
@@ -7124,6 +7274,158 @@ pub(crate) mod tests {
             ["issued", "dispatched Single", "completed Cancelled"],
             "the end is told at the guard's drop, with no outcome"
         );
+    }
+
+    /// A handle on a request's end is asked of the guard that keeps the
+    /// engine's side: a classic guard's is empty, and so is one made ahead
+    /// of its send until the send hands it the side. An empty handle asks
+    /// nothing of its reporter.
+    #[test]
+    fn a_requests_end_is_asked_of_the_guard_that_keeps_its_side() {
+        let registry = http_registry(&["http://h:1"]);
+        let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let placed = answered(&registry, &classic, PlacementInputs::default());
+        let guard = placed.guard(None);
+        let end = RequestEnd::of(&guard);
+        assert!(end.0.is_empty(), "a classic guard keeps nothing");
+        end.report(200, || panic!("nothing is asked for a classic guard"));
+        placed.ended(200, || panic!("nothing is asked for a classic answer"));
+        drop((guard, placed));
+
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_engine_on(&policies);
+        let placed = answered(&registry, &policies, PlacementInputs::default());
+        let ahead = placed.ahead(None);
+        assert!(
+            RequestEnd::of(&ahead).0.is_empty(),
+            "a guard made ahead keeps no side yet"
+        );
+        let sent = placed.sent(ahead);
+        let end = RequestEnd::of(&sent);
+        assert!(!end.0.is_empty(), "the sent guard keeps the side");
+        drop(placed);
+        drop(sent);
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            ["issued", "dispatched Single"],
+            "the end waits for the handle"
+        );
+        end.report(502, || false);
+        drop(end);
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            ["issued", "dispatched Single", "completed ConnectFailed 502"]
+        );
+    }
+
+    /// An answer reports its request's end once and lets its handle go
+    /// there: the end is heard at the guard's drop while the answer still
+    /// stands, with the status reported, and a second report says nothing.
+    #[test]
+    fn an_answer_reports_its_requests_end_and_lets_its_handle_go() {
+        let registry = http_registry(&["http://h:1"]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_engine_on(&policies);
+        let said = || heard.lock().expect("the stage heard").clone();
+
+        let placed = answered(&registry, &policies, PlacementInputs::default());
+        let guard = placed.guard_keeping_end(None);
+        placed.ended(500, || true);
+        assert_eq!(
+            said(),
+            ["issued", "dispatched Single"],
+            "the guard still stands"
+        );
+        drop(guard);
+        assert_eq!(
+            said(),
+            ["issued", "dispatched Single", "completed ServerError 500"],
+            "the answer holds no end back behind its report"
+        );
+        placed.ended(200, || panic!("the answer's handle is gone"));
+        drop(placed);
+        assert_eq!(said().len(), 3, "one end a request");
+    }
+
+    /// An answer keeps a handle on its request's end only where its route
+    /// made the guard by the keeping call. Behind [`Placed::guard`] it holds
+    /// no end back, and a report through it says nothing.
+    #[test]
+    fn an_answer_keeps_no_handle_behind_a_plain_guard() {
+        let registry = http_registry(&["http://h:1"]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_engine_on(&policies);
+
+        let placed = answered(&registry, &policies, PlacementInputs::default());
+        let guard = placed.guard(None);
+        placed.ended(200, || panic!("the answer keeps no handle"));
+        drop(guard);
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            ["issued", "dispatched Single", "completed Cancelled"],
+            "the end is told at the guard's drop, while the answer stands"
+        );
+        drop(placed);
+    }
+
+    /// Through the answer only a sent request is reported: an answer whose
+    /// guard was never made has no handle, and its drop is a release.
+    #[test]
+    fn an_answer_that_was_never_sent_reports_nothing() {
+        let registry = http_registry(&["http://h:1"]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_engine_on(&policies);
+
+        let placed = answered(&registry, &policies, PlacementInputs::default());
+        placed.ended(502, || panic!("an unsent request has no end to report"));
+        drop(placed);
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            ["issued", "released Abandoned"]
+        );
+    }
+
+    /// Under a stock document, none of whose stages takes an end, nothing is
+    /// asked or classed for a report, through the answer or through the guard.
+    #[test]
+    fn nothing_is_classed_where_no_stage_takes_an_end() {
+        let registry = http_registry(&["http://h:1"]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        preset_on(&policies, "round_robin");
+
+        let placed = answered(&registry, &policies, PlacementInputs::default());
+        let guard = placed.guard_keeping_end(None);
+        RequestEnd::of(&guard).report(200, || panic!("no stage takes this end"));
+        placed.ended(200, || panic!("no stage takes this end"));
+    }
+
+    /// The gateway's one mapping of a status to a class: under 400 a
+    /// success, 408 and 504 a timeout, any other 4xx the client's error, and
+    /// a 5xx the server's error where the worker answered it, a failed
+    /// connection where the router made it.
+    #[test]
+    fn a_status_is_classed_by_one_mapping() {
+        for (status, answered, class) in [
+            (200, true, TransportClass::Ok),
+            (204, false, TransportClass::Ok),
+            (399, true, TransportClass::Ok),
+            (400, true, TransportClass::ClientError),
+            (408, true, TransportClass::Timeout),
+            (429, true, TransportClass::ClientError),
+            (499, false, TransportClass::ClientError),
+            (500, true, TransportClass::ServerError),
+            (500, false, TransportClass::ConnectFailed),
+            (502, false, TransportClass::ConnectFailed),
+            (503, true, TransportClass::ServerError),
+            (504, true, TransportClass::Timeout),
+            (504, false, TransportClass::Timeout),
+        ] {
+            assert_eq!(
+                transport_class(status, answered),
+                class,
+                "{status}, answered by the worker: {answered}"
+            );
+        }
     }
 
     /// An answer of the engine that no guard was made from gives its lease

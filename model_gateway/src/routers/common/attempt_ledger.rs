@@ -44,6 +44,11 @@ pub(crate) fn mark_upstream_answer(response: &mut Response) {
     response.extensions_mut().insert(UpstreamAnswer);
 }
 
+/// Whether the worker itself answered `response` (see [`UpstreamAnswer`]).
+pub(crate) fn is_upstream_answer(response: &Response) -> bool {
+    response.extensions().get::<UpstreamAnswer>().is_some()
+}
+
 /// Response extension: the attempt failed on one side of a disaggregated pair,
 /// named by its engine, and that side alone is what the request must not be
 /// replayed on (see [`AttemptLedger::settle`]).
@@ -95,8 +100,7 @@ pub(crate) fn failed_side_type(response: &Response) -> Option<WorkerType> {
 /// gives a request it processed and failed on. Its "not served now" statuses
 /// (502, 503, 504) stay replayable.
 pub(crate) fn is_definitive_failure(response: &Response) -> bool {
-    response.status() == StatusCode::INTERNAL_SERVER_ERROR
-        && response.extensions().get::<UpstreamAnswer>().is_some()
+    response.status() == StatusCode::INTERNAL_SERVER_ERROR && is_upstream_answer(response)
 }
 
 /// What one request's attempts have told the worker pool so far.

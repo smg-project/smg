@@ -2829,6 +2829,9 @@ impl PDRouter {
                 upstream_sse,
                 source,
                 guard: decode_guard,
+                // The pair routes tell the policy engine no end yet, so
+                // the relay is handed no handle and says nothing.
+                end: placement::RequestEnd::default(),
                 headers: response_headers,
                 mode: ChunkMode::Hook(hook),
             },
@@ -9478,6 +9481,41 @@ mod tests {
     async fn the_engine_hears_both_sides_of_a_pair_written_concurrently() {
         assert_eq!(
             heard_of_a_served_pair(Sends::ConcurrentWrite).await,
+            [
+                "issued",
+                "issued",
+                "dispatched Prefill",
+                "dispatched Decode",
+                "completed Cancelled",
+                "completed Cancelled",
+            ]
+        );
+    }
+
+    /// A streamed pair tells the engine no outcome yet. The decode's answer
+    /// goes through the relay that the regular router's streams go through,
+    /// and this route hands that relay no handle: under a stage that takes
+    /// an end the decode's guard holds one, and both sides still end with
+    /// class cancelled and no status.
+    #[tokio::test]
+    async fn the_engine_hears_no_outcome_of_a_pairs_streamed_decode() {
+        let (router, heard) = heard_pair_router(Sends::BothAtOnce).await;
+        let response = chat_through(&router, true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        // A relay that held a handle would tell the end from its task,
+        // behind the body's last byte.
+        let said = || heard.lock().expect("the stage heard").clone();
+        for _ in 0..1024 {
+            if said().len() >= 6 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            said(),
             [
                 "issued",
                 "issued",
