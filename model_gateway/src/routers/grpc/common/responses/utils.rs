@@ -446,17 +446,20 @@ pub(crate) fn resolve_function_identity(
     name: &str,
 ) -> (String, Option<String>) {
     let tools = tools.unwrap_or_default();
-    if !tools
-        .iter()
-        .any(|tool| matches!(tool, ResponseTool::Function(ft) if ft.function.name == name))
-    {
+    if !tools.iter().any(|tool| match tool {
+        ResponseTool::Function(ft) => ft.function.name == name,
+        ResponseTool::Custom(ct) => ct.name == name,
+        _ => false,
+    }) {
         for tool in tools {
             if let ResponseTool::Namespace(namespace) = tool {
                 for member in &namespace.tools {
-                    if let NamespaceTool::Function(ft) = member {
-                        if is_namespaced(name, &namespace.name, &ft.function.name) {
-                            return (ft.function.name.clone(), Some(namespace.name.clone()));
-                        }
+                    let member_name = match member {
+                        NamespaceTool::Function(ft) => &ft.function.name,
+                        NamespaceTool::Custom(ct) => &ct.name,
+                    };
+                    if is_namespaced(name, &namespace.name, member_name) {
+                        return (member_name.clone(), Some(namespace.name.clone()));
                     }
                 }
             }

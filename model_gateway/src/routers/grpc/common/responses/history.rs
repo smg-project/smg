@@ -13,10 +13,13 @@
 use std::sync::Arc;
 
 use axum::response::Response;
-use openai_protocol::responses::{
-    from_turn_boundary, generate_id, normalize_input_item, without_calls_answered_by,
-    without_outputs_of_missing_calls, McpToolCallError, ResponseContentPart, ResponseInput,
-    ResponseInputOutputItem, ResponsesRequest, StringOrContentParts,
+use openai_protocol::{
+    responses::{
+        from_turn_boundary, generate_id, normalize_input_item, without_calls_answered_by,
+        without_outputs_of_missing_calls, McpToolCallError, ResponseContentPart, ResponseInput,
+        ResponseInputOutputItem, ResponsesRequest, StringOrContentParts,
+    },
+    validated::Normalizable,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -156,6 +159,9 @@ pub(crate) async fn load_history(
     // `user` messages for local backends, while keeping the caller's original
     // `request` untouched for persistence so subsequent turns can replay them.
     lower_responses_request_for_local_backend(&mut loaded)?;
+    if continues && loaded.tool_choice.is_none() {
+        loaded.normalize();
+    }
     if let Some(error_response) = refuse_tools_without_a_direct_caller(loaded.tools.as_deref()) {
         return Err(error_response);
     }
@@ -1763,14 +1769,15 @@ pub(crate) mod tests {
 
     /// A first turn that declares tools inline via `additional_tools` keeps
     /// them in the stored input; a second turn continuing via
-    /// `previous_response_id` with only a `function_call_output` recovers those
-    /// tools into `loaded.tools` when `load_history` lowers the combined turn.
+    /// either history mechanism with only a `function_call_output` recovers
+    /// those tools even when the client sends an empty top-level list.
     #[tokio::test]
-    async fn previous_response_continuation_preserves_inline_additional_tools() {
+    async fn continuations_preserve_inline_additional_tools() {
         let stores = Stores::with_conversation().await;
         let turn_1_req: ResponsesRequest = serde_json::from_value(json!({
             "model": "test-model",
             "store": true,
+            "conversation": "conv_1",
             "input": [
                 {
                     "type": "additional_tools",
@@ -1825,33 +1832,37 @@ pub(crate) mod tests {
         .await
         .expect("turn 1 persists");
 
-        let turn_2: ResponsesRequest = serde_json::from_value(json!({
-            "model": "test-model",
-            "previous_response_id": "resp_turn_1",
-            "input": [{
-                "type": "function_call_output",
-                "call_id": "call_1",
-                "output": "ok"
-            }]
-        }))
-        .unwrap();
+        for (field, id) in [
+            ("previous_response_id", "resp_turn_1"),
+            ("conversation", "conv_1"),
+        ] {
+            let body = json!({
+                (field): id,
+                "model": "test-model",
+                "tools": [],
+                "input": [{"type": "function_call_output", "call_id": "call_1", "output": "ok"}]
+            });
+            let mut turn_2: ResponsesRequest = serde_json::from_value(body).unwrap();
 
-        let loaded = load_history(stores.history(), &turn_2, None, ReplayInto::Chat)
-            .await
-            .expect("turn 2 reloads turn 1 history");
-        let tools = loaded.tools.as_deref().expect("lifted tools from turn 1");
-        assert_eq!(tools.len(), 1);
-        assert!(matches!(
-            &tools[0],
-            openai_protocol::responses::ResponseTool::Function(ft) if ft.function.name == "exec_command"
-        ));
-        let ResponseInput::Items(items) = &loaded.input else {
-            panic!("expected items");
-        };
-        assert_eq!(items.len(), 3);
-        assert!(matches!(
-            &items[0],
-            ResponseInputOutputItem::Message { role, .. } if role == "user"
-        ));
+            turn_2.normalize();
+            let loaded = load_history(stores.history(), &turn_2, None, ReplayInto::Chat)
+                .await
+                .expect("turn 2 reloads turn 1 history");
+            assert_eq!(serde_json::to_value(&loaded.tool_choice).unwrap(), "auto");
+            let tools = loaded.tools.as_deref().expect("lifted tools from turn 1");
+            assert_eq!(tools.len(), 1);
+            assert!(matches!(
+                &tools[0],
+                openai_protocol::responses::ResponseTool::Function(ft) if ft.function.name == "exec_command"
+            ));
+            let ResponseInput::Items(items) = &loaded.input else {
+                panic!("expected items");
+            };
+            assert_eq!(items.len(), 3);
+            assert!(matches!(
+                &items[0],
+                ResponseInputOutputItem::Message { role, .. } if role == "user"
+            ));
+        }
     }
 }

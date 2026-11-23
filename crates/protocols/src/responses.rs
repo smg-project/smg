@@ -2276,6 +2276,9 @@ pub enum ResponseInputOutputItem {
         author: String,
         recipient: String,
         content: Vec<AgentMessageContentPart>,
+        /// Codex stamps agent mail with creation time and content attribution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        internal_chat_message_metadata_passthrough: Option<serde_json::Map<String, Value>>,
     },
     #[serde(untagged)]
     SimpleInputMessage {
@@ -2810,6 +2813,8 @@ enum TaggedItem {
         author: String,
         recipient: String,
         content: Vec<AgentMessageContentPart>,
+        #[serde(default)]
+        internal_chat_message_metadata_passthrough: Option<serde_json::Map<String, Value>>,
     },
 }
 
@@ -4340,7 +4345,12 @@ impl Normalizable for ResponsesRequest {
         if self.tool_choice.is_none() {
             if has_declared_tools {
                 self.tool_choice = Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto));
-            } else if self.tools.is_some() {
+            } else if self.tools.is_some()
+                && self.previous_response_id.is_none()
+                && self.conversation.is_none()
+            {
+                // A continuation can inherit inline tools. Leave its choice
+                // open until the backend has loaded the preceding turn.
                 self.tool_choice = Some(ResponsesToolChoice::Options(ToolChoiceOptions::None));
             }
             // If neither top-level `tools` nor inline `additional_tools` is

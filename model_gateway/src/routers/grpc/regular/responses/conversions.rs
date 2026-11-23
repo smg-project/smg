@@ -22,7 +22,7 @@ use openai_protocol::{
     responses::{
         CustomToolCallOutputContent, CustomToolInputContentPart, IncludeField, ResponseContentPart,
         ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
-        ResponseReasoningContent::ReasoningText, ResponseUsage, ResponsesRequest,
+        ResponseReasoningContent::ReasoningText, ResponseTool, ResponseUsage, ResponsesRequest,
         ResponsesResponse, ResponsesUsage, StringOrContentParts, TextConfig, TextFormat,
     },
     UNKNOWN_MODEL_ID,
@@ -793,6 +793,7 @@ fn map_text_to_response_format(text: Option<&TextConfig>) -> Option<ResponseForm
 pub(crate) fn chat_to_responses(
     chat_resp: &ChatCompletionResponse,
     original_req: &ResponsesRequest,
+    effective_tools: Option<&[ResponseTool]>,
     response_id_override: Option<String>,
 ) -> Result<ResponsesResponse, String> {
     // Extract the first choice (responses API doesn't support n>1)
@@ -817,7 +818,7 @@ pub(crate) fn chat_to_responses(
             .flatten()
             .map(|call| call.function.arguments.as_deref().unwrap_or_default()),
     );
-    push_tool_call_output_items(&mut output, choice, original_req);
+    push_tool_call_output_items(&mut output, choice, effective_tools);
 
     let (status, incomplete_details) = response_status(choice.finish_reason.as_deref(), cut);
     let usage = chat_resp.usage.as_ref().map(responses_usage);
@@ -902,15 +903,15 @@ fn message_output_item(choice: &ChatChoice) -> Option<ResponseOutputItem> {
 fn push_tool_call_output_items(
     output: &mut Vec<ResponseOutputItem>,
     choice: &ChatChoice,
-    original_req: &ResponsesRequest,
+    effective_tools: Option<&[ResponseTool]>,
 ) {
     let Some(tool_calls) = &choice.message.tool_calls else {
         return;
     };
-    let custom_names = custom_tool_names(original_req.tools.as_deref());
+    let custom_names = custom_tool_names(effective_tools);
     for tool_call in tool_calls {
         let (name, namespace) =
-            resolve_function_identity(original_req.tools.as_deref(), &tool_call.function.name);
+            resolve_function_identity(effective_tools, &tool_call.function.name);
         if custom_names.contains(&tool_call.function.name) {
             output.push(ResponseOutputItem::CustomToolCall {
                 call_id: tool_call.id.clone(),
@@ -982,6 +983,7 @@ mod tests {
         let response = chat_to_responses(
             &chat_response,
             &ResponsesRequest::default(),
+            None,
             Some("resp_test".to_string()),
         )
         .expect("chat response should convert");
@@ -1017,6 +1019,7 @@ mod tests {
         let response = chat_to_responses(
             &chat_response,
             &ResponsesRequest::default(),
+            None,
             Some("resp_plain".to_string()),
         )
         .expect("chat response should convert");
@@ -1082,7 +1085,7 @@ mod tests {
         .unwrap();
 
         let plain = serde_json::to_value(
-            chat_to_responses(&chat, &ResponsesRequest::default(), None).unwrap(),
+            chat_to_responses(&chat, &ResponsesRequest::default(), None, None).unwrap(),
         )
         .unwrap();
         assert_eq!(plain["output"][0]["type"], "reasoning");
@@ -1104,8 +1107,10 @@ mod tests {
             include: Some(vec![IncludeField::ReasoningEncryptedContent]),
             ..Default::default()
         };
-        let encrypted =
-            serde_json::to_value(chat_to_responses(&chat, &asking, None).unwrap()).unwrap();
+        let encrypted = serde_json::to_value(
+            chat_to_responses(&chat, &asking, asking.tools.as_deref(), None).unwrap(),
+        )
+        .unwrap();
         assert_eq!(encrypted["output"][0]["content"][0]["text"], "because");
         assert!(
             encrypted["output"][0]["encrypted_content"].is_string(),
@@ -1929,7 +1934,7 @@ mod tests {
                 {"id":"call_weather","type":"function","function":{"name":"weather.lookup","arguments":"{}"}}
             ]},"finish_reason":"tool_calls"}]
         })).unwrap();
-        let response = chat_to_responses(&chat, &request, None).unwrap();
+        let response = chat_to_responses(&chat, &request, request.tools.as_deref(), None).unwrap();
         let wire = serde_json::to_value(&response.output[0]).unwrap();
         assert_eq!(wire["name"], "lookup");
         assert_eq!(wire["namespace"], "weather");
@@ -1953,7 +1958,10 @@ mod tests {
                 {"id":"call_time","type":"function","function":{"name":"time","arguments":"{}"}}
             ]},"finish_reason":"tool_calls"}]
         })).unwrap();
-        let wire = serde_json::to_value(chat_to_responses(&chat, &request, None).unwrap()).unwrap();
+        let wire = serde_json::to_value(
+            chat_to_responses(&chat, &request, request.tools.as_deref(), None).unwrap(),
+        )
+        .unwrap();
         assert_eq!(wire["status"], "completed");
         assert_eq!(wire["output"].as_array().unwrap().len(), 2);
         for (item, call_id) in wire["output"]
@@ -1981,7 +1989,10 @@ mod tests {
                 {"id":"call_add","type":"function","function":{"name":"add_integers","arguments":""}}
             ]},"finish_reason":"tool_calls"}]
         })).unwrap();
-        let wire = serde_json::to_value(chat_to_responses(&chat, &request, None).unwrap()).unwrap();
+        let wire = serde_json::to_value(
+            chat_to_responses(&chat, &request, request.tools.as_deref(), None).unwrap(),
+        )
+        .unwrap();
         assert_eq!(wire["status"], "incomplete", "{wire}");
         assert_eq!(
             wire["incomplete_details"],
@@ -2005,7 +2016,8 @@ mod tests {
                 ]},"finish_reason":finish_reason}]
             }))
             .unwrap();
-            let response = chat_to_responses(&chat, &ResponsesRequest::default(), None).unwrap();
+            let response =
+                chat_to_responses(&chat, &ResponsesRequest::default(), None, None).unwrap();
             let wire = serde_json::to_value(response).unwrap();
             assert_eq!(wire["status"], "failed", "{finish_reason}");
             assert_eq!(wire["output"].as_array().unwrap().len(), 2);
@@ -2031,7 +2043,7 @@ mod tests {
                 {"id":"call_time","type":"function","function":{"name":"time","arguments":"{\"tz\":"}}
             ]},"finish_reason":"length"}]
         })).unwrap();
-        let response = chat_to_responses(&chat, &ResponsesRequest::default(), None).unwrap();
+        let response = chat_to_responses(&chat, &ResponsesRequest::default(), None, None).unwrap();
         let wire = serde_json::to_value(response).unwrap();
         assert_eq!(wire["status"], "incomplete");
         assert_eq!(wire["incomplete_details"]["reason"], "max_output_tokens");
@@ -2052,7 +2064,7 @@ mod tests {
             ]},"finish_reason":"length"}]
         })).unwrap();
         let wire = serde_json::to_value(
-            chat_to_responses(&chat, &ResponsesRequest::default(), None).unwrap(),
+            chat_to_responses(&chat, &ResponsesRequest::default(), None, None).unwrap(),
         )
         .unwrap();
         assert_eq!(wire["status"], "incomplete");
@@ -2075,7 +2087,7 @@ mod tests {
             }))
             .unwrap();
             let wire = serde_json::to_value(
-                chat_to_responses(&chat, &ResponsesRequest::default(), None).unwrap(),
+                chat_to_responses(&chat, &ResponsesRequest::default(), None, None).unwrap(),
             )
             .unwrap();
             assert_eq!(wire["status"], "incomplete", "{finish_reason}");
@@ -2107,8 +2119,10 @@ mod tests {
                 ]},"finish_reason":finish_reason}]
             }))
             .unwrap();
-            let wire =
-                serde_json::to_value(chat_to_responses(&chat, &request, None).unwrap()).unwrap();
+            let wire = serde_json::to_value(
+                chat_to_responses(&chat, &request, request.tools.as_deref(), None).unwrap(),
+            )
+            .unwrap();
             assert_eq!(wire["status"], "incomplete", "{finish_reason}");
             assert!(wire["incomplete_details"].is_null(), "{finish_reason}");
             assert_eq!(

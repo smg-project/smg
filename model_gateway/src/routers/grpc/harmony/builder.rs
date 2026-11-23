@@ -19,6 +19,7 @@ use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{ChatLogProbs, ContentPart, Tool},
     responses::{
+        CustomToolCallOutputContent, CustomToolInputContentPart,
         ReasoningEffort as ResponsesReasoningEffort, ResponseContentPart, ResponseInput,
         ResponseInputOutputItem, ResponseReasoningContent, ResponseTool, ResponsesRequest,
         StringOrContentParts,
@@ -778,7 +779,11 @@ impl HarmonyBuilder {
                     all_messages.push(msg);
 
                     // Track function tool calls so that function_call_output can find the name
-                    if matches!(item, ResponseInputOutputItem::FunctionToolCall { .. }) {
+                    if matches!(
+                        item,
+                        ResponseInputOutputItem::FunctionToolCall { .. }
+                            | ResponseInputOutputItem::CustomToolCall { .. }
+                    ) {
                         prev_outputs.push(item);
                     }
                 }
@@ -875,6 +880,22 @@ impl HarmonyBuilder {
                 Ok(tool_call_message(name, arguments, output.as_deref()))
             }
 
+            ResponseInputOutputItem::CustomToolCall {
+                name,
+                namespace,
+                input,
+                ..
+            } => {
+                let name = namespace
+                    .as_ref()
+                    .map_or_else(|| name.clone(), |ns| format!("{ns}.{name}"));
+                Ok(tool_call_message(
+                    name,
+                    &json!({"input": input}).to_string(),
+                    None,
+                ))
+            }
+
             // A hosted tool call of a stored turn replays the same way, under
             // the name the model called it by.
             ResponseInputOutputItem::McpCall {
@@ -893,40 +914,27 @@ impl HarmonyBuilder {
             // Function call output (separate from call) - requires looking up the original call
             ResponseInputOutputItem::FunctionCallOutput {
                 call_id, output, ..
+            } => replay_tool_result(prev_outputs, call_id, &output.to_text_only()?),
+            ResponseInputOutputItem::CustomToolCallOutput {
+                call_id, output, ..
             } => {
-                // Search prev_outputs in reverse order to find the matching function call
-                let call = prev_outputs
-                    .iter()
-                    .rev()
-                    .find_map(|item| match item {
-                        ResponseInputOutputItem::FunctionToolCall {
-                            call_id: item_call_id,
-                            name,
-                            namespace,
-                            ..
-                        } if item_call_id == call_id => Some(match namespace {
-                            Some(namespace) => format!("{namespace}.{name}"),
-                            None => name.clone(),
-                        }),
-                        _ => None,
-                    })
-                    .ok_or_else(|| format!("No function call found for call_id: {call_id}"))?;
-
-                // Create Tool message with "functions.{name}" prefix
-                // IMPORTANT: Must include recipient="assistant" for parser to recognize it.
-                // We keep channel=None to minimize what the model might copy.
-                Ok(HarmonyMessage {
-                    author: Author {
-                        role: Role::Tool,
-                        name: Some(format!("functions.{call}")),
-                    },
-                    recipient: Some("assistant".to_string()),
-                    content: vec![Content::Text(TextContent {
-                        text: output.to_text_only()?,
-                    })],
-                    channel: None,
-                    content_type: None,
-                })
+                let text = match output {
+                    CustomToolCallOutputContent::Text(text) => text.clone(),
+                    CustomToolCallOutputContent::Parts(parts) => parts
+                        .iter()
+                        .map(|part| match part {
+                            CustomToolInputContentPart::InputText { text } => Ok(text.as_str()),
+                            CustomToolInputContentPart::InputImage { .. } => {
+                                Err("Harmony does not support \"input_image\" content parts")
+                            }
+                            CustomToolInputContentPart::InputFile { .. } => {
+                                Err("Harmony does not support \"input_file\" content parts")
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                        .join("\n"),
+                };
+                replay_tool_result(prev_outputs, call_id, &text)
             }
 
             // Simple input message (usually user message)
@@ -1006,15 +1014,6 @@ impl HarmonyBuilder {
 
             ResponseInputOutputItem::Compaction { .. }
             | ResponseInputOutputItem::ItemReference { .. } => {
-                Err("Unsupported input item type".to_string())
-            }
-
-            ResponseInputOutputItem::CustomToolCall { .. }
-            | ResponseInputOutputItem::CustomToolCallOutput { .. } => {
-                warn!(
-                    function = "parse_response_item_to_harmony_message",
-                    "Custom tool item reached Harmony conversion"
-                );
                 Err("Unsupported input item type".to_string())
             }
 
@@ -1299,6 +1298,37 @@ impl Default for HarmonyBuilder {
     }
 }
 
+fn replay_tool_result(
+    prev_outputs: &[&ResponseInputOutputItem],
+    call_id: &str,
+    text: &str,
+) -> Result<HarmonyMessage, String> {
+    let name = prev_outputs
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            ResponseInputOutputItem::FunctionToolCall {
+                call_id: id,
+                name,
+                namespace,
+                ..
+            }
+            | ResponseInputOutputItem::CustomToolCall {
+                call_id: id,
+                name,
+                namespace,
+                ..
+            } if id == call_id => Some(
+                namespace
+                    .as_ref()
+                    .map_or_else(|| name.clone(), |ns| format!("{ns}.{name}")),
+            ),
+            _ => None,
+        })
+        .ok_or_else(|| format!("No function call found for call_id: {call_id}"))?;
+    Ok(tool_call_message(name, "", Some(text)))
+}
+
 /// The harmony message of a tool call the assistant issued, by the name the
 /// model called it by: its result once it ran (a Tool message under
 /// `functions.{name}`, addressed to the assistant), the call itself otherwise
@@ -1312,7 +1342,6 @@ fn tool_call_message(name: String, arguments: &str, output: Option<&str>) -> Har
         debug!(
             tool_name = %name,
             author_name = %author_name,
-            output_preview = %output_str.chars().take(100).collect::<String>(),
             "Building tool result message with Tool role (recipient=assistant, no channel)"
         );
         HarmonyMessage {
@@ -2305,7 +2334,13 @@ mod tests {
                 "name": "apply_patch",
                 "description": "Apply a unified patch to files."
             }],
-            "input": "Edit main.rs"
+            "input": [
+                {"role":"user", "content":"Edit main.rs"},
+                {"type":"custom_tool_call", "name":"apply_patch", "call_id":"call_1",
+                 "input":"*** Begin Patch\n*** Add File: main.rs\n+fn main() {}\n*** End Patch"},
+                {"type":"custom_tool_call_output", "call_id":"call_1",
+                 "output":[{"type":"input_text", "text":"Success. Added main.rs."}]}
+            ]
         }))
         .unwrap();
         let output = HarmonyBuilder::new()
@@ -2320,5 +2355,10 @@ mod tests {
             decoded.contains("apply_patch"),
             "top-level custom tool must be rendered in Harmony prompt: {decoded}"
         );
+        assert!(
+            decoded.contains(r#"{"input":"*** Begin Patch\n*** Add File: main.rs"#),
+            "{decoded}"
+        );
+        assert!(decoded.contains("Success. Added main.rs."), "{decoded}");
     }
 }

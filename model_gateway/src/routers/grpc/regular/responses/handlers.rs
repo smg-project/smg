@@ -200,6 +200,7 @@ async fn route_responses_streaming(
     streaming::convert_chat_stream_to_responses_stream(
         ctx,
         chat_request,
+        modified_request.tools,
         params,
         &request,
         background,

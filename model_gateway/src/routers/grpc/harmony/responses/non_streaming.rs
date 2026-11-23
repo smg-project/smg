@@ -37,9 +37,10 @@ use crate::{
                 streaming::OutputItemKind,
                 tool_call_limit,
                 utils::{
-                    add_model_call_usage, function_call_status, generation_failure_error,
-                    iteration_exceeds_safety_limit, resolve_function_identity, response_status,
-                    tool_call_overflow, McpToolCallLimit,
+                    add_model_call_usage, custom_tool_input, custom_tool_names,
+                    function_call_status, generation_failure_error, iteration_exceeds_safety_limit,
+                    resolve_function_identity, response_status, tool_call_overflow,
+                    McpToolCallLimit,
                 },
                 NotStored, ReplayInto, ResponsesContext,
             },
@@ -547,6 +548,7 @@ fn build_tool_response(
     // Add function tool calls WITHOUT output (need caller execution): each
     // call's status under the turn's finish, which a cut call reads as
     // incomplete, and the response as cut.
+    let custom_names = custom_tool_names(responses_request.tools.as_deref());
     let mut cut_call = false;
     for tool_call in function_tool_calls {
         let call_id = tool_call.id.clone();
@@ -555,6 +557,16 @@ fn build_tool_response(
             resolve_function_identity(responses_request.tools.as_deref(), &tool_call.function.name);
         let status = function_call_status(finish_reason, &arguments);
         cut_call |= status == "incomplete";
+        if custom_names.contains(&tool_call.function.name) {
+            output.push(ResponseOutputItem::CustomToolCall {
+                id: Some(OutputItemKind::CustomToolCall.new_id()),
+                call_id,
+                name,
+                namespace,
+                input: custom_tool_input(&arguments),
+            });
+            continue;
+        }
         output.push(ResponseOutputItem::FunctionToolCall {
             id: Some(OutputItemKind::FunctionCall.new_id()),
             call_id,

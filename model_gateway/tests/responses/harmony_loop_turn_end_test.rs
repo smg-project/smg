@@ -8,7 +8,7 @@
 
 use serde_json::{json, Value};
 
-use super::harmony_loop_harness::{serve, token_ids, End, Served, Turn, ANSWER};
+use super::harmony_loop_harness::{serve, serve_with_input, token_ids, End, Served, Turn, ANSWER};
 
 /// A call to the mock tool server's search tool up to its arguments, the
 /// arguments whole and cut, and the call's closing token.
@@ -370,4 +370,65 @@ async fn the_loop_runs_the_server_call_a_turn_ended_on() {
         misread.len(),
         misread.join("\n")
     );
+}
+
+/// Codex replays a patch result and asks for another edit. The model sees its
+/// function-shaped tool, while the client receives raw patch text and a call id
+/// it can echo on the next turn.
+#[tokio::test]
+async fn harmony_replays_and_emits_codex_custom_patch_calls() {
+    let patch = "*** Begin Patch\n*** Add File: hello.txt\n+Hello\n*** End Patch\n";
+    let reply = format!(
+        "<|channel|>commentary to=functions.apply_patch <|constrain|>json<|message|>{}<|call|>",
+        json!({"input": patch})
+    );
+    let turns = [Turn {
+        output_ids: token_ids(&[&reply]).remove(0),
+        prompt_tokens: 24,
+        end: End::Finish("stop"),
+    }];
+    let input = json!([
+        {"type":"additional_tools", "role":"developer", "tools":[
+            {"type":"namespace", "name":"functions", "description":"Default tools", "tools":[
+                {"type":"custom", "name":"apply_patch"}
+            ]}
+        ]},
+        {"role":"user", "content":"Create a README and a greeting."},
+        {"type":"custom_tool_call", "name":"apply_patch", "call_id":"call_readme",
+         "input":"*** Begin Patch\n*** Add File: README.md\n+# Demo\n*** End Patch"},
+        {"type":"custom_tool_call_output", "call_id":"call_readme", "output":"Exit code: 0\nWall time: 0.1 seconds\nOutput:\nSuccess. Updated the following files:\nA README.md\n"}
+    ]);
+    for stream in [false, true] {
+        let served = serve_with_input(&turns, stream, input.clone()).await;
+        let item = served.response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "apply_patch")
+            .unwrap();
+        assert_eq!(item["type"], "custom_tool_call");
+        assert_eq!(item["input"], patch);
+        assert_eq!(served.response["output"], served.stored["output"]);
+        assert_eq!(served.tool_calls, 0);
+        if stream {
+            let events: Vec<_> = served
+                .events
+                .iter()
+                .filter(|e| e["item"]["id"] == item["id"] || e["item_id"] == item["id"])
+                .collect();
+            let types: Vec<_> = events.iter().filter_map(|e| e["type"].as_str()).collect();
+            assert_eq!(
+                types,
+                [
+                    "response.output_item.added",
+                    "response.custom_tool_call_input.delta",
+                    "response.custom_tool_call_input.done",
+                    "response.output_item.done"
+                ]
+            );
+            assert_eq!(events[0]["item"]["call_id"], item["call_id"]);
+            assert_eq!(events[1]["delta"], patch);
+            assert_eq!(events[2]["input"], patch);
+        }
+    }
 }

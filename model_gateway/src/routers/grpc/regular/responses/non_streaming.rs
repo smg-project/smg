@@ -136,19 +136,24 @@ async fn execute_without_mcp(
         .await?; // Preserve the Response error as-is
 
     // Convert ChatCompletionResponse → ResponsesResponse
-    conversions::chat_to_responses(&chat_response, original_request, params.response_id)
-        .map(|responses_response| (responses_response, parser))
-        .map_err(|e| {
-            error!(
-                function = "execute_without_mcp",
-                error = %e,
-                "Failed to convert ChatCompletionResponse to ResponsesResponse"
-            );
-            error::internal_error(
-                "convert_to_responses_format_failed",
-                format!("Failed to convert to responses format: {e}"),
-            )
-        })
+    conversions::chat_to_responses(
+        &chat_response,
+        original_request,
+        modified_request.tools.as_deref(),
+        params.response_id,
+    )
+    .map(|responses_response| (responses_response, parser))
+    .map_err(|e| {
+        error!(
+            function = "execute_without_mcp",
+            error = %e,
+            "Failed to convert ChatCompletionResponse to ResponsesResponse"
+        );
+        error::internal_error(
+            "convert_to_responses_format_failed",
+            format!("Failed to convert to responses format: {e}"),
+        )
+    })
 }
 
 /// Execute the MCP tool calling loop
@@ -188,7 +193,7 @@ pub(super) async fn execute_tool_loop(
         .unwrap_or_else(|| format!("resp_{}", uuid::Uuid::now_v7()));
 
     let session = McpToolSession::new(&ctx.mcp_orchestrator, mcp_servers, &session_request_id);
-    let user_function_names = collect_user_function_names(original_request);
+    let user_function_names = collect_user_function_names(&current_request);
 
     // Get MCP tools and convert to chat format (do this once before loop)
     let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&session);
@@ -262,6 +267,7 @@ pub(super) async fn execute_tool_loop(
             let mut responses_response = conversions::chat_to_responses(
                 &chat_response,
                 original_request,
+                current_request.tools.as_deref(),
                 params.response_id.clone(),
             )
             .map_err(|e| {
@@ -324,7 +330,7 @@ pub(super) async fn execute_tool_loop(
                         &tc.name,
                     );
                     let arguments =
-                        dispatch_arguments(response_format, original_request, &tc.arguments);
+                        dispatch_arguments(response_format, &current_request, &tc.arguments);
                     let input = ToolExecutionInput {
                         call_id: tc.call_id,
                         tool_name: tc.name,
@@ -378,6 +384,7 @@ pub(super) async fn execute_tool_loop(
                 let mut responses_response = conversions::chat_to_responses(
                     &chat_response,
                     original_request,
+                    current_request.tools.as_deref(),
                     params.response_id.clone(),
                 )
                 .map_err(|e| {

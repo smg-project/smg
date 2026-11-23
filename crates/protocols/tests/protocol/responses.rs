@@ -5709,6 +5709,8 @@ fn additional_tools_normalizes_tool_choice_and_reports_input_item_error_path() {
         json!("required"),
         json!({"type": "function", "name": "exec_command"}),
         json!({"type": "function", "name": "spawn_agent", "namespace": "collaboration"}),
+        json!({"type": "function", "name": "exec_command", "namespace": "functions"}),
+        json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "exec_command"}]}),
     ] {
         let req: ResponsesRequest = serde_json::from_value(json!({
             "model": "test-model",
@@ -5742,6 +5744,20 @@ fn additional_tools_normalizes_tool_choice_and_reports_input_item_error_path() {
         err.contains("input[1].tools[0].parameters"),
         "expected input-scoped error path, got: {err}"
     );
+}
+
+#[test]
+fn empty_agent_message_is_rejected_at_validation() {
+    let req: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "input": [{"type":"agent_message","author":"/root","recipient":"/root/worker","content":[]}]
+    }))
+    .unwrap();
+    assert!(req
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("Agent message content cannot be empty"));
 }
 
 #[test]

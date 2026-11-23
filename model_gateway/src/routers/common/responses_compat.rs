@@ -25,9 +25,12 @@
 //! original wire items pass through untouched.
 
 use axum::response::Response;
-use openai_protocol::responses::{
-    generate_id, AgentMessageContentPart, NamespaceTool, ResponseContentPart, ResponseInput,
-    ResponseInputOutputItem, ResponseTool, ResponsesRequest, ResponsesToolChoice,
+use openai_protocol::{
+    common::ToolReference,
+    responses::{
+        generate_id, AgentMessageContentPart, NamespaceTool, ResponseContentPart, ResponseInput,
+        ResponseInputOutputItem, ResponseTool, ResponsesRequest, ResponsesToolChoice,
+    },
 };
 
 use crate::routers::error;
@@ -141,6 +144,7 @@ pub(crate) fn lower_responses_request_for_local_backend(
                 author,
                 recipient,
                 content,
+                ..
             } => {
                 let text = format_agent_message_text(&author, &recipient, &content).map_err(
                     |part_kind| {
@@ -175,6 +179,38 @@ pub(crate) fn lower_responses_request_for_local_backend(
         let target = request.tools.get_or_insert_with(Vec::new);
         for tool in lifted_tools {
             push_or_replace_tool(target, tool);
+        }
+        if has_explicit_functions_namespace {
+            // Codex permits bare names for inline functions. A real bare
+            // declaration takes precedence when both spellings exist.
+            let needs_namespace = |name: &str| {
+                !target.iter().any(|tool| callable_tool_name(tool) == Some(name))
+                    && target.iter().any(|tool| {
+                        matches!(tool, ResponseTool::Namespace(ns)
+                            if ns.name == DEFAULT_FUNCTION_NAMESPACE
+                                && ns.tools.iter().any(|member| namespace_member_name(member) == name))
+                    })
+            };
+            match &mut request.tool_choice {
+                Some(ResponsesToolChoice::Function(choice))
+                    if choice.namespace.is_none() && needs_namespace(&choice.name) =>
+                {
+                    choice.namespace = Some(DEFAULT_FUNCTION_NAMESPACE.to_owned());
+                }
+                Some(ResponsesToolChoice::AllowedTools { tools, .. }) => {
+                    for tool in tools {
+                        if let ToolReference::Function { name } = tool {
+                            if needs_namespace(name) {
+                                *name = format!("{DEFAULT_FUNCTION_NAMESPACE}.{name}");
+                            }
+                        }
+                    }
+                }
+                Some(ResponsesToolChoice::Custom { name, .. }) if needs_namespace(name) => {
+                    *name = format!("{DEFAULT_FUNCTION_NAMESPACE}.{name}");
+                }
+                _ => {}
+            }
         }
     }
 
@@ -274,8 +310,10 @@ mod tests {
         validated::Normalizable,
     };
     use serde_json::{json, Value};
+    use validator::Validate;
 
     use super::*;
+    use crate::routers::grpc::common::responses::utils::extract_tools_from_response_tools;
 
     fn parse_request(body: Value) -> ResponsesRequest {
         serde_json::from_value(body).expect("request should deserialize")
@@ -386,6 +424,17 @@ mod tests {
         assert!(text.contains("Sender: /root"), "{text}");
         assert!(text.contains("Recipient: /root/worker_1"), "{text}");
         assert!(text.ends_with("Reply with OK-123."), "{text}");
+    }
+
+    #[test]
+    fn inline_tool_declarations_alone_leave_no_local_model_input() {
+        let mut req = parse_request(json!({
+            "model":"test-model",
+            "input":[{"type":"additional_tools", "role":"developer",
+                "tools":[{"type":"function","name":"exec_command"}]}]
+        }));
+        let response = lower_responses_request_for_local_backend(&mut req).unwrap_err();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -507,11 +556,11 @@ mod tests {
                 "description": "Explicit functions namespace",
                 "tools": [{
                     "type": "function",
-                    "name": "old_tool",
+                    "name": "write_stdin",
                     "parameters": {"type": "object"}
                 }]
             }],
-            "tool_choice": {"type": "function", "name": "new_tool", "namespace": "functions"},
+            "tool_choice": {"type": "function", "name": "exec_command", "namespace": "functions"},
             "input": [
                 {
                     "type": "additional_tools",
@@ -522,24 +571,52 @@ mod tests {
                         "description": "",
                         "tools": [{
                             "type": "function",
-                            "name": "new_tool",
+                            "name": "exec_command",
                             "parameters": {"type": "object"}
-                        }]
+                        }, {"type": "custom", "name": "apply_patch"}]
                     }]
                 },
-                {"role": "user", "content": "call new_tool"}
+                {"role": "user", "content": "Run git status"}
             ]
         }));
+        for (choice, expected) in [
+            (
+                json!({"type": "function", "name": "exec_command"}),
+                "functions.exec_command",
+            ),
+            (
+                json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "exec_command"}]}),
+                "functions.exec_command",
+            ),
+            (
+                json!({"type": "custom", "name": "apply_patch"}),
+                "functions.apply_patch",
+            ),
+        ] {
+            let mut request = mixed.clone();
+            request.tool_choice = Some(serde_json::from_value(choice).unwrap());
+            request.validate().unwrap();
+            lower_responses_request_for_local_backend(&mut request).unwrap();
+            let tools = extract_tools_from_response_tools(request.tools.as_deref());
+            let offered = request
+                .tool_choice
+                .unwrap()
+                .to_chat_tool_choice()
+                .narrow_tools(&tools)
+                .unwrap();
+            assert_eq!(offered.len(), 1);
+            assert_eq!(offered[0].function.name, expected);
+        }
         lower_responses_request_for_local_backend(&mut mixed).unwrap();
         let wire = serde_json::to_value(&mixed).unwrap();
         assert_eq!(wire["tools"].as_array().unwrap().len(), 1);
         assert_eq!(wire["tools"][0]["type"], "namespace");
         assert_eq!(wire["tools"][0]["name"], "functions");
         let members = wire["tools"][0]["tools"].as_array().unwrap();
-        assert_eq!(members.len(), 2);
-        assert_eq!(members[0]["name"], "old_tool");
-        assert_eq!(members[1]["name"], "new_tool");
+        assert_eq!(members.len(), 3);
+        assert_eq!(members[0]["name"], "write_stdin");
+        assert_eq!(members[1]["name"], "exec_command");
         assert_eq!(wire["tool_choice"]["namespace"], "functions");
-        assert_eq!(wire["tool_choice"]["name"], "new_tool");
+        assert_eq!(wire["tool_choice"]["name"], "exec_command");
     }
 }

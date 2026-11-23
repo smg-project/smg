@@ -48,6 +48,7 @@ use crate::{
                     streaming::{
                         attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter,
                     },
+                    utils::custom_tool_input,
                     Reading, ReadingEnd,
                 },
             },
@@ -846,9 +847,56 @@ struct OpenCall {
     output_index: usize,
     item_id: String,
     response_format: Option<ResponseFormat>,
+    custom: bool,
     /// The item as `output_item.added` announced it, retained so a partial
     /// call rejected by the completed parse can still be closed.
     item: serde_json::Value,
+}
+
+impl OpenCall {
+    async fn open_custom(
+        name: &str,
+        call_id: &str,
+        emitter: &mut ResponseStreamEventEmitter,
+        tx: &SseSender,
+    ) -> Self {
+        let (output_index, item_id) = emitter.allocate_output_index(OutputItemKind::CustomToolCall);
+        let item = json!({"id": item_id, "type": "custom_tool_call", "name": name, "call_id": call_id, "input": ""});
+        ResponseStreamEventEmitter::sent(
+            emitter
+                .send_output_item_added(output_index, &item, tx)
+                .await,
+        );
+        Self {
+            output_index,
+            item_id,
+            response_format: None,
+            custom: true,
+            item,
+        }
+    }
+
+    async fn close_custom(
+        &self,
+        arguments: &str,
+        retain: bool,
+        emitter: &mut ResponseStreamEventEmitter,
+        tx: &SseSender,
+    ) {
+        emitter.function_call_status(arguments);
+        let input = custom_tool_input(arguments);
+        for event in emitter.custom_input_events(self.output_index, &self.item_id, &input) {
+            emitter.send_event_best_effort(&event, tx).await;
+        }
+        let mut item = self.item.clone();
+        item["input"] = json!(input);
+        ResponseStreamEventEmitter::sent(
+            emitter
+                .send_output_item_done(self.output_index, item, retain, tx)
+                .await,
+        );
+        emitter.complete_output_item(self.output_index);
+    }
 }
 
 impl ResponsesDecode {
@@ -1079,7 +1127,7 @@ impl ResponsesDecode {
         let Some(open) = self.calls.get(&call.index) else {
             return;
         };
-        if !streams_arguments(open.response_format.as_ref()) {
+        if open.custom || !streams_arguments(open.response_format.as_ref()) {
             return;
         }
         let Some(args) = call
@@ -1119,6 +1167,11 @@ impl ResponsesDecode {
             .map(|n| n.as_str())
             .unwrap_or("");
         let server = session.filter(|s| s.has_exposed_tool(tool_name));
+        if server.is_none() && emitter.is_custom_tool(tool_name) {
+            let open = OpenCall::open_custom(tool_name, call_id, emitter, tx).await;
+            self.calls.insert(call.index, open);
+            return;
+        }
         // A server call past the turn's allowance opens no item: the loop will not run it (the
         // request's cap, or the final turn after it), so it is parsed for the loop and dropped
         // here, never emitted or stored as a completed call. Its place among the turn's server
@@ -1166,6 +1219,7 @@ impl ResponsesDecode {
                 output_index,
                 item_id: item_id.clone(),
                 response_format,
+                custom: false,
                 item,
             },
         );
@@ -1268,11 +1322,24 @@ impl ResponsesDecode {
             return;
         };
         for (call_index, tool_call) in tool_calls.iter().enumerate() {
-            let Some(open) = self.calls.get(&call_index) else {
-                continue;
-            };
             let tool_name = &tool_call.function.name;
             let args_str = tool_call.function.arguments.as_deref().unwrap_or("");
+            let Some(open) = self.calls.get(&call_index) else {
+                // A single engine chunk can contain the whole call, including its closing token.
+                if !session.is_some_and(|s| s.has_exposed_tool(tool_name))
+                    && emitter.is_custom_tool(tool_name)
+                {
+                    let open = OpenCall::open_custom(tool_name, &tool_call.id, emitter, tx).await;
+                    open.close_custom(args_str, RETAIN_OUTPUT_ITEM, emitter, tx)
+                        .await;
+                }
+                continue;
+            };
+            if open.custom {
+                open.close_custom(args_str, RETAIN_OUTPUT_ITEM, emitter, tx)
+                    .await;
+                continue;
+            }
 
             if streams_arguments(open.response_format.as_ref()) {
                 let event = match open.response_format {
@@ -1350,6 +1417,11 @@ impl ResponsesDecode {
             let Some(open) = self.calls.get(&index) else {
                 continue;
             };
+            if open.custom {
+                open.close_custom(&arguments, OMIT_OUTPUT_ITEM, emitter, tx)
+                    .await;
+                continue;
+            }
             if streams_arguments(open.response_format.as_ref()) {
                 let event = match open.response_format {
                     Some(_) => emitter.emit_mcp_call_arguments_done(
