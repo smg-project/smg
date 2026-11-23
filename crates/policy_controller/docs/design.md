@@ -771,7 +771,8 @@ shadow. On main two pickers say so: round robin and `passthrough`.
 4. **The binding.** The first binding in document order whose model pattern and phase match gives
    the plan and the profile. No match is a refusal, `PolicyDeclined`, naming `binding`.
 5. **Short answers for a routing key.** A request with a routing key may be answered from the
-   key's pin in the session table. Only the records of the workers the key names are read.
+   key's pin in the session table, or from the workers its key reaches on the ring its host
+   lends. Only the records of the workers the key names are read.
 6. **Cache affinity.** A profile that reads which worker holds the prompt's beginning has those
    workers named before the pass, and the pick recorded after it.
 7. **Records.** One `Candidate` for each worker is written into the thread's buffer. Over a list
