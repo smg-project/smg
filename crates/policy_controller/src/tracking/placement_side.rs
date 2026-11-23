@@ -24,17 +24,27 @@
 //! ([`DecisionGuard::completed`](super::DecisionGuard::completed)), and
 //! its send would then say nothing. So a prefill side dropped behind its
 //! send, while the decode still stands chosen, holds its end back until
-//! the decode side speaks: at its dispatch, or at its own drop. The end is
-//! said then with the instant the prefill side was dropped at, so the span
-//! a stage reads is the prefill's own.
+//! the decode side speaks: at its dispatch, at the call that takes its
+//! decode again, or at its own drop. The end is said then with the instant
+//! the prefill side was dropped at, so the span a stage reads is the
+//! prefill's own.
+//!
+//! **A decode decided again** is asked of the pair's decode side
+//! ([`PlacementSide::decode_again`]), behind its prefill's answer. Its host
+//! may let the prefill side go before that call or behind it.
 
 use std::{fmt, sync::Arc, time::Instant};
 
 use parking_lot::Mutex;
+use smg_worker::identity::basic::Worker;
 
 use super::{
     lease::{ReleaseReason, Side},
     placement::Placement,
+};
+use crate::engine::{
+    decision_engine::{DecisionRefused, DecodeRefused},
+    PlaceRequest, Unplaced,
 };
 
 /// One side of a placed request, kept by its host from that side's send to
@@ -44,6 +54,12 @@ use super::{
 /// never went out is released as abandoned. A side that went out ends as
 /// class cancelled, with the span from its dispatch. A side of a placement
 /// that owes no event says nothing and reads no clock.
+///
+/// A pair's sides say two of those words otherwise (the module's words on
+/// the order). A prefill side dropped behind its send, while the decode
+/// still stands chosen, says its end later: behind the decode side's word.
+/// A decode side that stands chosen and never went out says nothing at its
+/// drop: nothing was booked for it.
 pub struct PlacementSide {
     side: Side,
     /// The label of the profile that picked this side.
@@ -88,14 +104,23 @@ impl Placement<'static> {
     /// The placement as the sides its host sends, each an owned value to
     /// keep with that side's send: the side of [`Placement::worker`], which
     /// is a single request's one side or a pair's prefill, and a pair's
-    /// decode side. A placement that names a decode worker is a pair's.
+    /// decode side. A placement is a pair's where its lease is a pair's,
+    /// and one that holds no lease where it names a decode worker.
     ///
-    /// Its host reads the placement's workers before this call: a side
-    /// names none.
+    /// Its host reads the placement's workers before this call and leaves
+    /// them in place: a side names none. A debug build stops on a pair's
+    /// placement whose decode worker was taken out.
     #[must_use]
     pub fn sides(self) -> (PlacementSide, Option<PlacementSide>) {
         let profile = self.profile;
-        if self.decode.is_none() {
+        let names_decode = self.decode.is_some();
+        let lease = self.held.as_ref();
+        let pair = lease.map_or(names_decode, |held| held.target().pair.is_some());
+        debug_assert_eq!(
+            pair, names_decode,
+            "a pair's placement names its decode worker: its host leaves it in place"
+        );
+        if !pair {
             let whole = PlacementSide {
                 side: Side::Single,
                 profile,
@@ -146,6 +171,46 @@ impl PlacementSide {
                 }
             }
         }
+    }
+
+    /// Decides the pair's decode again behind its prefill's answer
+    /// ([`Placement::decode_again`]), for a pair whose first decision
+    /// booked its prefill alone: the call of the pair's decode side. It
+    /// answers the decode the request now goes to. Its host sends the
+    /// decode there, and says this side's [`Self::sent`] at that send.
+    ///
+    /// `request` states the request again, as [`Placement::decode_again`]
+    /// reads it.
+    ///
+    /// **The order.** The call is made once the prefill side's send was
+    /// said. Its host may let the prefill side go before the call or
+    /// behind it: a prefill's end that waits for this side's word is said
+    /// behind the decode the call took, with the instant the prefill side
+    /// was dropped at. Behind a call that took no decode nothing more is
+    /// said, and that end still waits for this side's word.
+    ///
+    /// # Errors
+    ///
+    /// As [`Placement::decode_again`]: the placement stands as it stood
+    /// before the call. A side that is not a pair's decode side, which is
+    /// a pair's prefill side or a single request's one side, is refused
+    /// with no decision made: [`Unplaced::Refused`] with
+    /// [`DecisionRefused::Decode`] and [`DecodeRefused::NotChosen`].
+    pub fn decode_again(
+        &mut self,
+        request: &PlaceRequest<'_>,
+    ) -> Result<Arc<dyn Worker>, Unplaced> {
+        let (Side::Decode, Of::Shared(pair)) = (self.side, &self.of) else {
+            let refused = DecisionRefused::Decode(DecodeRefused::NotChosen);
+            return Err(Unplaced::Refused(refused));
+        };
+        let mut pair = pair.lock();
+        pair.placement.decode_again(request)?;
+        // The decode no longer stands chosen: a prefill's end that waited
+        // for this side's word is said behind the decode the call took.
+        pair.end_held_prefill();
+        // The call wrote the decode it took.
+        pair.placement.decode.clone().ok_or(Unplaced::NoWorkers)
     }
 }
 
@@ -200,14 +265,14 @@ mod tests {
 
     use super::*;
     use crate::{
-        document::spec::{AppliedSpec, PolicySpec},
+        document::spec::{AppliedSpec, DecodePick, PolicySpec},
         engine::{
             decision::{Decision, Target, Targets},
             decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
             framework::{Picker, TieBand},
             policy_engine::{PolicyEngine, PoolMembers},
             view::{Candidate, Constraints, Phase, RequestFacts},
-            PairAdmission, PairLists, PartnerClasses, PlaceRequest,
+            PairAdmission, PairLists, PartnerClasses,
         },
         stages::{pickers::push_drawn, registry::StageRegistry, Lifecycle},
         store::GatewayId,
@@ -396,6 +461,16 @@ mod tests {
         fn of_pairs() -> Self {
             let document = PolicySpec::pair_presets("round_robin", "round_robin");
             Self::under(document.expect("the pair presets"), "decode")
+        }
+
+        /// A host of pairs whose document picks a pair's decode after its
+        /// prefill: a request that asks its decode again is placed with
+        /// its decode standing chosen.
+        fn of_later_pairs() -> Self {
+            let document = PolicySpec::pair_presets("round_robin", "round_robin");
+            let mut document = document.expect("the pair presets");
+            document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+            Self::under(document, "decode")
         }
 
         /// A host of single requests whose document's stage takes every
@@ -607,6 +682,112 @@ mod tests {
         assert!(host.words().is_empty());
     }
 
+    /// A pair's request that asks its decode again, over `lists`.
+    fn later(lists: WorkerLists<'_>) -> PlaceRequest<'_> {
+        PlaceRequest {
+            decode_again: true,
+            ..PlaceRequest::of(MODEL, lists)
+        }
+    }
+
+    /// The two sides of the pair `host`'s engine places for `request`.
+    fn sides_of(host: &Host, request: &PlaceRequest<'_>) -> (PlacementSide, PlacementSide) {
+        let placement = host.engine.place(request).expect("a placement");
+        let (prefill, decode) = placement.kept().sides();
+        (prefill, decode.expect("a pair's decode side"))
+    }
+
+    /// A pair's decode side asks its decode again once the prefill went
+    /// out, and is answered the decode the request now goes to. A stage
+    /// hears the decode's issue at that call, and the decode's dispatch at
+    /// its send. A prefill side kept past the call says its end at its own
+    /// drop. One let go ahead of the call holds its end back for the
+    /// decode the call takes: the end is said behind that decode's issue,
+    /// with the span to the prefill side's drop.
+    #[test]
+    fn a_decode_side_asks_its_decode_again_behind_its_prefills_send() {
+        let host = Host::of_later_pairs();
+        let classes = PartnerClasses::number(1, [&[0_u32][..]]);
+        let request = later(host.lists(&classes));
+        let (mut prefill, mut decode) = sides_of(&host, &request);
+        prefill.sent();
+        assert_eq!(host.words(), [("issued", P), ("sent", P)]);
+        let taken = decode.decode_again(&request).expect("a decode");
+        assert_eq!(taken.url(), host.workers[1].url());
+        assert_eq!(host.words(), [("issued", D)]);
+        drop(prefill);
+        assert_eq!(host.words(), [("ended", P)]);
+        decode.sent();
+        drop(decode);
+        assert_eq!(host.words(), [("sent", D), ("ended", D)]);
+
+        // The prefill side let go ahead of the call.
+        let (mut prefill, mut decode) = sides_of(&host, &request);
+        let start = Instant::now();
+        prefill.sent();
+        drop(prefill);
+        let dropped = Instant::now();
+        assert_eq!(host.words(), [("issued", P), ("sent", P)], "the end waits");
+        thread::sleep(Duration::from_millis(20));
+        decode.decode_again(&request).expect("a decode");
+        let span = host.prefills_end(&[("issued", D)]);
+        let longest = dropped.duration_since(start).as_micros();
+        assert!(span <= longest, "{span} over {longest}");
+        decode.sent();
+        drop(decode);
+        assert_eq!(host.words(), [("sent", D), ("ended", D)]);
+    }
+
+    /// Behind a call that took no decode nothing is said and the placement
+    /// stands: a prefill's end that is held back still waits, and is said
+    /// behind the dispatch of the first decision's decode.
+    #[test]
+    fn a_second_ask_that_takes_no_decode_leaves_a_held_end_waiting() {
+        let host = Host::of_later_pairs();
+        let classes = PartnerClasses::number(1, [&[0_u32][..]]);
+        let request = later(host.lists(&classes));
+        let (mut prefill, mut decode) = sides_of(&host, &request);
+        prefill.sent();
+        drop(prefill);
+        assert_eq!(host.words(), [("issued", P), ("sent", P)]);
+
+        // At this call the host's classes pair the prefill with no decode:
+        // the decode's own decision sheds, and issues nothing.
+        let alone = PartnerClasses::number(1, [&[0_u32; 0][..]]);
+        let answer = decode.decode_again(&later(host.lists(&alone))).err();
+        assert!(matches!(answer, Some(Unplaced::Shed { .. })), "{answer:?}");
+        assert!(host.words().is_empty(), "the held end still waits");
+        decode.sent();
+        assert_eq!(host.words(), [("issued", D), ("sent", D), ("ended", P)]);
+        drop(decode);
+        assert_eq!(host.words(), [("ended", D)]);
+    }
+
+    /// A side that is not a pair's decode side is refused its second ask
+    /// by one name, with no decision made and nothing said: a pair's
+    /// prefill side, and a single request's one side.
+    #[test]
+    fn a_side_that_is_no_pairs_decode_side_is_refused_a_second_ask_by_name() {
+        let refused = Unplaced::Refused(DecisionRefused::Decode(DecodeRefused::NotChosen));
+        let host = Host::of_later_pairs();
+        let classes = PartnerClasses::number(1, [&[0_u32][..]]);
+        let request = later(host.lists(&classes));
+        let (mut prefill, decode) = sides_of(&host, &request);
+        prefill.sent();
+        host.words();
+        assert_eq!(prefill.decode_again(&request).err(), Some(refused));
+        assert!(host.words().is_empty());
+        drop((prefill, decode));
+        host.words();
+
+        let singles = Host::of_singles();
+        let mut single = singles.single();
+        single.sent();
+        singles.words();
+        assert_eq!(single.decode_again(&request).err(), Some(refused));
+        assert!(singles.words().is_empty());
+    }
+
     /// A single request's one side owns its placement: its dispatch, and
     /// at its drop its end, or its release where it never went out. A
     /// placement that owes no event gives a side that says nothing.
@@ -662,6 +843,21 @@ mod tests {
 
         let host = Host::of_singles();
         assert_eq!(host.single().profile(), "round_robin");
+    }
+
+    /// A pair's placement whose host took the decode worker out stops a
+    /// debug build where its sides are asked: the lease is a pair's, and
+    /// the placement names no decode.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "its host leaves it in place")]
+    fn a_pairs_placement_with_its_decode_taken_out_stops_a_debug_build() {
+        let host = Host::of_pairs();
+        let classes = PartnerClasses::number(1, [&[0_u32][..]]);
+        let lists = host.lists(&classes);
+        let mut placement = placed(host.engine, &host.workers, lists, false);
+        drop(placement.decode.take());
+        drop(placement.sides());
     }
 
     /// A side travels with its send: to the task that reads the response,

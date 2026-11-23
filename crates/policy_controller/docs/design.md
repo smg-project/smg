@@ -1141,6 +1141,8 @@ impl Placement<'static> {
 impl PlacementSide {
     pub fn sent(&mut self); // this side of the request went out
     pub fn profile(&self) -> &'static str; // the label of the profile that picked this side
+    // a pair's decode side: its decode decided again, answered the decode the request goes to
+    pub fn decode_again(&mut self, request: &PlaceRequest<'_>) -> Result<Arc<dyn Worker>, Unplaced>;
     // dropped: a release where the side never went out, an end of class cancelled where it did
 }
 ```
@@ -1149,6 +1151,11 @@ A pair's two sides share the pair's one placement behind a lock of that one requ
 crate keeps the order of a pair's words itself: a prefill side dropped while the decode still
 stands chosen holds its end back until the decode side speaks, and says it then with the
 instant of its own drop.
+
+A host that keeps sides asks the decode again on the pair's decode side, once the prefill
+side's send was said. It may let the prefill side go before that call or behind it: a
+prefill's end that waits is said behind the decode the call took, and behind a call that took
+none it still waits. Any other side is refused by name, with no decision made.
 
 Nothing else is asked of a host that makes this call. In particular it never names a policy,
 never looks inside a decision, never keeps a lease and never runs a timer for the engine.
