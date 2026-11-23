@@ -134,7 +134,7 @@ Later changes do not update these counts.
 | `policies/` | 12,568 | 12 | One file for each built-in policy. |
 | `stages/` | 10,365 | 8 | The built-in filters, scorers and pickers and their table. |
 | `tracking/` | 10,075 | 12 | The lease, its guard, the placement, the dispatch credit, the record of sent prefixes. |
-| `store/` | 29,896 | 28 | The controller's in-memory store: worker records, loads, cache index, sessions, leases. |
+| `store/` | 29,896 | 28 | The controller's in-memory store: worker records, loads, cache index, leases. |
 | `service/` | 80,546 | 59 | The controller: the gRPC service, election, replication, discovery. |
 | `worker_host/` | 18,895 | 19 | What lets a controller hold worker objects of the worker crate. |
 | `load/` | 5,842 | 10 | A worker's load report as a stage reads it, and the controller's own load poller. |
@@ -1706,7 +1706,7 @@ Its data is one in-memory store (`store/memory.rs`):
 | health | the worker crate's health checker over the worker objects, on the leader | copied into the records |
 | loads | the worker crate's load monitor over the worker objects, every 10 seconds while the replica leads; the crate's own poller still runs beside it | `PushLoad` is not served; a single request's decision is given the monitor's snapshot where the document reads reports and keeps none; no decision reads the poller's table |
 | cache index | a follower of each worker's cache events | an index of the store's own; `PushKvEvents` is not served; a single request's decision reads none yet, only the engine's own record of sent prompts |
-| sessions, leases | decisions: a filed lease books its session key's count of requests in flight | not replicated to a standby; no decision reads the counts: a controller's in-flight cap reads the count its leases step on each worker object (10.2); a single request's session pins are the engine's own table, one for each document |
+| leases | decisions | not replicated to a standby; a lease that counts for its session key steps that key's count on its worker's object, which a controller's in-flight cap reads (10.2); a single request's session pins are the engine's own table, one for each document |
 
 The gRPC service (`crates/policy_controller/contracts/policy_controller.proto`):
 

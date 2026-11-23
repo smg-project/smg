@@ -267,15 +267,9 @@ impl Entry {
     }
 }
 
-/// Shards of a table no host sized ([`SessionTable::new`]), and of the
-/// store's count of each key's requests in flight, by the key's low bits:
-/// keyed decisions on different keys take different locks.
-pub(crate) const SHARDS: usize = 16;
-
-/// The shard of `key` in the store's count of requests in flight.
-pub(crate) fn shard_of(key: u64) -> usize {
-    (key % SHARDS as u64) as usize
-}
+/// Shards of a table no host sized ([`SessionTable::new`]): keyed
+/// decisions on different keys take different locks.
+const SHARDS: usize = 16;
 
 /// The shards of a table whose keyed decisions run on every core of the
 /// host at once ([`SessionTable::with_shards`]): four a core, rounded up to
