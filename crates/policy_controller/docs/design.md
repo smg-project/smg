@@ -878,10 +878,14 @@ The types the two engines shared stay where they were moved ahead of the deletio
   lists (`PairLists::decide` keeps a pair to the positions its host states, and a single
   request states the positions of its list in `Constraints::places` and is decided, which is
   built); an encode request's demands (a single request's and a pair's are kept, which is built).
-- Five request fields that only the old engine's host fills leave with it (`pinned_at`,
-  `lent_in_flight`, `lent_session_in_flight`, `session_counted`, `model_fingerprint`),
-  and `Constraints::pins`. One of them needs a successor: a sessions rule with
-  a cap asks `session_counted` of its host today.
+- Four request fields that only the old engine's host fills leave with it (`pinned_at`,
+  `lent_in_flight`, `lent_session_in_flight`, `model_fingerprint`), and `Constraints::pins`.
+  A fifth, `session_counted`, stays, which is built: by it a host says that somebody counts a
+  key's requests on each worker, and a sessions rule with a cap asks nothing more of it. Where
+  that count stands on a worker object is the request's maker's to say
+  (`RequestMaker::session_counted_under`, a provided method): under the key's text for a host
+  whose own load guard counts, and under the session's number for a controller, which counts
+  by the leases it holds (10.2).
 - The trait's method that the kept engine answers with a constant, `decide_encode_pair`, is built
   or removed. It is removed, and the guard's maker of that name with it, which is done: a host
   asks the engine's own entry with its three lists (`PolicyEngine::decide_encode_at`) and holds
@@ -1571,8 +1575,9 @@ the store steps for each lease on file. A record made of a worker object states 
 no zone.
 The asking gateway's reach, its wires and its standing vetoes are stated to the engine as places
 of the list. A new document is a new engine object: its session pins and its record of sent
-prompts start empty, and that record is told no worker's leave. A sessions rule's cap counts no
-request of a key: a key stays on its worker past the cap, as under a rule with no cap. A
+prompts start empty, and that record is told no worker's leave. A sessions rule's cap reads a
+key's requests on the worker object too: under a rule with a cap the store steps that count for
+each lease on file, under the session's number written as text. A
 registration, a drain or a deregistration is on the worker objects when its call answers: a
 decision behind the acknowledgment reads the fleet the call left. A controller that starts over
 standing rows holds their worker objects before it serves.

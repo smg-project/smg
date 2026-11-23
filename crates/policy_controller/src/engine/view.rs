@@ -446,6 +446,28 @@ impl Session {
         self.0
     }
 
+    /// The bytes [`Self::text`] writes: a `u64` in sixteen hexadecimal
+    /// digits.
+    pub const TEXT_LEN: usize = 16;
+
+    /// The session's number as text, written into `buffer`: sixteen
+    /// lower-case hexadecimal digits, the highest first. A worker object
+    /// counts a key's requests under a text, and where held decisions on
+    /// file count a session's requests there, this is that text
+    /// ([`HostCount::session_booked`](crate::tracking::HostCount::session_booked)).
+    /// It is the one writer of it: what moves a held decision's count onto
+    /// a worker object and what reads a record's count both call it, so
+    /// the two name one entry. Nothing is allocated: the buffer is the
+    /// caller's, on its stack.
+    pub fn text(self, buffer: &mut [u8; Self::TEXT_LEN]) -> &str {
+        for (at, digit) in buffer.iter_mut().enumerate() {
+            let nibble = (self.0 >> (60 - 4 * at)) & 0xf;
+            *digit = b"0123456789abcdef"[nibble as usize];
+        }
+        // Sixteen ASCII digits: the conversion cannot fail.
+        std::str::from_utf8(buffer).unwrap_or_default()
+    }
+
     /// A session from the scoped value a lease carries on the wire.
     #[cfg(any(test, feature = "client"))]
     pub(crate) const fn from_raw(value: u64) -> Self {
@@ -1070,6 +1092,52 @@ pub struct KeyedRow {
     pub in_flight: u16,
 }
 
+/// Where a worker's object counts the requests of a request's session
+/// key: the name the count stands under there. A request's maker states it
+/// ([`RequestMaker::session_counted_under`](super::decision_engine::RequestMaker::session_counted_under)),
+/// and the reader of a record's count asks under that name.
+///
+/// One worker object stands in one process, which counts by its own guards
+/// or by the decisions it holds on file and never by both, so the two
+/// names do not meet on one object.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SessionCountedUnder {
+    /// The key's own text: the caller's own guard counts each request on
+    /// the worker it sends it to, for as long as the request runs. What a
+    /// process that serves its requests itself does.
+    #[default]
+    KeyText,
+    /// The session's number written as text ([`Session::text`]): the
+    /// decisions held on file count them, one a lease that books the
+    /// worker
+    /// ([`HostCount::session_booked`](crate::tracking::HostCount::session_booked)).
+    /// What a controller does, which serves no request. Its frame carries
+    /// the key in the clear or hashed: the lease carries the number alone.
+    SessionNumber,
+}
+
+impl SessionCountedUnder {
+    /// The name the count of `facts`' session key stands under on a
+    /// worker's object: the key's text as the request carries it, or the
+    /// session's number as [`Session::text`] writes it into `buffer`.
+    /// `None` for a request with no such name: no key in the clear under
+    /// the first, no key at all under the second. The one place that turns
+    /// the statement into the name.
+    pub fn name<'a: 'b, 'b>(
+        self,
+        facts: &RequestFacts<'a>,
+        buffer: &'b mut [u8; Session::TEXT_LEN],
+    ) -> Option<&'b str> {
+        match self {
+            Self::KeyText => facts.session_key.plain,
+            Self::SessionNumber => {
+                let session = facts.session();
+                (!session.is_none()).then(|| session.text(buffer))
+            }
+        }
+    }
+}
+
 /// One request as a decision sees it. Borrowed from the host for the
 /// duration of the decision.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1195,7 +1263,9 @@ pub struct RequestFacts<'a> {
     /// rule's in-flight cap reads the count either way. A key kept on its
     /// worker over the overload veto is kept under a capped rule only
     /// where this is set: with no count the cap could not hand the key on,
-    /// so the veto stands for it as for any request. In-process only.
+    /// so the veto stands for it as for any request. Where the count
+    /// stands on a worker's object is the request's maker's to say
+    /// ([`SessionCountedUnder`]). In-process only.
     pub session_counted: bool,
     /// The candidates' affinity facts, by index in the candidate slice the
     /// decision is made over: the one column the affinity stages read, in
@@ -2203,6 +2273,53 @@ mod tests {
             ..plain
         };
         assert!(keyless.session().is_none());
+    }
+
+    /// A session key's count stands on a worker's object under one of two
+    /// names. Under the key's text the name is the text the request
+    /// carries, and a key carried as its fingerprint alone has none. Under
+    /// the session's number it is the number's sixteen digits: one name for
+    /// the key in either form, another for another model. A request with
+    /// no key has no name under either.
+    #[test]
+    fn a_sessions_count_is_named_by_where_it_stands() {
+        let plain = RequestFacts {
+            model: "model-a",
+            session_key: Identity::plain("conversation-7"),
+            ..RequestFacts::default()
+        };
+        let hashed = RequestFacts {
+            session_key: Identity::hashed(plain.session_key.hash),
+            ..plain
+        };
+        let named = |under: SessionCountedUnder, facts: &RequestFacts<'_>| {
+            let mut buffer = [0; Session::TEXT_LEN];
+            under.name(facts, &mut buffer).map(str::to_owned)
+        };
+        let text = SessionCountedUnder::KeyText;
+        let number = SessionCountedUnder::SessionNumber;
+        assert_eq!(SessionCountedUnder::default(), text);
+        assert_eq!(named(text, &plain).as_deref(), Some("conversation-7"));
+        assert_eq!(named(text, &hashed), None);
+        let digits = format!("{:016x}", plain.session().get());
+        assert_eq!(named(number, &plain).as_deref(), Some(digits.as_str()));
+        assert_eq!(named(number, &hashed).as_deref(), Some(digits.as_str()));
+        let other = RequestFacts {
+            model: "model-b",
+            ..plain
+        };
+        assert_ne!(named(number, &other), Some(digits));
+        let keyless = RequestFacts::default();
+        assert_eq!(named(text, &keyless), None);
+        assert_eq!(named(number, &keyless), None);
+        // The number's text: every digit, the highest first.
+        let text_of = |value| {
+            let mut buffer = [0; Session::TEXT_LEN];
+            Session::from_raw(value).text(&mut buffer).to_owned()
+        };
+        assert_eq!(text_of(0x1f), "000000000000001f");
+        assert_eq!(text_of(u64::MAX), "ffffffffffffffff");
+        assert_eq!(text_of(0x0123_4567_89ab_cdef), "0123456789abcdef");
     }
 
     /// A carried fingerprint is the host's word that it is the name's. A

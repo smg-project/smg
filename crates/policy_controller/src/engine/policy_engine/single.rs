@@ -295,11 +295,18 @@ pub(super) fn decide(
     };
     let facts = &mut request.facts;
     // One value for every record of the decision: its instant, the host's
-    // snapshot as the host holds it, the key's text for a stage that
-    // counts the key's requests on a worker, and the list's own word, the
-    // one a pick alone turns ([`PolicyEngine::pick`]): a draw of this
-    // decision takes the list's next turn.
-    let key = facts.session_key.plain;
+    // snapshot as the host holds it, the name the key's requests are
+    // counted under on a worker, as the request's maker states it, for a
+    // stage that reads that count, and the list's own word, the one a
+    // pick alone turns ([`PolicyEngine::pick`]): a draw of this decision
+    // takes the list's next turn. The maker is asked under a document
+    // that reads the count and under no other.
+    let mut name = [0; Session::TEXT_LEN];
+    let key = if spec.engine().needs().session_in_flight {
+        maker.session_counted_under().name(facts, &mut name)
+    } else {
+        None
+    };
     let live =
         records::Live::at(spec.engine(), &own.clock, now, loads, key).turning(&members.rotation.0);
     // A retry leaves every worker of the engines it tried: over a list
@@ -623,7 +630,8 @@ pub(crate) mod tests {
             prompt_hashes::HashSeeds,
             records::worker_id,
             view::{
-                Candidate, Constraints, FixedFacts, Identity, RequestFacts, WireModes, WorkerId,
+                Candidate, Constraints, FixedFacts, Identity, RequestFacts, SessionCountedUnder,
+                WireModes, WorkerId,
             },
         },
         policies::random::Random,
@@ -1082,6 +1090,102 @@ pub(crate) mod tests {
         assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
         let again = pick.targets.first().expect("a target");
         assert_eq!(again.id, placed.id);
+    }
+
+    /// The count a capped sessions rule reads stands on a worker's object
+    /// under the name the request's maker states. A maker that says
+    /// nothing is of a host whose own guard counts, and the count is read
+    /// under the key's text. A maker of a host that counts by the
+    /// decisions it holds on file says the session's number, and the count
+    /// is read under that number's text, though the request carries its
+    /// key in the clear. A count under the other name is no count of the
+    /// key: its next request stays on its worker.
+    #[test]
+    fn a_keys_count_is_read_under_the_name_its_requests_maker_states() {
+        /// The maker of a host that counts by the decisions it holds.
+        struct ByNumber<'a>(Asks<'a>);
+
+        impl RequestMaker for ByNumber<'_> {
+            fn model(&self) -> &str {
+                self.0.model()
+            }
+
+            fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+                self.0.make(spec)
+            }
+
+            fn workers(&self) -> WorkerLists<'_> {
+                self.0.workers()
+            }
+
+            fn session_counted_under(&self) -> SessionCountedUnder {
+                SessionCountedUnder::SessionNumber
+            }
+        }
+
+        /// The key's first request pins it on a worker, two requests of
+        /// the key are counted there under `name`, and the key's next
+        /// request is decided: what its rule said of the pin, and whether
+        /// the request left the pin's worker.
+        fn next(
+            engine: &PolicyEngine,
+            list: &[Arc<dyn Worker>],
+            maker: &impl RequestMaker,
+            name: &str,
+        ) -> (SessionVerdict, bool) {
+            let now = Instant::now();
+            let mut guard = DecisionGuard::decide_under(engine, GatewayId::LOCAL, maker, now)
+                .expect("a decision");
+            let owner = guard.take(0).expect("the first target");
+            guard.dispatched(now);
+            for _ in 0..2 {
+                list[owner.position as usize].increment_load();
+                list[owner.position as usize].increment_routing_key_load(name);
+            }
+            let decided = engine.decide_under(GatewayId::LOCAL, maker, now);
+            let (decided, _) = decided.expect("an answer").whole().expect("a whole one");
+            let pick = *decided.decision.pick().expect("a pick");
+            let went = pick.targets.first().expect("a target");
+            (pick.session_verdict, went.id != owner.id)
+        }
+
+        let keyed = || {
+            let mut keyed = request();
+            keyed.facts.session_key = Identity::plain("talk-1");
+            keyed
+        };
+        let mut digits = [0; Session::TEXT_LEN];
+        let number = keyed().facts.session().text(&mut digits).to_owned();
+        let decided = |by_number: bool, name: &str| {
+            // The stock rule with an in-flight cap of two, which places a
+            // key on the worker with the fewest requests.
+            let mut document = PolicySpec::preset("manual").expect("a built-in preset");
+            let rule = document.bindings[0].sessions.as_mut();
+            let rule = rule.expect("the stock rule");
+            (rule.inflight_cap, rule.assignment) = (2, Assignment::MinLoad);
+            document.generation = 1;
+            let spec = AppliedSpec::validate(&document).expect("the document validates");
+            let (engine, list) = (PolicyEngine::new(spec), pool(4));
+            let members = PublishedList::new(Arc::clone(&list));
+            let asks = Asks::of(keyed(), Some(&members));
+            if by_number {
+                next(&engine, &list, &ByNumber(asks), name)
+            } else {
+                next(&engine, &list, &asks, name)
+            }
+        };
+        let (handed_on, kept) = (
+            (SessionVerdict::Respill, true),
+            (SessionVerdict::Pinned, false),
+        );
+        assert_eq!(decided(false, "talk-1"), handed_on, "a guard's count");
+        assert_eq!(decided(false, &number), kept, "no count of a guard's");
+        assert_eq!(
+            decided(true, &number),
+            handed_on,
+            "the held decisions' count"
+        );
+        assert_eq!(decided(true, "talk-1"), kept, "no count of a held decision");
     }
 
     /// The entry reads its host's clock where a decision is dated and

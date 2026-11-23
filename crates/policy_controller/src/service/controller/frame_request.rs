@@ -17,7 +17,10 @@
 //! deciding document reads of them. The budget is what is left of the
 //! frame's at the decision. The places of its list the asking gateway may
 //! take, and the positions its standing vetoes hold back, are stated by
-//! position ([`FrameRequest::held_to`]).
+//! position ([`FrameRequest::held_to`]). A keyed frame's request says that
+//! its key's requests are counted on each worker, and the maker says under
+//! what name ([`RequestMaker::session_counted_under`]): the session's
+//! number, by the decisions the controller holds on file.
 //!
 //! **What the maker does not state.**
 //!
@@ -53,7 +56,7 @@ use crate::{
     document::spec::AppliedSpec,
     engine::{
         decision_engine::{Request, RequestMaker, WorkerLists},
-        view::{Constraints, WireModes},
+        view::{Constraints, RequestFacts, SessionCountedUnder, WireModes},
     },
 };
 
@@ -156,9 +159,15 @@ impl RequestMaker for FrameRequest<'_> {
 
     fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
         let frame = self.frame;
+        let facts = frame.facts(self.lists, frame.hashes_read(spec), self.budget_micros);
         Request {
             id: frame.id(),
-            facts: frame.facts(self.lists, frame.hashes_read(spec), self.budget_micros),
+            facts: RequestFacts {
+                // The decisions a controller holds on file count a key's
+                // requests on each worker: a keyed frame's count stands.
+                session_counted: !facts.session_key.is_none(),
+                ..facts
+            },
             constraints: Constraints {
                 // The gateway's wires are the caller's to state, as places.
                 wire_modes: WireModes::NONE,
@@ -180,6 +189,13 @@ impl RequestMaker for FrameRequest<'_> {
 
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         self.loads
+    }
+
+    // A controller serves no request, so no guard of its own counts one
+    // under its key's text. The decisions it holds on file count a key's
+    // requests on each worker, under the session's number.
+    fn session_counted_under(&self) -> SessionCountedUnder {
+        SessionCountedUnder::SessionNumber
     }
 }
 

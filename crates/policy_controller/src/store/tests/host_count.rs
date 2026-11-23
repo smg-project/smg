@@ -3,6 +3,7 @@
 //! it, and it goes with its row.
 
 use std::{
+    collections::BTreeMap,
     sync::{
         atomic::{AtomicI64, AtomicU32, Ordering::SeqCst},
         Arc,
@@ -11,7 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{booking, done, facts, followed, issue_pair, on, pair, ready};
+use parking_lot::Mutex;
+
+use super::{booking, done, facts, followed, issue_pair, on, pair, ready, LeaseRecord, Session};
 use crate::{
     engine::{
         decision::{Target, Targets},
@@ -27,12 +30,13 @@ use crate::{
 };
 
 /// What a host counts for one worker, read from outside the store: the
-/// leases it holds, and how many of the counts handed over it the store
-/// dropped.
+/// leases it holds, the leases of each session among them, and how many
+/// of the counts handed over it the store dropped.
 #[derive(Default)]
 struct Kept {
     held: AtomicI64,
     dropped: AtomicU32,
+    sessions: Mutex<BTreeMap<u64, i64>>,
 }
 
 impl Kept {
@@ -42,6 +46,12 @@ impl Kept {
 
     fn dropped(&self) -> u32 {
         self.dropped.load(SeqCst)
+    }
+
+    /// The leases of `session` it holds.
+    fn of(&self, session: Session) -> i64 {
+        let sessions = self.sessions.lock();
+        sessions.get(&session.get()).copied().unwrap_or(0)
     }
 }
 
@@ -58,6 +68,18 @@ impl HostCount for Count {
     fn freed(&self) {
         let held = self.0.held.fetch_sub(1, SeqCst);
         assert!(held > 0, "an end with no booking under it");
+    }
+
+    fn session_booked(&self, session: Session) {
+        assert!(!session.is_none(), "a step of no session");
+        *self.0.sessions.lock().entry(session.get()).or_default() += 1;
+    }
+
+    fn session_freed(&self, session: Session) {
+        let mut sessions = self.0.sessions.lock();
+        let held = sessions.entry(session.get()).or_default();
+        assert!(*held > 0, "a session's end with no booking under it");
+        *held -= 1;
     }
 }
 
@@ -339,9 +361,193 @@ fn a_row_that_is_gone_takes_no_count() {
     assert_eq!((kept.held(), kept.dropped()), (0, 2));
 }
 
+/// The sessions of the keyed cases: the numbers two keys make.
+const KEY: Session = Session::from_raw(7);
+const OTHER: Session = Session::from_raw(8);
+
+/// `record` as a lease of `session`.
+fn of_session(mut record: LeaseRecord, session: Session) -> LeaseRecord {
+    record.lease.session = session;
+    record
+}
+
+/// Every door of the leases steps the count of a lease's session on its
+/// worker's count where it steps the lease's own: a filing, a dispatch
+/// that names another target, a completion, a pair's two sides, a
+/// release, the dispatch deadline, a new leader's restore and a gone
+/// gateway. A lease with no session steps no session's count.
+#[test]
+fn every_door_of_the_leases_steps_a_sessions_count_with_its_lease() {
+    let store = MemoryStore::new();
+    let workers = ["http://a:1", "http://b:1", "http://c:1"].map(|key| ready(&store, key));
+    let counts = workers.map(|id| handed(&store, id));
+    let [a, b, c] = workers;
+    let keyed = || counts.each_ref().map(|kept| kept.of(KEY));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+
+    // A single's lease, sent to its pick's second target, then ended. A
+    // lease with no session stands beside it on its first worker.
+    let mut targets = Targets::new();
+    for id in [a, b] {
+        targets.push(Target {
+            id,
+            ..Target::default()
+        });
+    }
+    let mut single = of_session(booking(gateway, 1, a, now), KEY);
+    single.picked = PickRecord::of(&targets);
+    assert_eq!(leases.issue(single), Ok(()));
+    assert_eq!(keyed(), [1, 0, 0], "a filing");
+    assert_eq!(leases.issue(booking(gateway, 9, a, now)), Ok(()));
+    assert_eq!((keyed(), counts[0].held()), ([1, 0, 0], 2), "no session");
+    assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Single, 1), now));
+    assert_eq!(keyed(), [0, 1, 0], "a dispatch on another target");
+    assert!(leases.completed(gateway, LeaseId(1), &done(Side::Single)));
+    assert!(leases.completed(gateway, LeaseId(9), &done(Side::Single)));
+    assert_eq!(keyed(), [0, 0, 0], "a completion");
+
+    // A pair: each side on its own worker, the decode sent to an alternate.
+    let (record, mut decode) = pair(2, a, &[b, c], now);
+    decode.session = KEY;
+    issue_pair(leases, (of_session(record, KEY), decode)).expect("the key is free");
+    assert_eq!(keyed(), [1, 1, 0], "a pair's filing");
+    assert!(leases.dispatched(gateway, LeaseId(2), on(Side::Decode, 1), now));
+    assert_eq!(keyed(), [1, 0, 1], "a decode's dispatch on an alternate");
+    let gone = ReleaseReason::ClientGone;
+    assert!(leases.released(gateway, LeaseId(2), None, gone));
+    assert_eq!(keyed(), [0, 0, 0], "a release of every side");
+
+    // A lease no dispatch names by its deadline.
+    let third = of_session(booking(gateway, 3, c, now), KEY);
+    assert_eq!(leases.issue(third), Ok(()));
+    assert_eq!(keyed(), [0, 0, 1], "a second filing");
+    assert_eq!(leases.expire(now + Duration::from_secs(9)).len(), 1);
+    assert_eq!(keyed(), [0, 0, 0], "the dispatch deadline");
+
+    // A new leader's file: what a gateway's pages list, then the gateway gone.
+    let pages = [4, 5].map(|id| of_session(booking(gateway, id, b, now), KEY));
+    assert_eq!(leases.restore(gateway, &pages), 2);
+    assert_eq!(keyed(), [0, 2, 0], "a restore");
+    assert_eq!(leases.drop_gateways(&[gateway]), [2]);
+    assert_eq!(keyed(), [0, 0, 0], "a gone gateway");
+    assert!(counts.iter().all(|kept| kept.held() == 0));
+}
+
+/// The sessions of the leases filed ahead of a worker's count are on the
+/// first count handed, each as many times as its leases stand, and their
+/// ends are that count's.
+#[test]
+fn a_session_filed_ahead_of_its_workers_count_is_on_the_first_count_handed() {
+    let store = MemoryStore::new();
+    let worker = ready(&store, "http://a:1");
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    for (id, session) in [(1, KEY), (2, KEY), (3, KEY), (4, OTHER)] {
+        let lease = of_session(booking(gateway, id, worker, now), session);
+        assert_eq!(leases.issue(lease), Ok(()));
+    }
+    assert!(leases.completed(gateway, LeaseId(1), &done(Side::Single)));
+
+    let kept = handed(&store, worker);
+    let read = || (kept.of(KEY), kept.of(OTHER), kept.held());
+    assert_eq!(read(), (2, 1, 3), "the leases that stand, by their session");
+    assert!(leases.completed(gateway, LeaseId(2), &done(Side::Single)));
+    assert!(leases.completed(gateway, LeaseId(4), &done(Side::Single)));
+    assert_eq!(read(), (1, 0, 1));
+    assert!(leases.completed(gateway, LeaseId(3), &done(Side::Single)));
+    assert_eq!(read(), (0, 0, 0));
+}
+
+/// A count of a number of its own, handed in another's place, takes the
+/// sessions of the leases that stand, and the count before it gives them
+/// up.
+#[test]
+fn a_count_of_its_own_number_takes_the_sessions_of_the_one_before_it() {
+    let store = MemoryStore::new();
+    let worker = ready(&store, "http://a:1");
+    let first = handed(&store, worker);
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    for (id, session) in [(1, KEY), (2, KEY), (3, OTHER)] {
+        let lease = of_session(booking(gateway, id, worker, now), session);
+        assert_eq!(leases.issue(lease), Ok(()));
+    }
+    assert_eq!((first.of(KEY), first.of(OTHER)), (2, 1));
+
+    let second = handed(&store, worker);
+    assert_eq!((first.of(KEY), first.of(OTHER)), (0, 0), "given up");
+    assert_eq!((second.of(KEY), second.of(OTHER)), (2, 1), "taken");
+    assert!(leases.completed(gateway, LeaseId(1), &done(Side::Single)));
+    assert_eq!((first.of(KEY), second.of(KEY)), (0, 1));
+}
+
+/// A row that leaves takes the sessions of the leases that book it off
+/// its count: their ends step no host's count.
+#[test]
+fn a_row_that_leaves_takes_its_sessions_off_its_count() {
+    let store = MemoryStore::new();
+    let worker = ready(&store, "http://a:1");
+    let kept = handed(&store, worker);
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    for id in 1..=2 {
+        let lease = of_session(booking(gateway, id, worker, now), KEY);
+        assert_eq!(leases.issue(lease), Ok(()));
+    }
+    assert_eq!(kept.of(KEY), 2);
+
+    remove(&store, worker);
+    assert_eq!((kept.of(KEY), kept.held()), (0, 0), "given up");
+    for id in 1..=2 {
+        assert!(leases.completed(gateway, LeaseId(id), &done(Side::Single)));
+    }
+    assert_eq!(kept.of(KEY), 0, "an end behind the row steps nothing");
+}
+
+/// A lease counts for its session on its worker's count by its issue. One
+/// whose decision read no count books its worker alone, whatever session
+/// it carries, and its end takes nothing of the session's. One whose
+/// decision read the count books its session too, until it leaves the
+/// file. A lease with no session books none under either issue.
+#[test]
+fn a_lease_steps_its_sessions_count_by_its_issue() {
+    let store = MemoryStore::new();
+    let worker = ready(&store, "http://a:1");
+    let kept = handed(&store, worker);
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let slot = store.snapshot().booked_of(worker);
+    let decided = |session| of_session(booking(gateway, 0, worker, now), session);
+    let minted = "minted under the store's term";
+    let unread = store.issue_decided(decided(KEY), slot, |_| ());
+    let unread = unread.expect(minted).id;
+    assert_eq!((kept.of(KEY), kept.held()), (0, 1), "its worker alone");
+    let read = store.issue_keyed(decided(KEY), slot, |_| ());
+    let read = read.expect(minted).id;
+    let keyless = store.issue_keyed(decided(Session::NONE), slot, |_| ());
+    keyless.expect(minted);
+    assert_eq!((kept.of(KEY), kept.held()), (1, 3));
+    let gone = ReleaseReason::ClientGone;
+    assert!(leases.released(gateway, unread, None, gone));
+    assert_eq!((kept.of(KEY), kept.held()), (1, 2), "nothing of the key's");
+    assert!(leases.released(gateway, read, None, gone));
+    assert_eq!((kept.of(KEY), kept.held()), (0, 1));
+}
+
 /// The gateways that file at once in a case, and the leases each files.
 const WRITERS: u32 = 4;
 const LEASES: u64 = 2_000;
+
+/// The session a writer's leases carry: one a writer.
+fn session_of(writer: u32) -> Session {
+    Session::from_raw(u64::from(writer) + 1)
+}
 
 /// Says a writer ended, however it ended.
 struct Ended<'a>(&'a AtomicU32);
@@ -353,8 +559,9 @@ impl Drop for Ended<'_> {
 }
 
 /// Four gateways file leases on `worker` and end every second one, each
-/// on a thread of its own. `among` runs once leases stand, or once every
-/// writer ended: the hand-over or the leaving a case sets among them.
+/// on a thread of its own and under a session of its own. `among` runs
+/// once leases stand, or once every writer ended: the hand-over or the
+/// leaving a case sets among them.
 fn among_filings(store: &MemoryStore, worker: WorkerId, among: impl FnOnce()) {
     let now = Instant::now();
     let (filed, ended) = (AtomicU32::new(0), AtomicU32::new(0));
@@ -365,7 +572,8 @@ fn among_filings(store: &MemoryStore, worker: WorkerId, among: impl FnOnce()) {
                 let _ended = Ended(ended);
                 let gateway = GatewayId(u64::from(writer) + 1);
                 for id in 1..=LEASES {
-                    let lease = store.issue(booking(gateway, id, worker, now));
+                    let lease = booking(gateway, id, worker, now);
+                    let lease = store.issue(of_session(lease, session_of(writer)));
                     assert_eq!(lease, Ok(()));
                     // Every second lease ends, and the others stand.
                     if id % 2 == 0 {
@@ -383,7 +591,8 @@ fn among_filings(store: &MemoryStore, worker: WorkerId, among: impl FnOnce()) {
 }
 
 /// Leases filed and ended on several threads while the worker's first
-/// count is handed: no step is lost and none is taken twice.
+/// count is handed: no step is lost and none is taken twice, of a lease
+/// and of its session.
 #[test]
 fn a_count_handed_among_filings_holds_the_leases_that_stand() {
     for _ in 0..8 {
@@ -394,6 +603,14 @@ fn a_count_handed_among_filings_holds_the_leases_that_stand() {
         among_filings(&store, worker, || hand(&store, worker, &kept));
         let stand = u32::try_from(u64::from(WRITERS) * LEASES / 2).expect("a small count");
         assert_eq!(kept.held(), i64::from(stand), "the leases that stand");
+        let each = i64::try_from(LEASES / 2).expect("a small count");
+        for writer in 0..WRITERS {
+            assert_eq!(
+                kept.of(session_of(writer)),
+                each,
+                "writer {writer}'s session"
+            );
+        }
     }
 }
 
@@ -410,5 +627,8 @@ fn a_count_that_leaves_among_filings_holds_no_lease() {
         among_filings(&store, worker, || remove(&store, worker));
         assert_eq!(kept.held(), 0, "every lease it took is given up");
         assert_eq!(kept.dropped(), 1);
+        for writer in 0..WRITERS {
+            assert_eq!(kept.of(session_of(writer)), 0, "writer {writer}'s session");
+        }
     }
 }
