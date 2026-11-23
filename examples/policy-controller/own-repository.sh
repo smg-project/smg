@@ -111,7 +111,8 @@ mock-worker = { git = "${url}" }
 serde_yaml = "${serde_yaml}"
 smg-grpc-client = { git = "${url}" }
 smg-policy-controller = { git = "${url}", features = ["client"] }
-tokio = { version = "${tokio}", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+smg-worker = { git = "${url}", features = ["runtime", "test-util"] }
+tokio = { version = "${tokio}", features = ["macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
 tonic = ${tonic}
 
 [profile.release]

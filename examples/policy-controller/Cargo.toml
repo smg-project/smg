@@ -27,6 +27,9 @@ tikv-jemallocator = { workspace = true }
 # requests on one through the engine's client. They register workers
 # through the generated client and ask decisions through the crate's
 # reference client, a feature the tests alone turn on.
+#
+# `own-repository.sh` writes this list into the manifest of the copy it
+# makes: a dependency added here is added there.
 [dev-dependencies]
 mock-worker = { path = "../../crates/mock_worker" }
 serde_yaml = { workspace = true }
