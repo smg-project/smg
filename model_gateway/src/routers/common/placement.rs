@@ -962,7 +962,9 @@ fn single_of_by_engine(
 /// worker is taken where the slice holds that worker object, beside the
 /// request's own rule. The engine keeps a list's turn and its records with
 /// the list, so they are the pool's. A worker that joined the pool behind
-/// the caller's read is in no slice and takes no such request.
+/// the caller's read is in no slice and takes no such request, and a
+/// slice's worker object that the pool's list does not hold, as one
+/// replaced between the two reads, takes none either.
 #[inline(never)]
 fn from_by_engine(
     engine: &'static PolicyEngine,
@@ -6839,6 +6841,23 @@ pub(crate) mod tests {
         let urls = |seen: BTreeMap<String, i32>| seen.into_keys().collect::<Vec<_>>();
         assert_eq!(urls(from_slice), ["http://s:1", "http://v:2"]);
         assert_eq!(urls(on_wire), ["http://v:1", "http://v:2"]);
+
+        // The request's own rule holds beside the part: where it refuses
+        // one of the wire's two workers, and one of the slice's two, the
+        // other takes every request.
+        let refuses_one = |worker: &dyn Worker| worker.url() != "http://v:2";
+        let ruled = PlacementInputs {
+            candidate_filter: Some(&refuses_one),
+            ..Default::default()
+        };
+        for _ in 0..8 {
+            let placed = select_single(&registry, &policies, MODEL, pool, Some(pinned), ruled);
+            let placed = placed.expect("the wire's other worker");
+            assert_eq!(placed.url(), "http://v:1");
+            let placed = select_from(&registry, &policies, MODEL, pool, &two, ruled);
+            let placed = placed.expect("the slice's other worker");
+            assert_eq!(placed.url(), "http://s:1");
+        }
 
         let whole: Vec<Arc<dyn Worker>> = registry.get_routing_pool(MODEL, pool).to_vec();
         let mut turns = BTreeMap::new();
