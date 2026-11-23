@@ -67,8 +67,9 @@ pub enum Values {
     /// carrying no type and the text between them the value's characters as they are, no escape
     /// among them, so the next `"` ends the value whatever stands before it (a value that ends
     /// in a backslash closes at its quote), save that a `"` right after a backslash is the model's
-    /// own escaped quote (`5\" screen`, which the family's own readers decode) unless the value's
-    /// end follows it. A value between double quotes reads as written, by
+    /// own escaped quote unless the value's end follows it, and reads as the quote alone where
+    /// the value reads as its text (`5\" screen` is `5" screen`, as the family's own readers
+    /// decode it). A value between double quotes otherwise reads as written, by
     /// the kind the request's tool declares for its parameter, by its text where none is
     /// declared; a value the model writes bare, a single-quoted string included and the strings
     /// inside a bare list or object, reads as Python's, escapes and all.
@@ -195,6 +196,9 @@ struct Extent {
     /// if `,` or `)` follows it, whitespace aside, and the model's own escaped quote otherwise,
     /// after which the string goes on.
     tentative: bool,
+    /// A quote in doubt was the model's own: its backslash is the model's escape and none of the
+    /// value's characters ([`without_the_models_escapes`]).
+    own_quote: bool,
 }
 
 impl Extent {
@@ -207,6 +211,7 @@ impl Extent {
             verbatim: values == Values::Quoted,
             escapes: true,
             tentative: false,
+            own_quote: false,
         }
     }
 
@@ -223,6 +228,7 @@ impl Extent {
                     return true;
                 }
                 // The quote was the model's own escaped one: the string goes on, and `c` is its.
+                self.own_quote = true;
                 self.escaped = c == '\\';
                 if c == quote {
                     self.quote = None;
@@ -693,8 +699,8 @@ impl Assembler {
                 kind,
             } => {
                 if scan.ends_at(c) {
-                    let (key, start, kind) = (key.clone(), *start, *kind);
-                    self.write_value(&key, start, kind, out);
+                    let (key, start, scan, kind) = (key.clone(), *start, *scan, *kind);
+                    self.write_value(&key, start, scan, kind, out);
                     if c == ')' {
                         self.end_call(Text::uncounted(String::new()), out);
                         self.stage = Stage::Between;
@@ -767,13 +773,20 @@ impl Assembler {
     /// bytes are reported whole under `KeyWithoutAValue` and nothing is written for it, so the
     /// object closes whole without it and no empty string is made up for a value the model did
     /// not write.
-    fn write_value(&mut self, key: &str, start: usize, kind: Option<Kind>, out: &mut Events) {
+    fn write_value(
+        &mut self,
+        key: &str,
+        start: usize,
+        scan: Extent,
+        kind: Option<Kind>,
+        out: &mut Events,
+    ) {
         let text = self.carried[start..].trim().to_string();
         if text.is_empty() {
             return self.skip_member_without_a_value(out);
         }
         let value = match self.values {
-            Values::Quoted => quoted_value(&text, kind),
+            Values::Quoted => quoted_value(&text, kind, scan.own_quote),
             Values::Python | Values::Json => python_literal(&text)
                 .filter(|json| reads_back_as_an_argument(json))
                 .unwrap_or_else(|| json(&text, None)),
@@ -819,12 +832,19 @@ impl Assembler {
         let raw = self.carried[start..].trim_start();
         let value = match scan.quote {
             _ if raw.is_empty() => String::new(),
+            // A model's escaped quote under a kind that is no string: the value may still read
+            // as a list, an object or its decoded text, so nothing of it is written yet.
+            Some(_)
+                if scan.own_quote && !matches!(kind, Some(Kind::String | Kind::NullableString)) =>
+            {
+                String::new()
+            }
             Some(quote) if scan.depth == 0 && raw.starts_with(quote) => {
-                open_string(&raw[quote.len_utf8()..], quote, self.values)
+                open_string(&raw[quote.len_utf8()..], quote, scan, self.values)
             }
             None if scan.depth == 0 => {
                 let text = raw.trim_end();
-                self.whole_value(text, kind)
+                self.whole_value(text, kind, scan.own_quote)
                     .unwrap_or_else(|| cut_word(text))
             }
             // A list or a dict still open: as written where its spelling is JSON's so far, else
@@ -838,10 +858,10 @@ impl Assembler {
     /// reads whole: the text between a quoted value's quotes typed by `kind` under
     /// [`Values::Quoted`], a Python or JSON literal that reads back under every dialect; nothing
     /// for text that is no whole value yet.
-    fn whole_value(&self, text: &str, kind: Option<Kind>) -> Option<String> {
+    fn whole_value(&self, text: &str, kind: Option<Kind>, own_quote: bool) -> Option<String> {
         if self.values == Values::Quoted {
             if let Some(inner) = between_double_quotes(text) {
-                return Some(json(inner, kind));
+                return Some(typed(inner, kind, own_quote));
             }
         }
         python_literal(text).filter(|json| reads_back_as_an_argument(json))
@@ -932,17 +952,68 @@ impl Assembler {
 /// A value under [`Values::Quoted`]: between double quotes, the text inside them as it stands,
 /// since the template writes the string's characters as they are and decodes no escape (a
 /// backslash and an `r` in a value are those two characters, not a carriage return, and a
-/// backslash at the value's end is the value's last character, before the quote that ends it), typed by
+/// backslash at the value's end is the value's last character, before the quote that ends it),
+/// save the model's own escaped quotes ([`typed`]), typed by
 /// `kind`, the one the request's tool declares for the parameter, or by its text where none is
 /// declared; a value the model wrote bare, a single-quoted Python string included, reads as a
 /// Python literal, and any other text as the tagged tables read theirs.
-fn quoted_value(text: &str, kind: Option<Kind>) -> String {
+fn quoted_value(text: &str, kind: Option<Kind>, own_quote: bool) -> String {
     if let Some(inner) = between_double_quotes(text) {
-        return json(inner, kind);
+        return typed(inner, kind, own_quote);
     }
     python_literal(text)
         .filter(|json| reads_back_as_an_argument(json))
         .unwrap_or_else(|| json(text, kind))
+}
+
+/// The JSON of `inner`, the text between a quoted value's double quotes, typed by `kind`. Where
+/// the extent took a quote for the model's own (`own_quote`), a list or an object the literal
+/// reader takes as written keeps its text, since that reader decodes the escapes of its strings
+/// itself; any other value, a declared string or text that read as nothing but itself, is typed
+/// from its text without the model's escapes (`{\"k\":1}` under a declared object is the object).
+fn typed(inner: &str, kind: Option<Kind>, own_quote: bool) -> String {
+    if own_quote && matches!(kind, Some(Kind::String | Kind::NullableString)) {
+        return json(&without_the_models_escapes(inner, true), kind);
+    }
+    let read = json(inner, kind);
+    if own_quote && read == json(inner, Some(Kind::String)) {
+        let plain = without_the_models_escapes(inner, true);
+        let decoded = json(&plain, kind);
+        // The decoded text is the value's characters: a list, an object or a number it spells
+        // reads as such, but a string it spells keeps the quotes the model escaped.
+        return if decoded.starts_with('"') {
+            json(&plain, Some(Kind::String))
+        } else {
+            decoded
+        };
+    }
+    read
+}
+
+/// `inner`, the text after a quoted value's opening `"`, without the backslash of each quote
+/// its extent took for the model's own escaped one: the extent's walk again, so that no other
+/// backslash goes, not the one before the quote that ends the value, nor one that stands
+/// outside a string the value closed. `closed` when the value's closing `"` follows `inner`:
+/// it is read too, since it can be the character that decides the quote before it.
+fn without_the_models_escapes(inner: &str, closed: bool) -> String {
+    let mut scan = Extent::new(Values::Quoted);
+    scan.ends_at('"');
+    let mut plain = String::with_capacity(inner.len());
+    let mut escape = 0;
+    for c in inner.chars().chain(closed.then_some('"')) {
+        let in_doubt = scan.tentative;
+        scan.ends_at(c);
+        if in_doubt && !scan.tentative {
+            plain.remove(escape);
+        } else if scan.tentative && !in_doubt {
+            escape = plain.len() - 1;
+        }
+        plain.push(c);
+    }
+    if closed {
+        plain.pop();
+    }
+    plain
 }
 
 /// The text between the double quotes of `text`, when it begins and ends with one.
@@ -967,13 +1038,16 @@ fn cut_word(text: &str) -> String {
 /// A string the end of the stream cut open, as the open JSON string the dialect would have
 /// written for its text so far: `inner`, the bytes after the opening `quote`, decoded as the
 /// dialect reads them and escaped as JSON requires, after the opening `"` and with no closing
-/// one. Under [`Values::Quoted`] nothing is decoded, so the text stands as written; under the
+/// one. Under [`Values::Quoted`] nothing is decoded but the model's own escaped quotes in a
+/// double-quoted value ([`without_the_models_escapes`]), a backslash the cut left in doubt held
+/// back with the quote and the whitespace after it, since the next character decides whether it
+/// is the model's escape or the value's last character; under the
 /// other dialects the string is closed as the model would have closed it and read whole, the
 /// closing quote then taken off again, and when the cut left an escape unfinished (`\u00`) the
 /// text from the last backslash that begins an escape is left out, since what it would have
 /// stood for is not known, the escapes before it decoded as before; text the literal reader
 /// cannot read even so stands as written.
-fn open_string(inner: &str, quote: char, values: Values) -> String {
+fn open_string(inner: &str, quote: char, scan: Extent, values: Values) -> String {
     if values != Values::Quoted {
         let decoded = [Some(inner.len()), last_escape_start(inner)]
             .into_iter()
@@ -986,7 +1060,22 @@ fn open_string(inner: &str, quote: char, values: Values) -> String {
     }
     let mut json = String::with_capacity(inner.len() + 1);
     json.push('"');
-    push_escaped(&mut json, inner);
+    if scan.escapes {
+        push_escaped(&mut json, inner);
+        return json;
+    }
+    let plain;
+    let mut known = inner;
+    if scan.own_quote {
+        plain = without_the_models_escapes(inner, false);
+        known = &plain;
+    }
+    if scan.tentative {
+        known = known.rfind("\\\"").map_or(known, |at| &known[..at]);
+    } else if scan.escaped {
+        known = &known[..known.len() - 1];
+    }
+    push_escaped(&mut json, known);
     json
 }
 
@@ -1229,7 +1318,8 @@ mod tests {
     /// a backslash inside it is one of the value's characters, however many stand before the
     /// closing quote and whatever follows one, and the next `"` ends the value, save that a `"`
     /// right after a backslash is the model's own escaped quote unless the value's end follows
-    /// it. Each shape whole, at every cut, in the turn's list and in a list held after content.
+    /// it, and reads as the quote alone, that backslash its escape. Each shape whole, at every
+    /// cut, in the turn's list and in a list held after content.
     #[test]
     fn a_quoted_values_backslashes_are_its_characters_wherever_they_stand() {
         let declared = Declared::of(&[tool(
@@ -1237,6 +1327,7 @@ mod tests {
             value!({"type": "object", "properties": {
                 "command": {"type": "string"},
                 "unit": {"type": "string"},
+                "tags": {"type": "array"},
             }}),
         )]);
         let shapes: &[(&str, &str)] = &[
@@ -1279,23 +1370,49 @@ mod tests {
                 "{\"command\": \"dir C:\\\\\", \"unit\": \"N/A\"}",
             ),
             // a quote the model escaped Python's way, inside the value: the value's end does not
-            // follow it, so the string goes on and the backslash is kept, as the family's own
-            // readers keep the quote; once, twice, and right before the closing quote
+            // follow it, so the string goes on and the quote stands alone, its backslash the
+            // model's escape, as the family's own readers decode it; once, twice, and right
+            // before the closing quote
             (
                 "[cmd_controller_execute(command=\"5\\\" screen\", unit=\"N/A\")]",
-                "{\"command\": \"5\\\\\\\" screen\", \"unit\": \"N/A\"}",
+                "{\"command\": \"5\\\" screen\", \"unit\": \"N/A\"}",
             ),
             (
                 "[cmd_controller_execute(command=\"say \\\"hi\\\" now\", unit=\"N/A\")]",
-                "{\"command\": \"say \\\\\\\"hi\\\\\\\" now\", \"unit\": \"N/A\"}",
+                "{\"command\": \"say \\\"hi\\\" now\", \"unit\": \"N/A\"}",
             ),
             (
                 "[cmd_controller_execute(command=\"say \\\"hi\\\"\", unit=\"N/A\")]",
-                "{\"command\": \"say \\\\\\\"hi\\\\\\\"\", \"unit\": \"N/A\"}",
+                "{\"command\": \"say \\\"hi\\\"\", \"unit\": \"N/A\"}",
             ),
             (
                 "[cmd_controller_execute(command=\"a\\\"b\", unit=\"N/A\")]",
+                "{\"command\": \"a\\\"b\", \"unit\": \"N/A\"}",
+            ),
+            // of two backslashes before such a quote, the one next to it is the escape
+            (
+                "[cmd_controller_execute(command=\"a\\\\\"b\", unit=\"N/A\")]",
                 "{\"command\": \"a\\\\\\\"b\", \"unit\": \"N/A\"}",
+            ),
+            // after such a quote, a backslash outside the string the value closed is no escape
+            (
+                r#"[cmd_controller_execute(command="x\"y" \"z", unit="N/A")]"#,
+                r#"{"command": "x\"y\" \\\"z", "unit": "N/A"}"#,
+            ),
+            // a list keeps its text as written: the literal reader decodes its strings' escapes
+            (
+                r#"[cmd_controller_execute(tags="['a\\"b', 'c']", unit="N/A")]"#,
+                r#"{"tags": ["a\\\"b", "c"], "unit": "N/A"}"#,
+            ),
+            // a list that reads only without the model's escapes is typed from the decoded text
+            (
+                r#"[cmd_controller_execute(tags="[\"a\"]", unit="N/A")]"#,
+                r#"{"tags": ["a"], "unit": "N/A"}"#,
+            ),
+            // a string the decoded text spells keeps the quotes the model escaped
+            (
+                r#"[cmd_controller_execute(q="\"x\"", unit="N/A")]"#,
+                r#"{"q": "\"x\"", "unit": "N/A"}"#,
             ),
         ];
         for (output, arguments) in shapes {
@@ -1348,15 +1465,13 @@ mod tests {
         // A quote the model escaped right before the value's end is read as the template writes
         // it: the value ends there, with the backslash as its last character, and what follows
         // is no argument, so the turn's list ends open and says so with no arguments made up, and
-        // a list held after content is content.
+        // a list held after content is content. The quote escaped before it stands alone.
         let output = "[cmd_controller_execute(command=\"say \\\"hi\\\", ok\", unit=\"N/A\")]";
         let events = run_bare(&declared, &[output]);
         let read = calls(&events);
         assert_eq!(read.len(), 1);
         assert!(
-            read[0]
-                .2
-                .starts_with("{\"command\": \"say \\\\\\\"hi\\\\\""),
+            read[0].2.starts_with("{\"command\": \"say \\\"hi\\\\\""),
             "{}",
             read[0].2
         );
@@ -1366,6 +1481,20 @@ mod tests {
         let events = run_bare(&declared, &[&held]);
         assert_eq!(content(&events), held);
         assert!(calls(&events).is_empty());
+        // The stream's end right after a backslash, or after the quote that follows one, leaves
+        // both readings open: the fragment holds neither until a character decides. A list
+        // with a model's escape may still read as a list or as text: nothing of it is written.
+        for (cut, arguments) in [
+            (r#"command="5\"#, r#"{"command": "5"#),
+            (r#"command="5\" "#, r#"{"command": "5"#),
+            (r#"command="5\" s"#, r#"{"command": "5\" s"#),
+            (r#"command="a\"\"#, r#"{"command": "a\""#),
+            (r#"tags="['a\\"b', 'c']"#, r#"{"tags": "#),
+        ] {
+            let output = format!("[cmd_controller_execute({cut}");
+            let read = calls(&run_bare(&declared, &[&output]));
+            assert_eq!(read[0].2, arguments, "{cut}");
+        }
     }
 
     fn run_bare(declared: &Declared, pieces: &[&str]) -> Vec<Event<'static>> {
@@ -1957,7 +2086,7 @@ mod tests {
         );
         // A value the model writes bare reads as Python's, whatever the tool declares, a
         // single-quoted string with its escape; a double-quoted one is the template's, read as
-        // written, backslashes and all.
+        // written, save the quotes the model escaped itself.
         let events = run_bare(
             &tools(),
             &["[get_weather(days=3, detailed=True, city='it\\'s', zip=\"a \\\"q\\\"\")]"],
@@ -1967,8 +2096,7 @@ mod tests {
             [(
                 0,
                 "get_weather".to_string(),
-                r#"{"days": 3, "detailed": true, "city": "it's", "zip": "a \\\"q\\\""}"#
-                    .to_string()
+                r#"{"days": 3, "detailed": true, "city": "it's", "zip": "a \"q\""}"#.to_string()
             )]
         );
         // A string the template wrote as it stands, with a newline, a backslash and the two

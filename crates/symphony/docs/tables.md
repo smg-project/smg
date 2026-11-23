@@ -760,8 +760,10 @@ list and nothing after it; no thought. What the table says beyond the others:
   the recorded benchmark sets write it) closes at its quote, whole and at every cut. One
   reading is kept from the model's side: a `"` right after a backslash is the model's own
   escaped quote (`size="5\" screen"`, which the family's own readers decode) unless `,` or `)`
-  follows it, whitespace aside, so such a value reads whole with its backslash kept, and only a
-  quote the value's end follows closes it. A value the
+  follows it, whitespace aside, so such a value reads whole, the quote alone and its backslash
+  as the model's escape (`5" screen`; every other backslash stays as written; a value meant to
+  hold that backslash, the text `5\" screen` itself, cannot be told from the escape and loses
+  it), and only a quote the value's end follows closes it. A value the
   model writes bare (`days=3`, `detailed=False`, `city='Paris'`), the spelling its model card and
   the family's parsers take, reads as Python's, a single-quoted string with its escapes. The
   structural tags write Python's values, the spelling the model is told to write.
