@@ -1436,12 +1436,9 @@ impl Tree {
                 continue;
             }
 
-            // Decrement when removing tenant from node
-            let node_len = node.text.read().char_count();
+            // Remove tenant from node, and decrement by what it held there
+            let node_len = self.remove_tenant_from_node(&node, &tenant);
             self.sub_tenant_chars(&tenant, node_len);
-
-            // Remove tenant from node
-            node.tenant_last_access_time.remove(tenant.as_ref());
 
             // Get parent reference outside of the borrow scope
             // Use Weak::upgrade() to get a strong reference if the parent still exists
@@ -1546,11 +1543,11 @@ impl Tree {
     /// Inserts for the tenant may run beside the purge, so its count is
     /// debited by what each removal took out, as eviction debits, and is
     /// never dropped whole: a count dropped whole left a node attached or
-    /// split off meanwhile standing uncounted. What can still drift is a
-    /// count with no node behind it: a node attached ahead of the walk
-    /// whose insert counts behind the debit, or a split between a removal
-    /// and the read of its length. Such a count stays with the tenant's
-    /// entry.
+    /// split off meanwhile standing uncounted. A node a split makes between
+    /// the walk and its child's removal stays the tenant's, counted, until
+    /// its next purge. What can still drift is a count with no node behind
+    /// it: a node attached ahead of the walk whose insert counts behind the
+    /// debit. Such a count stays with the tenant's entry.
     pub fn remove_tenant_all(&self, tenant_id: &TenantId) {
         let expected_chars = self.tenant_char_size(tenant_id);
 
@@ -1580,9 +1577,7 @@ impl Tree {
         }
         let mut removed = 0;
         for (node, _) in &nodes {
-            if self.remove_tenant_from_node(node, tenant_id) {
-                removed += node.text.read().char_count();
-            }
+            removed += self.remove_tenant_from_node(node, tenant_id);
             self.detach_empty_ancestors(node);
         }
         self.sub_tenant_chars(tenant_id, removed);
@@ -1680,10 +1675,7 @@ impl Tree {
                 break;
             }
 
-            let node_chars = node.text.read().char_count();
-            if self.remove_tenant_from_node(&node, tenant_id) {
-                evicted += node_chars;
-            }
+            evicted += self.remove_tenant_from_node(&node, tenant_id);
         }
 
         // Update tenant char count and tree-wide total
@@ -1708,12 +1700,26 @@ impl Tree {
         }
     }
 
+    /// Removes a tenant's ownership of a node and returns the chars it held
+    /// there, zero where it held none.
+    ///
+    /// The ownership leaves and the length is read under one `text` read
+    /// guard, as a replay credits it: a concurrent split truncates the node
+    /// and clones its tenant map in one `text` write section, so it hands the
+    /// tenant's prefix to the new node with its count, or it runs behind both
+    /// steps. Read apart, a split between the two left the count off by the
+    /// prefix: high where the length was read behind the removal, short
+    /// where it was read ahead.
     #[expect(
         clippy::unused_self,
         reason = "method logically belongs to the tree instance; keeps API consistent with collect_tenant_nodes"
     )]
-    fn remove_tenant_from_node(&self, node: &NodeRef, tenant_id: &TenantId) -> bool {
-        node.tenant_last_access_time.remove(tenant_id).is_some()
+    fn remove_tenant_from_node(&self, node: &NodeRef, tenant_id: &TenantId) -> usize {
+        let text = node.text.read();
+        if node.tenant_last_access_time.remove(tenant_id).is_none() {
+            return 0;
+        }
+        text.char_count()
     }
 
     /// Get the char count for a specific tenant.

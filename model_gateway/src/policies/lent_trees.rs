@@ -653,7 +653,7 @@ mod tests {
     /// to its worker. Two threads write prompts by the engine's own call,
     /// four to a worker, and the trees are emptied again and again until
     /// 2,000 are written. No prompt that is left then is one its worker's
-    /// count lacks. A purge by name would leave such a prompt: it drops a
+    /// count lacks. A purge by name left such a prompt while it dropped a
     /// worker's whole count behind its walk, with a prompt written between
     /// the two.
     #[test]

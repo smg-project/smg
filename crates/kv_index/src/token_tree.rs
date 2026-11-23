@@ -1660,6 +1660,13 @@ impl TokenTree {
         node: &NodeRef,
         tenant_id: &TenantId,
     ) -> (usize, Option<(NodeRef, u64)>) {
+        // The ownership leaves and the length is read under one `tokens` read
+        // guard, as a replay credits it: a concurrent split truncates the node
+        // and clones its tenant map in one `tokens` write section, so it hands
+        // the tenant's prefix to the new node with its count, or it runs behind
+        // both steps. Read apart, a split between the two debited the truncated
+        // length alone: the prefix stayed counted with no node behind it.
+        let tokens = node.tokens.read();
         if node
             .tenant_last_access_time
             .remove(tenant_id.as_ref())
@@ -1668,7 +1675,11 @@ impl TokenTree {
             return (0, None);
         }
 
-        let node_tokens = node.tokens.read().len();
+        let node_tokens = tokens.len();
+        // The guard ends ahead of the clean-up, which takes the parent's
+        // entry: a splitting insert holds that entry while it waits to write
+        // these tokens.
+        drop(tokens);
         let parent_leaf_info = self.cleanup_empty_ancestors_with_parent(node, tenant_id);
 
         (node_tokens, parent_leaf_info)
@@ -1799,11 +1810,12 @@ impl TokenTree {
     /// never dropped whole. An insert counts behind the nodes it attached,
     /// and a split hands the tenant's prefix to a new node: a count dropped
     /// whole left such a node standing uncounted, so the total read short
-    /// by it and the tenant's next purge returned at a count of zero. What
-    /// can still drift is a count with no node behind it: a node attached
-    /// ahead of the walk whose insert counts behind the debit, or a split
-    /// between a removal and the read of its length. Such a count stays
-    /// with the tenant's entry.
+    /// by it and the tenant's next purge returned at a count of zero. A
+    /// node a split makes between the walk and its child's removal stays
+    /// the tenant's, counted, until its next purge. What can still drift is
+    /// a count with no node behind it: a node attached ahead of the walk
+    /// whose insert counts behind the debit. Such a count stays with the
+    /// tenant's entry.
     pub fn remove_tenant_all(&self, tenant_id: &TenantId) {
         let expected_tokens = self.tenant_token_size(tenant_id);
         self.root.tenant_last_access_time.remove(tenant_id.as_ref());

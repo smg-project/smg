@@ -2707,7 +2707,12 @@ fn test_remove_tenant_all_beside_inserts_keeps_texts_counted() {
         });
         let until = Instant::now() + Duration::from_secs(60);
         loop {
-            assert!(Instant::now() < until, "no purge ran beside 50 inserts");
+            if Instant::now() >= until {
+                // The writer stops too: `thread::scope` joins it ahead of
+                // the panic, and it would write on with no purge.
+                done.store(true, Ordering::Relaxed);
+                panic!("no purge ran beside 50 inserts");
+            }
             if tree.tenant_char_size(&purged) < 500 * 64 {
                 thread::yield_now();
                 continue;
@@ -2730,5 +2735,59 @@ fn test_remove_tenant_all_beside_inserts_keeps_texts_counted() {
     assert!(
         counted >= standing,
         "{standing} chars stand in the tree, {counted} are counted"
+    );
+}
+
+/// A removal beside a split debits what the tenant held on the node when
+/// its ownership left. The purge's step for one node runs here by hand: its
+/// helper, then the debit. A second tenant's insert splits the node, and a
+/// read guard of the test's parks that split ahead of its `text` write
+/// section. A waiting writer holds every later reader off, so the helper's
+/// read of the length runs behind the split. A helper that took the
+/// ownership ahead of the guard debited the suffix alone: the split's clone
+/// no longer named the tenant, and its prefix stayed counted with no node
+/// behind it, past every later purge. Under one guard the helper waits, the
+/// new prefix node keeps the tenant with its count, and the tenant's next
+/// purge takes both.
+#[test]
+fn a_removal_beside_a_split_leaves_no_count_without_a_node() {
+    let tree = Tree::new();
+    let purged = tenant("tenant1");
+    tree.insert_text("aaaaaaaabbbbbbbb", "tenant1");
+    let node = Arc::clone(tree.root.children.iter().next().unwrap().value());
+    let entered = AtomicBool::new(false);
+    let until = Instant::now() + Duration::from_secs(60);
+
+    thread::scope(|scope| {
+        let held = node.text.read();
+        scope.spawn(|| tree.insert_text("aaaaaaaa", "tenant2"));
+        while node.text.try_read().is_some() {
+            assert!(Instant::now() < until, "the split never asked to write");
+            thread::yield_now();
+        }
+        scope.spawn(|| {
+            entered.store(true, Ordering::Relaxed);
+            let taken = tree.remove_tenant_from_node(&node, &purged);
+            tree.sub_tenant_chars(&purged, taken);
+        });
+        // The split is let go once the ownership left, as it does where the
+        // helper takes it ahead of the guard, or 50 ms into the helper's wait.
+        while !entered.load(Ordering::Relaxed) {
+            thread::yield_now();
+        }
+        let waited = Instant::now() + Duration::from_millis(50);
+        while node.tenant_last_access_time.contains_key("tenant1") && Instant::now() < waited {
+            thread::yield_now();
+        }
+        drop(held);
+    });
+
+    // The split ran: the node keeps its second half alone.
+    assert_eq!(node.text.read().char_count(), 8);
+    tree.remove_tenant_all(&purged);
+    assert!(
+        !tree.tenant_char_count.contains_key("tenant1"),
+        "{} chars are counted for a tenant no node names",
+        tree.tenant_char_size(&purged)
     );
 }
