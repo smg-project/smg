@@ -78,7 +78,8 @@ impl Phi3VisionProcessor {
     }
 
     /// Create a processor with custom settings.
-    pub fn with_config(num_crops: usize) -> Self {
+    #[cfg(test)]
+    fn with_config(num_crops: usize) -> Self {
         Self {
             num_crops,
             mean: CLIP_MEAN,
