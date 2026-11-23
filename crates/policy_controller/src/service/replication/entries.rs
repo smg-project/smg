@@ -154,23 +154,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         EntryReplication::NotYet(PINS),
     ),
     ("ReservationStore", "held", EntryReplication::Read),
-    ("SessionsStore", "pin", EntryReplication::NotYet(PINS)),
-    (
-        "SessionsStore",
-        "pin_no_earlier",
-        EntryReplication::NotYet(PINS),
-    ),
-    ("SessionsStore", "lookup", EntryReplication::Read),
-    ("SessionsStore", "unpin", EntryReplication::NotYet(PINS)),
-    (
-        "SessionsStore",
-        "drop_workers",
-        EntryReplication::NotYet(PINS),
-    ),
-    ("SessionsStore", "expire", EntryReplication::NotYet(PINS)),
-    ("SessionsStore", "merge", EntryReplication::Rebuilt(HELLO)),
-    ("SessionsStore", "len", EntryReplication::Read),
-    ("SessionsStore", "is_empty", EntryReplication::Read),
     ("LeasesStore", "term", EntryReplication::Read),
     // The term is told to the journal: every later position is under it.
     ("LeasesStore", "set_term", EntryReplication::Journaled),
@@ -271,7 +254,7 @@ mod tests {
     use super::*;
 
     /// The store's ingress traits, each with its file's text.
-    const TRAITS: [(&str, &str); 8] = [
+    const TRAITS: [(&str, &str); 7] = [
         ("WorkersStore", include_str!("../../store/workers.rs")),
         ("HealthSink", include_str!("../../store/health.rs")),
         ("LoadSink", include_str!("../../store/loads.rs")),
@@ -281,7 +264,6 @@ mod tests {
             "ReservationStore",
             include_str!("../../store/reservations.rs"),
         ),
-        ("SessionsStore", include_str!("../../store/sessions.rs")),
         ("LeasesStore", include_str!("../../store/leases.rs")),
     ];
 

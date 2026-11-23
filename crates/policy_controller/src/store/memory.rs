@@ -44,7 +44,7 @@ use crate::{
         loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
         membership::same_worker,
         reservations::{ReservationKind, ReservationStore},
-        sessions::{Pin, SessionTables, SessionsStore},
+        sessions::SessionTables,
         signals::{SignalSink, SignalWriteOutcome, Writes},
         snapshot::{
             left_models, micros, same_cache, same_offer, Classes, EncodePairBuffers, OnFile,
@@ -119,17 +119,11 @@ pub struct MemoryStore {
     /// tables and reads each pool's standing in them.
     kv: Arc<KvTables>,
     reservations: Mutex<Reservations>,
-    /// The pins of record and the keys' requests in flight, in the shards
-    /// of the engine's own table ([`SessionTables`]): a dispatch's write,
-    /// a lookup and a keyed decision's read hold one shard, and a sweep or
-    /// a worker's removal walks them one hold after another. The files of
-    /// leases share the tables: a lease on file books its key's count
-    /// there. A shard's lock is a leaf, taken under a file's turn or with
-    /// no lock held.
+    /// The keys' requests in flight, in the shards of the engine's own
+    /// table ([`SessionTables`]). The files of leases share the table: a
+    /// lease on file books its key's count there. A shard's lock is a
+    /// leaf, taken under a file's turn.
     sessions: Arc<SessionTables>,
-    /// When the pins were last swept and how often a pass runs
-    /// ([`Self::sweep_pins`]).
-    pins_swept: Mutex<PinsSwept>,
     /// The files of leases behind their turns, one a decider ([`turn`]).
     files: turn::Files,
     /// The blocks of the leading term's counter, each block's file and the
@@ -256,7 +250,6 @@ impl MemoryStore {
             kv,
             reservations: Mutex::default(),
             sessions,
-            pins_swept: Mutex::default(),
             files: turn::Files::one(leases),
             blocks: Blocks::default(),
             world,
@@ -646,8 +639,8 @@ impl MemoryStore {
     /// A decided membership change, written under the write's hold of the
     /// membership lock: the tables, the epoch, the change log and the
     /// journal's telling, the member's count slot and load entry, the build
-    /// the write owes or pays, the word to the stages and the session pins
-    /// of record. One body for every writer that hands a change with the
+    /// the write owes or pays, the word to the stages and the session
+    /// pins. One body for every writer that hands a change with the
     /// row it leaves: [`Self::follow`] hands a leader's, and the store's
     /// own registration decides its own over the table's row
     /// ([`WorkersStore::upsert_by`]). `now` is the write's one read of the
@@ -999,14 +992,6 @@ impl MemoryStore {
                 self.listed();
             }
             drop(loads);
-            // The pins' sweep learns a generation's interval here, not at
-            // its first pass: a generation replaced between two ticks of
-            // the sweep still leaves its interval for the pins it ended.
-            // It is saved under the workers lock, so two applies save
-            // theirs in the order of their publications.
-            if let Some(every) = spec.engine().pins_shortest_sweep() {
-                self.pins_swept.lock().every = Some(every);
-            }
             self.tell_members(&workers);
             if let Some(journal) = &self.journal {
                 journal.generation(at, generation);
@@ -1481,7 +1466,7 @@ impl MemoryStore {
     /// are swept at later issues. The vetoes a world
     /// carries are not among them: they leave with the row in the
     /// publication of the membership write that calls this. Nor are the
-    /// sessions' pins of record that name the worker: they stand through
+    /// engine's session pins that name the worker: they stand through
     /// the key's absence ([`Workers::gone`]) and leave where the key does
     /// not return as the worker it was ([`Self::forget_gone`]), at the
     /// store's own write and at a followed one. A row a snapshot drops
@@ -1502,28 +1487,14 @@ impl MemoryStore {
         loads.ranks.remove(&id);
     }
 
-    /// The sessions' pins of record that name a worker whose row is gone
-    /// leave here, once the membership write let the workers lock go: the
-    /// walk is as long as the pins of record, and no writer of the
-    /// membership or of a worker's health waits on it. A pin a dispatch
-    /// writes past the walk names a row that is gone and is taken by no
-    /// decision; where its rule has a TTL, the pins' sweep ends it. A
-    /// worker's id is its key and incarnation: where the same incarnation
-    /// registers again before the walk ends, a pin a dispatch writes for
-    /// it in a shard the walk has not reached leaves though its row
-    /// stands, until the key's next dispatch writes it again. One walk for
-    /// every id of `ids`. The rename of a key registered again is the
-    /// exception to the lock's rule ([`Self::follow_pins`]): it runs under
-    /// the workers lock, since renames must run in the registrations'
-    /// order.
-    fn forget_pins(&self, ids: &[WorkerId]) {
-        SessionsStore::drop_workers(self, ids);
-    }
-
     /// The keys that stayed away past the absence's time leave the list
-    /// at the store's tick ([`Self::sweep_pins`]), with their pins: a
-    /// membership that stands still ends them too, under any rules.
-    fn end_gone(&self, now: Instant) {
+    /// at the store's tick, with their pins: a membership that stands
+    /// still ends them too, under any rules.
+    #[cfg_attr(
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "called by the served controller alone")
+    )]
+    pub(crate) fn end_gone(&self, now: Instant) {
         let ended = {
             let mut workers = self.workers.lock();
             if workers.gone.is_empty() {
@@ -1536,19 +1507,19 @@ impl MemoryStore {
 
     /// Keys that left do not return as the workers they were, or stayed
     /// away past the absence's time: their session pins leave the standing
-    /// engine's table and the pins of record, in one walk of each for them
-    /// all. With the workers lock let go, as [`Self::forget_pins`].
+    /// engine's table, in one walk for them all. With the workers lock let
+    /// go: the walk is as long as the table, and no writer of the
+    /// membership or of a worker's health waits on it.
     fn forget_gone(&self, ids: &[WorkerId]) {
         if ids.is_empty() {
             return;
         }
         self.world.load().spec().engine().pins_forget(ids);
-        self.forget_pins(ids);
     }
 
     /// A key is registered again as the worker it was: its session pins
-    /// name `new` where they named `old`, in the standing engine's table
-    /// and of record. Under the workers lock and behind the
+    /// name `new` where they named `old`, in the standing engine's
+    /// table. Under the workers lock and behind the
     /// registration's own word, at the store's own write and at a
     /// followed one. A registration leaves its build owed: no decision
     /// reads the new row before its pins stand under its id. A
@@ -1559,25 +1530,6 @@ impl MemoryStore {
     /// whole time.
     fn pins_follow(&self, old: WorkerId, new: WorkerId) {
         self.world.load().spec().engine().pins_follow(old, new);
-        self.follow_pins(old, new);
-    }
-
-    /// The sessions' pins of record that name `old` name `new`: the key
-    /// was registered again as the worker it was. One walk of the pins of
-    /// record on a rare event, under the workers lock: a registration of
-    /// the key behind this one renames what this one left, and no walk
-    /// overtakes an earlier one.
-    fn follow_pins(&self, old: WorkerId, new: WorkerId) {
-        if old == new {
-            return;
-        }
-        for shard in self.sessions.shards() {
-            for pin in shard.lock().pins.values_mut() {
-                if pin.worker == old {
-                    pin.worker = new;
-                }
-            }
-        }
     }
 
     /// How long a key that left keeps its session pins: the standing
@@ -2082,8 +2034,8 @@ impl WorkersStore for MemoryStore {
         let now = Instant::now();
         self.pay_leave(&workers, classes, now);
         self.tell_membership(change);
-        // The key's session pins stand through its absence, in the
-        // engine's table and of record: the key is filed as gone, and the
+        // The key's session pins stand through its absence in the
+        // engine's table: the key is filed as gone, and the
         // worker it was takes them back where it is registered again in
         // time.
         let ended = workers.file_gone(row.row.facts, id, now, self.pins_absence());
@@ -3217,141 +3169,6 @@ impl ReservationStore for MemoryStore {
     }
 }
 
-// --------------------------------------------------------------- sessions
-
-impl SessionsStore for MemoryStore {
-    fn pin(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<u64>) {
-        if key == 0 {
-            return;
-        }
-        self.sessions.shard(key).lock().pins.insert(
-            key,
-            Pin {
-                worker,
-                last_used: at,
-                ends,
-            },
-        );
-    }
-
-    // The one product caller is the pin's writer for a lease whose own
-    // rule ends its pin, an arm that stands out of line: the door is
-    // part of that arm, so the arm is one call.
-    #[inline(always)]
-    fn pin_no_earlier(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<u64>) {
-        if key == 0 {
-            return;
-        }
-        let pin = Pin {
-            worker,
-            last_used: at,
-            ends,
-        };
-        let mut shard = self.sessions.shard(key).lock();
-        let stood = shard.pins.entry(key).or_insert(pin);
-        // The later end stays, and no end is later than any instant.
-        let later = stood.ends.zip(ends).map(|(stood, asked)| stood.max(asked));
-        *stood = Pin { ends: later, ..pin };
-    }
-
-    fn lookup(&self, key: u64) -> Option<Pin> {
-        self.sessions.shard(key).lock().pins.get(&key).copied()
-    }
-
-    fn unpin(&self, key: u64) {
-        self.sessions.shard(key).lock().pins.remove(&key);
-    }
-
-    fn drop_workers(&self, workers: &[WorkerId]) -> usize {
-        let shards = self.sessions.shards().iter();
-        shards
-            .map(|shard| {
-                let mut shard = shard.lock();
-                let pins = &mut shard.pins;
-                let before = pins.len();
-                pins.retain(|_, pin| !workers.contains(&pin.worker));
-                before - pins.len()
-            })
-            .sum()
-    }
-
-    fn expire(&self, now: u64) -> usize {
-        let shards = self.sessions.shards().iter();
-        shards
-            .map(|shard| {
-                let mut shard = shard.lock();
-                let pins = &mut shard.pins;
-                let count = pins.len();
-                pins.retain(|_, pin| pin.ends.is_none_or(|ends| ends > now));
-                count - pins.len()
-            })
-            .sum()
-    }
-
-    fn merge(&self, key: u64, pin: Pin) {
-        if key == 0 {
-            return;
-        }
-        let mut shard = self.sessions.shard(key).lock();
-        let entry = shard.pins.entry(key).or_insert(pin);
-        if pin.last_used > entry.last_used {
-            *entry = pin;
-        }
-    }
-
-    fn len(&self) -> usize {
-        let shards = self.sessions.shards().iter();
-        shards.map(|shard| shard.lock().pins.len()).sum()
-    }
-}
-
-/// When the pins were last swept, and at what interval.
-#[derive(Default)]
-struct PinsSwept {
-    /// The instant of the last pass; `None` before the first.
-    last: Option<Instant>,
-    /// The interval of the last generation one of whose rules swept, in
-    /// microseconds, learned at its apply; `None` before one was applied.
-    every: Option<u64>,
-}
-
-impl MemoryStore {
-    /// One pass of the pins' sweep at `now`, where one is due: each pin of
-    /// record past its own end leaves the table, whatever the other rules
-    /// keep. A pass is due once the interval of the standing rule that
-    /// sweeps most often has passed since the last one, so a clock that
-    /// ticks faster walks nothing between two passes. The interval is the
-    /// standing generation's at each tick: the pins outlive generations,
-    /// and an apply that shortens it waits out no earlier one. Where no
-    /// standing rule sweeps, the interval of the last generation one of
-    /// whose rules swept stands, as its apply left it, so the pins it
-    /// ended still leave; before any such generation no pass runs. Returns
-    /// how many pins left by their own end. At every call, under any
-    /// rules, the keys that stayed away past the absence's time are
-    /// forgotten first ([`Self::end_gone`]).
-    pub(crate) fn sweep_pins(&self, now: Instant) -> usize {
-        self.end_gone(now);
-        let standing = self.with_snapshot(|world| world.spec().engine().pins_shortest_sweep());
-        {
-            let mut swept = self.pins_swept.lock();
-            let Some(every) = standing.or(swept.every) else {
-                return 0;
-            };
-            let interval = Duration::from_micros(every);
-            if swept
-                .last
-                .is_some_and(|last| now.saturating_duration_since(last) < interval)
-            {
-                return 0;
-            }
-            swept.last = Some(now);
-        }
-        // The pins' ends stand on the decision clock: the pass's instant
-        // is turned into it once.
-        SessionsStore::expire(self, self.micros(now))
-    }
-}
-
 // ----------------------------------------------------------------- leases
 
 /// The leases on file, the ids the store mints for a decision's, and the
@@ -3864,7 +3681,7 @@ impl Leases {
         let kept = (held.decode, (found.side, held.record.dispatch_deadline));
         // The place's own test left room for one more: nothing wraps.
         let count = found.issues.wrapping_add(1);
-        decode.state = LeaseState::issued(decode.state.session_ttl_micros());
+        decode.state = LeaseState::ISSUED;
         decode.target_index = 0;
         let laid = FiledDecode {
             side: decode,
@@ -4372,6 +4189,10 @@ impl MemoryStore {
     /// past its deadline stands no longer than the next issues take, and no
     /// call passes over the file: an issue adds one place to the queue and
     /// steps over [`DUE_STEPS`] at most.
+    #[cfg_attr(
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "called by the served controller alone")
+    )]
     pub(crate) fn issue_decided(
         &self,
         record: LeaseRecord,

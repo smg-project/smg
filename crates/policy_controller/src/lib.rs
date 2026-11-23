@@ -177,16 +177,6 @@ pub mod plugins;
 pub mod policies;
 pub mod service;
 pub mod stages;
-// The served controller alone files a decision's lease in the store and
-// tells its stages: a build without it compiles those entries and calls
-// none of them.
-#[cfg_attr(
-    not(feature = "controller"),
-    expect(
-        dead_code,
-        reason = "the store's lease entries are called by the served controller alone"
-    )
-)]
 pub mod store;
 pub mod tracking;
 #[cfg(feature = "worker-host")]

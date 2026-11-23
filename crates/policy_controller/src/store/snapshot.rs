@@ -1222,6 +1222,10 @@ impl StoreSnapshot {
     /// report's row, which may have left or changed its rank since its
     /// decision. A member holds one rank in every pool that lists it, so
     /// the first pool found answers.
+    #[cfg_attr(
+        not(feature = "controller"),
+        expect(dead_code, reason = "called by the served controller alone")
+    )]
     pub(crate) fn lists_rank(&self, id: WorkerId, rank: u16) -> bool {
         self.pooled_row(id)
             .is_some_and(|(pool, row)| self.rows[pool][row].dp_rank == rank)

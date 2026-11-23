@@ -803,6 +803,10 @@ impl MemoryStore {
 
     /// Gives the store the controller's word to the engine: what tells it
     /// of a frame applied to a lease on file. Given once: the first stays.
+    #[cfg_attr(
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "called by the served controller alone")
+    )]
     pub(crate) fn tell_through(&self, teller: Teller) {
         self.files.teller.get_or_init(|| teller);
     }
@@ -810,6 +814,10 @@ impl MemoryStore {
     /// A lifecycle call the controller made for a lease panicked and was
     /// held: counted. `true` for the first of a streak, the one its caller
     /// writes a line for.
+    #[cfg_attr(
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "called by the served controller alone")
+    )]
     pub(crate) fn call_faulted(&self) -> bool {
         let faults = &self.files.faults;
         let first = faults.fetch_or(STREAK, Relaxed) & STREAK == 0;
@@ -820,6 +828,10 @@ impl MemoryStore {
     /// A lifecycle call the controller made for a lease returned: a
     /// streak of faults ends. One load where none stands, so a call that
     /// returns writes nothing the deciders share.
+    #[cfg_attr(
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "called by the served controller alone")
+    )]
     pub(crate) fn call_returned(&self) {
         let faults = &self.files.faults;
         if faults.load(Relaxed) & STREAK != 0 {
