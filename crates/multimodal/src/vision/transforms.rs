@@ -581,14 +581,6 @@ pub(crate) fn to_tensor_then_normalize_table(mean: &[f64; 3], std: &[f64; 3]) ->
     })
 }
 
-/// Rescale tensor by a constant factor.
-///
-/// Used when `do_rescale=True` in HuggingFace configs (typically 1/255).
-pub fn rescale(tensor: &mut Array3<f32>, factor: f64) {
-    let factor = factor as f32;
-    tensor.mapv_inplace(|v| v * factor);
-}
-
 /// Python-compatible rounding (banker's rounding / round half to even).
 /// Matches Python's `round()` where 0.5 rounds to the nearest even number
 /// (`12.5 -> 12`, `13.5 -> 14`), unlike Rust's `f64::round()` which rounds
@@ -5508,16 +5500,6 @@ mod tests {
         // (0.5 - 0.5) / 0.5 = 0.0
         for val in &tensor {
             assert!(val.abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn test_rescale() {
-        let mut tensor = Array3::<f32>::from_elem((3, 2, 2), 255.0);
-        rescale(&mut tensor, 1.0 / 255.0);
-
-        for val in &tensor {
-            assert!((val - 1.0).abs() < 1e-6);
         }
     }
 
