@@ -1103,7 +1103,7 @@ pub(crate) mod tests {
             check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
             check_one_row, check_provider, check_rank_rows, check_refresh, FindOne,
             MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Precondition,
-            Remover, RowRevision, Rows, Stated, StoreMembershipWriter,
+            Remover, RowRevision, Rows, Stated, StoreDoor,
         },
     };
 
@@ -2808,16 +2808,6 @@ pub(crate) mod tests {
             .expect("found");
         let row = store.by_key(URL).expect("the found row");
         assert_eq!(row.facts.reachable_from, one);
-
-        // A store held in process serves one gateway, and takes the row.
-        let lone = Arc::new(MemoryStore::default());
-        let wrote = StoreMembershipWriter::new(Arc::clone(&lone)).found_one(
-            &maker,
-            URL,
-            &stated(WireModes::ZMQ, Reachability::Any),
-        );
-        let row = lone.by_key(URL).expect("the row in process");
-        assert_eq!(wrote, Ok(MembershipWriteOutcome::Registered(row.id)));
     }
 
     fn standing(row: &WorkerRow) -> RowRevision {
@@ -3101,7 +3091,7 @@ pub(crate) mod tests {
         let local = Arc::new(MemoryStore::default());
         let maker = found("pods/a");
         let hosted = ReplicaMembershipWriter::new(Arc::new(door), operator(), under(TERM));
-        let lone = StoreMembershipWriter::new(Arc::clone(&local));
+        let lone = StoreDoor::new(Arc::clone(&local));
         let write = |door: &dyn Rows, store: &MemoryStore| {
             let by = Remover::Registrant(&maker);
             assert_eq!(

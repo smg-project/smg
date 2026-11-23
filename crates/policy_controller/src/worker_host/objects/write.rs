@@ -151,7 +151,7 @@ impl<G: Generation> Objects<G> {
         if !store.follow_objects(change, Some(row.clone()), seen) {
             return self.moved(store, place);
         }
-        self.put(store, row, built, false, None);
+        self.put(store, row, built);
         Some(change)
     }
 

@@ -1675,11 +1675,9 @@ vetoes, read the worker objects: a later step **[planned]**.
 
 **What stands beside an object [built].** `RowRemainder` (`worker_host/remainder.rs`) holds
 what a registration stated and the worker object does not hold as stated. The code that keeps
-the objects writes one with every object it builds or takes. `Objects::row_of` gives a worker's
-whole record back from the object and its remainder, with no read of the store's table, for an
-object built from its record or handed in with it. An object that was handed in and kept while
-its record moved states the six facts it holds whole as they were handed in, and as the
-engine's address the one it dials, where the moved record names an engine. A single request's
+the objects writes one with every object it builds. `Objects::row_of` gives a worker's
+whole record back from the object and its remainder, with no read of the store's table.
+A single request's
 decision reads four of the remainder's facts: the record's id, whether the worker takes images,
 its wire modes and from where it is reached. The controller's registration calls decide a write
 over a whole record read back (step 1 below). Of the 24 facts a registration states:
