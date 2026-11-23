@@ -204,6 +204,11 @@ pub struct LeaseRecord {
     /// one word does not say which side the rule placed. The door that
     /// files a pair clears the word, as it writes the pair's mark.
     ///
+    /// No replication entry of a lease's record exists yet, so none is
+    /// written for the word: the entry that carries a record will carry
+    /// it. A record a gateway's `Hello` page lists is filed with the word
+    /// its caller wrote ([`LeasesStore::restore`]).
+    ///
     /// [`RulePlaced::Untold`]: crate::document::spec::RulePlaced::Untold
     pub untold: bool,
     /// The term of the leader that issued the lease.

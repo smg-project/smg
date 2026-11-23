@@ -2608,8 +2608,8 @@ mod tests {
     /// two.
     const PLACED: [&str; 7] = [
         "random",
-        "round_robin",
         "power_of_two",
+        "round_robin",
         "least_load",
         "passthrough",
         "bucket",
@@ -2761,9 +2761,9 @@ mod tests {
 
     /// The override's rule places single requests alone, beside a policy
     /// that places one by nothing its key hands it. A pair plan, a gateway
-    /// of many routers and the two other policies whose keyed requests the
+    /// of many routers and the one other policy whose keyed requests the
     /// override places are each refused by the setting's name, in a
-    /// sentence that says which of the four it is.
+    /// sentence that says which of the three it is.
     #[test]
     fn the_override_is_refused_where_its_rule_has_no_document() {
         let why = |config: &RoutingSettings| match config.policy_document() {
