@@ -573,13 +573,10 @@ mod tests {
         assert_eq!(shape(&items), expected);
     }
 
-    /// A conversation one item longer than the limit, whose first items are
-    /// two calls with their outputs: its window begins at the first output,
-    /// inside a turn whose request is before the window. The window replays
-    /// from its first client message; the output of the call before it and
-    /// the call with its output after it go with the turn the cut split.
     /// A call and its output replay together or not at all: when the caller
-    /// may not see one of the two, the other goes with it.
+    /// may not see one of the two, the other goes with it. A second output
+    /// of the call takes nothing with it: the call keeps the output the
+    /// caller may see.
     #[tokio::test]
     async fn a_tool_row_the_caller_may_not_see_takes_its_pair_out_of_the_replay() {
         for hide_call in [true, false] {
@@ -594,8 +591,33 @@ mod tests {
                 "hide_call {hide_call}"
             );
         }
+
+        let components = components().await;
+        let mut second = output_row("call_own");
+        second.tenant = Some("other".into());
+        let rows = vec![
+            message_row(1),
+            call_row("call_own"),
+            output_row("call_own"),
+            second,
+        ];
+        link_rows(&components, rows).await;
+        assert_eq!(
+            shape(&loaded_input(&components, "item 2").await),
+            [
+                "user:item 1",
+                "function_call:call_own",
+                "function_call_output:call_own",
+                "user:item 2"
+            ]
+        );
     }
 
+    /// A conversation one item longer than the limit, whose first items are
+    /// two calls with their outputs: its window begins at the first output,
+    /// inside a turn whose request is before the window. The window replays
+    /// from its first client message; the output of the call before it and
+    /// the call with its output after it go with the turn the cut split.
     #[tokio::test]
     async fn a_cut_window_begins_at_its_first_client_message() {
         let components = components().await;

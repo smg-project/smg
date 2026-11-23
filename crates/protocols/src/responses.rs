@@ -5047,21 +5047,31 @@ pub fn without_outputs_of_missing_calls(
         .collect()
 }
 
-/// `items` without the tool calls whose output is among `skipped`, items of
-/// the same history that are not replayed: a call replays only with its
-/// output, as an output only with its call. A call that no output answers
-/// stays: the request may bring its output.
+/// `items` without the tool calls that only an output among `skipped`
+/// answers, items of the same history that are not replayed: a call replays
+/// only with its output, as an output only with its call. A call with its
+/// output among `items` stays, whatever `skipped` holds for it, and so does
+/// a call that no output answers: the request may bring its output.
 pub fn without_calls_answered_by(
     items: Vec<ResponseInputOutputItem>,
     skipped: &[ResponseInputOutputItem],
 ) -> Vec<ResponseInputOutputItem> {
-    let answered: HashSet<&str> = skipped.iter().filter_map(tool_output_call_id).collect();
-    if answered.is_empty() {
+    let unreplayed: HashSet<&str> = skipped.iter().filter_map(tool_output_call_id).collect();
+    if unreplayed.is_empty() {
         return items;
     }
+    let answered: HashSet<&str> = items.iter().filter_map(tool_output_call_id).collect();
+    let stays: Vec<bool> = items
+        .iter()
+        .map(|item| {
+            is_answered_call(item, &answered)
+                || tool_call_id(item).is_none_or(|call_id| !unreplayed.contains(call_id))
+        })
+        .collect();
     items
         .into_iter()
-        .filter(|item| tool_call_id(item).is_none_or(|call_id| !answered.contains(call_id)))
+        .zip(stays)
+        .filter_map(|(item, stays)| stays.then_some(item))
         .collect()
 }
 

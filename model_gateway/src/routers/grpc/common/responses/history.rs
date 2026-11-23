@@ -1330,7 +1330,8 @@ pub(crate) mod tests {
 
     /// A call and its output replay together or not at all: when the caller
     /// may not see one of the two, the other goes with it, as the output of
-    /// a call before a cut window does.
+    /// a call before a cut window does. A second output of the call takes
+    /// nothing with it: the call keeps the output the caller may see.
     #[tokio::test]
     async fn a_tool_row_the_caller_may_not_see_takes_its_pair_out_of_the_replay() {
         for hide_call in [true, false] {
@@ -1346,6 +1347,26 @@ pub(crate) mod tests {
                 "hide_call {hide_call}"
             );
         }
+
+        let stores = Stores::with_conversation().await;
+        let mut second = output_row("call_own");
+        second.tenant = Some("other".to_string());
+        let rows = vec![
+            message_row(1),
+            call_row("call_own"),
+            output_row("call_own"),
+            second,
+        ];
+        link_rows(&stores, rows).await;
+        assert_eq!(
+            shape(&replayed_items(&stores, "item 2").await),
+            [
+                "message:user",
+                "function_call:call_own",
+                "function_call_output:call_own",
+                "message:user"
+            ]
+        );
     }
 
     /// A conversation of 120 items replays its newest 100, oldest first,

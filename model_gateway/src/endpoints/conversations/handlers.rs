@@ -36,6 +36,9 @@ use crate::routers::{
 // ============================================================================
 
 const MAX_ITEMS_PER_REQUEST: usize = 20;
+/// The rows of an item list page when the request names no `limit`, and the
+/// fewest a further store read of one list asks for.
+const DEFAULT_LIST_LIMIT: usize = 100;
 /// The longest item id a client may supply, in bytes: the id columns of the
 /// SQL stores are 64 wide, and every backend gives the same refusal before any
 /// store is asked, where one of them used to fail the insert instead.
@@ -429,7 +432,7 @@ pub async fn list_conversation_items(
         return response;
     }
 
-    let limit = limit.unwrap_or(100);
+    let limit = limit.unwrap_or(DEFAULT_LIST_LIMIT);
     let order = match order {
         Some("asc") => SortOrder::Asc,
         _ => SortOrder::Desc,
@@ -440,9 +443,10 @@ pub async fn list_conversation_items(
     // paging fields below describe the rows in `data`.
     let mut after = after.map(String::from);
     let mut visible = Vec::new();
+    let mut read = limit;
     let listed = loop {
         let params = ListParams {
-            limit,
+            limit: read,
             order,
             after: after.take(),
         };
@@ -450,13 +454,17 @@ pub async fn list_conversation_items(
             Ok(page) => page,
             Err(e) => break Err(e),
         };
-        let last_page = page.len() < limit;
+        let last_page = page.len() < read;
         after = page.last().map(|item| item.id.0.clone());
         visible.extend(page.into_iter().filter(|item| item.is_visible_to(tenant)));
         if last_page || visible.len() >= limit {
             visible.truncate(limit);
             break Ok(visible);
         }
+        // The refused rows may be another caller's: a further page is at
+        // least a default page, so a small `limit` does not pay a store read
+        // a row.
+        read = limit.max(DEFAULT_LIST_LIMIT);
     };
 
     match listed {
@@ -2727,7 +2735,10 @@ mod tests {
                 &items,
                 B,
                 conv_of_b,
-                json!({"items": [{"type": "message", "role": "user", "content": "own"}]}),
+                json!({"items": [
+                    {"type": "message", "role": "user", "content": "older"},
+                    {"type": "message", "role": "user", "content": "own"}
+                ]}),
             )
             .await,
         )
@@ -2749,11 +2760,11 @@ mod tests {
                 .await,
         )
         .await;
-        let own = &added["data"][0]["id"];
-        assert_eq!(
-            (&page["data"][0]["id"], &page["first_id"], &page["last_id"]),
-            (own, own, own),
-            "{page}"
-        );
+        // the further store page holds both of the caller's rows: the page
+        // keeps the newer one
+        let own = &added["data"][1]["id"];
+        let rows = page["data"].as_array().map(Vec::len);
+        let ids = (&page["data"][0]["id"], &page["first_id"], &page["last_id"]);
+        assert_eq!((rows, ids), (Some(1), (own, own, own)), "{page}");
     }
 }
