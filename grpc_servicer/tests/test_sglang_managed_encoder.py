@@ -251,7 +251,7 @@ def test_launcher_complete_and_window_validation():
     assert cfg["receive_endpoint"] == "http://10.0.0.1:30000"
     cap, _ = epd_launcher.encoder_window(cfg)
     assert 0 < cap <= cfg["max_active"]
-    assert epd_launcher.encoder_staging_bytes(4096, "bfloat16") == 4096 * 4096 * 2
+    assert epd_launcher.encoder_staging_bytes(4096, "bfloat16") == 32768 * 4096 * 2
 
     args.host = "::1"
     args.dtype = "half"

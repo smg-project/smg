@@ -403,7 +403,7 @@ impl ZmqEngineClient {
                 sglang_constraint_ref(sp),
                 self.structured_outputs_support(),
             )
-            .map_err(tonic::Status::invalid_argument)?;
+            .map_err(constraint_refused_status)?;
         }
         let original_text = req.tokenized.as_ref().map(|t| t.original_text.clone());
         let pin = req.data_parallel_rank;

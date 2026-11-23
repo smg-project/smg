@@ -12,7 +12,8 @@ from smg_grpc_servicer.hostport import host_port
 from .epd_plugin import EVENTS_ENV, ROLE_ENV
 
 PROCESSOR_CONTRACT = "smg-image-grid-v1"
-MAX_CONTEXT_BYTES = 2 * 1024**3
+MAX_CONTEXT_BYTES = 16 * 1024**3
+MAX_IMAGE_TOKENS_PER_REQUEST = 32768
 
 
 def available_cpus():
@@ -71,9 +72,9 @@ def complete(args, role):
             control_listen=host_port(args.host or "0.0.0.0", args.port + 10),
             receive_endpoint=f"http://{host_port(advertise_host, args.port)}",
             max_artifact_bytes=64 * 1024**2,
-            max_staging_bytes_per_request=32 * 1024**2,
+            max_staging_bytes_per_request=256 * 1024**2,
             max_receivers=max_receivers,
-            max_control_bytes=4 * 1024**2,
+            max_control_bytes=64 * 1024**2,
             max_images=32,
             max_http_connections=max_active * max_receivers + 16,
             processor_options={"model_id": args.model_path},
@@ -89,7 +90,7 @@ def encoder_staging_bytes(hidden_size, dtype):
     element_bytes = {"float16": 2, "bfloat16": 2, "float32": 4}.get(dtype)
     if type(hidden_size) is not int or hidden_size <= 0 or element_bytes is None:
         raise ValueError("unsupported managed embedding dimensions or dtype")
-    return 4096 * hidden_size * element_bytes
+    return MAX_IMAGE_TOKENS_PER_REQUEST * hidden_size * element_bytes
 
 
 def encoder_window(config):

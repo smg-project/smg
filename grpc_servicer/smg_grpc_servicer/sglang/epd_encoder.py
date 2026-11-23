@@ -273,7 +273,7 @@ class NativeEncoder:
             work.cancel()
             await asyncio.gather(work, return_exceptions=True)
 
-    async def _wait_entry(self, rid, timeout=30.0):
+    async def _wait_entry(self, rid, timeout=120.0):
         """Resolve an active entry by `rid`, waiting boundedly if P's HTTP call arrives before execute."""
         require(isinstance(rid, str) and 0 < len(rid) <= 512, "missing receiver request id")
         entry = self.entries.get(rid)

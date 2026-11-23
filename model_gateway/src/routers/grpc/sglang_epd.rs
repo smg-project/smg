@@ -334,6 +334,13 @@ fn image_references(body: &ChatCompletionRequest) -> Result<Vec<String>, Status>
             }
         }
     }
+    const MAX_IMAGE_REF_BYTES: usize = 63 * 1024 * 1024;
+    let total_bytes: usize = images.iter().map(String::len).sum();
+    if total_bytes > MAX_IMAGE_REF_BYTES {
+        return Err(Status::invalid_argument(
+            "managed image references exceed the 64 MiB encoder control budget",
+        ));
+    }
     Ok(images)
 }
 

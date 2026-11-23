@@ -474,6 +474,7 @@ impl EncoderRuntime {
             || request.mm_items.len() > self.config.max_images
             || request.encoded_len() > self.config.max_control_bytes
             || request.prefill_host.is_empty()
+            || request.prefill_host.len() > 256
         {
             return Err(Status::invalid_argument("invalid encoder request/deadline"));
         }
