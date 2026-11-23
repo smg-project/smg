@@ -577,7 +577,8 @@ impl<G: Generation> LoadConsumer for SnapshotReaders<G> {
 /// It polls every `Ready` object its host dials each `every`, cut to whole
 /// seconds: the monitor takes one second for less. An object built for a
 /// row that one gateway alone reaches is asked for no load, where the
-/// host asked for such objects with their checks off ([`Objects::dials`]).
+/// host asked for such objects with their checks off
+/// ([`Objects::with_host_local_unchecked`]).
 /// It publishes the reports as one
 /// snapshot ([`WorkerMonitor::subscribe`]), which the host hands its
 /// decisions. Its own sink judges each worker's overload by the thresholds
