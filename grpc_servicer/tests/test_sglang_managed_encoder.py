@@ -263,6 +263,11 @@ def test_launcher_complete_and_window_validation():
     args.dtype = "float"
     assert epd_launcher.complete(args, "encoder")["embedding_dtype"] == "float32"
 
+    args.port = 65530
+    with pytest.raises(ValueError, match="--port"):
+        epd_launcher.complete(args, "encoder")
+    args.port = 30000
+
     args.revision = None
     with pytest.raises(ValueError, match="--revision"):
         epd_launcher.complete(args, "prefill")

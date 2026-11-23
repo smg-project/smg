@@ -31,14 +31,9 @@ def available_cpus():
 
 def complete(args, role):
     """Derive native contracts and finite limits instead of requiring duplicated deployment JSON."""
-    restricted = (
-        ("nnodes", "pp_size", "dp_size", "attn_dp_size")
-        if role == "encoder"
-        else ("nnodes", "pp_size")
-    )
-    for field in restricted:
+    for field in ("nnodes", "pp_size", "dp_size", "attn_dp_size"):
         if getattr(args, field, 1) != 1:
-            raise ValueError(f"managed EPD {role} does not support native {field} != 1")
+            raise ValueError(f"managed EPD does not support native {field} != 1")
     if getattr(args, "enable_unified_memory", False):
         raise ValueError("managed EPD does not support unified-memory KV envelopes")
     revision = getattr(args, "revision", None)
