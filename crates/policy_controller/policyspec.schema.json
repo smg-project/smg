@@ -339,7 +339,7 @@
       "type": "object",
       "properties": {
         "used": {
-          "description": "What a worker holds: field names and their coefficients, summed. At\nleast one is required. A name written `signal.<name>` reads a signal\nthe document declares. Under a capacity that is a number, a field\nor a signal of the worker is required: the request's size alone\nreads nothing of a worker there. A worker that lacks a named value\nhas no room.",
+          "description": "What a worker holds: field names and their coefficients, summed. At\nleast one is required. A name written `signal.<name>` reads a signal\nthe document declares. `request.max_output_tokens` reads the most\ntokens the request's answer may hold, so a coefficient above zero\nreserves room for the answer: a request that states no limit\nreserves none. Under a capacity that is a number, a field or a\nsignal of the worker is required: the request's own values alone\nread nothing of a worker there. A worker that lacks a named value\nhas no room.",
           "type": "object",
           "additionalProperties": {
             "type": "number",
@@ -362,6 +362,7 @@
                   "load.resident_tokens",
                   "load.running",
                   "load.waiting_uncached_tokens",
+                  "request.max_output_tokens",
                   "request.prompt_tokens",
                   "sent.requests",
                   "sent.tokens"

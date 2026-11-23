@@ -697,6 +697,41 @@ fn a_plain_request_is_placed_on_the_worker_at_its_place() {
     }
 }
 
+/// A room rule that names the request's output limit reserves room for the
+/// answer its caller states through the one call: a worker whose requests
+/// in flight leave no room for the answer is passed over while another
+/// has room. No classic policy reads an output limit: the rule is a
+/// document's own.
+#[test]
+fn the_output_limit_a_caller_states_reserves_room_under_the_documents_rule() {
+    let document = r#"{"apiVersion":"smg.policy/v1","generation":1,"profiles":{"p":{
+        "filter":["healthy",{"has-room":{
+            "used":{"candidate.in_flight":100,"request.max_output_tokens":1},
+            "capacity":1000}}],
+        "pick":"passthrough"}}}"#;
+    let document: PolicySpec = serde_json::from_str(document).expect("a well-formed document");
+    let engine = hosted(engine_of(&document));
+    let list = pool(2);
+    let members = PublishedList::new(Arc::clone(&list));
+    // Five requests in flight on the list's first worker: half its capacity.
+    for _ in 0..5 {
+        list[0].increment_load();
+    }
+    let placed_at = |max_output_tokens| {
+        let request = PlaceRequest {
+            max_output_tokens,
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let placement = engine.place(&request).expect("a placement");
+        list.iter()
+            .position(|worker| Arc::ptr_eq(worker, &placement.worker))
+    };
+    // An answer of 500 tokens fits beside the five requests, so the first
+    // worker of the list takes the request. A token more does not fit.
+    assert_eq!(placed_at(500), Some(0));
+    assert_eq!(placed_at(501), Some(1));
+}
+
 /// A preset's document with a spare profile of another name ahead of the
 /// bound one, so that the bound profile is the document's second.
 fn spared(name: &str) -> &'static PolicyEngine {

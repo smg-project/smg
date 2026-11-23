@@ -191,6 +191,9 @@ pub(crate) struct HasRoomRule {
     /// The coefficient of the request's size: zero where the rule does not
     /// name it.
     request_tokens: f64,
+    /// The coefficient of the request's output limit: zero where the rule
+    /// does not name it.
+    output_tokens: f64,
     /// The capacity less the headroom.
     bound: f64,
     /// Whether a term reads the row's count in flight.
@@ -209,10 +212,14 @@ impl HasRoomRule {
     pub(crate) const NAME: &str = "has-room";
     /// The request's size among the rule's fields. Every request states it.
     pub(crate) const REQUEST_TOKENS: &str = "request.prompt_tokens";
+    /// The request's output limit among the rule's fields: the most tokens
+    /// its answer may hold. A request that states none reads zero.
+    pub(crate) const OUTPUT_TOKENS: &str = "request.max_output_tokens";
 
     pub(crate) fn new(
         terms: &[(CostTerm, f64)],
         request_tokens: f64,
+        output_tokens: f64,
         capacity: f64,
         headroom: f64,
         sent: Option<Arc<DispatchCredit>>,
@@ -220,6 +227,7 @@ impl HasRoomRule {
         let coefficients = Coefficients::of(terms);
         Self {
             request_tokens,
+            output_tokens,
             bound: (1.0 - headroom) * capacity,
             in_flight: coefficients.in_flight != 0.0,
             loads: terms.iter().any(|&(term, _)| term.reads_load()),
@@ -231,12 +239,18 @@ impl HasRoomRule {
         }
     }
 
-    /// The request's part of what a row holds: its size times the rule's
-    /// coefficient. Every row of a pass is handed the same, so a pass works
-    /// it once.
+    /// The request's part of what a row holds, in name order: its output
+    /// limit times the rule's coefficient for it, then its size times the
+    /// size's. Under a coefficient above zero the limit's product reserves
+    /// room for the answer ahead of its first token. A request that states
+    /// no limit reserves nothing, and under a rule that names no limit the
+    /// product is zero: the sum equals the size's product, so such a rule
+    /// keeps the rows it kept. Every row of a pass is handed the same, so a
+    /// pass works it once.
     #[inline(always)]
     fn asked(&self, facts: &RequestFacts<'_>) -> f64 {
-        f64::from(facts.prompt_tokens) * self.request_tokens
+        f64::from(facts.max_output_tokens) * self.output_tokens
+            + f64::from(facts.prompt_tokens) * self.request_tokens
     }
 
     /// Whether a row has room, by its report as `load` hands it and its
@@ -380,7 +394,8 @@ impl Filter for HasRoomRule {
 
     // A report ends the sends before it, so the sends need the reports
     // though no term may read one. A rule that names the request's size
-    // needs it counted.
+    // needs it counted. The output limit asks nothing of a host: a request
+    // states it, or zero for none.
     fn needs(&self) -> Needs {
         Needs {
             loads: self.loads || self.sent.is_some(),

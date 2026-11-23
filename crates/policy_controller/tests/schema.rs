@@ -206,6 +206,7 @@ fn the_committed_schema_admits_a_filter_by_its_name_and_by_its_name_with_paramet
         .expect("the names the rule may sum");
     for name in [
         "load.resident_tokens",
+        "request.max_output_tokens",
         "request.prompt_tokens",
         "sent.tokens",
     ] {
