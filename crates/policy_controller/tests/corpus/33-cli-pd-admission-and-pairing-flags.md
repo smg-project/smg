@@ -34,10 +34,21 @@ profiles:
       - least-load
     pick:
       best: { sample: 16 }
+  cache_aware:
+    filter: [healthy, not-overloaded, not-tried]
+    score:
+      - warmup-slice: { weight: 8 }
+      - prefix-affinity: { weight: 4 }
+      - kv-pressure
+      - least-load
+    pick:
+      best: { sample: 16 }
 plans:
   pd-pair: { pairing: strict }
 bindings:
-  - match: { model: "*" }
+  - match: { model: "*", phase: [prefill, decode] }
     plan: pd-pair
     profiles: { prefill: prefill, decode: decode }
+  - match: { model: "*" }
+    profile: cache_aware
 ```
