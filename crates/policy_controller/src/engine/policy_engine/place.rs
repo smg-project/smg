@@ -91,7 +91,7 @@ use crate::{
             Constraints, Header, Identity, MediaCounts, Phase, RequestFacts, WireModes, WorkerId,
         },
     },
-    policies::consistent_hashing::LentRing,
+    policies::consistent_hashing::{Head, LentRing},
     store::GatewayId,
     tracking::{lease::ReleaseReason, DecisionGuard, Placement},
     Draw,
@@ -285,8 +285,13 @@ pub struct PlaceRequest<'a> {
     /// routing value by its own text, the value goes to the worker this
     /// ring's walk reaches, where the caller's own ring policy puts it:
     /// the engine reads the value's place on the ring with the request's
-    /// keys. Under any other document the ring is asked nothing. `None`
-    /// from a caller that keeps no ring: the stage places by its own.
+    /// keys. Under the prefix form of the ring stage the engine asks the
+    /// ring where each head of the request stands
+    /// ([`LentRing::head_position`]). A ring that answers nothing for a
+    /// head is asked nothing more and is not lent, and neither is a ring
+    /// to a request that has no head. Under any other document the ring
+    /// is asked nothing. `None` from a caller that keeps no ring: the
+    /// stage places by its own.
     pub ring: Option<&'a dyn LentRing>,
     /// The route's own rule for a worker its request may be sent to, and
     /// `None` for a route that has none. It is asked of the workers the
@@ -417,6 +422,10 @@ pub(super) struct Made<'r, 'a> {
     /// at the request's first making and borrowed by each one after it:
     /// none where the request carries no key or is lent no ring.
     place: OnceCell<Option<u64>>,
+    /// Where the request's heads stand on that ring under the prefix form
+    /// of the ring stage: asked of the lender at the request's first
+    /// making, like the key's place.
+    heads: OnceCell<Places>,
     /// The panic of the route's rule where it was asked inside the lookup
     /// of a lent token tree ([`RequestMaker::sends_to`]): kept for the
     /// call, which raises it again outside the decision ([`raise`]).
@@ -490,6 +499,7 @@ impl<'r, 'a> Made<'r, 'a> {
             headers: OnceCell::new(),
             key: Cell::new(None),
             place: OnceCell::new(),
+            heads: OnceCell::new(),
             panicked: OnceCell::new(),
             sent: Cell::new(Sent::NONE),
         }
@@ -499,8 +509,9 @@ impl<'r, 'a> Made<'r, 'a> {
     /// the call missed so far, is held to the places the call keeps
     /// ([`Call::admitted`]), and borrows the prompt's hashes where an
     /// earlier ask of the call made them. The headers of the document's
-    /// view and the key's place on a lent ring are made again by each ask
-    /// that makes the request: a later ask is the call's cold path.
+    /// view and the key's place on a lent ring, or the heads' places, are
+    /// made again by each ask that makes the request: a later ask is the
+    /// call's cold path.
     pub(super) fn asked(
         engine: &'a PolicyEngine,
         request: &'r PlaceRequest<'a>,
@@ -525,13 +536,14 @@ impl<'r, 'a> Made<'r, 'a> {
 
     /// The request's routing value and its client's value, by the sources
     /// its binding names in the engine's document, with where the value a
-    /// ring places it by stands on `ring`
+    /// ring places it by stands on a ring, as `place` answers for that
+    /// value's text and for whether it is the client's
     /// ([`KeySources::derive_keys`](crate::document::KeySources::derive_keys)).
     /// The routing value is the first source that holds one; none where
     /// the binding names no source or none holds a value. The client's
     /// value is read only where the request has no routing value: it
     /// places where no session does.
-    fn keys(&self, ring: Option<&dyn LentRing>) -> DerivedKeys<'a> {
+    fn keys(&self, place: impl FnOnce(&str, bool) -> Option<u64>) -> DerivedKeys<'a> {
         let request = self.request;
         let spec = self.engine.spec();
         let Some(sources) = spec.key_sources_for(request.model, request.phase()) else {
@@ -539,20 +551,139 @@ impl<'r, 'a> Made<'r, 'a> {
         };
         let headers = request.headers;
         let header = move |name: &str| headers.header(name);
-        sources.derive_keys(header, request.request_id, ring)
+        sources.derive_keys_by(header, request.request_id, place)
     }
 
-    /// The ring the request's caller lends, where a stage of the profile
-    /// that decides the request places a routing value by its own text
-    /// ([`Engine::states_key_place`](crate::engine::Engine::states_key_place)),
-    /// and none under any other profile. The prefix form of the ring is
-    /// asked for another text, whose place this maker does not state: such
-    /// a request is lent no ring, and its stage places by its own.
-    fn ring(&self) -> Option<&'a dyn LentRing> {
+    /// The request's keys, the ring its decision is lent and where the
+    /// request stands on it, by the word of the profile that decides the
+    /// request. A stage that places a routing value by its own text
+    /// ([`Engine::states_key_place`](crate::engine::Engine::states_key_place))
+    /// is stated that text's place, read with the keys. The prefix form of
+    /// the ring
+    /// ([`Engine::states_head_places`](crate::engine::Engine::states_head_places))
+    /// is stated where the lender puts each head of the request
+    /// ([`LentRing::head_position`]): the routing value where the request
+    /// carries one, else the prompt's heads, the deepest first. A lender
+    /// that places no head lends no ring, a request that has no head is
+    /// lent none, and a request under any other profile lends none: its
+    /// stage places by its own. The lender is asked at the first making
+    /// of one ask of the call, and a later making of that ask borrows
+    /// what it answered. A call that asks again makes its request anew,
+    /// and asks the lender again.
+    fn stated<'w>(
+        &'w self,
+        spec: &'w AppliedSpec,
+    ) -> (DerivedKeys<'a>, Option<&'a dyn LentRing>, &'w [u64]) {
         let request = self.request;
-        let engine = self.engine.spec().engine();
-        let ring = request.ring;
-        ring.filter(|_| engine.states_key_place(request.model, request.phase()))
+        let (model, phase) = (request.model, request.phase());
+        let Some(ring) = request.ring else {
+            return (self.keys(|_, _| None), None, &[]);
+        };
+        // The two questions are asked of one lookup of the binding.
+        let engine = spec.engine();
+        let profiles = engine.ring_profiles(model, phase);
+        if engine.key_place_of(profiles) {
+            let first = self.place.get().is_none();
+            let keys = self.keys(|text, _| first.then(|| ring.position(text)));
+            let place = self.place.get_or_init(|| keys.ring_position);
+            return (keys, Some(ring), place.as_slice());
+        }
+        let Some(rule) = engine.head_rule_of(profiles) else {
+            return (self.keys(|_, _| None), None, &[]);
+        };
+        // A routing value leads the prompt: its text is the one head. A
+        // client's value places nothing under this form.
+        let key_at = Cell::new(None);
+        let first = self.heads.get().is_none();
+        let keys = self.keys(|text, client| {
+            if first && !client {
+                key_at.set(Some(ring.head_position(Head::Text(text))));
+            }
+            None
+        });
+        let heads = self.heads.get_or_init(|| {
+            let mut places = Places::default();
+            match key_at.take() {
+                Some(answer) => places.state(answer),
+                None => {
+                    let (tokens, text) = (request.prompt.tokens, request.prompt.text);
+                    rule.heads(tokens, text, |head| {
+                        // A lender that places no head is asked nothing more.
+                        if !places.unplaced {
+                            places.state(ring.head_position(head));
+                        }
+                    });
+                    places.turn();
+                }
+            }
+            places
+        });
+        // The ring is lent with a place: a request that has no head, and
+        // one whose lender places none, state nothing and lend nothing.
+        let places = heads.as_slice();
+        let ring = (!places.is_empty()).then_some(ring);
+        (keys, ring, places)
+    }
+}
+
+/// How many of a request's places on a lent ring its maker keeps in the
+/// list itself ([`Places`]).
+const HEADS_INLINE: usize = 8;
+
+/// Where a request's heads stand on the ring its caller lends, as the
+/// lender answered for each ([`Made::stated`]). As many as [`HEADS_INLINE`]
+/// stand in the list itself. A prompt that reaches more boundaries has its
+/// list on the heap, made once an ask of the call: the gateway's own
+/// policy lists every boundary a prompt reaches
+/// (`model_gateway/src/policies/prefix_hash.rs`, lines 172 to 180 at
+/// 882be6f4f).
+#[derive(Default)]
+struct Places {
+    inline: [u64; HEADS_INLINE],
+    /// How many places `inline` holds, while `spilled` holds none.
+    len: usize,
+    spilled: Vec<u64>,
+    /// The lender places no head: the request is lent no ring and states
+    /// no place.
+    unplaced: bool,
+}
+
+impl Places {
+    /// The lender's answer for one head, behind those stated so far.
+    fn state(&mut self, answer: Option<u64>) {
+        let Some(place) = answer else {
+            self.unplaced = true;
+            return;
+        };
+        if self.spilled.is_empty() && self.len < HEADS_INLINE {
+            self.inline[self.len] = place;
+            self.len += 1;
+            return;
+        }
+        if self.spilled.is_empty() {
+            self.spilled.extend_from_slice(&self.inline);
+        }
+        self.spilled.push(place);
+    }
+
+    /// The list turned round: its heads were stated the shallowest first.
+    fn turn(&mut self) {
+        if self.spilled.is_empty() {
+            self.inline[..self.len].reverse();
+        } else {
+            self.spilled.reverse();
+        }
+    }
+
+    /// The places, and none where the lender places no head.
+    fn as_slice(&self) -> &[u64] {
+        if self.unplaced {
+            &[]
+        } else if self.spilled.is_empty() {
+            &self.inline[..self.len]
+        } else {
+            &self.spilled
+        }
     }
 }
 
@@ -565,11 +696,9 @@ impl RequestMaker for Made<'_, '_> {
         let request = self.request;
         // The engine decides under its one document, the one it hands here.
         debug_assert!(std::ptr::eq(spec, self.engine.spec()));
-        let ring = self.ring();
-        // The key's place is taken at the first making: a later one hands
-        // the keys' reader no ring, and nothing is hashed again.
-        let keys = self.keys(ring.filter(|_| self.place.get().is_none()));
-        let place = self.place.get_or_init(|| keys.ring_position);
+        // The request's place is taken at the first making: a later one
+        // asks the ring nothing, and nothing is hashed again.
+        let (keys, ring, places) = self.stated(spec);
         let session_key = keys.session.map_or(Identity::NONE, |derived| derived.key);
         self.key.set(session_key.plain);
         // The headers the document's view shows a stage, each named by its
@@ -598,7 +727,7 @@ impl RequestMaker for Made<'_, '_> {
             session_key,
             client_key: keys.client_key,
             ring,
-            ring_positions: place.as_slice(),
+            ring_positions: places,
             attempt: request.attempt,
             tried: request.tried,
             budget_micros: self.budget_micros,

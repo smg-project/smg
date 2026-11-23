@@ -23,10 +23,11 @@ use std::{
 
 use smg_policy_controller::{
     engine::{Identity, PlaceRequest, Prompt, TokenEntry, TokenKey, WorkerLists},
+    policies::consistent_hashing::LentRing,
     tracking::{Outcome, Placement, Side, TransportClass},
 };
 
-use super::{conversations, ruled, Host, Run, MODEL};
+use super::{conversations, ruled, Host, Run, MODEL, RING};
 
 /// The prompt a request by the one call states: 1,024 token ids, the size
 /// the plain request states.
@@ -73,13 +74,22 @@ pub(super) fn asked(run: &Run, host: &Host) -> bool {
     true
 }
 
+/// The ring `host` lends with each request by the one call: the run's
+/// ring under a cell whose document reads one, as a host that keeps rings
+/// lends its own with such a request, and none under any other document.
+pub(super) fn lent(host: &Host) -> Option<&'static dyn LentRing> {
+    let reads = host.engine.spec().needs().ring;
+    let ring = RING.get().filter(|_| reads)?;
+    Some(ring)
+}
+
 /// One request by the one call: the model, the list and a prompt of the
 /// plain request's size, and the dispatch and the end said of a placement
 /// that owes them. The answer stays where the call wrote it: a placement
 /// is not moved. The call answers a worker and no place of the list, so
 /// the place this says is the first. With `rule` the request states a
-/// route's rule ([`ruled::admits`]).
-pub(super) fn one(host: &Host, rule: bool) -> Option<u32> {
+/// route's rule ([`ruled::admits`]), and it lends `ring` ([`lent`]).
+pub(super) fn one(host: &Host, rule: bool, ring: Option<&'static dyn LentRing>) -> Option<u32> {
     let request = PlaceRequest {
         prompt: Prompt {
             tokens: Some(&PROMPT),
@@ -87,6 +97,7 @@ pub(super) fn one(host: &Host, rule: bool) -> Option<u32> {
             ..Prompt::NONE
         },
         admits: ruled::admits(rule),
+        ring,
         ..PlaceRequest::of(MODEL, WorkerLists::Single(host.list.lent()))
     };
     let mut answer = host.engine.place(&request);

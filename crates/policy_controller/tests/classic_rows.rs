@@ -734,6 +734,24 @@ fn the_classic_prefix_hash_rows_replay_on_a_ring_their_caller_lends() {
     }
 }
 
+/// The same rows through the one call a gateway asks, over worker objects:
+/// the caller lends each row's ring and states no place. The engine cuts a
+/// request into the heads the gateway's own policy cuts it into and asks
+/// the lender where each stands, and every request goes to its recorded
+/// worker. That the lender's own recipe for a head is the gateway's is
+/// proven where a gateway lends its ring, not here.
+#[cfg(feature = "in-process")]
+#[test]
+fn the_classic_prefix_hash_rows_replay_through_the_one_call_with_no_place_stated() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/classic/sheets");
+    let sheet = fs::read_to_string(dir.join("prefix_hash.json")).expect("the sheet is readable");
+    for (text, rows) in [(classic::prefix_hash::INLINE, 19), (sheet.as_str(), 31)] {
+        let (replayed, defects) = classic::prefix_hash::through_the_one_call::replay(text);
+        assert_eq!(replayed, rows, "the rows replayed through the one call");
+        assert!(defects.is_empty(), "{defects:#?}");
+    }
+}
+
 #[test]
 fn the_classic_sticky_override_rows_replay_pick_for_pick_and_share_for_share() {
     let (rows, defects) = replay_sheet(classic::sticky_override::INLINE, "the inline rows");

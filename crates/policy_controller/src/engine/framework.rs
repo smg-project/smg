@@ -26,7 +26,7 @@ use crate::{
         warm_up::WarmUpRule,
     },
     load::signals::SignalCells,
-    policies::random::Random,
+    policies::{prefix_hash::HeadRule, random::Random},
     stages::{
         filters::RowTests,
         lifecycle::Lifecycle,
@@ -424,12 +424,27 @@ pub trait Scorer: Lifecycle + Debug {
     /// for the routing value's own text on a ring the caller lends
     /// ([`RequestFacts::ring`]): the hash ring that is keyed by no prefix.
     /// What makes a request for its caller states that place under such a
-    /// stage and lends the ring to no other
-    /// ([`Engine::states_key_place`]): another form of the ring is asked for
-    /// another text. A stage that reads a ring ([`Scorer::needs`]) and
-    /// answers `false` here is taken for such a form.
+    /// stage ([`Engine::states_key_place`]): another form of the ring is
+    /// asked for another text, and says which
+    /// ([`Self::places_by_heads`]). A stage that reads a ring
+    /// ([`Scorer::needs`]) and answers `false` here is taken for such a
+    /// form.
     fn places_by_key_text(&self) -> bool {
         false
+    }
+
+    /// How the stage cuts a request into the heads it places it by on a
+    /// ring its caller lends ([`RequestFacts::ring`]): the prefix form of
+    /// the hash ring, which reads where a head stands
+    /// ([`LentRing::head_position`](crate::policies::consistent_hashing::LentRing::head_position))
+    /// and never where the routing value's own text does. What makes a
+    /// request for its caller states a place for each head under such a
+    /// stage ([`Engine::states_head_places`]). `None` from every other
+    /// stage. The answer stands for the stage's generation, as
+    /// [`Self::needs`] does: it is asked at most once where an engine is
+    /// built, and no decision asks.
+    fn places_by_heads(&self) -> Option<HeadRule<'_>> {
+        None
     }
 
     /// The warm-up ruling this stage applies, where it applies one: what a
@@ -3406,6 +3421,9 @@ pub struct Engine {
     /// Per profile, what its stages ask of a decision beyond the profile's
     /// own run ([`Marks`]).
     marks: Vec<Marks>,
+    /// Per profile, how its scorers place a request by its heads on a lent
+    /// ring ([`HeadPlaces`]).
+    head_places: Vec<HeadPlaces>,
     /// Per profile, what its stages ask of a host ([`Profile::needs`]),
     /// asked of them once at the build: a decision reads its answer here.
     profile_needs: Vec<Needs>,
@@ -3604,6 +3622,66 @@ impl Order {
     /// Whether stage `i` is a rank that orders nothing.
     const fn alike(self, i: usize) -> bool {
         self.ranks(i) && self.alike & (1 << i) != 0
+    }
+}
+
+/// The positions of the two profiles a request is placed by on a lent
+/// ring ([`Engine::ring_profiles`]): the one that decides it and a pair's
+/// decode profile, each where there is one.
+pub(crate) type RingProfiles = (Option<usize>, Option<usize>);
+
+/// How a profile's scorers place a request by its heads on a lent ring
+/// ([`Scorer::places_by_heads`]), asked of them once when the engine is
+/// built. What makes a request reads the answer here and asks no stage
+/// ([`Engine::states_head_places`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum HeadPlaces {
+    /// No scorer of the profile reads a ring.
+    #[default]
+    Unread,
+    /// Every scorer of the profile that reads a ring places by heads cut
+    /// by this one rule: its depth, and the view's boundaries.
+    Rule(u32, Box<[u32]>),
+    /// A scorer reads a ring by another place than a head's, or two
+    /// scorers name two rules: no one list of heads' places is the
+    /// profile's.
+    Apart,
+}
+
+impl HeadPlaces {
+    fn of(profile: &Profile) -> Self {
+        let mut found = Self::Unread;
+        for stage in &profile.scorers {
+            let stated = match stage.scorer.places_by_heads() {
+                Some(rule) => Self::Rule(rule.depth, rule.boundaries.into()),
+                None if stage.scorer.needs().ring => return Self::Apart,
+                None => continue,
+            };
+            if found != Self::Unread && found != stated {
+                return Self::Apart;
+            }
+            found = stated;
+        }
+        found
+    }
+
+    /// The one rule of this profile and of `other`, a pair's second side
+    /// where the request has one: a side that reads no ring holds nothing
+    /// back, and two rules are none.
+    fn with<'a>(&'a self, other: Option<&'a Self>) -> Option<HeadRule<'a>> {
+        let one = match (self, other) {
+            (one, None | Some(Self::Unread)) => one,
+            (Self::Unread, Some(one)) => one,
+            (own, Some(other)) if own == other => own,
+            _ => return None,
+        };
+        match one {
+            Self::Rule(depth, boundaries) => Some(HeadRule {
+                depth: *depth,
+                boundaries,
+            }),
+            Self::Unread | Self::Apart => None,
+        }
     }
 }
 
@@ -4604,6 +4682,7 @@ impl Engine {
             .with_absence(absence(&bindings))
             .with_shards(session_shards(&bindings));
         let sessions = Arc::new(sessions);
+        let head_places: Vec<HeadPlaces> = profiles.iter().map(HeadPlaces::of).collect();
         let keeping = marks.iter().any(|marks| marks.scoped());
         #[cfg(feature = "in-process")]
         let written_draws = profiles
@@ -4736,6 +4815,7 @@ impl Engine {
             sessions,
             assignment: AssignmentStages::default(),
             marks,
+            head_places,
             profile_needs,
             named_by,
             row_tests,
@@ -4979,15 +5059,62 @@ impl Engine {
     /// ([`KeySources::derive_keys`](crate::document::KeySources::derive_keys)).
     #[must_use]
     pub fn states_key_place(&self, model: &str, phase: Phase) -> bool {
+        self.key_place_of(self.ring_profiles(model, phase))
+    }
+
+    /// The profiles a request of `phase` for `model` is placed by on a
+    /// ring its caller lends: the one that decides it and, for a pair
+    /// asked at its prefill, its decode profile. One lookup of its
+    /// binding, and a second for a pair's. What makes a request looks
+    /// them up once and asks both of [`Self::key_place_of`] and
+    /// [`Self::head_rule_of`].
+    pub(crate) fn ring_profiles(&self, model: &str, phase: Phase) -> RingProfiles {
         let own = self.resolve(model, phase);
-        let own = own.map(|(_, index, _)| self.marks[usize::from(index)]);
-        let own = own.unwrap_or_default();
-        let decode = if phase == Phase::Prefill {
-            self.pair_decode_marks(model)
-        } else {
-            Marks::default()
+        let own = own.map(|(_, index, _)| usize::from(index));
+        let decode = (phase == Phase::Prefill)
+            .then(|| self.pair_binding(model))
+            .flatten()
+            .and_then(|binding| profile_index(binding, Phase::Decode))
+            .map(usize::from);
+        (own, decode)
+    }
+
+    /// [`Self::states_key_place`] by the two profiles of
+    /// [`Self::ring_profiles`].
+    pub(crate) fn key_place_of(&self, (own, decode): RingProfiles) -> bool {
+        let marks = |at: Option<usize>| {
+            let marks = at.and_then(|at| self.marks.get(at));
+            marks.copied().unwrap_or_default()
         };
+        let (own, decode) = (marks(own), marks(decode));
         (own.key_place() || decode.key_place()) && !(own.other_place() || decode.other_place())
+    }
+
+    /// [`Self::states_head_places`] by the two profiles of
+    /// [`Self::ring_profiles`].
+    pub(crate) fn head_rule_of(&self, (own, decode): RingProfiles) -> Option<HeadRule<'_>> {
+        let own = self.head_places.get(own?)?;
+        own.with(decode.and_then(|at| self.head_places.get(at)))
+    }
+
+    /// How what makes a request of `phase` for `model` cuts it into the
+    /// heads whose places it states on a ring its caller lends: the rule
+    /// of a scorer of the profile that decides the request
+    /// ([`Scorer::places_by_heads`]), or, for a pair asked at its prefill,
+    /// of a scorer of its decode profile. [`Self::states_key_place`]
+    /// answers for the plain ring by the same two profiles, and this is
+    /// its mirror: every scorer of either that places by heads names the
+    /// one rule, and no scorer of either reads a ring by another text. A
+    /// pair's two sides are handed one ring and one list of places, so a
+    /// side that reads no ring holds nothing back, and a pair of two
+    /// depths or of two ring forms states nothing. `None` then, and where
+    /// no binding matches. The scorers answered when the engine was built,
+    /// and no stage is asked here. Only a request that lends a ring to a
+    /// profile with no place for its key's text pays for the answer: one
+    /// lookup of its binding, and a second for a pair's decode profile.
+    #[must_use]
+    pub fn states_head_places(&self, model: &str, phase: Phase) -> Option<HeadRule<'_>> {
+        self.head_rule_of(self.ring_profiles(model, phase))
     }
 
     /// The marks of the decode profile of `model`'s pair binding, none
@@ -5916,20 +6043,33 @@ impl Engine {
         // The place a request states on a lent ring is the live profile's
         // kind of place. A shadow that reads a ring by the other kind is
         // lent none: the place is not its own, and it places on its own
-        // ring.
-        let live = profile_index(&entry.binding, facts.phase);
-        let live = live.and_then(|at| self.marks.get(usize::from(at)));
+        // ring. So is a shadow of the prefix form that cuts a request by
+        // another rule than the live profile's: the places stated are the
+        // live profile's heads'. A live profile that reads no ring states
+        // no place, and its shadow is apart from none.
+        let live = profile_index(&entry.binding, facts.phase).map(usize::from);
+        let apart = live.is_some_and(|live| {
+            let form = self
+                .marks
+                .get(live)
+                .is_some_and(|&live| marks.ring_apart(live));
+            let own = self.head_places.get(usize::from(index));
+            let live = self.head_places.get(live);
+            let reads = |places: Option<&HeadPlaces>| {
+                places.is_some_and(|places| *places != HeadPlaces::Unread)
+            };
+            form || (reads(own) && reads(live) && own != live)
+        });
         let unlent;
-        let facts = match live {
-            Some(&live) if facts.ring.is_some() && marks.ring_apart(live) => {
-                unlent = RequestFacts {
-                    ring: None,
-                    ring_positions: &[],
-                    ..*facts
-                };
-                &unlent
-            }
-            _ => facts,
+        let facts = if facts.ring.is_some() && apart {
+            unlent = RequestFacts {
+                ring: None,
+                ring_positions: &[],
+                ..*facts
+            };
+            &unlent
+        } else {
+            facts
         };
         // The pool's own word counts the live decision's turns alone: a
         // shadow is lent none, and its picker turns a rotation of its own.
@@ -7115,7 +7255,7 @@ impl Engine {
     /// asked here. No host asks a pair's shadows yet. The change that asks
     /// them holds a side's shadow to that rule against both live sides'
     /// marks together, as [`Self::states_key_place`] reads them: a pair is
-    /// lent one place for its two sides.
+    /// lent one list of places for its two sides.
     ///
     /// `None` where the binding names no shadow for the side, where the
     /// build did not find that profile free to run beside the live one
@@ -7712,6 +7852,93 @@ mod tests {
         };
         engine.on_dispatched(&lease, &target, Side::Single, 0);
         target.id
+    }
+
+    /// A live profile that reads no ring states no place on one, and its
+    /// shadow is apart from none: a ring the request's caller lends is the
+    /// shadow's, under the plain ring and under the prefix form alike. The
+    /// shadow's first target is the worker that ring reaches first,
+    /// whichever it is.
+    #[test]
+    fn a_shadow_beside_a_live_profile_that_reads_no_ring_keeps_the_lent_ring() {
+        use crate::policies::{
+            cache_aware::Gates,
+            consistent_hashing::{ConsistentHash, InOrder},
+        };
+
+        let mut rows = [candidate(0, 3), candidate(1, 5), candidate(2, 9)];
+        for (at, row) in rows.iter_mut().enumerate() {
+            row.id = WorkerId::from_address(&format!("w{at}"));
+        }
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        for prefixed in [false, true] {
+            let ring = ConsistentHash::new(None);
+            let ring = if prefixed {
+                ring.keyed_by_prefix(256, Gates::default(), &[])
+            } else {
+                ring
+            };
+            let engine = with_shadow(
+                Profile {
+                    name: "ring".into(),
+                    scorers: vec![WeightedScorer {
+                        scorer: Box::new(ring),
+                        weight: 1.0,
+                    }],
+                    ..least_requests_profile()
+                },
+                None,
+            );
+            for first in [2usize, 0] {
+                let order = [first, 1, 2 - first].map(|at| format!("w{at}"));
+                let lent = InOrder(order.to_vec());
+                let facts = RequestFacts {
+                    model: "m",
+                    session_key: Identity::hashed(9),
+                    ring: Some(&lent),
+                    ring_positions: &[0],
+                    ..RequestFacts::default()
+                };
+                let shadow = engine
+                    .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+                    .expect("a shadow decision");
+                assert_eq!(
+                    first_of(&shadow),
+                    Some(rows[first].id),
+                    "prefixed: {prefixed}"
+                );
+            }
+        }
+    }
+
+    /// One profile whose two ring scorers cut a request by two rules has no
+    /// one list of heads' places: the engine states no rule for it, and a
+    /// request under it is lent no ring. Two scorers of one rule state that
+    /// rule.
+    #[test]
+    fn a_profile_whose_ring_scorers_name_two_head_rules_states_none() {
+        use crate::policies::{cache_aware::Gates, consistent_hashing::ConsistentHash};
+
+        let depth_of = |depths: [u32; 2]| {
+            let scorers = depths.map(|depth| {
+                let ring = ConsistentHash::new(None);
+                WeightedScorer {
+                    scorer: Box::new(ring.keyed_by_prefix(depth, Gates::default(), &[])),
+                    weight: 1.0,
+                }
+            });
+            let profile = Profile {
+                name: "ring".into(),
+                scorers: scorers.into(),
+                ..least_requests_profile()
+            };
+            let engine = Engine::new(vec![profile], vec![single_binding()], 1, Needs::default());
+            let rule = engine.states_head_places("m", Phase::Single);
+            rule.map(|rule| rule.depth)
+        };
+        assert_eq!(depth_of([256, 256]), Some(256));
+        assert_eq!(depth_of([256, 128]), None);
     }
 
     #[test]

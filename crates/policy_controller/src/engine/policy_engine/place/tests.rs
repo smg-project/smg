@@ -22,19 +22,22 @@ use tokio::time::sleep;
 use super::*;
 use crate::{
     document::spec::{
-        BoundedLoadParams, ConsistentHashParams, FilterSpec, KeySourceSpec, OverloadSpec,
+        BoundedLoadParams, ConsistentHashParams, FilterSpec, KeySourceSpec, Needs, OverloadSpec,
         PolicySpec, RoutingKeySpec, ScoreStage, ShadowSpec, MANUAL_SESSION_HEADER,
     },
     engine::{
         decision::{Queue, ShadowKind, Shed, Target, Targets, Trace},
         decision_engine::Decided,
-        framework::{Filter, Picker, Place, TieBand},
+        framework::{Filter, Picker, Place, Scorer, TieBand},
         list_cell::tests::PublishedList,
         records::worker_id,
         view::{fingerprint, Candidate, FixedFacts, HashKind},
         EncodeLists, PairAdmission, PairLists, PartnerClasses,
     },
-    policies::consistent_hashing::InOrder as Lent,
+    policies::{
+        consistent_hashing::{Head, InOrder as Lent},
+        prefix_hash::HeadRule,
+    },
     stages::{pickers::push_drawn, registry::StageRegistry, Lifecycle},
     tracking::lease::{EventSet, Lease, Outcome, Side},
 };
@@ -1771,7 +1774,8 @@ fn lent_ring_places(engine: &'static PolicyEngine) {
     assert!(eighth_first > 0, "no key has the eighth ahead in the list");
 }
 
-/// [`Lent`], with a count of the keys it was asked the place of.
+/// [`Lent`], with a count of the keys and the heads it was asked the place
+/// of.
 #[derive(Debug)]
 struct Asked(Lent, AtomicU32);
 
@@ -1779,6 +1783,11 @@ impl LentRing for Asked {
     fn position(&self, key: &str) -> u64 {
         self.1.fetch_add(1, atomic::Ordering::Relaxed);
         self.0.position(key)
+    }
+
+    fn head_position(&self, head: Head<'_>) -> Option<u64> {
+        self.1.fetch_add(1, atomic::Ordering::Relaxed);
+        self.0.head_position(head)
     }
 
     fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
@@ -1847,6 +1856,84 @@ fn a_shadow_of_another_ring_form_is_lent_no_ring() {
     assert_eq!(counted, [0, 1, 0, 0]);
 }
 
+/// [`Lent`], with a count of its walks.
+#[derive(Debug)]
+struct Walked(Lent, AtomicU32);
+
+impl LentRing for Walked {
+    fn position(&self, key: &str) -> u64 {
+        self.0.position(key)
+    }
+
+    fn head_position(&self, head: Head<'_>) -> Option<u64> {
+        self.0.head_position(head)
+    }
+
+    fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
+        self.1.fetch_add(1, atomic::Ordering::Relaxed);
+        self.0.walk(position, take);
+    }
+}
+
+/// A shadow profile that places as its live profile does is lent the
+/// request's ring and walks it as the live profile does: a shadow of the
+/// plain ring beside the plain ring, and a shadow of the prefix form that
+/// cuts a request by the live profile's rule. The two then agree on the
+/// ring's owner. A shadow of the prefix form that cuts by another depth is
+/// lent none: the places stated are the live profile's heads', so the
+/// lent ring is walked for the live profile alone, as beside a shadow of
+/// another ring form.
+#[test]
+fn a_shadow_is_lent_the_ring_where_it_places_as_its_live_profile_does() {
+    // The lent ring's walks under one request, and the shadow's counts.
+    let walks = |live: &str, twin: &str, depth: Option<u32>| {
+        let mut document = PolicySpec::preset(live).expect("a built-in preset");
+        let twin = PolicySpec::preset(twin).expect("a built-in preset");
+        let mut twin = twin.profiles.into_values().next().expect("its profile");
+        if let Some(depth) = depth {
+            twin.score[0] = ScoreStage::ConsistentHash(ConsistentHashParams {
+                prefix_tokens: Some(depth),
+                ..ConsistentHashParams::default()
+            })
+            .into();
+        }
+        document.profiles.insert("twin".into(), twin);
+        document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+        document.generation = 1;
+        let engine = hosted(engine_of(&document));
+        let list = pool(2);
+        let members = PublishedList::new(Arc::clone(&list));
+        let ring = Walked(Lent(vec![list[0].url().to_owned()]), AtomicU32::new(0));
+        let ids: Vec<u32> = (0..64).collect();
+        let headers = [("x-smg-routing-key", "conv-1")];
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(&ids),
+                ..Prompt::NONE
+            },
+            headers: &headers,
+            ring: Some(&ring),
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let placement = engine.place(&request).expect("a placement");
+        assert!(Arc::ptr_eq(&placement.worker, &list[0]), "the ring's owner");
+        // Agreed, another target, another outcome, skipped.
+        let counted = ShadowKind::ALL.map(|kind| engine.shadowed(0, kind));
+        (ring.1.load(atomic::Ordering::Relaxed), counted)
+    };
+    let (plain, prefix) = ("consistent_hashing", "prefix_hash");
+    for (live, other) in [(plain, prefix), (prefix, plain)] {
+        let (alone, _) = walks(live, other, None);
+        assert!(alone > 0, "{live}: the live profile walks the lent ring");
+        let (both, counted) = walks(live, live, None);
+        assert_eq!(both, 2 * alone, "{live}: its twin walks it too");
+        assert_eq!(counted, [1, 0, 0, 0], "{live}: the two agree");
+    }
+    let (alone, _) = walks(prefix, plain, None);
+    let (another_depth, _) = walks(prefix, prefix, Some(128));
+    assert_eq!(another_depth, alone, "a shadow of another depth");
+}
+
 /// A ring no decision may ask.
 #[derive(Debug)]
 struct Unasked;
@@ -1856,48 +1943,393 @@ impl LentRing for Unasked {
         panic!("the ring was asked where {key} stands");
     }
 
+    fn head_position(&self, head: Head<'_>) -> Option<u64> {
+        panic!("the ring was asked where the head {head:?} stands");
+    }
+
     fn walk(&self, position: u64, _: &mut dyn FnMut(&str) -> bool) {
         panic!("the ring was walked from {position}");
     }
 }
 
-/// Under `prefix_hash` a request through the one call is lent no ring. The
-/// classic policy asks its ring for another text than the routing value's
-/// own (`model_gateway/src/policies/prefix_hash.rs`, lines 223 to 229 and
-/// 291 to 293 at 882be6f4f), and no place is read here by that rule. So
-/// the stage's own ring places the request on the worker it has with no
-/// ring lent, and the caller's ring is asked nothing. A document with no
-/// ring stage asks it nothing either.
+/// A ring whose lender places no request by a head: it answers nothing for
+/// one, as the trait does for a lender that says nothing, and may be asked
+/// nothing else.
+#[derive(Debug)]
+struct Headless;
+
+impl LentRing for Headless {
+    fn position(&self, key: &str) -> u64 {
+        panic!("the ring was asked where {key} stands");
+    }
+
+    fn walk(&self, position: u64, _: &mut dyn FnMut(&str) -> bool) {
+        panic!("the ring was walked from {position}");
+    }
+}
+
+/// Under `prefix_hash` a lender that places no head lends no ring: the
+/// request states no place, and the stage's own ring places it on the
+/// worker it has with no ring lent. The lender is not asked where a key's
+/// own text stands, which is no place of this form: a routing value and a
+/// prompt are answered alike. A document with no ring stage asks a ring
+/// nothing at all.
 #[test]
-fn a_request_under_the_prefix_form_is_lent_no_ring() {
+fn a_lender_that_places_no_head_lends_no_ring_under_the_prefix_form() {
     let tokens: Vec<u32> = (0..64).collect();
-    let headers = [("x-smg-routing-key", "conv-1")];
-    for name in ["prefix_hash", "random"] {
+    let keyed = [("x-smg-routing-key", "conv-1")];
+    let rings: [(&str, &'static dyn LentRing); 2] =
+        [("prefix_hash", &Headless), ("random", &Unasked)];
+    for (name, ring) in rings {
         let engine = hosted(preset(name));
         let list = pool(8);
         let members = PublishedList::new(Arc::clone(&list));
-        let request = |ring: Option<&'static dyn LentRing>| PlaceRequest {
+        for headers in [&keyed as &dyn HeaderRead, &()] {
+            let request = |ring: Option<&'static dyn LentRing>| PlaceRequest {
+                prompt: Prompt {
+                    tokens: Some(&tokens),
+                    ..Prompt::NONE
+                },
+                headers,
+                ring,
+                ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+            };
+            let placed = |request: &PlaceRequest<'_>| {
+                let placement = engine.place(request).expect("a placement");
+                let worker = |held: &Arc<dyn Worker>| Arc::ptr_eq(held, &placement.worker);
+                list.iter().position(worker).expect("a worker of the list")
+            };
+            let lent = request(Some(ring));
+            let made = Made::new(engine, &lent, &[]);
+            let facts = made.make(engine.spec()).facts;
+            assert!(facts.ring.is_none(), "{name}");
+            assert!(facts.ring_positions.is_empty(), "{name}");
+            let with = placed(&lent);
+            if name == "prefix_hash" {
+                assert_eq!(with, placed(&request(None)), "the stage's own ring");
+            }
+        }
+    }
+}
+
+/// The `prefix_hash` preset over a view of `boundaries`, whose binding
+/// reads a client's value too, from the header `x-client`.
+fn prefixed(boundaries: &[u32]) -> PolicyEngine {
+    let mut document = PolicySpec::preset("prefix_hash").expect("a built-in preset");
+    document.view.boundaries = boundaries.to_vec();
+    let header = |name: &str, client| KeySourceSpec {
+        header: Some(name.to_owned()),
+        client,
+        ..KeySourceSpec::default()
+    };
+    document.bindings[0].routing_key = Some(RoutingKeySpec {
+        sources: vec![header("x-smg-routing-key", false), header("x-client", true)],
+        strip_lineage: false,
+    });
+    engine_of(&document)
+}
+
+/// Under the prefix form a request through the one call states where its
+/// lender puts each of its heads, the deepest first: a head at each of the
+/// view's boundaries the prompt reaches, and for a prompt that reaches
+/// none the one head of the form's depth, which a shorter prompt is whole.
+/// The gateway's own policy cuts a prompt so
+/// (`model_gateway/src/policies/prefix_hash.rs`, lines 361 to 386 at
+/// 882be6f4f). A routing value leads the prompt: its text is the one head,
+/// placed as a head is and never as a key's own text. A client's value
+/// places nothing. The request goes where the ring's walk reaches from its
+/// first place. The lender is asked once for each head: a second making
+/// states the places the first took.
+#[test]
+fn a_request_under_the_prefix_form_states_where_its_heads_stand() {
+    let engine = hosted(prefixed(&[64, 256]));
+    let list = pool(8);
+    let members = PublishedList::new(Arc::clone(&list));
+    let order = [6, 1, 4, 0, 7, 2, 5, 3];
+    let urls = order.iter().map(|&at| list[at].url().to_owned());
+    let ring = Asked(Lent(urls.collect()), AtomicU32::new(0));
+    let asks = || ring.1.load(atomic::Ordering::Relaxed);
+    let at = |head: Head<'_>| ring.0.head_position(head).expect("a lender of heads");
+    // The request's places, and the worker of the list it went to.
+    let stated = |tokens: Option<&[u32]>, text: Option<&str>, headers: &dyn HeaderRead| {
+        let request = PlaceRequest {
             prompt: Prompt {
-                tokens: Some(&tokens),
+                tokens,
+                text,
                 ..Prompt::NONE
             },
-            headers: &headers,
+            headers,
+            ring: Some(&ring),
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let made = Made::new(engine, &request, &[]);
+        let before = asks();
+        let facts = made.make(engine.spec()).facts;
+        let places = facts.ring_positions.to_vec();
+        assert_eq!(
+            facts.ring.is_some(),
+            !places.is_empty(),
+            "lent with a place"
+        );
+        assert_eq!(asks() - before, places.len() as u32, "one ask a head");
+        assert_eq!(made.make(engine.spec()).facts.ring_positions, places);
+        assert_eq!(asks() - before, places.len() as u32, "a second making");
+        let placement = engine.place(&request).expect("a placement");
+        let worker = |held: &Arc<dyn Worker>| Arc::ptr_eq(held, &placement.worker);
+        let went = list.iter().position(worker).expect("a worker of the list");
+        if let Some(&first) = places.first() {
+            assert_eq!(went, order[(first % 8) as usize], "the walk's first");
+        }
+        places
+    };
+    let ids: Vec<u32> = (500..800).collect();
+    let both = [at(Head::Tokens(&ids[..256])), at(Head::Tokens(&ids[..64]))];
+    assert_eq!(stated(Some(&ids), None, &()), both);
+    assert_eq!(
+        stated(Some(&ids[..100]), None, &()),
+        [at(Head::Tokens(&ids[..64]))]
+    );
+    assert_eq!(
+        stated(Some(&ids[..40]), None, &()),
+        [at(Head::Tokens(&ids[..40]))]
+    );
+    // A text is cut at four characters a token.
+    let text: String = (0..300).map(|at| format!("{at:04}")).collect();
+    let cut = [at(Head::Text(&text[..1024])), at(Head::Text(&text[..256]))];
+    assert_eq!(stated(None, Some(&text), &()), cut);
+    assert_eq!(stated(Some(&[]), Some(&text), &()), cut, "no token id");
+    let keyed = [("x-smg-routing-key", "conv-1")];
+    let led = stated(Some(&ids), None, &keyed);
+    assert_eq!(led, [at(Head::Text("conv-1"))]);
+    assert_ne!(led, [ring.0.position("conv-1")], "the key's own text");
+    let client = [("x-client", "10.0.0.1")];
+    assert_eq!(stated(Some(&ids), None, &client), both);
+    assert_eq!(stated(None, None, &client), [0_u64; 0]);
+}
+
+/// A ring that places a head of token ids at its length in tokens. Its walk
+/// reaches one worker from the place of a head of sixteen tokens and
+/// another from every other place.
+#[derive(Debug)]
+struct ByDepth {
+    shallowest: String,
+    deeper: String,
+}
+
+impl LentRing for ByDepth {
+    fn position(&self, key: &str) -> u64 {
+        panic!("the ring was asked where {key} stands");
+    }
+
+    fn head_position(&self, head: Head<'_>) -> Option<u64> {
+        match head {
+            Head::Tokens(ids) => Some(ids.len() as u64),
+            Head::Text(_) => None,
+        }
+    }
+
+    fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
+        let from_sixteen = position == 16;
+        let _ = take(if from_sixteen {
+            &self.shallowest
+        } else {
+            &self.deeper
+        });
+    }
+}
+
+/// A prompt that reaches more boundaries than its list of places holds in
+/// itself states every one of them, the deepest first, and is tried at
+/// each in turn: the gateway's own policy lists every boundary a prompt
+/// reaches and tries each until one's owner is under the bound
+/// (`model_gateway/src/policies/prefix_hash.rs`, lines 172 to 180 and 291
+/// to 319 at 882be6f4f). Here nine. The owner of the eight deepest is past
+/// the bound, and the ninth's takes the request, though two workers hold
+/// fewer requests. A prompt that reaches a tenth boundary states ten
+/// places: none is lost and none stated twice.
+#[test]
+fn a_prompt_that_reaches_nine_boundaries_is_tried_at_the_ninth() {
+    let boundaries: Vec<u32> = (1..=10).map(|at| 16 * at).collect();
+    let engine = hosted(prefixed(&boundaries));
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    (0..30).for_each(|_| list[0].increment_load());
+    (0..5).for_each(|_| list[1].increment_load());
+    let ring = ByDepth {
+        shallowest: list[1].url().to_owned(),
+        deeper: list[0].url().to_owned(),
+    };
+    let ids: Vec<u32> = (0..150).collect();
+    let request = PlaceRequest {
+        prompt: Prompt {
+            tokens: Some(&ids),
+            ..Prompt::NONE
+        },
+        ring: Some(&ring),
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+    };
+    let made = Made::new(engine, &request, &[]);
+    let places = made.make(engine.spec()).facts.ring_positions.to_vec();
+    assert_eq!(places, [144, 128, 112, 96, 80, 64, 48, 32, 16]);
+    let placement = engine.place(&request).expect("a placement");
+    assert!(
+        Arc::ptr_eq(&placement.worker, &list[1]),
+        "the ninth's owner"
+    );
+    let ids: Vec<u32> = (0..160).collect();
+    let request = PlaceRequest {
+        prompt: Prompt {
+            tokens: Some(&ids),
+            ..Prompt::NONE
+        },
+        ring: Some(&ring),
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+    };
+    let made = Made::new(engine, &request, &[]);
+    let places = made.make(engine.spec()).facts.ring_positions.to_vec();
+    assert_eq!(places, [160, 144, 128, 112, 96, 80, 64, 48, 32, 16]);
+}
+
+/// A scorer that scores every worker alike, and counts how often it is
+/// asked what it needs and how it places by heads.
+#[derive(Debug)]
+struct CountsAsks(Arc<AtomicU32>);
+
+impl Lifecycle for CountsAsks {}
+
+impl Scorer for CountsAsks {
+    fn name(&self) -> &'static str {
+        "counts-asks"
+    }
+
+    fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
+        out.fill(0.0);
+        TieBand::NORMALIZED
+    }
+
+    fn needs(&self) -> Needs {
+        self.0.fetch_add(1, atomic::Ordering::Relaxed);
+        Needs::default()
+    }
+
+    fn places_by_heads(&self) -> Option<HeadRule<'_>> {
+        self.0.fetch_add(1, atomic::Ordering::Relaxed);
+        None
+    }
+}
+
+/// A stage says how it places by heads, and what it needs, where its
+/// generation is built. No making of a request and no decision asks it
+/// again, under a lent ring or under none: the engine answers from what
+/// the build kept.
+#[test]
+fn a_stage_is_asked_how_it_places_where_its_generation_is_built() {
+    let asks = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&asks);
+    let mut stages = StageRegistry::builtin();
+    let added = stages.scorer("counts-asks", move || {
+        Box::new(CountsAsks(Arc::clone(&counted)))
+    });
+    added.expect("a free name");
+    // The prefix form's document, the counting stage beside its ring stage.
+    let document = PolicySpec::preset("prefix_hash").expect("a built-in preset");
+    let mut document = serde_json::to_value(document).expect("the document as JSON");
+    let profiles = document["profiles"].as_object_mut();
+    for profile in profiles.expect("the profiles").values_mut() {
+        let score = profile["score"].as_array_mut();
+        score
+            .expect("the profile's scorers")
+            .push("counts-asks".into());
+    }
+    let mut document: PolicySpec = serde_json::from_value(document).expect("a document");
+    document.generation = 1;
+    let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+    let engine = hosted(PolicyEngine::new(spec.expect("the stages hold the scorer")));
+    let built = asks.load(atomic::Ordering::Relaxed);
+    assert!(built > 0, "the build asks the stage");
+
+    let list = pool(2);
+    let members = PublishedList::new(Arc::clone(&list));
+    let lent = Lent(vec![list[0].url().to_owned()]);
+    let ids: Vec<u32> = (0..64).collect();
+    for ring in [Some(&lent as &dyn LentRing), None] {
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(&ids),
+                ..Prompt::NONE
+            },
             ring,
             ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
         };
-        let placed = |request: &PlaceRequest<'_>| {
-            let placement = engine.place(request).expect("a placement");
-            let worker = |held: &Arc<dyn Worker>| Arc::ptr_eq(held, &placement.worker);
-            list.iter().position(worker).expect("a worker of the list")
-        };
-        let lent = request(Some(&Unasked));
-        let made = Made::new(engine, &lent, &[]);
+        let made = Made::new(engine, &request, &[]);
         let facts = made.make(engine.spec()).facts;
-        assert!(facts.ring.is_none(), "{name}");
-        assert!(facts.ring_positions.is_empty(), "{name}");
-        let with = placed(&lent);
-        if name == "prefix_hash" {
-            assert_eq!(with, placed(&request(None)), "the stage's own ring");
+        assert_eq!(facts.ring.is_some(), ring.is_some());
+        engine.place(&request).expect("a placement");
+    }
+    let asked = asks.load(atomic::Ordering::Relaxed);
+    assert_eq!(asked, built, "no decision asks the stage");
+}
+
+/// A lender that answers a script: for each head it is asked about, in the
+/// order of its asks, the place the script holds, and `None` where the
+/// script says so. It counts its asks, and is asked nothing else.
+#[derive(Debug)]
+struct Scripted(&'static [Option<u64>], AtomicU32);
+
+impl LentRing for Scripted {
+    fn position(&self, key: &str) -> u64 {
+        panic!("the ring was asked where {key} stands");
+    }
+
+    fn head_position(&self, _: Head<'_>) -> Option<u64> {
+        let at = self.1.fetch_add(1, atomic::Ordering::Relaxed);
+        self.0.get(at as usize).copied().flatten()
+    }
+
+    fn walk(&self, position: u64, _: &mut dyn FnMut(&str) -> bool) {
+        panic!("the ring was walked from {position}");
+    }
+}
+
+/// A lender that answers nothing for a head lends no ring, whichever head
+/// it declines: the request states no place, a place answered ahead of the
+/// `None` among them, and the lender is asked about no head behind that
+/// one. A routing value is the request's one head: where the lender
+/// declines it, the prompt behind it is not asked about. A second making
+/// asks nothing again.
+#[test]
+fn a_lender_that_declines_a_head_is_asked_nothing_more() {
+    let engine = hosted(prefixed(&[16, 32, 48]));
+    let list = pool(2);
+    let members = PublishedList::new(Arc::clone(&list));
+    let ids: Vec<u32> = (0..48).collect();
+    let keyed = [("x-smg-routing-key", "conv-1")];
+    // The lender's script, the request's headers, the asks the lender
+    // counts.
+    let rows: [(&'static [Option<u64>], &dyn HeaderRead, u32); 4] = [
+        (&[None, Some(1), Some(2)], &(), 1),
+        (&[Some(1), None, Some(2)], &(), 2),
+        (&[Some(1), Some(2), None], &(), 3),
+        (&[None, Some(1), Some(2)], &keyed, 1),
+    ];
+    for (script, headers, asks) in rows {
+        let ring = Scripted(script, AtomicU32::new(0));
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(&ids),
+                ..Prompt::NONE
+            },
+            headers,
+            ring: Some(&ring),
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let made = Made::new(engine, &request, &[]);
+        for making in 0..2 {
+            let facts = made.make(engine.spec()).facts;
+            assert!(facts.ring.is_none(), "{script:?}, making {making}");
+            assert!(facts.ring_positions.is_empty(), "{script:?}");
+            let asked = ring.1.load(atomic::Ordering::Relaxed);
+            assert_eq!(asked, asks, "{script:?}, making {making}");
         }
     }
 }
@@ -1905,17 +2337,19 @@ fn a_request_under_the_prefix_form_is_lent_no_ring() {
 /// A pair's request is lent the ring where a side's ring stage places a
 /// routing value by its own text, the prefill's or the decode's: both
 /// sides are handed the one ring, and each takes it by its own stage
-/// ([`RequestFacts::ring`]). A pair with no such stage is lent none, and
-/// neither is a pair with a side of the prefix form, which would take the
-/// one place stated for its own: the caller's ring is asked nothing.
+/// ([`RequestFacts::ring`]). The prefix form is lent it by the same rule,
+/// and states the lender's place of the routing value as a head. A side
+/// that reads no ring holds nothing back. A pair with no ring stage is
+/// lent none, and neither is a pair of two ring forms or of two depths,
+/// whose one list of places would be one side's alone: the caller's ring
+/// is asked nothing.
 #[test]
 fn a_pairs_request_is_lent_the_ring_a_side_of_it_places_by() {
     let list = pool(2);
     let headers = [("x-smg-routing-key", "conv-1")];
     let ring = Lent(vec![list[1].url().to_owned(), list[0].url().to_owned()]);
-    let stated = |prefill: &str, decode: &str, ring: &dyn LentRing| {
-        let document = PolicySpec::pair_presets(prefill, decode);
-        let engine = engine_of(&document.expect("the pair presets"));
+    let stated = |document: PolicySpec, ring: &dyn LentRing| {
+        let engine = engine_of(&document);
         let members = PublishedList::new(Arc::clone(&list));
         let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
         let pair = pair_of(&members, &classes);
@@ -1928,16 +2362,43 @@ fn a_pairs_request_is_lent_the_ring_a_side_of_it_places_by() {
         let facts = made.make(engine.spec()).facts;
         (facts.ring.is_some(), facts.ring_positions.to_vec())
     };
+    let pair = |prefill: &str, decode: &str| {
+        PolicySpec::pair_presets(prefill, decode).expect("the pair presets")
+    };
+    let (ringed, prefixed, plain) = ("consistent_hashing", "prefix_hash", "round_robin");
     let lent = (true, vec![ring.position("conv-1")]);
-    let ringed = "consistent_hashing";
-    assert_eq!(stated(ringed, ringed, &ring), lent);
-    assert_eq!(stated("round_robin", ringed, &ring), lent);
-    assert_eq!(stated(ringed, "round_robin", &ring), lent);
+    assert_eq!(stated(pair(ringed, ringed), &ring), lent);
+    assert_eq!(stated(pair(plain, ringed), &ring), lent);
+    assert_eq!(stated(pair(ringed, plain), &ring), lent);
+    let head = ring.head_position(Head::Text("conv-1"));
+    let lent = (true, head.into_iter().collect::<Vec<_>>());
+    assert_eq!(lent.1.len(), 1);
+    assert_eq!(stated(pair(prefixed, prefixed), &ring), lent);
+    assert_eq!(stated(pair(plain, prefixed), &ring), lent);
+    assert_eq!(stated(pair(prefixed, plain), &ring), lent);
     let none = (false, Vec::new());
-    assert_eq!(stated("round_robin", "round_robin", &Unasked), none);
-    assert_eq!(stated("prefix_hash", "prefix_hash", &Unasked), none);
-    assert_eq!(stated("prefix_hash", ringed, &Unasked), none);
-    assert_eq!(stated(ringed, "prefix_hash", &Unasked), none);
+    assert_eq!(stated(pair(plain, plain), &Unasked), none);
+    assert_eq!(stated(pair(prefixed, ringed), &Unasked), none);
+    assert_eq!(stated(pair(ringed, prefixed), &Unasked), none);
+    let mut two_depths = pair(prefixed, prefixed);
+    let decode = two_depths.profiles.get_mut("decode").expect("the side");
+    decode.score[0] = ScoreStage::ConsistentHash(ConsistentHashParams {
+        prefix_tokens: Some(128),
+        ..ConsistentHashParams::default()
+    })
+    .into();
+    assert_eq!(stated(two_depths, &Unasked), none);
+    // The engine's own word, phase by phase: a pair asked at its prefill
+    // is answered for both its profiles, and a decode asked alone for its
+    // own.
+    let depths = |document: PolicySpec| {
+        let engine = engine_of(&document);
+        let rule = |phase| engine.spec().engine().states_head_places(MODEL, phase);
+        [Phase::Prefill, Phase::Decode].map(|phase| rule(phase).map(|rule| rule.depth))
+    };
+    assert_eq!(depths(pair(prefixed, plain)), [Some(256), None]);
+    assert_eq!(depths(pair(plain, prefixed)), [Some(256), Some(256)]);
+    assert_eq!(depths(pair(prefixed, ringed)), [None, None]);
 }
 
 /// A filter of the host's own. It keeps a worker for a request that is
