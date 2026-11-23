@@ -386,6 +386,8 @@ decided by the engine's entry for an encode request over three lists of worker o
 `overload.json` replays through the worker crate's load monitor, built as a host of the engine over worker lists
 builds it, which the `worker-host` feature brings.
 
+`minimum_tokens.json` replays through the rank cache of that load monitor, behind the same feature.
+
 ## Limits left
 
 A limit is a recorded row the replay does not decide as recorded, with the reason. The replay names each one and
@@ -432,13 +434,19 @@ fails once the reason no longer holds.
 - `bucket.json`: none. All 19 rows replay.
 - `cache_aware.json`: none. All 28 rows replay.
 - `sticky_override.json`: none. All 18 rows replay.
-- `minimum_tokens.json`: owed whole, 18 rows. A row records the rank the load monitor's rank cache gives a request
+- `minimum_tokens.json`: none through the load monitor's rank cache. All 18 rows replay there, rank for rank.
+  A row records the rank the load monitor's rank cache gives a request
   on a worker that stands for several ranks: an answer of the host's own code, asked after the pick. The crate's
   store listed a row a rank and decided these rows by rules of its own, eight as recorded and ten apart, until the
   replay stopped reading that store.
-  No module replays the sheet now: the replay names it as owed and holds it to its 18 rows,
-  until the change that asks the load monitor of a controller's host. Three of the ten rows were held apart by
-  rules of the engine's scorer and picker, which stand whatever feeds a rank's loads. A rank is scored by the
+  The replay builds the monitor as the overload sheet's replay does and hands it each poll, failed poll and
+  eviction. It asks the monitor's rank cache for each request's rank, with the worker as one object for all its
+  ranks, or as the object of its one rank in the three rows that say so.
+  It does not replay the engine's pick among rank objects, and these rows are not that pick's answers. The engine
+  serves no rank option: `refuse_unsupported` in `src/document/routing_settings.rs` refuses the gateway's, and
+  where each rank is a worker object the engine picks among them by its profile.
+  Three of the ten rows answer apart under the engine's pick among rank objects,
+  by rules of its scorer and picker. There a rank is scored by the
   context tokens of its requests, not by the tokens its cache uses
   (`the-used-tokens-decide-where-a-rank-holds-fewer-context-tokens`,
   `a-rank-that-reports-no-context-tokens-is-a-rank-by-its-used-tokens`), and equal ranks are drawn, where the

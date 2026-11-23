@@ -165,8 +165,8 @@ impl Bed {
     }
 
     /// One request decided over the rank objects of the worker: the rank of
-    /// its target, or `None` where the decision names no worker.
-    fn pick(&mut self, key: Option<&str>) -> Option<u16> {
+    /// its target, or the engine's reason where it picks no worker.
+    fn pick(&mut self, key: Option<&str>) -> Result<u16, String> {
         self.seed += 1;
         let asked = Asked {
             request: Request {
@@ -186,10 +186,15 @@ impl Bed {
             },
         };
         let decided = self.engine.decide_under(GatewayId::LOCAL, &asked, self.now);
-        let (decided, _) = decided.ok()?.whole()?;
+        let decided = decided.map_err(|refused| format!("no decision: {refused:?}"))?;
+        let (decided, _) = decided.whole().ok_or("a place alone")?;
         match decided.decision {
-            Decision::Pick(pick) => Some(pick.targets.first()?.dp_rank),
-            _ => None,
+            Decision::Pick(pick) => {
+                let target = pick.targets.first().ok_or("a pick that names no worker")?;
+                Ok(target.dp_rank)
+            }
+            Decision::Shed(shed) => Err(format!("shed under {}", shed.emptied_by)),
+            Decision::Queue(_) => Err("a queue ticket".to_string()),
         }
     }
 }
@@ -234,23 +239,25 @@ const APART: &[Apart] = &[
 fn replay(row: &Row) -> Result<Outcome, String> {
     let mut bed = Bed::new(row.listed())?;
     let Some(keys) = row.keys else {
-        return Ok(Outcome::Sequence(
-            row.steps
-                .iter()
-                .map(|Step::Pick { key }| bed.pick(key.as_deref()))
-                .collect(),
-        ));
+        let picks: Result<Vec<_>, String> = row
+            .steps
+            .iter()
+            .map(|Step::Pick { key }| bed.pick(key.as_deref()).map(Some))
+            .collect();
+        return picks.map(Outcome::Sequence);
     };
     let mut rank = |i: u32| bed.pick(Some(&format!("key-{i}")));
     let counts = if keys.pairs {
-        let together = (0..keys.count)
-            .filter(|&i| rank(i).is_some_and(|first| rank(i) == Some(first)))
-            .count() as u32;
+        let mut together = 0;
+        for i in 0..keys.count {
+            let first = rank(i)?;
+            together += u32::from(rank(i)? == first);
+        }
         vec![together, keys.count - together]
     } else {
         let mut counts = vec![0u32; usize::from(row.listed())];
         for i in 0..keys.count {
-            let rank = rank(i).ok_or("a key took no rank")?;
+            let rank = rank(i)?;
             counts[usize::from(rank)] += 1;
         }
         counts.sort_unstable_by(|a, b| b.cmp(a));

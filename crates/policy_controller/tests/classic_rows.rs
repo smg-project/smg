@@ -37,8 +37,8 @@
 //! must replay verdict for verdict through that monitor, built as a host of
 //! the engine over worker lists builds it, which `worker-host` brings.
 //! A minimum-tokens row holds the rank the load monitor gave each request
-//! on one worker. This crate's store judged it by rules of its own and is
-//! no longer read here, so that sheet is owed ([`OWED_SHEETS`]).
+//! on one worker. It must replay rank for rank through the rank cache of
+//! that monitor, which is the worker crate's own rank choice.
 //! A retry-wire row, a media row, a context-window row and a rank-pin row
 //! hold the gateway's answer to each request of one pool, a retry that
 //! stays on its wire, a request that carries media, a request of some
@@ -59,6 +59,9 @@
 //! one worker object for each rank, where the load monitor judges each
 //! object by its own rank's figures, and holds the rows that answer apart
 //! there to the verdicts its entries give.
+//! The minimum-tokens module replays no row through the engine: the engine
+//! serves no rank option, and where each rank is a worker object it picks
+//! among them by its profile, which these rows do not record.
 //! A row whose form this crate does not build yet is owed: [`OWED`] names
 //! it with the validator's words and the
 //! change that builds it, and the replay fails once the row is no longer
@@ -83,8 +86,10 @@ mod classic {
     pub mod context_window;
     pub mod demand_bed;
     pub mod encode_pair;
+    pub mod load_bed;
     pub mod manual;
     pub mod media_refs;
+    pub mod minimum_tokens;
     pub mod overload;
     pub mod pair_index;
     pub mod pair_select;
@@ -144,23 +149,13 @@ struct OwedSheet {
     by: &'static str,
 }
 
-/// The owed sheets. The first was recorded before the change that replays
-/// it landed here. The other records an answer of the host's own load
-/// monitor, which the engine over worker lists is never asked: its module
-/// replayed it through this crate's store, by the store's own rules, and
-/// left when this replay stopped reading the store.
-const OWED_SHEETS: &[OwedSheet] = &[
-    OwedSheet {
-        policy: "constraint-decider",
-        rows: 5,
-        by: "a request's hard demands: the constraint's decider on a retry",
-    },
-    OwedSheet {
-        policy: "minimum_tokens",
-        rows: 18,
-        by: "the load monitor's rank choice, asked of the host a controller runs",
-    },
-];
+/// The owed sheets: one, recorded before the change that replays
+/// it landed here.
+const OWED_SHEETS: &[OwedSheet] = &[OwedSheet {
+    policy: "constraint-decider",
+    rows: 5,
+    by: "a request's hard demands: the constraint's decider on a retry",
+}];
 
 /// The owed sheet of a policy, when one is owed.
 fn owed_sheet(policy: &str) -> Option<&'static OwedSheet> {
@@ -309,6 +304,8 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// pair-select module does.
 /// An overload row picks nothing either: its module brings its own replay,
 /// over a host's load monitor, and holds a copied row whole too.
+/// A minimum-tokens row names a rank or none: its module brings its own
+/// replay, over the rank cache of that monitor, and holds a copied row whole.
 /// An encode-pair row is replayed in its store part by its own module;
 /// its copied rows name no runtime either, and the pair index's rule
 /// holds them.
@@ -317,7 +314,7 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// brings its own replay too, over one bed; their copied rows name each
 /// runtime by a token, or name none, and the pair index's rule holds them
 /// as well.
-const MODULES: [Module; 16] = [
+const MODULES: [Module; 17] = [
     module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
     module::<classic::bucket::Row>(classic::bucket::INLINE),
     module::<classic::cache_aware::Row>(classic::cache_aware::INLINE),
@@ -339,6 +336,12 @@ const MODULES: [Module; 16] = [
         inline: classic::media_refs::INLINE,
         replay: classic::media_refs::replay_rows,
         copied: classic::pair_index::copied_row_defects,
+    },
+    Module {
+        policy: classic::minimum_tokens::POLICY,
+        inline: classic::minimum_tokens::INLINE,
+        replay: classic::minimum_tokens::replay_rows,
+        copied: whole_row_defects,
     },
     Module {
         policy: classic::overload::POLICY,
@@ -776,6 +779,13 @@ fn the_classic_sticky_rank_rows_replay_rank_for_rank_and_count_for_count() {
 #[test]
 fn the_classic_overload_rows_replay_verdict_for_verdict() {
     let (rows, defects) = replay_sheet(classic::overload::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
+fn the_classic_minimum_tokens_rows_replay_rank_for_rank() {
+    let (rows, defects) = replay_sheet(classic::minimum_tokens::INLINE, "the inline rows");
     assert!(rows >= 8, "{rows} inline rows");
     assert!(defects.is_empty(), "{defects:#?}");
 }
@@ -1323,6 +1333,7 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
             "encode_pair.json",
             "manual.json",
             "media-refs.json",
+            "minimum_tokens.json",
             "overload.json",
             "pair-index.json",
             "pair-select.json",

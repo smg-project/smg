@@ -179,7 +179,7 @@ Once the prefill is dispatched, `store.issue_decode(gateway, id, decode, now)` c
 Build from a checkout with `protoc` available. The service feature uses the worker protocol files from the checkout. The stock binary requires the `controller` feature, which enables `worker-host`. Without `controller`, cargo builds no binary and says nothing. Save the first policy document above as `policy.yaml`, then run the following from the checkout root.
 
 ```sh
-cargo build --release --locked -p smg-policy-controller --features controller,worker-host
+cargo build --release --locked -p smg-policy-controller --features controller
 target/release/smg-policy-controller --controller-id controller-0 --spec-file policy.yaml \
   --gateway-listen 127.0.0.1:30100 --control-listen 127.0.0.1:30101 \
   --replication-listen 127.0.0.1:30102 --admin-listen 127.0.0.1:30103 \

@@ -1791,6 +1791,43 @@ fn a_cap_the_records_holders_fill_is_not_read_past() {
     });
 }
 
+/// Under a source that reads the record alone the record's holders are
+/// named ahead of the index's, and the index is asked in the room they
+/// leave. Where the record names fewer holders than the profile's sample
+/// and the index holds the request for another worker, each holder stands
+/// in the naming once: the record is not read again behind the index.
+#[test]
+fn a_record_named_ahead_is_not_named_again_behind_the_index() {
+    use crate::document::spec::{AffinitySource, BestParams, PickStage, ScoreSpec};
+
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    document.generation = 1;
+    let profile = document
+        .profiles
+        .get_mut("cache_aware")
+        .expect("the profile");
+    profile.pick = PickStage::Best(BestParams { sample: 3 }).into();
+    for stage in &mut profile.score {
+        if let ScoreSpec::Params(ScoreStage::PrefixAffinity(prefix)) = stage {
+            prefix.source = Some(AffinitySource::Predictor);
+        }
+    }
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    assert_eq!(spec.engine().affinity_rows_cap(MODEL, Phase::Single), 3);
+
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 4);
+    store(&index, 0, &hashes_of(&asked));
+    let bed = Bed::new(affinity, spec, 3);
+    // The pick writes the record: the prefix was sent to the second worker.
+    let first = bed.decide(&request(&asked, 0, NOW), Some(1)).expect("rows");
+    assert_eq!(first.holders, [(0, 4, 0)]);
+    // One holder of the record and one of the index, under a sample of
+    // three: the room left is not filled by the record a second time.
+    assert_eq!(bed.holders(&asked, NOW), [(0, 4, 0), (1, 0, 4)]);
+}
+
 /// A naming is made once a decision, ahead of its filters. The holder the
 /// record names and the holder the index names stand in it by row, each
 /// with its depth, and they stand whole where the filters refuse every
