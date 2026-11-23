@@ -2548,6 +2548,13 @@ fn anchored_digit_stages_cut_digit_runs_as_the_library_does() {
 #[test]
 fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
     let mut state = 0x5A5A_1234_5678_9ABCu64;
+    // Two pools for the whole test: every thread of each calls at once.
+    let pools = [3, 7].map(|threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("pool")
+    });
     for shape in shapes() {
         let tokenizer = tokenizer_of(&shape, &mut state);
         let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
@@ -2559,14 +2566,27 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
             .chain(shape.stripped.iter().map(|(s, _, _, _)| *s))
             .collect();
         let mut compared = 0;
-        for _ in 0..3 {
-            let text = long_text(&mut state, &added, 3 * PARALLEL_MIN_BYTES);
+        for round in 0..3 {
+            // The third text has a handful of units, which the threads take
+            // as their own: fewer than the larger pool has threads. The
+            // others have thousands.
+            let text = if round < 2 {
+                long_text(&mut state, &added, 3 * PARALLEL_MIN_BYTES)
+            } else {
+                let piece = long_text(&mut state, &[], 3 * PARALLEL_MIN_BYTES / 8);
+                [piece.as_str(); 3].join(&format!(" {} ", added.first().unwrap_or(&"")))
+            };
             let units = native.units(&text, true, true).as_slice().len();
             assert!(
                 units >= 4,
                 "{}: {units} units for {} bytes",
                 shape.name,
                 text.len()
+            );
+            assert!(
+                round < 2 || units < 7,
+                "{}: {units} units, every thread has its own",
+                shape.name
             );
             let pooled = native
                 .encode_with(Some(tokenizer.get_model()), &text, true, false)
@@ -2576,6 +2596,19 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
                 .expect("serial");
             compared += 1;
             assert_eq!(pooled, serial, "{}: the pool changed the ids", shape.name);
+            for pool in &pools {
+                for ids in pool.broadcast(|_| {
+                    native.encode_with(Some(tokenizer.get_model()), &text, true, false)
+                }) {
+                    assert_eq!(
+                        ids.expect("pooled"),
+                        serial,
+                        "{}: {} callers at once",
+                        shape.name,
+                        pool.current_num_threads()
+                    );
+                }
+            }
             let reference = tokenizer
                 .encode(text.as_str(), false)
                 .expect("encode")
@@ -2589,6 +2622,41 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
             shape.name
         );
     }
+}
+
+/// Unit k of a long text is pool thread k's own: a thread takes its own unit
+/// before a free one. Thread 0 of a pool of two is held while thread 1 reads
+/// both units of a text whose second unit alone is not ASCII: the unit thread
+/// 1 read last is the first.
+#[test]
+fn a_pool_thread_takes_its_own_unit_of_a_long_text_first() {
+    use std::sync::{Barrier, Mutex};
+    let tokenizer = tokenizer_of(&shapes()[0], &mut 0x5A5A_1234_5678_9ABC);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let model = tokenizer.get_model();
+    let text = "xy ".repeat(24 << 10) + "я";
+    assert_eq!(native.units(&text, true, true).as_slice().len(), 2);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .expect("pool");
+    // Thread 1 holds `reading` from before the two meet until it returns or
+    // unwinds, and thread 0 waits for it inside its own callback: it can
+    // neither take a unit nor outlast a panic of thread 1.
+    let (met, reading) = (Barrier::new(2), Mutex::new(()));
+    let last_was_ascii = pool.broadcast(|context| {
+        if context.index() == 0 {
+            met.wait();
+            drop(reading.lock());
+            return false;
+        }
+        let _held = reading.lock();
+        met.wait();
+        let ids = native.encode_with(Some(model), &text, true, false);
+        ids.expect("pooled");
+        native.thread_piece_cache().borrow().unit_ascii
+    });
+    assert!(last_was_ascii[1], "thread 1 read the second unit first");
 }
 
 /// The added-token search through the tokens' prefixes finds what the

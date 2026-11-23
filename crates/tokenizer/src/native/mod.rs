@@ -67,8 +67,8 @@ use std::{
     hash::Hash,
     ops::Range,
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Mutex, OnceLock, PoisonError,
     },
     thread::ThreadId,
     time::{Duration, Instant},
@@ -471,6 +471,12 @@ impl Drop for Inside<'_> {
 /// The size a long text unit is cut into for the pool, at the first stable
 /// boundary past each multiple of it.
 const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
+/// The fewest bytes the units of a text may average for the pool's threads to
+/// take their own units of it. A text cut finer, as a chat transcript is by
+/// its added tokens, is read as the iterator splits it, a run of neighbours
+/// a thread: threads that each take every n-th of many small units write the
+/// same cache lines.
+const OWN_UNIT_MIN_BYTES: usize = 1 << 10;
 /// Threads of the pool the vocabulary seed is read on at load. The pool is
 /// built for that read and joined before the load returns: on rayon's
 /// global pool the first load would build that pool at the machine's
@@ -3103,8 +3109,8 @@ impl NativeEncoder {
     }
 
     /// [`Self::encode`] with the thread pool used or not; the ids are the
-    /// same either way (the units are encoded by the same code in the same
-    /// order).
+    /// same either way (the units are encoded by the same code, and the
+    /// pool joins their ids in input order).
     pub(crate) fn encode_with(
         &self,
         model: Option<&ModelWrapper>,
@@ -3163,21 +3169,90 @@ impl NativeEncoder {
                 .iter()
                 .map(|unit| Vec::with_capacity(Self::ids_capacity(unit)))
                 .collect();
-            units
-                .par_iter()
-                .zip(parts.par_iter_mut())
-                .enumerate()
-                .try_for_each(|(index, (unit, ids))| {
+            if units.len() * OWN_UNIT_MIN_BYTES > text.len() {
+                units
+                    .par_iter()
+                    .zip(parts.par_iter_mut())
+                    .enumerate()
+                    .try_for_each(|(index, (unit, ids))| {
+                        let marker = self.marker_before(units, index, at_start);
+                        let mut mapped = String::new();
+                        let mut cache = self.piece_cache_for_text(text.len());
+                        // Filled through a Vec in this thread's frame: the
+                        // slots of `parts` share a cache line or two, and
+                        // every piece appended writes its Vec's length.
+                        let mut filled = std::mem::take(ids);
+                        self.encode_unit(
+                            model,
+                            unit,
+                            marker,
+                            words,
+                            &mut mapped,
+                            &mut filled,
+                            &mut cache,
+                        )?;
+                        self.answer_rest(&mut filled, &mut cache);
+                        *ids = filled;
+                        Ok(())
+                    })?;
+            } else {
+                // One callback a unit, as the iterator has, but the thread
+                // that runs a callback chooses its unit: unit k is the own
+                // unit of pool thread k (modulo the pool's size), and a
+                // thread takes its own units first, then any still free. A
+                // text read again so finds a unit's pieces in the cache of
+                // the thread that learned them, when that thread comes for
+                // it (none is sent for; a thread beyond the unit count owns
+                // none). The choice costs two allocations a call more than
+                // counted above (the units' claims and locks, the threads'
+                // counts). A unit costs one winning swap and one lock that
+                // no other thread asks for; every probe on the way to it
+                // costs a count, and a load where it names a unit already
+                // taken.
+                let slots: Vec<(AtomicBool, Mutex<&mut Vec<u32>>)> = parts
+                    .iter_mut()
+                    .map(|ids| (AtomicBool::new(false), Mutex::new(ids)))
+                    .collect();
+                let threads = rayon::current_num_threads();
+                // How many of its own units each thread has come for (a
+                // scan for the next one grows with the square of a thread's
+                // units).
+                let came: Vec<AtomicUsize> = (0..threads.min(units.len()))
+                    .map(|_| AtomicUsize::new(0))
+                    .collect();
+                // The units any thread may take are offered once each, in
+                // order.
+                let offered = AtomicUsize::new(0);
+                let take = || {
+                    let me = rayon::current_thread_index().unwrap_or(0);
+                    let own = std::iter::from_fn(|| {
+                        let index = me + came.get(me)?.fetch_add(1, Ordering::Relaxed) * threads;
+                        (index < units.len()).then_some(index)
+                    });
+                    let rest = std::iter::from_fn(|| {
+                        let index = offered.fetch_add(1, Ordering::Relaxed);
+                        (index < units.len()).then_some(index)
+                    });
+                    let claim = |index: usize| {
+                        let taken = &slots[index].0;
+                        !taken.load(Ordering::Relaxed) && !taken.swap(true, Ordering::Relaxed)
+                    };
+                    let Some(index) = own.chain(rest).find(|&index| claim(index)) else {
+                        // Every offer is out: a unit still free is held by
+                        // the callback that fetched its offer, and that one
+                        // takes it. No unit is left unread.
+                        return Ok(());
+                    };
+                    // Only the thread that took the unit asks for its lock.
+                    let (_, ids) = &slots[index];
+                    let mut ids = ids.lock().unwrap_or_else(PoisonError::into_inner);
                     let marker = self.marker_before(units, index, at_start);
                     let mut mapped = String::new();
                     let mut cache = self.piece_cache_for_text(text.len());
-                    // Filled through a Vec in this thread's frame: the slots
-                    // of `parts` share a cache line or two, and every piece
-                    // appended writes its Vec's length.
-                    let mut filled = std::mem::take(ids);
+                    let mut filled = std::mem::take(&mut **ids);
                     self.encode_unit(
                         model,
-                        unit,
+                        &units[index],
                         marker,
                         words,
                         &mut mapped,
@@ -3185,9 +3260,17 @@ impl NativeEncoder {
                         &mut cache,
                     )?;
                     self.answer_rest(&mut filled, &mut cache);
-                    *ids = filled;
+                    **ids = filled;
                     Ok(())
-                })?;
+                };
+                // The range splits, and a decline stops it, as the iterator
+                // over the units did.
+                (0..units.len()).into_par_iter().try_for_each(|_| take())?;
+                debug_assert!(
+                    slots.iter().all(|(taken, _)| taken.load(Ordering::Relaxed)),
+                    "a unit of the text was left unread"
+                );
+            }
             let body: usize = parts.iter().map(Vec::len).sum();
             let mut ids = Vec::with_capacity(before.len() + body + after.len());
             ids.extend_from_slice(before);
