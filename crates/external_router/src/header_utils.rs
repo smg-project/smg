@@ -188,6 +188,10 @@ pub fn is_smg_owned_error_code_header(name: &str) -> bool {
 /// and the OpenAI-style streamed answers, `anthropic::sse::build_sse_response` for the
 /// Messages streamed ones.
 pub(crate) fn should_forward_header_no_alloc(name: &str) -> bool {
+    // The gateway's own CORS layer (`--cors-allowed-origins`) writes the
+    // `access-control-*` fields of an answer: an upstream's stay behind.
+    const ACCESS_CONTROL_PREFIX: &str = "access-control-";
+
     // List of headers that should NOT be forwarded: hop-by-hop, the SMG error-code
     // marker, and the upstream's `server` header, which names the upstream's software
     // and version to every client while the gateway's own answers carry none.
@@ -202,6 +206,9 @@ pub(crate) fn should_forward_header_no_alloc(name: &str) -> bool {
         || name.eq_ignore_ascii_case("content-encoding")
         || name.eq_ignore_ascii_case("host")
         || name.eq_ignore_ascii_case("server")
+        || name
+            .get(..ACCESS_CONTROL_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(ACCESS_CONTROL_PREFIX))
         || is_smg_owned_error_code_header(name))
 }
 
@@ -585,6 +592,11 @@ mod tests {
             "41"
         );
         assert_eq!(forwarded.get("retry-after").unwrap(), "3");
+    }
+
+    #[test]
+    fn the_response_filter_refuses_the_access_control_family() {
+        assert!(!should_forward_header_no_alloc("Access-Control-Made-Up"));
     }
 
     /// The tests' HTTP client, the process-level TLS crypto provider
