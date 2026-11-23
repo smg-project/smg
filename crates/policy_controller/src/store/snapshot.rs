@@ -1,13 +1,13 @@
-//! The snapshot a decision reads (design 4.1 and 5.5): every pool derived
+//! The store's published world (design 4.1 and 5.5): every pool derived
 //! from one membership, each a slice of whole candidate rows.
 //!
 //! One invariant: **a decision reads one publication.** A world is
 //! everything the store published together: a pool per model and role, its
 //! rows sorted by worker id, the gateways' standing vetoes and the
 //! generation they were published under ([`StoreSnapshot::spec`]). One load
-//! hands a decision all of it, so both sides of a pair decision, their load
-//! records, the vetoes and the engine with its number are of one publication,
-//! never a prefill pool of one and a decode pool of the next.
+//! hands a decision all of it, so the vetoes it reads and the engine with
+//! its number are of one publication, never the vetoes of one and the
+//! engine of the next.
 //!
 //! **A membership write owes its build.** A registration, its refresh and
 //! a patch write their row and leave one membership build owed. The store's
