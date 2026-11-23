@@ -45,9 +45,6 @@ pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 /// Default number of crops for HD transform.
 pub const DEFAULT_NUM_CROPS: usize = 16;
 
-/// Default number of image tokens per crop (144 per tile + base).
-pub const DEFAULT_NUM_IMG_TOKENS: usize = 144;
-
 /// Tile size used in Phi3-Vision (336x336).
 pub const TILE_SIZE: u32 = 336;
 
@@ -87,18 +84,6 @@ impl Phi3VisionProcessor {
             mean: CLIP_MEAN,
             std: CLIP_STD,
         }
-    }
-
-    /// This processor normalized with `config`'s mean and std where the config
-    /// sets them; the crop budget stays this processor's own.
-    pub fn with_normalization_of(mut self, config: &PreProcessorConfig) -> Self {
-        if let Some(mean) = &config.image_mean {
-            self.mean = [mean[0], mean[1], mean[2]];
-        }
-        if let Some(std) = &config.image_std {
-            self.std = [std[0], std[1], std[2]];
-        }
-        self
     }
 
     /// Create a processor from preprocessor config.
