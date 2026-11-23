@@ -15,10 +15,6 @@
 //!   wake is in the cell. For a run pinned to two cores; no gate reads it;
 //! - `policy_store_journal/member_write/<plain|journaled>/<n>`: one refresh
 //!   of a member's facts, the pool derived again;
-//! - `policy_store_journal/view_build/<plain|journaled>/<n>`: one
-//!   decision's build. A decision reads the published world and no line of
-//!   the journal: the two read alike, and the count says so where the
-//!   clock cannot;
 //! - `policy_store_journal/read/<events>`: one reader's copy of a batch out
 //!   of the log, the longest the log's lock is held;
 //! - `policy_store_journal/read/watched_at_head`: a watch's read of the
@@ -63,8 +59,8 @@ use smg_policy_controller::{
     engine::{LoadRow, Role, SignalSource, WorkerId},
     service::replication::Log,
     store::{
-        GatewayId, JournalKinds, LeasesStore, LoadSink, LoadSource, MemoryStore, Position,
-        ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        JournalKinds, LeasesStore, LoadSink, LoadSource, MemoryStore, Position, WorkerFacts,
+        WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
 };
 #[cfg(feature = "worker-host")]
@@ -292,33 +288,6 @@ fn member_write(c: &mut Criterion) {
     group.finish();
 }
 
-fn view_build(c: &mut Criterion) {
-    let mut group = c.benchmark_group("policy_store_journal/view_build");
-    for (kind, loads) in KINDS {
-        for n in SIZES {
-            let pool = pool_of(n, loads);
-            let ask = ViewQuery {
-                gateway: GatewayId(1),
-                now: pool.opened + Duration::from_secs(1),
-                pinned: None,
-                affinity: false,
-                signal_cells: false,
-            };
-            let mut out = ViewBuffers::default();
-            group.bench_with_input(BenchmarkId::new(kind, n), &n, |b, _| {
-                b.iter(|| {
-                    let built =
-                        pool.store
-                            .build_view(MODEL, Role::Single, black_box(&ask), &mut out);
-                    black_box(&out.candidates);
-                    built.map_or(0, |built| built.pool_size)
-                });
-            });
-        }
-    }
-    group.finish();
-}
-
 fn read(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_store_journal/read");
     let pool = pool_of(64, Some(LOADS));
@@ -466,7 +435,6 @@ criterion_group!(
     load_write,
     status_write,
     member_write,
-    view_build,
     read,
     cut,
     load_write_drained
