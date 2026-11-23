@@ -229,7 +229,14 @@ pub(crate) fn issue(
         state: LeaseState::issued(ttl_micros),
     };
     let told = |lease: &Lease| stages.on_decision_issued(lease, decision);
-    let lease = store.issue_decided(record, world.booked_of(first.id), told)?;
+    // The slot of the pick's count, as the decision's world names it. A
+    // member the worker objects list ahead of that world, inside its
+    // registration window, is read in the table its write filed it in:
+    // its lease books its count as any other's does.
+    let booked = world
+        .booked_of(first.id)
+        .or_else(|| store.filed_slot(first.id));
+    let lease = store.issue_decided(record, booked, told)?;
     front.count_shadow(said);
     Ok(Some(lease))
 }
