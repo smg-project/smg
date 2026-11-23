@@ -1482,7 +1482,7 @@ struct ServingArgs {
     cb_timeout_duration_secs: u64,
 
     /// While the circuit is closed, a failed request more than this many
-    /// seconds after the last one starts the count anew
+    /// seconds after the last one starts the count anew (at least 1)
     #[arg(long, default_value_t = 120, help_heading = "Circuit Breaker")]
     cb_window_duration_secs: u64,
 

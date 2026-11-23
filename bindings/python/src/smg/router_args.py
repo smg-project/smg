@@ -2552,7 +2552,10 @@ class RouterArgs:
             f"--{prefix}cb-window-duration-secs",
             type=int,
             default=RouterArgs.cb_window_duration_secs,
-            help="Sliding window duration in seconds for tracking failures",
+            help=(
+                "While the circuit is closed, a failed request more than this many seconds"
+                " after the last one starts the count anew (at least 1)"
+            ),
         )
         cb_group.add_argument(
             f"--{prefix}disable-circuit-breaker",
