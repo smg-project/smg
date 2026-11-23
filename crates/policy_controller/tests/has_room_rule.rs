@@ -149,6 +149,14 @@ fn the_requests_size_counts_where_the_rule_names_it() {
     assert_eq!(kept(&policy, 0, &request(100), &rows), [0, 1]);
     assert_eq!(kept(&policy, 0, &request(101), &rows), [0]);
     assert_eq!(kept(&policy, 0, &request(301), &rows), [0u32; 0]);
+    // A request of text alone counts at its text's bytes over four: 404
+    // bytes are the 101 tokens that leave the second row no room.
+    let worded = |prompt_bytes| RequestFacts {
+        prompt_bytes,
+        ..request(0)
+    };
+    assert_eq!(kept(&policy, 0, &worded(400), &rows), [0, 1]);
+    assert_eq!(kept(&policy, 0, &worded(404), &rows), [0]);
     // A rule that names no value of the request reads the same rows for any
     // request.
     let unsized_rule = self::policy(RESIDENT);

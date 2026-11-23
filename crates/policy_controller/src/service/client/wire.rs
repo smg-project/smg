@@ -46,7 +46,10 @@ pub(crate) fn request(request: &Request<'_>) -> (proto::DecideRequest, usize) {
             priority: facts.priority,
             streaming: facts.streaming,
             max_output_tokens: facts.max_output_tokens,
-            prompt_tokens: facts.prompt_tokens,
+            // A frame states one count: a request of text alone states
+            // its text's bytes over four, the number a frame stated before
+            // a request told its sizes apart.
+            prompt_tokens: facts.prompt_size(),
             block_hashes: facts.block_hashes[..held].to_vec(),
             hash_kind: match facts.hash_kind {
                 HashKind::Token => proto::HashKind::Token,
@@ -541,6 +544,37 @@ mod tests {
                 },
             );
         }
+    }
+
+    /// A frame states one count. A request of text alone states its text's
+    /// length and no count of tokens: it is sent as its bytes over four,
+    /// the count a frame stated before a request told its sizes apart. A
+    /// text of two-byte characters is sent by its bytes, and so is a text
+    /// whose characters nothing counted. A stated count of tokens is sent
+    /// as stated, whatever length stands beside it.
+    #[test]
+    fn a_frame_states_the_length_of_a_request_of_text_as_its_count() {
+        let sent = |prompt_tokens, (prompt_chars, prompt_bytes): (u32, u32)| {
+            let asked = Request {
+                id: b"a request",
+                facts: RequestFacts {
+                    model: "model-a",
+                    prompt_tokens,
+                    prompt_chars,
+                    prompt_bytes,
+                    ..RequestFacts::default()
+                },
+                constraints: Constraints::default(),
+            };
+            let facts = request(&asked).0.facts.expect("the frame's facts");
+            facts.prompt_tokens
+        };
+        // 52 one-byte characters, 26 two-byte characters, a text of 52
+        // bytes under a document that counts no characters, a count of
+        // tokens beside a text, and nothing.
+        let texts = [sent(0, (52, 52)), sent(0, (26, 52)), sent(0, (0, 52))];
+        assert_eq!(texts, [13, 13, 13]);
+        assert_eq!((sent(13, (400, 400)), sent(0, (0, 0))), (13, 0));
     }
 
     /// A list longer than a frame holds is copied no further than a frame's

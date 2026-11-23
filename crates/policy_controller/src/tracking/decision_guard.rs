@@ -82,8 +82,30 @@ use crate::{
         view::WorkerId,
     },
     store::GatewayId,
-    tracking::lease::{Dispatch, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass},
+    tracking::lease::{
+        Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass,
+    },
 };
+
+/// The three sizes a side's words state: its lease's token count and its
+/// text's two lengths ([`Lease::tokens`], [`Lease::chars`] and
+/// [`Lease::bytes`]).
+#[derive(Clone, Copy, Default)]
+struct Stated {
+    tokens: u32,
+    chars: u32,
+    bytes: u32,
+}
+
+impl Stated {
+    const fn of(lease: &Lease) -> Self {
+        Self {
+            tokens: lease.tokens,
+            chars: lease.chars,
+            bytes: lease.bytes,
+        }
+    }
+}
 
 /// Where a handle's decision came from, and where its reports go.
 enum Arm<D> {
@@ -162,10 +184,10 @@ pub struct DecisionGuard<D: Deref<Target: DecisionEngine>> {
     /// chosen. A decode that owes a dispatch or an end was then picked by
     /// a decode call, and was issued with its prefill otherwise.
     later: bool,
-    /// The prompt size the decode side's words state: the lease's own, and
+    /// The three sizes the decode side's words state: the lease's own, and
     /// a decode call's from the call that picks the side. Nothing reads a
     /// single's.
-    stated: u32,
+    stated: Stated,
     /// The target at that index.
     target: Target,
     owed: Owed,
@@ -262,9 +284,10 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         } else {
             Owed::Nothing
         };
-        // The size the decode side's words state until a decode call picks
+        // The sizes the decode side's words state until a decode call picks
         // the side: the lease's own.
-        let stated = decided.lease.map_or(0, |leased| leased.lease.tokens);
+        let stated = decided.lease.map(|leased| Stated::of(&leased.lease));
+        let stated = stated.unwrap_or_default();
         Self {
             arm,
             decided,
@@ -288,11 +311,13 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
             index: self.index,
             target: &self.target,
             // Lent as the handle keeps them, with no test of the lease's
-            // side: a single's answer names no decode session, its size is
+            // side: a single's answer names no decode session, its sizes are
             // the lease's own and its decode side never stands chosen.
             decode: HeldDecode {
                 session: self.decided.decode_session,
-                tokens: self.stated,
+                tokens: self.stated.tokens,
+                chars: self.stated.chars,
+                bytes: self.stated.bytes,
                 chosen: matches!(self.decode, Owed::Later { .. }),
             },
         })
@@ -425,8 +450,8 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         if let Some((leased, target)) = answer.lease.zip(first) {
             self.decided.decision = answer.decision;
             self.decided.decode_session = answer.decode_session;
-            // The call issued the side under the size it stated.
-            self.stated = leased.lease.tokens;
+            // The call issued the side under the three sizes it stated.
+            self.stated = Stated::of(&leased.lease);
             (self.index, self.target) = (0, *target);
             self.decode = self.decode.sent_later();
             if let Some(held) = &mut self.decided.lease {
@@ -660,6 +685,9 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     }
 
     /// Says a dispatch and keeps the worker it named for a cancelled end.
+    /// It stands in line in its two callers: a host says a dispatch once
+    /// a request.
+    #[inline]
     fn dispatch(&self, owed: Owed, worker: WorkerId, now: Instant) -> Owed {
         let Owed::Dispatch {
             lease,
@@ -1117,7 +1145,7 @@ mod tests {
     /// read before this number moves.
     #[test]
     fn a_handle_is_the_size_it_has_in_a_build_with_no_link() {
-        const HELD: usize = 488;
+        const HELD: usize = 504;
         assert_eq!(size_of::<DecisionGuard<Arc<PolicyEngine>>>(), HELD);
         assert_eq!(size_of::<DecisionGuard<&PolicyEngine>>(), HELD);
         // A placement is the handle and what its host reads of the answer:
@@ -1125,6 +1153,12 @@ mod tests {
         // label of a pair's decode side and one pointer to an encode
         // request's encoders.
         assert_eq!(size_of::<crate::tracking::Placement<'_>>(), HELD + 88);
+        // The lease the handle keeps states its request's text's two
+        // lengths beside its token count: eight bytes more, the handle's
+        // too. The second length sits in the padding the first left. The
+        // handle keeps the two lengths the decode side's words state
+        // beside that side's token count: eight bytes more.
+        assert_eq!(size_of::<Lease>(), 72);
     }
 
     /// A request that is served: its lease is issued on the pick's first

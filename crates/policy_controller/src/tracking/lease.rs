@@ -14,7 +14,7 @@ use std::{fmt, time::Instant};
 use crate::{
     engine::{
         sticky_sessions::SessionVerdict,
-        view::{Health, LoadRow, Session, WorkerId},
+        view::{tokens_or_text, Health, LoadRow, Session, WorkerId},
     },
     load::ReportSignals,
     tracking::in_flight::WorkerSlot,
@@ -82,10 +82,40 @@ pub struct Lease {
     /// only; the wire carries the dispatch deadline as a duration.
     pub issued_micros: u64,
     /// The prompt size the request stated, in tokens: 0 where it stated
-    /// none. The `least-load` and `resident-work` stages credit a dispatch
-    /// of no stated size at their own mean prefill; every other reader
-    /// takes the 0 as stated.
+    /// none, as a request of text alone does. The `least-load` and
+    /// `resident-work` stages credit a dispatch of no stated size at their
+    /// own mean prefill; every other reader takes the 0 as stated.
     pub tokens: u32,
+    /// The length of the request's text in characters
+    /// ([`crate::engine::RequestFacts::prompt_chars`]): 0 where the request
+    /// stated token ids, or no text, or no stage of its document reads a
+    /// request's size. The `bucket` stage books a request of no stated
+    /// tokens by it, as it places one, and it has no other reader.
+    /// In-process only: the wire carries [`Self::tokens`].
+    pub chars: u32,
+    /// The length of the request's text in bytes
+    /// ([`crate::engine::RequestFacts::prompt_bytes`]): 0 where the request
+    /// stated token ids, or no text. [`Self::prompt_size`] makes a count
+    /// of it, under any document. In-process only: the wire carries
+    /// [`Self::tokens`].
+    pub bytes: u32,
+}
+
+impl Lease {
+    /// The size the request stated in tokens, for a reader that prices a
+    /// request of text by its length: [`Self::tokens`], and where the
+    /// request stated none its text's bytes over four ([`Self::bytes`]).
+    /// It is the number
+    /// [`RequestFacts::prompt_size`](crate::engine::RequestFacts::prompt_size)
+    /// reads of the request: a plugin's view of a held decision shows
+    /// this where its view of the request showed that, and the two are
+    /// one number for every text, under every document. The decode side
+    /// of a pair that a decode call picked states that call's request.
+    #[inline]
+    #[must_use]
+    pub const fn prompt_size(&self) -> u32 {
+        tokens_or_text(self.tokens, self.bytes)
+    }
 }
 
 /// The transport outcome of a dispatch, beside its status: what a health

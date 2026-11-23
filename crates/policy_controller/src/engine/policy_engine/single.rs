@@ -139,8 +139,9 @@ pub(super) fn alone(
 /// The short path's pick under a document that takes a word on a lease,
 /// as its host takes it: the decision that names the worker at the place
 /// picked, alone ([`AlonePick::decision`]), and its lease, issued here as a
-/// whole pass's is ([`issued`]). The lease states the size `plain` states
-/// and no session, and is dated at `now` on the engine's clock. The issue
+/// whole pass's is ([`issued`]). The lease states the size `plain` states,
+/// the two lengths of its `text`, characters and bytes, and no session, and
+/// is dated at `now` on the engine's clock. The issue
 /// is told where a stage takes it. `None` where the list holds no worker at
 /// the place.
 pub(super) fn noted(
@@ -148,6 +149,7 @@ pub(super) fn noted(
     pick: AlonePick,
     members: &PoolMembers,
     plain: Plain,
+    text: (u32, u32),
     now: Instant,
 ) -> Option<DecideOutcome> {
     let position = pick.place as usize;
@@ -169,6 +171,8 @@ pub(super) fn noted(
         session_verdict: SessionVerdict::None,
         issued_micros: own.clock.micros(now),
         tokens: plain.prompt_tokens,
+        chars: text.0,
+        bytes: text.1,
     };
     let decided = DecideOutcome {
         decision: pick.decision(id, dp_rank),
@@ -568,6 +572,8 @@ pub(super) fn issued(
             session_verdict: pick.session_verdict,
             issued_micros: facts.now_micros,
             tokens: facts.prompt_tokens,
+            chars: facts.prompt_chars,
+            bytes: facts.prompt_bytes,
         })
     });
     let issue = document.hears.contains(EventKind::Issued);
@@ -787,6 +793,14 @@ pub(crate) mod tests {
             self.request.plain()
         }
 
+        fn prompt_chars(&self) -> u32 {
+            self.request.prompt_chars()
+        }
+
+        fn prompt_bytes(&self) -> u32 {
+            self.request.prompt_bytes()
+        }
+
         fn workers(&self) -> WorkerLists<'_> {
             self.members
         }
@@ -913,7 +927,8 @@ pub(crate) mod tests {
         let list = pool(4);
         let members = PublishedList::new(Arc::clone(&list));
         let mut sized = request();
-        sized.facts.prompt_tokens = 321;
+        (sized.facts.prompt_tokens, sized.facts.prompt_chars) = (321, 77);
+        sized.facts.prompt_bytes = 154;
         sized.facts.session_key = Identity::plain("a-key");
         let asks = Asks::of(sized, Some(&members));
         let (mut seen, mut last) = ([0_u32; 4], 0);
@@ -932,7 +947,8 @@ pub(crate) mod tests {
                 (lease.side, lease.booked, lease.target_index),
                 (Side::Single, target.id, 0)
             );
-            assert_eq!((lease.tokens, lease.session), (321, Session::NONE));
+            assert_eq!((lease.tokens, lease.chars, lease.bytes), (321, 77, 154));
+            assert_eq!(lease.session, Session::NONE);
             assert_eq!(lease.session_verdict, SessionVerdict::None);
             assert!(lease.id.0 > last, "each pick takes the next id");
             last = lease.id.0;
@@ -1157,11 +1173,15 @@ pub(crate) mod tests {
     /// A request stated ahead is plain where it is a first attempt that
     /// asks nothing beyond a worker of its list, and says what a pick with
     /// no request made needs: its phase, its wires and its size. Each thing
-    /// it states beyond that makes it a request the whole pass reads.
+    /// it states beyond that makes it a request the whole pass reads. Its
+    /// text's two lengths are asked apart, where such a pick's lease is
+    /// issued.
     #[test]
     fn a_request_stated_ahead_says_whether_it_is_plain() {
         let mut stated = request();
         stated.facts.prompt_tokens = 9;
+        stated.facts.prompt_chars = 31;
+        stated.facts.prompt_bytes = 62;
         stated.constraints.wire_modes = WireModes::GRPC;
         assert_eq!(
             stated.plain(),
@@ -1171,6 +1191,7 @@ pub(crate) mod tests {
                 prompt_tokens: 9,
             })
         );
+        assert_eq!((stated.prompt_chars(), stated.prompt_bytes()), (31, 62));
         let tried = [WorkerId(1)];
         let rows = [0_u32];
         let mut retried = request();
@@ -1555,6 +1576,27 @@ pub(crate) mod tests {
         assert!(grown.1 >= 4, "the engine's four ranks stand in it");
         asked(&ranked, &tried);
         assert_eq!(kept(), grown, "the list is kept as it grew");
+    }
+
+    /// A whole pass's lease states the three sizes its request states: the
+    /// count of its token ids and its text's two lengths. A reader that
+    /// sizes a held decision of text reads the bytes over four off the
+    /// lease, the number its request's facts read: here a text of 400
+    /// two-byte characters.
+    #[test]
+    fn a_whole_passs_lease_states_the_requests_three_sizes() {
+        // The stock sessions rule takes a word on a lease.
+        let engine = preset("manual");
+        let list = pool(2);
+        let members = PublishedList::new(Arc::clone(&list));
+        let mut keyed = request();
+        keyed.facts.session_key = Identity::hashed(9);
+        (keyed.facts.prompt_chars, keyed.facts.prompt_bytes) = (400, 800);
+        let size = keyed.facts.prompt_size();
+        let asks = Asks::of(keyed, Some(&members));
+        let lease = decided(&engine, &asks).lease.expect("a lease").lease;
+        assert_eq!((lease.tokens, lease.chars, lease.bytes), (0, 400, 800));
+        assert_eq!((lease.prompt_size(), size), (200, 200));
     }
 
     /// A retry decided under its whole list of tried workers is leased as
@@ -2311,6 +2353,8 @@ pub(crate) mod tests {
             session_verdict: SessionVerdict::None,
             issued_micros: 0,
             tokens: 0,
+            chars: 0,
+            bytes: 0,
         };
         engine.spec().engine().on_decision_issued(&lease, &decision);
         assert_eq!(heard.lock().as_slice(), [("issued", first.id, 0)]);

@@ -276,7 +276,7 @@ impl Gates {
     /// request's hashes alone would understate it and overstate every
     /// holder's share.
     fn request_blocks(&self, facts: &RequestFacts<'_>) -> u32 {
-        let from_tokens = self.whole_blocks(facts.prompt_tokens, facts).max(1);
+        let from_tokens = self.whole_blocks(facts.prompt_size(), facts).max(1);
         let from_hashes = u32::try_from(facts.block_hashes.len()).unwrap_or(u32::MAX);
         from_tokens.max(from_hashes)
     }
@@ -291,7 +291,7 @@ impl Gates {
     fn whole(&self, facts: &RequestFacts<'_>) -> Whole {
         let block = self.block_size_of(facts);
         let hashed = u32::try_from(facts.block_hashes.len()).unwrap_or(u32::MAX);
-        let size = units_within(facts.prompt_tokens, facts.hash_kind);
+        let size = units_within(facts.prompt_size(), facts.hash_kind);
         Whole {
             block,
             size: size.max(block).max(hashed.saturating_mul(block)),
@@ -1609,7 +1609,9 @@ mod tests {
         // The whole keeps what the request's block count guards: a size
         // stated under the hashes the host sent reads as the hashes, a
         // prompt of no size as one block, and the text kind's as its bytes
-        // beside a window of bytes.
+        // beside a window of bytes. A request of text states its length and
+        // no count of tokens: 100 two-byte characters are 200 bytes, and
+        // the share is taken of the bytes.
         let whole = |facts: RequestFacts<'_>| {
             let whole = Gates::of(None, None, Some(16)).whole(&facts);
             (whole.block, whole.size)
@@ -1628,7 +1630,9 @@ mod tests {
         let text = RequestFacts {
             hash_kind: HashKind::Text,
             block_size: 64,
-            ..sized(50)
+            prompt_chars: 100,
+            prompt_bytes: 200,
+            ..hashed
         };
         assert_eq!(whole(text), (64, 200));
     }
@@ -1861,11 +1865,14 @@ mod tests {
         capped.prompt_tokens = 16 * 16;
         assert_eq!(scores(&slice, &capped, &held(4)), vec![0.0, 0.0, 1.0]);
         assert_eq!(scores(&slice, &capped, &held(8)), vec![1.0, 1.0, 1.0]);
-        // A text-kind request counts characters: 64 tokens are 256
-        // characters, sixteen blocks of sixteen, the same quarter.
+        // A text-kind request states its length and no count of tokens.
+        // Its windows are bytes: 128 two-byte characters are 256 bytes,
+        // sixteen windows of sixteen, the same quarter. Read by its
+        // characters the request would be eight windows, and four of them
+        // half of it.
         let mut text = facts(8);
         text.hash_kind = HashKind::Text;
-        text.prompt_tokens = 64;
+        (text.prompt_tokens, text.prompt_chars, text.prompt_bytes) = (0, 128, 256);
         assert_eq!(scores(&slice, &text, &held(4)), vec![0.0, 0.0, 1.0]);
     }
 

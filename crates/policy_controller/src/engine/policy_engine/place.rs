@@ -85,7 +85,9 @@ use crate::{
         demands::Demands,
         framework::EncodeItems,
         list_cell::LentList,
-        prompt_hashes::{prompt_tokens_of, HashSeeds, PromptHashes},
+        prompt_hashes::{
+            prompt_bytes_of, prompt_chars_of, prompt_tokens_of, HashSeeds, PromptHashes,
+        },
         records::worker_id,
         view::{
             Constraints, Header, Identity, MediaCounts, Phase, RequestFacts, WireModes, WorkerId,
@@ -782,8 +784,23 @@ impl RequestMaker for Made<'_, '_> {
         (first && !asks_more).then(|| Plain {
             phase: request.phase(),
             wires: WireModes::NONE,
-            prompt_tokens: prompt_tokens_of(request.prompt.tokens, request.prompt.text),
+            prompt_tokens: prompt_tokens_of(request.prompt.tokens),
         })
+    }
+
+    // Asked where a plain request's pick is leased, ahead of its making:
+    // the hashing counts the text of a request that is made, so a text is
+    // passed over once.
+    fn prompt_chars(&self) -> u32 {
+        let prompt = self.request.prompt;
+        let sized = self.engine.spec().needs().prompt_size;
+        prompt_chars_of(prompt.tokens, prompt.text, sized)
+    }
+
+    // The text's bytes, for the same lease: its length is at hand.
+    fn prompt_bytes(&self) -> u32 {
+        let prompt = self.request.prompt;
+        prompt_bytes_of(prompt.tokens, prompt.text)
     }
 
     fn workers(&self) -> WorkerLists<'_> {

@@ -89,6 +89,31 @@ pub trait RequestMaker {
         None
     }
 
+    /// The length of the request's text in characters, as the request made
+    /// would state it
+    /// ([`RequestFacts::prompt_chars`](super::view::RequestFacts::prompt_chars)):
+    /// zero for a request of token ids or of no text, and from a maker
+    /// that does not say.
+    ///
+    /// An engine that decides over its host's lists asks this where it
+    /// issues the lease of a plain request's pick, which states the
+    /// length, and nowhere else. So [`RequestMaker::plain`] stays cheap,
+    /// and a text is passed over once a request: here for a pick that is
+    /// leased ahead of the request's making, and at the making otherwise.
+    fn prompt_chars(&self) -> u32 {
+        0
+    }
+
+    /// The length of the request's text in bytes, as the request made
+    /// would state it
+    /// ([`RequestFacts::prompt_bytes`](super::view::RequestFacts::prompt_bytes)):
+    /// zero for a request of token ids or of no text, and from a maker
+    /// that does not say. Asked where [`RequestMaker::prompt_chars`] is,
+    /// for the same lease. It costs no pass over the text.
+    fn prompt_bytes(&self) -> u32 {
+        0
+    }
+
     /// The workers the request may be sent to, where its host holds them:
     /// the lists the decision's targets name by position
     /// ([`Target::position`], [`Pair::decode_position`](super::decision::Pair::decode_position)).
@@ -185,6 +210,14 @@ impl RequestMaker for Request<'_> {
             prompt_tokens: facts.prompt_tokens,
         })
     }
+
+    fn prompt_chars(&self) -> u32 {
+        self.facts.prompt_chars
+    }
+
+    fn prompt_bytes(&self) -> u32 {
+        self.facts.prompt_bytes
+    }
 }
 
 /// What a plain request states ([`RequestMaker::plain`]): all that a pick
@@ -207,7 +240,9 @@ pub struct Plain {
     pub wires: WireModes,
     /// The size of its prompt in tokens, as the request made would state it
     /// ([`RequestFacts::prompt_tokens`](super::view::RequestFacts::prompt_tokens)):
-    /// a lease issued for it states the size.
+    /// a lease issued for it states the size. Its text's two lengths are
+    /// asked apart, where that lease is issued
+    /// ([`RequestMaker::prompt_chars`], [`RequestMaker::prompt_bytes`]).
     pub prompt_tokens: u32,
 }
 
@@ -290,8 +325,9 @@ impl fmt::Debug for TokenKey<'_> {
 /// from it in its side, in the worker it books (the decode of the pick's
 /// first target where the side was issued with its prefill, the decode of
 /// the target taken where it stood chosen), in its session
-/// ([`HeldDecode::session`]) and, behind a decode call, in its size
-/// ([`HeldDecode::tokens`]). A decode issued later is dated at its
+/// ([`HeldDecode::session`]) and, behind a decode call, in its three sizes
+/// ([`HeldDecode::tokens`], [`HeldDecode::chars`] and
+/// [`HeldDecode::bytes`]). A decode issued later is dated at its
 /// issue, the decode call's instant or its dispatch's, and its later words
 /// bear the first decision's instant, which is this lease's
 /// ([`Lifecycle::on_decision_issued`](crate::stages::Lifecycle::on_decision_issued)).
@@ -333,6 +369,12 @@ pub struct HeldDecode {
     /// side was issued with its prefill or goes out with no call, and a
     /// decode call's own once one picked the side.
     pub tokens: u32,
+    /// The characters of the text the side's words state
+    /// ([`Lease::chars`]), by the rule of [`Self::tokens`]: the first
+    /// decision's, and a decode call's own once one picked the side.
+    pub chars: u32,
+    /// The bytes of that text ([`Lease::bytes`]), by the same rule.
+    pub bytes: u32,
     /// The side stood chosen until this word: its request stated the later
     /// decode, no decode call picked it, and nothing was issued for it.
     /// The side's dispatch said under this is its issue too, dated at the

@@ -169,6 +169,8 @@ fn request_record() -> &'static [&'static str] {
             media,
             seed,
             block_size,
+            prompt_chars,
+            prompt_bytes,
             now_micros,
             pinned_at,
             lent_in_flight,
@@ -356,6 +358,8 @@ fn lease_record() -> &'static [&'static str] {
             session_verdict,
             issued_micros,
             tokens,
+            chars,
+            bytes,
         }
     )
 }
@@ -658,6 +662,8 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
             // The affinity column rides the request in the crate; the wire
             // carries each entry in its candidate.
             host_only: &[
+                "prompt_chars",
+                "prompt_bytes",
                 "now_micros",
                 "pinned_at",
                 "lent_in_flight",
@@ -832,7 +838,13 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Lease",
             record: lease_record(),
-            host_only: &["booked", "session_verdict", "issued_micros"],
+            host_only: &[
+                "booked",
+                "session_verdict",
+                "issued_micros",
+                "chars",
+                "bytes",
+            ],
             wire_only: &["term", "dispatch_ttl_ms", "origin"],
             wire: &[
                 ("id", Type::Fixed64),
@@ -911,6 +923,8 @@ fn wit_mirrors() -> Vec<WitMirror> {
             record: "request",
             crate_record: request_record(),
             host_only: &[
+                "prompt_chars",
+                "prompt_bytes",
                 "now_micros",
                 "pinned_at",
                 "lent_in_flight",
@@ -944,7 +958,13 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "lease",
             crate_record: lease_record(),
-            host_only: &["booked", "session_verdict", "issued_micros"],
+            host_only: &[
+                "booked",
+                "session_verdict",
+                "issued_micros",
+                "chars",
+                "bytes",
+            ],
             before: &[],
             beside: &[],
         },

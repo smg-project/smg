@@ -64,6 +64,8 @@ mod place;
 mod ruled;
 #[path = "in_process/signals.rs"]
 mod signals;
+#[path = "in_process/worded.rs"]
+mod worded;
 
 #[cfg(any(target_env = "msvc", target_env = "musl"))]
 use std::alloc::System as Allocator;
@@ -747,6 +749,12 @@ fn main() {
     // The one call a host makes for a request, where the run asks it.
     if place::asked(&run, &host) {
         let (rule, ring) = (ruled::stated(&run), place::lent(&host));
+        if worded::stated(&run) {
+            measure(&run, &host, upkeep, publish, converted, |_| {
+                worded::one(&host)
+            });
+            return;
+        }
         measure(&run, &host, upkeep, publish, converted, |_| {
             place::one(&host, rule, ring)
         });

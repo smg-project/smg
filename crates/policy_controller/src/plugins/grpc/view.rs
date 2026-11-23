@@ -340,7 +340,7 @@ fn lease(l: &Lease, exposure: &Exposure) -> proto::Lease {
             Reveal::None => 0,
             Reveal::Hash | Reveal::Plain => l.session.get(),
         },
-        tokens: l.tokens,
+        tokens: l.prompt_size(),
         term: 0,
         dispatch_ttl_ms: 0,
         // Bit 63 set is a gateway-minted lease (the design's two id spaces).
@@ -1091,6 +1091,51 @@ mod tests {
         assert_eq!(sent(sized), 512);
         assert_eq!(sent(other), 0);
         assert_eq!(sent(Needs::default()), 0);
+    }
+
+    /// A frame's lease states the size its request's frame stated: the
+    /// count of the request's token ids, and for a request of text alone
+    /// its text's bytes over four, whatever its characters. A text of 400
+    /// two-byte characters reads 200 in the request's frame and in the
+    /// lease's: a plugin that books by the one and frees by the other
+    /// keeps its books.
+    #[test]
+    fn a_frames_lease_states_the_size_its_requests_frame_stated() {
+        use crate::{
+            document::spec::Needs,
+            engine::view::{PoolFacts, RequestFacts},
+            plugins::shared::config::Exposure,
+            tracking::lease::Lease,
+        };
+
+        let size = |tokens, chars, bytes| {
+            let told = Lease {
+                tokens,
+                chars,
+                bytes,
+                ..Lease::default()
+            };
+            super::lease(&told, &Exposure::default()).tokens
+        };
+        let sizes = (size(7, 400, 800), size(0, 400, 800), size(0, 0, 0));
+        assert_eq!(sizes, (7, 200, 0));
+        let worded = RequestFacts {
+            model: "m",
+            prompt_chars: 400,
+            prompt_bytes: 800,
+            ..RequestFacts::default()
+        };
+        let sized = Needs {
+            prompt_size: true,
+            ..Needs::default()
+        };
+        let (pool, shown) = (PoolFacts::default(), Exposure::default());
+        let sent = super::decide(1, &worded, &[], &pool, &shown, sized).request;
+        let sent = sent.expect("a frame carries its request").prompt_tokens;
+        assert_eq!(
+            (sent, size(0, worded.prompt_chars, worded.prompt_bytes)),
+            (200, 200)
+        );
     }
 
     /// The frame carries each candidate's requests in flight as the

@@ -707,6 +707,8 @@ pub(super) fn issue(
         session_verdict: pick.session_verdict,
         issued_micros: facts.now_micros,
         tokens: facts.prompt_tokens,
+        chars: facts.prompt_chars,
+        bytes: facts.prompt_bytes,
     };
     let decode = lease_events::decode_as_issued(&lease, first, session)?;
     engine.on_decision_issued(&lease, decision);
@@ -799,13 +801,17 @@ pub(super) fn issue_decode(
 
 /// The decode side's lease for a pick of the decode decided again, as
 /// [`issue_decode`] hands it back, and no word to a stage: under the id and
-/// the generation of `prefill`, with the size the call states.
+/// the generation of `prefill`, with the three sizes the call states: its
+/// token count and its text's two lengths. A call may state another text
+/// than the first decision did, and its side reads the call's.
 ///
 /// `None` for a decision that picks no pair.
 fn decode_side(facts: &RequestFacts<'_>, decision: &Decision, prefill: &Lease) -> Option<Lease> {
     let first = decision.pick()?.targets.first()?;
     Some(Lease {
         tokens: facts.prompt_tokens,
+        chars: facts.prompt_chars,
+        bytes: facts.prompt_bytes,
         ..lease_events::decode_as_issued(prefill, first, decode_session(facts))?
     })
 }
@@ -984,6 +990,13 @@ mod tests {
         SIZES.with_borrow_mut(std::mem::take)
     }
 
+    thread_local! {
+        /// The side of each word a stage heard on this thread, and what
+        /// its lease stated of its request's text: its characters, its
+        /// bytes and the size made of them ([`Lease::prompt_size`]).
+        static LENGTHS: RefCell<Vec<(Side, [u32; 3])>> = const { RefCell::new(Vec::new()) };
+    }
+
     /// A picker that picks as [`Best`] and keeps every word it hears.
     #[derive(Debug)]
     struct Hears(Arc<Mutex<Vec<Word>>>);
@@ -1000,6 +1013,8 @@ mod tests {
                 named,
             ));
             SIZES.with_borrow_mut(|sizes| sizes.push((word, lease.side, lease.tokens)));
+            let stated = [lease.chars, lease.bytes, lease.prompt_size()];
+            LENGTHS.with_borrow_mut(|lengths| lengths.push((lease.side, stated)));
         }
     }
 
@@ -2805,6 +2820,8 @@ mod tests {
             decode: HeldDecode {
                 session,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: false,
             },
         };
@@ -2890,6 +2907,8 @@ mod tests {
             decode: HeldDecode {
                 session,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: false,
             },
         };
@@ -2928,6 +2947,8 @@ mod tests {
             decode: HeldDecode {
                 session,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: true,
             },
         };
@@ -2960,6 +2981,8 @@ mod tests {
             decode: HeldDecode {
                 session,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: true,
             },
         };
@@ -3095,6 +3118,8 @@ mod tests {
             decode: HeldDecode {
                 session: outcome.decode_session,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: true,
             },
         };
@@ -3224,6 +3249,8 @@ mod tests {
             decode: HeldDecode {
                 session: outcome.decode_session,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: true,
             },
         };
@@ -3338,6 +3365,8 @@ mod tests {
             decode: HeldDecode {
                 session: outcome.decode_session,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: true,
             },
         };
@@ -3589,6 +3618,48 @@ mod tests {
         let with = host.asks(&classes, false);
         let [_, decode] = sizes_by_side(door, local, &with, None, false);
         assert_eq!(decode, own);
+    }
+
+    /// A decode call may state another text than the first decision did.
+    /// The side is issued under the call's three sizes, and its dispatch,
+    /// its end and its release state them too: a stage that books a
+    /// request of text by its characters reads one length at every word of
+    /// the side, and a plugin is shown the size the call's own request
+    /// showed. Neither request here states a token count: the first is a
+    /// text of 400 characters in 800 bytes, the call's one of 900 in 1,800.
+    /// The prefill side states the first decision's lengths behind the
+    /// call as before it, and so does a decode that goes out with no call.
+    #[test]
+    fn a_decode_calls_side_states_the_calls_text_lengths_at_every_word() {
+        let host = Host::of(1, 2);
+        let classes = every(1, 2);
+        let of_text = |chars, bytes| {
+            let mut asks = host.asks(&classes, true);
+            let facts = &mut asks.0.facts;
+            (facts.prompt_tokens, facts.prompt_chars, facts.prompt_bytes) = (0, chars, bytes);
+            asks
+        };
+        let (first, again) = (of_text(400, 800), of_text(900, 1_800));
+        let (door, local) = (&host.engine, GatewayId::LOCAL);
+        // What each word of a side stated: the prefill's, then the decode's.
+        let heard = |again, released| {
+            LENGTHS.with_borrow_mut(Vec::clear);
+            let _ = sizes_by_side(door, local, &first, again, released);
+            let heard = LENGTHS.with_borrow_mut(std::mem::take);
+            let of = |side| {
+                let words = heard.iter().filter(|word| word.0 == side);
+                words.map(|word| word.1).collect::<Vec<_>>()
+            };
+            [of(Side::Prefill), of(Side::Decode)]
+        };
+        let (own, called) = ([400, 800, 200], [900, 1_800, 450]);
+        let [prefill, decode] = heard(Some(&again), false);
+        assert_eq!(prefill, [own; 3], "issued, sent and ended");
+        assert_eq!(decode, [called; 3], "issued, sent and ended");
+        let [_, decode] = heard(Some(&again), true);
+        assert_eq!(decode, [called; 2], "issued and released");
+        let [_, decode] = heard(None, false);
+        assert_eq!(decode, [own; 3], "with no call");
     }
 
     /// Four prefills and four decodes under the pair document of the two
@@ -4138,6 +4209,8 @@ mod tests {
                 decode: HeldDecode {
                     session: decode_session(&asks.0.facts),
                     tokens: before.lease.tokens,
+                    chars: before.lease.chars,
+                    bytes: before.lease.bytes,
                     chosen: guard.decode_chosen(),
                 },
             };
@@ -4226,6 +4299,8 @@ mod tests {
             decode: HeldDecode {
                 session: first.decode_session,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: true,
             },
         };

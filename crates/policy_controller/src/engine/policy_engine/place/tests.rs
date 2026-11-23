@@ -394,9 +394,14 @@ fn each_making_draws_a_seed_of_its_own() {
 /// and a text alone are hashed too. A request with no prompt states no
 /// block and no size.
 ///
-/// A text alone states its size as its bytes over four. The classic
-/// router prices a request with no token ids at its mean prefill
-/// (`model_gateway/src/policies/least_load.rs:810-816`).
+/// A text alone states no count of tokens, so a stage that credits a send
+/// of no stated size credits it at its own mean. The classic router's
+/// `least_load` prices a request with no token ids at its mean prefill
+/// (`model_gateway/src/policies/least_load.rs:812-816`). The text states
+/// its two lengths. Its bytes are at hand, and a reader that sizes a
+/// request of text reads them over four. Its characters are counted
+/// because a stage of this document reads a request's size. Token ids
+/// win: beside them no length is stated.
 #[test]
 fn the_prompts_blocks_are_hashed_under_its_partition_once() {
     let engine = preset("cache_aware");
@@ -431,6 +436,7 @@ fn the_prompts_blocks_are_hashed_under_its_partition_once() {
         (HashKind::Token, expected.block_size)
     );
     assert_eq!((first.namespace_seed, first.prompt_tokens), (13, 600));
+    assert_eq!(first.prompt_chars, 0, "the text is not passed over");
     assert!(
         ptr::eq(first.block_hashes, again.block_hashes),
         "hashed once"
@@ -449,9 +455,11 @@ fn the_prompts_blocks_are_hashed_under_its_partition_once() {
     let request = stated(None, Some(&text[..]));
     let made = Made::new(&engine, &request, &[]);
     let facts = made.make(engine.spec()).facts;
+    assert_eq!(facts.hash_kind, HashKind::Text);
+    // The bytes are stated under any document, and the size is theirs.
     assert_eq!(
-        (facts.hash_kind, facts.prompt_tokens),
-        (HashKind::Text, 1_000)
+        (facts.prompt_tokens, facts.prompt_bytes, facts.prompt_size()),
+        (0, 4_000, 1_000)
     );
     assert!(!facts.block_hashes.is_empty());
 
@@ -490,9 +498,12 @@ fn a_plain_request_says_so_and_is_answered_a_place() {
             prompt_tokens: 40,
         })
     );
-    // A text alone, as a request that is not tokenized states its prompt:
-    // the size it says is the text's bytes over four.
-    let text = "t".repeat(400);
+    // A text alone, as a request that is not tokenized states its prompt,
+    // says no count of tokens. Asked its text's lengths, it states the
+    // bytes under any document, and counts the characters under a
+    // document a stage of which reads a request's size, as `bucket` does,
+    // and none under this one. The text is of 200 two-byte characters.
+    let text = "\u{e9}".repeat(200);
     let worded = PlaceRequest {
         prompt: Prompt {
             text: Some(&text[..]),
@@ -500,8 +511,24 @@ fn a_plain_request_says_so_and_is_answered_a_place() {
         },
         ..PlaceRequest::of(MODEL, plain.lists)
     };
-    let short = Made::new(&engine, &worded, &[]).plain();
-    assert_eq!(short.expect("a plain request").prompt_tokens, 100);
+    let sizes = |engine: &PolicyEngine, request: &PlaceRequest<'_>| {
+        let made = Made::new(engine, request, &[]);
+        let said = made.plain().expect("a plain request");
+        (said.prompt_tokens, made.prompt_chars(), made.prompt_bytes())
+    };
+    assert_eq!(sizes(&engine, &worded), (0, 0, 400));
+    assert_eq!(sizes(&preset("bucket"), &worded), (0, 200, 400));
+    // Token ids win: a request that holds its ids and a text states the
+    // count of the ids, no length of the text and no pass over it.
+    let both = PlaceRequest {
+        prompt: Prompt {
+            tokens: Some(&tokens),
+            text: Some(&text[..]),
+            ..Prompt::NONE
+        },
+        ..PlaceRequest::of(MODEL, plain.lists)
+    };
+    assert_eq!(sizes(&preset("bucket"), &both), (40, 0, 0));
     let read = Cell::new(0);
     let clock = || {
         read.set(read.get() + 1);
