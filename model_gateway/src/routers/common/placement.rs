@@ -21,7 +21,9 @@ use axum::{
 use parking_lot::Mutex;
 use rand::RngExt;
 use smg_policy_controller::{
-    engine::{PairAdmission, PairLists, PolicyEngine, PoolMembers, Unplaced, WorkerLists},
+    engine::{
+        PairAdmission, PairLists, PlaceRequest, PolicyEngine, PoolMembers, Unplaced, WorkerLists,
+    },
     policies::consistent_hashing::LentRing,
     tracking::{Placement, PlacementSide},
 };
@@ -125,6 +127,12 @@ pub(crate) fn admission_prefilters(
 
 /// A per-request candidate predicate: a worker it rejects is never selected.
 pub(crate) type CandidateFilter<'a> = &'a (dyn Fn(&dyn Worker) -> bool + Sync);
+
+/// The read of a model's pair index as it stands now, for a pair's decode
+/// asked again behind its prefill ([`decode_again`]). The read costs a
+/// snapshot and an index, so a route hands it as a call: the policy
+/// engine's arm alone makes it, once, and a classic pair reads nothing.
+pub(crate) type PairsAgain<'a> = &'a dyn Fn() -> Arc<PdPairIndex>;
 
 /// Everything a single-worker placement reads from the request.
 #[derive(Clone, Copy, Default)]
@@ -684,6 +692,68 @@ impl ByEngine {
             }
             None => guard,
         }
+    }
+
+    /// [`decode_again`] for a decode the policy engine placed, out of line.
+    /// The engine decides the decode again on this answer's side of the
+    /// pair, which is held for the time of that decision: the route's rule
+    /// is asked under it, and touches neither of the pair's answers. A side
+    /// that a guard took already was sent: it is asked nothing, and the
+    /// pair index is not read.
+    #[inline(never)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pair placement's own arguments, and the decode's guard"
+    )]
+    fn decode_again(
+        &self,
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        model_id: &str,
+        pairs: PairsAgain<'_>,
+        wire: Option<WireConstraint>,
+        inputs: PlacementInputs<'_>,
+        ahead: WorkerLoadGuard,
+    ) -> (Option<Placed>, WorkerLoadGuard) {
+        let Some(engine) = policies.engine() else {
+            return (None, ahead);
+        };
+        let mut held = self.side.lock();
+        let Some(side) = held.as_mut() else {
+            return (None, ahead);
+        };
+        let pairs = pairs();
+        let asked = with_pair_request(
+            engine,
+            registry,
+            policies,
+            model_id,
+            &pairs,
+            wire,
+            None,
+            inputs,
+            |request| side.decode_again(request),
+        );
+        let worker = match asked {
+            Ok(worker) if !ahead.counts(&worker) => worker,
+            Ok(_) => return (None, ahead),
+            Err(unplaced) => {
+                debug!(
+                    model_id,
+                    ?unplaced,
+                    "A pair's decode stands as first decided"
+                );
+                return (None, ahead);
+            }
+        };
+        let Some(side) = held.take() else {
+            return (None, ahead);
+        };
+        drop(held);
+        debug!(decode = %worker.redacted_url(), "A pair's decode moved behind its prefill");
+        let guard = ahead.onto(Arc::clone(&worker));
+        let moved = Placed::by_side(worker, *side, self.routing_key.as_deref());
+        (Some(moved), guard)
     }
 }
 
@@ -2011,17 +2081,18 @@ impl PairAdmission for PairGates<'_> {
     }
 }
 
-/// [`select_pair`] where the gateway started the policy engine, out of
-/// line: the engine places the pair with one call, over its value of each
-/// pool ([`PdPairIndex::lent`]), the index's pair classes
+/// The policy engine's request for a pair over the two pools of `pairs`,
+/// handed to `ask`: the engine's value of each pool
+/// ([`PdPairIndex::lent`]), the index's pair classes
 /// ([`PdPairIndex::classes`]) and this gateway's two admission reads
 /// ([`PairGates`]), on the hash ring the registry answers for the model now
-/// ([`ModelRing::read`]). Its document picks both sides: no classic policy
-/// runs, and the load default of the classic pass pairs nobody here.
+/// ([`ModelRing::read`]). One function for a pair's two decisions: the
+/// first ([`pair_by_engine`]), and the decode asked again behind its
+/// prefill ([`decode_again`]), which reads no prefill's capacity.
 ///
 /// What `inputs` state of the request is handed as the engine reads it
 /// ([`place_request`]), the route's own rule among it, which the engine
-/// asks of both workers it picked. Three things are the pair's own:
+/// asks of the workers it picked. Three things are the pair's own:
 ///
 /// - A retry pinned to its retained plan's wire is held to the places of
 ///   each pool on that wire. The lists stay the pools' own.
@@ -2030,22 +2101,11 @@ impl PairAdmission for PairGates<'_> {
 /// - The request states that its decode may be asked again behind its
 ///   prefill's answer. A route that sends both sides at once sends the
 ///   decode the first decision named, which the engine books at that send.
-///
-/// Prefills all at the request's admission limit answer
-/// [`PlacementFailure::PrefillAtCapacity`], on which the route waits for a
-/// slot and asks again. Any other miss is judged from the side that has
-/// nobody the request may use and that is available, the prefills first, as
-/// a classic pass judges its own ([`failure_from`]).
-///
-/// Records the selection metric of each side under that worker's transport
-/// label and the label of the profile that picked the side, and under the
-/// configured policy's name where the engine names none.
-#[inline(never)]
 #[expect(
     clippy::too_many_arguments,
     reason = "the pair placement's own arguments, and the engine it asks"
 )]
-fn pair_by_engine(
+fn with_pair_request<R>(
     engine: &'static PolicyEngine,
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -2054,12 +2114,8 @@ fn pair_by_engine(
     wire: Option<WireConstraint>,
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
-) -> Result<PlacedPair, Box<PairFailure>> {
-    if let Some(failure) = unpairable(policies, model_id, pairs) {
-        return Err(failure);
-    }
-    let fail =
-        |role: WorkerRole, verdict: PlacementFailure| Box::new(PairFailure { role, verdict });
+    ask: impl FnOnce(&PlaceRequest<'_>) -> R,
+) -> R {
     let [prefill, decode] = pairs.lent().map(|lent| engine.members_of(lent));
     let on_wire = |pool: &[Arc<dyn Worker>]| -> Option<Vec<u32>> {
         wire.is_some().then(|| {
@@ -2100,8 +2156,64 @@ fn pair_by_engine(
     request.ring = ring.lent();
     request.attempt = u8::try_from(inputs.tried.len().div_ceil(2)).unwrap_or(u8::MAX);
     request.decode_again = true;
-    let placement = match engine.place(&request) {
-        Ok(placement) => placement,
+    ask(&request)
+}
+
+/// [`select_pair`] where the gateway started the policy engine, out of
+/// line: the engine places the pair with one call, over the request
+/// [`with_pair_request`] states. Its document picks both sides: no classic
+/// policy runs, and the load default of the classic pass pairs nobody here.
+///
+/// Prefills all at the request's admission limit answer
+/// [`PlacementFailure::PrefillAtCapacity`], on which the route waits for a
+/// slot and asks again. Any other miss is judged from the side that has
+/// nobody the request may use and that is available, the prefills first, as
+/// a classic pass judges its own ([`failure_from`]).
+///
+/// Records the selection metric of each side under that worker's transport
+/// label and the label of the profile that picked the side, and under the
+/// configured policy's name where the engine names none.
+#[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pair placement's own arguments, and the engine it asks"
+)]
+fn pair_by_engine(
+    engine: &'static PolicyEngine,
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    pairs: &PdPairIndex,
+    wire: Option<WireConstraint>,
+    prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+    inputs: PlacementInputs<'_>,
+) -> Result<PlacedPair, Box<PairFailure>> {
+    if let Some(failure) = unpairable(policies, model_id, pairs) {
+        return Err(failure);
+    }
+    let fail =
+        |role: WorkerRole, verdict: PlacementFailure| Box::new(PairFailure { role, verdict });
+    let placed = with_pair_request(
+        engine,
+        registry,
+        policies,
+        model_id,
+        pairs,
+        wire,
+        prefill_capacity,
+        inputs,
+        |request| {
+            engine.place(request).map(|placement| {
+                let labels = (
+                    placement.profile,
+                    placement.decode_profile.unwrap_or(placement.profile),
+                );
+                (labels, PlacedPair::by_engine(placement))
+            })
+        },
+    );
+    let (labels, pair) = match placed {
+        Ok(placed) => placed,
         Err(Unplaced::PrefillsFull) => {
             return Err(fail(
                 WorkerRole::Prefill,
@@ -2128,21 +2240,22 @@ fn pair_by_engine(
             return Err(fail(role, failure_from(&judged, model_id, shedding)));
         }
     };
-    let configured =
-        |label: &'static str, policy: &'static str| if label.is_empty() { policy } else { label };
-    let labels = (
-        configured(placement.profile, policies.get_prefill_policy().name()),
-        configured(
-            placement.decode_profile.unwrap_or(placement.profile),
-            policies.get_decode_policy().name(),
-        ),
-    );
-    let Some(pair) = PlacedPair::by_engine(placement) else {
+    let Some(pair) = pair else {
         return Err(fail(WorkerRole::Decode, PlacementFailure::Unavailable));
     };
+    let configured =
+        |label: &'static str, policy: &'static str| if label.is_empty() { policy } else { label };
     for (role, worker, label) in [
-        (metrics_labels::WORKER_PREFILL, &pair.prefill, labels.0),
-        (metrics_labels::WORKER_DECODE, &pair.decode, labels.1),
+        (
+            metrics_labels::WORKER_PREFILL,
+            &pair.prefill,
+            configured(labels.0, policies.get_prefill_policy().name()),
+        ),
+        (
+            metrics_labels::WORKER_DECODE,
+            &pair.decode,
+            configured(labels.1, policies.get_decode_policy().name()),
+        ),
     ] {
         let transport = worker.connection_mode().as_metric_label();
         Metrics::record_worker_selection(role, transport, model_id, label);
@@ -2153,6 +2266,55 @@ fn pair_by_engine(
         "The policy engine placed a PD pair"
     );
     Ok(pair)
+}
+
+/// A pair's decode asked again behind its prefill's answer: the placement
+/// function a pair route calls once its prefill has answered and before it
+/// sends the decode, where it sends the two sides one behind the other.
+///
+/// `decode` is the pair's decode as [`select_pair`] answered it, and `ahead`
+/// its load guard, made ahead of its send ([`Placed::ahead`]). `pairs`,
+/// `wire` and `inputs` state the request again, over the pair index as it
+/// stands now ([`PairsAgain`]): the route's own rule in `inputs` is asked of
+/// the decode the engine picks. The function answers the guard to keep, and
+/// the decode the request goes to now where that is another worker than
+/// `decode`'s:
+///
+/// - `(None, ahead)` wherever the first decision's decode stands: under the
+///   classic policies, under a document that picked the decode with its
+///   prefill, where the second decision names the same worker, and where it
+///   takes no worker, whatever the reason. The route sends the decode it
+///   has.
+/// - That worker, with the decode's side of the engine's placement, and a
+///   guard that counts it under the key `ahead` counted under. `ahead` is
+///   let go here: the first decode is counted no more, and its answer
+///   keeps nothing of the engine.
+///
+/// The route says [`Placed::sent`] with the answered guard, on the decode
+/// the request goes to, at that decode's send.
+///
+/// A route makes this one call for every pair it sends that way, with no
+/// test of its own around it. A thin front, always inlined: a classic
+/// answer pays the one test of its pointer, and its pair index is not read.
+#[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pair placement's own arguments, the decode's answer and its guard"
+)]
+pub(crate) fn decode_again(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    pairs: PairsAgain<'_>,
+    wire: Option<WireConstraint>,
+    inputs: PlacementInputs<'_>,
+    decode: &Placed,
+    ahead: WorkerLoadGuard,
+) -> (Option<Placed>, WorkerLoadGuard) {
+    match &decode.engine {
+        None => (None, ahead),
+        Some(first) => first.decode_again(registry, policies, model_id, pairs, wire, inputs, ahead),
+    }
 }
 
 /// Why a pass of the pair placement placed no pair.
@@ -7131,5 +7293,226 @@ pub(crate) mod tests {
         let _heard = hearing_pairs_on(&policies, false);
         let pair = pair_from(&registry, &policies).expect("the engine places the pair");
         drop(pair.prefill.into_guarded_worker());
+    }
+
+    /// One prefill and two decodes on one KV transport, under an engine
+    /// whose document picks a pair's decode behind its prefill, with the
+    /// pair's first placement: its prefill sent and its guard let go, as a
+    /// route that sends the two sides one behind the other leaves it, and
+    /// the decode's guard made ahead of its send under the key `"key"`.
+    fn a_pair_behind_its_prefill() -> (
+        WorkerRegistry,
+        PolicyRegistry,
+        Heard,
+        PlacedPair,
+        WorkerLoadGuard,
+    ) {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_pairs_on(&policies, true);
+        let pair = pair_from(&registry, &policies).expect("the engine places the pair");
+        drop(pair.prefill.guard(None));
+        let ahead = pair.decode.ahead(Some("key"));
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            ["issued", "dispatched Prefill"],
+            "the prefill's end waits for the decode's word"
+        );
+        (registry, policies, heard, pair, ahead)
+    }
+
+    /// The decode of `pair` asked again with `rule` as the route's own.
+    fn asked_again(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        rule: Option<CandidateFilter<'_>>,
+        pair: &PlacedPair,
+        ahead: WorkerLoadGuard,
+    ) -> (Option<Placed>, WorkerLoadGuard) {
+        let inputs = PlacementInputs {
+            candidate_filter: rule,
+            ..Default::default()
+        };
+        decode_again(
+            registry,
+            policies,
+            MODEL,
+            &|| pairs_of(registry, policies),
+            None,
+            inputs,
+            &pair.decode,
+            ahead,
+        )
+    }
+
+    /// A pair's decode asked again behind its prefill moves the request to
+    /// the decode the engine takes then: here the first decode is no longer
+    /// ready. The answer is that decode with the engine's decode side, and
+    /// a guard that counts it under the key the first guard counted under,
+    /// while the first decode is counted no more. A stage hears the
+    /// decode's issue at the ask, then the prefill's end that was held
+    /// back, and the decode's dispatch where the route says its send. The
+    /// first decode's answer keeps nothing of the engine.
+    #[test]
+    fn a_decode_asked_again_moves_the_request_and_its_guard_to_the_decode_the_engine_takes() {
+        let (registry, policies, heard, pair, ahead) = a_pair_behind_its_prefill();
+        let said = || heard.lock().expect("the stage heard").clone();
+        let first = Arc::clone(pair.decode.worker());
+        first.set_status(WorkerStatus::NotReady);
+
+        let (moved, guard) = asked_again(&registry, &policies, None, &pair, ahead);
+        let moved = moved.expect("the decode moved");
+        assert_ne!(moved.url(), first.url());
+        assert_eq!((first.load(), moved.load()), (0, 1));
+        assert_eq!(
+            (
+                first.routing_key_inflight("key"),
+                moved.routing_key_inflight("key")
+            ),
+            (0, 1)
+        );
+        assert_eq!(said()[2..], ["issued", "completed Cancelled"]);
+
+        let guard = moved.sent(guard);
+        assert_eq!(said()[4..], ["dispatched Decode"]);
+        drop(pair);
+        assert_eq!(said().len(), 5, "the first decode's answer says nothing");
+        drop(guard);
+        assert_eq!(said()[5..], ["completed Cancelled"]);
+        assert_eq!(moved.load(), 0);
+    }
+
+    /// The first decision's decode stands wherever the second ask takes no
+    /// other worker, and the guard handed in is the guard to keep: where
+    /// the engine names the same decode again, where the route's own rule
+    /// refuses every decode, and where the decode's send was said already.
+    /// The route sends the decode it has, and the engine books it at that
+    /// send.
+    #[test]
+    fn a_decode_asked_again_that_takes_no_other_worker_leaves_the_first_standing() {
+        // The engine names the first decode again: the other is not ready.
+        let (registry, policies, heard, pair, ahead) = a_pair_behind_its_prefill();
+        let said = || heard.lock().expect("the stage heard").clone();
+        for worker in &registry.get_all() {
+            let decode = *worker.worker_type() == WorkerType::Decode;
+            if decode && worker.url() != pair.decode.url() {
+                worker.set_status(WorkerStatus::NotReady);
+            }
+        }
+        let (moved, guard) = asked_again(&registry, &policies, None, &pair, ahead);
+        assert!(moved.is_none());
+        assert!(guard.counts(pair.decode.worker()));
+        assert_eq!(said()[2..], ["issued", "completed Cancelled"]);
+        let guard = pair.decode.sent(guard);
+        assert_eq!(said()[4..], ["dispatched Decode"]);
+        drop(guard);
+        assert_eq!(said()[5..], ["completed Cancelled"]);
+
+        // The route's rule refuses every decode: nothing is taken.
+        let (registry, policies, heard, pair, ahead) = a_pair_behind_its_prefill();
+        let said = || heard.lock().expect("the stage heard").clone();
+        let nobody = |_: &dyn Worker| false;
+        let (moved, guard) = asked_again(&registry, &policies, Some(&nobody), &pair, ahead);
+        assert!(moved.is_none());
+        assert!(guard.counts(pair.decode.worker()));
+        let before = said().len();
+        let guard = pair.decode.sent(guard);
+        let told = said()[before..].to_vec();
+        assert!(
+            told.contains(&"dispatched Decode".to_owned()),
+            "the first decision's decode is booked at its send: {told:?}"
+        );
+        drop(guard);
+
+        // An answer whose send was said is asked nothing: its pair index
+        // is not read.
+        let (registry, policies, heard, pair, ahead) = a_pair_behind_its_prefill();
+        let sent = pair.decode.sent(ahead);
+        let before = heard.lock().expect("the stage heard").len();
+        let unread: PairsAgain<'_> = &|| panic!("a sent decode reads no pair index");
+        let inputs = PlacementInputs::default();
+        let (moved, guard) = decode_again(
+            &registry,
+            &policies,
+            MODEL,
+            unread,
+            None,
+            inputs,
+            &pair.decode,
+            sent,
+        );
+        assert!(moved.is_none());
+        assert!(guard.counts(pair.decode.worker()));
+        assert_eq!(heard.lock().expect("the stage heard").len(), before);
+        drop(guard);
+    }
+
+    /// A classic pair's answer keeps the guard it was handed, by the one
+    /// test of the front: the route's read of the pair index is never made.
+    #[test]
+    fn a_classic_decode_asked_again_reads_no_pair_index() {
+        let registry = one_pair();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let pair = pair_from(&registry, &policies).expect("a classic pair");
+        let ahead = pair.decode.ahead(None);
+        let unread: PairsAgain<'_> = &|| panic!("a classic pair reads no pair index");
+        let inputs = PlacementInputs::default();
+        let (moved, guard) = decode_again(
+            &registry,
+            &policies,
+            MODEL,
+            unread,
+            None,
+            inputs,
+            &pair.decode,
+            ahead,
+        );
+        assert!(moved.is_none());
+        assert!(guard.counts(pair.decode.worker()));
+        assert_eq!(pair.decode.load(), 1);
+        drop(guard);
+        assert_eq!(pair.decode.load(), 0);
+    }
+
+    /// A document that picks a pair's decode with its prefill booked the
+    /// decode at the pair's one decision. The engine refuses the ask as a
+    /// decode that is not chosen, which is no failure of the request: the
+    /// guard handed in is the guard to keep, the ask says nothing, and the
+    /// route sends the first decode. The engine hears that decode's
+    /// dispatch at its send and its end at the guard's drop. Every pair is
+    /// placed so under the stock document.
+    #[test]
+    fn a_decode_booked_with_its_prefill_answers_the_ask_as_the_first_decode_standing() {
+        let registry = one_pair();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_pairs_on(&policies, false);
+        let said = || heard.lock().expect("the stage heard").clone();
+        let pair = pair_from(&registry, &policies).expect("the engine places the pair");
+        drop(pair.prefill.guard(None));
+        let ahead = pair.decode.ahead(None);
+        assert_eq!(
+            said(),
+            [
+                "issued",
+                "issued",
+                "dispatched Prefill",
+                "completed Cancelled"
+            ]
+        );
+
+        let (moved, guard) = asked_again(&registry, &policies, None, &pair, ahead);
+        assert!(moved.is_none());
+        assert!(guard.counts(pair.decode.worker()));
+        assert_eq!(said().len(), 4, "the ask says nothing");
+
+        let guard = pair.decode.sent(guard);
+        assert_eq!(said()[4..], ["dispatched Decode"]);
+        drop(guard);
+        assert_eq!(said()[5..], ["completed Cancelled"]);
+        assert_eq!(pair.decode.load(), 0);
     }
 }

@@ -639,7 +639,7 @@ pub(crate) fn ensure_selection_supports_media_refs(
             .collect(),
         WorkerSelection::Disaggregated {
             prefill, decode, ..
-        } => vec![prefill.as_ref(), decode.as_ref()],
+        } => vec![prefill.as_ref(), &**decode],
     };
     if !workers
         .iter()
@@ -1997,7 +1997,8 @@ mod tests {
                 RuntimeType::Vllm,
                 ConnectionMode::Grpc,
                 &[],
-            ),
+            )
+            .into(),
             runtime_type: RuntimeType::Vllm,
         };
         assert_eq!(
@@ -2019,7 +2020,7 @@ mod tests {
         let mixed = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: file_prefill,
-            decode: capable("grpc://127.0.0.1:9605"),
+            decode: capable("grpc://127.0.0.1:9605").into(),
             runtime_type: RuntimeType::Vllm,
         };
         ensure_selection_supports_media_refs(&mixed, &plan_https, PipelinePin::Any)
@@ -2042,7 +2043,7 @@ mod tests {
         let half = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: capable("grpc://127.0.0.1:9607"),
-            decode: silent_decode,
+            decode: silent_decode.into(),
             runtime_type: RuntimeType::Vllm,
         };
         assert_eq!(
@@ -2248,7 +2249,7 @@ mod tests {
         let half = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: pipeline_worker("grpc://127.0.0.1:9732"),
-            decode: capable("grpc://127.0.0.1:9733"),
+            decode: capable("grpc://127.0.0.1:9733").into(),
             runtime_type: RuntimeType::Vllm,
         };
         assert_eq!(

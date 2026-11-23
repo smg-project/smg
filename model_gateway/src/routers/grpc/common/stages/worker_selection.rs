@@ -2,7 +2,7 @@
 
 use std::{
     future::Future,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -12,7 +12,11 @@ use axum::{
 };
 use futures::{future::Either, FutureExt};
 use openai_protocol::common::CachePartition;
-use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
+use parking_lot::Mutex;
+use smg_worker::identity::{
+    basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
+    sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL,
+};
 use tracing::{debug, error, warn};
 
 use super::{
@@ -32,7 +36,10 @@ use crate::{
     },
     routers::{
         common::{
+            attempt_ledger::AttemptLedger,
+            kv_transfer::is_moriio_worker,
             pair_index::{PdPairIndex, PdWire},
+            pd_admission::{self, PdAdmissionGuard, Tried},
             placement::{
                 self, CandidateFilter, PairFailure, PipelinePin, Placed, PlacementFailure,
                 PlacementInputs, RefusalSite,
@@ -46,6 +53,7 @@ use crate::{
         },
         error,
         grpc::{
+            backend_client::{connected_backend_client, BackendClient},
             context::{
                 stage_output, DispatchContext, EncodeWorkerAssignment, ExecutionPlan,
                 PreparationOutput, RequestContext, RequestInput, RequestType, RoutingSnapshot,
@@ -63,6 +71,11 @@ type PdWorkerPair = (Arc<dyn Worker>, Arc<dyn Worker>, RuntimeType);
 /// A PD pair as the placement answers it: each worker as a [`Placed`],
 /// which that side's load guard is made from.
 type PlacedPdPair = (Placed, Placed, RuntimeType);
+
+/// A PD pair the Prefill admission seated: the prefill's handle, whose
+/// guard the admission made from its answer, and the decode as its
+/// placement answered it, which the dispatch makes its guard from.
+type AdmittedPdPair = (Arc<dyn Worker>, Placed, RuntimeType);
 
 /// The candidate predicate of a request carrying media references with no
 /// pipeline pin: only workers that process them themselves. The stage
@@ -112,6 +125,7 @@ impl PrefillCandidateError for PdSelectionFailure {
 }
 
 /// Result type for EPD worker selection: (encode assignments, prefill, decode, runtime_type).
+#[cfg(test)]
 type EncodePrefillDecodeWorkerSelection = (
     Vec<EncodeWorkerAssignment>,
     Arc<dyn Worker>,
@@ -122,6 +136,15 @@ type EncodePrefillDecodeWorkerSelection = (
 /// An EPD selection as the placement answers its pair: the prefill and the
 /// decode each as a [`Placed`], which that side's load guard is made from.
 type PlacedEpdSelection = (Vec<EncodeWorkerAssignment>, Placed, Placed, RuntimeType);
+
+/// An EPD selection the Prefill admission seated, its pair as
+/// [`AdmittedPdPair`] holds one.
+type AdmittedEpdSelection = (
+    Vec<EncodeWorkerAssignment>,
+    Arc<dyn Worker>,
+    Placed,
+    RuntimeType,
+);
 
 /// Client-visible, gateway-owned code for a request refused ahead of worker
 /// selection because it had already waited longer than the queue timeout
@@ -308,7 +331,7 @@ pub(crate) fn waited_past_timeout(
     (waited > timeout).then_some(waited)
 }
 
-fn disaggregated((prefill, decode, runtime_type): PdWorkerPair) -> WorkerSelection {
+fn disaggregated((prefill, decode, runtime_type): AdmittedPdPair) -> WorkerSelection {
     WorkerSelection::Disaggregated {
         encode_assignments: None,
         prefill,
@@ -862,6 +885,123 @@ impl WorkerSelectionStage {
         Ok(())
     }
 
+    /// A pair's decode asked again behind its prefill's answer, for the
+    /// dispatch that sends one request's two sides one behind the other
+    /// ([`placement::decode_again`]). The stage states the request again
+    /// from what outlived it, as a retry's selection does, on the retained
+    /// plan's wire. `first` is the decode the dispatch holds, and `ahead`
+    /// its load guard.
+    ///
+    /// The pair index as it stands now is read by the placement's own call,
+    /// for a decode the policy engine placed and whose send was not said.
+    /// A classic pair reads nothing here.
+    ///
+    /// The route's rule for a decode the request may move to: the request's
+    /// ledger admits it, as at every selection; it reads the built request
+    /// as the first decode does ([`reads_the_request_alike`]), in a window
+    /// no narrower ([`holds_what_the_first_holds`]); the gateway holds its
+    /// client, since a connect behind the prefill's answer could fail a
+    /// request the first decode would have served; and its admission gate
+    /// takes the request now, by one try with no wait
+    /// ([`pd_admission::try_admit_decode`]). The first decode holds with no
+    /// try: its client and its claim stand. A claim tried for a decode the
+    /// engine then passes over is given back at the next try, and at the
+    /// call's end.
+    ///
+    /// Answers the guard to keep, and the decode the request moved to where
+    /// it moved, with its client and its gate's claim.
+    pub(crate) fn decode_again(
+        &self,
+        request: &RequestAgain<'_>,
+        first: &Placed,
+        ahead: WorkerLoadGuard,
+    ) -> (Option<MovedDecode>, WorkerLoadGuard) {
+        let model_id = request.model_id;
+        // The index the placement reads, kept for the rule: the rule is
+        // asked behind that read.
+        let read: OnceLock<Arc<PdPairIndex>> = OnceLock::new();
+        let pairs = || {
+            let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+            let mode = self.policy_registry.pd_pairing_mode();
+            Arc::clone(read.get_or_init(|| snapshot.pd_pairs(PdWire::Grpc, mode)))
+        };
+        // What the decode the rule last said yes to brings with it. The
+        // engine asks the rule once a decode, best first, and takes the
+        // first it says yes to that is ready: that last yes is the decode
+        // the request moves to.
+        let brought: Mutex<Option<Brought>> = Mutex::new(None);
+        let takes_the_request = |worker: &dyn Worker| {
+            let mut brought = brought.lock();
+            *brought = None;
+            let alike = reads_the_request_alike(&**first, worker)
+                && holds_what_the_first_holds(&**first, worker, model_id);
+            if !alike || !request.ledger.admits(worker) {
+                return false;
+            }
+            if same_worker(first.worker(), worker) {
+                return true;
+            }
+            let mut held = read
+                .get()
+                .into_iter()
+                .flat_map(|pairs| pairs.decode_pool.iter());
+            let Some(decode) = held.find(|held| same_worker(held, worker)) else {
+                return false;
+            };
+            let Some(client) = connected_backend_client(worker) else {
+                return false;
+            };
+            let claim = match pd_admission::try_admit_decode(decode, 1) {
+                Tried::NoWindow => None,
+                Tried::Claimed(claim) => Some(claim),
+                Tried::Full => return false,
+            };
+            *brought = Some(Brought {
+                decode: Arc::clone(decode),
+                client: (*client).clone(),
+                claim,
+            });
+            true
+        };
+        let rid = request.routing.rid.as_deref();
+        let inputs = PlacementInputs {
+            text: request.routing.routing_text.as_deref(),
+            tokens: Some(request.tokens).filter(|ids| !ids.is_empty()),
+            headers: request.headers,
+            rid_key: self.policy_registry.derive_rid_key(rid),
+            rid,
+            cache_namespace: request.routing.cache_namespace,
+            candidate_filter: Some(&takes_the_request),
+            tried: request.tried,
+        };
+        let (moved, guard) = placement::decode_again(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            &pairs,
+            Some(request.wire),
+            inputs,
+            first,
+            ahead,
+        );
+        let brought = brought.into_inner();
+        let moved = moved.and_then(|decode| {
+            debug_assert!(
+                brought
+                    .as_ref()
+                    .is_some_and(|brought| Arc::ptr_eq(&brought.decode, decode.worker())),
+                "the rule's last yes was to the decode the engine took"
+            );
+            let Brought { client, claim, .. } = brought?;
+            Some(MovedDecode {
+                decode,
+                client,
+                claim,
+            })
+        });
+        (moved, guard)
+    }
+
     /// Keep known grid-bearing decode identities on vision-capable workers.
     /// EPD references are unresolved: prefer vision when available, but let
     /// dispatch validate the resulting identity before using a stripped decode request.
@@ -903,7 +1043,7 @@ impl WorkerSelectionStage {
         wire: Option<WireConstraint>,
         media: MediaDemands,
         demand: PairDemands,
-    ) -> Result<(PdWorkerPair, PrefillLoadGuard), Response> {
+    ) -> Result<(AdmittedPdPair, PrefillLoadGuard), Response> {
         acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
@@ -911,15 +1051,10 @@ impl WorkerSelectionStage {
             |capacity| self.placed_pd_pair(model_id, inputs, wire, capacity, demand),
         )
         .await
-        // The prefill's side went into its guard. The decode's guard is not
-        // made from its answer yet.
+        // The prefill's side went into its guard. The dispatch makes the
+        // decode's guard from its answer.
         .map(|((prefill, decode, runtime), guard)| {
-            let pair = (
-                prefill.into_guarded_worker(),
-                decode.worker_alone_for_now(),
-                runtime,
-            );
-            (pair, guard)
+            ((prefill.into_guarded_worker(), decode, runtime), guard)
         })
         .map_err(|error| {
             Self::acquire_failure(model_id, error, |failure| {
@@ -936,7 +1071,7 @@ impl WorkerSelectionStage {
         sticky_key: Option<&str>,
         encode_item_hashes: &[Vec<u8>],
         demand: EpdDemands,
-    ) -> Result<(EncodePrefillDecodeWorkerSelection, PrefillLoadGuard), Response> {
+    ) -> Result<(AdmittedEpdSelection, PrefillLoadGuard), Response> {
         acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
@@ -953,15 +1088,10 @@ impl WorkerSelectionStage {
         )
         .await
         // As for a PD pair: the prefill's side went into its guard, and the
-        // decode's guard is not made from its answer yet.
+        // dispatch makes the decode's guard from its answer.
         .map(|((assignments, prefill, decode, runtime), guard)| {
-            let selection = (
-                assignments,
-                prefill.into_guarded_worker(),
-                decode.worker_alone_for_now(),
-                runtime,
-            );
-            (selection, guard)
+            let prefill = prefill.into_guarded_worker();
+            ((assignments, prefill, decode, runtime), guard)
         })
         .map_err(|error| {
             Self::acquire_failure(model_id, error, |failure| {
@@ -1019,6 +1149,83 @@ impl WorkerSelectionStage {
             }
         }
     }
+}
+
+/// What a dispatch hands the selection stage to state its request again,
+/// for a pair's decode asked again behind its prefill
+/// ([`WorkerSelectionStage::decode_again`]): what outlived the parsed
+/// request, as a retry's selection reads it.
+pub(crate) struct RequestAgain<'a> {
+    pub model_id: &'a str,
+    pub routing: &'a RoutingSnapshot,
+    pub headers: Option<&'a HeaderMap>,
+    /// The prompt's token ids, off the request the decode is sent.
+    pub tokens: &'a [u32],
+    /// The retained plan's wire: the decode's request was built for it.
+    pub wire: WireConstraint,
+    /// The engines the request's failed attempts were sent to.
+    pub tried: &'a [String],
+    pub ledger: &'a AttemptLedger,
+}
+
+/// A decode a request moved to behind its prefill: its placement's answer,
+/// the client the gateway held for it ahead of the move, and what its
+/// admission gate seated for the dispatch, `None` where its engine reports
+/// no window.
+pub(crate) struct MovedDecode {
+    pub decode: Placed,
+    pub client: BackendClient,
+    pub claim: Option<PdAdmissionGuard>,
+}
+
+/// What the route's rule holds for a decode it said yes to, where the
+/// request would move to it ([`WorkerSelectionStage::decode_again`]): the
+/// decode, its client and its gate's claim.
+struct Brought {
+    decode: Arc<dyn Worker>,
+    client: BackendClient,
+    claim: Option<PdAdmissionGuard>,
+}
+
+/// Whether `held` and `worker` name one worker object.
+fn same_worker(held: &Arc<dyn Worker>, worker: &dyn Worker) -> bool {
+    std::ptr::addr_eq(Arc::as_ptr(held), std::ptr::from_ref(worker))
+}
+
+/// Whether `worker` reads a decode request built for `first` as `first`
+/// does. The request is built whole before the prefill goes out, for the
+/// decode the first decision named, and nothing shapes it again behind a
+/// second ask. So a decode that takes it runs the first one's runtime on
+/// the first one's connection, constrains a turn by the same labels,
+/// samples by the same defaults, and handles media the same way. It is no
+/// MoRI-IO engine, whose prefill would have been told its decode.
+fn reads_the_request_alike(first: &dyn Worker, worker: &dyn Worker) -> bool {
+    worker.connection_mode() == first.connection_mode()
+        && worker.metadata().spec.runtime_type == first.metadata().spec.runtime_type
+        && worker.metadata().decoding == first.metadata().decoding
+        && sampling_defaults(worker) == sampling_defaults(first)
+        && multimodal::worker_language_model_only(worker)
+            == multimodal::worker_language_model_only(first)
+        && !is_moriio_worker(worker)
+}
+
+/// Whether `worker`'s context window for `model` holds every request that
+/// `first`'s holds. The request's sizes were checked against the first
+/// decode alone, where the pair was placed with no window demand stated. A
+/// worker that states no window binds nothing, as at that check.
+fn holds_what_the_first_holds(first: &dyn Worker, worker: &dyn Worker, model: &str) -> bool {
+    match (first.context_length(model), worker.context_length(model)) {
+        (_, None) => true,
+        (Some(first), Some(window)) => window >= first,
+        (None, Some(_)) => false,
+    }
+}
+
+/// The sampling defaults a worker's label states, which request building
+/// lays under a request for its decode worker.
+fn sampling_defaults(worker: &dyn Worker) -> Option<&String> {
+    let labels = &worker.metadata().spec.labels;
+    labels.get(DEFAULT_SAMPLING_PARAMS_LABEL)
 }
 
 /// Candidate predicate for requests carrying media references.
@@ -4178,7 +4385,7 @@ mod tests {
                     .unwrap();
                 let selected = match ctx.workers.as_ref().unwrap() {
                     WorkerSelection::Single { worker } => worker.worker(),
-                    WorkerSelection::Disaggregated { decode, .. } => decode,
+                    WorkerSelection::Disaggregated { decode, .. } => decode.worker(),
                 };
                 assert_eq!(selected.url(), workers[2].url());
             }
@@ -4499,7 +4706,7 @@ mod tests {
         ctx.headers = Some(headers);
         let plan = retained_plan(&[1, 2, 3]);
         let selected_decode = |ctx: &DispatchContext| match ctx.workers.as_ref().unwrap() {
-            WorkerSelection::Disaggregated { decode, .. } => Arc::clone(decode),
+            WorkerSelection::Disaggregated { decode, .. } => Arc::clone(decode.worker()),
             WorkerSelection::Single { .. } => panic!("expected PD selection"),
         };
 
@@ -8174,14 +8381,85 @@ mod tests {
     #[test]
     fn the_dispatch_future_fits_its_bound() {
         let mut ctx = dispatch_ctx("test-model", grpc_wire(RuntimeType::Vllm));
+        let stage = regular_stage(Arc::new(WorkerRegistry::new()));
         let future = size_of_val(&execute_plan(
             &mut ctx,
             retained_plan(&[1]),
             false,
             None,
             GroupedDpSticky::Off,
+            &stage,
         ));
         assert!(future <= 2048, "the dispatch future is {future} bytes");
+    }
+
+    /// A decode request is built for the decode the first decision named.
+    /// A second ask moves the pair to a decode that reads it alike alone:
+    /// each difference here refuses the move.
+    #[test]
+    fn a_built_decode_request_moves_to_a_decode_that_reads_it_alike_alone() {
+        use smg_worker::identity::basic::MORIIO_CONNECTOR;
+
+        type Shape = fn(BasicWorkerBuilder) -> BasicWorkerBuilder;
+        let decode = |shape: Shape| {
+            let worker = BasicWorkerBuilder::new("grpc://decode:30000")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm);
+            shape(worker).build()
+        };
+        let first = decode(|worker| worker);
+        assert!(reads_the_request_alike(&first, &decode(|worker| worker)));
+        let others: [(&str, Shape); 6] = [
+            ("another connection", |worker| {
+                worker.connection_mode(ConnectionMode::Zmq)
+            }),
+            ("another runtime", |worker| {
+                worker.runtime_type(RuntimeType::Sglang)
+            }),
+            ("another grammar start", |worker| {
+                worker.label("constrained_decoding_start", "first_token")
+            }),
+            ("no vision encoder", |worker| {
+                worker.label("supports_vision", "false")
+            }),
+            ("the MoRI-IO connector", |worker| {
+                worker.kv_connector(MORIIO_CONNECTOR)
+            }),
+            ("other sampling defaults", |worker| {
+                worker.label(DEFAULT_SAMPLING_PARAMS_LABEL, r#"{"temperature":1.0}"#)
+            }),
+        ];
+        for (what, shape) in others {
+            let other = decode(shape);
+            assert!(!reads_the_request_alike(&first, &other), "{what}");
+        }
+    }
+
+    /// A request's sizes were checked against the first decode's context
+    /// window. A decode the pair moves to holds a window no narrower, or
+    /// states none.
+    #[test]
+    fn a_moved_decode_holds_a_window_no_narrower_than_the_first() {
+        let decode = |window: Option<u32>| {
+            let card = ModelCard::new("m");
+            let card = match window {
+                Some(window) => card.with_context_length(window),
+                None => card,
+            };
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .worker_type(WorkerType::Decode)
+                .model(card)
+                .build()
+        };
+        let holds = |first: Option<u32>, other: Option<u32>| {
+            holds_what_the_first_holds(&decode(first), &decode(other), "m")
+        };
+        assert!(holds(Some(32_768), Some(32_768)));
+        assert!(holds(Some(4_096), Some(32_768)));
+        assert!(!holds(Some(32_768), Some(4_096)), "a narrower window");
+        assert!(holds(Some(32_768), None), "no window stated binds nothing");
+        assert!(!holds(None, Some(4_096)), "the first stated none");
     }
 }
 

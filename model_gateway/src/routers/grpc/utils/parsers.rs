@@ -719,7 +719,7 @@ impl WorkerDecoding {
     pub fn of(workers: Option<&WorkerSelection>) -> Self {
         match workers {
             Some(WorkerSelection::Single { worker }) => Self::of_worker(&**worker),
-            Some(WorkerSelection::Disaggregated { decode, .. }) => Self::of_worker(decode.as_ref()),
+            Some(WorkerSelection::Disaggregated { decode, .. }) => Self::of_worker(&**decode),
             None => Self {
                 policy: ConstrainedDecoding::Requested,
                 start: GrammarStart::Unknown,
@@ -1077,7 +1077,7 @@ mod tests {
             WorkerDecoding::of(Some(&WorkerSelection::Disaggregated {
                 encode_assignments: None,
                 prefill,
-                decode,
+                decode: decode.into(),
                 runtime_type: openai_protocol::worker::RuntimeType::TokenSpeed,
             }))
             .policy,
@@ -1166,7 +1166,7 @@ mod tests {
             WorkerDecoding::of(Some(&WorkerSelection::Disaggregated {
                 encode_assignments: None,
                 prefill,
-                decode,
+                decode: decode.into(),
                 runtime_type: openai_protocol::worker::RuntimeType::TokenSpeed,
             }))
             .vocabulary,

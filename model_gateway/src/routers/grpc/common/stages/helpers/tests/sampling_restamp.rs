@@ -200,7 +200,7 @@ fn labelled_pair(prefill_json: Option<&str>, decode_json: Option<&str>) -> Worke
     WorkerSelection::Disaggregated {
         encode_assignments: None,
         prefill: side("grpc://prefill:30000", WorkerType::Prefill, prefill_json),
-        decode: side("grpc://decode:30000", WorkerType::Decode, decode_json),
+        decode: side("grpc://decode:30000", WorkerType::Decode, decode_json).into(),
         runtime_type: RuntimeType::Sglang,
     }
 }

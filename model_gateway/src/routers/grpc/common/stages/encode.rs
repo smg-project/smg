@@ -527,7 +527,7 @@ mod tests {
                     .map(|(item_index, worker)| EncodeWorkerAssignment { item_index, worker })
                     .collect(),
             ),
-            decode: Arc::clone(&prefill),
+            decode: Arc::clone(&prefill).into(),
             prefill,
             runtime_type: RuntimeType::Vllm,
         }
@@ -701,7 +701,7 @@ mod tests {
                 worker: Arc::clone(&encoder),
             }]),
             prefill,
-            decode,
+            decode: decode.into(),
             runtime_type: RuntimeType::TokenSpeed,
         };
         let clients = ClientSelection::Disaggregated {

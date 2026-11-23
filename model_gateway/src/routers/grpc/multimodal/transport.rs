@@ -853,7 +853,7 @@ fn worker_shares_dev_shm(workers: Option<&WorkerSelection>, skip_pixel_values: b
                 }
             }
             worker_matches_shm_namespace(prefill, local)
-                && worker_matches_shm_namespace(decode, local)
+                && worker_matches_shm_namespace(decode.worker(), local)
         }
         None => false,
     }

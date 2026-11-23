@@ -394,7 +394,7 @@ pub(crate) fn selection_context_length(workers: &WorkerSelection, model_id: &str
         WorkerSelection::Single { worker } => worker.context_length(model_id),
         WorkerSelection::Disaggregated {
             prefill, decode, ..
-        } => pair_context_length(prefill.as_ref(), decode.as_ref(), model_id),
+        } => pair_context_length(prefill.as_ref(), &**decode, model_id),
     }
 }
 
@@ -541,7 +541,7 @@ mod tests {
         WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: worker(WorkerType::Prefill, prefill),
-            decode: worker(WorkerType::Decode, decode),
+            decode: worker(WorkerType::Decode, decode).into(),
             runtime_type: RuntimeType::Sglang,
         }
     }
