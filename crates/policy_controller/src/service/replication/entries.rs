@@ -104,12 +104,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         "evict",
         EntryReplication::Rebuilt("each replica drops its own load rows"),
     ),
-    // No host calls it.
-    (
-        "LoadSink",
-        "evict_unready",
-        EntryReplication::Rebuilt("each replica's caller says its own reset, under its own lead"),
-    ),
     ("LoadSink", "publish_due", EntryReplication::Read),
     ("LoadSink", "publish", EntryReplication::Rebuilt(PUBLISHED)),
     ("LoadSink", "wake_with", EntryReplication::Read),
