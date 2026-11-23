@@ -350,8 +350,8 @@ fn a_key_over_prefill_workers_passes_an_owner_over_its_thresholds() {
 /// on the ring the caller lends and on the stage's own.
 ///
 /// The gateway's own placement lifts the overload veto for a key only
-/// where every candidate's type is the regular one (`select_pass`,
-/// `model_gateway/src/routers/common/placement.rs:1337`).
+/// where every candidate's type is the regular one (`select_pass`, at main
+/// `450084124`, `model_gateway/src/routers/common/placement.rs:1337`).
 #[test]
 fn a_key_over_decode_or_encode_workers_passes_an_owner_over_its_thresholds() {
     for role in [WorkerType::Decode, WorkerType::Encode] {

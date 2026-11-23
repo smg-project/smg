@@ -8465,10 +8465,10 @@ mod tests {
         // Prefill workers: no key is kept over them.
         let mut prefill = with(|row| row.role = Role::Prefill);
         prefill[1].health.overloaded = true;
-        // Nor over decode workers or encode workers: every role but the
-        // regular one passes the key on, as the gateway's own placement
-        // asks that every candidate is a regular worker
-        // (model_gateway/src/routers/common/placement.rs:1337).
+        // Nor over decode or encode workers: every role but the regular
+        // one passes the key on, as the gateway's own placement asks that
+        // every candidate is a regular worker (`select_pass`, at main
+        // `450084124`, `model_gateway/src/routers/common/placement.rs:1337`).
         let mut decode = with(|row| row.role = Role::Decode);
         decode[1].health.overloaded = true;
         let mut encode = with(|row| row.role = Role::Encode);
