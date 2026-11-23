@@ -28,7 +28,7 @@ use crate::{
     engine::{
         decision::{Queue, ShadowKind, Shed, Target, Targets, Trace},
         decision_engine::Decided,
-        framework::{Filter, Picker, Place, Scorer, TieBand},
+        framework::{Filter, Picker, Place, Scorer, TieBand, DRAW_FROM},
         list_cell::tests::PublishedList,
         records::worker_id,
         view::{fingerprint, Candidate, FixedFacts, HashKind},
@@ -915,6 +915,54 @@ fn a_retry_is_placed_past_the_worker_it_tried() {
         let placement = engine.place(&retry).expect("a placement");
         assert!(Arc::ptr_eq(&placement.worker, &list[1]));
         assert_eq!(placement.id(), worker_id(list[1].as_ref()));
+    }
+}
+
+/// A retry whose tried worker has left its list names no worker of it and
+/// states its number alone. It takes no turn of the list: the first
+/// attempts between such retries take the list's workers one after the
+/// other, and the retries go round every worker of the list, at every
+/// size.
+///
+/// The classic router gives a request that tried a worker an untried list
+/// of its own, whether or not that worker is still listed
+/// (`model_gateway/src/routers/common/placement.rs:1256-1269`), and its
+/// policy takes a list's turn for a list named whole alone (`:1277`,
+/// `model_gateway/src/policies/round_robin.rs:145`). The gateway states the
+/// number as the count of the workers a request tried and names the ones
+/// still listed (`model_gateway/src/routers/common/place_request.rs:33-44`,
+/// `:94`).
+#[test]
+fn a_retry_whose_tried_worker_left_the_list_takes_no_turn_of_it() {
+    for workers in [4, DRAW_FROM, 64] {
+        let engine = hosted(preset("round_robin"));
+        let list = pool(workers);
+        let members = PublishedList::new(Arc::clone(&list));
+        let first = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
+        let retry = PlaceRequest {
+            attempt: 1,
+            ..PlaceRequest::of(MODEL, first.lists)
+        };
+        let at = |request: &PlaceRequest<'_>| {
+            let placement = engine.place(request).expect("a placement");
+            let taken = |worker: &Arc<dyn Worker>| Arc::ptr_eq(worker, &placement.worker);
+            list.iter().position(taken).expect("a worker of the list")
+        };
+        // As many first attempts as turn the list once for each worker but
+        // one, and a retry behind each: the retries go a whole number of
+        // times round the list.
+        let requests = workers * (workers - 1);
+        let (mut firsts, mut retries) = (Vec::new(), vec![0_usize; workers]);
+        for _ in 0..requests {
+            firsts.push(at(&first));
+            retries[at(&retry)] += 1;
+        }
+        let in_turn: Vec<usize> = (0..requests)
+            .map(|turn| (firsts[0] + turn) % workers)
+            .collect();
+        assert_eq!(firsts, in_turn, "{workers} workers: the first attempts");
+        let shares = vec![workers - 1; workers];
+        assert_eq!(retries, shares, "{workers} workers: the retries");
     }
 }
 

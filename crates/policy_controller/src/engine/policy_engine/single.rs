@@ -1280,16 +1280,17 @@ pub(crate) mod tests {
         }
     }
 
-    /// A draw turns the list's own word, the one a pick alone turns. Two
-    /// lists of one model and one size so turn a rotation each: asked in
-    /// turn, a request with no routing key and a new session at each, they
-    /// take each list's workers one after the other. And over one list a
-    /// pick alone and a new session's whole decision share one rotation:
-    /// the pick is asked for a model the same profile is bound for with no
-    /// rule, since a place under a rule is not one pick's.
+    /// A whole decision turns the list's own word, the one a pick alone
+    /// turns, at every size: under the draw's floor, at it and above it.
+    /// Two lists of one model and one size so turn a rotation each: asked
+    /// in turn, a request with no routing key and a new session at each,
+    /// they take each list's workers one after the other. And over one
+    /// list a pick alone and a new session's whole decision share one
+    /// rotation: the pick is asked for a model the same profile is bound
+    /// for with no rule, since a place under a rule is not one pick's.
     /// The gateway's classic policy keeps its rotation by the list it is
-    /// handed whole (`model_gateway/src/policies/round_robin.rs:95-99`,
-    /// `:151`).
+    /// handed whole, whatever its size
+    /// (`model_gateway/src/policies/round_robin.rs:95-99`, `:151`).
     #[test]
     fn each_list_turns_its_own_rotation_for_every_request() {
         let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
@@ -1301,9 +1302,9 @@ pub(crate) mod tests {
         unruled.matcher.model = "unruled-*".to_owned();
         document.bindings.insert(0, unruled);
         document.bindings[1].sessions = Some(rule);
-        let keys: Vec<String> = (0..24).map(|key| format!("key-{key}")).collect();
+        let keys: Vec<String> = (0..48).map(|key| format!("key-{key}")).collect();
         let mut keys = keys.iter();
-        for workers in [DRAW_FROM, 64] {
+        for workers in [3, DRAW_FROM - 1, DRAW_FROM, 64] {
             let spec = AppliedSpec::validate(&document).expect("the document validates");
             let engine = PolicyEngine::new(spec);
             let Place::Alone(profile) = engine.place_for("unruled-1", Phase::Single) else {
@@ -1349,6 +1350,107 @@ pub(crate) mod tests {
                 .map(|turn| (places[0][0] + turn) % workers)
                 .collect();
             assert_eq!(shared, in_turn, "{workers} workers, one list");
+        }
+    }
+
+    /// A turn that lands on a refused worker falls to the rotation of the
+    /// workers the filters kept, in every whole decision and at every size:
+    /// the ready workers take exact shares, a request with no routing key
+    /// and a new session in turn, and the list's word moves once a request.
+    /// The gateway's classic policy asks the list's turn by place and lets
+    /// a refused place fall to its set's rotation
+    /// (`model_gateway/src/policies/round_robin.rs:151-153`, `:164-167`),
+    /// and its own case holds these shares over four workers (`:430-441`).
+    #[test]
+    fn a_refused_turn_falls_to_the_kept_workers_rotation_at_every_size() {
+        let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+        let manual = PolicySpec::preset("manual").expect("a built-in preset");
+        document.view.headers.clone_from(&manual.view.headers);
+        let mut rule = manual.bindings[0].sessions.clone().expect("its rule");
+        rule.assignment = Assignment::Delegate;
+        document.bindings[0].sessions = Some(rule);
+        for workers in [4, DRAW_FROM, 64] {
+            let spec = AppliedSpec::validate(&document).expect("the document validates");
+            let engine = PolicyEngine::new(spec);
+            let list = pool(workers);
+            list[1].set_status(WorkerStatus::NotReady);
+            let members = PublishedList::new(Arc::clone(&list));
+            let word = &engine.members_of(members.lent()).rotation.0;
+            let before = word.load(Ordering::Relaxed);
+            // One request a turn of the list goes to the kept workers'
+            // rotation, which comes round once in as many turns of the list
+            // as workers are kept.
+            let requests = workers * (workers - 1);
+            let keys: Vec<String> = (0..requests).map(|key| format!("key-{key}")).collect();
+            let mut times = vec![0_usize; workers];
+            for (turn, key) in keys.iter().enumerate() {
+                let mut ask = request();
+                if turn % 2 == 1 {
+                    ask.facts.session_key = Identity::plain(key);
+                }
+                let asks = Asks::of(ask, Some(&members));
+                let decided = decided(&engine, &asks);
+                let pick = decided.decision.pick().expect("a pick");
+                times[pick.targets.first().expect("the target").position as usize] += 1;
+            }
+            let mut shares = vec![workers; workers];
+            shares[1] = 0;
+            assert_eq!(times, shares, "{workers} workers");
+            let turned = word.load(Ordering::Relaxed) - before;
+            assert_eq!(
+                turned, requests as u64,
+                "{workers} workers: a turn a request"
+            );
+        }
+    }
+
+    /// A retry takes no turn of the list: it turns the rotation of the
+    /// workers it has not tried, at every size. So the first attempts
+    /// between the retries take the list's workers one after the other,
+    /// and each worker not tried takes an exact share of the retries. The
+    /// gateway's classic placement hands its policy a retry's untried
+    /// workers as a list of their own, which nobody names
+    /// (`model_gateway/src/routers/common/placement.rs:1256-1269`,
+    /// `:1277`), and its policy takes the list's turn for a list named
+    /// whole alone (`model_gateway/src/policies/round_robin.rs:145`), a set's
+    /// rotation for any other (`:158-167`).
+    ///
+    /// A request that names a worker it tried is a retry whatever number it
+    /// states: a host that states none is answered as one that does.
+    #[test]
+    fn a_retry_turns_the_untried_workers_rotation_and_no_turn_of_the_list() {
+        let sizes = [4, DRAW_FROM, 64];
+        for (workers, attempt) in sizes.into_iter().flat_map(|n| [(n, 1), (n, 0)]) {
+            let engine = preset("round_robin");
+            let list = pool(workers);
+            let members = PublishedList::new(Arc::clone(&list));
+            let tried = [worker_id(list[0].as_ref())];
+            let mut retry = request();
+            retry.facts.tried = &tried;
+            retry.facts.attempt = attempt;
+            let (first, retry) = (
+                Asks::of(request(), Some(&members)),
+                Asks::of(retry, Some(&members)),
+            );
+            // As many first attempts as turn the list once for each worker
+            // not tried, and a retry behind each: the retries go once round
+            // the untried workers for each worker of the list.
+            let requests = workers * (workers - 1);
+            let (mut firsts, mut retries) = (Vec::new(), vec![0_usize; workers]);
+            for _ in 0..requests {
+                firsts.push(placed(&engine, &first).place as usize);
+                let decided = decided(&engine, &retry);
+                let pick = decided.decision.pick().expect("a pick");
+                retries[pick.targets.first().expect("the target").position as usize] += 1;
+            }
+            let in_turn: Vec<usize> = (0..requests)
+                .map(|turn| (firsts[0] + turn) % workers)
+                .collect();
+            let said = format!("{workers} workers, a retry that states attempt {attempt}");
+            assert_eq!(firsts, in_turn, "{said}: the first attempts");
+            let mut shares = vec![workers; workers];
+            shares[0] = 0;
+            assert_eq!(retries, shares, "{said}: the retries");
         }
     }
 

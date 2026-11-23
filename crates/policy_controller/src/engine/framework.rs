@@ -487,18 +487,25 @@ impl Shortlist {
 /// counts none: its own draws, twice the sample, bound what it asks.
 pub const DRAW_BOUND: u32 = 8;
 
-/// The smallest pool at which a decision draws first, set by run. A draw
-/// pays more than the whole pass for each row it asks about, so a small
-/// pool is read whole. With every row ready the draw reads faster than the
-/// pass from eight rows on, and with one row in seventeen not ready from
-/// sixteen, for every built-in that draws: sixteen is the first size the
-/// `draw` bench reads at which it wins on both. Rows refused do not move
+/// The smallest pool at which a decision draws first for speed, set by
+/// run. A draw pays more than the whole pass for each row it asks about, so
+/// a small pool is read whole where the two place a request by one rule
+/// (the last paragraph names the picker whose draw is asked under it). With
+/// every row ready the draw reads faster than the pass from eight rows on,
+/// and with one row in seventeen not ready from sixteen, for every built-in
+/// that draws: sixteen is the first size the `draw` bench reads at which it
+/// wins on both. Rows refused do not move
 /// this size, and under twice this size they can cost more than the draw
 /// gains: with every second row refused, a pool under 32 rows can pay more
 /// than its whole pass: under a picker that draws two rows, and under
 /// `round_robin` too in a whole decision with its view's build. The bench's
 /// cells `power_of_two/half/16` and `power_of_two/half/32` hold that shape
 /// and where it ends.
+///
+/// A picker that takes turns ([`Picker::takes_turns`]) is asked to draw
+/// under this size too, over a pool that lends its own word
+/// ([`PoolFacts::word`]): its draw takes the list's own turn, which the
+/// whole pass does not, so there the size is no matter of speed.
 pub const DRAW_FROM: usize = 16;
 
 /// The pool size from which a profile whose leading stages are ranks is
@@ -575,7 +582,9 @@ pub trait Picker: Lifecycle + Debug {
 
     /// Whether the picker draws first ([`Picker::draw_first`]); the default
     /// is no. The engine reads it once per profile when it is built, and
-    /// asks such a picker to draw over a pool of [`DRAW_FROM`] rows or more.
+    /// asks such a picker to draw over a pool of [`DRAW_FROM`] rows or more,
+    /// and over a smaller one where its draw is a turn
+    /// ([`Picker::takes_turns`]).
     fn draws_first(&self) -> bool {
         false
     }
@@ -596,7 +605,8 @@ pub trait Picker: Lifecycle + Debug {
     /// it hands out, each one kept by `keep` and none twice: the scorers are
     /// handed them and [`Picker::order_drawn`] orders them. On `false`
     /// nothing is decided, what `kept` holds is dropped and the whole pass
-    /// runs: the picker does not draw first, or its bound ran out before it
+    /// runs: the picker does not draw first, its rule leaves this request to
+    /// the pass, as a rotation leaves a retry, or its bound ran out before it
     /// held its pick ([`DRAW_BOUND`] refused rows, or a sample's draws). A
     /// draw that keeps nobody says
     /// nothing of the pool: the pass alone sheds. `draw` is the seed's stream: the
@@ -714,11 +724,14 @@ pub trait Picker: Lifecycle + Debug {
     /// that serves no request. Such a picker's draw ([`Picker::draw_first`])
     /// must read no value of the seed's stream: the engine hands it the
     /// request's own seed and asserts in a debug build that none was read.
-    /// The default is no. The engine reads it at two decisions: a pair's
-    /// decode decided again, handed the decode of the pair's first decision
-    /// ([`Profile::keeps_its_pick`]), and a session a sessions rule leaves
-    /// to the profile ([`Assignment::Delegate`]), which takes the pool's
-    /// turn.
+    /// The default is no. The engine reads it at a pair's decode decided
+    /// again, handed the decode of the pair's first decision
+    /// ([`Profile::keeps_its_pick`]), and once at its build, for a profile
+    /// that draws for every request. The row such a picker's draw lands on
+    /// is its rule's answer, so the draw is asked at every pool size over a
+    /// pool that lends its own word ([`PoolFacts::word`]), and a session a
+    /// sessions rule leaves to the profile ([`Assignment::Delegate`]) takes
+    /// the pool's turn.
     fn takes_turns(&self) -> bool {
         false
     }
@@ -727,8 +740,8 @@ pub trait Picker: Lifecycle + Debug {
     /// ([`Picker::picks_alone`]). `keep` asks the caller's test of the
     /// worker at a position of the pool: one read of that worker. `Some`
     /// is the position picked, which `keep` kept. `None` where the rule
-    /// kept no worker. A rule whose own bound ran out first, as a
-    /// rotation's turns past a refused worker do, leaves the pool to its
+    /// kept no worker. A rule that did not ask every worker, as a rotation
+    /// whose one turn lands on a refused worker, leaves the pool to its
     /// caller, which reads it whole and asks [`Picker::pick_among`] of the
     /// workers that pass. A rule that asked every worker settles it
     /// ([`Picker::asks_every_worker`]). The default picks nobody.
@@ -743,7 +756,7 @@ pub trait Picker: Lifecycle + Debug {
 
     /// Whether [`Picker::pick_alone`] asks `keep` of every worker of the
     /// pool before it picks nobody, as a scan in the pool's order does and
-    /// a rotation's bounded turns do not. Its `None` then says that no
+    /// a rotation's one turn does not. Its `None` then says that no
     /// worker of the pool passes, and the caller does not read the pool a
     /// second time to learn it. The default is no.
     fn asks_every_worker(&self) -> bool {
@@ -3737,6 +3750,15 @@ impl Marks {
     /// and places by another text than the routing value's own: the place
     /// stated for that text is not its place. Read by the same lookup.
     const OTHER_PLACE: u16 = 1 << 11;
+    /// The profile draws for every request and its picker keeps an order
+    /// it takes turns of ([`Picker::takes_turns`]). The row its draw lands
+    /// on is its rule's answer, where another picker's draw is a faster
+    /// way to the whole pass's: so the draw is asked under the draw's
+    /// floor too, over a pool that lends its own word
+    /// ([`PoolFacts::word`]), and of a session its rule leaves to the
+    /// profile ([`Engine::pool_turn`]). One read tells a decision so,
+    /// where the picker's own answer is a call.
+    const TURNS: u16 = 1 << 12;
 
     fn of(profile: &Profile, order: Order) -> Self {
         let scoped = if profile.scoped() { Self::SCOPED } else { 0 };
@@ -3801,9 +3823,21 @@ impl Marks {
         } else {
             0
         };
+        let turns = if draws_always && profile.picker.takes_turns() {
+            Self::TURNS
+        } else {
+            0
+        };
         // The three marks no run of the engine reads.
         let for_hosts = by_reports | key_place | other_place;
-        Self(scoped | by_assignment | draws_first | joined | ranked | engines | owns | for_hosts)
+        // What says when the profile draws, and how.
+        let draws = draws_first | joined | turns;
+        Self(scoped | by_assignment | draws | ranked | engines | owns | for_hosts)
+    }
+
+    /// A profile whose requests take their list's own turn first.
+    const fn turns(self) -> bool {
+        self.0 & Self::TURNS != 0
     }
 
     /// Whether no stage asks anything before the profile's run: no scope
@@ -5540,7 +5574,9 @@ impl Engine {
     /// to that rule is placed by its assignment. Every other request of a
     /// profile whose picker draws first ([`Picker::draw_first`]) is decided
     /// by the rows it draws where the pool is large enough, and by the whole
-    /// pass under that size or when the draw keeps nobody. A picker the rows
+    /// pass under that size or when the draw keeps nobody. A picker that
+    /// takes turns ([`Picker::takes_turns`]) draws under that size too, over
+    /// a pool that lends its own word ([`PoolFacts::word`]). A picker the rows
     /// named join ([`Picker::joined_by_named`]) draws for a request that
     /// names rows and for no other. A pass the overload veto leaves nobody is
     /// put to the binding's all-vetoed rule: the request goes to the
@@ -5611,8 +5647,10 @@ impl Engine {
     /// sessions rule over a keyed request; no encode item; no list of the
     /// pool's engines for a profile that decides over them; a pool of
     /// [`DRAW_FROM`] rows or more; and a profile that draws for every
-    /// request, or for this one, which names rows. `pool` is read for its
-    /// list of engines alone.
+    /// request, or for this one, which names rows. A smaller pool is
+    /// written whole, also where [`Self::decide`] then draws over it for
+    /// a picker that takes turns. `pool` is read for its list of engines
+    /// alone.
     #[cfg(feature = "in-process")]
     pub(crate) fn drawn_for(
         &self,
@@ -5833,8 +5871,9 @@ impl Engine {
                     }
                 }
             }
-            // A draw or the ranks, only over a pool of `DRAW_FROM` rows or
-            // more: the ranks' floor is the draw's.
+            // A draw or the ranks over a pool of `DRAW_FROM` rows or more:
+            // the ranks' floor is the draw's. A turn's draw under the floor
+            // is asked behind them.
             let ahead = marks.ahead();
             if ahead != 0 && candidates.len() >= DRAW_FROM {
                 // A profile that draws for every request is the draw's at one
@@ -5865,6 +5904,14 @@ impl Engine {
                 {
                     return run_ranked(self, index, facts, pool, set, cx, buf);
                 }
+            }
+            // Under the floor a draw is asked of one kind of profile: one
+            // whose picker takes turns, over a pool that lends its own
+            // word. Its draw is the list's own turn, which the whole pass
+            // does not take: it is the same decision at every pool size.
+            // From the floor up such a profile's draw was asked above.
+            if marks.turns() && pool.word.is_some() {
+                return run_drawn(self, index, facts, pool, set, cx, buf);
             }
         }
         run_whole(self, index, facts, pool, set, cx, buf)
@@ -6626,7 +6673,10 @@ impl Engine {
     /// every filter of the profile, hard and soft alike, and taken where it
     /// is one of the survivors in `buf.kept` too. A new session and a
     /// session at its cap so take the next turn of the rotation such a
-    /// request turns, and none of the survivors' own. `None` where the
+    /// request turns, and none of the survivors' own. The draw is asked
+    /// where that request's is: from the draw's floor up ([`DRAW_FROM`]),
+    /// and under it over a pool that lends its own word
+    /// ([`PoolFacts::word`]). `None` where the
     /// profile's plain request is not the draw's, or the draw keeps nobody:
     /// the stages decide ([`score_and_pick`]), as the whole pass does behind
     /// that draw. So where a soft filter refuses every row, both kinds of
@@ -6647,12 +6697,13 @@ impl Engine {
         cx: &Constraints<'_>,
         buf: &mut Buffers,
     ) -> Option<Decision> {
-        // The plain path's own test of a draw, the pool's size asked
-        // first: `DRAW_FROM` rows or more, a profile that draws for every
-        // request, and a request its host holds to no places.
+        // The plain path's own test of a turn: a profile that draws for
+        // every request and takes turns, over `DRAW_FROM` rows or more or
+        // over a pool that lends its own word, and a request its host
+        // holds to no places.
         let at = usize::from(index);
-        let draws = candidates.len() >= DRAW_FROM && self.marks[at].ahead() == Marks::DRAWS_FIRST;
-        if !(draws && !places::stated(cx) && self.profiles[at].picker.takes_turns()) {
+        let sized = candidates.len() >= DRAW_FROM || pool.word.is_some();
+        if !(sized && self.marks[at].turns() && !places::stated(cx)) {
             return None;
         }
         let (profile, tests) = (&self.profiles[at], self.row_tests[at]);

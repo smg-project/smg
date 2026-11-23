@@ -579,9 +579,9 @@ impl PolicyEngine {
     /// read: the one its pass asks of every candidate, so the rule of a
     /// lifted veto has one home. Behind the list's first ask no row is
     /// read, no table looked up, no lock taken and nothing allocated. Where
-    /// a rotation's turns all land on refused workers the pool is passed
-    /// over once, as [`Self::pick_among`] passes over a list. A rule that
-    /// asked every worker and kept none is not followed by that pass.
+    /// a rotation's turn lands on a refused worker the pool is passed over
+    /// once, as [`Self::pick_among`] passes over a list. A rule that asked
+    /// every worker and kept none is not followed by that pass.
     #[must_use]
     pub fn pick(
         &self,
@@ -1541,11 +1541,13 @@ mod tests {
     }
 
     /// Workers that are not ready take no request, and the ready ones take
-    /// exact shares. In a small pool a turn on such a worker goes to the
-    /// pass at once, and the ready workers' own rotation places the
-    /// request. In a pool that earns turns the pool's next turn does. Past
-    /// a run of such workers longer than those turns both rotations place
-    /// requests, and both are exact.
+    /// exact shares. At every size a turn on such a worker goes to the
+    /// pass, and the ready workers' own rotation places the request, as
+    /// the classic router's turn does
+    /// (`model_gateway/src/policies/round_robin.rs:151-153`, `:164-167`):
+    /// the turn is not handed to the list's next worker. Its own case of
+    /// four workers holds the shares
+    /// (`model_gateway/src/policies/round_robin.rs:430-441`).
     #[test]
     fn a_pick_keeps_exact_shares_past_workers_not_ready() {
         let engine = preset("round_robin");
@@ -1577,29 +1579,29 @@ mod tests {
             assert_eq!(times, if at == 5 { 0 } else { 24 }, "worker {at} of 8");
         }
 
-        // Sixty-four workers, one in four not ready, none beside another:
-        // the pool's next turn places each request, and no pass runs.
+        // Sixty-four workers, one in four not ready, none beside another.
+        // Over three turns of the pool each ready worker takes three by
+        // the pool's turn, and the 48 turns on a worker not ready go once
+        // round the ready workers' own rotation.
         let list = pool(64);
         leave(&list, &|at| at % 4 != 1);
         let members = PublishedList::new(Arc::clone(&list));
-        let times = shares(&members, 48 * 5);
+        let times = shares(&members, 64 * 3);
         for (at, &times) in times.iter().enumerate() {
-            assert_eq!(times, if at % 4 == 1 { 0 } else { 5 }, "worker {at} of 64");
+            assert_eq!(times, if at % 4 == 1 { 0 } else { 4 }, "worker {at} of 64");
         }
 
-        // Sixty-four workers, sixteen in a row not ready, three turns a
-        // pick. From the pool's turn on the first of the run, each turn of
-        // the pool places 53 requests: 48 by the pool's turn and five by
-        // the ready workers' own rotation, which comes round once in 48
-        // such picks. Over 48 turns of the pool each ready worker takes 53.
+        // Sixty-four workers, sixteen in a row not ready, from the pool's
+        // turn on the first of the run: the same shares. The worker behind
+        // the run takes no more than its peers.
         let list = pool(64);
         leave(&list, &|at| !(20..36).contains(&at));
         let members = PublishedList::new(Arc::clone(&list));
         let made = engine.members_of(members.lent());
         made.rotation.0.store(20, Ordering::Relaxed);
-        let times = shares(&members, 48 * 53);
+        let times = shares(&members, 64 * 3);
         for (at, &times) in times.iter().enumerate() {
-            let expected = if (20..36).contains(&at) { 0 } else { 53 };
+            let expected = if (20..36).contains(&at) { 0 } else { 4 };
             assert_eq!(times, expected, "worker {at} of 64, a run not ready");
         }
     }
@@ -1664,7 +1666,8 @@ mod tests {
 
     /// A pick that asked every worker of a pool and kept none has the pool's
     /// answer: a scan reads each worker once and no pass reads them again.
-    /// A rotation's turns stop short of the pool, which is then passed over.
+    /// A rotation's one turn stops short of the pool, which is then passed
+    /// over.
     #[test]
     fn a_pick_that_asked_every_worker_is_not_followed_by_a_pass() {
         for workers in [1, 2, 8, 64] {
