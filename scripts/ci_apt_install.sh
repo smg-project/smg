@@ -49,8 +49,8 @@ if [ "${1:-}" = "--attempt" ]; then
         log "an earlier attempt failed; asking for another mirror"
     fi
     echo started >"${earlier}"
-    # shellcheck disable=SC2086 # an empty word must vanish, not become an argument
     mirror_status=0
+    # shellcheck disable=SC2086 # an empty word must vanish, not become an argument
     bash "${here}/ci_apt_mirror.sh" ${reprobe} || mirror_status=$?
     if [ "${mirror_status}" -ne 0 ]; then
         if [ -n "${strict_mirror}" ]; then
