@@ -1058,6 +1058,12 @@ impl McpOrchestrator {
                 .any(|server| server.builtin_type.is_some() && server.name == name)
     }
 
+    /// Whether the pool holds a connection under `key`: the request's own, or
+    /// one pooled since under the same key.
+    pub(crate) fn is_pooled(&self, key: &PoolKey) -> bool {
+        self.connection_pool.contains(key)
+    }
+
     /// Execute a single tool using an already-resolved qualified binding.
     ///
     /// This path does not perform tool-name reverse lookup. Callers must provide
@@ -2945,6 +2951,62 @@ mod tests {
             .tool_inventory()
             .get_entry(url, "late")
             .is_none());
+    }
+
+    /// A request's own server whose connection left the pool before the
+    /// session is built lists with an error, not as a server of no tools.
+    #[tokio::test]
+    async fn a_server_whose_connection_left_the_pool_lists_with_an_error() {
+        use crate::core::session::{McpServerBinding, McpToolSession};
+
+        let mut config = McpConfig::default();
+        config.pool.max_connections = 1;
+        let orchestrator = &McpOrchestrator::new(config).await.unwrap();
+        // Pools a connection that is never asked and answers its key.
+        let pool = |url: &str| {
+            let config = McpServerConfig {
+                transport: McpTransport::Streamable {
+                    url: url.to_string(),
+                    token: None,
+                    headers: HashMap::new(),
+                },
+                ..sse_server("tools", url)
+            };
+            let key = PoolKey::from_config(&config, None);
+            let (_, client_io) = tokio::io::duplex(64);
+            let client = rmcp::service::serve_directly((), client_io, None);
+            let pooling =
+                orchestrator
+                    .connection_pool
+                    .get_or_create(key.clone(), config, |_, _| std::future::ready(Ok(client)));
+            async move {
+                pooling.await.unwrap();
+                key
+            }
+        };
+        let url = "http://tools.example/mcp";
+        let mut binding = McpServerBinding {
+            label: "tools".to_string(),
+            server_key: url.to_string(),
+            allowed_tools: None,
+            list_error: None,
+            pool_key: Some(pool(url).await),
+        };
+        let list_error = |binding: &McpServerBinding| {
+            McpToolSession::new(orchestrator, vec![binding.clone()], "request")
+                .list_error_for_binding("tools", url)
+        };
+        assert_eq!(list_error(&binding), None);
+
+        // Another server's connection takes the pool's one place.
+        pool("http://other.example/mcp").await;
+        assert_eq!(
+            list_error(&binding).as_deref(),
+            Some("Server not found: tools")
+        );
+        // A listing that failed keeps its own error.
+        binding.list_error = Some("boom".to_string());
+        assert_eq!(list_error(&binding).as_deref(), Some("boom"));
     }
 
     #[test]

@@ -21,6 +21,7 @@ use super::{
 };
 use crate::{
     approval::ApprovalMode,
+    error::McpError,
     inventory::{QualifiedToolName, ToolCategory, ToolEntry},
     tenant::TenantContext,
 };
@@ -43,9 +44,10 @@ pub struct McpServerBinding {
     /// When `Some`, only the listed tool names are exposed for this server.
     /// When `None`, all tools from the server are exposed.
     pub allowed_tools: Option<Vec<String>>,
-    /// Why the server's tools could not be listed when this binding was made;
-    /// `None` when they were listed. A request's item reports its own
-    /// connect's outcome, whatever the pool did since.
+    /// Why the request cannot read the server's tools; `None` when it can.
+    /// The connect sets its listing's failure; a session sets `Server not
+    /// found` for a listed binding whose key the pool holds no more when the
+    /// session is built.
     pub list_error: Option<String>,
     /// The pool key a dynamic server was connected with; `None` for a
     /// configured server. A tool call of the binding on the key's own
@@ -118,7 +120,7 @@ impl<'a> McpToolSession<'a> {
     /// request context for downstream execution paths.
     pub fn new_with_headers(
         orchestrator: &'a McpOrchestrator,
-        mcp_servers: Vec<McpServerBinding>,
+        mut mcp_servers: Vec<McpServerBinding>,
         request_id: impl Into<String>,
         forwarded_headers: HashMap<String, String>,
     ) -> Self {
@@ -126,6 +128,21 @@ impl<'a> McpToolSession<'a> {
         let tenant_ctx = TenantContext::default();
         let server_keys: Vec<String> = mcp_servers.iter().map(|b| b.server_key.clone()).collect();
         let mut mcp_tools = Self::collect_visible_mcp_tools(orchestrator, &server_keys);
+        // A request's own server whose key the pool holds no more: its calls
+        // find no server, and its listing says so, where it read as a listing
+        // of no tools. Asked after the tools are read: a connection that
+        // leaves between the two is told as well.
+        for binding in &mut mcp_servers {
+            if binding.list_error.is_none()
+                && binding
+                    .pool_key
+                    .as_ref()
+                    .is_some_and(|key| !orchestrator.is_pooled(key))
+            {
+                binding.list_error =
+                    Some(McpError::ServerNotFound(binding.label.clone()).to_string());
+            }
+        }
 
         // The model's view of a server is the union of its bindings' allowlists
         // (a server bound under several labels lists each label's own set,
@@ -463,9 +480,10 @@ impl<'a> McpToolSession<'a> {
             .collect()
     }
 
-    /// The failure of the tool listing made when `server_label` (bound to
-    /// `server_key`) was connected for this request, for its `mcp_list_tools`
-    /// item's `error`; `None` when the listing succeeded.
+    /// Why this request cannot read the tools of `server_label` (bound to
+    /// `server_key`), for its `mcp_list_tools` item's `error`: the failure of
+    /// the listing made at its connect, or `Server not found` when its key
+    /// left the pool before the session was built; `None` otherwise.
     pub fn list_error_for_binding(&self, server_label: &str, server_key: &str) -> Option<String> {
         self.all_mcp_servers
             .iter()
