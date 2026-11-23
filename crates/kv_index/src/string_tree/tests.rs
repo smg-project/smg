@@ -1,4 +1,5 @@
 use std::{
+    sync::atomic::AtomicBool,
     thread,
     time::{Duration, Instant},
 };
@@ -2677,4 +2678,57 @@ fn the_block_scan_skips_whole_chunks_and_finds_the_byte_after_them() {
         193, 200,
     ];
     assert_scan_is_byte_wise(&text, lengths.into_iter());
+}
+
+/// A purge by name beside the writes of its own tenant leaves no text
+/// standing that the tenant's count lacks. One writer inserts text after
+/// text for the tenant, each under a first char of its own. The purge runs
+/// each time the tenant holds 500 texts, so its removals take long enough
+/// for whole inserts to fall between its walk and its end, and it is
+/// repeated until 50 texts were written beside one purge. A count dropped
+/// whole behind the removals erased the count of every such text.
+#[test]
+fn test_remove_tenant_all_beside_inserts_keeps_texts_counted() {
+    let tree = Tree::new();
+    let purged = tenant("tenant1");
+    let written = AtomicUsize::new(0);
+    let done = AtomicBool::new(false);
+    let tail = "x".repeat(63);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            // The supplementary planes: a million chars, none a surrogate.
+            for first in (0x1_0000..0x10_0000).filter_map(char::from_u32) {
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+                tree.match_and_insert(&format!("{first}{tail}"), "tenant1");
+                written.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let until = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(Instant::now() < until, "no purge ran beside 50 inserts");
+            if tree.tenant_char_size(&purged) < 500 * 64 {
+                thread::yield_now();
+                continue;
+            }
+            let before = written.load(Ordering::Relaxed);
+            tree.remove_tenant_all(&purged);
+            if written.load(Ordering::Relaxed) >= before + 50 {
+                break;
+            }
+        }
+        done.store(true, Ordering::Relaxed);
+    });
+
+    // At rest. The root's own entry is no text.
+    let standing: usize = tree
+        .iter_entries()
+        .map(|(text, _)| text.chars().count())
+        .sum();
+    let counted = tree.tenant_char_size(&purged);
+    assert!(
+        counted >= standing,
+        "{standing} chars stand in the tree, {counted} are counted"
+    );
 }

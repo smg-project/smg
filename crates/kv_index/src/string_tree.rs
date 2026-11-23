@@ -1538,9 +1538,18 @@ impl Tree {
     }
 
     /// Remove a tenant from all nodes in the tree (including root), detach
-    /// nodes the removal emptied, and drop the tenant's char-count entry.
-    /// Used for mesh eviction propagation and worker removal — size-based
-    /// eviction never fires for a tenant whose count no longer grows.
+    /// nodes the removal emptied, and drop the tenant's char-count entry
+    /// once it reads zero. Used for mesh eviction propagation and worker
+    /// removal — size-based eviction never fires for a tenant whose count no
+    /// longer grows.
+    ///
+    /// Inserts for the tenant may run beside the purge, so its count is
+    /// debited by what each removal took out, as eviction debits, and is
+    /// never dropped whole: a count dropped whole left a node attached or
+    /// split off meanwhile standing uncounted. What can still drift is a
+    /// count with no node behind it, where an insert counts behind the
+    /// debit of the node it attached. Such a count stays with the tenant's
+    /// entry.
     pub fn remove_tenant_all(&self, tenant_id: &TenantId) {
         let expected_chars = self.tenant_char_size(tenant_id);
 
@@ -1548,7 +1557,8 @@ impl Tree {
         // but global removal must include it.
         self.remove_tenant_from_node(&self.root, tenant_id);
         if expected_chars == 0 {
-            self.tenant_char_count.remove(tenant_id);
+            self.tenant_char_count
+                .remove_if(tenant_id, |_, count| *count == 0);
             return;
         }
 
@@ -1568,13 +1578,16 @@ impl Tree {
             nodes.clear();
             self.collect_tenant_nodes(&self.root, tenant_id, &mut nodes);
         }
+        let mut removed = 0;
         for (node, _) in &nodes {
-            self.remove_tenant_from_node(node, tenant_id);
+            if self.remove_tenant_from_node(node, tenant_id) {
+                removed += node.text.read().char_count();
+            }
             self.detach_empty_ancestors(node);
         }
-        if let Some((_, count)) = self.tenant_char_count.remove(tenant_id) {
-            self.total_char_count.fetch_sub(count, Ordering::Relaxed);
-        }
+        self.sub_tenant_chars(tenant_id, removed);
+        self.tenant_char_count
+            .remove_if(tenant_id, |_, count| *count == 0);
     }
 
     /// Fast tenant walk for the common prefix-closed ownership shape. If a

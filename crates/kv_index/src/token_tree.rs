@@ -1790,14 +1790,26 @@ impl TokenTree {
     }
 
     /// Remove a tenant from every node (including the root), detach nodes
-    /// the removal emptied, and drop the tenant's token-count entry.
-    /// Size-based eviction never fires for a tenant whose count no longer
-    /// grows, so removed workers must be purged eagerly.
+    /// the removal emptied, and drop the tenant's token-count entry once it
+    /// reads zero. Size-based eviction never fires for a tenant whose count
+    /// no longer grows, so removed workers must be purged eagerly.
+    ///
+    /// Inserts for the tenant may run beside the purge, so its count is
+    /// debited by what each removal took out, as eviction debits, and is
+    /// never dropped whole. An insert counts behind the nodes it attached,
+    /// and a split hands the tenant's prefix to a new node: a count dropped
+    /// whole left such a node standing uncounted, so the total read short
+    /// by it and the tenant's next purge returned at a count of zero. What
+    /// can still drift is a count with no node behind it: a node attached
+    /// ahead of the walk whose insert counts behind the debit, or a split
+    /// between a removal and the read of its length. Such a count stays
+    /// with the tenant's entry.
     pub fn remove_tenant_all(&self, tenant_id: &TenantId) {
         let expected_tokens = self.tenant_token_size(tenant_id);
         self.root.tenant_last_access_time.remove(tenant_id.as_ref());
         if expected_tokens == 0 {
-            self.tenant_token_count.remove(tenant_id.as_ref());
+            self.tenant_token_count
+                .remove_if(tenant_id.as_ref(), |_, count| *count == 0);
             return;
         }
 
@@ -1813,12 +1825,13 @@ impl TokenTree {
             nodes.clear();
             self.collect_tenant_nodes(&self.root, tenant_id, &mut nodes);
         }
+        let mut removed = 0;
         for node in &nodes {
-            self.remove_tenant_and_cleanup(node, tenant_id);
+            removed += self.remove_tenant_and_cleanup(node, tenant_id).0;
         }
-        if let Some((_, count)) = self.tenant_token_count.remove(tenant_id.as_ref()) {
-            self.total_token_count.fetch_sub(count, Ordering::Relaxed);
-        }
+        self.sub_tenant_tokens(tenant_id, removed);
+        self.tenant_token_count
+            .remove_if(tenant_id.as_ref(), |_, count| *count == 0);
     }
 
     /// Fast tenant walk for the common prefix-closed ownership shape. If a

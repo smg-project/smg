@@ -1,4 +1,8 @@
-use std::{sync::Arc, thread};
+use std::{
+    sync::{atomic::AtomicBool, Arc},
+    thread,
+    time::{Duration, Instant},
+};
 
 use super::*;
 
@@ -2833,4 +2837,52 @@ fn hashes_name_live_nodes_through_random_inserts_and_evictions() {
     }
     assert_eq!(tree.hashed_paths(), 0);
     assert_hashes_name_live_nodes(&tree);
+}
+
+/// A purge by name beside the writes of its own tenant leaves no prompt
+/// standing that the tenant's count lacks. One writer inserts prompt after
+/// prompt for the tenant, none a prefix of another. The purge runs each time
+/// the tenant holds 500 prompts, so its removals take long enough for whole
+/// inserts to fall between its walk and its end, and it is repeated until 50
+/// prompts were written beside one purge. A count dropped whole behind the
+/// removals erased the count of every such prompt.
+#[test]
+fn test_remove_tenant_all_beside_inserts_keeps_prompts_counted() {
+    let tree = TokenTree::new();
+    let purged = tenant("tenant1");
+    let written = AtomicUsize::new(0);
+    let done = AtomicBool::new(false);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            for prompt in 0..4_000_000_u32 {
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+                tree.match_and_insert(&make_tokens(prompt * 1_000, 4), "tenant1");
+                written.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let until = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(Instant::now() < until, "no purge ran beside 50 inserts");
+            if tree.tenant_token_size(&purged) < 500 * 4 * PAGE_SIZE {
+                thread::yield_now();
+                continue;
+            }
+            let before = written.load(Ordering::Relaxed);
+            tree.remove_tenant_all(&purged);
+            if written.load(Ordering::Relaxed) >= before + 50 {
+                break;
+            }
+        }
+        done.store(true, Ordering::Relaxed);
+    });
+
+    // At rest. The root's own entry is no prompt.
+    let standing: usize = tree.iter_entries().map(|(prompt, _)| prompt.len()).sum();
+    let counted = tree.tenant_token_size(&purged);
+    assert!(
+        counted >= standing,
+        "{standing} tokens stand in the tree, {counted} are counted"
+    );
 }
