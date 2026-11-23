@@ -27,7 +27,7 @@ use rand::RngExt;
 use smg_grpc_client::{
     common_proto, tokenspeed_encoder::tokenspeed_encoder_proto as tokenspeed_encoder,
 };
-use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker};
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard};
 use tracing::error;
 use uuid::Uuid;
 
@@ -141,6 +141,8 @@ pub(crate) struct EncodeDispatchPlan {
 pub(crate) struct PreparedEncodeJob {
     item: PreparedEncodeItem,
     target: EncodeTarget,
+    /// The encode worker the job is assigned to: its load counts the send.
+    worker: Arc<dyn Worker>,
     bootstrap_room: i64,
 }
 
@@ -188,6 +190,9 @@ impl EncodeDispatchPlan {
 
 impl PreparedEncodeJob {
     pub(crate) async fn dispatch(self) -> std::result::Result<(), String> {
+        // Booked on its encode worker until the send ends, as a generate
+        // call is on its worker.
+        let _load = WorkerLoadGuard::with_key(self.worker, None);
         self.item.dispatch(self.target, self.bootstrap_room).await
     }
 }
@@ -422,6 +427,7 @@ fn build_plan(
         jobs.push(PreparedEncodeJob {
             item,
             target,
+            worker: Arc::clone(worker),
             bootstrap_room,
         });
     }
@@ -813,15 +819,19 @@ mod tests {
             mm_placeholders: Vec::new(),
             content_hash: Vec::new(),
         };
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new(format!("http://{address}")).build());
         let watch = launch_encode_dispatch(EncodeDispatchPlan::new(vec![PreparedEncodeJob {
             item: PreparedEncodeItem::tokenspeed(item, false, 0),
-            target: EncodeTarget::Grpc(format!("http://{address}")),
+            target: EncodeTarget::Grpc(worker.url().to_string()),
+            worker: Arc::clone(&worker),
             bootstrap_room: 42,
         }]));
         let mut dropped = tokio::time::timeout(Duration::from_secs(5), held.recv())
             .await
             .expect("the encode send never reached the encoder")
             .expect("the encoder holds the call");
+        assert_eq!(worker.load(), 1, "a call in flight counts in the load");
 
         // While the request holds the watch, its call stays open.
         assert!(
@@ -837,6 +847,7 @@ mod tests {
             .await
             .expect("the encoder still holds the call of a request that is over")
             .expect_err("a held call is dropped, never released");
+        assert_eq!(worker.load(), 0, "the load goes with the call");
     }
 
     /// An encode send that fails names its worker with the address masked:
@@ -1034,6 +1045,7 @@ mod tests {
             let dispatch = EncodeDispatchPlan::new(vec![PreparedEncodeJob {
                 item,
                 target: EncodeTarget::Grpc("http://encode-worker:9000".to_string()),
+                worker: Arc::new(BasicWorkerBuilder::new("http://encode-worker:9000").build()),
                 bootstrap_room: 42,
             }]);
             assert!(!dispatch.is_empty());
