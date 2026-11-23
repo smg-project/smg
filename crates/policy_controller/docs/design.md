@@ -646,9 +646,13 @@ A decision of the engine publishes no insert to other gateways.
 events they push fill the index and nothing else. Records B and C are the deciding process's own
 account of the prompts it sent, written by its policy at each decision. No worker pushes them and
 no worker's stream carries them. In classic the gateway's policy keeps them. With the engine in
-the gateway the gateway keeps them and lends them to the engine. On main it lends none yet
-(section 9.2). Until it does, a request under the engine reads the hash table, and the index
-beside it where its model has one. A prefill-decode pair is lent no tree: each of its sides
+the gateway the gateway keeps them and lends them to the engine. On main it lends the token tree
+alone, to a single request, under a document that reads the prefixes sent to each worker (section
+9.2). A single request with token ids is decided inside that tree, by classic's own key. That
+holds where its model has no index of cache events and its profile reads sent prefixes and names
+the holders' rows. A request given as text names no entry and still reads the hash table. A
+request of a model that has an index still reads the index and the hash table together.
+A prefill-decode pair is lent no tree: each of its sides
 reads the hash table, and the index where its model has one, by the side's own list. An encode
 request's first decision reads neither yet. A controller is to
 keep trees of its own **[planned]**, and section 11 says what its contract must hold for that. On
