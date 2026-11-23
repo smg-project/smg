@@ -72,8 +72,11 @@ Everything below follows from seven rules.
 4. **The host side is small.** A host builds the engine at start, calls it at one place for each
    request and tells it what became of the request. A host has no policy logic: it never asks
    which policy is running.
-5. **Switched off, it costs nothing.** A classic decision runs the same instructions with this
-   code in the tree as without it.
+5. **Switched off, it costs a test.** With the option off no engine is built and classic's own
+   selection decides; a request pays the test of the option where it is placed and what the five
+   placement functions and the load guard cost for carrying an answer of either side, counted for
+   each policy in the gateway's decision bench and shown on the page of each change to those
+   functions (section 13.2).
 6. **Classic is the reference.** Under the document that a set of routing flags means, the engine
    gives the answer the classic policy gives. A difference is a defect, or a decision written in
    section 15.
@@ -1278,14 +1281,14 @@ The design adds no second mechanism where one exists.
 | which worker was sent a prompt | the host's own trees, of the kv-index crate's two tree types | one more question on the trait the host already answers for cache events |
 | a request's lifetime on a worker | the load guard every route keeps | one optional field (decision 4) |
 | the place where a worker is chosen | classic's five placement functions | one call in each |
-| the rank inside a worker that stands for several | the load monitor's rank cache and the gateway's sticky pin, asked after the pick | nothing |
+| the rank a request is sent with | the worker object's own rank, where its registration states one | nothing: no rank choice runs behind the pick, and the classic rank option is refused at the start beside the engine |
 | the lease's reporting | `DecisionGuard` | `Placement`, which holds it |
 | proof against classic | classic's recorders and their sheets | replays through the kept engine |
 
-## 9. The gateway as a host **[planned]**
+## 9. The gateway as a host **[partly]**
 
-After stage 0 the gateway does not call the engine. This section is the shape of the one change
-that brings it back, after the crate meets section 16's tests.
+After stage 0 the gateway did not call the engine. This section is the shape of the one change
+that brings it back, behind an option that is off by default (section 9.3).
 
 ### 9.1 Where classic chooses a worker
 
@@ -1329,15 +1332,26 @@ request ──> route (HTTP or gRPC, any family)
   the engine on, no classic policy object is built. So the start function owns the trees the
   engine is lent **[planned]**: it keeps them, runs their size pass on a timer and tells them a
   worker that left.
-- **Each request.** The five functions ask the engine. They fill `PlaceRequest` from the inputs
-  they already take. No route changes for this.
+
+  The start makes the policy crate's one start call as the last step of the context's build. The document is checked first against the table of stages the gateway's host hands the start, or the stock table where it hands none, and a refused document ends the start before the gateway listens. The engine's task follows the registry's events and tells the document's stages a worker that joined and a worker that was removed. Where the configuration runs the policy controller the gateway builds its policy registry with no classic policy object: a stand-in that places nothing stands in its default and encode slots, and a worker's registration and a router's build add no policy.
+
+- **Each request.** Four of the five functions ask the engine. They fill `PlaceRequest` from the inputs
+  they already take. A route names the answer's type and makes its load guard from the answer, in the places it made one before.
+
+  The fifth, the encode stage's own selection, takes its pair from `select_pair` and refuses a request that carries an item for the encode workers by name **[planned]**: the engine places no encoder yet.
+
+  Where the document asks a pair's decode again, the two pair routes make one more call between the prefill's answer and the decode's dispatch (section 8.2).
+
 - **The request's end.** The placement stays with the request's load guard, which every route
   already keeps to the end of the response, streamed or not (decision 4).
+
+  The engine hears the dispatch where the guard is made, or at the send for a guard a route makes ahead of its send, and the end where the guard is dropped. It is told no outcome, so a plugin stage that learns from outcomes learns nothing in process.
+
 - **Membership.** The gateway's value for a model's workers gets one cell for each list, which
   the engine fills.
-- **The rank.** After the engine names a worker, the gateway chooses the rank inside a worker
-  that stands for several by classic's own code, as it does after classic's pick. The earlier
-  integration asked no rank policy for a pair the engine placed. This change does.
+- **The rank.** A data-parallel worker registered rank by rank (the gateway's `--dp-aware`) is the shape the engine serves in full. Each rank is then a worker object, and a record of its own in its list (`Candidate::dp_rank`, section 5.3). The record reads its own rank's named values (section 5.8). A stage that keeps load reports is told each rank's own report, under that rank (`Signal::Load`). `Candidate::engine` is the same number on every rank of one such worker. The request is sent with the rank of the record the engine picked, and no rank choice runs behind the pick. One limit stands on the HTTP pair route: under a connector whose hand-over holds both sides of a pair to one rank, the route's own turn names that rank, with the engine on as under classic, so the rank that serves such a pair need not be the rank whose record the engine picked.
+
+  The gateway's rank option (`dp_minimum_tokens_scheduler`) is refused at the start beside the engine, under the settings' own document and under a supplied one. A worker object that stands for several ranks states no rank, and its request is sent with none.
 
 The change also writes again three small things that stage 0 takes out with the earlier
 integration: the gateway's two readers of its own index of cache events for the engine (about
@@ -1347,12 +1361,14 @@ lines), and the cell beside each published list.
 The bar for that change:
 
 1. It adds no file of policy logic to the gateway and no branch on a policy's name.
-2. No route gets an engine branch. The call sites are the five functions.
-3. With the engine off, a classic decision costs the same instructions as before the change,
-   counted in the gateway's decision bench.
+2. No route gets an engine branch. The call sites are the five functions, and one call in the two
+   pair routes between a prefill's answer and its decode's dispatch, where the document asks the
+   decode again.
+3. With the engine off, a classic decision pays what rule 5 names and no more, counted in the
+   gateway's decision bench.
 4. With the engine on, every classic test of the gateway passes under the settings' own document.
 
-### 9.3 The options **[planned]**
+### 9.3 The options
 
 | Option | Meaning |
 |---|---|
@@ -1575,6 +1591,8 @@ a loader are **[planned]** and not scheduled (decision 8).
 
 Rule 6 says classic is the reference. Rule 7 says the proof is inside the crate.
 
+A gateway may run a document that names a builder's own stages: the builder hands its stage table at the start, and the supplied document is checked against that table (section 12). Such a document has no classic twin to be compared with: rule 6 speaks of the document that a set of routing flags means. Its proof is a case of its own (rule 7).
+
 ### 13.1 Classic's recorded answers
 
 A *sheet* is a file of recorded lines: for one set of workers and one request, the answer the
@@ -1724,7 +1742,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The lease and its events; the guard | **[built]** | |
 | The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request, for a pair and for an encode request, with the route's rule and the decision made again, three decisions a call at most or a single request's fourth where the third found the workers the route's rule takes, and a single request's later decisions held to those workers; the later decisions of a pair and of an encode request held to them are not |
 | The crate's bench of the kept engine | **[planned]** | |
-| The gateway as a host | **[planned]** | section 9; the earlier integration, still on main, is taken out first (stage 0) |
+| The gateway as a host | **[partly]** | section 9, behind `--policy-controller on`, which is off by default: single requests and pairs on the HTTP and gRPC routes, a pair's decode asked again, a host's table of stages at the start; an encode request that carries an item is refused by name until the engine places an encoder; every classic test of the gateway with the engine on (the bar's fourth point) is not met yet |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |
 | The controller on the one engine and the worker crate's structures | **[partly]** | a single request is decided by `PolicyEngine` over the registry's list; a pair's phases are answered `Busy`; a decision reads no load report, no overload verdict and no cache event, and a sessions rule's cap counts nothing (section 10.2) |
 | The controller finding its own workers | **[partly]** | discovery registers nothing yet |
