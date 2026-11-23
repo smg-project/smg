@@ -4083,6 +4083,41 @@ pub(crate) mod tests {
         ));
     }
 
+    /// Beside the default settings, whose pairing mode is lenient, the
+    /// registry of a gateway that runs a supplied document reads its pair
+    /// index by that document's pairing. Under a document that says
+    /// `strict`, the pair of an unknown transport, which the lenient rule
+    /// forms, is not formed.
+    #[test]
+    fn a_supplied_documents_strict_pairing_forms_no_pair_of_an_unknown_transport() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, None),
+        ]);
+        let can_pair = |pairing: smg_policy_controller::document::Pairing| {
+            let mut document = smg_policy_controller::document::PolicySpec::pair_presets(
+                "round_robin",
+                "round_robin",
+            )
+            .expect("paired presets");
+            document.plans.pd_pair.pairing = pairing;
+            let settings = crate::config::RouterConfig {
+                mode: crate::config::RoutingMode::PrefillDecode {
+                    prefill_urls: Vec::new(),
+                    decode_urls: Vec::new(),
+                    prefill_policy: None,
+                    decode_policy: None,
+                },
+                policy_controller: true,
+                policy_spec: Some(document),
+                ..Default::default()
+            };
+            pairs_of(&registry, &PolicyRegistry::of_config(&settings)).can_pair()
+        };
+        assert!(can_pair(smg_policy_controller::document::Pairing::Lenient));
+        assert!(!can_pair(smg_policy_controller::document::Pairing::Strict));
+    }
+
     fn registry_with(workers: &[(&str, ConnectionMode, RuntimeType)]) -> WorkerRegistry {
         let typed: Vec<_> = workers
             .iter()
