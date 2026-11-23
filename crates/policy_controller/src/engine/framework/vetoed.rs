@@ -50,7 +50,7 @@ use crate::{
     engine::{
         decision::{Decision, LiftedVeto, Pick, Survivors, Targets, Trace},
         sticky_sessions::SessionVerdict,
-        view::{Candidate, Constraints, Health, PoolFacts, RequestFacts},
+        view::{Candidate, Constraints, Health, PoolFacts, RequestFacts, Role},
     },
     stages::{
         filters::{HasCapacity, Healthy, NotOverloaded, NotTried},
@@ -205,7 +205,8 @@ impl Engine {
 /// Whether a keyed request keeps its key's worker over the overload veto:
 /// a request of the single plan that carries a session key, under a binding
 /// that steers ([`AllVetoed::Steer`]). A decision asks it for a profile the
-/// plain ring alone places ([`Engine::places_by_key`]) and then
+/// plain ring alone places ([`Engine::places_by_key`]) over a pool of
+/// regular workers ([`regular`]) and then
 /// decides the request with the veto lifted ([`Engine::keep`]). The key's
 /// worker takes the request while it is over its thresholds, beside free
 /// workers too, as a session keeps its owner. A binding that sheds keeps
@@ -232,6 +233,14 @@ pub(super) fn keeps_its_key(
                     && (sessions.inflight_cap == 0 || facts.session_counted)
             }
         }
+}
+
+/// Whether every candidate the request may take is a regular worker. A key
+/// keeps its worker over the overload veto among regular workers alone, as
+/// the gateway's own placement lifts the veto for a key: a worker of
+/// another role over its thresholds passes the key on.
+pub(super) fn regular(candidates: &[Candidate], cx: &Constraints<'_>) -> bool {
+    places::rows(candidates, cx).all(|row| row.role == Role::Single)
 }
 
 /// The profile's filters again with the overload veto lifted, for a keyed
