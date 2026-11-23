@@ -1,8 +1,5 @@
 //! The cases of a frame's request maker: what the engine over worker lists
 //! is handed of a frame, and what it answers.
-//!
-//! Each case names the place the controller on main answers by today, the
-//! engine over stored records and its read of a frame.
 
 use std::{
     sync::Arc,
@@ -197,10 +194,8 @@ fn shed_of(decided: Decided) -> (ShedReason, &'static str) {
     }
 }
 
-/// Every field of a frame reaches the request its maker makes, as it
-/// reaches the request of the engine over stored records
-/// (`Checked::read`, and its case over the same frame in the wire's own
-/// cases). Three things are a controller's own and not the frame's: the
+/// Every field of a frame reaches the request its maker makes.
+/// Three things are a controller's own and not the frame's: the
 /// budget is what is left, the wires are not stated, and the places and
 /// held-back positions are the ones the maker was handed. Of the subset
 /// hint a 0 alone is stated. The frame's whole budget and the wires its
@@ -293,8 +288,7 @@ fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
     let free = unheld.make(&spec).constraints;
     assert_eq!(free.places, None);
     assert!(free.stalled.is_empty() && free.held.is_empty());
-    // More left than the field holds is told as its widest, as the read for
-    // the engine over stored records tells it.
+    // More left than the field holds is told as its widest.
     let long = FrameRequest::new(
         &frame,
         &lists,
@@ -316,10 +310,7 @@ fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
 }
 
 /// A decider reads frame after frame onto the same buffers: a later frame's
-/// request holds its own lists and nothing of an earlier frame's, as the
-/// read for the engine over stored records hands them
-/// (`a_decider_reads_frame_after_frame_on_the_same_buffers` in the wire's
-/// own cases).
+/// request holds its own lists and nothing of an earlier frame's.
 #[test]
 fn a_later_frames_request_holds_nothing_of_an_earlier_frames_lists() {
     let spec = applied(&preset("random"));
@@ -694,11 +685,10 @@ fn a_count_past_its_records_width_is_made_at_its_widest_and_a_header_past_256_na
 }
 
 /// A frame's decision is a whole one and names its alternates, up to four
-/// (`MAX_TARGETS`; a rotation's whole pick, `policies/round_robin.rs`), as
-/// the engine over stored records answers every frame: a gateway's
-/// dispatch names a target of the answer by its index. So the maker never
-/// says its request plain. Said plain, the same frame is answered the one
-/// place a caller in process takes.
+/// (`MAX_TARGETS`; a rotation's whole pick, `policies/round_robin.rs`): a
+/// gateway's dispatch names a target of the answer by its index. So the
+/// maker never says its request plain. Said plain, the same frame is
+/// answered the one place a caller in process takes.
 #[test]
 fn a_frames_decision_names_its_alternates() {
     let engine = engine("round_robin");
@@ -723,9 +713,8 @@ fn a_frames_decision_names_its_alternates() {
 }
 
 /// The hashes past what the deciding document reads are cut where the
-/// request is made, and the first ones kept, as the read for the engine
-/// over stored records cuts them (`Viewed::max_block_hashes`): a prefix
-/// cut short is still a prefix.
+/// request is made, and the first ones kept: a prefix cut short is
+/// still a prefix.
 #[test]
 fn the_hashes_past_what_the_document_reads_are_cut_and_the_first_kept() {
     let frame = frame_of(7, |frame| {
@@ -779,12 +768,11 @@ fn the_hashes_are_cut_in_blocks_of_the_frames_own_size_and_kind() {
     assert_eq!((text(32), text(64)), (32, 16));
 }
 
-/// A hint of 0 is a decision over no candidates. Main sheds such a frame
-/// `NoEndpoints` under `subset-hint` (`emptied` in the engine over stored
-/// records). The maker keeps the 0, so the answer cannot be lost: the
-/// frame's caller gives it before it asks the engine
-/// (`GatewayPlaces::taken`), and the engine declines the single request of
-/// a caller that did not, where it would have picked a worker.
+/// A hint of 0 is a decision over no candidates. The controller sheds such
+/// a frame `NoEndpoints` under `subset-hint`. The maker keeps the 0, so the
+/// answer cannot be lost: the frame's caller gives it before it asks the
+/// engine (`GatewayPlaces::taken`), and the engine declines the single
+/// request of a caller that did not, where it would have picked a worker.
 #[test]
 fn a_hint_of_0_reaches_the_engine_which_refuses_a_single_request_not_answered_for_it() {
     let engine = engine("random");
@@ -923,10 +911,9 @@ fn a_frame_names_a_worker_by_the_stores_id_over_a_list_that_states_it() {
     );
 }
 
-/// A positive subset hint reaches no stage, as on main, where the
-/// deciding threads say so of the engine over stored records: the frame
-/// decides as one that states none. The engine over worker lists declines
-/// a request that states a hint, so the maker leaves it out.
+/// A positive subset hint reaches no stage: the frame decides as one that
+/// states none. The engine over worker lists declines a request that
+/// states a hint, so the maker leaves it out.
 #[test]
 fn a_positive_subset_hint_reaches_no_stage() {
     let engine = engine("random");

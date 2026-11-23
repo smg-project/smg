@@ -41,10 +41,9 @@
 //! ring.
 //! A session stays where its key was first placed, and where the gateway
 //! sent it: a dispatch on a pick's second target moves the key and the
-//! lease's count there, a key served on its failover keeps its worker,
-//! and the store's pin of record follows the dispatch.
-//! A pinned key outlives its generation: under the preset applied anew a
-//! key that was dispatched names the row of the store's pin of record.
+//! lease's count there, and a key served on its failover keeps its worker.
+//! A new document's engine starts with no session pin yet: a key that was
+//! dispatched is placed anew behind an apply.
 //! A prompt returns to its worker as a key does: under the prefix preset a
 //! head of 256 tokens names one row whatever follows it, a routing key
 //! leads it, a retry walks to one next worker, a worker past its bounded
@@ -633,12 +632,9 @@ fn row_of(harness: &Harness, id: u64, dp_rank: u32) -> Result<Picked, String> {
 }
 
 /// Asks, and reads every target of the pick as a row of the fleet, best
-/// first, with the one lease the answer carries: its id and the session it
-/// names. The lease is the caller's, to dispatch on a target and to give up.
-async fn offered(
-    harness: &mut Harness,
-    ask: DecideRequest,
-) -> Result<(Vec<Picked>, u64, u64), String> {
+/// first, with the id of the one lease the answer carries. The lease is the
+/// caller's, to dispatch on a target and to give up.
+async fn offered(harness: &mut Harness, ask: DecideRequest) -> Result<(Vec<Picked>, u64), String> {
     let answer = harness.client().decide(ask).await;
     let Ok(Answer::Decision(Decision {
         leases,
@@ -655,7 +651,7 @@ async fn offered(
     for target in &pick.targets {
         rows.push(row_of(harness, target.id, target.dp_rank)?);
     }
-    Ok((rows, lease.id, lease.session_key))
+    Ok((rows, lease.id))
 }
 
 /// The whole case's bound: its waits sum to seconds on an idle host.
@@ -1217,32 +1213,22 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         // The session is where the gateway sent its request. A key's first
         // decision claims the first target of its pick; the gateway
         // dispatches on the second, and the key's later asks name that
-        // row. The store's pin of record, which no decision writes, names
-        // it from that dispatch on.
+        // row. The store tells the engine of a dispatch under the turn of
+        // the lease's file, and its read of the lease takes that turn: once
+        // the store reads the lease dispatched, the next decision reads the
+        // move.
         let sticky = ASKS + 1;
-        let (offer, sent_lease, pin) = offered(&mut harness, keyed(nth("sent", 0), sticky))
+        let (offer, sent_lease) = offered(&mut harness, keyed(nth("sent", 0), sticky))
             .await
             .expect("a pick answers an ask over a ready fleet");
         let sent = offer
             .get(1)
             .copied()
             .expect("a key's first placement offers a second target");
-        assert_eq!(
-            harness.pinned(pin),
-            None,
-            "a decision alone writes no pin of record"
-        );
         harness
             .dispatch_at(sent_lease, 1)
             .await
             .expect("the store reads the lease dispatched");
-        // The pin of record is written after the engine's table moved: once
-        // it names the row, the next decision reads the dispatch.
-        within("the pin of record names the row sent to", ROOM, || {
-            harness.pinned(pin) == Some((sent.engine, sent.rank))
-        })
-        .await
-        .expect("a keyed dispatch writes the pin of record");
         for n in 1..8 {
             let again = picked(&mut harness, keyed(nth("sent", n), sticky))
                 .await
@@ -1252,17 +1238,11 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
                 "a key first sent to its second target stays where it was sent"
             );
         }
-        assert_eq!(
-            harness.pinned(pin),
-            Some((sent.engine, sent.rank)),
-            "a keyed dispatch writes the pin of record on the worker served"
-        );
 
         // A key served on its failover keeps its worker. With its row
         // excluded by the gateway the key is placed on another row and
         // dispatched there; the exclusion over, it is back on its own row,
-        // which the pin of record never left, and excluded again it
-        // returns to that failover.
+        // and excluded again it returns to that failover.
         let away = |run: &str, n: u64| {
             let mut ask = keyed(nth(run, n), sticky);
             ask.constraints = Some(proto::Constraints {
@@ -1271,7 +1251,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             });
             ask
         };
-        let (offer, away_lease, _) = offered(&mut harness, away("away", 0))
+        let (offer, away_lease) = offered(&mut harness, away("away", 0))
             .await
             .expect("a pick answers an ask over a ready fleet");
         let failover = offer.first().copied().expect("a pick names a target");
@@ -1287,11 +1267,6 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             back, sent,
             "its own row routable again, a key is back on it"
         );
-        assert_eq!(
-            harness.pinned(pin),
-            Some((sent.engine, sent.rank)),
-            "a dispatch on the failover leaves the preferred worker pinned"
-        );
         for n in 1..8 {
             let again = picked(&mut harness, away("away", n))
                 .await
@@ -1305,17 +1280,17 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .await
             .expect("the leases given up leave the file");
 
-        // A new generation asks a pinned key on its row of record. An
-        // engine's table of sessions starts empty with its generation,
-        // and the store's pins of record outlive it. Eight keys are each
-        // dispatched where they were placed; under the preset applied
-        // anew each of them, and the key sent to its second target above,
-        // names the row its pin names. Placed afresh, a key names its old
-        // row once in as many asks as the fleet has rows.
-        let mut pinned = vec![(sticky, pin, sent)];
+        // A new generation places a pinned key anew. An engine's table of
+        // sessions starts empty with its generation, and nothing carries a
+        // pin across an apply yet. Eight keys are each dispatched where
+        // they were placed; under the preset applied anew each of them,
+        // and the key sent to its second target above, is asked again.
+        // Placed afresh, a key names its old row once in as many asks as
+        // the fleet has rows.
+        let mut pinned = vec![(sticky, sent)];
         let mut held = Vec::new();
         for key in (2 * ASKS..).take(8) {
-            let (offer, lease, session) = offered(&mut harness, keyed(nth("pinned", key), key))
+            let (offer, lease) = offered(&mut harness, keyed(nth("pinned", key), key))
                 .await
                 .expect("a pick answers an ask over a ready fleet");
             let row = offer.first().copied().expect("a pick names a target");
@@ -1323,7 +1298,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
                 .dispatch_at(lease, 0)
                 .await
                 .expect("the store reads the lease dispatched");
-            pinned.push((key, session, row));
+            pinned.push((key, row));
             held.push(lease);
         }
         given_up(&mut harness, &held, 0)
@@ -1332,20 +1307,12 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         harness
             .apply("manual")
             .expect("a preset of this build applies");
-        for (key, session, row) in pinned {
-            assert_eq!(
-                harness.pinned(session),
-                Some((row.engine, row.rank)),
-                "a pin of record outlives the generation that wrote it"
-            );
+        for (key, row) in pinned {
             let again = picked(&mut harness, keyed(nth("anew", key), key))
                 .await
                 .expect("a pick answers an ask over a ready fleet");
             if KEEPS_PINS_ACROSS_AN_APPLY {
-                assert_eq!(
-                    again, row,
-                    "a new generation asks a pinned key on its row of record"
-                );
+                assert_eq!(again, row, "a new generation asks a pinned key on its row");
             }
         }
 
@@ -1353,14 +1320,12 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         // kept lease books the first target of its pick; dispatched on the
         // second it books that row instead, and the asks after it, each
         // kept, name every other row once: the first target among them.
-        // Its request brought a key that no sessions rule governs: the
-        // dispatch pins that session nowhere.
         let fewest = PolicySpec::power_of_two(PowerOfTwoMetric::LeastRequests)
             .expect("a form of this build's preset");
         harness
             .apply_document(fewest)
             .expect("a form of this build's preset applies");
-        let (offer, moved, unruled) = offered(&mut harness, keyed(nth("moved", 0), sticky + 1))
+        let (offer, moved) = offered(&mut harness, keyed(nth("moved", 0), sticky + 1))
             .await
             .expect("a pick answers an ask over a ready fleet");
         let claimed = offer.first().copied().expect("a pick names a target");
@@ -1385,11 +1350,6 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             round.len() == ranks - 1 && round.contains(&claimed) && !round.contains(&served),
             "a lease dispatched on its second target books that row and frees the first: \
              {claimed:?} then {served:?}, the round {round:?}"
-        );
-        assert_eq!(
-            harness.pinned(unruled),
-            None,
-            "a key no sessions rule governs is pinned by no dispatch"
         );
         given_up(&mut harness, &moved, 0)
             .await

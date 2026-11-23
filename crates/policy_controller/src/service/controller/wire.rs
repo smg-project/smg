@@ -4,7 +4,7 @@
 //! A frame is checked once, where it is read ([`Checked::new`]): what the
 //! wire can say and the engine's record cannot hold is refused there, by
 //! the field's name, before the request takes a place in a queue. The read
-//! after it ([`Checked::read`]) borrows the frame and cannot fail: the
+//! after it ([`Lists::of`]) borrows the frame and cannot fail: the
 //! model, the hashes, the keys and the header values are read where the
 //! frame holds them, and the three lists the record holds in another form
 //! (the tried and the excluded ids, the headers) are written into buffers
@@ -53,7 +53,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub(crate) use crate::engine::store_backed_engine::Viewed;
 use crate::{
     document::{
         operator::{Document, NeedsRow, Status},
@@ -62,10 +61,9 @@ use crate::{
     engine::{
         decision::{Decision, ShedReason, Target},
         demands::Demands,
-        store_backed_engine::RequestForm,
         view::{
-            fingerprint, key_of_session, AffinityRows, Constraints, HashKind, Header, Identity,
-            MediaCounts, ModelFingerprint, Phase, RequestFacts, Session, WireModes, WorkerId,
+            fingerprint, key_of_session, Constraints, HashKind, Header, Identity, MediaCounts,
+            ModelFingerprint, Phase, RequestFacts, Session, WireModes, WorkerId,
         },
     },
     service::proto::{
@@ -340,6 +338,7 @@ impl Checked {
     }
 
     /// The request's block hashes, in order from its first block.
+    #[cfg(test)]
     pub(crate) fn block_hashes(&self) -> &[u64] {
         &self.facts.block_hashes
     }
@@ -455,113 +454,6 @@ impl Checked {
             // No frame holds a request to places.
             places: None,
         }
-    }
-
-    /// Hands `decide` the request as the engine reads it, with what the
-    /// decision's `view` adds to the frame, and returns its answer. The
-    /// request borrows the frame and `lists`, for the time of `decide`.
-    /// `name` is asked first, over that request with no row named: what it
-    /// answers stands as the request's named rows for `decide`.
-    pub(crate) fn read<'n, R>(
-        &self,
-        lists: &mut Lists,
-        view: Viewed<'_>,
-        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<AffinityRows<'n>>,
-        decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
-    ) -> R {
-        let lists = lists.of(self);
-        // The request and the constraints in the engine's form, built once:
-        // the naming's answer is written into the request below.
-        let (mut request, cx) = (
-            RequestFacts {
-                now_micros: view.now_micros,
-                affinity: view.affinity,
-                // What the leases book, beside rows a view lent.
-                lent_in_flight: view.in_flight.as_ref(),
-                // The signal cells stand beside the rows of the host that
-                // decides, whose view hands them.
-                signal_cells: view.signal_cells,
-                ..self.facts(&lists, view.max_block_hashes, view.budget_micros)
-            },
-            Constraints {
-                // The asking gateway's standing vetoes beside lent rows,
-                // and nothing where each row carries its own bit.
-                stalled: view.stalled,
-                held: view.held,
-                pins: view.pins,
-                ..self.constraints(&lists)
-            },
-        );
-        request.named = name(&request, &cx);
-        decide(&request, &cx)
-    }
-}
-
-impl RequestForm for Checked {
-    type Lists = Lists;
-
-    fn model(&self) -> &str {
-        Self::model(self)
-    }
-
-    fn phase(&self) -> Phase {
-        Self::phase(self)
-    }
-
-    fn id(&self) -> &[u8] {
-        Self::id(self)
-    }
-
-    fn wires(&self) -> Option<WireModes> {
-        Self::wires(self)
-    }
-
-    fn subset(&self) -> Option<u32> {
-        Self::subset(self)
-    }
-
-    /// A frame states no demand: the contract's constraints carry none
-    /// yet.
-    fn demands(&self) -> Demands {
-        Demands::default()
-    }
-
-    fn decode_later(&self) -> bool {
-        Self::decode_later(self)
-    }
-
-    fn asks_decode(&self) -> bool {
-        self.rare & DECODE_OF != 0
-    }
-
-    fn hashes(&self) -> usize {
-        Self::hashes(self)
-    }
-
-    fn hashes_read(&self, spec: &AppliedSpec) -> usize {
-        Self::hashes_read(self, spec)
-    }
-
-    fn block_hashes(&self) -> &[u64] {
-        Self::block_hashes(self)
-    }
-
-    fn cache_namespace(&self) -> (u64, HashKind) {
-        (self.facts.namespace_seed, self.hash_kind)
-    }
-
-    fn seed(&self) -> u64 {
-        Self::seed(self)
-    }
-
-    fn read<'n, R>(
-        &self,
-        lists: &mut Lists,
-        viewed: Viewed<'_>,
-        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<AffinityRows<'n>>,
-        decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
-    ) -> R {
-        Self::read(self, lists, viewed, name, decide)
     }
 }
 
@@ -1038,7 +930,7 @@ const fn role(phase: Phase) -> proto::Role {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{busy, credit, decided, emptied, Checked, Lists, Refusal, Viewed, MAX_FRAME};
+    use super::{busy, credit, decided, Checked, Lists, Refusal, MAX_FRAME};
     use crate::{
         document::spec::{AppliedSpec, MAX_BLOCK_HASHES},
         engine::{
@@ -1047,11 +939,7 @@ pub(crate) mod tests {
                 Targets, Trace,
             },
             decision_engine::{Request, RequestMaker, WorkerLists},
-            store_backed_engine::unnamed,
-            view::{
-                fingerprint, AffinityFacts, Constraints, HashKind, Header, Identity, MediaCounts,
-                ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
-            },
+            view::{Constraints, Phase, RequestFacts, WorkerId},
         },
         service::{
             controller::frame_request::FrameRequest,
@@ -1452,363 +1340,6 @@ pub(crate) mod tests {
         frame
     }
 
-    /// Reads `frame` over a view of the case's own (the rows' clock at 77,
-    /// 1,500 microseconds left, a column of two) and hands `check` the
-    /// request as the engine reads it.
-    fn reading<R>(
-        frame: proto::DecideRequest,
-        lists: &mut Lists,
-        check: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
-    ) -> R {
-        let checked = Checked::new(frame).expect("a frame the record holds");
-        let affinity = [AffinityFacts::default(); 2];
-        let view = Viewed {
-            now_micros: 77,
-            budget_micros: 1_500,
-            affinity: &affinity,
-            stalled: &[],
-            held: &[],
-            in_flight: None,
-            max_block_hashes: 256,
-            pins: None,
-            signal_cells: None,
-        };
-        checked.read(lists, view, unnamed, check)
-    }
-
-    #[test]
-    fn every_field_of_a_frame_reaches_the_engines_request() {
-        let checked = Checked::new(full()).expect("a frame the record holds");
-        assert_eq!(
-            (checked.model(), checked.phase(), checked.facts.seed),
-            ("model-a", Phase::Decode, 24)
-        );
-        assert_eq!(checked.budget().as_micros(), 2_000);
-        assert_eq!(checked.into_id(), [7, 8, 9]);
-        reading(full(), &mut Lists::default(), |facts, constraints| {
-            assert_eq!(facts.model, "model-a");
-            assert_eq!(facts.namespace_seed, 11);
-            assert_eq!(facts.tenant, Identity::plain("tenant-a"));
-            assert_eq!(facts.tenant.hash, fingerprint(b"tenant-a"));
-            assert_eq!(facts.priority, -100);
-            assert!(facts.streaming);
-            assert_eq!((facts.max_output_tokens, facts.prompt_tokens), (12, 13));
-            assert_eq!(facts.block_hashes, [14, 15, 16]);
-            assert_eq!(facts.hash_kind, HashKind::Text);
-            // The hash form is the session's value, as it was sent.
-            assert_eq!(facts.session().get(), 17);
-            assert_eq!(facts.session_key.plain, None);
-            assert_eq!(facts.phase, Phase::Decode);
-            assert_eq!(facts.attempt, 2);
-            assert_eq!(facts.tried, [WorkerId(18), WorkerId(19)]);
-            assert_eq!(
-                facts.headers,
-                [
-                    Header {
-                        name: 0,
-                        value: "first"
-                    },
-                    Header {
-                        name: 255,
-                        value: "last"
-                    },
-                ]
-            );
-            assert_eq!(
-                facts.media,
-                MediaCounts {
-                    images: 20,
-                    audio: 21,
-                    video: 22,
-                    bytes: 23
-                }
-            );
-            assert_eq!((facts.seed, facts.block_size), (24, 25));
-            assert_eq!(facts.client_key, 29);
-            // The view's three facts are the decision's own, not the
-            // frame's: the frame's budget of 2,000 is not what the engine
-            // is told is left.
-            assert_eq!(
-                (facts.now_micros, facts.budget_micros, facts.affinity.len()),
-                (77, 1_500, 2)
-            );
-            assert!(facts.named.is_none());
-            assert_eq!(facts.model_fingerprint, ModelFingerprint::NONE);
-            assert_eq!(
-                constraints.excluded,
-                [WorkerId(26), WorkerId(27), WorkerId(28)]
-            );
-            assert_eq!(
-                constraints.wire_modes,
-                WireModes::GRPC.union(WireModes::ZMQ)
-            );
-            assert!(constraints.overload_lifted);
-            assert!(!constraints.decode_later);
-            assert_eq!(constraints.subset_hint, Some(0));
-        });
-    }
-
-    #[test]
-    fn a_frame_with_nothing_set_reads_as_the_records_defaults() {
-        // Nothing but its id, which the contract's range asks of every frame.
-        let bare = || proto::DecideRequest {
-            request_id: vec![1],
-            ..proto::DecideRequest::default()
-        };
-        let checked = Checked::new(bare()).expect("a frame of its id alone");
-        assert_eq!(
-            (checked.model(), checked.phase(), checked.facts.seed),
-            ("", Phase::Single, 0)
-        );
-        assert!(checked.budget().is_zero());
-        reading(bare(), &mut Lists::default(), |facts, constraints| {
-            assert_eq!(
-                (facts.phase, facts.hash_kind),
-                (Phase::Single, HashKind::Token)
-            );
-            assert_eq!(
-                (facts.tenant, facts.session_key),
-                (Identity::NONE, Identity::NONE)
-            );
-            assert_eq!(facts.media, MediaCounts::default());
-            assert!(facts.headers.is_empty() && facts.tried.is_empty());
-            assert!(constraints.excluded.is_empty());
-            assert_eq!(constraints.wire_modes, WireModes::NONE);
-            assert_eq!(constraints.subset_hint, None);
-        });
-    }
-
-    #[test]
-    fn an_enum_reads_by_its_number_and_a_number_that_names_no_value_is_refused_by_its_field() {
-        for (wire, record) in [
-            (proto::Phase::Unspecified, Phase::Single),
-            (proto::Phase::Single, Phase::Single),
-            (proto::Phase::Prefill, Phase::Prefill),
-            (proto::Phase::Decode, Phase::Decode),
-            (proto::Phase::Encode, Phase::Encode),
-        ] {
-            let frame = with(|facts| facts.phase = wire.into());
-            let read = reading(frame, &mut Lists::default(), |facts, _| facts.phase);
-            assert_eq!(read, record, "{wire:?}");
-        }
-        for (wire, record) in [
-            (proto::HashKind::Unspecified, HashKind::Token),
-            (proto::HashKind::Token, HashKind::Token),
-            (proto::HashKind::Text, HashKind::Text),
-        ] {
-            let frame = with(|facts| facts.hash_kind = wire.into());
-            let read = reading(frame, &mut Lists::default(), |facts, _| facts.hash_kind);
-            assert_eq!(read, record, "{wire:?}");
-        }
-        let refused = |frame| Checked::new(frame).expect_err("refused");
-        assert_eq!(
-            refused(with(|facts| facts.phase = 5)),
-            Refusal::OutOfRange("facts.phase")
-        );
-        assert_eq!(
-            refused(with(|facts| facts.hash_kind = 3)),
-            Refusal::OutOfRange("facts.hash_kind")
-        );
-        assert_eq!(
-            refused(with(|facts| facts.phase = 5)).to_string(),
-            "facts.phase is out of its range in this protocol version"
-        );
-    }
-
-    /// A text request states its window, in bytes. One that carries
-    /// hashes and states none is refused by its field: the view's block
-    /// size is in tokens, and read as a window it would count the
-    /// request's blocks at another size than its host hashed them. A text
-    /// request with no hash prices nothing and is taken, and a token
-    /// request that states none reads the view's.
-    #[test]
-    fn a_text_request_that_states_no_window_is_refused_by_its_field() {
-        let refused = |frame| Checked::new(frame).expect_err("refused");
-        assert_eq!(
-            refused(with(|facts| facts.block_size = 0)),
-            Refusal::OutOfRange("facts.block_size")
-        );
-        let bare = with(|facts| {
-            facts.block_size = 0;
-            facts.block_hashes.clear();
-        });
-        let read = reading(bare, &mut Lists::default(), |facts, _| {
-            (facts.hash_kind, facts.block_size, facts.block_hashes.len())
-        });
-        assert_eq!(read, (HashKind::Text, 0, 0), "no hash to price");
-        for kind in [proto::HashKind::Token, proto::HashKind::Unspecified] {
-            let frame = with(|facts| {
-                facts.hash_kind = kind.into();
-                facts.block_size = 0;
-            });
-            let read = reading(frame, &mut Lists::default(), |facts, _| {
-                (facts.hash_kind, facts.block_size)
-            });
-            assert_eq!(read, (HashKind::Token, 0), "{kind:?}");
-        }
-        let stated = with(|facts| facts.block_size = 64);
-        let read = reading(stated, &mut Lists::default(), |facts, _| {
-            (facts.hash_kind, facts.block_size)
-        });
-        assert_eq!(read, (HashKind::Text, 64));
-    }
-
-    #[test]
-    fn a_key_is_read_in_the_form_its_frame_carries() {
-        let tenant = |form: Option<Form>| {
-            let frame = with(|facts| facts.tenant = Some(proto::Identity { form }));
-            reading(frame, &mut Lists::default(), |facts, _| {
-                (facts.tenant.hash, facts.tenant.plain.map(str::to_owned))
-            })
-        };
-        assert_eq!(tenant(Some(Form::Hash(5))), (5, None));
-        assert_eq!(
-            tenant(Some(Form::Plain("a".to_owned()))),
-            (fingerprint(b"a"), Some("a".to_owned()))
-        );
-        // No form, a fingerprint of zero and an empty name are no key.
-        for absent in [None, Some(Form::Hash(0)), Some(Form::Plain(String::new()))] {
-            assert_eq!(tenant(absent.clone()), (0, None), "{absent:?}");
-        }
-        let unset = with(|facts| facts.session_key = None);
-        let read = reading(unset, &mut Lists::default(), |facts, _| {
-            facts.session_key.hash
-        });
-        assert_eq!(read, 0);
-    }
-
-    /// The contract's own numbers: the key "conversation-7" under the model
-    /// "model-a" names one session a phase, and names it in either form.
-    /// The hash form is the session's value: it is never read as a key's
-    /// fingerprint and scoped again.
-    #[test]
-    fn a_session_key_names_the_contracts_session_in_its_plain_form_and_in_its_hash_form() {
-        let sessions: [(proto::Phase, u64); 4] = [
-            (proto::Phase::Single, 0x6e88_ff71_cc98_2a42),
-            (proto::Phase::Prefill, 0x619f_dbb0_c262_9a55),
-            (proto::Phase::Decode, 0x3e92_fbbd_183d_f4b6),
-            (proto::Phase::Encode, 0x3780_ba54_336a_57d0),
-        ];
-        let named = |phase: proto::Phase, form: Option<Form>| {
-            let frame = with(|facts| {
-                facts.phase = phase.into();
-                facts.session_key = Some(proto::Identity { form });
-            });
-            reading(frame, &mut Lists::default(), |facts, _| {
-                let key = facts.session_key;
-                (
-                    facts.session().get(),
-                    key.hash,
-                    key.plain.map(str::to_owned),
-                )
-            })
-        };
-        let key = fingerprint(b"conversation-7");
-        for (phase, session) in sessions {
-            let plain = "conversation-7".to_owned();
-            assert_eq!(
-                named(phase, Some(Form::Plain(plain.clone()))),
-                (session, key, Some(plain)),
-                "{phase:?}"
-            );
-            // The same session, and the same key for a stage that reads it.
-            assert_eq!(
-                named(phase, Some(Form::Hash(session))),
-                (session, key, None),
-                "{phase:?}"
-            );
-        }
-        // No form, a value of zero and an empty key are no session.
-        for absent in [None, Some(Form::Hash(0)), Some(Form::Plain(String::new()))] {
-            let read = named(proto::Phase::Single, absent.clone());
-            assert_eq!(read, (0, 0, None), "{absent:?}");
-        }
-        // The one value that would give the fingerprint no key has is no
-        // key's session.
-        let keyless = with(|facts| {
-            facts.phase = proto::Phase::Single.into();
-            facts.session_key = Some(key_form(Form::Hash(0xc771_96d2_b9cf_9497)));
-        });
-        let refused = Checked::new(keyless).expect_err("no key's session");
-        assert_eq!(refused, Refusal::OutOfRange("facts.session_key.hash"));
-    }
-
-    #[test]
-    fn a_count_past_its_records_width_saturates_and_a_header_past_256_names_is_refused() {
-        let frame = with(|facts| {
-            facts.attempt = 256;
-            facts.media = Some(proto::MediaCounts {
-                images: 65_536,
-                audio: u32::MAX,
-                video: 65_535,
-                bytes: u32::MAX,
-            });
-        });
-        let (attempt, media) = reading(frame, &mut Lists::default(), |facts, _| {
-            (facts.attempt, facts.media)
-        });
-        assert_eq!(attempt, u8::MAX);
-        assert_eq!(
-            media,
-            MediaCounts {
-                images: u16::MAX,
-                audio: u16::MAX,
-                video: 65_535,
-                bytes: u32::MAX
-            }
-        );
-        let frame = with(|facts| facts.headers[1].name = 256);
-        assert_eq!(
-            Checked::new(frame).expect_err("a name past the record's"),
-            Refusal::OutOfRange("facts.headers.name")
-        );
-        // A frame's headers by their count: 256 are read, each a record of
-        // its own, and one more is refused by the list's path. An empty
-        // header is two bytes as encoded.
-        let headers = |count| with(|facts| facts.headers = vec![proto::Header::default(); count]);
-        let read = reading(headers(256), &mut Lists::default(), |facts, _| {
-            facts.headers.len()
-        });
-        assert_eq!(read, 256);
-        assert_eq!(
-            Checked::new(headers(257)).expect_err("a header past a view's names"),
-            Refusal::OutOfRange("facts.headers")
-        );
-        let size = |count| {
-            let facts = headers(count).facts.expect("the full frame has facts");
-            prost::Message::encoded_len(&facts)
-        };
-        assert_eq!(size(257) - size(0), 2 * 257);
-        // A wire-mode bit this build does not know is dropped, wherever in
-        // the wire's 32 it stands. A gateway that states such bits alone
-        // still states wires: none this build knows, and the record reads
-        // that as it reads a gateway that states none.
-        let stating = |bits: u32| {
-            let mut frame = full();
-            frame
-                .constraints
-                .as_mut()
-                .expect("the full frame has constraints")
-                .wire_modes = bits;
-            let stated = Checked::new(frame.clone())
-                .expect("a frame the record holds")
-                .wires();
-            let read = reading(frame, &mut Lists::default(), |_, constraints| {
-                constraints.wire_modes
-            });
-            (stated, read)
-        };
-        assert_eq!(
-            stating(0b1_0000_1001),
-            (Some(WireModes::HTTP), WireModes::HTTP)
-        );
-        assert_eq!(
-            stating(0b1_0000_0000),
-            (Some(WireModes::NONE), WireModes::NONE)
-        );
-        assert_eq!(stating(0), (None, WireModes::NONE));
-    }
-
     /// The text is said and dropped at the check: the frame a queue holds
     /// keeps none of it, its buffer neither.
     #[test]
@@ -1847,14 +1378,12 @@ pub(crate) mod tests {
     /// its facts say, and is no pair's first request: its bit is not read.
     #[test]
     fn a_frame_keeps_its_decode_later_bit_and_its_decode_of_id() {
-        use crate::engine::{store_backed_engine::RequestForm, view::Phase};
+        use crate::engine::view::Phase;
         let said = |later: bool, of: Option<u64>| {
             let mut frame = with(|facts| facts.phase = proto::Phase::Prefill.into());
             (frame.decode_later, frame.decode_of) = (later, of);
             let frame = Checked::new(frame).expect("no word is a field out of its range");
-            assert_eq!(RequestForm::decode_later(&frame), frame.decode_later());
             let of = frame.decode_of().map(|lease| lease.0);
-            assert_eq!(frame.asks_decode(), of.is_some());
             (frame.says_more(), frame.decode_later(), of, frame.phase())
         };
         let lease = 1 << 32 | 7;
@@ -1875,32 +1404,6 @@ pub(crate) mod tests {
         frame.decode_of = Some(0);
         let refused = Checked::new(frame).err();
         assert_eq!(refused, Some(Refusal::OutOfRange("decode_of")));
-    }
-
-    #[test]
-    fn the_hashes_past_what_the_generation_reads_are_cut_at_the_read_and_the_first_ones_kept() {
-        let frame = with(|facts| facts.block_hashes = (1..=6).collect());
-        let checked = Checked::new(frame).expect("a frame the record holds");
-        assert_eq!(checked.hashes(), 6);
-        let read = |max_block_hashes| {
-            let view = Viewed {
-                now_micros: 0,
-                budget_micros: 1,
-                affinity: &[],
-                stalled: &[],
-                held: &[],
-                in_flight: None,
-                max_block_hashes,
-                pins: None,
-                signal_cells: None,
-            };
-            checked.read(&mut Lists::default(), view, unnamed, |facts, _| {
-                facts.block_hashes.to_vec()
-            })
-        };
-        assert_eq!(read(4), [1, 2, 3, 4]);
-        assert_eq!(read(6), [1, 2, 3, 4, 5, 6]);
-        assert_eq!(read(7), [1, 2, 3, 4, 5, 6]);
     }
 
     /// The spec's range for `view.max_block_hashes` ends where the frame's
@@ -1924,56 +1427,6 @@ pub(crate) mod tests {
         assert_eq!(u32::try_from(read.hashes()), Ok(MAX_BLOCK_HASHES));
         let over = frame(MAX_BLOCK_HASHES + 1);
         assert_eq!(prost::Message::encoded_len(&over), MAX_FRAME + 3);
-    }
-
-    #[test]
-    fn a_decider_reads_frame_after_frame_on_the_same_buffers() {
-        let mut lists = Lists::default();
-        let first = reading(full(), &mut lists, |facts, constraints| {
-            (
-                facts.tried.len(),
-                facts.headers.len(),
-                constraints.excluded.len(),
-            )
-        });
-        assert_eq!(first, (2, 2, 3));
-        let held = (
-            lists.tried.capacity(),
-            lists.excluded.capacity(),
-            lists.headers.capacity(),
-        );
-        assert!(held.0 >= 2 && held.1 >= 3 && held.2 >= 2, "{held:?}");
-        assert!(
-            lists.headers.is_empty(),
-            "a frame's headers end with its read"
-        );
-        // A frame with shorter lists reads its own, and nothing of the last.
-        let frame = with(|facts| {
-            facts.tried = vec![1];
-            facts.headers.truncate(1);
-        });
-        let second = reading(frame, &mut lists, |facts, _| {
-            let headers: Vec<(u8, String)> = facts
-                .headers
-                .iter()
-                .map(|header| (header.name, header.value.to_owned()))
-                .collect();
-            (facts.tried.to_vec(), headers)
-        });
-        assert_eq!(second, (vec![WorkerId(1)], vec![(0, "first".to_owned())]));
-        assert_eq!(
-            held,
-            (
-                lists.tried.capacity(),
-                lists.excluded.capacity(),
-                lists.headers.capacity()
-            ),
-            "the buffers are kept"
-        );
-        // The buffer one frame's headers leave is the one the next frame's
-        // take: the emptying keeps it.
-        let spent: Vec<Header<'_>> = Vec::with_capacity(8);
-        assert!(emptied(spent).capacity() >= 8);
     }
 
     /// The wire's trace carries the veto the all-vetoed rule lifted, and

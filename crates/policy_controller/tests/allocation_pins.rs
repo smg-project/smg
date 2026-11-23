@@ -8,7 +8,10 @@
 //! first). The
 //! store's pins stand beside them: two membership writes are held to each
 //! other, a write that moves an offer to one that moves none and a
-//! registration into 512 workers to one into 8. A host in process is pinned
+//! registration into 512 workers to one into 8. A lease's life at the store
+//! allocates nothing once its file is sized: its record filed, its
+//! dispatch and its completion handed to the file, the completion written
+//! for the health rule and the sweep's pass. A host in process is pinned
 //! too, in a build
 //! with the `in-process` feature: a request held from its decision to its
 //! completion allocates nothing after the first ones. A separate
@@ -30,9 +33,10 @@ use smg_policy_controller::{
     },
     stages::Lifecycle,
     store::{
-        LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        GatewayId, Hand, HealthSink, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource,
+        MemoryStore, PickRecord, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    tracking::{Lease, Side},
+    tracking::{Dispatch, Lease, LeaseId, Outcome, Said, Side, TransportClass},
 };
 
 #[global_allocator]
@@ -609,6 +613,85 @@ fn store_of(n: usize) -> (MemoryStore, Vec<WorkerId>, Instant) {
     store.publish(opened);
     assert_eq!(store.publish_due(), None);
     (store, ids, opened)
+}
+
+/// A lease's life at the store, over the store's own calls and no engine:
+/// its record filed, its dispatch and its completion handed to its file as
+/// a session hands a gateway's frames, the gateway's completion written on
+/// the served worker for the health rule, and the sweep's pass a host's
+/// loop makes. The hand and the health write are the calls a served
+/// controller makes for a `Dispatched` and a `Completed` frame. The record
+/// is filed by the trait's door, under an id of the case's own: a served
+/// decision's issue mints its id and steps the deadline queue inside the
+/// crate, and no case out here reaches that call. Behind the trait's door
+/// the sweep steps the queue, so the case's clock moves a step a lease and
+/// the queue holds the places of one deadline's span.
+#[test]
+fn a_lease_filed_dispatched_and_completed_at_the_store_allocates_nothing() {
+    const LEASES: u32 = 256;
+    const STEP: Duration = Duration::from_millis(50);
+    const SPAN: Duration = Duration::from_secs(5);
+    for n in [8usize, 64] {
+        let (store, ids, opened) = store_of(n);
+        let gateway = GatewayId(7);
+        let hand = Hand::new(gateway);
+        let term = LeasesStore::term(&store);
+        let life = |request: u32| {
+            let now = opened + STEP * request;
+            let worker = ids[request as usize % n];
+            // An id of the host's own minting: the high bit.
+            let lease = LeaseId(1 << 63 | u64::from(request));
+            let filed = store.issue(LeaseRecord {
+                lease: Lease {
+                    id: lease,
+                    ..Lease::default()
+                },
+                gateway,
+                request: u64::from(request),
+                target: worker,
+                picked: PickRecord::default(),
+                decode: None,
+                term,
+                issued_at: now,
+                dispatch_deadline: now + SPAN,
+                state: LeaseState::ISSUED,
+            });
+            assert_eq!(filed, Ok(()), "the store files the lease");
+            let dispatch = Dispatch {
+                target_index: 0,
+                side: Side::Single,
+                since_decision_micros: 100,
+            };
+            store.hand(&hand, lease, Said::Dispatched(dispatch, now));
+            let outcome = Outcome {
+                served: worker,
+                ..Outcome::reported(200, TransportClass::Ok)
+            };
+            store.hand(&hand, lease, Said::Completed(outcome));
+            HealthSink::completed(&store, gateway, worker, outcome.class, now);
+            let ended = store.expire(now);
+            assert!(ended.is_empty(), "no lease waited out its deadline");
+        };
+        // The first lives size the file, fill the deadline queue to its
+        // span and write each worker's first completion of this gateway.
+        for request in 0..LEASES {
+            life(request);
+        }
+        assert_eq!(store.live(gateway), 0, "a completed lease left the file");
+        let ((), allocations) = allocations_during(|| {
+            for request in LEASES..2 * LEASES {
+                life(request);
+            }
+        });
+        assert_eq!(store.live(gateway), 0, "a completed lease left the file");
+        let counted = opened + STEP * LEASES;
+        assert!(
+            ids.iter()
+                .all(|worker| store.completed_ok_since(gateway, *worker, counted)),
+            "{n} members: each worker holds a completion of the counted lives"
+        );
+        assert_eq!(allocations, 0, "{n} members: a lease's life allocated");
+    }
 }
 
 #[test]

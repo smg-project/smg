@@ -139,8 +139,7 @@ Lines of each folder under `src/`, tests included, counted on main.
 | **Total** | **271,245** | **211** | |
 
 The engine that stays (section 5.7) is `engine/policy_engine.rs` and the folder beside it: 6,228
-lines with their tests, and 1,818 more for the record writer and its tests. The engine that goes
-is `engine/store_backed_engine.rs` and the folder beside it: 12,461 lines with their tests.
+lines with their tests, and 1,818 more for the record writer and its tests.
 
 ## 3. The policy document **[built]**
 
@@ -619,7 +618,7 @@ load snapshot; a snapshot's reports are converted once for a list and cached.
 
 `engine` is `PolicyEngine`'s number. It writes each record its engine's place where it finds the
 list's engines, once for a list, so records that state one place are ranks of one data-parallel
-engine. The store-backed engine and a default record leave 0 on every record, which would read as
+engine. A default record leaves 0 on every record, which would read as
 one engine, so a stage reads the field where `PolicyEngine` decides: in process, and in a
 controller for a single request. The
 number holds within one generation of one list and is no id beyond it.
@@ -1428,7 +1427,7 @@ Its data is one in-memory store (`store/memory.rs`):
 | health | the worker crate's health checker over the worker objects, on the leader | copied into the records |
 | loads | the crate's own poller, every 10 seconds | `PushLoad` is not served; a single request's decision reads none yet |
 | cache index | a follower of each worker's cache events | an index of the store's own; `PushKvEvents` is not served; a single request's decision reads none yet, only the engine's own record of sent prompts |
-| sessions, leases | decisions | not replicated to a standby; a single request's session pins are the engine's own table, one for each document, and no decision reads the store's pins |
+| sessions, leases | decisions (leases only) | not replicated to a standby; a single request's session pins are the engine's own table, one for each document, and no decision reads the store's pins |
 
 The gRPC service (`crates/policy_controller/contracts/policy_controller.proto`):
 
@@ -1461,7 +1460,7 @@ the worker crate's structures, and the one engine.
 | health | the worker crate's health checker over the worker objects, on the leader; each outcome is copied into the store's record, an object's status follows its record's, and a single request's decision reads the object's | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
 | loads | the crate's own poller and table; a single request's decision reads no report and no overload verdict yet | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic, whose gateway hands every worker the same two defaults |
 | cache events | an index of the store's own; a single request's decision reads none yet | the kv-index crate's index, filled by the worker crate's collector |
-| sessions | the engine's session table for a single request, one for each document; the store's tables are still written, and no decision reads them | the engine's session table |
+| sessions | the engine's session table for a single request, one for each document; the store's pins of record are not written at dispatch, and no decision reads them | the engine's session table |
 | leases | the store's lease tables, in memory, one for each deciding thread | stay: a controller must remember what it issued to gateways |
 | decisions | a single request: `PolicyEngine::decide_without_lease` over the registry's list; a pair's phases: none, the request is answered `Busy` | `PolicyEngine::decide_without_lease` over the registry's lists |
 | discovery | not registering | the discovery crate through its host interface, registering through the worker crate's job queue |

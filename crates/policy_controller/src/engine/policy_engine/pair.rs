@@ -461,8 +461,8 @@ fn decode_session(facts: &RequestFacts<'_>) -> Session {
 ///
 /// One side alone is no pair: where either list holds no record the engine
 /// answers over no candidate. A request that states a hard demand or a
-/// subset hint of none is shed under the stage's name the engine over a
-/// store sheds it by, and a hint of some records is declined under it.
+/// subset hint of none is shed, and a hint of some records is declined,
+/// each under a stage's name ([`not_decided`]).
 fn decide_records(
     engine: &Engine,
     facts: &RequestFacts<'_>,
@@ -757,10 +757,6 @@ mod tests {
             list_cell::tests::PublishedList,
             records::worker_id,
             sticky_sessions::{DecodeVerdict, SessionVerdict},
-            store_backed_engine::{
-                tests::{later_request, pair_fleet, pair_request, GATEWAY},
-                StoreBackedEngine,
-            },
             view::{Identity, Role, WireModes, WorkerId},
         },
         policies::consistent_hashing::InOrder,
@@ -3012,9 +3008,7 @@ mod tests {
     ///
     /// The gateway's own routing picks a pair's decode with its prefill and
     /// has no stage that hears an issue
-    /// (`model_gateway/src/routers/common/placement.rs:1227`). The engine
-    /// over stored records holds such a panic and hands back the pick its
-    /// file holds (`engine/store_backed_engine.rs`, `issue_decode`).
+    /// (`model_gateway/src/routers/common/placement.rs:1227`).
     #[test]
     fn a_stage_that_panics_at_a_decode_calls_issue_costs_the_call_nothing() {
         let host = Host::under(stopping(), 1, 2);
@@ -3125,37 +3119,6 @@ mod tests {
         assert_eq!(decode, own);
         let with = host.asks(&classes, false);
         let [_, decode] = sizes_by_side(door, local, &with, None, false);
-        assert_eq!(decode, own);
-    }
-
-    /// The engine over a store keeps a decode side's own size on its file
-    /// and tells every word of the side under it. The same sequence gives
-    /// the same sizes there as the engine over worker lists tells from what
-    /// its guard lends.
-    #[test]
-    fn the_engine_over_a_store_tells_a_decode_calls_side_under_the_calls_size() {
-        let store = pair_fleet(1, 2).expect("a pair's fleet");
-        let (spec, _) = hearing();
-        store.apply(spec).expect("a later generation");
-        let door = StoreBackedEngine::new(store);
-        let mut first = later_request(b"pair");
-        first.facts.prompt_tokens = 40;
-        let mut again = later_request(b"pair");
-        again.facts.prompt_tokens = 47;
-        let own = [("issued", 40), ("dispatched", 40), ("completed", 40)];
-        let [prefill, decode] = sizes_by_side(&door, GATEWAY, &first, Some(&again), false);
-        assert_eq!(prefill, own);
-        assert_eq!(
-            decode,
-            [("issued", 47), ("dispatched", 47), ("completed", 47)]
-        );
-        let [_, decode] = sizes_by_side(&door, GATEWAY, &first, Some(&again), true);
-        assert_eq!(decode, [("issued", 47), ("released", 47)]);
-        let [_, decode] = sizes_by_side(&door, GATEWAY, &first, None, false);
-        assert_eq!(decode, own);
-        let mut with = pair_request(b"pair");
-        with.facts.prompt_tokens = 40;
-        let [_, decode] = sizes_by_side(&door, GATEWAY, &with, None, false);
         assert_eq!(decode, own);
     }
 

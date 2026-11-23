@@ -1888,16 +1888,6 @@ impl Harness {
             .is_some_and(|record| matches!(record.state, LeaseState::Dispatched { .. }))
     }
 
-    /// The row the store's pin of record names for `session`, the value a
-    /// lease states of its request's session; `None` where the store pins
-    /// the session nowhere.
-    pub fn pinned(&self, session: u64) -> Option<(usize, u16)> {
-        // By the trait's path, as `leases` reads the file.
-        let pin =
-            smg_policy_controller::store::SessionsStore::lookup(self.store.as_ref(), session)?;
-        self.named(pin.worker.0)
-    }
-
     /// Whether the store holds a completion of class ok by the gateway named
     /// `gateway` on the first rank of the engine at `engine`, at or after
     /// `since`: the read a decision's precedence rule makes of one

@@ -1,12 +1,10 @@
 //! What a host's decisions stand on: the engine that makes a whole decision
 //! and hears what its host says of the decision's lease.
 //!
-//! Two engines are one to a host. [`StoreBackedEngine`](super::StoreBackedEngine) decides over the
-//! policy store's rows: a controller's own, and a gateway's that follows a
-//! controller. The engine of a gateway's own process decides over the
-//! gateway's worker objects and holds no store. A
-//! [`DecisionGuard`](crate::tracking::DecisionGuard) holds a decision of
-//! either, and a host's own object asks either, through [`DecisionEngine`].
+//! The engine decides over the worker objects its host lends and holds no
+//! store. A [`DecisionGuard`](crate::tracking::DecisionGuard) holds a
+//! decision of it, and a host's own object asks it, through
+//! [`DecisionEngine`].
 //!
 //! **What a guard lends.** A guard lends its engine one view of the
 //! decision it holds, with each word and with a pair's decode call
@@ -571,8 +569,7 @@ pub struct Request<'a> {
     /// under a rule with an in-flight cap. A budget of 0 leaves a decision
     /// in process unbounded. Over a link it says the request's time is spent.
     pub facts: RequestFacts<'a>,
-    /// What the host alone knows. The door writes its standing vetoes and
-    /// the pins of record over the host's.
+    /// What the host alone knows.
     pub constraints: Constraints<'a>,
 }
 
