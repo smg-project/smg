@@ -17,7 +17,7 @@
 
 use std::{sync::Arc, time::Instant};
 
-use super::{decide, sendable, walk, Call, Made, PlaceRequest, Sides, Unplaced};
+use super::{decide, raise, sendable, walk, Call, Made, PlaceRequest, Sent, Sides, Unplaced};
 use crate::{
     engine::{
         decision::Target,
@@ -69,9 +69,15 @@ pub(super) fn ask<'a>(
     lists: &PairLists<'_>,
     call: &mut Call,
 ) -> Result<Option<Placement<'a>>, Unplaced> {
-    let made = Made::asked(engine.object, request, call);
-    let (decided, dated) = decide(engine, &made).map_err(Unplaced::Refused)?;
-    let key = made.key();
+    let mut made = Made::asked(engine.object, request, call);
+    let decided = decide(engine, &made);
+    // The route's rule panicked inside the decision, at the question of
+    // where the prompt goes: the panic is the caller's, as a single's is.
+    if let Some(panic) = made.panicked.take() {
+        raise(engine.object, panic, decided);
+    }
+    let (decided, dated) = decided.map_err(Unplaced::Refused)?;
+    let (key, kept) = (made.key(), [made.sent.get(), made.decodes.get()]);
     // A pair's decision is whole: no one pick decides a place of two lists.
     let Decided::Whole(decided, later) = decided else {
         return Err(Unplaced::Refused(DecisionRefused::Faulted));
@@ -80,7 +86,7 @@ pub(super) fn ask<'a>(
         return Err(Unplaced::PrefillsFull);
     }
     let now = dated.unwrap_or_else(Instant::now);
-    let held = |target: &Target| sides(request, lists, target);
+    let held = |target: &Target| sides(request, lists, target, &kept);
     let placement = walk(engine, decided, later, now, &mut call.missed, held)?;
     Ok(placement.map(|mut placement| {
         placement.routing_key = key;
@@ -93,19 +99,26 @@ pub(super) fn ask<'a>(
 /// both ([`sendable`]): what a walk of a pair's targets asks of each
 /// ([`walk`]), over a pair's two lists and over the pair's two of an encode
 /// request's three. Else the ids of the sides it cannot be sent to.
+///
+/// A worker the decision asked of is taken by the answer it was given
+/// there (`kept`: the prefills', then the decodes'), and read no second
+/// time: the request goes to the pair its prompt was stored for.
 pub(super) fn sides(
     request: &PlaceRequest<'_>,
     lists: &PairLists<'_>,
     target: &Target,
+    kept: &[Sent; 2],
 ) -> Result<Sides, [Option<WorkerId>; 2]> {
-    let side = |list: LentList<'_>, place: u32| {
+    let side = |list: LentList<'_>, place: u32, kept: &Sent| {
         let worker = list.workers.get(place as usize)?;
-        sendable(request, worker.as_ref()).then(|| Arc::clone(worker))
+        let sends = kept.answer(place);
+        let sends = sends.unwrap_or_else(|| sendable(request, worker.as_ref()));
+        sends.then(|| Arc::clone(worker))
     };
     // A target with no decode side is no pair: it names nobody.
     let pair = target.pair.ok_or([None; 2])?;
-    let prefill = side(lists.prefill, target.position);
-    let decode = side(lists.decode, pair.decode_position);
+    let prefill = side(lists.prefill, target.position, &kept[0]);
+    let decode = side(lists.decode, pair.decode_position, &kept[1]);
     match (prefill, decode) {
         (Some(prefill), Some(decode)) => Ok((prefill, Some(decode))),
         (prefill, decode) => Err([

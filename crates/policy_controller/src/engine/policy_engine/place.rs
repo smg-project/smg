@@ -72,7 +72,7 @@ use std::{
 
 use smg_worker::identity::basic::Worker;
 
-use super::{Loaded, PolicyEngine};
+use super::{encode::EncodeLists, Loaded, PolicyEngine};
 use crate::{
     document::{
         spec::{AppliedSpec, DecodePick},
@@ -425,6 +425,9 @@ pub(super) struct Made<'r, 'a> {
     /// ([`RequestMaker::sends_to`]): the call's pick takes these answers,
     /// and reads none of those targets again.
     sent: Cell<Sent>,
+    /// The same on the decodes of a pair's targets, by their places in the
+    /// decode list: `sent` holds the prefills' then.
+    decodes: Cell<Sent>,
 }
 
 /// What a call's maker answered on a decision's targets where the decision
@@ -494,6 +497,7 @@ impl<'r, 'a> Made<'r, 'a> {
             heads: OnceCell::new(),
             panicked: OnceCell::new(),
             sent: Cell::new(Sent::NONE),
+            decodes: Cell::new(Sent::NONE),
         }
     }
 
@@ -815,10 +819,12 @@ impl RequestMaker for Made<'_, '_> {
         self.request.prompt.entry?.token_key(page)
     }
 
-    // The walk's own read of a single request's target, made ahead of the
-    // walk for the write of where the prompt went, a lent tree's or the
-    // record's: ready, and admitted by the route's rule, which is asked of
-    // a worker that is ready and of no other.
+    // The walk's own read of a target, made ahead of the walk for the
+    // write of where the prompt went, a lent tree's or the record's: each
+    // worker of the target ready, and admitted by the route's rule, which
+    // is asked of a worker that is ready and of no other. A single
+    // request's target is its one worker, and a pair's is its prefill and
+    // its decode, in a pair's two lists or an encode request's.
     //
     // A rule that panics here panics inside a decision, where the engine's
     // own catch would answer it as a decision that faulted. It is the
@@ -827,20 +833,41 @@ impl RequestMaker for Made<'_, '_> {
     // the decision ([`raise`]). The walk catches the rule's panic the same
     // way where it asks ([`walk`]).
     //
-    // Each answer is kept ([`Sent`]): the call's pick takes it, so a
-    // target is read and its rule asked once a decision.
+    // Each answer is kept ([`Sent`]), a pair's by its side: the call's pick
+    // takes it, so a worker is read and its rule asked once a decision. A
+    // pair's targets share workers, their prefill first of all: one that
+    // an earlier target was asked of answers as it did.
     fn sends_to(&self, target: &Target) -> bool {
-        let WorkerLists::Single(list) = self.request.lists else {
-            return true;
-        };
-        let Some(worker) = list.workers.get(target.position as usize) else {
+        match self.request.lists {
+            WorkerLists::None => true,
+            WorkerLists::Single(list) => self.asks(list, target.position, &self.sent),
+            WorkerLists::Pair(lists) | WorkerLists::Encode(EncodeLists { pair: lists, .. }) => {
+                let side = |list: LentList<'_>, place: u32, kept: &Cell<Sent>| {
+                    let held = kept.get().answer(place);
+                    held.unwrap_or_else(|| self.asks(list, place, kept))
+                };
+                target.pair.is_some_and(|pair| {
+                    side(lists.prefill, target.position, &self.sent)
+                        && side(lists.decode, pair.decode_position, &self.decodes)
+                })
+            }
+        }
+    }
+}
+
+impl Made<'_, '_> {
+    /// Whether the call sends to the worker at `place` of `list`, one
+    /// worker of a target ([`RequestMaker::sends_to`]). The answer is kept
+    /// in `kept`.
+    fn asks(&self, list: LentList<'_>, place: u32, kept: &Cell<Sent>) -> bool {
+        let Some(worker) = list.workers.get(place as usize) else {
             return false;
         };
         let worker = worker.as_ref();
         if self.panicked.get().is_some() {
             return false;
         }
-        let mut sent = self.sent.get();
+        let mut sent = kept.get();
         let sendable = ready(worker)
             && self.request.admits.is_none_or(|admits| {
                 match catch_unwind(AssertUnwindSafe(|| admits(worker))) {
@@ -854,8 +881,8 @@ impl RequestMaker for Made<'_, '_> {
                     }
                 }
             });
-        sent.keep(target.position, sendable);
-        self.sent.set(sent);
+        sent.keep(place, sendable);
+        kept.set(sent);
         sendable
     }
 }

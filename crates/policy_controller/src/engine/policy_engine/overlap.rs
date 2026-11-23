@@ -1446,12 +1446,15 @@ impl PoolAffinity {
 
 /// The target a decision's request goes to: the first target of a pick the
 /// profile is told of ([`told_target`]) that the request's caller sends to
-/// (`sends_to`), asked best first. It is the worker a tree's match and the
-/// record's two writes keep the request's prefix for. `None` where the
-/// decision picked nobody, the binding's sessions rule keeps the request
-/// from the profile, or the caller sends to none of the pick's targets:
-/// nothing is stored.
-fn sent_target(decision: &Decision, sends_to: impl Fn(&Target) -> bool) -> Option<&Target> {
+/// (`sends_to`), asked best first. It is the worker a tree's match, the
+/// record's two writes and a pair's two writes behind its first pick keep
+/// the request's prefix for. `None` where the decision picked nobody, the
+/// binding's sessions rule keeps the request from the profile, or the
+/// caller sends to none of the pick's targets: nothing is stored.
+pub(super) fn sent_target(
+    decision: &Decision,
+    sends_to: impl Fn(&Target) -> bool,
+) -> Option<&Target> {
     told_target(decision)?;
     let mut targets = decision.pick()?.targets.iter();
     targets.find(|target| sends_to(target))

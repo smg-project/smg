@@ -106,7 +106,7 @@ fn asked<'a>(
     };
     let decided = engine.decide_encode_at(&made, items, placed, clock);
     let (decided, later) = decided.map_err(Unplaced::Refused)?;
-    let key = made.key();
+    let (key, kept) = (made.key(), [made.sent.get(), made.decodes.get()]);
     if prefills_full(&decided.decision) {
         return Err(Unplaced::PrefillsFull);
     }
@@ -133,7 +133,7 @@ fn asked<'a>(
     let read = OnceCell::new();
     let taken = walk(engine, decided, later, now, &mut call.missed, |target| {
         let (_, down) = read.get_or_init(&encoders);
-        let sides = sides(request, &lists.pair, target)?;
+        let sides = sides(request, &lists.pair, target, &kept)?;
         if down.is_empty() {
             Ok(sides)
         } else {
