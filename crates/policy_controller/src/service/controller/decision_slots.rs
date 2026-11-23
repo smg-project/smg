@@ -1844,7 +1844,9 @@ pub(crate) mod tests {
     /// snapshot: its engine's own task tells such a stage each report, and
     /// a controller runs no such task yet. The monitor publishes one worker
     /// with no queue and the others deep in theirs, and three frames still
-    /// name three workers, each by the requests it holds.
+    /// name three workers, each by the requests it holds. The scorer that
+    /// reads reports outweighs the one that keeps them eight to one: given
+    /// the snapshot, it would name the worker with no queue three times.
     #[tokio::test]
     async fn a_document_with_a_stage_that_keeps_reports_is_given_no_snapshot() {
         let document: PolicySpec = serde_json::from_str(
@@ -1852,7 +1854,10 @@ pub(crate) mod tests {
               "apiVersion": "smg.policy/v1",
               "generation": 1,
               "profiles": { "p": {
-                "score": ["least-load", { "resident-work": { "request_tokens": 512 } }],
+                "score": [
+                  { "least-load": { "weight": 8 } },
+                  { "resident-work": { "request_tokens": 512 } }
+                ],
                 "pick": "best"
               } },
               "bindings": [{ "profile": "p" }]
