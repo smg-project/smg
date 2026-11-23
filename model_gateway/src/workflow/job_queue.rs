@@ -1908,6 +1908,220 @@ mod tests {
         }
     }
 
+    /// A second `POST` of an engine that stands as rank workers is refused as
+    /// a duplicate though its server info no longer reads. The failed read
+    /// leaves the registration no shape, and the rank workers stand at
+    /// `{base}@{rank}`, where the base address finds none. After it the two
+    /// rank workers stand alone, with no plain worker beside them.
+    #[tokio::test]
+    async fn a_repeated_create_is_refused_for_rank_workers_whose_server_info_fails() {
+        use std::sync::atomic::Ordering;
+
+        use http::StatusCode;
+        use serde_json::json;
+
+        use crate::app_context::testing::live_app_context;
+
+        let (base, failing) = engine_whose_server_info_turns(
+            (StatusCode::OK, json!({"dp_size": 2})),
+            (StatusCode::INTERNAL_SERVER_ERROR, json!({})),
+        )
+        .await;
+        let context = live_app_context();
+        let marks = DashSet::new();
+        let create = add_worker(&base, WorkerRegistrationMode::CreateOnly);
+        let ranks = vec![format!("{base}@0"), format!("{base}@1")];
+
+        let first = execute_job(&create, &context, &marks, None).await;
+        assert!(first.is_ok(), "{first:?}");
+        assert_eq!(standing_at(&context, &base), ranks);
+
+        failing.store(true, Ordering::Relaxed);
+        let second = execute_job(&create, &context, &marks, None).await;
+        assert!(
+            matches!(&second, Err(said) if said.contains("already exists")),
+            "{second:?}"
+        );
+        assert_eq!(
+            standing_at(&context, &base),
+            ranks,
+            "no plain worker beside the ranks"
+        );
+    }
+
+    /// An upsert that reads two ranks where the engine stands as one plain
+    /// worker is refused by name: the first registration's server info
+    /// failed to read. The register step replaces a worker under its own
+    /// address alone, so the rank workers would stand beside the plain one.
+    /// After the refusal the plain worker stands alone.
+    #[tokio::test]
+    async fn an_upsert_that_reads_ranks_is_refused_where_a_plain_worker_stands() {
+        use std::sync::atomic::Ordering;
+
+        use http::StatusCode;
+        use serde_json::json;
+
+        use crate::app_context::testing::live_app_context;
+
+        let (base, reads) = engine_whose_server_info_turns(
+            (StatusCode::INTERNAL_SERVER_ERROR, json!({})),
+            (StatusCode::OK, json!({"dp_size": 2})),
+        )
+        .await;
+        let context = live_app_context();
+        let marks = DashSet::new();
+        let upsert = add_worker(&base, WorkerRegistrationMode::Upsert);
+        let plain = vec![base.clone()];
+
+        let first = execute_job(&upsert, &context, &marks, None).await;
+        assert!(first.is_ok(), "{first:?}");
+        assert_eq!(standing_at(&context, &base), plain);
+
+        reads.store(true, Ordering::Relaxed);
+        let second = execute_job(&upsert, &context, &marks, None).await;
+        assert!(
+            matches!(&second, Err(said) if said.contains(
+                "stands as one worker and this registration read 2 data-parallel ranks"
+            )),
+            "{second:?}"
+        );
+        assert_eq!(
+            standing_at(&context, &base),
+            plain,
+            "no rank worker beside the plain one"
+        );
+    }
+
+    /// An upsert takes a peer's rank workers that stand at its addresses
+    /// though they state no rank: an import with no spec is built from the
+    /// address alone. The registration reads the same two ranks and claims
+    /// both under their addresses. After it the registry holds the engine
+    /// once, each worker states its rank, and this node owns both.
+    #[tokio::test]
+    async fn an_upsert_takes_a_peers_rank_workers_that_state_no_rank() {
+        use http::StatusCode;
+        use serde_json::json;
+        use smg_worker::{
+            registry::{RemoteWorkerState, WorkerOrigin},
+            workflow::find_workers_by_url,
+        };
+
+        use crate::app_context::testing::live_app_context;
+
+        let two_ranks = (StatusCode::OK, json!({"dp_size": 2}));
+        let (base, _) = engine_whose_server_info_turns(two_ranks.clone(), two_ranks).await;
+        let context = live_app_context();
+        let registry = &context.worker_registry;
+        for rank in 0..2 {
+            let url = format!("{base}@{rank}");
+            registry.on_remote_worker_state(&RemoteWorkerState {
+                worker_id: format!("peer-rank-{rank}"),
+                model_id: "m".to_string(),
+                url: url.clone(),
+                health: true,
+                version: 1,
+                spec: Vec::new(),
+            });
+            let id = registry.get_id_by_url(&url).expect("the import");
+            assert_eq!(registry.origin_of(&id), Some(WorkerOrigin::Mesh));
+            let imported = registry.get(&id).expect("the import");
+            assert_eq!(imported.dp_rank(), None, "built from the address alone");
+        }
+        let marks = DashSet::new();
+        let upsert = add_worker(&base, WorkerRegistrationMode::Upsert);
+
+        let result = execute_job(&upsert, &context, &marks, None).await;
+
+        assert!(result.is_ok(), "{result:?}");
+        let mut standing: Vec<(String, Option<usize>, Option<WorkerOrigin>)> =
+            find_workers_by_url(registry, &base)
+                .iter()
+                .map(|worker| {
+                    let id = registry.get_id_by_url(worker.url()).expect("its id");
+                    (
+                        worker.url().to_string(),
+                        worker.dp_rank(),
+                        registry.origin_of(&id),
+                    )
+                })
+                .collect();
+        standing.sort_by(|a, b| a.0.cmp(&b.0));
+        let local = Some(WorkerOrigin::Local);
+        assert_eq!(
+            standing,
+            [
+                (format!("{base}@0"), Some(0), local),
+                (format!("{base}@1"), Some(1), local)
+            ]
+        );
+    }
+
+    /// An engine stub whose server info answers `first` until the switch it
+    /// returns is set, and `then` from then on: a read that fails, or one
+    /// that comes back. Returns its base address and the switch.
+    async fn engine_whose_server_info_turns(
+        first: (http::StatusCode, serde_json::Value),
+        then: (http::StatusCode, serde_json::Value),
+    ) -> (String, Arc<AtomicBool>) {
+        use std::sync::atomic::Ordering;
+
+        use axum::{routing::get, Json};
+        use http::StatusCode;
+        use serde_json::json;
+
+        use crate::workflow::steps::local::test_support::{json_router, serve_router};
+
+        let turned = Arc::new(AtomicBool::new(false));
+        let server_info = {
+            let turned = Arc::clone(&turned);
+            move || {
+                let (status, body) = if turned.load(Ordering::Relaxed) {
+                    then.clone()
+                } else {
+                    first.clone()
+                };
+                async move { (status, Json(body)) }
+            }
+        };
+        let router = json_router(vec![
+            ("/health", StatusCode::OK, json!({"status": "ok"})),
+            (
+                "/v1/models",
+                StatusCode::OK,
+                json!({"data": [{"id": "m", "owned_by": "sglang"}]}),
+            ),
+            (
+                "/model_info",
+                StatusCode::OK,
+                json!({"model_path": "m", "is_generation": true}),
+            ),
+        ])
+        .route("/server_info", get(server_info));
+        (serve_router(router).await, turned)
+    }
+
+    /// A registration of the engine at `base` in `registration_mode`, as the
+    /// worker API asks it.
+    fn add_worker(base: &str, registration_mode: WorkerRegistrationMode) -> Job {
+        Job::AddWorker {
+            asker: WorkerJobAsker::Api,
+            config: Box::new(WorkerSpec::new(base)),
+            registration_mode,
+        }
+    }
+
+    /// The addresses of the workers that stand for `base` in the registry,
+    /// the plain one and the rank workers, in order.
+    fn standing_at(context: &AppContext, base: &str) -> Vec<String> {
+        let mut urls: Vec<String> =
+            smg_worker::workflow::find_workers_by_url(&context.worker_registry, base)
+                .iter()
+                .map(|worker| worker.url().to_string())
+                .collect();
+        urls.sort();
+        urls
+    }
+
     /// The registration workflows the store holds that have not ended.
     async fn registrations_running(context: &AppContext) -> usize {
         context

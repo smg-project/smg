@@ -11,6 +11,7 @@ use super::{
     data::{DpInfo, WorkerKind, WorkerRegistrationWorkflowData},
     host::{require_host, WorkflowHost},
     runtimes::{zmq_runtime, zmq_runtime_names, DEFAULT_RUNTIME},
+    select::find_workers_by_url,
 };
 use crate::{
     connection::engine::EngineConnectionCache,
@@ -26,6 +27,7 @@ use crate::{
     labels::{has_control_character, SUPPORTS_VISION_LABEL},
     model_card::ModelCard,
     model_type::ModelType,
+    registry::WorkerOrigin,
     worker::{ConstrainedDecoding, HealthCheckConfig, WorkerSpec, WorkerType},
     UNKNOWN_MODEL_ID,
 };
@@ -155,14 +157,13 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
         let health_endpoint = &settings.health_endpoint;
 
         let dp_ranks = dp_rank_expansion(context.data.dp_info.as_ref());
-        // Rank workers register at `{base}@{rank}`, which the base address
-        // checked above does not find.
-        if create_only
-            && dp_ranks
-                .iter()
-                .flatten()
-                .any(|(rank, _)| registry.get_by_url(&format!("{url}@{rank}")).is_some())
-        {
+        // The workers that stand for this address, read from the registry:
+        // the plain one, and the rank workers at `{base}@{rank}`, which the
+        // base address checked above does not find.
+        let standing = find_workers_by_url(registry, &url);
+        // A create is refused by any of them, whatever shape this
+        // registration read.
+        if create_only && !standing.is_empty() {
             return Err(already_exists(&config.url));
         }
 
@@ -235,6 +236,75 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
                 Arc::new(builder.build()) as Arc<dyn Worker>
             })
             .collect();
+
+        // Any other registration replaces every worker of this node that
+        // stands, or changes nothing. The registry step replaces a worker
+        // under its own address alone, so a standing worker is replaced where
+        // one was built at its address, whatever rank either states. A
+        // registration that read another shape would leave a worker beside
+        // its own, and the registry would hold the engine twice: a plain
+        // worker beside rank workers, where a server info failed to read on
+        // either registration, or a rank above the size read now.
+        //
+        // A peer's worker, imported from its published state, holds nothing
+        // back: this node takes the addresses it is configured with, where
+        // the registry step claims an import, and a peer's worker of another
+        // shape stays the import's to settle. The engine can then stand
+        // twice on this node until the peer's state changes.
+        let own: Vec<&Arc<dyn Worker>> = standing
+            .iter()
+            .filter(|stands| {
+                registry
+                    .get_id_by_url(stands.url())
+                    .is_some_and(|id| registry.origin_of(&id) == Some(WorkerOrigin::Local))
+            })
+            .collect();
+        let kept: Vec<&Arc<dyn Worker>> = own
+            .iter()
+            .copied()
+            .filter(|stands| workers.iter().all(|built| built.url() != stands.url()))
+            .collect();
+        // The refusal names one of them, the first by its address.
+        if let Some(first) = kept.iter().min_by_key(|stands| stands.url()) {
+            // A rank worker is one whose address ends in a rank, as the
+            // finder selected it.
+            let standing_ranks = own
+                .iter()
+                .filter(|stands| {
+                    Endpoint::parse_with_rank(stands.url()).is_ok_and(|(_, rank)| rank.is_some())
+                })
+                .count();
+            let stands = match (own.len() - standing_ranks, standing_ranks) {
+                (1, 0) => "one worker".to_string(),
+                (plain, 0) => format!("{plain} workers"),
+                (0, 1) => "one rank worker".to_string(),
+                (0, ranks) => format!("{ranks} rank workers"),
+                (plain, ranks) => format!("{plain} plain and {ranks} rank workers"),
+            };
+            let built_ranks = workers
+                .iter()
+                .filter(|built| built.dp_rank().is_some())
+                .count();
+            let read = match built_ranks {
+                0 => "no data-parallel ranks".to_string(),
+                ranks => format!("{ranks} data-parallel ranks"),
+            };
+            let others = match kept.len() - 1 {
+                0 => String::new(),
+                more => format!(" and {more} more"),
+            };
+            return Err(WorkflowError::StepFailed {
+                step_id: StepId::new("create_worker"),
+                message: format!(
+                    "Worker {} stands as {stands} and this registration read {read}: it would \
+                     leave {}{others} beside its own, so nothing is changed (remove what stands \
+                     at the address to register it again)",
+                    Endpoint::redacted_str(&config.url),
+                    // As it is registered, so that another spelling shows.
+                    Endpoint::redacted_url(first.url()),
+                ),
+            });
+        }
 
         debug!(
             "Created {} worker(s) for {} ({:?}, {} labels)",

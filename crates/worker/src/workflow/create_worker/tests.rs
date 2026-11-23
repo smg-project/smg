@@ -846,6 +846,300 @@ async fn create_only_refuses_a_group_whose_rank_workers_are_registered() {
     assert!(second.data.actual_workers.is_none());
 }
 
+/// A registration that read no shape, where the address's rank workers
+/// stand: a server info that failed to read leaves none, and the rank
+/// workers are at `{base}@{rank}`, where the base address finds no worker.
+/// A create is refused as a duplicate and any other registration by name.
+/// Neither builds a plain worker beside the ranks.
+#[tokio::test]
+async fn a_registration_with_no_shape_builds_no_plain_worker_beside_standing_ranks() {
+    let base = "http://worker:8000";
+    let host = ordinary_host();
+    for rank in 0..2 {
+        let worker = BasicWorkerBuilder::new(base)
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("m"))
+            .dp_config(rank, 2)
+            .build();
+        host.worker_registry().register(Arc::new(worker)).unwrap();
+    }
+    let shapeless = |mode: WorkerRegistrationMode| {
+        let mut spec = WorkerSpec::new(base);
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+        let mut data = local_data(spec, ConnectionMode::Http, Arc::clone(&host));
+        data.registration_mode = mode;
+        WorkflowContext::new(WorkflowInstanceId::new(), data)
+    };
+
+    let mut create = shapeless(WorkerRegistrationMode::CreateOnly);
+    let error = CreateLocalWorkerStep
+        .execute(&mut create)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Step failed: create_worker - Worker http://worker:8000 already exists"
+    );
+    assert!(create.data.actual_workers.is_none());
+
+    let mut upsert = shapeless(WorkerRegistrationMode::Upsert);
+    let error = CreateLocalWorkerStep
+        .execute(&mut upsert)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("stands as 2 rank workers and this registration read no data-parallel ranks"),
+        "{error}"
+    );
+    assert!(upsert.data.actual_workers.is_none());
+}
+
+/// A registration over what stands replaces every worker of the address or
+/// changes nothing. One that reads two ranks where a plain worker stands
+/// (its first server info failed to read) is refused by name, and so is one
+/// that reads two ranks where four stand: each would leave a worker beside
+/// its own. One that reads four where two stand replaces both and adds two.
+#[tokio::test]
+async fn a_registration_over_what_stands_leaves_no_worker_beside_its_own() {
+    let base = "http://worker:8000";
+    let standing_ranks = |size: usize| {
+        let host = ordinary_host();
+        for rank in 0..size {
+            let worker = BasicWorkerBuilder::new(base)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("m"))
+                .dp_config(rank, size)
+                .build();
+            host.worker_registry().register(Arc::new(worker)).unwrap();
+        }
+        host
+    };
+    let plain = ordinary_host();
+    let worker = BasicWorkerBuilder::new(base)
+        .worker_type(WorkerType::Regular)
+        .model(ModelCard::new("m"))
+        .build();
+    plain.worker_registry().register(Arc::new(worker)).unwrap();
+
+    for (host, read, said) in [
+        (
+            plain,
+            2,
+            Some("stands as one worker and this registration read 2 data-parallel ranks"),
+        ),
+        (
+            standing_ranks(4),
+            2,
+            Some("stands as 4 rank workers and this registration read 2 data-parallel ranks"),
+        ),
+        (standing_ranks(2), 4, None),
+    ] {
+        let mut spec = WorkerSpec::new(base);
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+        let mut data = local_data(spec, ConnectionMode::Http, host);
+        data.dp_info = Some(DpInfo {
+            dp_size: read,
+            model_id: "m".to_string(),
+        });
+        data.registration_mode = WorkerRegistrationMode::Upsert;
+        let mut upsert = WorkflowContext::new(WorkflowInstanceId::new(), data);
+
+        let result = CreateLocalWorkerStep.execute(&mut upsert).await;
+
+        let built = upsert.data.actual_workers.as_ref().map(Vec::len);
+        match said {
+            Some(said) => {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(said), "{error}");
+                assert!(error.contains("nothing is changed"), "{error}");
+                assert_eq!(built, None, "{said}");
+            }
+            None => {
+                assert_eq!(result.unwrap(), StepResult::Success);
+                assert_eq!(built, Some(read), "a wider engine replaces what stands");
+            }
+        }
+    }
+}
+
+/// What this node registered is held by its address, the registry step's
+/// own key, and not by the rank a worker states. Two workers built from the
+/// address alone stand at `{base}@{rank}` and state no rank. An upsert that
+/// reads the same two ranks replaces both. A registration that reads no
+/// ranks is refused, since its plain worker would stand beside them, and
+/// the refusal counts them as rank workers.
+#[tokio::test]
+async fn standing_workers_are_held_by_their_addresses_not_their_stated_ranks() {
+    let base = "http://worker:8000";
+    let host = ordinary_host();
+    for rank in 0..2 {
+        let imported = BasicWorkerBuilder::new(format!("{base}@{rank}"))
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("m"))
+            .build();
+        assert_eq!(imported.dp_rank(), None, "built from the address alone");
+        // Registered here: this node owns them.
+        host.worker_registry().register(Arc::new(imported)).unwrap();
+    }
+    let upsert = |read: Option<usize>| {
+        let mut spec = WorkerSpec::new(base);
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+        let mut data = local_data(spec, ConnectionMode::Http, Arc::clone(&host));
+        data.dp_info = read.map(|dp_size| DpInfo {
+            dp_size,
+            model_id: "m".to_string(),
+        });
+        data.registration_mode = WorkerRegistrationMode::Upsert;
+        WorkflowContext::new(WorkflowInstanceId::new(), data)
+    };
+
+    let mut same_shape = upsert(Some(2));
+    assert_eq!(
+        CreateLocalWorkerStep
+            .execute(&mut same_shape)
+            .await
+            .unwrap(),
+        StepResult::Success
+    );
+    let built: Vec<String> = same_shape
+        .data
+        .actual_workers
+        .unwrap()
+        .iter()
+        .map(|worker| worker.url().to_string())
+        .collect();
+    assert_eq!(built, ["http://worker:8000@0", "http://worker:8000@1"]);
+
+    let mut no_size = upsert(None);
+    let error = CreateLocalWorkerStep
+        .execute(&mut no_size)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(
+            "stands as 2 rank workers and this registration read no data-parallel ranks: it \
+             would leave http://worker:8000@0 and 1 more beside its own, so nothing is changed"
+        ),
+        "{error}"
+    );
+    assert!(no_size.data.actual_workers.is_none());
+}
+
+/// A worker that stands under another spelling of the address is one the
+/// registry step would not replace: an upsert under the other spelling is
+/// refused, and the refusal names the worker that would stay. The two
+/// spellings differ in the form of an IPv6 address, or in the host's letter
+/// case alone.
+#[tokio::test]
+async fn an_upsert_under_another_spelling_of_a_standing_address_is_refused() {
+    for (stands, asked) in [
+        ("http://[::1]:8000", "http://[0:0:0:0:0:0:0:1]:8000"),
+        ("http://Worker:8000", "http://worker:8000"),
+    ] {
+        let host = ordinary_host();
+        let standing = BasicWorkerBuilder::new(stands)
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("m"))
+            .build();
+        host.worker_registry().register(Arc::new(standing)).unwrap();
+        let mut spec = WorkerSpec::new(asked);
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+        let mut data = local_data(spec, ConnectionMode::Http, host);
+        data.registration_mode = WorkerRegistrationMode::Upsert;
+        let mut upsert = WorkflowContext::new(WorkflowInstanceId::new(), data);
+
+        let error = CreateLocalWorkerStep
+            .execute(&mut upsert)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains(&format!(
+                "stands as one worker and this registration read no data-parallel ranks: it \
+                 would leave {stands} beside its own, so nothing is changed"
+            )),
+            "{error}"
+        );
+        assert!(upsert.data.actual_workers.is_none());
+    }
+}
+
+/// A peer's worker, imported from its published state, holds no registration
+/// of this node back: the node takes the addresses it is configured with.
+/// Imports with no spec stand at `{base}@{rank}` and state no rank, and a
+/// same-shape upsert builds over both. A peer's rank workers do not stop a
+/// registration that read no ranks, and a peer's plain worker does not stop
+/// the upsert of this node's own ranks. In those two the engine stands twice
+/// until the peer's state changes, as it did before the rule.
+#[tokio::test]
+async fn a_peers_imported_workers_hold_no_registration_back() {
+    use crate::registry::RemoteWorkerState;
+
+    let base = "http://worker:8000";
+    let import = |host: &Arc<ProbingHost>, url: &str| {
+        let registry = host.worker_registry();
+        registry.on_remote_worker_state(&RemoteWorkerState {
+            worker_id: format!("peer-{url}"),
+            model_id: "m".to_string(),
+            url: url.to_string(),
+            health: true,
+            version: 1,
+            spec: Vec::new(),
+        });
+        let id = registry.get_id_by_url(url).expect("the import");
+        assert_eq!(registry.origin_of(&id), Some(WorkerOrigin::Mesh));
+    };
+    let built_by_upsert = |host: &Arc<ProbingHost>, read: Option<usize>| {
+        let mut spec = WorkerSpec::new(base);
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+        let mut data = local_data(spec, ConnectionMode::Http, Arc::clone(host));
+        data.dp_info = read.map(|dp_size| DpInfo {
+            dp_size,
+            model_id: "m".to_string(),
+        });
+        data.registration_mode = WorkerRegistrationMode::Upsert;
+        let mut upsert = WorkflowContext::new(WorkflowInstanceId::new(), data);
+        async move {
+            let result = CreateLocalWorkerStep.execute(&mut upsert).await;
+            assert_eq!(result.unwrap(), StepResult::Success);
+            let built = upsert.data.actual_workers.expect("the built workers");
+            built
+                .iter()
+                .map(|worker| worker.url().to_string())
+                .collect::<Vec<String>>()
+        }
+    };
+    let ranks = ["http://worker:8000@0", "http://worker:8000@1"];
+
+    let peers_ranks = ordinary_host();
+    for url in ranks {
+        import(&peers_ranks, url);
+        let imported = peers_ranks.worker_registry().get_by_url(url).unwrap();
+        assert_eq!(imported.dp_rank(), None, "built from the address alone");
+    }
+    assert_eq!(built_by_upsert(&peers_ranks, Some(2)).await, ranks);
+    assert_eq!(built_by_upsert(&peers_ranks, None).await, [base]);
+
+    let own_ranks = ordinary_host();
+    for rank in 0..2 {
+        let worker = BasicWorkerBuilder::new(base)
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("m"))
+            .dp_config(rank, 2)
+            .build();
+        own_ranks
+            .worker_registry()
+            .register(Arc::new(worker))
+            .unwrap();
+    }
+    import(&own_ranks, base);
+    assert_eq!(built_by_upsert(&own_ranks, Some(2)).await, ranks);
+}
+
 #[test]
 fn model_alias_map_does_not_duplicate_user_provided_alias() {
     // POST /workers can already carry aliases in the spec; the router map
