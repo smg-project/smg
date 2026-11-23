@@ -187,6 +187,9 @@ pub struct WorkerRuntime {
     processed_counter: AtomicUsize,
     worker_routing_key_load: WorkerRoutingKeyLoad,
     revision: AtomicU64,
+    /// The revision the worker stood at when it last entered `Draining`. A
+    /// removal pinned below it did not make that mark.
+    drained_at: AtomicU64,
     /// Absolute overload veto. Lives here rather than in the load-snapshot map
     /// so selection reads it under the guard it already holds, and so a
     /// same-URL replacement inherits it with the rest of the shared runtime.
@@ -699,6 +702,7 @@ impl WorkerRuntime {
             processed_counter: AtomicUsize::new(0),
             worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
             revision: AtomicU64::new(0),
+            drained_at: AtomicU64::new(0),
             overloaded: AtomicBool::new(false),
             stall: AtomicU8::new(0),
             liveness_signalled: AtomicBool::new(false),
@@ -1023,7 +1027,15 @@ impl WorkerRuntime {
             self.cache_trace_epochs_valid
                 .store(false, Ordering::Release);
         }
+        if status == WorkerStatus::Draining && self.status() != WorkerStatus::Draining {
+            self.drained_at.store(self.revision(), Ordering::Release);
+        }
         self.status.store(status as u8, Ordering::Release);
+    }
+
+    #[cfg(feature = "workflow")]
+    pub(crate) fn drained_at(&self) -> u64 {
+        self.drained_at.load(Ordering::Acquire)
     }
 
     pub fn revision(&self) -> u64 {
