@@ -68,13 +68,7 @@
 //!
 //! [`HealthAdapter`] writes probe outcomes and connect signals to the store
 //! and sets the object's status to the status that stands there. The host
-//! supplies the [`Lead`] and the term the adapter writes under. Its
-//! projection ([`HealthAdapter::project`]) writes what the object knows of
-//! its worker onto the row: the object's liveness veto is the row's stalled
-//! bit, for every gateway. The worker crate's collector drives it through
-//! the adapter: at each move of that veto, for an object laid over another,
-//! and for every object where a collector starts. A host that runs the
-//! collector calls no projection of its own.
+//! supplies the [`Lead`] and the term the adapter writes under.
 //!
 //! [`load_monitor`] is the worker crate's own load monitor over the
 //! holder's registry, with no adapter under it. It publishes the workers'
