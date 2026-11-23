@@ -469,7 +469,13 @@ jobs:
             bash scripts/bfcl/setup_client_env.sh "$RUNNER_TEMP/bfcl-client-venv"
           fi
       - name: Register model in bfcl (no-op if bfcl already ships a handler)
-        run: '"${BFCL_CLIENT_PYTHON:-python}" scripts/bfcl/register_bfcl_model.py --model-id "$MODEL" || true'
+        env:
+          GPU_VENDOR: ${{ matrix.vendor || 'nvidia' }}
+        run: |
+          if [ "$GPU_VENDOR" != amd ]; then
+            : "${BFCL_CLIENT_PYTHON:?The isolated NVIDIA BFCL client Python was not prepared}"
+          fi
+          "${BFCL_CLIENT_PYTHON:-python}" scripts/bfcl/register_bfcl_model.py --model-id "$MODEL"
       - name: Stage model weights
         # Skip if pre-staged locally at <cache>/<id> (e.g. blackwell NVMe); else
         # download just this leg's model (not the whole GPU tier, which pulls

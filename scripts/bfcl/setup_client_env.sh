@@ -21,7 +21,9 @@ ENGINE_NUMPY_BEFORE="$("$ENGINE_PYTHON" -c 'from importlib.metadata import versi
 # NVIDIA engine's ml-dtypes/OpenCV cohort requires NumPy >=2. Client-side Torch
 # is only a BFCL dependency; it must not download a second GPU runtime.
 "$UV_BIN" venv --python "$ENGINE_PYTHON" "$CLIENT_ENV"
-"$UV_BIN" pip install --python "$CLIENT_ENV/bin/python" --torch-backend=cpu \
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+bash "$SCRIPT_DIR/../ci_retry.sh" 3 10 \
+  "$UV_BIN" pip install --python "$CLIENT_ENV/bin/python" --torch-backend=cpu \
   "bfcl-eval==2026.3.23" soundfile
 "$UV_BIN" pip check --python "$CLIENT_ENV/bin/python"
 "$CLIENT_ENV/bin/python" -I - <<'PY'
@@ -37,10 +39,17 @@ print("BFCL client:", sys.executable, "numpy", metadata.version("numpy"), "torch
 PY
 
 ENGINE_NUMPY_AFTER="$("$ENGINE_PYTHON" -c 'from importlib.metadata import version; print(version("numpy"))')"
-[[ "$ENGINE_NUMPY_AFTER" == "$ENGINE_NUMPY_BEFORE" ]]
+if [[ "$ENGINE_NUMPY_AFTER" != "$ENGINE_NUMPY_BEFORE" ]]; then
+  printf 'ERROR: BFCL client setup changed engine NumPy from %s to %s (%s)\n' \
+    "$ENGINE_NUMPY_BEFORE" "$ENGINE_NUMPY_AFTER" "$ENGINE_PYTHON" >&2
+  exit 1
+fi
 # Exercise the import chain that failed before either NVIDIA arm could start.
 "$ENGINE_PYTHON" -c 'import numpy; import vllm.entrypoints.cli.launch; print("BFCL engine launch import canary: numpy", numpy.__version__)'
-[[ -x "$CLIENT_ENV/bin/bfcl" ]]
+if [[ ! -x "$CLIENT_ENV/bin/bfcl" ]]; then
+  echo "ERROR: BFCL client executable is missing or not executable: $CLIENT_ENV/bin/bfcl" >&2
+  exit 1
+fi
 
 # Do not activate the client or add it to PATH: both serving arms, SMG and their
 # subprocesses must keep the original engine interpreter and dependencies.

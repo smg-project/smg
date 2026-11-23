@@ -22,7 +22,10 @@ def score_script():
         if marker in step.get("run", "")
     ]
     assert len(scripts) == 1
-    return scripts[0][scripts[0].index(marker) :]
+    guard = '\nif [ "$GPU_VENDOR" != amd ]; then'
+    start = scripts[0].rfind(guard, 0, scripts[0].index(marker))
+    assert start >= 0
+    return scripts[0][start:]
 
 
 def write_executable(path, body):
@@ -31,9 +34,19 @@ def write_executable(path, body):
     path.chmod(0o700)
 
 
-def run_score(tmp_path, mode="sequential", *, report_write_failure=False, **faults):
+def run_score(
+    tmp_path,
+    mode="sequential",
+    *,
+    report_write_failure=False,
+    vendor="amd",
+    bfcl_executable=None,
+    **faults,
+):
     bin_dir = tmp_path / "bin"
     write_executable(bin_dir / "bfcl", "#!/bin/sh\nexit 99\n")
+    if bfcl_executable is not None:
+        write_executable(Path(bfcl_executable), "#!/bin/sh\nexit 99\n")
     write_executable(
         tmp_path / "scripts/bfcl/launch_arm.sh",
         """#!/bin/bash
@@ -68,7 +81,7 @@ printf 'http://%s.invalid\n' "$1"
             args = sys.argv[1:]
             common = [
                 "--bfcl-model", "mock", "--categories", "mock",
-                "--bfcl", str(temp / "bin/bfcl"), "--project-root", str(root),
+                "--bfcl", os.environ["EXPECTED_BFCL"], "--project-root", str(root),
                 "--run-timeout", "1",
             ]
             reports = [
@@ -119,6 +132,8 @@ printf 'http://%s.invalid\n' "$1"
         "TRACE": str(tmp_path / "trace"),
         "RUNNER_TEMP": str(tmp_path),
         "ARM_MODE": mode,
+        "GPU_VENDOR": vendor,
+        "EXPECTED_BFCL": bfcl_executable or str(bin_dir / "bfcl"),
         "GPU_A": "0",
         "GPU_B": "1",
         "BFCL_MODEL_FC": "mock",
@@ -133,6 +148,9 @@ printf 'http://%s.invalid\n' "$1"
         "COMPARE_RC": "0",
         **{key: str(value) for key, value in faults.items()},
     }
+    env.pop("BFCL_EXECUTABLE", None)
+    if bfcl_executable is not None:
+        env["BFCL_EXECUTABLE"] = bfcl_executable
     if report_write_failure:
         (tmp_path / "bfcl_ab.json").symlink_to("/dev/full")
     # Skip the real host/flock prelude and replace only its EXIT cleanup boundary.
@@ -148,7 +166,11 @@ printf 'http://%s.invalid\n' "$1"
     )
     trace = (tmp_path / "trace").read_text().splitlines()
     report_path = tmp_path / "bfcl_ab.json"
-    report = None if report_path.is_symlink() else json.loads(report_path.read_text())
+    report = (
+        None
+        if report_path.is_symlink() or not report_path.exists()
+        else json.loads(report_path.read_text())
+    )
     return result, trace, report
 
 
@@ -336,3 +358,27 @@ def test_actual_driver_diagnostic_write_failure_remains_hard_incomplete(tmp_path
     assert result.returncode == 2
     assert (tmp_path / "broken_stderr.attempted").read_text() == "attempted"
     assert not (tmp_path / "comparison.json").exists()
+
+
+@pytest.mark.parametrize("mode", ["sequential", "concurrent"])
+def test_nvidia_requires_prepared_bfcl_before_launching_either_arm(tmp_path, mode):
+    result, trace, report = run_score(tmp_path, mode, vendor="nvidia")
+    assert result.returncode != 0
+    assert "isolated NVIDIA BFCL client was not prepared" in result.stderr
+    assert not any(event.startswith(("launch:a:", "launch:b:", "python:")) for event in trace)
+    assert report is None
+    assert not (tmp_path / "owned-a").exists()
+    assert not (tmp_path / "owned-b").exists()
+
+
+@pytest.mark.parametrize("mode", ["sequential", "concurrent"])
+def test_nvidia_uses_the_explicit_client_executable_in_each_score_mode(tmp_path, mode):
+    client = str(tmp_path / "isolated client/bin/bfcl")
+    result, trace, report = run_score(tmp_path, mode, vendor="nvidia", bfcl_executable=client)
+    assert result.returncode == 0, result.stderr
+    assert report == {"complete": True}
+    assert "python:comparison" in trace
+    assert "launch:a:0" in trace
+    assert f"launch:b:{'0' if mode == 'sequential' else '1'}" in trace
+    assert not (tmp_path / "owned-a").exists()
+    assert not (tmp_path / "owned-b").exists()
