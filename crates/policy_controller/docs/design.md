@@ -358,18 +358,17 @@ The built-in stages:
 A program that embeds the crate can add stages of its own under new names
 (`StageRegistry::filter`, `scorer`, `picker`) and validate documents against that table.
 
-**[built]** Such a stage keeps building when the crate grows. The events a stage hears (`Signal`,
-`Membership`, `ReleaseReason`, `TransportClass`, `EventKind`) and the three answers it gives as an
-enum (`ScoreSpread`, `ScoreFront`, `DrawUnit`) are marked non-exhaustive: a `match` on one keeps
-an arm for the rest, and a case with named fields is matched with `..` and made by its call. The
-two records a caller builds are marked too: a stage writes its `Needs` as one chain from
-`Needs::NONE`, a call a flag, and a host makes an `Outcome` by `Outcome::reported`. So are the two
-records a stage answers with, each made by its call: `Shortlist` and `HeadRule`. The records a
-stage only reads (`RequestFacts`, `Candidate`, `Constraints`, `PoolFacts`, `LoadRow`,
-`AffinityFacts`, `Demands`, `DemandFacts`, `Target`, `Pair`, `Pick`, `Overlap`, `Lease`) carry no
-mark yet. Each gains fields, so code that builds one writes the rest as `..Default::default()` and
-never matches it whole. `Decision`, `ShedReason`, `Side`, `Phase`, `Role` and `Said` stay closed
-by design: a caller answers every case of them, and a new case must stop its build.
+**[built]** Such a stage keeps building when the crate grows. For each type below, the table says
+whether it is marked non-exhaustive and how code writes it:
+
+| What | Types | Marked | How code writes it |
+|---|---|---|---|
+| the events a stage hears | `Signal`, `Membership`, `ReleaseReason`, `TransportClass`, `EventKind` | yes | a `match` on one keeps an arm for the rest, and a case with named fields is matched with `..` and made by its call |
+| the answers a stage gives as an enum | `ScoreSpread`, `ScoreFront`, `DrawUnit` | yes | as the events are |
+| the records a caller builds | `Needs`, `Outcome` | yes | a stage writes its `Needs` as one chain from `Needs::NONE`, a call a flag. A host makes an `Outcome` by `Outcome::reported` |
+| the records a stage answers with | `Shortlist`, `HeadRule` | yes | each is made by its call |
+| the records a stage only reads | `RequestFacts`, `Candidate`, `Constraints`, `PoolFacts`, `LoadRow`, `AffinityFacts`, `Demands`, `DemandFacts`, `Target`, `Pair`, `Pick`, `Overlap`, `Lease` | not yet | each gains fields, so code that builds one writes the rest as `..Default::default()` and never matches it whole |
+| the enums closed by design | `Decision`, `ShedReason`, `Side`, `Phase`, `Role`, `Said` | no | a caller answers every case of them, and a new case must stop its build |
 
 ## 4. The data the engine reads
 
