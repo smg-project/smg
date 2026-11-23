@@ -1808,8 +1808,7 @@ impl TokenTree {
         let expected_tokens = self.tenant_token_size(tenant_id);
         self.root.tenant_last_access_time.remove(tenant_id.as_ref());
         if expected_tokens == 0 {
-            self.tenant_token_count
-                .remove_if(tenant_id.as_ref(), |_, count| *count == 0);
+            self.drop_count_at_zero(tenant_id);
             return;
         }
 
@@ -1830,6 +1829,12 @@ impl TokenTree {
             removed += self.remove_tenant_and_cleanup(node, tenant_id).0;
         }
         self.sub_tenant_tokens(tenant_id, removed);
+        self.drop_count_at_zero(tenant_id);
+    }
+
+    /// Drops a tenant's count entry where it reads zero, and only there: an
+    /// insert may have counted since the entry was last read.
+    fn drop_count_at_zero(&self, tenant_id: &TenantId) {
         self.tenant_token_count
             .remove_if(tenant_id.as_ref(), |_, count| *count == 0);
     }

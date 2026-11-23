@@ -1547,8 +1547,9 @@ impl Tree {
     /// debited by what each removal took out, as eviction debits, and is
     /// never dropped whole: a count dropped whole left a node attached or
     /// split off meanwhile standing uncounted. What can still drift is a
-    /// count with no node behind it, where an insert counts behind the
-    /// debit of the node it attached. Such a count stays with the tenant's
+    /// count with no node behind it: a node attached ahead of the walk
+    /// whose insert counts behind the debit, or a split between a removal
+    /// and the read of its length. Such a count stays with the tenant's
     /// entry.
     pub fn remove_tenant_all(&self, tenant_id: &TenantId) {
         let expected_chars = self.tenant_char_size(tenant_id);
@@ -1557,8 +1558,7 @@ impl Tree {
         // but global removal must include it.
         self.remove_tenant_from_node(&self.root, tenant_id);
         if expected_chars == 0 {
-            self.tenant_char_count
-                .remove_if(tenant_id, |_, count| *count == 0);
+            self.drop_count_at_zero(tenant_id);
             return;
         }
 
@@ -1586,6 +1586,12 @@ impl Tree {
             self.detach_empty_ancestors(node);
         }
         self.sub_tenant_chars(tenant_id, removed);
+        self.drop_count_at_zero(tenant_id);
+    }
+
+    /// Drops a tenant's count entry where it reads zero, and only there: an
+    /// insert may have counted since the entry was last read.
+    fn drop_count_at_zero(&self, tenant_id: &TenantId) {
         self.tenant_char_count
             .remove_if(tenant_id, |_, count| *count == 0);
     }
