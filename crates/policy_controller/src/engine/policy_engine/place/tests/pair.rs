@@ -689,7 +689,8 @@ fn a_pairs_call_makes_three_decisions_at_most() {
 /// A route's rule that panics passes its panic to the call's caller, and
 /// the decision it was asked under is given up by name as the panic
 /// passes: its lease is released once, and the engine is owed nothing. The
-/// same holds for a single request's whole decision.
+/// same holds for a single request's whole decision, and for a rule that
+/// panics where a pair's decision asks it.
 #[test]
 fn a_rule_that_panics_loses_no_lease() {
     let failing = |_: &dyn Worker| -> bool { panic!("the route's rule failed") };
@@ -726,6 +727,34 @@ fn a_rule_that_panics_loses_no_lease() {
     assert!(passed(&|| engine.place(&request).is_ok()));
     let first = worker_id(list[0].as_ref());
     assert_eq!(heard.lock().as_slice(), given_up(first));
+    assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+
+    // A pair whose sides read their record of sent prefixes asks the rule
+    // inside its decision. This rule panics at its first question alone:
+    // a panic swallowed there would leave the walk a rule that admits.
+    let mut document = PolicySpec::pair_presets("cache_aware", "cache_aware").expect("presets");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let engine = hosted(PolicyEngine::new(spec));
+    let lists = Lists::of(1, 1);
+    let classes = lists.every();
+    let tokens: Vec<u32> = (1_000..5_096).collect();
+    let asked = Cell::new(false);
+    let once = |_: &dyn Worker| -> bool {
+        if asked.replace(true) {
+            return true;
+        }
+        panic!("the route's rule failed")
+    };
+    let request = PlaceRequest {
+        prompt: Prompt {
+            tokens: Some(&tokens),
+            ..Prompt::NONE
+        },
+        admits: Some(&once),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
+    };
+    assert!(passed(&|| engine.place(&request).is_ok()));
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 

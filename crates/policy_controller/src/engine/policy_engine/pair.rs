@@ -927,6 +927,13 @@ fn issue_decode_caught(
 /// of either list is dialed on a wire the request does not state, the
 /// request is declined under the wires' name, ahead of every test the
 /// lists' own decision makes.
+///
+/// `sends_to` says whether the request's caller sends it to a target of
+/// the pick ([`RequestMaker::sends_to`]): each side's record of sent
+/// prefixes is written for the first target it takes. A decode decided
+/// again is handed `|_| true` and writes for its first target.
+///
+/// [`RequestMaker::sends_to`]: crate::engine::RequestMaker::sends_to
 #[inline]
 pub(super) fn decide(
     own: Loaded<'_, '_>,
@@ -954,7 +961,8 @@ pub(super) fn decide(
 /// With the view of the guard that holds the first it is the decode asked
 /// again behind the prefill that view names. The decision reads the
 /// reports in `loads`: the snapshot the request gives for this call, or
-/// the newest the engine's own task keeps at hand.
+/// the newest the engine's own task keeps at hand. `sends_to` is handed
+/// to [`decide`] as it stands.
 pub(super) fn decided(
     own: Loaded<'_, '_>,
     lists: &PairLists<'_>,
