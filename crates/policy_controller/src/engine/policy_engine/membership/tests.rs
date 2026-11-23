@@ -310,6 +310,10 @@ fn a_registration_and_a_removal_of_the_registry_are_told_to_the_stages() {
     remove(&registry, 0);
     drain(&engine, &mut follow);
     assert_eq!(told(&heard), [("joined", id(2)), ("left", id(0))]);
+    assert!(
+        !follow.unread,
+        "a word of a host that states no id owes no read"
+    );
 
     remove(&registry, 1);
     register(&registry, 1);
@@ -611,7 +615,7 @@ fn a_worker_replaced_inside_dropped_events_is_told_nothing_by_the_read() {
 
 /// A host that keeps ids by address answers of the worker that stands, so
 /// an id that stood only between two replacements heard together is told
-/// to no stage. A replacement that changes the id told owes a whole read
+/// to no stage. A replacement of a host that states ids owes a whole read
 /// at the next upkeep, with no lag: its snapshot names the ids that stand,
 /// and a stage drops what requests left under any other.
 #[test]
@@ -670,9 +674,9 @@ fn a_replacement_under_a_stated_id_that_stands_owes_a_whole_read() {
 /// A host that keeps ids by address can state another id of a worker and
 /// take every statement of it back ahead of the word: the word then names
 /// the fingerprint of the worker's address, and what requests left under
-/// the id between would stay. A replacement that changes the id told owes
-/// a whole read at the next upkeep, whatever its host states of the new
-/// object: its snapshot names the ids that stand.
+/// the id between would stay. The follow knows the host as one that
+/// states ids since the read at its start, so the replacement owes a
+/// whole read at the next upkeep: its snapshot names the ids that stand.
 #[test]
 fn a_replacement_that_changes_the_id_told_to_one_not_stated_owes_a_whole_read() {
     let registry = registry(1);
@@ -693,6 +697,45 @@ fn a_replacement_that_changes_the_id_told_to_one_not_stated_owes_a_whole_read() 
 
     engine.follow_registry(&mut members);
     assert_eq!(told_and_standing(&heard), (vec![], vec![id(0)]));
+}
+
+/// A host that keeps ids by address can state an id of a worker and take
+/// it back between the registry's write and the follow's ask, at a
+/// registration and at a removal as at a replacement: the word then names
+/// another id, and what requests left under the stated one would stay. So
+/// every word of membership of a host that states ids owes a whole read
+/// at the next upkeep: its snapshot names the ids that stand. A change of
+/// status is no such word, and owes none.
+#[test]
+fn a_registration_and_a_removal_under_a_host_that_states_ids_owe_a_whole_read() {
+    let registry = registry(1);
+    let host = Stating::over(&registry);
+    host.state(0, 7);
+    let (engine, heard, follow) = following(&host);
+    let mut members = Some(follow);
+    let _ = told(&heard);
+
+    // The host states nothing of the worker it registers, at the ask.
+    register(&registry, 1);
+    drain(&engine, members.as_mut().expect("the follow"));
+    assert_eq!(told_and_standing(&heard), (vec![("joined", id(1))], vec![]));
+    engine.follow_registry(&mut members);
+    let both = sorted(vec![WorkerId(7), id(1)]);
+    assert_eq!(told_and_standing(&heard), (vec![], both));
+
+    remove(&registry, 1);
+    drain(&engine, members.as_mut().expect("the follow"));
+    assert_eq!(told_and_standing(&heard), (vec![("left", id(1))], vec![]));
+    engine.follow_registry(&mut members);
+    assert_eq!(told_and_standing(&heard), (vec![], vec![WorkerId(7)]));
+
+    let moved = registry.transition_status(&object(&registry, 0), WorkerStatus::NotReady);
+    assert!(moved.is_some());
+    drain(&engine, members.as_mut().expect("the follow"));
+    assert!(
+        !members.as_ref().is_some_and(|follow| follow.unread),
+        "a change of status owes no read"
+    );
 }
 
 /// Two workers stand under one stated id, and the host gives one of them
