@@ -139,13 +139,18 @@ fn register_worker(
             let worker_id = WorkerId::from_string(worker_id.clone());
             let address = worker.redacted_url().to_string();
             // Fails when the ID is gone or the worker moved on, which covers
-            // the concurrent DELETE, DELETE + POST, and second-PUT cases.
-            if registry.replace_claiming_local(&worker_id, worker, *expected_revision) {
+            // the concurrent DELETE, DELETE + POST, and second-PUT cases, and
+            // when a removal is draining the worker.
+            if registry.replace_claiming_local_unless_draining(
+                &worker_id,
+                worker,
+                *expected_revision,
+            ) {
                 Ok(worker_id)
             } else {
                 Err(step_failed(format!(
-                    "Worker {} at {address} is no longer at revision {expected_revision}, \
-                     so the replacement was dropped",
+                    "Worker {} at {address} is no longer at revision {expected_revision} or \
+                     is being removed, so the replacement was dropped",
                     worker_id.as_str()
                 )))
             }
