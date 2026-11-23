@@ -723,14 +723,28 @@ fn the_print_option_answers_with_the_document_a_command_line_means() {
     );
 }
 
+/// Whether `sentence` is one line that begins with `head` and says more.
+fn is_one_sentence_headed(sentence: &str, head: &str) -> bool {
+    sentence
+        .strip_prefix(head)
+        .is_some_and(|words| !words.is_empty() && !words.contains('\n'))
+}
+
 #[test]
 fn the_print_option_says_a_refusal_in_one_sentence() {
-    // A setting no document says: no document, and the setting by its name.
-    let sticky = "routing_key_override.enabled = true: the sticky sessions' rule has no recorded \
-                  answers under this policy yet";
-    assert_eq!(
-        printed(&["smg", "--routing-key-override", "--print-policy-spec"]),
-        PolicySpecPrint::Refused(sticky.to_string())
+    // A setting no document says: no document, and one sentence with the
+    // setting by its name at the head. The words behind the head are the
+    // policy crate's, and no case of the gateway holds them.
+    let sticky = printed(&["smg", "--routing-key-override", "--print-policy-spec"]);
+    assert_eq!(sticky.document(), None);
+    assert!(
+        sticky
+            .refusal()
+            .is_some_and(|sentence| is_one_sentence_headed(
+                sentence,
+                "routing_key_override.enabled = true: "
+            )),
+        "{sticky:?}"
     );
 
     // A line the binary itself refuses: the configuration's own sentence.
@@ -750,12 +764,14 @@ fn the_print_option_says_a_refusal_in_one_sentence() {
         read_back(&decayed),
         PolicySpec::preset("cache_aware").expect("a preset")
     );
-    assert_eq!(
-        decayed.refusal(),
-        Some(
-            "profiles.cache_aware.score[1].prefix-affinity: the prefix-affinity decay is not in \
-             this build"
-        )
+    assert!(
+        decayed
+            .refusal()
+            .is_some_and(|sentence| is_one_sentence_headed(
+                sentence,
+                "profiles.cache_aware.score[1].prefix-affinity: "
+            )),
+        "{decayed:?}"
     );
 }
 
