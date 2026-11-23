@@ -219,6 +219,21 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
             }
         }
 
+        // Under the policy engine a `policy` label names no policy. Each
+        // registration that carries one says so, behind the step's last
+        // wait, so a step tried again writes no second line. The label's
+        // value is free text and is not written.
+        if policy_hint.is_some() && !app_context.policy_registry.keeps_classic_policies() {
+            for model_id in &updated_models {
+                let long = model_id.chars().nth(64).is_some();
+                let cut = if long { "..." } else { "" };
+                warn!(
+                    "Worker label policy of model {model_id:.64}{cut} names no policy: the \
+                     policy document in force places the model"
+                );
+            }
+        }
+
         // Initialize PD policies for prefill/decode workers (local workers only)
         let prefill_workers = app_context.worker_registry.get_prefill_workers();
         let decode_workers = app_context.worker_registry.get_decode_workers();
@@ -359,7 +374,10 @@ mod tests {
     /// worker of any role, whatever policy its label names, and gives the
     /// worker no completion sink. Under the classic policies the same
     /// workers make the labelled model's policy beside the default, and
-    /// each is given the registry's sink.
+    /// each is given the registry's sink. The engine's step names the
+    /// label at each registration that carries it, whichever worker heads
+    /// the model's list, and the classic step, which follows it, at none.
+    #[traced_test]
     #[tokio::test]
     async fn under_the_policy_engine_a_worker_of_any_role_gets_no_classic_policy() {
         let roles = [
@@ -380,7 +398,7 @@ mod tests {
             ));
             context.policy_registry = Arc::new(PolicyRegistry::of_config(&config));
             let app_context = Arc::new(context);
-            for (url, role) in roles {
+            for (nth, (url, role)) in roles.into_iter().enumerate() {
                 let worker = grpc_worker_at(url, role);
                 register(
                     &app_context,
@@ -389,6 +407,21 @@ mod tests {
                 )
                 .await;
                 assert_eq!(worker.completion_sink().is_some(), !policy_controller);
+                // Each of the engine's registrations writes the line once,
+                // and the classic ones behind them add none.
+                let written = if policy_controller {
+                    nth + 1
+                } else {
+                    roles.len()
+                };
+                let wanted = format!("Worker label policy of model {MODEL} names no policy");
+                logs_assert(|lines: &[&str]| {
+                    let named = lines.iter().filter(|line| line.contains(&wanted));
+                    match named.filter(|line| line.contains("WARN")).count() {
+                        count if count == written => Ok(()),
+                        count => Err(format!("the lines that name the label: {count}")),
+                    }
+                });
             }
             assert_eq!(app_context.policy_registry.classic_made_or_asked(), made);
         }
