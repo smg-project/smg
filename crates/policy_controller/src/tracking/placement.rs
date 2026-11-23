@@ -313,6 +313,14 @@ impl Placement<'_> {
     /// decode this call took, the prefill's end is said when the prefill
     /// answers and the decode's send at its own later instant.
     ///
+    /// **A panic.** A route's own rule ([`PlaceRequest::admits`]) that
+    /// panics as it is asked of a decode passes its panic to this call's
+    /// caller. The decode side the call issued is given up by name first,
+    /// and the placement stands as it stood before the call. A stage that
+    /// panics inside the decode's decision reaches no caller: the engine
+    /// holds the panic, counts it and refuses the call
+    /// ([`DecisionRefused::Faulted`]), and nothing was issued.
+    ///
     /// # Errors
     ///
     /// Why no decode was taken. The placement stands as it stood before
