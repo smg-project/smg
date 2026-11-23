@@ -1453,7 +1453,7 @@ Its data is one in-memory store (`store/memory.rs`):
 | health | the worker crate's health checker over the worker objects, on the leader | copied into the records |
 | loads | the crate's own poller, every 10 seconds | `PushLoad` is not served; a single request's decision reads none yet |
 | cache index | a follower of each worker's cache events | an index of the store's own; `PushKvEvents` is not served; a single request's decision reads none yet, only the engine's own record of sent prompts |
-| sessions, leases | decisions (leases only) | not replicated to a standby; a single request's session pins are the engine's own table, one for each document, and no decision reads the store's pins |
+| sessions, leases | decisions (leases only) | not replicated to a standby; a single request's session pins are the engine's own table, one for each document |
 
 The gRPC service (`crates/policy_controller/contracts/policy_controller.proto`):
 

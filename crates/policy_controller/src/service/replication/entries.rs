@@ -23,7 +23,7 @@ const HELLO: &str = "a gateway's own fact: it returns in the gateway's hello";
 const SUBSCRIPTION: &str = "each replica hears the engines' cache events itself";
 const DISPATCHED: &str = "a new leader reads dispatched leases from the engines' in-flight \
                           snapshots and rebuilds credits from its own tally";
-const PINS: &str = "pins, reservations and lease ends are journaled once pins have one table";
+const LEASES: &str = "no journal entry carries a reservation, an issue or a lease's end yet";
 const PUBLISHED: &str = "every replica publishes its own world";
 const REPORTED: &str = "each engine's next load report states its values again";
 
@@ -146,39 +146,43 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     (
         "ReservationStore",
         "try_reserve",
-        EntryReplication::NotYet(PINS),
+        EntryReplication::NotYet(LEASES),
     ),
     (
         "ReservationStore",
         "release",
-        EntryReplication::NotYet(PINS),
+        EntryReplication::NotYet(LEASES),
     ),
     ("ReservationStore", "held", EntryReplication::Read),
     ("LeasesStore", "term", EntryReplication::Read),
     // The term is told to the journal: every later position is under it.
     ("LeasesStore", "set_term", EntryReplication::Journaled),
-    ("LeasesStore", "issue", EntryReplication::NotYet(PINS)),
-    ("LeasesStore", "issue_pair", EntryReplication::NotYet(PINS)),
+    ("LeasesStore", "issue", EntryReplication::NotYet(LEASES)),
+    (
+        "LeasesStore",
+        "issue_pair",
+        EntryReplication::NotYet(LEASES),
+    ),
     (
         "LeasesStore",
         "issue_decode",
-        EntryReplication::NotYet(PINS),
+        EntryReplication::NotYet(LEASES),
     ),
     (
         "LeasesStore",
         "dispatched",
         EntryReplication::Rebuilt(DISPATCHED),
     ),
-    ("LeasesStore", "completed", EntryReplication::NotYet(PINS)),
-    ("LeasesStore", "released", EntryReplication::NotYet(PINS)),
+    ("LeasesStore", "completed", EntryReplication::NotYet(LEASES)),
+    ("LeasesStore", "released", EntryReplication::NotYet(LEASES)),
     ("LeasesStore", "get", EntryReplication::Read),
     ("LeasesStore", "sides", EntryReplication::Read),
-    ("LeasesStore", "expire", EntryReplication::NotYet(PINS)),
+    ("LeasesStore", "expire", EntryReplication::NotYet(LEASES)),
     ("LeasesStore", "restore", EntryReplication::Rebuilt(HELLO)),
     (
         "LeasesStore",
         "drop_gateways",
-        EntryReplication::NotYet(PINS),
+        EntryReplication::NotYet(LEASES),
     ),
     ("LeasesStore", "live", EntryReplication::Read),
     // The store type's own entries. A generation's apply is its one write.

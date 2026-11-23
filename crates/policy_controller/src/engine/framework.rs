@@ -1063,9 +1063,6 @@ pub struct Scratch {
     /// The encode side of an encode-pair decision, boxed: the entry moves
     /// one pointer out of the scratch while the pair entry holds the rest.
     encode: Option<Box<encode::EncodeScratch>>,
-    /// The TTL of the sessions rule that governed the last decision made
-    /// with this scratch ([`Scratch::session_ttl_micros`]).
-    session_ttl_micros: Option<u64>,
     /// What the last decision made through the keeping entry read of its
     /// session key, kept for the request's shadow ([`SessionsFound`]).
     sessions_found: SessionsFound,
@@ -1192,15 +1189,6 @@ impl Buffers {
 }
 
 impl Scratch {
-    /// The TTL of the sessions rule that governed the last decision made
-    /// with this scratch, in microseconds: `None` under a rule with none.
-    /// A host reads it beside a pick whose verdict says a rule governed
-    /// it, for the record of the lease it commits: a decision no rule
-    /// governed leaves it as it stood.
-    pub fn session_ttl_micros(&self) -> Option<u64> {
-        self.session_ttl_micros
-    }
-
     pub fn new() -> Self {
         Self::default()
     }
@@ -4833,23 +4821,6 @@ impl Engine {
         self.sessions.absence_micros()
     }
 
-    /// This generation's sessions rules.
-    fn session_rules(&self) -> impl Iterator<Item = &SessionRule> {
-        self.bindings
-            .iter()
-            .filter_map(|entry| entry.binding.sessions.as_ref())
-    }
-
-    /// How often a host sweeps the pins it keeps of this generation's
-    /// sessions rules: the shortest interval one of them sweeps at, in
-    /// microseconds. `None` where no rule sweeps.
-    pub fn pins_shortest_sweep(&self) -> Option<u64> {
-        self.session_rules()
-            .map(|rule| rule.sweep_micros)
-            .filter(|every| *every > 0)
-            .min()
-    }
-
     /// What the host must feed before any request exists: every profile's
     /// stages and the view's own list of headers.
     pub fn needs(&self) -> Needs {
@@ -6074,8 +6045,6 @@ impl Engine {
         scratch: &mut Scratch,
     ) -> Decision {
         let candidates = set.candidates;
-        // The rule's TTL, for the record of the lease the host commits.
-        scratch.session_ttl_micros = rule.ttl_micros;
         let buf = &mut scratch.single;
         // Whether the veto as it stands left the pool nobody: the form of a
         // kept key reads it, for the mark of its lifted placement.
@@ -15275,51 +15244,6 @@ mod tests {
         )
     }
 
-    #[test]
-    fn a_host_reads_the_rules_shortest_sweep() {
-        let rule = |ttl_micros, sweep_micros| SessionRule {
-            assignment: Assignment::Random,
-            inflight_cap: 0,
-            ttl_micros,
-            sweep_micros,
-            recovery: Recovery::Original,
-            rule_placed: RulePlaced::Told,
-        };
-        let bound = |model: &str, sessions| Binding {
-            model: model.into(),
-            phases: vec![],
-            plan: Plan::Single,
-            profile: 0,
-            decode_profile: None,
-            shadow: None,
-            decode_shadow: None,
-            sessions,
-            overload: None,
-        };
-        let two = |first, second| {
-            Engine::new(
-                vec![manual_profile()],
-                vec![bound("a", Some(first)), bound("*", Some(second))],
-                1,
-                Needs::default(),
-            )
-        };
-        let read = |engine: &Engine| engine.pins_shortest_sweep();
-        assert_eq!(read(&manual_engine(None)), None, "no rule");
-        let one = manual_engine(Some(rule(Some(1_000), 100)));
-        assert_eq!(read(&one), Some(100));
-        let both = two(rule(Some(1_000), 100), rule(Some(5_000), 40));
-        assert_eq!(read(&both), Some(40));
-        // A rule that keeps its keys with no TTL sweeps nothing: the other
-        // rule's interval stands, wherever the rule sits among the bindings.
-        let mixed = two(rule(Some(1_000), 100), rule(None, 0));
-        assert_eq!(read(&mixed), Some(100));
-        let mixed = two(rule(None, 0), rule(Some(1_000), 100));
-        assert_eq!(read(&mixed), Some(100));
-        let for_ever = manual_engine(Some(rule(None, 0)));
-        assert_eq!(read(&for_ever), None);
-    }
-
     /// One decision for `key` (`0`: no key) drawn by `seed`: the worker and
     /// what the decision did with the key.
     fn decide_seeded(
@@ -15509,45 +15433,6 @@ mod tests {
         let pick = decision.pick().expect("the respill places");
         assert_eq!(pick.session_verdict, SessionVerdict::Respill);
         assert_eq!(pick.targets.first().map(|t| t.position), Some(2));
-    }
-
-    /// A decision under a sessions rule leaves the rule's TTL on its
-    /// scratch, for the record of the lease its host commits: a claim, a
-    /// pin taken and a respill alike. A rule with no TTL leaves none.
-    #[test]
-    fn a_keyed_decision_leaves_its_rules_ttl_on_the_scratch() {
-        let rule = SessionRule {
-            ttl_micros: Some(60_000_000),
-            sweep_micros: 30_000_000,
-            ..SESSIONS
-        };
-        let engine = manual_engine(Some(rule));
-        let mut pool = vec![candidate(0, 5), candidate(1, 0), candidate(2, 3)];
-        let mut scratch = Scratch::new();
-        let mut said = |engine: &Engine, pool: &[Candidate], key, now| {
-            let facts = RequestFacts {
-                model: "m",
-                session_key: Identity::hashed(key),
-                now_micros: now,
-                ..RequestFacts::default()
-            };
-            let pool_facts = PoolFacts::default();
-            let none = Constraints::default();
-            let decision = engine.decide(&facts, &pool_facts, pool, &none, &mut scratch);
-            let verdict = decision.pick().expect("a pick").session_verdict;
-            (verdict, scratch.session_ttl_micros())
-        };
-        let claimed = SessionVerdict::Claimed(pool[1].id);
-        assert_eq!(said(&engine, &pool, 8, 5), (claimed, rule.ttl_micros));
-        assert_eq!(place_keyed(&engine, &pool, 7, 10).position, 1);
-        let pinned = (SessionVerdict::Pinned, rule.ttl_micros);
-        assert_eq!(said(&engine, &pool, 7, 20), pinned);
-        pool[1].session_in_flight = rule.inflight_cap;
-        pool[1].in_flight = 9;
-        let respill = (SessionVerdict::Respill, rule.ttl_micros);
-        assert_eq!(said(&engine, &pool, 7, 30), respill);
-        let for_ever = manual_engine(Some(SESSIONS));
-        assert_eq!(said(&for_ever, &pool, 9, 40).1, None);
     }
 
     /// On a side of a pair no sessions rule runs, so nothing places a
