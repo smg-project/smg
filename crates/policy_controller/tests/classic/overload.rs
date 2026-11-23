@@ -6,8 +6,8 @@
 //! whether the gateway read the worker as overloaded after each step.
 //!
 //! The replay hands each step to the worker crate's own load monitor, built
-//! as a host of the engine over worker lists builds it ([`load_monitor`]
-//! over the host's holder of worker objects), and reads the verdict off the
+//! as a host of the engine over worker lists builds it (the bed of the load
+//! sheets, [`Bed`]), and reads the verdict off the
 //! worker's object, where a decision reads it. A poll's answer goes through
 //! the monitor's one poll of a group, a pushed record through the record's
 //! own entry, and a worker's loads are dropped by the monitor's own loop
@@ -20,63 +20,22 @@
 //! each object by its own rank's figures, and [`APART`] names each row that
 //! answers apart from the gateway, with the verdict on each rank's object.
 
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, Instant},
+use std::time::Instant;
+
+use serde::Deserialize;
+use smg_policy_controller::store::Overload;
+use smg_worker::{
+    common_proto::EngineLoad,
+    health::overload::OverloadThresholds,
+    identity::{basic::Worker, builder::BasicWorkerBuilder},
+    worker::{SchedulerLoadSnapshot, WorkerLoadResponse},
 };
 
-use async_trait::async_trait;
-use parking_lot::Mutex;
-use serde::Deserialize;
-use smg_policy_controller::{
-    engine::WireModes,
-    store::{MemoryStore, Overload, WorkerFacts, WorkerStatus, WorkersStore},
-    worker_host::{load_monitor, Members, Objects},
-};
-use smg_worker::{
-    common_proto::{EngineLoad, KvEventBatch},
-    connection::engine::{AdminAnswer, EngineConnection, EngineConnector, HealthAnswer, ZmqLink},
-    health::overload::OverloadThresholds,
-    identity::{
-        basic::Worker,
-        builder::{rank_url, BasicWorkerBuilder},
-    },
-    load::monitor::poll_group_once_for_test,
-    registry::WorkerRegistry,
-    worker::{
-        ConnectionMode, ProfileOptions, RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey,
-        WorkerLoadResponse, WorkerType,
-    },
-};
+use super::load_bed::{paused, Bed, Laid, ENGINE, STEP};
 
 /// What these rows record, as a sheet's head names it: the gateway's
 /// overload verdict of one worker.
 pub const POLICY: &str = "overload";
-
-const MODEL: &str = "m";
-
-/// The worker's engine: the address of a worker of one rank, and what the
-/// objects of a worker's ranks dial.
-const ENGINE: &str = "grpc://w0:9000";
-
-/// The time between two steps of a row, as the recorder sets it.
-const STEP: Duration = Duration::from_secs(1);
-
-/// The poll interval a step's poll states: shorter than a step, so a rank
-/// that pushed a step ago is asked again, as the recorder asks it.
-const INTERVAL: Duration = Duration::from_millis(1);
-
-/// The monitor's own poll interval: a day, so every poll of a row is a
-/// step's.
-const IDLE: Duration = Duration::from_secs(86_400);
-
-/// Lets the monitor's tasks run until each waits again.
-async fn settle() {
-    for _ in 0..32 {
-        tokio::task::yield_now().await;
-    }
-}
 
 /// A pair of thresholds as the gateway holds them: the queued requests
 /// summed over a worker's ranks and the mean KV usage over them, each at or
@@ -138,108 +97,6 @@ struct Sheet {
     rows: Vec<Row>,
 }
 
-/// How a row's worker stands among the host's objects.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Laid {
-    /// One object under the engine's own address, which states the width
-    /// and no rank: the engine whole.
-    Whole,
-    /// One object for each rank, as a registration of several ranks lays
-    /// them.
-    Ranks,
-}
-
-/// The engine a row's objects dial: it answers a load poll with the answer
-/// the step scripted, or with a failure where the step scripted none.
-#[derive(Debug, Default)]
-struct Engine {
-    answer: Mutex<Option<WorkerLoadResponse>>,
-}
-
-fn not_scripted<T>() -> Result<T, tonic::Status> {
-    Err(tonic::Status::unimplemented(
-        "the replay scripts no such call",
-    ))
-}
-
-#[async_trait]
-impl EngineConnection for Engine {
-    fn carries_admin_calls(&self) -> bool {
-        false
-    }
-
-    fn is_alive(&self) -> bool {
-        true
-    }
-
-    async fn health_answer(&self) -> Result<HealthAnswer, tonic::Status> {
-        not_scripted()
-    }
-
-    async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
-        match self.answer.lock().clone() {
-            Some(answer) => Ok(answer),
-            None => Err(tonic::Status::unavailable("the step scripts no report")),
-        }
-    }
-
-    async fn flush_cache(&self, _timeout_s: f32) -> Result<AdminAnswer, tonic::Status> {
-        not_scripted()
-    }
-
-    async fn start_profile(&self, _options: &ProfileOptions) -> Result<AdminAnswer, tonic::Status> {
-        not_scripted()
-    }
-
-    async fn stop_profile(&self) -> Result<AdminAnswer, tonic::Status> {
-        not_scripted()
-    }
-
-    async fn model_labels(&self) -> Result<HashMap<String, String>, tonic::Status> {
-        not_scripted()
-    }
-
-    async fn server_labels(&self) -> Result<HashMap<String, String>, tonic::Status> {
-        not_scripted()
-    }
-
-    async fn subscribe_kv_events(
-        &self,
-        _start_seq: u64,
-    ) -> Result<tonic::Streaming<KvEventBatch>, tonic::Status> {
-        not_scripted()
-    }
-
-    async fn subscribe_load_records(
-        &self,
-    ) -> Result<tonic::Streaming<KvEventBatch>, tonic::Status> {
-        not_scripted()
-    }
-}
-
-/// A connector whose every gRPC connect is answered by the one engine.
-#[derive(Debug)]
-struct Dials(Arc<Engine>);
-
-#[async_trait]
-impl EngineConnector for Dials {
-    async fn connect_grpc(
-        &self,
-        _base_url: &str,
-        _runtime: RuntimeType,
-    ) -> Result<Arc<dyn EngineConnection>, String> {
-        Ok(self.0.clone())
-    }
-
-    async fn connect_zmq(&self, _link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
-        Err("the replay scripts no such connect".to_owned())
-    }
-
-    async fn dial_grpc(&self, _base_url: &str, _timeout: Duration) -> Result<(), String> {
-        Ok(())
-    }
-}
-
 /// A poll's answer as an engine sends it: one entry for each rank it names.
 fn answer(ranks: u16, figures: &[Option<Figures>]) -> WorkerLoadResponse {
     WorkerLoadResponse {
@@ -286,145 +143,32 @@ fn own(thresholds: Thresholds) -> Result<Overload, String> {
     })
 }
 
-/// One worker among a host's objects, its engine and the host's load
-/// monitor over them.
-struct Bed {
-    store: MemoryStore,
-    objects: Arc<Objects<Members>>,
-    engine: Arc<Engine>,
-    /// The worker's objects: one, or one a rank in rank order.
-    workers: Vec<Arc<dyn Worker>>,
-    ranks: u16,
-    laid: Laid,
-}
-
-impl Bed {
-    fn new(row: &Row, laid: Laid) -> Result<Self, String> {
-        let engine = Arc::new(Engine::default());
-        let dials: Arc<dyn EngineConnector> = Arc::new(Dials(Arc::clone(&engine)));
-        // The holder as a controller builds its own, with the gateway's
-        // thresholds where a controller states its program's defaults: a
-        // row's own values reach its object under any defaults, none too.
-        let objects = Arc::new(
-            Objects::new(Arc::new(WorkerRegistry::new()))
-                .with_connector(dials)
-                .with_host_local_unchecked()
-                .with_status_followed()
-                .with_overload_thresholds(OverloadThresholds {
-                    waiting_requests: row.gateway.waiting_requests.map(|waiting| waiting as usize),
-                    token_usage: row.gateway.token_usage,
-                }),
-        );
-        let store = MemoryStore::with_publish_window(Duration::ZERO);
-        let overload = own(row.worker)?;
-        let facts = |key: String, dp_rank: u16| WorkerFacts {
-            key,
-            engine: ENGINE.to_string(),
-            incarnation: 1,
-            models: vec![MODEL.to_string()],
-            dp_rank,
-            dp_size: row.ranks,
-            wire_modes: WireModes::GRPC,
-            overload,
-            ..WorkerFacts::default()
-        };
-        let keys: Vec<String> = match laid {
-            Laid::Ranks if row.ranks > 1 => (0..row.ranks)
-                .map(|rank| rank_url(ENGINE, usize::from(rank)))
-                .collect(),
-            _ => vec![ENGINE.to_string()],
-        };
-        let mut workers = Vec::with_capacity(keys.len());
-        for (rank, key) in keys.iter().enumerate() {
-            let id = store.upsert(facts(key.clone(), rank as u16)).id();
-            let stored = WorkersStore::get(&store, id).ok_or("no row behind its write")?;
-            store.set_status(id, WorkerStatus::Ready, stored.revision);
-        }
-        store.publish_now();
-        objects.follow(&store);
-        for key in &keys {
-            let object = objects.registry().get_by_url(key);
-            workers.push(object.ok_or_else(|| format!("no object under {key}"))?);
-        }
-        Ok(Self {
-            store,
-            objects,
-            engine,
-            workers,
-            ranks: row.ranks,
-            laid,
-        })
-    }
-
-    /// Writes `status` on each row of the worker and has the holder read
-    /// the change.
-    fn status(&self, status: WorkerStatus) -> Result<(), String> {
-        for worker in &self.workers {
-            let row = self
-                .store
-                .by_key(worker.url())
-                .ok_or("a worker object with no row")?;
-            self.store.set_status(row.id, status, row.revision);
-        }
-        self.store.publish_now();
-        self.objects.follow(&self.store);
-        Ok(())
-    }
-
-    /// The object a rank's pushed record lands on.
-    fn pusher(&self, rank: u16) -> Option<&Arc<dyn Worker>> {
-        match self.laid {
-            Laid::Ranks if self.ranks > 1 => self.workers.get(usize::from(rank)),
-            _ => self.workers.first(),
-        }
-    }
-
-    /// Whether each object of the worker reads as overloaded, in the
-    /// objects' order.
-    fn verdicts(&self) -> Vec<bool> {
-        self.workers
-            .iter()
-            .map(|worker| worker.is_overloaded())
-            .collect()
-    }
+/// The row's worker among a host's objects, laid as `laid`: the holder
+/// states the gateway's thresholds for every worker, and each of the
+/// worker's rows states the worker's own. `Err` where the row states what a
+/// worker's row cannot.
+fn bed(row: &Row, laid: Laid) -> Result<Bed, String> {
+    let gateway = OverloadThresholds {
+        waiting_requests: row.gateway.waiting_requests.map(|waiting| waiting as usize),
+        token_usage: row.gateway.token_usage,
+    };
+    Bed::new(row.ranks, laid, gateway, own(row.worker)?)
 }
 
 /// What the host's load monitor says of the row's worker after each step:
 /// the verdict on each of the worker's objects. `Err` where the row states
 /// what a worker's row cannot.
 fn replay(row: &Row, laid: Laid) -> Result<Vec<Vec<bool>>, String> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
-        .map_err(|err| err.to_string())?;
-    runtime.block_on(async {
-        let bed = Bed::new(row, laid)?;
-        let monitor = load_monitor(&bed.objects, IDLE);
-        // The monitor's own loop hears a worker leave the ready set. A
-        // group's loop polls once as it starts, ahead of the row's first
-        // step: the engine scripts no answer yet, so that poll brings no
-        // report to a monitor that holds none.
-        monitor.start_event_loop();
-        settle().await;
-        let group = WorkerGroupKey {
-            model_id: MODEL.to_string(),
-            worker_type: WorkerType::Regular,
-            connection_mode: ConnectionMode::Grpc,
-        };
+    paused(async {
+        let bed = bed(row, laid)?;
+        bed.start().await;
         let start = Instant::now();
         let mut verdicts = Vec::with_capacity(row.steps.len());
         for (at, step) in row.steps.iter().enumerate() {
             let now = start + STEP * (at as u32 + 1);
             match step {
-                Step::Poll(figures) => {
-                    *bed.engine.answer.lock() = Some(answer(row.ranks, figures));
-                    poll_group_once_for_test(&monitor, &group, INTERVAL, now).await;
-                }
-                Step::NoReport => {
-                    *bed.engine.answer.lock() = None;
-                    poll_group_once_for_test(&monitor, &group, INTERVAL, now).await;
-                }
+                Step::Poll(figures) => bed.poll(Some(answer(row.ranks, figures)), now).await,
+                Step::NoReport => bed.poll(None, now).await,
                 Step::Record { rank, figures } => {
                     let pusher = bed.pusher(*rank).ok_or("a record of no rank's object")?;
                     let record = EngineLoad {
@@ -433,19 +177,10 @@ fn replay(row: &Row, laid: Laid) -> Result<Vec<Vec<bool>>, String> {
                         active_token_usage: figures.active,
                         ..EngineLoad::default()
                     };
-                    monitor.apply_pushed_load(pusher, i32::from(*rank), &record, now);
+                    bed.monitor()
+                        .apply_pushed_load(pusher, i32::from(*rank), &record, now);
                 }
-                Step::Evict => {
-                    // The worker's rows leave the ready set, the holder
-                    // moves each object's status, and the monitor's loop
-                    // drops the worker's loads at that word.
-                    bed.status(WorkerStatus::NotReady)?;
-                    settle().await;
-                    // The recorder's worker is polled again behind the
-                    // drop: its rows are ready again.
-                    bed.status(WorkerStatus::Ready)?;
-                    settle().await;
-                }
+                Step::Evict => bed.evict().await?,
             }
             verdicts.push(bed.verdicts());
         }
@@ -732,18 +467,25 @@ fn a_row_no_entry_names_is_held_to_what_was_recorded_on_every_rank() {
 /// The sheet by the layouts that answer it: every row as recorded where the
 /// worker is one object, and of its fourteen rows of several ranks eleven
 /// apart where each rank is an object.
+/// The other three answer as recorded on every rank's object.
 #[test]
 fn the_sheet_replays_whole_and_eleven_of_its_rank_rows_stand_apart() {
     let sheet: Sheet =
         serde_json::from_str(include_str!("sheets/overload.json")).expect("the sheet");
     assert_eq!(sheet.rows.len(), 25);
     let mut several = 0;
+    let mut as_recorded = 0;
     for row in &sheet.rows {
         let whole = replay(row, Laid::Whole).expect("the worker as one object");
         assert_eq!(held_whole(row, &whole), None, "{}", row.name);
-        several += usize::from(row.ranks > 1);
+        if row.ranks > 1 {
+            several += 1;
+            let ranks = replay(row, Laid::Ranks).expect("an object a rank");
+            assert_eq!(held_ranks(row, &ranks), None, "{}", row.name);
+            as_recorded += usize::from(APART.iter().all(|apart| apart.row != row.name));
+        }
     }
-    assert_eq!((several, APART.len()), (14, 11));
+    assert_eq!((several, APART.len(), as_recorded), (14, 11, 3));
     for apart in APART {
         let named = sheet.rows.iter().any(|row| row.name == apart.row);
         assert!(named, "{} is on no sheet", apart.row);
@@ -760,9 +502,9 @@ fn a_rank_object_states_what_a_rank_worker_of_the_builder_states() {
     let sheet: Sheet = serde_json::from_str(INLINE).expect("the inline rows");
     let row = sheet.rows.first().expect("an inline row");
     let width = usize::from(row.ranks);
-    let bed = Bed::new(row, Laid::Ranks).expect("the rank objects");
-    assert_eq!(bed.workers.len(), width);
-    for (rank, object) in bed.workers.iter().enumerate() {
+    let ranks = bed(row, Laid::Ranks).expect("the rank objects");
+    assert_eq!(ranks.workers().len(), width);
+    for (rank, object) in ranks.workers().iter().enumerate() {
         let built = <BasicWorkerBuilder>::new(ENGINE)
             .dp_config(rank, width)
             .build();
@@ -772,9 +514,9 @@ fn a_rank_object_states_what_a_rank_worker_of_the_builder_states() {
         assert_eq!(object.dp_size(), built.dp_size());
         assert_eq!(object.is_dp_aware(), built.is_dp_aware());
     }
-    let whole = Bed::new(row, Laid::Whole).expect("the one object");
-    let [object] = whole.workers.as_slice() else {
-        panic!("{} objects of a worker laid whole", whole.workers.len());
+    let whole = bed(row, Laid::Whole).expect("the one object");
+    let [object] = whole.workers() else {
+        panic!("{} objects of a worker laid whole", whole.workers().len());
     };
     assert_eq!(
         (object.url(), object.dp_rank(), object.dp_size()),
@@ -796,6 +538,34 @@ fn a_usage_of_no_whole_permille_is_refused() {
     );
     assert_eq!(own(both(None)).map(|own| own.kv_usage_permille), Ok(None));
     assert!(own(both(Some(0.5005))).is_err());
+}
+
+/// A pushed record of a rank the worker has no object for is refused where
+/// each rank is an object: the replay hands it to no other rank's object.
+#[test]
+fn a_record_of_a_rank_the_worker_lacks_is_refused_on_an_object_a_rank() {
+    let mut sheet: serde_json::Value = serde_json::from_str(INLINE).expect("the inline rows");
+    let pushes = |row: &serde_json::Value| {
+        let steps = row["steps"].as_array();
+        steps.is_some_and(|steps| steps.iter().any(|step| step.get("record").is_some()))
+    };
+    let rows = sheet["rows"].as_array_mut().expect("the rows");
+    let row = rows
+        .iter_mut()
+        .find(|row| pushes(row))
+        .expect("a row that pushes");
+    let width = row["ranks"].clone();
+    for step in row["steps"].as_array_mut().expect("its steps") {
+        if let Some(record) = step.get_mut("record") {
+            record["rank"] = width.clone();
+        }
+    }
+    let row: Row = serde_json::from_value(row.take()).expect("a row");
+    assert_eq!(
+        replay(&row, Laid::Ranks),
+        Err("a record of no rank's object".to_string())
+    );
+    assert!(replay(&row, Laid::Whole).is_ok());
 }
 
 /// The rows a worker of one object a rank answers apart, copied whole from
