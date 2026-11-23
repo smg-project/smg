@@ -1,9 +1,10 @@
 //! The plugin's breaker: traps, invalid answers and the budget hits a plugin
 //! ran out of under its own bounds count as failures within a window; a
-//! moving p50 past half the decision's budget or a p99 past it (one sample
-//! per decision: the plugin's own charge in it, its constructor and stage
-//! calls whatever ended them and a lazy `init` the decision paid, over the
-//! decision's budget) counts as slowness; either opens the breaker for a
+//! moving p50 past half of the frames the plugin was given in a decision, at
+//! most the decision's budget, or a p99 past them (one sample per decision:
+//! the plugin's own charge in it, its constructor and stage calls whatever
+//! ended them and a lazy `init` the decision paid, over those frames:
+//! [`Latency::frame`]) counts as slowness; either opens the breaker for a
 //! cool-down, during which every stage of the plugin takes its fallback
 //! without a call. A report stamped during the cool-down, by a call admitted
 //! before the open, is dropped whenever it arrives: one incident is one
@@ -137,10 +138,11 @@ impl Breaker {
 
 /// The last [`Latency::SAMPLES`] decisions of one plugin on one thread, read
 /// every [`Latency::EVERY`] samples, each the plugin's charge in the decision
-/// as a share of its budget (in thousandths): a p50 past half the budget or
-/// a p99 past it is slow. The p99 of a window is its second-slowest sample,
-/// so one outlier does not open the breaker, and a window that read slow is
-/// forgotten, so it does not open it twice.
+/// as a share of the frames the plugin was given in it, at most the
+/// decision's budget ([`Latency::frame`], in thousandths): a p50 past half
+/// of them or a p99 past them is slow. The p99 of a window is its
+/// second-slowest sample, so one outlier does not open the breaker, and a
+/// window that read slow is forgotten, so it does not open it twice.
 #[derive(Debug)]
 pub(crate) struct Latency {
     ring: [u32; Self::SAMPLES],
@@ -160,6 +162,24 @@ impl Latency {
             next: 0,
             filled: 0,
         }
+    }
+
+    /// The frame a decision's sample is taken over, in microseconds: the
+    /// frames the plugin was given in the decision, `frames_micros` in all,
+    /// at most the decision's budget as it began, `seed_micros`. A charged
+    /// call is given its plugin's own frame under that budget, and the frame
+    /// counts whole whatever the decision had left for the call: a plugin
+    /// that others' draws starved is not read against the little it was
+    /// left. A call is cut at its frame, so under a budget wider than a
+    /// decision's frames a plugin's charge would pass no mark of the budget:
+    /// a request in process may state none, and a stage is then shown the
+    /// widest. So a plugin that answers in time reads slow too where its
+    /// median takes over half of its own frames: a budget of twice its usual
+    /// time keeps it under the mark. A guest's constructor is a call and adds
+    /// its frame, so a guest bound as one stage is read over two frames.
+    /// Every kind of plugin asks here.
+    pub(crate) fn frame(seed_micros: u64, frames_micros: u64) -> u32 {
+        u32::try_from(seed_micros.min(frames_micros)).unwrap_or(u32::MAX)
     }
 
     /// What a sample is: a charge of `micros` as a share of a frame of
@@ -573,5 +593,22 @@ mod tests {
 
         let mut unbudgeted = Latency::new();
         assert!(!(0..Latency::SAMPLES).any(|_| unbudgeted.record(1_000, 0)));
+    }
+
+    /// A sample's frame is the decision's budget or the frames of the
+    /// plugin's calls in the decision, whichever is less. A request that
+    /// states no budget seeds its decision with the widest one: the frames
+    /// are the lesser there.
+    #[test]
+    fn a_samples_frame_is_the_lesser_of_the_budget_and_the_calls_frames() {
+        assert_eq!(Latency::frame(1_000, 3_000), 1_000, "the budget");
+        assert_eq!(Latency::frame(10_000, 3_000), 3_000, "the frames");
+        let widest = u64::from(u32::MAX);
+        assert_eq!(Latency::frame(widest, 300), 300, "no budget stated");
+        assert_eq!(
+            Latency::frame(u64::MAX, u64::MAX),
+            u32::MAX,
+            "past the ring's range both: the widest frame"
+        );
     }
 }

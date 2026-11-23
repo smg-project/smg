@@ -70,9 +70,13 @@ pub enum Failure {
 /// When the plugin is bypassed to its fallbacks for a cool-down: this many
 /// failures (traps, invalid answers, the budget hits the plugin ran out of
 /// under its own bounds; one a decision, however many of its opens fail)
-/// within the window, or a moving p50 of its decisions past half the budget
+/// within the window, or a moving p50 of its decisions past half of the
+/// frames the plugin was given in a decision, at most the decision's budget,
 /// or a p99 (the second-slowest sample of the ring, each the plugin's own
-/// charge in a decision over that decision's budget) past it.
+/// charge in a decision over those frames) past them. A plugin is judged by
+/// its own frames under a request that states no budget too, so a budget of
+/// at least twice a plugin's usual time keeps one that answers in time under
+/// the mark.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BreakerSpec {
     pub failures: u32,

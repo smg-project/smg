@@ -1590,7 +1590,7 @@ fn a_missed_deadline_under_the_plugins_own_bound_is_one_failure_of_its_decision(
 /// that states none too: a stage is shown the widest budget there, the
 /// frame names the default as the plugin's deadline, and a plugin that
 /// answers nothing is waited for that long and no longer. The fallbacks
-/// decide.
+/// decide, and the missed frame is the plugin's own failure.
 #[test]
 fn a_plugin_with_no_budget_is_waited_for_the_default_frame_under_a_request_with_none() {
     let served = TestPlugin::serve();
@@ -1630,6 +1630,24 @@ fn a_plugin_with_no_budget_is_waited_for_the_default_frame_under_a_request_with_
         Some(u32::MAX),
         "the request's own budget, as a stage is shown it"
     );
+    // A loaded host can hold the I/O thread under any one frame, and a held
+    // miss is the host's: the next frame that leaves is judged.
+    decide_until_judged(&engine, &plugin, &widest, &pool(4), 1);
+    let stats = plugin.stats();
+    assert_eq!(
+        (
+            stats.missed - stats.stalls,
+            stats.own_misses,
+            stats.unread,
+            stats.answered
+        ),
+        (1, 1, 0, 0),
+        "the missed default frame is the plugin's own: {stats:?}"
+    );
+    assert_eq!(
+        stats.budget_spent, stats.stalls,
+        "no budget of the request's was spent: {stats:?}"
+    );
 }
 
 #[test]
@@ -1666,6 +1684,56 @@ fn a_plugin_that_misses_every_deadline_opens_its_breaker_through_the_latency_sam
     );
     assert!(matches!(
         decide_with(&engine, &quick, &candidates),
+        Decision::Pick(_)
+    ));
+    let after = plugin.stats();
+    assert_eq!(
+        (after.missed, after.bypassed),
+        (stats.missed, 1),
+        "inside the cool-down the plugin is not asked"
+    );
+}
+
+/// The same plugin under a request that states no budget, with a budget of
+/// its own that it misses every time: a stage is shown the widest budget
+/// there, and the plugin's time is set against its own frames, not against
+/// that budget. So the ring still judges it, and opens the breaker at its
+/// first window.
+#[test]
+fn a_plugin_that_misses_every_deadline_of_its_own_is_judged_under_a_request_with_no_budget() {
+    let served = TestPlugin::serve();
+    served.behave(Behaviour::Silent);
+    let runtime = runtime();
+    let mut tight = spec(&served, "always-late-of-its-own");
+    // A budget no longer than the I/O thread's promise: no miss of it is
+    // the plugin's failure, so the ring alone can turn the plugin off.
+    tight.budget_micros = 2_000;
+    let plugin = Plugin::load(&runtime, tight).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
+    let candidates = pool(4);
+    // What a stage is shown for a request that states no budget.
+    let widest = RequestFacts {
+        budget_micros: u32::MAX,
+        ..facts(1)
+    };
+    decide_until_judged(&engine, &plugin, &widest, &candidates, 64);
+    let stats = plugin.stats();
+    assert_eq!(
+        (
+            stats.missed - stats.stalls,
+            stats.breaker_opens,
+            stats.bypassed
+        ),
+        (64, 1, 0),
+        "{stats:?}"
+    );
+    assert_eq!(
+        (stats.own_misses, stats.unread),
+        (0, stats.missed - stats.stalls),
+        "the ring alone judged these: {stats:?}"
+    );
+    assert!(matches!(
+        decide_with(&engine, &widest, &candidates),
         Decision::Pick(_)
     ));
     let after = plugin.stats();
@@ -2058,11 +2126,14 @@ fn a_wait_the_remainder_ended_first_is_the_decisions_spend_at_what_the_frame_was
         .map(|(i, served)| {
             served.behave(Behaviour::Silent);
             // Seven of the decision's twenty milliseconds each, their own
-            // misses never opening them here.
+            // misses never opening them here. Each sample of theirs is a
+            // whole frame, so their windows read slow: under a cool-down of
+            // zero that opening bypasses nothing.
             let mut spec = spec(served, &format!("front-{i}"));
             spec.budget_micros = 7_000;
             spec.breaker = BreakerSpec {
                 failures: u32::MAX,
+                cooldown_micros: 0,
                 ..BreakerSpec::default()
             };
             Plugin::load(&runtime, spec).expect("the plugin loads")
@@ -2112,6 +2183,64 @@ fn a_wait_the_remainder_ended_first_is_the_decisions_spend_at_what_the_frame_was
     assert!(
         stats.own_misses <= 2,
         "a wait the remainder ended is not the plugin's own: {stats:?}"
+    );
+}
+
+/// A frame sent under what a decision had left is read against its plugin's
+/// whole frame. A silent filter draws three quarters of the budget, so the
+/// picker's frame leaves with the last quarter as its deadline and misses
+/// it: the decision's budget spent, whoever spent it, and no failure. Its
+/// sample is a quarter of the plugin's own frame, which no window reads
+/// slow. Read against the frame as sent, every sample would be a whole
+/// frame and the window would open at its first read.
+#[test]
+fn a_frame_sent_under_the_rest_is_read_against_its_plugins_whole_frame() {
+    let silent = TestPlugin::serve();
+    silent.behave(Behaviour::Silent);
+    let mute = TestPlugin::serve();
+    mute.behave(Behaviour::Silent);
+    let runtime = runtime();
+    // The silent filter's own budget is three quarters of the decision's.
+    // Nothing bypasses it here: its misses never count to an opening, and
+    // an opening by its own slow samples lasts no time.
+    let mut front = spec(&silent, "silent-front");
+    front.budget_micros = SHORT_MICROS / 4 * 3;
+    front.breaker = BreakerSpec {
+        failures: u32::MAX,
+        cooldown_micros: 0,
+        ..BreakerSpec::default()
+    };
+    let filter = Plugin::load(&runtime, front).expect("the plugin loads");
+    // The picker's own frame is the whole budget. A round whose filter frame
+    // did not leave asks it under that, and such a miss is its own: its
+    // failures never open it here.
+    let mut rest = spec(&mute, "under-the-rest");
+    rest.breaker = BreakerSpec {
+        failures: u32::MAX,
+        ..BreakerSpec::default()
+    };
+    let picker = Plugin::load(&runtime, rest).expect("the plugin loads");
+    let engine = single_engine(filter_then_picker(&filter, &picker));
+    let short = RequestFacts {
+        budget_micros: SHORT_MICROS,
+        ..facts(1)
+    };
+    // The window's first read is at its 64th sample.
+    decide_until_judged(&engine, &picker, &short, &pool(4), 64);
+    let stats = picker.stats();
+    assert_eq!(
+        (stats.unread, stats.breaker_opens, stats.bypassed),
+        (0, 0, 0),
+        "{stats:?}"
+    );
+    assert_eq!(
+        stats.budget_spent + stats.own_misses,
+        stats.missed,
+        "{stats:?}"
+    );
+    assert!(
+        stats.own_misses <= 2,
+        "a frame the remainder clamped is not the plugin's own: {stats:?}"
     );
 }
 
@@ -2183,13 +2312,18 @@ fn a_miss_under_a_remainder_the_plugin_alone_spent_is_its_own() {
 /// across its deadline leaves no gap for the witness. An honest plugin
 /// under such a budget, the I/O thread held across each deadline for less
 /// than the promise, misses every frame, and nothing says whose the miss
-/// is: each is the decision's budget spent, counted unread, and the breaker
-/// stays shut. Judged as the plugin's own, the fifth would open it.
+/// is: each is the decision's budget spent, counted unread, and no miss is
+/// the plugin's failure. Judged as its own, the fifth would open the
+/// breaker. The latency rule alone judges such frames: a window of them
+/// used up whole reads slow at its first read, whoever was late.
 #[test]
 fn a_miss_too_short_for_the_witness_is_unread_and_the_decisions_budget_spent() {
     // Longer than the plugin's budget, shorter than the promise.
     const HOLD: Duration = Duration::from_millis(3);
     let served = TestPlugin::serve();
+    // The plugin's usual time: inside its budget below, and over half of it.
+    // So a round answered in time is a slow sample too, like a miss.
+    served.script(|s| s.delay = Duration::from_micros(1_200));
     let runtime = runtime();
     // The plugin's own budget: a fifth of the decision's, half the promise.
     let mut spec = spec(&served, "short-frames");
@@ -2201,11 +2335,15 @@ fn a_miss_too_short_for_the_witness_is_unread_and_the_decisions_budget_spent() {
         budget_micros: 10_000,
         ..facts(1)
     };
-    // Past the window's first read, at its 64th sample.
+    // Up to the window's first read, at its 64th sample: an unread miss, or
+    // a round answered in time. A round the I/O thread was seen late in is
+    // charged nothing, answered or missed, so it is no sample.
     let mut rounds = 0_u64;
     let more = |rounds: u64| {
         let stats = plugin.stats();
-        stats.unread < 64 && stats.breaker_opens == 0 && rounds < 192
+        stats.answered + stats.missed - stats.stalls < 64
+            && stats.breaker_opens == 0
+            && rounds < 192
     };
     while more(rounds) {
         rounds += 1;
@@ -2227,14 +2365,17 @@ fn a_miss_too_short_for_the_witness_is_unread_and_the_decisions_budget_spent() {
         );
     }
     let stats = plugin.stats();
+    // The window's sixty-four samples: every one an unread miss, but a
+    // round answered in time, where this thread was held off its send. Each
+    // is past half of the plugin's frame, so the window's first read opens.
     assert_eq!(
         (
-            stats.unread,
+            stats.answered + stats.missed - stats.stalls,
             stats.own_misses,
             stats.breaker_opens,
             stats.bypassed
         ),
-        (64, 0, 0, 0),
+        (64, 0, 1, 0),
         "after {rounds} rounds: {stats:?}"
     );
     assert_eq!(
