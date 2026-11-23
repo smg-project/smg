@@ -8,8 +8,8 @@
 # (`.../member_write/<kind>/<n>`). Three read the log: a batch of 16 and of 256 events
 # (`policy_store_journal/read/<events>`) and a watch's read at the head (`.../read/watched_at_head`).
 #
-# The filter leaves out the binary's other rows: the cut's rows (`policy_store_journal/cut/`) and the load write's
-# third name (`.../load_write/watched/<n>`), which builds the journaled store once more.
+# The filter names the two load write kinds the gate runs, `plain` and `journaled`, and leaves every other row of
+# the binary out, the cut's rows (`policy_store_journal/cut/`) among them.
 #
 # Threshold (the method is described in tokenizer.toml): the identical-build spread, read through this gate as
 # three base and three pull-request runs of one build pinned to one core, the base a copy of the binary with one
