@@ -676,6 +676,11 @@ or protocols that not every worker of its list serves is refused. The refusal na
 except a pair's demand, which is shed under the stage `wires`.
 A pair's encode items are decided over a host's three lists, with the pair's lease issued
 (`PolicyEngine::decide_encode_at`). The trait's method for them takes no lists and refuses.
+The encoders are the one list the engine narrows by protocol itself. An encoder is named by its
+place in its list, and what its host says of it and of each prefill is laid by that place, so the
+host has no narrowed list to hand. The decision leaves out each encoder that serves no protocol
+the request states, and a request with items is refused under `wires` where the list holds
+encoders and none serves one. The pair's two lists are refused as a pair's are.
 The other inputs are honoured by the old engine only.
 A request that states places of its list (`Constraints::places`) is refused too, and the refusal
 names `places`, where the request is a pair: one list of places cannot hold a pair's two lists
@@ -1221,8 +1226,12 @@ impl Placement<'_> {
 ```
 
 Where the document's stages want no events, a single request's placement holds nothing and
-these calls do nothing. A pair's placement always holds a lease (section 6). `place` answers
-a single request and a pair with a placement, and no host makes one itself.
+these calls do nothing. A pair's placement always holds a lease (section 6), and so does an
+encode request's: it reports its pair's two sides as a pair does, and nothing of an encode side.
+No lease stands for an encoder, so `sent` and `ended` under the encode side tell no stage and
+end no side. The host that sends an encode call counts it on the worker itself, as the gateway's
+encode stage does. `place` answers a single request, a pair and an encode request with a
+placement, and no host makes one itself.
 
 A pair's decode can be decided again on its placement. Under a document that picks the decode
 after the prefill, a caller that states `decode_again` is placed with its prefill booked alone,
@@ -1731,7 +1740,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `manual` and sticky sessions on that engine | **[partly]** | their sheets replay through the decision function, not through the engine |
 | `bucket` on that engine | **[partly]** | the same |
 | Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; five of its 40 lines are held to an answer of the crate's own |
-| Encode-prefill-decode on that engine | **[partly]** | `PolicyEngine::decide_encode_at` decides it over a host's three lists and issues the pair's lease, and `place` places it; the entry declines a request held to a wire that a worker of a list it reads is not dialed on, and one that states the later decode where its decode is held to the workers that take images: a decode asked again takes no items |
+| Encode-prefill-decode on that engine | **[partly]** | `PolicyEngine::decide_encode_at` decides it over a host's three lists and issues the pair's lease, and `place` places it; the entry declines a request held to a wire that a worker of its pair's two lists is not dialed on, places its items on the encoders dialed on a wire it states, declines a request with items where the list holds encoders and none is, and declines one that states the later decode where its decode is held to the workers that take images: a decode asked again takes no items |
 | The lease and its events; the guard | **[built]** | |
 | The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request, for a pair and for an encode request, with the route's rule and the decision made again, three decisions a call at most or a single request's fourth where the third found the workers the route's rule takes, and a single request's later decisions held to those workers; the later decisions of a pair and of an encode request held to them are not |
 | The crate's bench of the kept engine | **[planned]** | |

@@ -450,6 +450,62 @@ fn an_encode_request_whose_pair_is_held_to_places_is_declined_by_name() {
     }
 }
 
+/// The places' decline reads whether a list's places are stated, and not
+/// what they state: both lists' places, and places that name no worker,
+/// are declined as one list's are. The engine says the decline ahead of
+/// every profile, in the shape of a profile's shed: it states the request's
+/// seed and the document's generation.
+#[test]
+fn the_places_decline_stands_for_both_lists_and_for_places_that_name_no_worker() {
+    let mut document = stock();
+    document.generation = 9;
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let mut host = Host::under(spec, 2, 2, 1);
+    let said = (&[of(1)][..], &[1, 1][..]);
+    let keys = [Identity::plain("item")];
+    let items = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    let mut placed = EncodePlaced::new();
+    let now = Instant::now();
+    let nobody = || Some(Vec::new());
+    let stated = [
+        [Some(vec![0]), Some(vec![1])],
+        [nobody(), None],
+        [None, nobody()],
+        [nobody(), nobody()],
+    ];
+    for held in stated {
+        let mut request = Request {
+            id: b"",
+            facts: RequestFacts {
+                model: "model-a",
+                phase: Phase::Prefill,
+                seed: 41,
+                ..RequestFacts::default()
+            },
+            constraints: Constraints::default(),
+        };
+        let mut decide = |host: &Host| {
+            let lists = host.lists(said);
+            lists.decide(&host.engine, None, now, &mut request, items, &mut placed)
+        };
+        host.places = [None, None];
+        let decision = decide(&host);
+        assert!(decision.pick().is_some(), "not a pick: {decision:?}");
+        host.places = held;
+        let decision = decide(&host);
+        let Decision::Shed(shed) = decision else {
+            panic!("not declined under {:?}: {decision:?}", host.places);
+        };
+        let named = (shed.reason, shed.emptied_by);
+        assert_eq!(named, (ShedReason::PolicyDeclined, "places"));
+        assert_eq!((shed.trace.seed, shed.trace.generation), (41, 9));
+        assert!(placed.encoders().is_empty(), "{:?}", host.places);
+    }
+}
+
 /// An encode request's pair reads each side's standing vetoes beside that
 /// side's list. The worker at one place of each list reports the shorter
 /// queue, so with no veto the pair and the encoder are of that place. A
@@ -1199,19 +1255,16 @@ async fn the_engines_entries_read_the_load_reports_a_pairs_first_decision_reads(
 }
 
 /// A request the encode side sheds, and one its wires decline, issue
-/// nothing: no lease, no id, no word, and no key stays placed. The wires'
-/// test reads the lists the request reads: with one worker of any of the
-/// three dialed over another wire than the rest, a request with an item that
-/// states one wire alone is declined through both entries, and one that
-/// states both is decided. A request with no item reads the pair's two
-/// lists and no encoder's wire.
+/// nothing: no lease, no id, no word, and no key stays placed. The pair's
+/// two lists are their host's to hand on the request's wires. With one
+/// worker of either dialed over another wire than the rest, a request that
+/// states one wire alone is declined through both entries, with an item
+/// and with none, and one that states both is decided.
 ///
-/// The classic router tests the wire a worker at a time, a pair's two sides
-/// (`model_gateway/src/routers/common/placement.rs:1301-1302` on main
-/// 4cefb0de5) and an encoder
-/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2137-2139`,
-/// `:2147`): it passes over the one worker and serves a request held to the
-/// other workers' wire by them. The engine declines that request, as it
+/// The classic router tests the wire a worker at a time on a pair's two
+/// sides (`model_gateway/src/routers/common/placement.rs:1301-1302` on main
+/// 384b8fd6b): it passes over the one worker and serves a request held to
+/// the other workers' wire by them. The engine declines that request, as it
 /// declines a pair one of whose workers is dialed on a wire the request
 /// does not state.
 #[test]
@@ -1236,15 +1289,9 @@ fn a_request_shed_or_declined_by_its_wires_issues_nothing_and_places_no_key() {
     assert!(decided.lease.is_none() && placed.encoders().is_empty());
     assert_eq!(entry.leases.0.load(Ordering::Relaxed), 0);
     assert!(heard.lock().is_empty());
-    let declined = |decision: &Decision| match decision {
-        Decision::Shed(shed) => {
-            (shed.reason, shed.emptied_by) == (ShedReason::PolicyDeclined, WIRES)
-        }
-        _ => false,
-    };
-    // In each of the three lists in turn, the first worker is dialed over
-    // gRPC. Every other worker of the three is dialed over HTTP.
-    for list in 0..3 {
+    // In each of the pair's two lists in turn, the first worker is dialed
+    // over gRPC. Every other worker of the three lists is dialed over HTTP.
+    for list in 0..2 {
         let (mut host, heard) = hearing(2, 2, 2);
         host.lists[list] = first_dialed_over_grpc(&host, list);
         let held_to = |wires| Asks {
@@ -1265,43 +1312,168 @@ fn a_request_shed_or_declined_by_its_wires_issues_nothing_and_places_no_key() {
             let asks = held_to(wires);
             let leased = entry.decide_encode_at(&asks, items, &mut placed, || now);
             let (leased, _) = leased.expect("a decision");
-            assert!(declined(&leased.decision), "list {list}, {wires:?}");
+            let named = declined_under(&leased.decision);
+            assert_eq!(named, Some(WIRES), "list {list}, {wires:?}");
             assert!(leased.lease.is_none(), "list {list}, {wires:?}");
             assert!(placed.encoders().is_empty(), "list {list}, {wires:?}");
             let unleased = entry.decide_encode_without_lease(&asks, items, &mut placed, now);
-            assert!(
-                declined(&unleased.expect("a decision")),
-                "list {list}, {wires:?}"
-            );
+            let named = declined_under(&unleased.expect("a decision"));
+            assert_eq!(named, Some(WIRES), "list {list}, {wires:?}");
         }
-        // A request with no item held to HTTP reads the pair's two lists
-        // alone: it is decided where the one worker is an encoder.
+        // A request with no item held to HTTP reads the same two lists.
         let (asks, none) = (held_to(WireModes::HTTP), EncodeItems::default());
         let decided = entry.decide_encode_at(&asks, none, &mut placed, || now);
         let (decided, _) = decided.expect("a decision");
-        assert_eq!(decided.lease.is_some(), list == 2, "list {list}");
-        assert_eq!(declined(&decided.decision), list != 2, "list {list}");
-        assert!(placed.encoders().is_empty(), "list {list}");
+        assert_eq!(declined_under(&decided.decision), Some(WIRES));
+        assert!(decided.lease.is_none(), "list {list}");
         // The decided requests alone took an id and were told.
-        let leases = 3 + usize::from(list == 2);
-        assert_eq!(entry.leases.0.load(Ordering::Relaxed), leases as u64);
-        assert_eq!(*heard.lock(), [Side::Prefill, Side::Decode].repeat(leases));
+        assert_eq!(entry.leases.0.load(Ordering::Relaxed), 3);
+        assert_eq!(*heard.lock(), [Side::Prefill, Side::Decode].repeat(3));
     }
 }
 
-/// `host`'s list `list` with its first worker dialed over gRPC, as the
-/// host publishes a list: its other worker stays.
-fn first_dialed_over_grpc(host: &Host, list: usize) -> PublishedList {
-    let dialed = <BasicWorkerBuilder>::new(format!("grpc://list-{list}-worker-0:9000"))
+/// The encoders are narrowed by the decision, where the pair's two lists
+/// are their host's to narrow: an encoder is named by its place in its
+/// list, and what its host says of it is laid by that place, so the host
+/// has no narrowed list to hand. Of two encoders the first is dialed over
+/// gRPC and reports the shorter queue, and the second is dialed over HTTP,
+/// as the pair's lists are. A request with an item that states both wires
+/// takes the first. One held to HTTP is decided through both entries, and
+/// its item is placed on the second at every call. One held to a wire the
+/// pair's lists are not dialed on is declined by them.
+///
+/// The classic router tests an encoder's wire with the rest of what the
+/// request asks of it, and keeps the encoders that pass
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2138`
+/// and `:2147` on main 384b8fd6b).
+#[test]
+fn an_item_is_placed_on_an_encoder_dialed_on_a_wire_its_request_states() {
+    let said = (&[of(1), of(1)][..], &[1, 1][..]);
+    let keys = [Identity::plain("item")];
+    let items = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    let mut placed = EncodePlaced::new();
+    let now = Instant::now();
+    let (mut host, heard) = hearing(2, 2, 2);
+    host.lists[2] = first_dialed_over_grpc(&host, 2);
+    let queue = |url: &str, queued| (url.to_owned(), one_rank_load(queued, 0.1, 1_000.0));
+    let queues = vec![queue(host.worker(2, 0).url(), 0), queue(&url(2, 1), 90_000)];
+    host.loads = Some(LoadSnapshot::from_loads_for_test(queues));
+    let held_to = |wires| Asks {
+        wires,
+        ..host.asks(said)
+    };
+    let entry = &host.engine;
+    let places = |placed: &EncodePlaced| -> Vec<u32> {
+        let encoders = placed.encoders().iter();
+        encoders.map(|target| target.position).collect()
+    };
+    let both = held_to(WireModes::HTTP.union(WireModes::GRPC));
+    let decided = entry.decide_encode_at(&both, items, &mut placed, || now);
+    let (decided, _) = decided.expect("a decision");
+    assert!(decided.lease.is_some());
+    assert_eq!(places(&placed), [0], "the shorter queue");
+    let http = held_to(WireModes::HTTP);
+    for _ in 0..3 {
+        let leased = entry.decide_encode_at(&http, items, &mut placed, || now);
+        let (leased, _) = leased.expect("a decision");
+        assert!(leased.lease.is_some());
+        assert_eq!(places(&placed), [1]);
+        let unleased = entry.decide_encode_without_lease(&http, items, &mut placed, now);
+        assert!(unleased.expect("a decision").pick().is_some());
+        assert_eq!(places(&placed), [1]);
+    }
+    for wires in [WireModes::GRPC, WireModes::ZMQ] {
+        let asks = held_to(wires);
+        let leased = entry.decide_encode_at(&asks, items, &mut placed, || now);
+        let (leased, _) = leased.expect("a decision");
+        let named = declined_under(&leased.decision);
+        assert_eq!(named, Some(WIRES), "{wires:?}");
+        assert!(leased.lease.is_none() && placed.encoders().is_empty());
+    }
+    // The decided requests alone took an id and were told.
+    assert_eq!(entry.leases.0.load(Ordering::Relaxed), 4);
+    assert_eq!(*heard.lock(), [Side::Prefill, Side::Decode].repeat(4));
+}
+
+/// Where the encoders' list holds encoders and none is dialed on a wire the
+/// request states, a request with an item is declined under the wires'
+/// name through both entries: it issues nothing and no key is placed. A
+/// request with no item reads no encoder's wire, and is decided over its
+/// pair. A list of no encoder is the encode side's own gap, whatever wire
+/// the request states.
+///
+/// The classic router refuses the request with an item too, under a name
+/// of its own, since no encoder passes its test of the wire
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2149-2176`
+/// on main 384b8fd6b). It holds a request with no item to no encoder
+/// (`:2149`, `:2187` and `:2215`).
+#[test]
+fn encoders_all_on_other_wires_decline_a_request_with_an_item_under_the_wires_name() {
+    let said = (&[of(1), of(1)][..], &[1, 1][..]);
+    let keys = [Identity::plain("item")];
+    let items = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    let mut placed = EncodePlaced::new();
+    let now = Instant::now();
+    let (mut host, heard) = hearing(2, 2, 2);
+    let encoders: Arc<[Arc<dyn Worker>]> = Arc::new([over_grpc(2, 0), over_grpc(2, 1)]);
+    host.lists[2] = PublishedList::new(encoders);
+    let entry = &host.engine;
+    let http = Asks {
+        wires: WireModes::HTTP,
+        ..host.asks(said)
+    };
+    let leased = entry.decide_encode_at(&http, items, &mut placed, || now);
+    let (leased, _) = leased.expect("a decision");
+    assert_eq!(declined_under(&leased.decision), Some(WIRES));
+    assert!(leased.lease.is_none() && placed.encoders().is_empty());
+    let unleased = entry.decide_encode_without_lease(&http, items, &mut placed, now);
+    assert_eq!(declined_under(&unleased.expect("a decision")), Some(WIRES));
+    assert_eq!(entry.leases.0.load(Ordering::Relaxed), 0);
+    assert!(heard.lock().is_empty());
+    // With no item the same request is its pair's, and takes no encoder.
+    let none = EncodeItems::default();
+    let decided = entry.decide_encode_at(&http, none, &mut placed, || now);
+    let (decided, _) = decided.expect("a decision");
+    assert!(decided.lease.is_some() && placed.encoders().is_empty());
+    // A request that states no wire takes an encoder of the list.
+    let free = host.asks(said);
+    let decided = entry.decide_encode_at(&free, items, &mut placed, || now);
+    let (decided, _) = decided.expect("a decision");
+    assert!(decided.lease.is_some() && placed.encoders().len() == 1);
+    // No encoder at all: the encode side's gap, by its own name.
+    let (alone, _) = hearing(1, 1, 0);
+    let asks = Asks {
+        wires: WireModes::HTTP,
+        ..alone.asks((&[], &[1]))
+    };
+    let decided = (alone.engine).decide_encode_at(&asks, items, &mut placed, || now);
+    let (decided, _) = decided.expect("a decision");
+    assert_eq!(gap(&decided.decision), Some("encoders"));
+}
+
+/// A ready worker of list `list` at `place` that is dialed over gRPC.
+fn over_grpc(list: usize, place: usize) -> Arc<dyn Worker> {
+    let dialed = <BasicWorkerBuilder>::new(format!("grpc://list-{list}-worker-{place}:9000"))
         .worker_type(WorkerType::Regular)
         .connection_mode(ConnectionMode::Grpc)
         .model(ModelCard::new("model-a"))
         .health_config(no_health_check())
         .build();
     dialed.set_status(WorkerStatus::Ready);
-    let dialed: Arc<dyn Worker> = Arc::new(dialed);
+    Arc::new(dialed)
+}
+
+/// `host`'s list `list` with its first worker dialed over gRPC, as the
+/// host publishes a list: its other worker stays.
+fn first_dialed_over_grpc(host: &Host, list: usize) -> PublishedList {
     let stays = Arc::clone(host.worker(list, 1));
-    let workers: Arc<[Arc<dyn Worker>]> = Arc::new([dialed, stays]);
+    let workers: Arc<[Arc<dyn Worker>]> = Arc::new([over_grpc(list, 0), stays]);
     PublishedList::new(workers)
 }
 

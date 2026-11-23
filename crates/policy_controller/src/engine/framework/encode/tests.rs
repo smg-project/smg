@@ -92,6 +92,9 @@ struct Bed {
     references: bool,
     decode_images: bool,
     images: u16,
+    /// The wires the request's host states to the encode side; none until a
+    /// case states one.
+    wires: WireModes,
 }
 
 impl Bed {
@@ -114,6 +117,7 @@ impl Bed {
             references: false,
             decode_images: false,
             images: 1,
+            wires: WireModes::NONE,
         }
     }
 
@@ -187,6 +191,10 @@ impl Bed {
             decode_images: self.decode_images,
         };
         let cx = Constraints::default();
+        let encode_cx = Constraints {
+            wire_modes: self.wires,
+            ..Constraints::default()
+        };
         let mut placed = EncodePlaced::new();
         let decision = engine.decide_encode_pair(
             facts,
@@ -196,7 +204,7 @@ impl Bed {
             items,
             &cx,
             &cx,
-            &cx,
+            &encode_cx,
             &mut Scratch::new(),
             &mut placed,
         );
@@ -275,13 +283,12 @@ fn a_request_without_items_reads_no_encoder_and_places_none() {
     assert_eq!(bed.placed(), ((0, 0), vec![], false));
 }
 
-/// A request with no item, asked over each shape of the encode pool that
-/// declines a request with one: an empty encode pool beside the bed's
-/// prefill, then each of the three columns of another length than its list
+/// Each shape of the encode pool that declines a request with an item: an
+/// empty encode pool beside the bed's prefill, then each of the three
+/// columns of another length than its list
 /// (`a_column_of_another_length_and_a_binding_of_another_plan_decline`).
-/// Over each it takes the pair entry's pair, and no encoder is placed.
-fn a_request_without_items_takes_its_pair(decode_images: bool) {
-    let shapes: [fn(&mut Bed); 4] = [
+fn shapes() -> [fn(&mut Bed); 4] {
+    [
         |bed| {
             bed.encoders.clear();
             bed.facts.clear();
@@ -290,16 +297,23 @@ fn a_request_without_items_takes_its_pair(decode_images: bool) {
         |bed| bed.facts.clear(),
         |bed| bed.prefill_classes.push(1),
         |bed| bed.encode_affinity = vec![AffinityFacts::default(); 3],
-    ];
-    for (at, shape) in shapes.iter().enumerate() {
+    ]
+}
+
+/// A request with no item that states `images` images, asked over each of
+/// those shapes. Over each it takes the pair entry's pair, and no encoder
+/// is placed.
+fn a_request_without_items_takes_its_pair(images: u16, decode_images: bool) {
+    for (at, shape) in shapes().iter().enumerate() {
         let mut bed = Bed::new();
         bed.keys.clear();
+        bed.images = images;
         bed.decode_images = decode_images;
         shape(&mut bed);
         let (decision, placed) = bed.decide();
         assert!(
             matches!(decision, Decision::Pick(_)),
-            "shape {at}: {decision:?}"
+            "shape {at}, {images} images: {decision:?}"
         );
         assert_eq!(decision, bed.pair(&engine()), "shape {at}");
         assert!(placed.encoders().is_empty(), "shape {at}");
@@ -307,21 +321,41 @@ fn a_request_without_items_takes_its_pair(decode_images: bool) {
 }
 
 /// A request with no item is answered whatever its host handed in the
-/// encode pool's columns. The classic router reads no encoder for such a
-/// request: each of its reads stands behind the test that the request has
-/// items
-/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2131`,
-/// `:2149`, `:2187` and `:2215` on main cbefc9565).
+/// encode pool's columns: one that states an image, and one of text alone.
+/// The classic router holds such a request to no encoder. It lists the
+/// encoders for every request, and each of its tests that refuses a
+/// request for want of one, or keeps a pair to the workers one hands to,
+/// stands behind the test that the request has items
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2149`,
+/// `:2187` and `:2215` on main 384b8fd6b).
 #[test]
 fn a_request_without_items_is_answered_whatever_the_encode_pools_columns_hold() {
-    a_request_without_items_takes_its_pair(false);
+    a_request_without_items_takes_its_pair(1, false);
+    a_request_without_items_takes_its_pair(0, false);
 }
 
 /// So is one that asks images of its decode: the bed's decode takes them,
-/// and the pair is the pair entry's.
+/// and the pair is the pair entry's. Over the same shapes a decode that
+/// takes none leaves the request no pair, and the shed names the decode's
+/// stage: what a request asks of its decode is read whatever the encode
+/// pool holds. The classic router refuses that request by its pairs'
+/// decodes alone, since a request with no item asks no encoder of a pair
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2187`
+/// and `:2202-2206` on main 384b8fd6b).
 #[test]
 fn a_request_without_items_that_asks_images_of_its_decode_reads_no_encode_column() {
-    a_request_without_items_takes_its_pair(true);
+    a_request_without_items_takes_its_pair(1, true);
+    for (at, shape) in shapes().iter().enumerate() {
+        let mut bed = Bed::new();
+        bed.keys.clear();
+        bed.decode_images = true;
+        bed.decodes = vec![Candidate {
+            vision: false,
+            ..row(0, Role::Decode, 1, 0)
+        }];
+        shape(&mut bed);
+        assert_eq!(bed.stage(), "decode-vision", "shape {at}");
+    }
 }
 
 #[test]
@@ -415,6 +449,131 @@ fn a_gap_no_retry_closes_is_named_by_membership() {
     }];
     bed.decode_images = true;
     assert_eq!(bed.stage(), "decode-vision");
+}
+
+/// An encoder at `at` that holds `in_flight` requests, dialed on `wire`.
+fn dialed_on(wire: WireModes, at: u32, in_flight: u32) -> Candidate {
+    Candidate {
+        wire_modes: wire,
+        ..row(at, Role::Encode, 0, in_flight)
+    }
+}
+
+/// An encoder dialed on no wire the request's host states is left out, and
+/// the item goes to one that is: here the idle encoder is dialed over gRPC
+/// and the busy one over HTTP. A host that states no wire leaves none out,
+/// and one that states both takes the idle one.
+///
+/// The classic router tests an encoder's wire with the rest of what the
+/// request asks of it, and keeps the encoders that pass
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2138`
+/// and `:2147` on main 384b8fd6b).
+#[test]
+fn an_encoder_dialed_on_no_wire_the_request_states_is_left_out() {
+    let mut bed = Bed::new();
+    bed.encoders = vec![
+        dialed_on(WireModes::GRPC, 0, 0),
+        dialed_on(WireModes::HTTP, 1, 4),
+    ];
+    bed.facts = vec![pushing(1), pushing(1)];
+    assert_eq!(bed.placed(), ((0, 0), vec![0], false));
+    bed.wires = WireModes::HTTP;
+    assert_eq!(bed.placed(), ((0, 0), vec![1], false));
+    bed.wires = WireModes::HTTP.union(WireModes::GRPC);
+    assert_eq!(bed.placed(), ((0, 0), vec![0], false));
+    // An encoder that is not ready is no encoder to send to, on its wire
+    // or off it: the shed is the encode side's, by state.
+    bed.wires = WireModes::HTTP;
+    bed.encoders[1] = unready(bed.encoders[1]);
+    assert_eq!(bed.stage(), "encoders");
+}
+
+/// An encoder dialed on two wires takes a request held to one of them: a
+/// row states the set of its wires, and one stated wire in the set is
+/// enough. The idle encoder is dialed over HTTP and gRPC, and the busy one
+/// over gRPC alone: a request held to gRPC takes the idle one, and so does
+/// a request held to HTTP, where it is the only one left.
+///
+/// The classic router compares the request's wire with the one wire its
+/// worker is dialed on
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2138`
+/// on main 384b8fd6b, by
+/// `model_gateway/src/routers/common/placement.rs:88-93`): it holds no
+/// encoder on two.
+#[test]
+fn an_encoder_dialed_on_two_wires_takes_a_request_held_to_one_of_them() {
+    let mut bed = Bed::new();
+    bed.encoders = vec![
+        dialed_on(WireModes::HTTP.union(WireModes::GRPC), 0, 0),
+        dialed_on(WireModes::GRPC, 1, 4),
+    ];
+    bed.facts = vec![pushing(1), pushing(1)];
+    bed.wires = WireModes::GRPC;
+    assert_eq!(bed.placed(), ((0, 0), vec![0], false));
+    bed.wires = WireModes::HTTP;
+    assert_eq!(bed.placed(), ((0, 0), vec![0], false));
+}
+
+/// A prefill whose class holds no encoder on the request's wires is no
+/// candidate of the pair. The idle prefill's one encoder is dialed over
+/// gRPC, and the busy prefill's over HTTP: a request held to HTTP takes
+/// the busy prefill and its encoder.
+///
+/// The classic router keeps a pair to the workers an encoder it kept hands
+/// to
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2213-2216`
+/// on main 384b8fd6b, over the encoders kept at `:2147`).
+#[test]
+fn a_prefill_whose_encoders_are_on_other_wires_is_not_the_pairs() {
+    let mut bed = Bed::new();
+    bed.prefills = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 5)];
+    bed.prefill_classes = vec![1, 2];
+    bed.encoders = vec![
+        dialed_on(WireModes::GRPC, 0, 0),
+        dialed_on(WireModes::HTTP, 1, 0),
+    ];
+    bed.facts = vec![pushing(1), pushing(2)];
+    assert_eq!(bed.placed(), ((0, 0), vec![0], false));
+    bed.wires = WireModes::HTTP;
+    assert_eq!(bed.placed(), ((1, 0), vec![1], false));
+}
+
+/// A gap is named by the encoders on the request's wires. The encoder
+/// dialed over HTTP processes no references, and the one over gRPC
+/// processes them and takes images: for a request of references with an
+/// image held to HTTP, no encoder takes the media. With no wire stated the
+/// second encoder takes the request. Where the encoder over gRPC pushes,
+/// the gap is the one of an encoder that lacks its role, on whatever wire
+/// that encoder is dialed.
+///
+/// The classic router names a gap by the encoders that pass its test of
+/// the wire: with none that would take the request but for its image, the
+/// request's media are not supported
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2153-2164`
+/// and `:2171-2172` on main 384b8fd6b). Its test of a pushing encoder
+/// stands between the two and reads no wire (`:2165-2170`).
+#[test]
+fn a_gap_is_named_by_the_encoders_on_the_requests_wires() {
+    let processes = |references: bool| EncoderFacts {
+        class: 1,
+        pushes: false,
+        references,
+    };
+    let mut bed = Bed::new();
+    bed.encoders = vec![
+        dialed_on(WireModes::HTTP, 0, 0),
+        dialed_on(WireModes::GRPC, 1, 0),
+    ];
+    bed.facts = vec![processes(false), processes(true)];
+    bed.references = true;
+    assert_eq!(bed.placed(), ((0, 0), vec![1], false));
+    bed.wires = WireModes::HTTP;
+    assert_eq!(bed.stage(), "encode-media");
+    bed.facts[1] = EncoderFacts {
+        references: true,
+        ..pushing(1)
+    };
+    assert_eq!(bed.stage(), "ec-compatible");
 }
 
 /// A hard filter that refuses one row, by its id.
@@ -520,6 +679,17 @@ fn encoders_the_veto_left_none_of_shed_as_saturation() {
     bed.encoders[1] = overloaded(row(1, Role::Encode, 0, 0));
     bed.facts[1] = pushing(0);
     assert_eq!(shed_of(&bed.decide().0), missing);
+    // Nor is one over its thresholds dialed on no wire the request states.
+    bed.encoders = vec![
+        unready(dialed_on(WireModes::HTTP, 0, 0)),
+        overloaded(dialed_on(WireModes::GRPC, 1, 0)),
+    ];
+    bed.facts[1] = pushing(1);
+    bed.wires = WireModes::HTTP;
+    assert_eq!(shed_of(&bed.decide().0), missing);
+    // With no wire stated the veto left none.
+    bed.wires = WireModes::NONE;
+    assert_eq!(shed_of(&bed.decide().0), saturated);
 }
 
 #[test]

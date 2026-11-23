@@ -27,12 +27,12 @@ use crate::{
             DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused, HeldDecision,
             Plain, Request, RequestMaker, SweepOutcome, TokenKey, WorkerLists,
         },
-        framework::{EncodeItems, EncodePlaced},
+        framework::{EncodeItems, EncodePlaced, EncoderFacts},
         list_cell::tests::PublishedList,
         prompt_hashes::{HashSeeds, PromptHashes},
         records::worker_id,
-        view::{Constraints, Phase, RequestFacts, Session, WorkerId},
-        PairAdmission, PairLists, PartnerClasses, PolicyEngine,
+        view::{Constraints, Identity, Phase, RequestFacts, Session, WorkerId},
+        EncodeLists, PairAdmission, PairLists, PartnerClasses, PolicyEngine,
     },
     store::GatewayId,
     tracking::{
@@ -257,7 +257,8 @@ impl PairAdmission for Open {
 }
 
 /// A host's two lists of ready workers, every prefill a partner of every
-/// decode, under the stock pair document with round robin on both sides.
+/// decode, under the stock pair document with round robin on both sides,
+/// or under a document of the case's own.
 struct PairHost {
     engine: PolicyEngine,
     prefills: Arc<[Arc<dyn Worker>]>,
@@ -269,7 +270,12 @@ struct PairHost {
 impl PairHost {
     fn of(prefills: usize, decodes: usize) -> Self {
         let document = PolicySpec::pair_presets("round_robin", "round_robin");
-        let engine = engine(&document.expect("the pair presets"));
+        Self::under(&document.expect("the pair presets"), prefills, decodes)
+    }
+
+    /// [`Self::of`], under `document`.
+    fn under(document: &PolicySpec, prefills: usize, decodes: usize) -> Self {
+        let engine = engine(document);
         let prefills = workers("prefill", WorkerType::Prefill, prefills);
         let decodes = workers("decode", WorkerType::Decode, decodes);
         let members = [
@@ -288,10 +294,10 @@ impl PairHost {
         }
     }
 
-    /// The engine behind a door that lends this host's two lists.
-    fn door(&self) -> Door<'_> {
+    /// The host's two lists, as it lends them for one request.
+    fn lists(&self) -> PairLists<'_> {
         let [prefill, decode] = &self.members;
-        let lists = PairLists {
+        PairLists {
             prefill: prefill.lent(),
             decode: decode.lent(),
             classes: &self.classes,
@@ -302,8 +308,12 @@ impl PairHost {
             prefill_held: &[],
             decode_stalled: &[],
             decode_held: &[],
-        };
-        Door::new(&self.engine, WorkerLists::Pair(lists))
+        }
+    }
+
+    /// The engine behind a door that lends this host's two lists.
+    fn door(&self) -> Door<'_> {
+        Door::new(&self.engine, WorkerLists::Pair(self.lists()))
     }
 
     /// The id of a prefill of the list other than `taken`.
@@ -1074,6 +1084,70 @@ fn an_encode_outcome_on_a_pairs_handle_ends_neither_side() {
             Said::Completed(prefilled),
             Said::Released(Some(Side::Decode), ReleaseReason::Abandoned),
         ]
+    );
+}
+
+/// A handle of an encode request's decision holds its pair's two sides,
+/// under the prefill's lease, and nothing of an encoder. The decision is
+/// the engine's over its host's three lists
+/// ([`PolicyEngine::decide_encode_at`]), held as an answer its host asked
+/// itself ([`DecisionGuard::holding`]). Its first target is the pair's,
+/// both sides are issued, and the item's encoder is placed beside it. Each
+/// word the handle says is of the prefill or of the decode: dropped with
+/// its decode sent, it gives the prefill up and completes the decode as
+/// cancelled.
+#[test]
+fn a_handle_of_an_encode_pair_holds_the_pairs_two_sides() {
+    let preset = "round_robin";
+    let document = PolicySpec::epd_presets(preset, preset, preset);
+    let host = PairHost::under(&document.expect("the encode presets"), 1, 1);
+    let encoders = PublishedList::new(workers("encode", WorkerType::Encode, 1));
+    // The one encoder hands to the one prefill.
+    let facts = [EncoderFacts {
+        class: 1,
+        ..EncoderFacts::default()
+    }];
+    let lists = WorkerLists::Encode(EncodeLists {
+        pair: host.lists(),
+        encoders: encoders.lent(),
+        encoders_stalled: &[],
+        encoders_held: &[],
+        facts: &facts,
+        prefill_classes: &[1],
+    });
+    let door = Door::new(&host.engine, lists);
+    let now = Instant::now();
+    let items = EncodeItems {
+        keys: &[Identity::hashed(11)],
+        ..EncodeItems::default()
+    };
+    let mut placed = EncodePlaced::new();
+    let (request, engine) = (pair_request(), &host.engine);
+    let asked = Listed(&request, lists);
+    let decided = engine.decide_encode_at(&asked, items, &mut placed, || now);
+    let (decided, later) = decided.expect("a decision");
+    let mut handle = DecisionGuard::holding(&door, GATEWAY, decided, later, now);
+    let side = handle.lease().map(|leased| leased.lease.side);
+    assert_eq!(side, Some(Side::Prefill));
+    assert!(!handle.decode_chosen(), "both sides are issued");
+    let target = handle.take(0).expect("the first pair");
+    let decode = decode_of(&target);
+    let encoder = worker_id(encoders.workers()[0].as_ref());
+    let named: Vec<WorkerId> = placed.encoders().iter().map(|at| at.id).collect();
+    assert_eq!(named, [encoder]);
+    let sent_at = now + Duration::from_micros(100);
+    handle.dispatched_decode(sent_at);
+    drop(handle);
+    let words = door.words();
+    let [first, released, Said::Completed(cancelled)] = words.as_slice() else {
+        panic!("the decode's send, the prefill's release, the decode's end: {words:?}");
+    };
+    assert_eq!(*first, sent(Side::Decode, 0, 100, sent_at));
+    let abandoned = ReleaseReason::Abandoned;
+    assert_eq!(*released, Said::Released(Some(Side::Prefill), abandoned));
+    assert_eq!(
+        (cancelled.side, cancelled.served, cancelled.class),
+        (Side::Decode, decode, TransportClass::Cancelled)
     );
 }
 

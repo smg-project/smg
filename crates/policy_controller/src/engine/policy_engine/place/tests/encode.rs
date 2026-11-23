@@ -6,7 +6,10 @@ use super::{
     super::encode::{ask, PLACED},
     *,
 };
-use crate::engine::{decision_engine::DecodeRefused, EncoderFacts};
+use crate::{
+    engine::{decision_engine::DecodeRefused, EncoderFacts},
+    tracking::lease::TransportClass,
+};
 
 /// The caller's admission as one test of a prefill's place: every decode
 /// has room.
@@ -549,6 +552,68 @@ fn an_encode_requests_targets_are_walked_with_its_encoders_kept() {
 
     trip(&three.workers[0][0]);
     assert_eq!(engine.place(&request).err(), Some(Unplaced::NoWorkers));
+}
+
+/// What an encode request reports: its pair's two sides, as a pair does,
+/// and nothing of an encode side. No lease stands for an encoder, so a
+/// send and an end said under the encode side reach no stage, move no
+/// worker's count and end no side. Both sides of the pair stay owed their
+/// own words, and the stages hear each as a pair's.
+///
+/// The classic router tells no policy of an encode call either. The code
+/// that sends the call counts it on its worker while it is in flight
+/// (`model_gateway/src/routers/grpc/common/stages/encode.rs:190-196` on
+/// main 384b8fd6b), so a placement that booked an encoder would count the
+/// call twice.
+#[test]
+fn an_encode_sides_send_and_end_say_nothing_and_leave_the_pair_owed() {
+    let (engine, heard) = hearing(fewest(DecodePick::default()));
+    let three = Three::of([1, 1, 1], |_, _| false);
+    let (prefill, decode) = (three.id(0, 0), three.id(1, 0));
+    let keys = [Identity::plain("item")];
+    let items = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    let request = asking(three.lists((&[PLAIN], &[1])), items);
+    let mut placement = engine.place(&request).expect("a placement");
+    assert_eq!(three.places(&placement), (0, 0, vec![0]));
+    let said = || heard.lock().clone();
+    let counts = || [0, 1, 2].map(|list| three.workers[list][0].load());
+    let (at_issue, booked) = (said(), counts());
+    assert_eq!(at_issue, [issued(prefill), issued(decode)]);
+    assert_eq!(booked[2], 0, "nothing is booked on an encoder");
+    // The end of a side that was served, as its caller says it.
+    let served = Outcome {
+        side: Side::Single,
+        served: WorkerId(0),
+        status: 200,
+        class: TransportClass::Ok,
+        ttft_micros: 0,
+        tokens_in: 0,
+        tokens_out: 0,
+        duration_micros: 0,
+    };
+    placement.sent(Side::Encode);
+    placement.ended(Side::Encode, served);
+    assert_eq!((said(), counts()), (at_issue, booked));
+    assert!(placement.owes_events(), "both sides of the pair are owed");
+    placement.sent(Side::Prefill);
+    placement.sent(Side::Decode);
+    placement.ended(Side::Prefill, served);
+    placement.ended(Side::Decode, served);
+    assert!(!placement.owes_events());
+    let word = |heard: &str, worker| (heard.to_owned(), worker);
+    assert_eq!(
+        said()[2..],
+        [
+            word("dispatched at 0", prefill),
+            word("dispatched at 0", decode),
+            word("completed Ok", prefill),
+            word("completed Ok", decode),
+        ]
+    );
+    assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 
 /// An encode request's decision that sheds is answered its shed by name,
