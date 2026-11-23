@@ -49,7 +49,7 @@ mod frame_request;
 mod gateway_places;
 mod gateways;
 mod generations;
-#[cfg(all(test, feature = "worker-host"))]
+#[cfg(test)]
 mod kv_feed;
 mod lifecycle;
 mod membership;
@@ -108,8 +108,6 @@ use self::{
     spec_store::SpecStore,
     standby::{Lag, Standby},
 };
-#[cfg(feature = "worker-host")]
-use crate::worker_host::{KvFeed, Members};
 use crate::{
     load::ingest::{
         loads::{LoadDriver, LoadDriverConfig},
@@ -118,6 +116,7 @@ use crate::{
     service::elector::{Elector, Fence},
     stages::registry::StageRegistry,
     store::{MemoryStore, WorkersStore},
+    worker_host::{KvFeed, Members},
 };
 
 /// The protobuf package of the controller's API.
@@ -164,13 +163,10 @@ pub struct Controller {
     admin_addr: SocketAddr,
     /// The replica's worker objects: one object of the worker crate a row
     /// of the store, followed by one task of the serve.
-    #[cfg(feature = "worker-host")]
     workers: Arc<worker_objects::WorkerObjects>,
-    #[cfg(feature = "worker-host")]
     kv_feed: KvFeed<Members>,
     /// The health probes of the replica's workers: one task of the serve,
     /// which probes while this replica leads.
-    #[cfg(feature = "worker-host")]
     prober: worker_objects::Prober,
     /// Worker discovery, where the configuration names a provider: one task
     /// of the serve, which runs the provider while this replica leads.
@@ -459,20 +455,16 @@ impl Controller {
         let (standing, stood) = watch::channel(ElectionObservation::default());
         let steps = stood.clone();
         // What a watched write wakes beside the feed: the follower of the
-        // replica's worker objects, where the build has one.
+        // replica's worker objects.
         let objects = worker_objects::ObjectsWake::default();
-        #[cfg(feature = "worker-host")]
         let woken = objects.clone();
         let journal =
             replication::journaled_waking(&config.election.lease, config.decide_shards, objects);
-        #[cfg(feature = "worker-host")]
         let workers = Arc::new(worker_objects::WorkerObjects::new(
             Arc::clone(&journal.0),
             woken,
         ));
-        #[cfg(feature = "worker-host")]
         let kv_feed = KvFeed::new(Arc::clone(&journal.0), workers.holder());
-        #[cfg(feature = "worker-host")]
         let prober = worker_objects::Prober::new(Arc::clone(&workers), elector.fence());
         let mut shared = Shared::new(
             config.controller_id.clone(),
@@ -515,11 +507,8 @@ impl Controller {
             listeners,
             admin,
             admin_addr,
-            #[cfg(feature = "worker-host")]
             workers,
-            #[cfg(feature = "worker-host")]
             kv_feed,
-            #[cfg(feature = "worker-host")]
             prober,
             #[cfg(feature = "discovery")]
             discovery,
@@ -838,11 +827,8 @@ impl Controller {
             spec_file,
             listeners,
             admin,
-            #[cfg(feature = "worker-host")]
             workers,
-            #[cfg(feature = "worker-host")]
             kv_feed,
-            #[cfg(feature = "worker-host")]
             prober,
             #[cfg(feature = "discovery")]
             discovery,
@@ -954,7 +940,6 @@ impl Controller {
         }
         // The worker objects follow the store on every replica alike: a
         // standby holds the objects its leader's rows make, there at a take.
-        #[cfg(feature = "worker-host")]
         {
             let workers_stop = stop.subscribe();
             tasks.spawn(async move {
@@ -1383,8 +1368,6 @@ mod tests {
         tell_readiness, tell_role, unnamed_port, Bound, ConfigError, Controller, EngineProbe,
         Error, NoFollow, Scope,
     };
-    #[cfg(feature = "worker-host")]
-    use crate::store::{HealthPolicy, WorkerFacts, WorkerStatus, WorkersStore};
     use crate::{
         engine::store_backed_engine::TERM_MARK,
         load::ingest::{
@@ -1395,7 +1378,7 @@ mod tests {
             ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, LeaseBackend,
             LeaseRecord, MemoryLease, TickOutcome,
         },
-        store::JournalKinds,
+        store::{HealthPolicy, JournalKinds, WorkerFacts, WorkerStatus, WorkersStore},
     };
 
     /// A lease that stores `writes` writes: the thread that steps it panics
@@ -1599,7 +1582,6 @@ mod tests {
     /// The serve starts the follower of the replica's worker objects, on
     /// the wake the store's log tells: a row written while the controller
     /// leads has its object, and a row removed has none.
-    #[cfg(feature = "worker-host")]
     #[tokio::test]
     async fn a_served_controller_holds_the_worker_objects_of_its_stores_rows() {
         let controller = Controller::bind(valid()).await.expect("the listeners bind");
@@ -1646,7 +1628,6 @@ mod tests {
     /// The serve starts the probes of the replica's workers: a row written
     /// while the controller leads is readied by the first probe its engine
     /// passes, with no hand on its status.
-    #[cfg(feature = "worker-host")]
     #[tokio::test]
     async fn a_served_controller_probes_its_rows_while_it_leads() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");

@@ -222,7 +222,7 @@ worker-host = [
 
 # Worker discovery on the leading controller, over the replica's worker
 # objects. Off by default.
-discovery = ["controller", "worker-host", "dep:smg-service-discovery"]
+discovery = ["controller", "dep:smg-service-discovery"]
 
 # The engine in a gateway's own process: one front over the gateway's worker
 # objects, which reads a worker's health where the worker crate keeps it. It
@@ -313,7 +313,7 @@ tikv-jemallocator = { workspace = true }
 [[bin]]
 name = "smg-policy-controller"
 path = "src/bin/smg-policy-controller.rs"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
 # A program that decides in its own process: it starts the engine and
 # serves each request by the one call the engine has for a request.
@@ -323,7 +323,7 @@ required-features = ["in-process"]
 
 [[test]]
 name = "binary"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
 [[test]]
 name = "operator_door"
@@ -331,11 +331,11 @@ required-features = ["operator"]
 
 [[test]]
 name = "spec_file"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
 [[test]]
 name = "spec_store"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
 # The program of the `in_process` example, driven by cases: the example's
 # own module, taken in as it stands.
@@ -358,7 +358,7 @@ required-features = ["kubernetes"]
 
 [[test]]
 name = "failover"
-required-features = ["client", "worker-host"]
+required-features = ["client"]
 
 [[test]]
 name = "fleet"
@@ -379,11 +379,11 @@ required-features = ["controller"]
 
 [[test]]
 name = "membership_calls"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
 [[test]]
 name = "replicas"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
 [[test]]
 name = "replication"
@@ -391,7 +391,7 @@ required-features = ["controller"]
 
 [[test]]
 name = "watch_workers"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
 [[bench]]
 name = "decision"
