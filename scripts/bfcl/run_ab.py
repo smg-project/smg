@@ -609,7 +609,9 @@ def incompleteness(arm: Arm, categories: list[str]) -> str | None:
     return "; ".join(reasons)
 
 
-def collect_scoring_validity(arm: Arm, categories: list[str]) -> dict:
+def collect_scoring_validity(
+    arm: Arm, categories: list[str], *, expected_sources: dict | None = None
+) -> dict:
     """Reconcile explicit inference errors with the official failure inventory.
 
     Official scores remain unchanged. An error absent from a complete failure
@@ -680,6 +682,19 @@ def collect_scoring_validity(arm: Arm, categories: list[str]) -> dict:
             ):
                 continue
             remaining -= len(body)
+            source = {
+                "path": str(path.relative_to(arm.project_root)),
+                "bytes": len(body),
+                "sha256": hashlib.sha256(body).hexdigest(),
+            }
+            # A later evaluate may overwrite a score without changing its
+            # accuracy/counts. Reconcile only the score snapshot saved with
+            # these results, never a new failure inventory for old scores.
+            if expected_sources is not None and json.dumps(
+                expected_sources.get(category), sort_keys=True, allow_nan=False
+            ) != json.dumps(source, sort_keys=True, allow_nan=False):
+                row["reason"] = "saved_score_source_mismatch"
+                continue
             records = [json.loads(line) for line in body.splitlines() if line.strip()]
             summary = records[0]
             total, correct, accuracy = (
@@ -711,11 +726,7 @@ def collect_scoring_validity(arm: Arm, categories: list[str]) -> dict:
                 status="invalid" if credited else "valid",
                 inference_error_ids=sorted(error_ids),
                 inference_errors_receiving_credit=credited,
-                source={
-                    "path": str(path.relative_to(arm.project_root)),
-                    "bytes": len(body),
-                    "sha256": hashlib.sha256(body).hexdigest(),
-                },
+                source=source,
             )
         except (OSError, ValueError, KeyError, TypeError, IndexError, RecursionError):
             continue
@@ -726,6 +737,34 @@ def collect_scoring_validity(arm: Arm, categories: list[str]) -> dict:
         if diagnostic.get("status") == "observed"
         and rows
         and all(row["status"] == "valid" for row in rows.values())
+        else "unknown"
+    )
+    return {"status": status, "categories": rows}
+
+
+def requested_scoring_validity(arm: Arm, categories: list[str]) -> dict:
+    """Scope already source-verified evidence to this comparison's categories."""
+    validity = arm.scoring_validity
+    evidence = validity.get("categories", {})
+    rows = {
+        category: evidence.get(
+            category, {"status": "unknown", "reason": "requested_category_unverified"}
+        )
+        for category in categories
+    }
+    # An aggregate UNKNOWN with no category explaining it remains UNKNOWN
+    # (e.g. unmatched saved diagnostic metadata). Excluding an independently
+    # unknown/invalid category may qualify the remaining verified categories.
+    unscoped_unknown = validity.get("status") == "unknown" and all(
+        row.get("status") == "valid" for row in evidence.values()
+    )
+    status = (
+        "invalid"
+        if any(row.get("status") == "invalid" for row in rows.values())
+        else "valid"
+        if rows
+        and all(row.get("status") == "valid" for row in rows.values())
+        and not unscoped_unknown
         else "unknown"
     )
     return {"status": status, "categories": rows}
@@ -789,18 +828,23 @@ def build_report(baseline: Arm, candidate: Arm, categories: list[str]) -> tuple[
     lines.append(overall_row("overall (unweighted)", b_overall, c_overall, overall_delta))
     lines.append(overall_row("overall (weighted by n)", b_weighted, c_weighted, weighted_delta))
     lines.append("")
-    incomplete = {a.name: incompleteness(a, categories) for a in (baseline, candidate)}
-    incomplete = {k: v for k, v in incomplete.items() if v}
-    for name, reason in incomplete.items():
-        lines.append(f"> ⚠️ **Incomplete arm `{name}`** — {reason}.")
+    arms = {"baseline": baseline, "candidate": candidate}
+    incomplete_by_role = {
+        role: reason for role, arm in arms.items() if (reason := incompleteness(arm, categories))
+    }
+    # Keep the existing display-name map for consumers. Roles preserve both
+    # arms' completeness when their human-readable names happen to match.
+    incomplete = {arms[role].name: reason for role, reason in incomplete_by_role.items()}
+    for role, reason in incomplete_by_role.items():
+        lines.append(f"> ⚠️ **Incomplete {role} arm `{arms[role].name}`** — {reason}.")
     if incomplete:
         lines.append("")
-    validity = {"baseline": baseline.scoring_validity, "candidate": candidate.scoring_validity}
+    validity = {role: requested_scoring_validity(arm, categories) for role, arm in arms.items()}
     validity_status = (
         "invalid"
         if any(v.get("status") == "invalid" for v in validity.values())
         else "valid"
-        if not incomplete and all(v.get("status") == "valid" for v in validity.values())
+        if not incomplete_by_role and all(v.get("status") == "valid" for v in validity.values())
         else "unknown"
     )
     comparison_validity = {
@@ -810,8 +854,8 @@ def build_report(baseline: Arm, candidate: Arm, categories: list[str]) -> tuple[
         "arms": validity,
     }
     lines.append(f"**Score comparison validity: {validity_status.upper()}**.")
-    for arm in (baseline, candidate):
-        for category, detail in arm.scoring_validity.get("categories", {}).items():
+    for role, arm in arms.items():
+        for category, detail in validity[role]["categories"].items():
             credited = detail.get("inference_errors_receiving_credit", [])
             if credited:
                 lines.append(
@@ -859,6 +903,7 @@ def build_report(baseline: Arm, candidate: Arm, categories: list[str]) -> tuple[
             "result_diagnostics": candidate.result_diagnostics,
         },
         "incomplete": incomplete,
+        "incomplete_by_role": incomplete_by_role,
         "comparison_validity": comparison_validity,
         "per_category": rows,
         "overall": {"baseline": b_overall, "candidate": c_overall, "delta": overall_delta},
@@ -869,6 +914,18 @@ def build_report(baseline: Arm, candidate: Arm, categories: list[str]) -> tuple[
         },
     }
     return "\n".join(lines), payload
+
+
+def score_source_snapshots(validity: dict) -> dict:
+    """Extract source bindings independently of cached validity verdicts."""
+    rows = validity.get("categories", {}) if isinstance(validity, dict) else {}
+    if not isinstance(rows, dict):
+        return {}
+    return {
+        category: row["source"]
+        for category, row in rows.items()
+        if isinstance(row, dict) and "source" in row
+    }
 
 
 def save_scores(arm: Arm, path: Path) -> None:
@@ -892,6 +949,7 @@ def save_scores(arm: Arm, path: Path) -> None:
                 "result_diagnostics": arm.result_diagnostics,
                 "score_directory": arm.score_directory,
                 "scoring_validity": arm.scoring_validity,
+                "score_sources": score_source_snapshots(arm.scoring_validity),
                 "result_source_root": relative_source,
             },
             indent=2,
@@ -937,10 +995,10 @@ def saved_result_diagnostics(data: dict, path: Path) -> tuple[dict, Path]:
             or not isinstance(counts, dict)
         ):
             return unknown, Path()
-        if set(rows) != set(scores) or set(rows) != set(counts):
+        if set(scores) != set(counts) or not set(scores) <= set(rows):
             return unknown, Path()
         if not all(
-            isinstance(key, str) and type(counts[key]) is int and counts[key] > 0 for key in rows
+            isinstance(key, str) and type(counts[key]) is int and counts[key] > 0 for key in scores
         ):
             return unknown, Path()
         fresh = collect_result_diagnostics(root, model, list(rows), {}, None, counts)
@@ -949,9 +1007,18 @@ def saved_result_diagnostics(data: dict, path: Path) -> tuple[dict, Path]:
         if json.dumps(cached, sort_keys=True, allow_nan=False) != json.dumps(
             fresh, sort_keys=True, allow_nan=False
         ):
-            # A missing/changed category cannot hide another category's freshly
-            # verified error. Retain actual per-category evidence, but do not
-            # promote this unmatched snapshot to an observed/valid comparison.
+            # Preserve only categories bound to the saved result snapshot.
+            # Fresh but changed results must not be paired with old scores;
+            # unchanged categories can still prove a known invalid result.
+            for category, row in fresh["categories"].items():
+                if json.dumps(rows[category], sort_keys=True, allow_nan=False) != json.dumps(
+                    row, sort_keys=True, allow_nan=False
+                ):
+                    fresh["categories"][category] = {
+                        "status": "unknown",
+                        "counts": None,
+                        "reason": unknown["reason"],
+                    }
             fresh.update(status="unknown", counts=None, reason=unknown["reason"])
             return fresh, root
         return fresh, root
@@ -975,7 +1042,13 @@ def load_scores(path: Path) -> Arm:
     )
     # A cached validity flag is not evidence: read the contained current score
     # and result sources again, just as for saved result diagnostics above.
-    arm.scoring_validity = collect_scoring_validity(arm, list(arm.scores))
+    # Earlier saved files kept source descriptors inside scoring_validity.
+    # Those descriptors are byte bindings only; no saved verdict is trusted.
+    sources = data.get("score_sources", score_source_snapshots(data.get("scoring_validity")))
+    if not isinstance(sources, dict):
+        sources = {}
+    categories = list(dict.fromkeys([*arm.scores, *diagnostic.get("categories", {})]))
+    arm.scoring_validity = collect_scoring_validity(arm, categories, expected_sources=sources)
     return arm
 
 
@@ -1009,8 +1082,9 @@ def write_report_and_gate(
         exit_code = EXIT_REGRESSION
 
     # An incomplete arm outranks a regression: there is no trustworthy delta to gate on.
-    for name, reason in payload["incomplete"].items():
-        print(f"\nINCOMPLETE: arm {name} — {reason}", file=sys.stderr)
+    for role, reason in payload["incomplete_by_role"].items():
+        arm = baseline if role == "baseline" else candidate
+        print(f"\nINCOMPLETE: {role} arm {arm.name} — {reason}", file=sys.stderr)
     check_work(baseline, deadline)
     check_work(candidate, deadline)
     if any(lifecycle_failed(arm) for arm in (baseline, candidate)):
@@ -1025,7 +1099,7 @@ def write_report_and_gate(
     elif payload["comparison_validity"]["status"] == "invalid":
         print("INVALID COMPARISON: inference errors received official credit", file=sys.stderr)
         exit_code = EXIT_INCOMPLETE
-    elif payload["incomplete"] and not args.allow_incomplete:
+    elif payload["incomplete_by_role"] and not args.allow_incomplete:
         exit_code = EXIT_INCOMPLETE
     return exit_code
 
