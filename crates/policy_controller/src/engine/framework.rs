@@ -8465,6 +8465,14 @@ mod tests {
         // Prefill workers: no key is kept over them.
         let mut prefill = with(|row| row.role = Role::Prefill);
         prefill[1].health.overloaded = true;
+        // Nor over decode workers or encode workers: every role but the
+        // regular one passes the key on, as the gateway's own placement
+        // asks that every candidate is a regular worker
+        // (model_gateway/src/routers/common/placement.rs:1337).
+        let mut decode = with(|row| row.role = Role::Decode);
+        decode[1].health.overloaded = true;
+        let mut encode = with(|row| row.role = Role::Encode);
+        encode[1].health.overloaded = true;
         let plain = RequestFacts {
             model: "m",
             ..RequestFacts::default()
@@ -8578,6 +8586,8 @@ mod tests {
                 &prefill,
                 false,
             ),
+            ("kept, decode workers", None, true, &keyed, &decode, false),
+            ("kept, encode workers", None, true, &keyed, &encode, false),
         ];
         let cx = &Constraints::default();
         for (path, sessions, keeps, facts, rows, pinned) in paths {
@@ -8603,9 +8613,9 @@ mod tests {
                 .expect("a shadow decision");
             assert_eq!(said(&shadow), said(&live), "{path}");
             assert_eq!(shadow.trace().profile, 1, "{path}");
-            // The prefill worker over its thresholds passes the key on: a
-            // kept key would take it.
-            if rows[0].role == Role::Prefill {
+            // A worker of another role over its thresholds passes the key
+            // on: a kept key would take it.
+            if rows[0].role != Role::Single {
                 assert_eq!(said(&live).0, [free[0].id], "{path}");
             }
             if !facts.session_key.is_none() {
