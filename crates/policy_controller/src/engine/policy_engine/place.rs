@@ -64,12 +64,9 @@ mod target;
 use std::{
     any::Any,
     cell::{Cell, OnceCell},
-    collections::hash_map::RandomState,
     fmt,
-    hash::BuildHasher,
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     sync::Arc,
-    thread,
     time::Instant,
 };
 
@@ -98,10 +95,10 @@ use crate::{
             Constraints, Header, Identity, MediaCounts, Phase, RequestFacts, WireModes, WorkerId,
         },
     },
+    fresh_seed,
     policies::consistent_hashing::{Head, LentRing},
     store::GatewayId,
     tracking::{lease::ReleaseReason, DecisionGuard, Placement},
-    Draw,
 };
 
 /// A request's headers, as its caller holds them.
@@ -377,25 +374,6 @@ impl<'a> PlaceRequest<'a> {
             WorkerLists::None | WorkerLists::Single(_) => Phase::Single,
         }
     }
-}
-
-/// A seed no other request of this thread was given: the one randomness a
-/// stage gets ([`RequestFacts::seed`]). Under a constant seed a policy that
-/// draws picks the same worker of an unchanged pool every time.
-///
-/// Each thread walks a draw sequence of its own ([`Draw`]). Its start is
-/// the standard library's process-random hash of the thread's id, so two
-/// threads and two runs of a process start apart.
-fn fresh_seed() -> u64 {
-    thread_local! {
-        static NEXT: Cell<u64> = Cell::new(RandomState::new().hash_one(thread::current().id()));
-    }
-    NEXT.with(|next| {
-        let mut draw = Draw::new(next.get());
-        let seed = draw.next_u64();
-        next.set(draw.state());
-        seed
-    })
 }
 
 /// One request as the engine makes it of what its caller stated: the one

@@ -8,6 +8,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     ptr,
     sync::atomic::{self, AtomicU32},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -852,7 +853,7 @@ fn a_placement_names_the_profile_that_picked_by_its_label() {
         _ => None,
     };
     let (turns, again) = (spared("round_robin"), spared("round_robin"));
-    let (passes, draws) = (spared("passthrough"), spared("random"));
+    let (passes, draws) = (spared("passthrough"), spared("power_of_two"));
     let at = [alone_at(turns), alone_at(passes), alone_at(draws)];
     assert_eq!(at, [Some(1), Some(1), None]);
 
@@ -863,7 +864,7 @@ fn a_placement_names_the_profile_that_picked_by_its_label() {
     // The other document's second profile has another name.
     assert_eq!(placed(passes).profile, "passthrough");
     // A whole decision's placement names its profile the same way.
-    assert_eq!(placed(draws).profile, "random");
+    assert_eq!(placed(draws).profile, "power_of_two");
 }
 
 /// Placing a request asks the process's table of names for nothing: the
@@ -872,7 +873,7 @@ fn a_placement_names_the_profile_that_picked_by_its_label() {
 #[test]
 fn placing_a_request_asks_the_table_of_names_for_nothing() {
     let asked = || crate::names::ASKED.with(Cell::get);
-    for name in ["round_robin", "random"] {
+    for name in ["round_robin", "power_of_two"] {
         let engine = hosted(preset(name));
         let list = pool(4);
         let members = PublishedList::new(Arc::clone(&list));

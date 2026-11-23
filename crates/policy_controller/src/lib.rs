@@ -166,6 +166,8 @@
 //! [`Needs`]: document::Needs
 //!
 
+use std::{cell::Cell, collections::hash_map::RandomState, hash::BuildHasher, thread};
+
 #[cfg(any(feature = "ingest", feature = "operator"))]
 mod address;
 pub mod document;
@@ -271,6 +273,26 @@ impl Draw {
     pub(crate) const fn state(self) -> u64 {
         self.0
     }
+}
+
+/// A seed no other request of this thread was given: the one randomness a
+/// stage gets ([`engine::RequestFacts::seed`]), and what a picker
+/// that places by itself draws from. Under a constant seed a policy that
+/// draws picks the same worker of an unchanged pool every time.
+///
+/// Each thread walks a draw sequence of its own ([`Draw`]). Its start is
+/// the standard library's process-random hash of the thread's id, so two
+/// threads and two runs of a process start apart.
+pub(crate) fn fresh_seed() -> u64 {
+    thread_local! {
+        static NEXT: Cell<u64> = Cell::new(RandomState::new().hash_one(thread::current().id()));
+    }
+    NEXT.with(|next| {
+        let mut draw = Draw::new(next.get());
+        let seed = draw.next_u64();
+        next.set(draw.state());
+        seed
+    })
 }
 
 #[cfg(test)]

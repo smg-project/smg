@@ -570,7 +570,15 @@ fn a_shadow_equal_to_the_live_profile_agrees_at_every_seed() {
             loads: loads.clone(),
             ..Asks::of(request(seed), Some(&members))
         };
-        decided(engine, &asks).decision
+        // A plain `random` request with no shadow is answered a place: its
+        // whole decision is the one the entry that issues no lease makes.
+        match answered(engine, &asks).whole() {
+            Some((decided, _)) => decided.decision,
+            None => {
+                let whole = engine.decide_without_lease(&asks, Instant::now());
+                whole.expect("a whole decision").0
+            }
+        }
     };
     for preset in ["least_load", "power_of_two", "random"] {
         let engine = engine_of(with_shadow_profile(preset, profile_of(preset)), &stages);

@@ -387,7 +387,7 @@ mod tests {
     /// whichever picker its profile holds, and both answers name the rule.
     #[test]
     fn a_place_whose_binding_states_a_sessions_rule_is_not_one_picks() {
-        for profile in ["round_robin", "passthrough"] {
+        for profile in ["round_robin", "random", "passthrough"] {
             let plain = engine_of(&preset(profile));
             let before = plain.place_for(MODEL, Phase::Single);
             assert!(matches!(before, Place::Alone(_)), "{profile}: {before:?}");
@@ -417,10 +417,10 @@ mod tests {
     /// shadow.
     #[test]
     fn a_stage_is_named_ahead_of_the_binding() {
-        let plain = engine_of(&preset("random"));
+        let plain = engine_of(&preset("power_of_two"));
         let before = plain.place_for(MODEL, Phase::Single);
-        let in_the_way = InTheWay::Picker("random");
-        let profile = "random";
+        let in_the_way = InTheWay::Scorer("least-load");
+        let profile = "power_of_two";
         assert_eq!(
             before,
             Place::NotAlone {
@@ -428,7 +428,7 @@ mod tests {
                 in_the_way
             }
         );
-        for document in [ruled("random"), shadowed_by("random", "round_robin")] {
+        for document in [ruled(profile), shadowed_by(profile, "round_robin")] {
             let engine = engine_of(&document);
             assert_eq!(engine.place_for(MODEL, Phase::Single), before);
         }
