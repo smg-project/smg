@@ -12,7 +12,7 @@ use llm_multimodal::{
 };
 use openai_protocol::worker::MmProcessingMode;
 use parking_lot::RwLock;
-use smg_worker::connection::http_client::build_with;
+use smg_worker::{connection::http_client::build_with, identity::basic::WorkerType};
 use tracing::{debug, warn};
 
 use super::{
@@ -537,6 +537,10 @@ pub(crate) struct MultimodalComponents {
     /// the way its loader does (the worker-side pipeline knows it; `None`
     /// keeps each spec's own constant).
     pub video_frame_budget: Option<usize>,
+    /// The role whose workers take a request's pixels in the router's mode
+    /// (`Mode::pixels_go_to`); the regular workers unless the router says
+    /// otherwise.
+    pub pixels_go_to: WorkerType,
 }
 
 impl MultimodalComponents {
@@ -628,6 +632,7 @@ impl MultimodalComponents {
             drain_fetches_on_error: false,
             inflight,
             video_frame_budget: None,
+            pixels_go_to: WorkerType::Regular,
         })
     }
 }
