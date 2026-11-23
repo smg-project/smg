@@ -5,11 +5,10 @@ request. It is written for a reader who knows the gateway and has not followed t
 README beside this folder is the user's guide (how to write a policy document, how to run the
 service). This file is the design.
 
-It describes the crate as it stands on main (read at commit `882be6f4f`, 2026-11-22) and what is
-planned. One thing on that commit is on its way out: the gateway still calls the engine through
-an earlier integration, which a pull request of its own removes first (stage 0 of section 16).
-Where the text speaks of the gateway, it speaks of main with that integration taken out. Every
-part has one of three marks:
+It describes the crate as it stands on main and what is planned. It was read whole at commit
+`882be6f4f` (2026-11-22). Four subjects were read again at commit `ce421ddd3` (2026-11-23): the
+gateway's option (sections 1 and 9), who sends a worker's data (4.3, 4.5, 10.1 and 10.2), the one
+engine (5.7) and a gateway under a controller (11). Every part has one of three marks:
 
 - **[built]**: on main as described.
 - **[partly]**: on main in part. The text says which part.
@@ -53,9 +52,10 @@ in two places:
 | Engine in the gateway | the engine, inside the gateway | the gateway, in the same structures as classic | **[partly]** |
 | Engine in a controller | the controller | the controller | **[partly]** |
 
-On main the gateway still calls the engine through an earlier integration. That integration is
-taken out first (stage 0 of section 16), so that the crate can be finished before the gateway
-depends on it. Section 9 says how the gateway gets the engine back, as one small change.
+On main the gateway calls the engine behind an option that is off by default (section 9). It
+once called the engine through an earlier integration. That integration was taken out first
+(stage 0 of section 16), so that the crate could be finished before the gateway depended on it.
+The engine then came back as one change.
 
 ### The seven rules
 
@@ -410,6 +410,19 @@ records that workers push. A worker whose pushed records are fresh is not polled
 is published after each poll, and for pushed records at most once in 20 ms. A snapshot is never
 changed after it is published.
 
+**Who opens the stream.** A worker pushes on a stream that its host opens to it. The worker
+crate's collector connects to the worker and subscribes, and the worker answers on that stream
+(`crates/worker/src/kv_events/`). It sends its cache events with the load records that ride
+them, or its load records alone where the host keeps no index of its cache. The collector hands
+the load records to the load monitor and the cache events to the index of cache events
+(section 4.5). Only a worker dialed over gRPC has such a stream; the monitor polls the others.
+A worker dials nobody for this, so it needs no address of a gateway or of a controller.
+
+The host that opens the stream is the process that holds the workers' data (the table of
+section 1): the gateway in classic and with the engine in the gateway, the controller with the
+engine in a controller (section 10.2). So a worker's data takes one way in every mode. Only the
+process that opens the stream changes.
+
 ### 4.4 The in-flight counters **[built]** (`smg-worker`)
 
 A route creates one `WorkerLoadGuard` for the worker it chose. The guard adds one to the worker's
@@ -505,6 +518,15 @@ request goes to.
   trees for each side. **[planned]** The engine reads the host's trees for each side.
 
 A decision of the engine publishes no insert to other gateways.
+
+**What the workers send and what they do not.** Only record A comes from the workers: the cache
+events they push fill the index and nothing else. Records B and C are the deciding process's own
+account of the prompts it sent, written by its policy at each decision. No worker pushes them and
+no worker's stream carries them. In classic the gateway's policy keeps them. With the engine in
+the gateway the gateway keeps them and lends them to the engine. On main it lends none yet
+(section 9.2). Until it does, a request under the engine reads the index and the hash table, and
+a pair reads no record of sent prefixes. A controller keeps its own, and section 11 says what its
+contract must hold for that.
 
 One change was made outside the policy crate first **[built]**: classic's trees moved out of
 its policy object into one store type of the kv-index crate (`ModelTrees`), with no behaviour
@@ -831,27 +853,22 @@ once for each new load snapshot and list, the converted load reports, which allo
 short path it allocates nothing. A draw that looked up load reports counts them toward its list's
 conversion where it takes the list's claim, which it tries and never waits for.
 
-### 5.7 Two engines today, one that stays **[partly]**
+### 5.7 One engine **[partly]**
 
-Main has two engines behind one trait (`DecisionEngine`, `engine/decision_engine.rs`).
+Main has one engine, `PolicyEngine`, behind the trait `DecisionEngine`
+(`engine/decision_engine.rs`). It decides over its host's worker objects, read in place. It keeps
+no lease: the host hands the lease back with each event. This document also calls it the kept
+engine.
 
-| | `PolicyEngine` | the store-backed engine |
-|---|---|---|
-| decides over | the host's worker objects, read in place | records copied into the policy store |
-| keeps leases | no: the host hands the lease back with each event | yes, in the store |
-| used by | the gateway's earlier integration, until stage 0 takes it out; the controller's service, for a single request | the controller's service, for a lease's words and its counters; it decides no request there |
-| size | 6,228 lines with its folder | 12,461 lines with its folder, plus the store's tables |
+A second engine stood beside it: the store-backed engine, also called the old engine here. It
+decided over records copied into the policy store and kept its leases there. Its type is deleted,
+a step of stage 4 (section 16). The store's copies of the worker data that only it read are
+deleted in the steps behind it (sections 10.2 and 10.3). A controller answers a pair's phases
+`Busy` until they are decided over worker lists (decision 5).
 
-**The design keeps `PolicyEngine` and removes the store-backed engine [partly].** The controller
-gets worker objects of its own (section 10), so its service calls the same engine a gateway
-calls. The switch is made in steps (decision 5): a single request is decided by `PolicyEngine`
-on main (10.1), the store-backed engine is deleted right behind that step, and a pair's phases,
-answered `Busy` meanwhile, are then decided by the one engine.
-
-The two engines still share types. `Request`, `DecideOutcome`, `DecisionRefused`, `DecodeRefused`
-and `SweepOutcome` are defined in the trait's file, and `Said` (section 6) beside `Lease`. They
-were moved there with no behaviour change, because deleting the old engine would otherwise break
-the kept one. `GatewayId` is still defined in the store.
+The types the two engines shared stay where they were moved ahead of the deletion: `Request`,
+`DecideOutcome`, `DecisionRefused`, `DecodeRefused` and `SweepOutcome` in the trait's file, and
+`Said` (section 6) beside `Lease`. `GatewayId` is still defined in the store.
 
 ### 5.8 What changes in the kept engine **[planned]**
 
@@ -1063,7 +1080,7 @@ the decision's lease and report each event; turn a refusal into a status. For a 
 `Placement` keeps the lease. The host still says the two events and turns a refusal into a
 status.
 
-That is too much. The gateway's earlier integration needs a module of its own of 19 files and
+That is too much. The gateway's earlier integration needed a module of its own of 19 files and
 13,856 lines (tests included) for it, and a branch in every route.
 
 A host that keeps a hash ring of a model's workers can lend it with a request: the request's facts
@@ -1343,8 +1360,8 @@ The design adds no second mechanism where one exists.
 
 ## 9. The gateway as a host **[partly]**
 
-After stage 0 the gateway did not call the engine. This section is the shape of the one change
-that brings it back, behind an option that is off by default (section 9.3).
+After stage 0 the gateway did not call the engine. This section is the one change that brought it
+back, behind an option that is off by default (section 9.3).
 
 ### 9.1 Where classic chooses a worker
 
@@ -1413,7 +1430,7 @@ request ──> route (HTTP or gRPC, any family)
 
   The gateway's rank option (`dp_minimum_tokens_scheduler`) is refused at the start beside the engine, under the settings' own document and under a supplied one. A worker object that stands for several ranks states no rank, and outside those two places its request is sent with none.
 
-The change also writes again three small things that stage 0 takes out with the earlier
+The change also wrote again three small things that stage 0 took out with the earlier
 integration: the gateway's two readers of its own index of cache events for the engine (about
 130 lines on main today), the pair classes read from the gateway's pair index (one file of 282
 lines), and the cell beside each published list.
@@ -1438,7 +1455,7 @@ The bar for that change:
 | `--policy-spec FILE` | run this document in place of the one the routing flags mean |
 | `--print-policy-spec` | print the document the routing flags mean, and exit |
 
-They come back with the change (decision 9). No released version has them.
+They came back with the change (decision 9). No released version has them.
 
 ## 10. The controller **[partly]**
 
@@ -1457,9 +1474,9 @@ Its data is one in-memory store (`store/memory.rs`):
 | Data | Filled by | Note |
 |---|---|---|
 | worker records | the `RegisterWorker`, `PatchWorker`, `DeregisterWorker` calls | discovery is in the code behind a feature the image leaves out, and registers nothing yet |
-| worker objects | a task that follows the worker records | a second form of the same workers, of the worker crate's type; each states its registration's overload thresholds over one default, 8 queued requests and 0.8 usage, and no monitor judges by them yet; an object's status follows its record's, and a single request's decision reads the workers here |
+| worker objects | a task that follows the worker records | a second form of the same workers, of the worker crate's type; each states its registration's overload thresholds over one default, 8 queued requests and 0.8 usage, and the load monitor judges by them while the replica leads; an object's status follows its record's, and a single request's decision reads the workers here |
 | health | the worker crate's health checker over the worker objects, on the leader | copied into the records |
-| loads | the crate's own poller, every 10 seconds | `PushLoad` is not served; a single request's decision reads none yet |
+| loads | the worker crate's load monitor over the worker objects, every 10 seconds while the replica leads; the crate's own poller still runs beside it | `PushLoad` is not served; a single request's decision is given the monitor's snapshot where the document reads reports and keeps none; no decision reads the poller's table |
 | cache index | a follower of each worker's cache events | an index of the store's own; `PushKvEvents` is not served; a single request's decision reads none yet, only the engine's own record of sent prompts |
 | sessions, leases | decisions (leases only) | not replicated to a standby; a single request's session pins are the engine's own table, one for each document, and no decision reads the store's pins |
 
@@ -1498,6 +1515,19 @@ the worker crate's structures, and the one engine.
 | leases | the store's lease tables, in memory, one for each deciding thread | stay: a controller must remember what it issued to gateways |
 | decisions | a single request: `PolicyEngine::decide_without_lease` over the registry's list; a pair's phases: none, the request is answered `Busy` | `PolicyEngine::decide_without_lease` over the registry's lists |
 | discovery | not registering | the discovery crate through its host interface, registering through the worker crate's job queue |
+
+**Who sends a worker's data.** Nothing changes for a worker. It pushes its load records and its
+cache events on the stream its host opens (section 4.3), and here the host is the controller. The
+controller runs the worker crate's collector and load monitor over its own worker objects, as a
+gateway does in classic. A gateway under a controller opens no such stream (section 11). On main
+the controller already opens the workers' streams with that collector, for their cache events,
+and runs that load monitor while it leads. The monitor is fed by its polls alone there: the load
+records that ride the streams are not handed to it yet.
+
+The contract has two calls that would push the same data to a controller, `PushLoad` and
+`PushKvEvents`. They are a relay's calls, not a worker's. A relay is a gateway in front of a
+worker that only it can reach, and it would forward what that worker's stream brought. Neither
+call is served, and this design names no use for them.
 
 What leaves the crate with that switch: the store-backed engine, the store's copies of the worker
 data that a worker object holds, the crate's own load poller, and the adapters that write worker
@@ -1631,6 +1661,18 @@ gateway                                           controller (leader)
 - The gateway keeps what is its own: the connections to the workers it dials, its circuit
   breakers, its in-flight counts and its rate limits. It runs no discovery, no health checker and
   no load monitor.
+- A rate limiter is no part of this design: the gateway keeps its own. Its later home is reserved
+  in the schema: a binding's `admission` block, which a document may not switch on today
+  (section 14). A limit written there would be decided with the placement. Three things stand to
+  build on. A decision can already refuse a request, with a reason and a time to retry. A lease's
+  events say when a request starts and ends. A request states its tenant to the engine
+  (`PlaceRequest::tenant`); the gateway fills none yet, and no binding may match by tenant yet.
+  That block is not the admission window of a pair's prefills, which stays the host's
+  (section 8.2).
+- Of the workers, the controller tells a gateway their list alone, on `WatchWorkers`: each
+  worker's address, role, models and status, with the facts a decision reads of it. It sends a
+  gateway no load report and no cache event: that data goes to the controller alone
+  (section 10.2).
 - The gateway's side is the same five functions of section 9, made asynchronous: an answer from a
   controller is a round trip, so each route's call changes by that much.
 - The request crosses in the contract's own form. The prompt crosses as hashes of its blocks, not
@@ -1638,6 +1680,10 @@ gateway                                           controller (leader)
   gateway excludes. So a controller matches a prompt by whole blocks. For the two trees of
   section 4.5 the contract must hold token ids, or the trees must be keyed by block hashes. The
   controller's own design settles which.
+- The gateway tells the controller what became of each request, on `Session`: its dispatch, then
+  its completion with the outcome (status, time to first token, tokens in and out, duration), or
+  its release with a reason. A controller's stages learn of the requests they placed from these
+  (section 6). In process the gateway tells its own engine no outcome yet (section 9.2).
 - When no answer comes in time (no credit on the stream, a change of leader, the controller
   gone), the gateway decides by itself with the same engine, under the document the controller
   pushed, over the worker list it follows (decision 6). That list stops changing while the
@@ -1645,9 +1691,9 @@ gateway                                           controller (leader)
 - Open: where a gateway under a controller gets a worker's API key. The contract's worker entry
   has no field for one.
 
-On main none of this is wired. A gateway given an address only follows the controller's worker
-list and decides every request itself, and it refuses prefill-decode and encode requests. That
-code leaves with the earlier integration.
+On main the controller's half is served (section 10.1): `Decide`, `Session` in part and
+`WatchWorkers`. No gateway calls it: the gateway has no option for a controller's address, and
+the document is not pushed yet.
 
 ## 12. User stages **[partly]**
 
@@ -1916,9 +1962,9 @@ inside the crate only.
 
 **Recommendation: (a).**
 
-**As taken.** The deciding threads were switched for a single request first (section 10.1). The
-store-backed engine is deleted right behind that step, and a request of a prefill, a decode or an
-encode phase, answered `Busy` meanwhile, is then decided by the one engine over worker lists.
+**As taken.** The deciding threads were switched for a single request first (section 10.1), and
+the store-backed engine's type was deleted behind that step. A request of a prefill, a decode or
+an encode phase is answered `Busy` until the one engine decides it over worker lists.
 
 ### Decision 6: a gateway under a controller that gets no answer in time
 
