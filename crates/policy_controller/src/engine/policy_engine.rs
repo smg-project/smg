@@ -368,6 +368,21 @@ impl PolicyEngine {
         }
     }
 
+    /// [`Self::new`] on the clock of a host that reads one of its own and
+    /// builds an engine for each of its documents: the engine's clock
+    /// starts at `origin`, the host's. An instant then reads alike under
+    /// every document and on the host's clock, so what one document's
+    /// stages stamped and the next takes over, a profile's count of sends
+    /// ([`Engine::succeed`](crate::engine::framework::Engine::succeed)),
+    /// is read on the clock it was written on.
+    #[must_use]
+    pub(crate) fn with_origin(spec: AppliedSpec, origin: Instant) -> Self {
+        Self {
+            clock: DecisionClock::from_origin(origin),
+            ..Self::new(spec)
+        }
+    }
+
     /// What the engine keeps for its affinity stages: the gateway hands its
     /// indexes of cache events here, once, at its start
     /// ([`Affinity::set_indexes`]), and reads the record's own count
@@ -733,11 +748,8 @@ impl PolicyEngine {
     /// ([`Self::decide_decode_without_lease`]).
     /// [`DecisionRefused::Faulted`] where the decision panicked.
     #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the controller's service calls it once it decides by this engine"
-        )
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "a controller's deciding thread calls it")
     )]
     pub(crate) fn decide_without_lease(
         &self,

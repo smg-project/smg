@@ -108,11 +108,8 @@ impl PolicyEngine {
     /// whose filing fails calls nothing, so that decision's shadow counts
     /// none. A decision that had no shadow counts nothing.
     #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the controller's service calls it once it decides by this engine"
-        )
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "a controller's deciding thread calls it")
     )]
     pub(crate) fn count_shadow(&self, said: Option<Shadowed>) {
         if let Some(said) = said {

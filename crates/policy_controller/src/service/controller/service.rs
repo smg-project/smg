@@ -81,6 +81,7 @@ use crate::{
     },
     stages::registry::StageRegistry,
     store::MemoryStore,
+    worker_host::{Members, Objects},
 };
 
 /// A leader's refusal in the instant between its take of the lease and its
@@ -221,7 +222,9 @@ impl Shared {
     /// another fence guards. A spec document names the stages `catalog`
     /// holds. `deciders` is how many threads decide. The store comes with
     /// the feed of the log it journals to, the one value one place builds
-    /// ([`journaled_waking`](super::replication::journaled_waking)).
+    /// ([`journaled_waking`](super::replication::journaled_waking)), and
+    /// with the holder of the replica's worker objects, which follow that
+    /// store: the deciders decide over their lists.
     ///
     /// # Errors
     ///
@@ -231,7 +234,7 @@ impl Shared {
         address: String,
         elector: &Elector,
         standing: watch::Receiver<ElectionObservation>,
-        (store, feed): (Arc<MemoryStore>, Feed),
+        (store, feed, objects): (Arc<MemoryStore>, Feed, Arc<Objects<Members>>),
         catalog: Arc<StageRegistry>,
         deciders: usize,
     ) -> io::Result<Self> {
@@ -246,6 +249,7 @@ impl Shared {
             decision_slots::QUEUE_DEPTH,
             &Reads {
                 store: Arc::clone(&store),
+                objects,
                 fence: elector.fence(),
                 standing: standing.clone(),
                 clock: Arc::new(Instant::now),
@@ -1217,7 +1221,7 @@ mod tests {
                 ADDRESS.to_owned(),
                 &elector,
                 stood,
-                journaled_for(&LeasePlace::Process, 0, 2),
+                bed::followed(journaled_for(&LeasePlace::Process, 0, 2)),
                 Arc::new(catalog),
                 2,
             )
@@ -1274,7 +1278,7 @@ mod tests {
             ADDRESS.to_owned(),
             &elector,
             stood,
-            (Arc::clone(&store), feed),
+            bed::followed((Arc::clone(&store), feed)),
             Arc::new(StageRegistry::builtin()),
             1,
         )
@@ -1361,7 +1365,7 @@ mod tests {
             ADDRESS.to_owned(),
             &elector,
             stood,
-            (store, feed),
+            bed::followed((store, feed)),
             Arc::new(StageRegistry::builtin()),
             1,
         )
@@ -1403,7 +1407,7 @@ mod tests {
             ADDRESS.to_owned(),
             &elector,
             stood,
-            (store, feed),
+            bed::followed((store, feed)),
             Arc::new(StageRegistry::builtin()),
             1,
         )
@@ -1469,7 +1473,7 @@ mod tests {
             ADDRESS.to_owned(),
             &elector,
             stood,
-            (Arc::clone(&store), feed),
+            bed::followed((Arc::clone(&store), feed)),
             Arc::new(StageRegistry::builtin()),
             1,
         )
@@ -1597,7 +1601,7 @@ mod tests {
                 ADDRESS.to_owned(),
                 &elector,
                 stood,
-                (Arc::clone(&store), feed),
+                bed::followed((Arc::clone(&store), feed)),
                 Arc::new(StageRegistry::builtin()),
                 2,
             )
@@ -2173,7 +2177,7 @@ mod tests {
                     ADDRESS.to_owned(),
                     &elector,
                     stood,
-                    (store, feed),
+                    bed::followed((store, feed)),
                     Arc::new(StageRegistry::builtin()),
                     2,
                 )
@@ -2531,11 +2535,26 @@ mod tests {
             assert_eq!((record.generation, record.binding), (1, 1));
             assert_eq!(record.decision, Some(decided));
             assert!(record.at_unix_micros > 0);
-            assert_eq!(record.profile_name, "z-first");
-            assert_eq!(record.plan_name, "single");
-            assert_eq!(record.picker_name, "best");
-            assert_eq!(record.filter_names, ["healthy"]);
-            assert_eq!(record.scorer_names, ["least-load"]);
+            // A model no worker serves is shed before a profile is chosen:
+            // its record names none.
+            let served = model == bed::MODEL;
+            let (profile, picker): (&str, &str) = if served {
+                ("z-first", "best")
+            } else {
+                ("", "")
+            };
+            let (filters, scorers): (&[&str], &[&str]) = if served {
+                (&["healthy"], &["least-load"])
+            } else {
+                (&[], &[])
+            };
+            assert_eq!(record.profile_name, profile);
+            assert_eq!(record.picker_name, picker);
+            assert_eq!(record.filter_names, filters);
+            assert_eq!(record.scorer_names, scorers);
+            if served {
+                assert_eq!(record.plan_name, "single");
+            }
             assert_eq!((record.decision_id, record.view_digest), (0, 0));
             assert!(record.candidates.is_empty() && record.projections.is_empty());
             assert!(record.request.is_none() && record.outcome.is_none());

@@ -657,10 +657,21 @@ pub(crate) enum Beside {
     /// The session key of the decode side's lease of a pair's pick. That
     /// lease is the prefill side's under this key: one id, one record, and
     /// at the answer one index and one count of tokens.
+    #[cfg_attr(
+        not(all(test, feature = "client")),
+        expect(
+            dead_code,
+            reason = "a pair's lease is handed over again once a pair is decided over worker lists"
+        )
+    )]
     Decode(Session),
     /// The issue of a decode call's pick. Where the answer does not leave,
     /// its sender takes this one issue back: the prefill that runs under
     /// the same lease keeps its booking ([`Leased::given_up`]).
+    #[expect(
+        dead_code,
+        reason = "a decode call's lease is handed over again once it is decided over worker lists"
+    )]
     Issue(DecodeIssue),
 }
 

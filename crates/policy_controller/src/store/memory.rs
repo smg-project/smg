@@ -32,6 +32,7 @@ use crate::{
     load::signals::{in_range, SignalCell, SignalColumn},
     stages::lifecycle::Lifecycle,
     store::{
+        applied::Applied,
         health::{HealthSink, HealthWrite, LeaderBits, VetoWrite},
         index::{indexed_under, KvEvent, KvTables, LaneCounts, LaneWriter},
         journal::{Journal, JournalKinds, Position},
@@ -930,7 +931,7 @@ impl MemoryStore {
     ) -> Result<bool, StaleGeneration> {
         // The writer takes a second reference: when it refuses, the last
         // one is this one, let go after the lock.
-        let spec = Arc::new(spec);
+        let spec = Arc::new(Applied::new(spec, self.origin));
         let generation = spec.generation();
         let before = {
             // Taken before the lock, so dropped after it: the journal
@@ -4787,6 +4788,10 @@ impl MemoryStore {
     /// since, and nothing moves: the caller tells its engine of a release
     /// only behind `true`.
     #[cfg(feature = "controller")]
+    #[expect(
+        dead_code,
+        reason = "a decode call's lease is taken back again once it is decided over worker lists"
+    )]
     pub(crate) fn unissue_decode(
         &self,
         gateway: GatewayId,

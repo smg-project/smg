@@ -28,6 +28,7 @@ use crate::{
     },
     stages::{lifecycle::Lifecycle, scorers::ResidentWork},
     store::{
+        applied::Applied,
         loads::LoadSample,
         pairing::{PairingDescriptor, Refusal},
         GatewayId, HealthSink, LeaderBits, LeasesStore, LoadSink, LoadSource, MembershipTail,
@@ -2806,10 +2807,34 @@ fn a_generation_is_applied_above_the_standing_one_and_no_other() {
     assert_eq!(view(&store, &ask(t0)).2.generation, 4);
 }
 
+/// Every engine a store builds reads the store's own clock: an instant
+/// reads alike in the store and under each document it applies. An apply
+/// hands a profile's count of sends to the next document's engine, which
+/// reads their stamps on the clock they were written on. An engine that
+/// started a clock of its own would read a send of the last second as one
+/// of the future, by the standing document's age.
+#[cfg(feature = "in-process")]
+#[test]
+fn every_engine_a_store_builds_reads_the_stores_clock() {
+    let store = MemoryStore::new();
+    let at = Instant::now() + Duration::from_secs(5);
+    let engines = |store: &MemoryStore| store.deciding(|world| world.front().clock().micros(at));
+    for number in 1..=3 {
+        store
+            .apply(generation(number))
+            .expect("above the standing one");
+        assert_eq!(
+            engines(&store),
+            store.micros(at),
+            "under generation {number}"
+        );
+    }
+}
+
 #[test]
 fn a_generation_outlives_its_last_world_until_the_next_apply_hands_it_back() {
     let mut writer = Writer::new(PUBLISH_WINDOW, Instant::now());
-    let first = Arc::new(generation(1));
+    let first = Arc::new(Applied::new(generation(1), Instant::now()));
     let held = Arc::downgrade(&first);
     let (world, before) = writer
         .apply(first, 0, std::iter::empty(), |_, _| None)
@@ -2820,7 +2845,12 @@ fn a_generation_outlives_its_last_world_until_the_next_apply_hands_it_back() {
     // since the first apply, is handed back.
     let reader = Arc::clone(&world);
     let (_, before) = writer
-        .apply(Arc::new(generation(2)), 0, std::iter::empty(), |_, _| None)
+        .apply(
+            Arc::new(Applied::new(generation(2), Instant::now())),
+            0,
+            std::iter::empty(),
+            |_, _| None,
+        )
         .expect("above the standing one");
     assert_eq!(before.map(|spec| spec.generation()), Some(0));
     writer.replaced(world);
@@ -2832,7 +2862,12 @@ fn a_generation_outlives_its_last_world_until_the_next_apply_hands_it_back() {
     // The next apply lets the world go and hands the generation back, and
     // the caller's drop is its end.
     let (_, before) = writer
-        .apply(Arc::new(generation(3)), 0, std::iter::empty(), |_, _| None)
+        .apply(
+            Arc::new(Applied::new(generation(3), Instant::now())),
+            0,
+            std::iter::empty(),
+            |_, _| None,
+        )
         .expect("above the standing one");
     let before = before.expect("the generation before the last");
     assert_eq!((before.generation(), held.strong_count()), (1, 1));
@@ -2843,17 +2878,27 @@ fn a_generation_outlives_its_last_world_until_the_next_apply_hands_it_back() {
 #[test]
 fn a_world_held_across_two_applies_takes_its_generation_to_a_publication() {
     let mut writer = Writer::new(PUBLISH_WINDOW, Instant::now());
-    let first = Arc::new(generation(1));
+    let first = Arc::new(Applied::new(generation(1), Instant::now()));
     let held = Arc::downgrade(&first);
     let (world, _) = writer
         .apply(first, 0, std::iter::empty(), |_, _| None)
         .expect("above the unbound start");
     // A reader holds the world the cell lets go at the next apply.
     let reader = Arc::clone(&world);
-    let applied = writer.apply(Arc::new(generation(2)), 0, std::iter::empty(), |_, _| None);
+    let applied = writer.apply(
+        Arc::new(Applied::new(generation(2), Instant::now())),
+        0,
+        std::iter::empty(),
+        |_, _| None,
+    );
     drop(applied.expect("above the standing one"));
     writer.replaced(world);
-    let applied = writer.apply(Arc::new(generation(3)), 0, std::iter::empty(), |_, _| None);
+    let applied = writer.apply(
+        Arc::new(Applied::new(generation(3), Instant::now())),
+        0,
+        std::iter::empty(),
+        |_, _| None,
+    );
     drop(applied.expect("above the standing one"));
     // The second apply handed the generation back and its caller let it
     // go: the reader's world alone holds it now.
@@ -2863,7 +2908,12 @@ fn a_world_held_across_two_applies_takes_its_generation_to_a_publication() {
     // holding it, here the next apply's.
     drop(reader);
     assert_eq!(held.strong_count(), 1);
-    let applied = writer.apply(Arc::new(generation(4)), 0, std::iter::empty(), |_, _| None);
+    let applied = writer.apply(
+        Arc::new(Applied::new(generation(4), Instant::now())),
+        0,
+        std::iter::empty(),
+        |_, _| None,
+    );
     drop(applied.expect("above the standing one"));
     assert_eq!(held.strong_count(), 0);
 }
@@ -5697,7 +5747,10 @@ fn a_member_whose_rows_revision_stands_is_carried_and_one_whose_revision_moved_i
     let zones =
         |world: &StoreSnapshot| (listed(world, WorkerId(3)).1, listed(world, WorkerId(7)).1);
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    let lists = Arc::new(generation_listing(1, &[], &["east", "west"], &[]));
+    let lists = Arc::new(Applied::new(
+        generation_listing(1, &[], &["east", "west"], &[]),
+        origin,
+    ));
     writer
         .apply(lists, 0, std::iter::empty(), |_, _| None)
         .expect("applied");
@@ -5717,7 +5770,10 @@ fn a_member_whose_rows_revision_stands_is_carried_and_one_whose_revision_moved_i
     assert_eq!(zones(&read), (1, 1));
     // An apply whose lists differ reads every member, at any revision and
     // in whatever order the store's table hands them,
-    let other = Arc::new(generation_listing(2, &[], &["west", "east"], &[]));
+    let other = Arc::new(Applied::new(
+        generation_listing(2, &[], &["west", "east"], &[]),
+        origin,
+    ));
     let members = [row(7, "east", 2), row(3, "east", 1)];
     let (relisted, _) = writer
         .apply(other, 3, members.filed(&writer), |_, _| None)

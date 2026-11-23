@@ -1265,11 +1265,8 @@ impl Objects<Members> {
     /// generation's reach stands as it was cut until the model's next
     /// membership change, as its lists do.
     #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "a controller's deciding thread asks it once it decides by the engine over worker lists"
-        )
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "a controller's deciding thread asks it")
     )]
     pub(crate) fn reach<'a>(&self, generation: &'a Members, role: Role) -> &'a ListReach {
         generation.reach(role, |members| self.fixed_facts(members))

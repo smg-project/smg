@@ -45,6 +45,12 @@ const OVERLOAD_DEFAULTS: OverloadThresholds = OverloadThresholds {
 /// judges the worker by ([`load_monitor`](crate::worker_host::load_monitor)).
 /// The service runs no such monitor yet, so no verdict is written on an
 /// object.
+///
+/// An object's status follows its row's
+/// ([`Objects::with_status_followed`]). A decision reads a worker's status
+/// on its object, and a probe's outcome is not the only write of a row's
+/// status: a drain marks the row, and a standby applies the statuses its
+/// leader wrote.
 pub(crate) struct WorkerObjects {
     store: Arc<MemoryStore>,
     objects: Arc<Objects<Members>>,
@@ -71,6 +77,7 @@ impl WorkerObjects {
                 Objects::new(Arc::new(WorkerRegistry::new()))
                     .with_connector(connector)
                     .with_host_local_unchecked()
+                    .with_status_followed()
                     .with_overload_thresholds(OVERLOAD_DEFAULTS),
             ),
             wake,

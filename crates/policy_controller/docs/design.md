@@ -51,7 +51,7 @@ in two places:
 |---|---|---|---|
 | Classic (the default) | the gateway's classic policies | the gateway | **[built]** |
 | Engine in the gateway | the engine, inside the gateway | the gateway, in the same structures as classic | **[planned]** |
-| Engine in a controller | the controller | the controller | **[planned]** |
+| Engine in a controller | the controller | the controller | **[partly]** |
 
 On main the gateway still calls the engine through an earlier integration. That integration is
 taken out first (stage 0 of section 16), so that the crate can be finished before the gateway
@@ -495,8 +495,8 @@ it lends in the same type **[planned]**.
 |---|---|---|---|
 | a model's worker list | the registry, at each membership change | yes | yes, the same list |
 | the worker object's state | health checker, load monitor, load guard (on a controller, the leases on file), outcomes | yes | yes, once for each decision |
-| `LoadSnapshot` | the load monitor | `least_load`, `cache_aware`, `power_of_two` | yes, the latest snapshot |
-| the index of cache events | the workers' event streams | `cache_aware` | yes, through `CacheIndex` |
+| `LoadSnapshot` | the load monitor | `least_load`, `cache_aware`, `power_of_two` | yes, the latest snapshot; a controller's engine is lent none yet |
+| the index of cache events | the workers' event streams | `cache_aware` | yes, through `CacheIndex`; a controller's engine is lent none yet |
 | the two trees | the deciding policy: classic's, or the engine inside the tree's walk | `cache_aware` | the host's own trees, lent: the token tree **[built]**, the string tree **[planned]** |
 
 ## 5. The engine
@@ -604,7 +604,8 @@ load snapshot; a snapshot's reports are converted once for a list and cached.
 `engine` is `PolicyEngine`'s number. It writes each record its engine's place where it finds the
 list's engines, once for a list, so records that state one place are ranks of one data-parallel
 engine. The store-backed engine and a default record leave 0 on every record, which would read as
-one engine, so a stage reads the field in process alone until `PolicyEngine` is the one engine. The
+one engine, so a stage reads the field where `PolicyEngine` decides: in process, and in a
+controller for a single request. The
 number holds within one generation of one list and is no id beyond it.
 
 ### 5.4 What a request states **[partly]**
@@ -784,6 +785,10 @@ not say which engine it was a rank of. A pair's two lists are not widened.
 
 A decision that panics is caught, counted and answered as refused. It never takes the host down.
 
+A request whose host hands no list (`WorkerLists::None`) is decided over no worker: it is shed
+with no endpoint under the stage `none`, and its trace names no profile. A controller hands none
+for a model no worker serves, and for a gateway that dials no worker of the model's list.
+
 What one decision writes: the thread's own buffer; on the short path one atomic add on the list's
 counter; one atomic add for a lease id where a stage needs lease events; a session pin where a
 sessions rule decides; the record of sent prefixes where a cache-affinity profile decides; and,
@@ -799,12 +804,14 @@ Main has two engines behind one trait (`DecisionEngine`, `engine/decision_engine
 |---|---|---|
 | decides over | the host's worker objects, read in place | records copied into the policy store |
 | keeps leases | no: the host hands the lease back with each event | yes, in the store |
-| used by | the gateway's earlier integration, until stage 0 takes it out; then nothing | the controller's service |
+| used by | the gateway's earlier integration, until stage 0 takes it out; the controller's service, for a single request | the controller's service, for a lease's words and its counters; it decides no request there |
 | size | 6,228 lines with its folder | 12,461 lines with its folder, plus the store's tables |
 
-**The design keeps `PolicyEngine` and removes the store-backed engine [planned].** The controller
+**The design keeps `PolicyEngine` and removes the store-backed engine [partly].** The controller
 gets worker objects of its own (section 10), so its service calls the same engine a gateway
-calls. The switch is made whole, in one change, after the kept engine is proven (decision 5).
+calls. The switch is made in steps (decision 5): a single request is decided by `PolicyEngine`
+on main (10.1), the store-backed engine is deleted right behind that step, and a pair's phases,
+answered `Busy` meanwhile, are then decided by the one engine.
 
 The two engines still share types. `Request`, `DecideOutcome`, `DecisionRefused`, `DecodeRefused`
 and `SweepOutcome` are defined in the trait's file, and `Said` (section 6) beside `Lease`. They
@@ -1344,7 +1351,7 @@ They come back with the change (decision 9). No released version has them.
 ## 10. The controller **[partly]**
 
 The controller is the binary `smg-policy-controller`. This section fixes the direction. The
-switch itself gets a short design of its own before its first change.
+switch is made in steps: 10.1 says what is on main.
 
 ### 10.1 On main
 
@@ -1358,11 +1365,11 @@ Its data is one in-memory store (`store/memory.rs`):
 | Data | Filled by | Note |
 |---|---|---|
 | worker records | the `RegisterWorker`, `PatchWorker`, `DeregisterWorker` calls | discovery is in the code behind a feature the image leaves out, and registers nothing yet |
-| worker objects | a task that follows the worker records | a second form of the same workers, of the worker crate's type; each states its registration's overload thresholds over one default, 8 queued requests and 0.8 usage, and no monitor judges by them yet |
+| worker objects | a task that follows the worker records | a second form of the same workers, of the worker crate's type; each states its registration's overload thresholds over one default, 8 queued requests and 0.8 usage, and no monitor judges by them yet; an object's status follows its record's, and a single request's decision reads the workers here |
 | health | the worker crate's health checker over the worker objects, on the leader | copied into the records |
-| loads | the crate's own poller, every 10 seconds | `PushLoad` is not served |
-| cache index | a follower of each worker's cache events | an index of the store's own; `PushKvEvents` is not served |
-| sessions, leases | decisions | not replicated to a standby |
+| loads | the crate's own poller, every 10 seconds | `PushLoad` is not served; a single request's decision reads none yet |
+| cache index | a follower of each worker's cache events | an index of the store's own; `PushKvEvents` is not served; a single request's decision reads none yet, only the engine's own record of sent prompts |
+| sessions, leases | decisions | not replicated to a standby; a single request's session pins are the engine's own table, one for each document, and no decision reads the store's pins |
 
 The gRPC service (`crates/policy_controller/contracts/policy_controller.proto`):
 
@@ -1378,10 +1385,12 @@ The gRPC service (`crates/policy_controller/contracts/policy_controller.proto`):
 | `Replicate` (stream) | a standby follows the leader | served |
 | `PushLoad`, `PushKvEvents`, `StepDown`, `WatchRegime` | | not served |
 
-A `Decide` request is decided on one of a fixed set of threads (the model picks the thread) by
-the store-backed engine over the store's published copy of the worker records.
+A `Decide` request of the single phase is decided on one of a fixed set of threads (the model
+picks the thread) by `PolicyEngine::decide_without_lease`, over the list of the model's workers
+that the worker objects' registry publishes. A request of a prefill, a decode or an encode phase
+is answered `Busy`, and its gateway decides it.
 
-### 10.2 As designed **[planned]**
+### 10.2 As designed **[partly]**
 
 Rule 2 and rule 3 apply to the controller as they do to the gateway: one set of worker data, in
 the worker crate's structures, and the one engine.
@@ -1389,13 +1398,13 @@ the worker crate's structures, and the one engine.
 | Data | On main | As designed |
 |---|---|---|
 | workers | records in the store, and worker objects kept in step with them | worker objects in a worker-crate registry; beside each, the code that keeps the objects holds what a registration stated and the object does not hold as stated (10.3); the membership log that watchers and standbys read stays |
-| lists | the store's published copy | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
-| health | the worker crate's health checker over the worker objects, on the leader; each outcome is copied into the store's record | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
-| loads | the crate's own poller and table | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic, whose gateway hands every worker the same two defaults |
-| cache events | an index of the store's own | the kv-index crate's index, filled by the worker crate's collector |
-| sessions | the store's tables | the engine's session table |
+| lists | the store's published copy; a single request's decision reads the registry's published list of the model's single workers | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
+| health | the worker crate's health checker over the worker objects, on the leader; each outcome is copied into the store's record, an object's status follows its record's, and a single request's decision reads the object's | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
+| loads | the crate's own poller and table; a single request's decision reads no report and no overload verdict yet | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic, whose gateway hands every worker the same two defaults |
+| cache events | an index of the store's own; a single request's decision reads none yet | the kv-index crate's index, filled by the worker crate's collector |
+| sessions | the engine's session table for a single request, one for each document; the store's tables are still written, and no decision reads them | the engine's session table |
 | leases | the store's lease tables, in memory, one for each deciding thread | stay: a controller must remember what it issued to gateways |
-| decisions | the store-backed engine | `PolicyEngine::decide_without_lease` over the registry's lists |
+| decisions | a single request: `PolicyEngine::decide_without_lease` over the registry's list; a pair's phases: none, the request is answered `Busy` | `PolicyEngine::decide_without_lease` over the registry's lists |
 | discovery | not registering | the discovery crate through its host interface, registering through the worker crate's job queue |
 
 What leaves the crate with that switch: the store-backed engine, the store's copies of the worker
@@ -1403,6 +1412,19 @@ data that a worker object holds, the crate's own load poller, and the adapters t
 state into the store. Some facts of a worker are not carried to its worker object today, and
 some stand there in a narrower form than a registration states: 10.3 names them and where they
 are kept.
+
+**The first step, on main.** A single request's decision reads the model's single workers in the
+order they registered, where the store's copy was sorted by id. It reads a worker's status, its
+breaker and its stalled bit on the worker object, and the count of requests in flight there, which
+the store steps for each lease on file. A record made of a worker object states one protocol and
+no zone.
+The asking gateway's reach, its wires and its standing vetoes are stated to the engine as places
+of the list. A new document is a new engine object: its session pins and its record of sent
+prompts start empty, and that record is told no worker's leave. A sessions rule's cap counts no
+request of a key: a key stays on its worker past the cap, as under a rule with no cap. A
+registration, a drain or a deregistration reaches a decision at the next pass of the task that
+follows the worker records, a moment after its call answers, and a controller that starts over
+standing rows answers no worker until that pass ends.
 
 ### 10.3 The controller's worker data **[partly]**
 
@@ -1414,9 +1436,9 @@ tells the data once more:
 |---|---|---|
 | the worker record | the store's table of records (`store/memory.rs`) | the registration calls; a watcher's and a standby's first copy |
 | a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
-| the worker object | the worker-crate registry | the health checker and the follower of cache events |
-| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | nothing in the controller's service yet |
-| the published copy of the records | the store | the store-backed engine's decisions |
+| the worker object | the worker-crate registry | the health checker, the follower of cache events and a single request's decision |
+| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a single request's decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. What the worker states for a request's hard demands is lent with the list, and no frame states a demand yet |
+| the published copy of the records | the store | a pick's booking and a gateway's vetoes; no request is decided over it |
 | the membership log's event | `service/replication/log.rs` | a watcher behind its first copy; a standby |
 
 The record leads and the object follows it. After the switch the object leads: a worker's data
@@ -1430,8 +1452,10 @@ the objects writes one with every object it builds or takes. `Objects::row_of` g
 whole record back from the object and its remainder, with no read of the store's table, for an
 object built from its record or handed in with it. An object that was handed in and kept while
 its record moved states the six facts it holds whole as they were handed in, and as the
-engine's address the one it dials, where the moved record names an engine. Nothing in the
-controller's service reads either yet. Of the 24 facts a registration states:
+engine's address the one it dials, where the moved record names an engine. A single request's
+decision reads four of the remainder's facts: the record's id, whether the worker takes images,
+its wire modes and from where it is reached. Nothing in the controller's service reads a whole
+record back yet. Of the 24 facts a registration states:
 
 - Six stand on the object whole, and the remainder holds none of them: the address, the role,
   the models, the labels, the cache block size and the bootstrap port. So does the status.
@@ -1470,7 +1494,8 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    that keeps the objects does today for a record that changed.
 2. A standby applies the leader's events to its own worker objects, and a watcher's and a
    standby's first copy is cut from the objects and their remainders.
-3. No health outcome is copied into a record: a decision reads the object's status.
+3. No health outcome is copied into a record: a decision reads the object's status, as a single
+   request's does on main.
 4. The table of records, the second copy of the facts, the two conversions between a record
    and an object, and the task that follows the table are deleted.
 
@@ -1687,7 +1712,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The crate's bench of the kept engine | **[planned]** | |
 | The gateway as a host | **[planned]** | section 9; the earlier integration, still on main, is taken out first (stage 0) |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |
-| The controller on the one engine and the worker crate's structures | **[planned]** | section 10.2 |
+| The controller on the one engine and the worker crate's structures | **[partly]** | a single request is decided by `PolicyEngine` over the registry's list; a pair's phases are answered `Busy`; a decision reads no load report, no overload verdict and no cache event, and a sessions rule's cap counts nothing (section 10.2) |
 | The controller finding its own workers | **[partly]** | discovery registers nothing yet |
 | A gateway under a controller | **[planned]** | section 11 |
 | User stages in WebAssembly and over gRPC | **[partly]** | library code that no document reaches |
@@ -1783,6 +1808,10 @@ inside the crate only.
 | (b) Document by document, behind a test at apply. | A test at apply, two load pollers for a time, a temporary call, and refactors inside the old engine that are deleted afterwards. |
 
 **Recommendation: (a).**
+
+**As taken.** The deciding threads were switched for a single request first (section 10.1). The
+store-backed engine is deleted right behind that step, and a request of a prefill, a decode or an
+encode phase, answered `Busy` meanwhile, is then decided by the one engine over worker lists.
 
 ### Decision 6: a gateway under a controller that gets no answer in time
 
