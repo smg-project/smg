@@ -2504,7 +2504,7 @@ impl PDRouter {
         .map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
         // The prefill's side went into its guard. The decode's guard is not
         // made from its answer yet.
-        let (prefill, decode) = (prefill.into_worker(), decode.worker_alone_for_now());
+        let (prefill, decode) = (prefill.into_guarded_worker(), decode.worker_alone_for_now());
         let guards = PdLoadGuards {
             prefill: prefill_guard,
             decode: WorkerLoadGuard::with_key(Arc::clone(&decode), sticky_key),

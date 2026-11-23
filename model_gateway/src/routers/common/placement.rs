@@ -637,6 +637,24 @@ impl Placed {
         self.worker
     }
 
+    /// The worker of an answer whose load guard was made: the engine's
+    /// side of the request is the guard's by now, so the answer has nothing
+    /// left to give up, and the worker's handle moves on with no count. For
+    /// a route that hands a pair's prefill on behind its guard. A debug
+    /// build stops where the answer still holds its side: the request
+    /// would go out under no guard of its own, and the engine would hear a
+    /// release.
+    #[inline]
+    pub(crate) fn into_guarded_worker(self) -> Arc<dyn Worker> {
+        debug_assert!(
+            self.engine
+                .as_ref()
+                .is_none_or(|engine| engine.side.lock().is_none()),
+            "a worker is handed on behind its guard"
+        );
+        self.worker
+    }
+
     /// NOT FOR MAIN: [`Self::into_worker`] for a route that does not make
     /// its load guard from the answer yet, which is a pair's decode. The
     /// call leaves with its last caller.
@@ -6927,5 +6945,42 @@ pub(crate) mod tests {
         let pair = pair_from(&registry, &policies).expect("a classic pair");
         let ahead = pair.decode.ahead(None);
         drop(pair.prefill.sent(ahead));
+    }
+
+    /// A pair's prefill is handed on behind its guard by a call of its own
+    /// name. The side is the guard's by then, so the engine hears nothing
+    /// of the hand-over, and a classic answer passes it for nothing.
+    #[test]
+    fn a_worker_handed_on_behind_its_guard_tells_the_engine_nothing() {
+        let registry = one_pair();
+        let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let pair = pair_from(&registry, &classic).expect("a classic pair");
+        assert_eq!(pair.prefill.into_guarded_worker().url(), "grpc://p:1");
+
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_pairs_on(&policies, false);
+        let said = || heard.lock().expect("the stage heard").clone();
+        let pair = pair_from(&registry, &policies).expect("the engine places the pair");
+        let guard = pair.prefill.guard(None);
+        assert_eq!(said()[2..], ["dispatched Prefill"]);
+        let worker = pair.prefill.into_guarded_worker();
+        assert_eq!((worker.url(), worker.load()), ("grpc://p:1", 1));
+        assert_eq!(said().len(), 3, "the hand-over says nothing");
+        drop(guard);
+        assert_eq!(said()[3..], ["completed Cancelled"]);
+    }
+
+    /// An answer of the engine handed on before its guard was made stops a
+    /// debug build: its request would go out under no guard of its own, and
+    /// the engine would hear a release.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a worker is handed on behind its guard")]
+    fn a_worker_handed_on_ahead_of_its_guard_stops_a_debug_build() {
+        let registry = one_pair();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let _heard = hearing_pairs_on(&policies, false);
+        let pair = pair_from(&registry, &policies).expect("the engine places the pair");
+        drop(pair.prefill.into_guarded_worker());
     }
 }

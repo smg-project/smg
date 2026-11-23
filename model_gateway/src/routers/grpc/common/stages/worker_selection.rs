@@ -915,7 +915,7 @@ impl WorkerSelectionStage {
         // made from its answer yet.
         .map(|((prefill, decode, runtime), guard)| {
             let pair = (
-                prefill.into_worker(),
+                prefill.into_guarded_worker(),
                 decode.worker_alone_for_now(),
                 runtime,
             );
@@ -957,7 +957,7 @@ impl WorkerSelectionStage {
         .map(|((assignments, prefill, decode, runtime), guard)| {
             let selection = (
                 assignments,
-                prefill.into_worker(),
+                prefill.into_guarded_worker(),
                 decode.worker_alone_for_now(),
                 runtime,
             );
