@@ -91,7 +91,7 @@ use super::{
     },
     framework::{release, AloneProfile, NotAlone, Picker, Place, PoolWord, ShadowRows},
     lease_events,
-    list_cell::LentList,
+    list_cell::{HandedLists, LentList},
     prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
     shadow::{Counted, Shadowed},
@@ -160,6 +160,9 @@ pub struct PolicyEngine {
     /// The host's worker registry, once it handed it
     /// ([`Self::set_registry`]): the engine's own task follows its events.
     members: membership::Handed,
+    /// The host's worker lists, once it handed them ([`Self::set_lists`]):
+    /// the engine's own task fills their cells ahead of their requests.
+    pub(super) lists: HandedLists,
 }
 
 /// The document's word of a binding's shadow: the binding's position, and
@@ -331,6 +334,7 @@ impl PolicyEngine {
             affinity: Affinity::default(),
             loads: task::Loads::default(),
             members: membership::Handed::default(),
+            lists: HandedLists::default(),
         }
     }
 
@@ -499,8 +503,9 @@ impl Loaded<'_, '_> {
     /// program states of its workers beside their objects ([`FixedFacts`]):
     /// the id it names a worker by where it keeps ids of its own, whether a
     /// worker takes images, or what it states for a request's hard demands.
-    /// The fill of a list's cell calls it ([`Self::members_of`]), inside
-    /// the first decision that asks the cell. `facts_of` is asked once a
+    /// The fill of a list's cell calls it ([`Self::members_of`]): inside
+    /// the first decision that asks the cell, or by the engine's own task
+    /// ahead of it ([`PolicyEngine::set_lists`]). `facts_of` is asked once a
     /// worker, in the list's order, here: every fact a program says of a
     /// worker is a field of that one answer. A request that states a demand
     /// is then held to the workers of the list that meet it

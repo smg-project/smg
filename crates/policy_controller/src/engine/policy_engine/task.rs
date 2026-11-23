@@ -216,23 +216,33 @@ impl PolicyEngine {
     ///   dropped events or closed. A panic of the host's own code in the
     ///   follow is held and counted ([`Self::upkeep_faults`]): the task
     ///   goes on, and reads the registry whole again at its next upkeep.
+    /// - The cells of a model's worker lists filled ahead of the model's
+    ///   requests, for an engine handed its program's lists
+    ///   ([`Self::set_lists`]): behind the registry's words of membership,
+    ///   and behind each whole read of the registry. A panic in a fill is
+    ///   held and counted ([`Self::upkeep_faults`]): the task goes on to
+    ///   the next list, and a list it did not fill is filled at its first
+    ///   ask.
     pub async fn run(&self) {
         self.run_with(|now| self.sweep(now)).await;
     }
 
     /// How many steps of the engine's own task panicked ([`Self::run`]): a
     /// run of the upkeep, a step of the registry's follow in the host's own
-    /// code, a stage's hearing of a load report, or a report's conversion
-    /// for the stages. Each was held, and the task went on. While
-    /// the upkeep's
+    /// code, a stage's hearing of a load report, a report's conversion for
+    /// the stages, or a fill of worker lists' cells ahead of their
+    /// requests. Each was held, and the task went on. While the upkeep's
     /// panics raise the count it does not run whole: session keys past
     /// their end can stay on file, though every request is still answered.
     /// While the follow's raise it, a join whose answer of the host
     /// panicked is lost until a whole read of the registry succeeds. A
-    /// removal asks the host nothing and is still told. A host whose code
-    /// panics at one worker every time fails every whole read. A stage
-    /// that panics at a load report keeps of it what it wrote ahead of the
-    /// panic, and a report whose conversion panics is told to no stage.
+    /// removal asks the host nothing ahead of its telling and is still
+    /// told. A host whose code panics at one worker every time fails every
+    /// whole read. A stage that panics at a load report keeps of it what it
+    /// wrote ahead of the panic, and a report whose conversion panics is
+    /// told to no stage. A list whose fill panics is left to its first ask,
+    /// and a panic of the program's own code where it hands a model's lists
+    /// leaves the lists it had not handed to theirs.
     #[must_use]
     pub fn upkeep_faults(&self) -> u64 {
         self.upkeep_faults.load(Ordering::Relaxed)

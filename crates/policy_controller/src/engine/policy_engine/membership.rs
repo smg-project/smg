@@ -57,7 +57,7 @@ use std::{
     cell::Cell,
     fmt,
     future::pending,
-    ptr,
+    mem, ptr,
     sync::{Arc, OnceLock, Weak},
     time::Instant,
 };
@@ -65,7 +65,9 @@ use std::{
 use rustc_hash::FxHashMap;
 use smg_worker::{
     identity::basic::Worker,
-    registry::{event::WorkerEvent, Generation, WorkerId as ObjectId, WorkerRegistry},
+    registry::{
+        event::WorkerEvent, worker_model_ids, Generation, WorkerId as ObjectId, WorkerRegistry,
+    },
     runtime::WorkerRuntime,
 };
 use tokio::sync::broadcast::{
@@ -262,6 +264,14 @@ pub(super) struct Follow {
     /// host can state an id and take it back between the registry's write
     /// and the follow's ask.
     stating: bool,
+    /// The models whose lists are owed a fill ahead of their requests
+    /// ([`PolicyEngine::set_lists`]): those the workers of the words heard
+    /// since the last fill serve. Empty under an engine handed no lists.
+    owed: Vec<String>,
+    /// Whether every list that stood was owed a fill since the program
+    /// handed its lists: by a whole read, or by the upkeep that found them
+    /// handed. A program may hand its lists behind the task's first poll.
+    filling: bool,
 }
 
 impl Follow {
@@ -371,7 +381,11 @@ impl PolicyEngine {
     /// read, so a worker that changes during the read is heard behind it.
     /// A panic of the host's own code in either step is held and counted
     /// ([`Self::upkeep_faults`]), and the step is owed again at the next
-    /// upkeep.
+    /// upkeep. Last it pays the fills the follow owes ([`Self::fill_owed`]),
+    /// with words still standing: those a whole read owed, those of words
+    /// that never stood alone on the subscription, and, where the program
+    /// handed its lists behind the whole read, those of every list that
+    /// stands.
     pub(super) fn follow_registry(&self, members: &mut Option<Follow>) {
         let follow = match members {
             Some(follow) => follow,
@@ -386,15 +400,40 @@ impl PolicyEngine {
                     under: FxHashMap::default(),
                     unread: true,
                     stating: false,
+                    owed: Vec::new(),
+                    filling: false,
                 })
             }
         };
         if follow.events.is_none() {
             follow.events = self.held(|| follow.registry.events());
         }
+        // Read ahead of the whole read: lists handed during it are found
+        // handed at the next upkeep.
+        let handed = self.lists.get().is_some();
+        let mut read = false;
         if follow.unread && follow.events.is_some() {
-            let read = self.held(|| self.read_whole(follow));
-            follow.unread = read.is_none();
+            read = self.held(|| self.read_whole(follow)).is_some();
+            follow.unread = !read;
+        }
+        // The program handed its lists since the follow last owed every
+        // list that stands: a whole read owed them, and else they are owed
+        // here, once.
+        if handed && !follow.filling {
+            let owed = read || self.held(|| self.owes_standing(follow)).is_some();
+            follow.filling = owed;
+        }
+        // What the whole read owes, and what words left owed that never
+        // stood alone on the subscription.
+        self.fill_owed(follow);
+    }
+
+    /// Every list that stands is owed a fill: the lists of each model a
+    /// standing worker serves. The follow's upkeep asks for it once, where
+    /// it finds the program's lists handed behind its whole read.
+    fn owes_standing(&self, follow: &mut Follow) {
+        for (_, worker) in follow.registry.standing() {
+            self.owes(follow, &worker);
         }
     }
 
@@ -424,7 +463,9 @@ impl PolicyEngine {
     /// the subscription go, and owes another and a whole read at the
     /// task's next upkeep. A panic of the host's own code at the word is
     /// held and counted ([`Self::upkeep_faults`]): the word is lost, so
-    /// the follow owes a whole read then too.
+    /// the follow owes a whole read then too. Behind the word the fills
+    /// the follow owes are paid, once no further word stands ready
+    /// ([`Self::fill_owed`]).
     pub(super) fn heard(&self, follow: Option<&mut Follow>, word: Result<WorkerEvent, RecvError>) {
         let Some(follow) = follow else {
             return;
@@ -436,6 +477,61 @@ impl PolicyEngine {
                 follow.unread = true;
             }
             None => follow.unread = true,
+        }
+        // The lists the word's worker stands in were published again. They
+        // are filled once no further word stands ready: of words heard
+        // together, each model's lists are asked once.
+        if follow.waiting() == 0 {
+            self.fill_owed(follow);
+        }
+    }
+
+    /// The lists of the models `worker` serves were published again: under
+    /// an engine handed its program's lists ([`Self::set_lists`]) they are
+    /// owed a fill ahead of their requests. The worker's object names its
+    /// models, by its cards of this minute. It is asked behind the word's
+    /// telling and under a catch of its own: a panic of its code is held
+    /// and counted ([`Self::upkeep_faults`]) and costs that worker's fills
+    /// alone, so no stage loses a word for a fill.
+    fn owes(&self, follow: &mut Follow, worker: &Arc<dyn Worker>) {
+        if self.lists.get().is_none() {
+            return;
+        }
+        if let Some(models) = self.held(|| worker_model_ids(worker)) {
+            follow.owed.extend(models);
+        }
+    }
+
+    /// Fills the cells the follow owes a fill. Each model owed is asked of
+    /// the program once
+    /// ([`ModelLists::lists_of`](crate::engine::list_cell::ModelLists::lists_of)),
+    /// and each list the program hands is asked its value under the
+    /// engine's document ([`Self::members_of`]), which fills a cell that
+    /// holds none.
+    ///
+    /// Each list's fill runs under a catch of its own. A list refused for
+    /// its facts is held and counted ([`Self::upkeep_faults`]) and costs
+    /// its own fill alone: the refusal does not unwind into the program's
+    /// code, which goes on to its next list. Each model's ask runs under a
+    /// catch too: a panic of the program's own code costs the lists of
+    /// that model it had not handed, and no other model's. What the follow
+    /// told stands as it was told.
+    fn fill_owed(&self, follow: &mut Follow) {
+        if follow.owed.is_empty() {
+            return;
+        }
+        let mut models = mem::take(&mut follow.owed);
+        let Some(lists) = self.lists.get() else {
+            return;
+        };
+        models.sort_unstable();
+        models.dedup();
+        for model in &models {
+            let _asked = self.held(|| {
+                lists.lists_of(model, &mut |lent| {
+                    let _filled = self.held(|| self.members_of(lent));
+                });
+            });
         }
     }
 
@@ -452,6 +548,7 @@ impl PolicyEngine {
             Ok(WorkerEvent::Registered { worker_id, worker }) => {
                 let id = follow.id_of(&worker);
                 self.stands(follow, worker_id, &worker, id, false);
+                self.owes(follow, &worker);
             }
             Ok(WorkerEvent::Replaced {
                 worker_id,
@@ -466,9 +563,14 @@ impl PolicyEngine {
                     let id = follow.id_of(&new);
                     self.stands(follow, worker_id, &new, id, true);
                 }
+                // The lists of both objects' models were published again,
+                // told or not.
+                self.owes(follow, &old);
+                self.owes(follow, &new);
             }
             Ok(WorkerEvent::Removed { worker_id, worker }) => {
                 self.gone(follow, &worker_id, Some(&worker));
+                self.owes(follow, &worker);
             }
             Ok(WorkerEvent::StatusChanged { .. }) => {}
             Err(RecvError::Lagged(_)) => {
@@ -580,6 +682,8 @@ impl PolicyEngine {
         }
         for (object, (id, worker)) in stands {
             self.stands(follow, object, &worker, id, false);
+            // Every list that stands may be one the task did not ask yet.
+            self.owes(follow, &worker);
         }
         let standing: Vec<WorkerId> = follow.under.keys().copied().collect();
         self.affinity.keep(&standing);
