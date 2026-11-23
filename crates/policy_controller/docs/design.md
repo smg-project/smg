@@ -1528,7 +1528,9 @@ tells the data once more:
 | the published copy of the records | the store | a pick's booking and a gateway's vetoes; no request is decided over it |
 | the membership log's event | `service/replication/log.rs` | a watcher behind its first copy; a standby |
 
-The record leads and the object follows it. After the switch the object leads: a worker's data
+A leader's write of a record is decided over the worker object since step 1 below, and the
+table follows it. The record still leads a status, a standby's data and a first copy, and the
+object follows it there. After the switch the object leads: a worker's data
 stands once, as its worker object with its remainder beside it, and the log still tells it. The
 remainder is the copy that stays. The table of records and the second copy of the facts end
 with step 4 below, and the published copy with the store-backed engine (10.2).
@@ -1541,8 +1543,8 @@ object built from its record or handed in with it. An object that was handed in 
 its record moved states the six facts it holds whole as they were handed in, and as the
 engine's address the one it dials, where the moved record names an engine. A single request's
 decision reads four of the remainder's facts: the record's id, whether the worker takes images,
-its wire modes and from where it is reached. Nothing in the controller's service reads a whole
-record back yet. Of the 24 facts a registration states:
+its wire modes and from where it is reached. The controller's registration calls decide a write
+over a whole record read back (step 1 below). Of the 24 facts a registration states:
 
 - Six stand on the object whole, and the remainder holds none of them: the address, the role,
   the models, the labels, the cache block size and the bootstrap port. So does the status.
@@ -1571,12 +1573,29 @@ record back yet. Of the 24 facts a registration states:
 A fact leaves the remainder when the worker object gets a field that holds it as stated
 (decision 10).
 
-**Behind the switch [planned].** Four steps, each small:
+**Behind the switch [partly].** Four steps, each small:
 
-1. A registration builds the worker object first and tells the membership log; no table of
-   records leads. The object, its remainder, the count of membership changes and the log's
-   event change in one turn, and a first copy is cut in the same turn, as the store's lock
-   orders them today. A change that moves a fact the object holds builds the object again: the
+1. **[built]** A leader's write of a record (a registration, a patch, a removal) is decided
+   over the worker objects, by the code that keeps them, in one turn of its own behind the
+   door's. It reads the record back from the object that stands, decides by the registration
+   rule, builds the object of the record the change leaves, tells the store the decided
+   change, and puts the object in the registry. A removal takes the object out first. So the
+   object stands when the write returns. The table of records follows on a leader as it does
+   on a standby, by one body, and the membership log is told from it. In a controller the
+   code that keeps the objects alone writes a worker object's own facts, so the record a change
+   in place writes to the table is the object's record read back whole. A second writer of an
+   object's facts in a controller would break that, as a gateway's refresh of a worker's models
+   is one in a gateway. The locks in their
+   order: the door's turn, the keeper's turn, the store's membership lock, and no lock of the
+   store over a write of the registry. The store takes a decided change only where the record
+   it was decided over still stands at the revision the keeper read, tested under the
+   membership lock: a write that landed between the two is never written over, and the keeper
+   reads the store again before it answers. Until step 2 a first copy is still cut from the table,
+   and a call still reads the record that stands there. Until step 3 a status is still the
+   table's word: a drain and a connect signal write the table, the store hands a record the
+   status its table holds, and a call follows the store into the objects before it answers. A
+   change the store took and the registry did not get is laid by the task that follows the
+   table, while that task stands. A change that moves a fact the object holds builds the object again: the
    new object takes the standing one's place under its id, with its running state, as the code
    that keeps the objects does today for a record that changed.
 2. A standby applies the leader's events to its own worker objects, and a watcher's and a
@@ -1591,8 +1610,8 @@ its address is one function beside the other membership rules (`WorkerFacts::lai
 `store/membership.rs`): from the record that stands and the facts stated, the change and the
 record it leaves. The store's own write decides by it over the table's record. It then writes
 the decided change by the one body a standby's applier writes a leader's change by
-(`MemoryStore::follow`). Step 1 gives the rule its second caller: the code that keeps the worker
-objects, over the record read back from an object.
+(`MemoryStore::follow`). The rule's second caller is the code that keeps the worker
+objects, over the record read back from an object (step 1).
 
 A lease keeps naming its worker by the record's id, never by a place in a list: a gateway
 reports on a lease later and across membership changes.

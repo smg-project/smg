@@ -5,7 +5,7 @@
 use std::{collections::hash_map::RandomState, fmt, hash::BuildHasher, sync::Arc, time::Instant};
 
 use super::workers::{
-    identity, MembershipChange, Registrant, WorkerFacts, WorkerRow, WorkerStatus,
+    identity, MembershipChange, Registrant, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
 };
 
 /// A write of a row by a caller that did not register it.
@@ -137,15 +137,9 @@ impl WorkerFacts {
     /// steps. The change is a resize where the width moved. Under another
     /// incarnation they are the key's next life: a new id, at revision 1,
     /// admitted at `now`. The key's registration stands through its new
-    /// incarnation, and so does its maker. The status carries over where
-    /// the registration matches ([`same_worker`]), as the registry
-    /// inherits a replaced worker's runtime state. A drain is of the
-    /// registration it named and ends with it: a draining incarnation
-    /// hands no status on. Whether a worker takes images and what it
-    /// states for a request's hard demands are not asked, though a change
-    /// of either starts another life: it is the same reachable worker. A
-    /// key no row stands under is registered: pending, at revision 1, by
-    /// `maker`.
+    /// incarnation, and so does its maker, and the standing row hands its
+    /// status on by its own rule ([`WorkerRow::hands_on`]). A key no row
+    /// stands under is registered: pending, at revision 1, by `maker`.
     ///
     /// A blank value of a descriptor or of an encode offer is no report:
     /// the row holds what the two rules read. A descriptor that stands so
@@ -194,15 +188,9 @@ impl WorkerFacts {
             return (change, row);
         }
         let new = identity(&self.key, self.incarnation);
-        let carries =
-            standing.status != WorkerStatus::Draining && same_worker(&standing.facts, &self);
         let row = WorkerRow {
             id: new,
-            status: if carries {
-                standing.status
-            } else {
-                WorkerStatus::Pending
-            },
+            status: standing.hands_on(&self),
             facts: self,
             revision: 1,
             admitted_at: now,
@@ -210,6 +198,47 @@ impl WorkerFacts {
         };
         let old = standing.id;
         (MembershipChange::Replaced { old, new }, row)
+    }
+}
+
+impl WorkerRow {
+    /// The status the key's next life starts in behind this row, where
+    /// `facts` are that life's. The row's own carries over where the
+    /// registration matches ([`same_worker`]), as the registry inherits a
+    /// replaced worker's runtime state. A drain is of the registration it
+    /// named and ends with it: a draining incarnation hands no status on,
+    /// and neither does another worker's. The next life is pending then.
+    /// Whether a worker takes images and what it states for a request's
+    /// hard demands are not asked, though a change of either starts another
+    /// life: it is the same reachable worker.
+    pub(super) fn hands_on(&self, facts: &WorkerFacts) -> WorkerStatus {
+        if self.status != WorkerStatus::Draining && same_worker(&self.facts, facts) {
+            self.status
+        } else {
+            WorkerStatus::Pending
+        }
+    }
+}
+
+impl WorkerPatch {
+    /// Writes the patch over `facts`: each fact it names, and no other.
+    /// Every field is named: one more stops the build here until it says
+    /// which fact it moves. A patch moves no part of a worker's offer.
+    pub(crate) fn laid_on(self, facts: &mut WorkerFacts) {
+        let Self {
+            labels,
+            priority,
+            overload,
+        } = self;
+        if let Some(labels) = labels {
+            facts.labels = labels;
+        }
+        if let Some(priority) = priority {
+            facts.priority = priority;
+        }
+        if let Some(overload) = overload {
+            facts.overload = overload;
+        }
     }
 }
 

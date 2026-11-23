@@ -641,9 +641,11 @@ impl MemoryStore {
     /// journal's telling, the member's count slot and load entry, the build
     /// the write owes or pays, the word to the stages and the session
     /// pins. One body for every writer that hands a change with the
-    /// row it leaves: [`Self::follow`] hands a leader's, and the store's
+    /// row it leaves: [`Self::follow`] hands a leader's, the store's
     /// own registration decides its own over the table's row
-    /// ([`WorkersStore::upsert_by`]). `now` is the write's one read of the
+    /// ([`WorkersStore::upsert_by`]), and where the replica keeps worker
+    /// objects their holder hands the ones it decided
+    /// (`MemoryStore::follow_objects`). `now` is the write's one read of the
     /// clock, behind the lock. Whether the change fit the tables, as
     /// [`Self::follow`] says it: one that does not writes nothing and tells
     /// the journal nothing.
@@ -1969,6 +1971,62 @@ impl MemoryStore {
             .map(|row| row.row.clone())
             .collect()
     }
+
+    /// One membership write this replica's worker objects decided, applied
+    /// as their holder tells it: a leader's side of [`Self::follow`], over
+    /// the one body ([`Self::decided`]). The holder decided the change over
+    /// its objects and built the object of the row the change leaves. The
+    /// store steps its own epoch and journals the write as its own. `row`
+    /// is that row, and none for a removal.
+    ///
+    /// `seen` is the revision of the row the holder decided over, and none
+    /// where it read no row under the key. The table's row must stand at
+    /// that revision still, under this hold of the membership lock: the
+    /// test the store's own patch and removal make there, and what its own
+    /// registration has by deciding under the lock. A writer outside the
+    /// holder's turn can move the row between the holder's read and this
+    /// call: a replica that just took the lead may still apply its last
+    /// leader's last event.
+    ///
+    /// A status is the table's word until a worker object's leads. The
+    /// holder read `row`'s off an object, which trails the table by the
+    /// status writes it has not followed. So a row changed in place keeps
+    /// the status the table holds, and a key's next life is handed the
+    /// table's by the rule every writer decides by
+    /// ([`WorkerRow::hands_on`]). The holder copies it onto the object.
+    ///
+    /// Whether the store took the change. One it does not take writes
+    /// nothing: another writer moved the row under the holder's turn, or
+    /// the change does not fit the tables, as [`Self::follow`] says it.
+    pub(crate) fn follow_objects(
+        &self,
+        change: MembershipChange,
+        mut row: Option<WorkerRow>,
+        seen: Option<u64>,
+    ) -> bool {
+        let workers = self.writing();
+        let table = |id: WorkerId| workers.rows.get(&id).map(|held| &held.row);
+        // The row the change was decided over, as the table holds it now.
+        let over = match change {
+            MembershipChange::Registered { .. } => None,
+            MembershipChange::Replaced { old, .. } => table(old),
+            MembershipChange::Relabelled { id }
+            | MembershipChange::Resized { id }
+            | MembershipChange::Removed { id } => table(id),
+            // No holder decides a status: it is the table's own write.
+            MembershipChange::StatusChanged { .. } => return false,
+        };
+        if over.map(|over| over.revision) != seen {
+            return false;
+        }
+        if let (Some(row), Some(over)) = (&mut row, over) {
+            row.status = match change {
+                MembershipChange::Replaced { .. } => over.hands_on(&row.facts),
+                _ => over.status,
+            };
+        }
+        self.decided(workers, Instant::now(), change, row)
+    }
 }
 
 impl WorkersStore for MemoryStore {
@@ -1989,22 +2047,7 @@ impl WorkersStore for MemoryStore {
     fn patch(&self, id: WorkerId, patch: WorkerPatch, revision: u64) -> Option<MembershipChange> {
         let mut workers = self.writing();
         let row = workers.guarded(id, revision)?;
-        // Every field is named: one more stops the build here until the
-        // carry below is asked of it.
-        let WorkerPatch {
-            labels,
-            priority,
-            overload,
-        } = patch;
-        if let Some(labels) = labels {
-            row.row.facts.labels = labels;
-        }
-        if let Some(priority) = priority {
-            row.row.facts.priority = priority;
-        }
-        if let Some(overload) = overload {
-            row.row.facts.overload = overload;
-        }
+        patch.laid_on(&mut row.row.facts);
         row.row.revision += 1;
         let change = workers.record(MembershipChange::Relabelled { id });
         // Labels, a priority and an overload are no part of an offer.
@@ -5030,9 +5073,12 @@ mod tests {
     }
 }
 
-/// A seam for the cases: a hook the writing thread runs once, where a
-/// membership write has let the workers lock go. No case reaches there from
-/// outside. In no build but the cases'.
+/// A seam for the cases: a hook the writing thread runs once, where a write
+/// by the store's one body has let the workers lock go
+/// ([`MemoryStore::decided`]): a registration, a followed change, or a
+/// change the replica's worker objects decided. The store's own patch,
+/// removal and status write run none. No case reaches there from outside.
+/// In no build but the cases'.
 #[cfg(test)]
 pub(crate) mod seam {
     use std::cell::RefCell;
@@ -5044,7 +5090,7 @@ pub(crate) mod seam {
     }
 
     /// `hook` runs once, behind the workers lock of this thread's next
-    /// registration or followed change.
+    /// write by that body.
     pub(crate) fn on_release(hook: impl FnOnce() + 'static) {
         RELEASED.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
     }

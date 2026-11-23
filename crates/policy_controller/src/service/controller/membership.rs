@@ -29,9 +29,13 @@
 //! a follower's is, and never under a term read before the wait.
 //!
 //! **A call that wrote leaves the replica's worker objects holding its
-//! write.** The service hands the door the holder of those objects, which
-//! its decisions read. Behind a write that answered, the door follows the
-//! store into them before the call answers: a decision made behind an
+//! write.** The door is made with the holder of those objects, which the
+//! service's decisions read. A call's write of a row (a registration, a
+//! patch, a removal) is decided over them and the store follows it
+//! ([`Objects::upsert`]): the object stands when the write returns. A status
+//! is the store's word still: a drain and a connect signal write the
+//! table. So behind a write that answered, the door follows the store into
+//! the objects before the call answers: a decision made behind an
 //! acknowledged registration, drain or removal reads the fleet the call
 //! left. A standby's applied rows reach the objects by the holder's own
 //! task.
@@ -88,8 +92,8 @@ use crate::{
     },
     store::{
         membership::{self, life, FactPastBound, WorkerFactsChange},
-        HealthSink, JournalKinds, MemoryStore, Position, Registrant, WorkerFacts, WorkerRow,
-        WorkerStatus, WorkersStore,
+        HealthSink, JournalKinds, MembershipChange, MemoryStore, Position, Registrant, WorkerFacts,
+        WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     worker_host::{
         drain, lay, lay_one, lay_ready, refresh, stated, stating, take, Members,
@@ -112,10 +116,10 @@ pub(crate) struct MembershipCalls {
     log: Arc<Log>,
     /// One call at a time, from its read to its read back.
     turn: Mutex<()>,
-    /// The replica's worker objects, where the door was handed them: a call
-    /// that wrote follows the store into them before it answers
-    /// ([`Self::following`]).
-    objects: Option<Arc<Objects<Members>>>,
+    /// The replica's worker objects: a call's write of a row is decided
+    /// over them, and a call that wrote follows the store into them before
+    /// it answers ([`Self::followed`]).
+    objects: Arc<Objects<Members>>,
 }
 
 fn invalid(refused: Refused) -> Status {
@@ -153,42 +157,65 @@ const PATCH: &str = "PatchWorker";
 const DEREGISTER: &str = "DeregisterWorker";
 
 impl MembershipCalls {
-    /// The door over `store` and the log it journals to. The count of lives
-    /// starts at a draw for this run.
-    pub(crate) fn new(store: Arc<MemoryStore>, log: Arc<Log>) -> Self {
-        Self::based(store, log, membership::base())
+    /// The door over `store`, the log it journals to and `objects`, the
+    /// holder of the replica's worker objects, which its decisions read.
+    /// The count of lives starts at a draw for this run.
+    pub(crate) fn new(
+        store: Arc<MemoryStore>,
+        log: Arc<Log>,
+        objects: Arc<Objects<Members>>,
+    ) -> Self {
+        Self::based(store, log, membership::base(), objects)
     }
 
-    /// The door over `store` and its log, its count starting at `base`,
-    /// below 2^39: a run draws it, a case fixes it.
-    pub(crate) fn based(store: Arc<MemoryStore>, log: Arc<Log>, base: u64) -> Self {
+    /// The door over `store`, its log and `objects`, its count starting at
+    /// `base`, below 2^39: a run draws it, a case fixes it.
+    pub(crate) fn based(
+        store: Arc<MemoryStore>,
+        log: Arc<Log>,
+        base: u64,
+        objects: Arc<Objects<Members>>,
+    ) -> Self {
         Self {
             store,
             base,
             log,
             turn: Mutex::new(()),
-            objects: None,
+            objects,
         }
     }
 
-    /// The door whose calls leave `objects` holding their write: the holder
-    /// of the replica's worker objects, which its decisions read. A door
-    /// handed none follows nothing.
-    #[must_use]
-    pub(crate) fn following(mut self, objects: Arc<Objects<Members>>) -> Self {
-        self.objects = Some(objects);
-        self
-    }
-
-    /// Reads the store to its end into the worker objects the door was
-    /// handed, where it was handed any. Its caller holds neither the door's
-    /// turn nor a lock of the store: the holder's follows run one at a time
-    /// by its own lock, and never inside a notification of the store
-    /// ([`Objects::follow`]).
+    /// Reads the store to its end into the worker objects. Its caller
+    /// holds neither the door's turn nor a lock of the store: the holder's
+    /// follows run one at a time by its own lock, and never inside a
+    /// notification of the store ([`Objects::follow`]).
     fn followed(&self) {
-        if let Some(objects) = &self.objects {
-            objects.follow(&*self.store);
-        }
+        self.objects.follow(&*self.store);
+    }
+
+    /// The door's write of a registration's facts, in its turn: decided
+    /// over the worker objects, which the store follows
+    /// ([`Objects::upsert`]). `None` where another writer moved the row
+    /// under the turn.
+    fn lay_row(&self, facts: WorkerFacts, maker: Registrant) -> Option<MembershipChange> {
+        self.objects.upsert(&self.store, facts, maker)
+    }
+
+    /// The door's write of a patch, as [`Self::lay_row`] writes a
+    /// registration.
+    fn patch_row(
+        &self,
+        id: WorkerId,
+        patch: WorkerPatch,
+        revision: u64,
+    ) -> Option<MembershipChange> {
+        self.objects.patch(&self.store, id, patch, revision)
+    }
+
+    /// The door's removal of a row, as [`Self::lay_row`] writes a
+    /// registration.
+    fn take_row(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
+        self.objects.remove(&self.store, id, revision)
     }
 
     /// The log's place: read after a call's write, that write's own or one
@@ -231,11 +258,13 @@ impl MembershipCalls {
     /// URL.
     ///
     /// The replica's worker objects hold the write when the call answers.
-    /// Behind a write that answered, with the turn let go and no lock of
-    /// the store held, the door follows the store into them
-    /// ([`Self::followed`]). A decision reads those objects, so none made
-    /// behind an acknowledged registration, drain or removal reads the
-    /// fleet as it stood before the call. A refused call follows nothing.
+    /// A row's write was decided over them in the turn. Behind a write
+    /// that answered, with the turn let go and no lock of the store held,
+    /// the door follows the store into them for what the table still
+    /// leads, a status ([`Self::followed`]). A decision reads those
+    /// objects, so none made behind an acknowledged registration, drain or
+    /// removal reads the fleet as it stood before the call. A refused call
+    /// follows nothing.
     fn call(
         &self,
         call: &'static str,
@@ -376,7 +405,8 @@ impl MembershipCalls {
         // The row's bound holds with its maker: the facts' own was told
         // where they were read.
         worker_wire::room(&facts, &facts.labels, maker, "spec").map_err(invalid)?;
-        let id = self.store.upsert_by(facts, maker.clone()).id();
+        let wrote = self.lay_row(facts, maker.clone());
+        let id = wrote.ok_or_else(moved)?.id();
         // The row, the epoch and the place as the registration's write left
         // them: the answer of a call that does not wait.
         let (mut now, mut epoch, mut at) = (self.read(id)?, self.store.epoch(), self.place());
@@ -426,8 +456,7 @@ impl MembershipCalls {
                     worker_wire::room(&standing.facts, labels, &standing.maker, "labels")
                         .map_err(invalid)?;
                 }
-                self.store
-                    .patch(standing.id, patch, standing.revision)
+                self.patch_row(standing.id, patch, standing.revision)
                     .ok_or_else(moved)?;
                 (self.read(standing.id)?, true)
             }
@@ -469,8 +498,7 @@ impl MembershipCalls {
     ) -> Result<proto::WorkerEvent, Status> {
         let standing = self.guarded(maker, request.worker_id, request.revision)?;
         let (event, wrote) = if !request.drain {
-            self.store
-                .remove(standing.id, standing.revision)
+            self.take_row(standing.id, standing.revision)
                 .ok_or_else(moved)?;
             (worker_wire::removed(&standing), true)
         } else if standing.status == WorkerStatus::Draining {
@@ -578,6 +606,18 @@ struct CallTurn<'a> {
 impl Turn for CallTurn<'_> {
     fn store(&self) -> &MemoryStore {
         &self.door.store
+    }
+
+    fn upsert(&self, facts: WorkerFacts, maker: Registrant) -> Option<MembershipChange> {
+        self.door.lay_row(facts, maker)
+    }
+
+    fn patch(&self, id: WorkerId, patch: WorkerPatch, revision: u64) -> Option<MembershipChange> {
+        self.door.patch_row(id, patch, revision)
+    }
+
+    fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
+        self.door.take_row(id, revision)
     }
 
     fn check_term(&self) -> Result<(), MembershipWriteRefused> {
@@ -832,7 +872,7 @@ impl ReplicaMembershipWriter {
         &self,
         call: &'static str,
         by: Remover<'_>,
-        write: impl FnOnce() -> Result<MembershipWriteOutcome, MembershipWriteRefused>,
+        write: impl FnOnce(u64) -> Result<MembershipWriteOutcome, MembershipWriteRefused>,
     ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         let asker = Some(match by {
             Remover::Registrant(Registrant::Control) => "control call",
@@ -840,8 +880,8 @@ impl ReplicaMembershipWriter {
             Remover::Provider(name) => name,
             Remover::Health(_) => "health",
         });
-        self.call(call, asker, |_| {
-            write().inspect(|wrote| self.audit(call, *wrote, asker))
+        self.call(call, asker, |term| {
+            write(term).inspect(|wrote| self.audit(call, *wrote, asker))
         })
     }
 }
@@ -858,6 +898,18 @@ struct ReplicaTurn<'a> {
 impl Turn for ReplicaTurn<'_> {
     fn store(&self) -> &MemoryStore {
         &self.host.door.store
+    }
+
+    fn upsert(&self, facts: WorkerFacts, maker: Registrant) -> Option<MembershipChange> {
+        self.host.door.lay_row(facts, maker)
+    }
+
+    fn patch(&self, id: WorkerId, patch: WorkerPatch, revision: u64) -> Option<MembershipChange> {
+        self.host.door.patch_row(id, patch, revision)
+    }
+
+    fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
+        self.host.door.take_row(id, revision)
     }
 
     fn check_term(&self) -> Result<(), MembershipWriteRefused> {
@@ -922,7 +974,7 @@ impl MembershipWriter for ReplicaMembershipWriter {
         url: &str,
         seen: RowRevision,
     ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
-        self.removal("worker drain", by, || {
+        self.removal("worker drain", by, |_| {
             drain(&self.door.store, by, url, seen)
         })
     }
@@ -933,8 +985,8 @@ impl MembershipWriter for ReplicaMembershipWriter {
         url: &str,
         seen: RowRevision,
     ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
-        self.removal("worker removal", by, || {
-            take(&self.door.store, by, url, seen)
+        self.removal("worker removal", by, |term| {
+            take(&ReplicaTurn { host: self, term }, by, url, seen)
         })
     }
 
@@ -1035,6 +1087,7 @@ pub(crate) mod tests {
         engine::view::{Role, WireModes, WorkerId},
         service::{
             controller::{
+                decision_slots::tests::holder,
                 election::LeasePlace,
                 principal::{tests::told, Principal},
                 replication::{journaled, journaled_from},
@@ -1081,13 +1134,15 @@ pub(crate) mod tests {
         door_in(TERM)
     }
 
-    /// The same under another term.
+    /// The same under another term. The door decides over a holder of its
+    /// own, built as the controller builds one.
     fn door_in(term: u64) -> (Arc<MemoryStore>, MembershipCalls) {
         let (store, feed) = journaled_from(&LeasePlace::Process, 0);
         store::LeasesStore::set_term(store.as_ref(), term);
+        let objects = holder(&store);
         (
             Arc::clone(&store),
-            MembershipCalls::based(store, feed.log, 0),
+            MembershipCalls::based(store, feed.log, 0, objects),
         )
     }
 
@@ -1146,20 +1201,19 @@ pub(crate) mod tests {
     /// the door is named by a decision behind the call. One whose
     /// deregistration was acknowledged is named by none behind it, and
     /// neither is one whose drain was acknowledged. The replica's own
-    /// writer shares the door's turn and its follow: a worker it removes is
+    /// writer shares the door's turn and its follow: a worker it drains is
     /// named by none behind its answer.
     #[tokio::test]
     async fn a_decision_behind_an_acknowledged_call_reads_the_fleet_the_call_left() {
         use std::collections::BTreeSet;
 
-        use crate::service::controller::{
-            decision_slots::tests::{frame, lent_pick, preset},
-            worker_objects::{ObjectsWake, WorkerObjects},
-        };
+        use crate::service::controller::decision_slots::tests::{frame, lent_pick, preset};
 
-        let (store, door) = door();
-        let objects = WorkerObjects::new(Arc::clone(&store), ObjectsWake::default()).holder();
-        let door = Arc::new(door.following(Arc::clone(&objects)));
+        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        store::LeasesStore::set_term(store.as_ref(), TERM);
+        let objects = holder(&store);
+        let door = MembershipCalls::based(Arc::clone(&store), feed.log, 0, Arc::clone(&objects));
+        let door = Arc::new(door);
         store
             .apply(preset("round_robin", 1))
             .expect("above the unbound start");
@@ -1197,16 +1251,149 @@ pub(crate) mod tests {
         // And an acknowledged drain.
         leave(ids[1], true);
         assert_eq!(named(), BTreeSet::from([ids[2]]));
-        // The last worker leaves through the replica's own writer, over the
-        // same door: no decision behind its answer names a worker.
+        // The last worker is drained through the replica's own writer,
+        // over the same door: no decision behind its answer names a worker.
+        // A drain is the table's write still, so the writer's follow is
+        // what takes it to the object.
         let hosted = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM));
         let last = WorkersStore::get(&*store, ids[2]).expect("the row stands");
         let by = Remover::Registrant(&last.maker);
         assert_eq!(
-            hosted.gone(by, "grpc://w2:8000", standing(&last)),
-            Ok(MembershipWriteOutcome::Removed(ids[2]))
+            hosted.drained(by, "grpc://w2:8000", standing(&last)),
+            Ok(MembershipWriteOutcome::Draining(ids[2]))
         );
         assert_eq!(named(), BTreeSet::new());
+    }
+
+    /// A call's write of a row builds the row's worker object where it is
+    /// written, and what the table still leads reaches the object behind
+    /// the write: the registry tells a registration, then the status the
+    /// connect signal moved, as the log tells the two. So it is for a call
+    /// of one row, for each rank of a wide call, and for a row the
+    /// replica's own writer lays. A door that wrote the table alone would
+    /// build each object behind its connect signal, ready from the start,
+    /// and the registry would tell no status.
+    #[test]
+    fn a_call_builds_a_rows_object_at_its_write_and_its_status_follows() {
+        use smg_worker::registry::event::WorkerEvent;
+
+        use crate::store::HealthPolicy;
+
+        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        store::LeasesStore::set_term(store.as_ref(), TERM);
+        let objects = holder(&store);
+        let mut events = objects.registry().subscribe_events();
+        let door = Arc::new(MembershipCalls::based(store, feed.log, 0, objects));
+        // What the registry told since the last read, in its order.
+        let mut told = move || -> Vec<&'static str> {
+            let mut told = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                told.push(match event {
+                    WorkerEvent::Registered { .. } => "registered",
+                    WorkerEvent::Replaced { .. } => "replaced",
+                    WorkerEvent::Removed { .. } => "removed",
+                    WorkerEvent::StatusChanged { .. } => "status",
+                });
+            }
+            told
+        };
+        door.register(&operator(), under(TERM), &ask(unchecked(URL), Mode::Add))
+            .expect("one row");
+        assert_eq!(told(), ["registered", "status"]);
+        let ranks = proto::WorkerSpec {
+            dp_size: 2,
+            ..unchecked("grpc://wide:8000")
+        };
+        door.register(&operator(), under(TERM), &ask(ranks, Mode::Add))
+            .expect("two ranks");
+        // Each write reads the store to its end first: the first rank's
+        // status reaches its object ahead of the second rank's write.
+        assert_eq!(told(), ["registered", "status", "registered", "status"]);
+        let hosted = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM));
+        let own = "grpc://own:8000";
+        let wrote = hosted.found_one(&found("pods/a"), own, &|_| WorkerFacts {
+            key: own.to_owned(),
+            engine: own.to_owned(),
+            health: HealthPolicy {
+                probes: false,
+                ..HealthPolicy::default()
+            },
+            ..found_facts()
+        });
+        assert!(
+            matches!(wrote, Ok(MembershipWriteOutcome::Registered(_))),
+            "{wrote:?}"
+        );
+        assert_eq!(told(), ["registered", "status"]);
+    }
+
+    /// A door's patch and removal are decided over the worker objects, as
+    /// its registration is: each runs the store's one body, which the
+    /// store's own patch and removal never run, and a removal's object has
+    /// left the registry when the store hears of it. So it is for a control
+    /// call and for a removal by the replica's own writer.
+    #[test]
+    fn a_doors_patch_and_removal_are_decided_over_the_worker_objects() {
+        use std::{cell::Cell, rc::Rc};
+
+        use crate::store::memory::seam;
+
+        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        store::LeasesStore::set_term(store.as_ref(), TERM);
+        let objects = holder(&store);
+        let calls = MembershipCalls::based(Arc::clone(&store), feed.log, 0, Arc::clone(&objects));
+        let door = Arc::new(calls);
+        // Whether `write` ran the one body, with the object of the row
+        // `gone` out of the registry by then.
+        let decided = |gone: Option<WorkerId>, write: &dyn Fn()| {
+            let ran = Rc::new(Cell::new(false));
+            let (told, objects) = (Rc::clone(&ran), Arc::clone(&objects));
+            seam::on_release(move || {
+                let stands = gone.and_then(|gone| objects.object(gone));
+                assert_eq!(stands, None, "the object leaves first");
+                told.set(true);
+            });
+            write();
+            ran.get()
+        };
+        door.register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
+            .expect("registered");
+        let row = store.by_key(URL).expect("the row");
+        let patch = proto::PatchWorkerRequest {
+            worker_id: row.id.0,
+            labels: [("lane".to_owned(), "b".to_owned())].into(),
+            remove_labels: Vec::new(),
+            overload: None,
+            revision: row.revision,
+        };
+        let patched = decided(None, &|| {
+            door.patch(&operator(), under(TERM), &patch)
+                .expect("patched");
+        });
+        assert!(patched, "a patch call");
+        let row = store.by_key(URL).expect("the row");
+        let leave = proto::DeregisterWorkerRequest {
+            worker_id: row.id.0,
+            revision: row.revision,
+            drain: false,
+        };
+        let removed = decided(Some(row.id), &|| {
+            door.deregister(&operator(), under(TERM), &leave)
+                .expect("removed");
+        });
+        assert!(removed, "a removal call");
+        let hosted = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM));
+        let maker = found("pods/a");
+        hosted
+            .found_one(&maker, URL, &|_| found_facts())
+            .expect("found");
+        let made = store.by_key(URL).expect("the found row");
+        let gone = decided(Some(made.id), &|| {
+            hosted
+                .gone(Remover::Registrant(&maker), URL, standing(&made))
+                .expect("gone");
+        });
+        assert!(gone, "a removal by the replica's own writer");
     }
 
     #[test]
@@ -1975,7 +2162,8 @@ pub(crate) mod tests {
         });
         let store = Arc::new(MemoryStore::journaled(journal).with_decision_slots(1));
         store::LeasesStore::set_term(store.as_ref(), TERM);
-        let door = MembershipCalls::based(Arc::clone(&store), Arc::clone(&feed.log), 0);
+        let log = Arc::clone(&feed.log);
+        let door = MembershipCalls::based(Arc::clone(&store), log, 0, holder(&store));
 
         let refused = door
             .register(&operator(), under(TERM), &ask(wide(URL, 2), Mode::Add))
@@ -2011,7 +2199,8 @@ pub(crate) mod tests {
         let handed = Arc::clone(&journal);
         let store = Arc::new(MemoryStore::journaled(handed).with_decision_slots(1));
         store::LeasesStore::set_term(store.as_ref(), TERM);
-        let door = MembershipCalls::based(Arc::clone(&store), Arc::clone(&feed.log), 0);
+        let log = Arc::clone(&feed.log);
+        let door = MembershipCalls::based(Arc::clone(&store), log, 0, holder(&store));
         door.register(&operator(), under(TERM), &ask(wide(URL, width), Mode::Add))
             .expect("the ranks registered under a held lead");
         (store, door, journal)
@@ -2074,7 +2263,8 @@ pub(crate) mod tests {
         });
         let store = Arc::new(MemoryStore::journaled(journal).with_decision_slots(1));
         store::LeasesStore::set_term(store.as_ref(), TERM);
-        let door = MembershipCalls::based(Arc::clone(&store), Arc::clone(&feed.log), 0);
+        let log = Arc::clone(&feed.log);
+        let door = MembershipCalls::based(Arc::clone(&store), log, 0, holder(&store));
         let lost = door
             .register(&operator(), under(TERM), &ask(wide(URL, 3), Mode::Add))
             .expect_err("the lead was lost at the second rank");
@@ -4003,7 +4193,8 @@ pub(crate) mod tests {
         let drawn: Vec<u64> = (0..64)
             .map(|_| {
                 let (store, feed) = journaled(&LeasePlace::Process, 1);
-                MembershipCalls::new(store, feed.log).base
+                let objects = holder(&store);
+                MembershipCalls::new(store, feed.log, objects).base
             })
             .collect();
         assert!(drawn.iter().all(|&base| base < BOUND), "{drawn:?}");
@@ -4020,7 +4211,7 @@ pub(crate) mod tests {
         let run = || {
             let (store, feed) = journaled(&LeasePlace::Process, 1);
             store::LeasesStore::set_term(store.as_ref(), 1);
-            let door = MembershipCalls::new(Arc::clone(&store), feed.log);
+            let door = MembershipCalls::new(Arc::clone(&store), feed.log, holder(&store));
             let first = row_of(
                 &door
                     .register(&operator(), under(1), &ask(spec(URL), Mode::Add))
