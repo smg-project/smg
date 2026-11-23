@@ -1560,18 +1560,6 @@ impl<'a> RequestFacts<'a> {
     }
 }
 
-/// A table of session pins that outlives an engine's own (design 5.1, the
-/// sessions row), lent by the deciding host among a decision's
-/// [`Constraints`]. A sessions rule asks it once a decision, for a key its
-/// engine's table holds no pin of: the table goes with its generation, the
-/// pins of record do not.
-pub trait PinSource: std::fmt::Debug + Sync {
-    /// The worker `key` is pinned to, where that pin has not ended by the
-    /// host's record and was last used less than `ttl_micros` ago (`None`:
-    /// a pin of any age). The host answers by its own clock.
-    fn pinned(&self, key: Session, ttl_micros: Option<u64>) -> Option<WorkerId>;
-}
-
 /// What only the deciding host knows now: its standing vetoes, the wires it
 /// speaks and the request-level lifts around the profile. The admission bits
 /// of a prefill window and a decode room ride the candidate rows.
@@ -1634,14 +1622,6 @@ pub struct Constraints<'a> {
     /// there a held row carries the breaker bit beside the stalled one.
     /// In-process only.
     pub held: &'a [u32],
-    /// The pins of record, where the host keeps a table that outlives the
-    /// engine's ([`PinSource`]): a sessions rule asks it for a key its own
-    /// table holds no pin of, and no other stage reads it. `None` where
-    /// the engine's table is the only one, as in a host that embeds the
-    /// engine. In-process only. A decision lent them ends a key with its
-    /// idle time in the engine's table too, as the record counts no sweep.
-    /// The engine over worker lists reads none.
-    pub pins: Option<&'a dyn PinSource>,
     /// The places of the pool's list the request may take, ascending, each
     /// once, where its host holds it to a part of the pool: the workers a
     /// retry may still take, the worker a request names, the workers that

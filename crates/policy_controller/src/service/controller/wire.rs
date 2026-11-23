@@ -437,8 +437,8 @@ impl Checked {
     /// The frame's constraints in the engine's form: the workers its
     /// gateway just missed, the wires it states, the lifted veto, the later
     /// decode and the subset hint. What the deciding program adds of its
-    /// own stands at rest: no position is held back, no pins are lent and
-    /// the request may take every place of its list.
+    /// own stands at rest: no position is held back and the request may
+    /// take every place of its list.
     ///
     /// The one reader of a frame's constraints, as [`Self::facts`] is of
     /// its facts.
@@ -454,7 +454,6 @@ impl Checked {
             demands: Demands::default(),
             stalled: &[],
             held: &[],
-            pins: None,
             // No frame holds a request to places.
             places: None,
         }

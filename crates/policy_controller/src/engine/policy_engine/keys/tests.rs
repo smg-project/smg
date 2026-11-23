@@ -3,7 +3,7 @@
 
 use std::{
     cell::OnceCell,
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -18,7 +18,7 @@ use crate::{
         policy_engine::PolicyEngine,
         records,
         sticky_sessions::{shards_for_this_host, SessionVerdict},
-        view::{Constraints, Identity, Phase, PinSource, RequestFacts, Session, WorkerId},
+        view::{Constraints, Identity, Phase, RequestFacts, Session, WorkerId},
     },
     policies::consistent_hashing::{InOrder, LentRing},
     store::GatewayId,
@@ -435,44 +435,6 @@ fn a_key_idle_past_its_time_keeps_its_worker_until_the_sweep() {
     assert!(matches!(placed, SessionVerdict::Claimed(_)));
     assert_eq!(served_at(61), (SessionVerdict::Pinned, worker));
     assert!(matches!(served_at(3_600).0, SessionVerdict::Claimed(_)));
-}
-
-/// Pins of record: one worker for every key, and whether it was asked.
-#[derive(Debug)]
-struct Elsewhere(WorkerId, OnceLock<()>);
-
-impl PinSource for Elsewhere {
-    fn pinned(&self, _: Session, _: Option<u64>) -> Option<WorkerId> {
-        let _ = self.1.set(());
-        Some(self.0)
-    }
-}
-
-/// This engine reads no pins of record: a request that lends a record naming
-/// another worker is decided as one that lends none, where the whole pass
-/// places its key and where its pin is followed. The record is never asked.
-#[test]
-fn a_request_that_lends_pins_of_record_is_decided_as_one_that_lends_none() {
-    let (engine, twin) = (preset("manual"), preset("manual"));
-    let list = pool(16);
-    let (members, others) = (
-        PublishedList::new(Arc::clone(&list)),
-        PublishedList::new(Arc::clone(&list)),
-    );
-    // The whole pass places the key, then the key's pin is followed.
-    let twice = |engine: &PolicyEngine, asks: &Asks<'_>| {
-        [(); 2].map(|()| targets(&decided(engine, asks).decision))
-    };
-    let plain = twice(&twin, &keyed(41, &others));
-    let mut ids = list
-        .iter()
-        .map(|worker| records::worker_id(worker.as_ref()));
-    let other = ids.find(|id| *id != plain[0][0].1).expect("another worker");
-    let record = Elsewhere(other, OnceLock::new());
-    let mut lent = keyed(41, &members);
-    lent.request.constraints.pins = Some(&record);
-    assert_eq!(twice(&engine, &lent), plain);
-    assert!(record.1.get().is_none(), "the record is not asked");
 }
 
 /// A document is handed the engine's table ahead of its engine's first

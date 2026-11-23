@@ -169,10 +169,10 @@
 //! refuses the request ([`frame_decision::decide`]). Its decider answers
 //! and counts that request as one its own catch held.
 //!
-//! What this step leaves to the next ones. A decision reads no session pin
-//! of the store's, and no load report under a document with a stage that
-//! keeps reports. A decode call, an encode request and a prefill whose
-//! model's plan pairs no side have no decision.
+//! What this step leaves to the next ones. A decision reads no load report
+//! under a document with a stage that keeps reports. A decode call, an
+//! encode request and a prefill whose model's plan pairs no side have no
+//! decision.
 
 use std::{
     io, mem,
@@ -5495,10 +5495,9 @@ pub(crate) mod tests {
     }
 
     /// A keyed session keeps its worker across an apply of a new
-    /// generation. The new engine's table of sessions starts empty: a
-    /// decision that finds no pin there reads the store's, which the
-    /// session's `Dispatched` frame wrote, and is made on it. Inside a
-    /// generation a decision of a dispatched key is made on its pin too.
+    /// generation. The new document's engine is to take the session table
+    /// of the engine before it (`Engine::share_sessions`): a decision of a
+    /// dispatched key is made on its pin under either generation.
     #[tokio::test]
     #[ignore = "a new document's engine starts with no session pin yet"]
     async fn a_keyed_session_keeps_its_worker_across_an_apply() {
@@ -5527,7 +5526,7 @@ pub(crate) mod tests {
                 .deciding(|world| world.spec().engine().sessions().pins(session))
         };
         // Each key's first decision claims a worker, and its gateway's
-        // Dispatched frame commits it: the engine's pin and the store's.
+        // Dispatched frame commits it: the engine's pin.
         let mut first = Vec::new();
         for key in 1..=KEYS {
             let answer = bed.ask(keyed(key, 1_000 + key)).await;
@@ -5551,12 +5550,13 @@ pub(crate) mod tests {
             assert_eq!(picked(&answer), worker);
             assert_eq!(verdict(&bed, &answer), SessionVerdict::Pinned);
         }
-        // A new generation: its engine's table holds no pin of any key.
-        assert!(pins(&bed, first[0].2).is_some());
+        // A new generation: its engine is to hold the pins of the one before.
+        let held = pins(&bed, first[0].2);
+        assert!(held.is_some());
         bed.store
             .apply(preset("manual", 2))
             .expect("a later generation");
-        assert_eq!(pins(&bed, first[0].2), None);
+        assert_eq!(pins(&bed, first[0].2), held);
         for &(key, worker, session) in &first {
             let answer = bed.ask(keyed(key, 3_000 + key)).await;
             assert_eq!(

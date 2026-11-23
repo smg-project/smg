@@ -2624,55 +2624,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// The entry reads no pins of record, as the one entry reads none: a
-    /// request that lends a record naming another worker is decided as one
-    /// that lends none, and the record is never asked.
-    #[test]
-    fn a_decision_without_a_lease_reads_no_pins_of_record() {
-        use std::sync::OnceLock;
-
-        use crate::engine::view::PinSource;
-
-        /// Pins of record: one worker for every key, and whether it was
-        /// asked.
-        #[derive(Debug)]
-        struct Elsewhere(WorkerId, OnceLock<()>);
-
-        impl PinSource for Elsewhere {
-            fn pinned(&self, _: Session, _: Option<u64>) -> Option<WorkerId> {
-                let _ = self.1.set(());
-                Some(self.0)
-            }
-        }
-
-        let (engine, twin) = (preset("manual"), preset("manual"));
-        let list = pool(16);
-        let (members, others) = (
-            PublishedList::new(Arc::clone(&list)),
-            PublishedList::new(Arc::clone(&list)),
-        );
-        let keyed = || {
-            let mut keyed = request();
-            keyed.facts.seed = 41;
-            keyed.facts.session_key = Identity::hashed(41);
-            keyed
-        };
-        let named = |engine: &PolicyEngine, asks: &Asks<'_>| {
-            let decision = engine.decide_without_lease(asks, Instant::now());
-            let (decision, _) = decision.expect("a decision");
-            let first = decision.pick().and_then(|pick| pick.targets.first());
-            first.map(|target| target.id).expect("a pick")
-        };
-        let plain = named(&twin, &Asks::of(keyed(), Some(&others)));
-        let mut ids = list.iter().map(|worker| worker_id(worker.as_ref()));
-        let other = ids.find(|id| *id != plain).expect("another worker");
-        let record = Elsewhere(other, OnceLock::new());
-        let mut lent = keyed();
-        lent.constraints.pins = Some(&record);
-        assert_eq!(named(&engine, &Asks::of(lent, Some(&members))), plain);
-        assert!(record.1.get().is_none(), "the record is not asked");
-    }
-
     /// A request that hands no list of its kind is decided over no worker,
     /// as the one entry decides it: a single with no list, a pair's prefill
     /// with none, and a prefill over a single's list. A single over a pair's

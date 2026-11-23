@@ -639,16 +639,12 @@ impl<'d> Loaded<'_, 'd> {
         Some(profiles.get(usize::from(profile.0))?.picker.as_ref())
     }
 
-    /// The request `maker` makes, as this engine decides it: with no pins of
-    /// record lent ([`Constraints::pins`](super::view::Constraints::pins)).
-    /// Its session table is the only one it reads, whatever the entry.
-    ///
-    /// A request that states no budget is made with the widest one: a stage
-    /// reads the number as the time left ([`budget::shown`]).
+    /// The request `maker` makes, as this engine decides it. A request that
+    /// states no budget is made with the widest one: a stage reads the
+    /// number as the time left ([`budget::shown`]).
     #[inline(always)]
     fn made<'w>(&'w self, maker: &'w impl RequestMaker) -> Request<'w> {
         let mut request = maker.make(&self.document.spec);
-        request.constraints.pins = None;
         request.facts.budget_micros = budget::shown(request.facts.budget_micros);
         request
     }

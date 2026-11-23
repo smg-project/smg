@@ -1681,14 +1681,14 @@
           }
         },
         "ttl_s": {
-          "description": "How long an idle key stays pinned, in seconds, before the rule's\nnext sweep forgets it; above zero (default 14400), `4294967295` for\never. A host that keeps a record of the pins, as the controller's\nown service does, forgets the key at `ttl_s` itself.",
+          "description": "How long an idle key stays pinned, in seconds, before the rule's\nnext sweep forgets it; above zero (default 14400), `4294967295` for\never.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
           "default": 14400
         },
         "sweep_s": {
-          "description": "The sweep cadence of idle keys, in seconds: a key idle for `ttl_s`\nis forgotten at the next sweep, and one used again ahead of it stays\npinned. Above zero (default 120), `4294967295` for never, allowed\nunder a `ttl_s` for ever alone. Under a host that keeps a record of\nthe pins the sweep only reclaims.",
+          "description": "The sweep cadence of idle keys, in seconds: a key idle for `ttl_s`\nis forgotten at the next sweep, and one used again ahead of it stays\npinned. Above zero (default 120), `4294967295` for never, allowed\nunder a `ttl_s` for ever alone.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
