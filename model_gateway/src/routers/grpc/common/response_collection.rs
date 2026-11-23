@@ -909,7 +909,7 @@ mod tests {
         let workers = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: Arc::clone(&prefill),
-            decode: Arc::clone(&prefill),
+            decode: Arc::clone(&prefill).into(),
             runtime_type: RuntimeType::Vllm,
         };
         let request = ProtoGenerateRequest::Vllm(Box::default());

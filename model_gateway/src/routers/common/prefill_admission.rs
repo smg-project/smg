@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use smg_worker::identity::basic::{Worker, WorkerLoadGuard};
 use tokio::sync::Notify;
 
-use crate::observability::metrics::Metrics;
+use crate::{observability::metrics::Metrics, routers::common::placement::Placed};
 
 const HEAD_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -87,6 +87,21 @@ pub struct PrefillReservation {
     load_guard: Option<WorkerLoadGuard>,
 }
 
+impl PrefillReservation {
+    /// This reservation, sent: its load guard is the prefill's, made under
+    /// the admission lock ahead of the prefill's send, under the route's
+    /// own key. The admission makes it behind the selection, of the
+    /// selected worker alone: it holds the answer as a value it does not
+    /// read. The guard is handed to the answer here ([`Placed::sent`]), so
+    /// the reservation's release is the end of the prefill's side.
+    fn sent(mut self, prefill: &Placed) -> Self {
+        if let Some(load_guard) = self.load_guard.take() {
+            self.load_guard = Some(prefill.sent(load_guard));
+        }
+        self
+    }
+}
+
 impl Drop for PrefillReservation {
     fn drop(&mut self) {
         let Some(load_guard) = self.load_guard.take() else {
@@ -151,7 +166,7 @@ impl<E: PrefillCandidateError + ?Sized> PrefillCandidateError for Box<E> {
     }
 }
 
-/// Why [`acquire_prefill`] could not reserve Prefill capacity.
+/// Why `acquire_prefill` could not reserve Prefill capacity.
 pub enum PrefillAcquireError<E> {
     /// Candidate selection found no worker to wait for. With admission
     /// enabled this is the verdict of the last attempt at the queue head.
@@ -167,7 +182,17 @@ pub enum PrefillAcquireError<E> {
 /// [`PrefillSelectionContext::has_capacity`] before it invokes a stateful
 /// routing policy. With admission disabled `select` receives `None` and runs
 /// once.
-pub async fn acquire_prefill<C, E, S, P>(
+///
+/// `prefill_of` names the prefill of what `select` answers, as the placement
+/// answers a worker ([`Placed`]): the load held is that answer's guard, the
+/// prefill's send being next. With admission disabled it is made here
+/// ([`Placed::guard`]). With admission enabled the reservation's own guard
+/// is handed to the answer ([`PrefillReservation::sent`]). The admission
+/// made that guard behind the selection, of the selected worker alone
+/// ([`PrefillAdmission::admit`] holds the answer as a value it does not
+/// read), so it counts under `routing_key` even where the policy engine
+/// names a routing value of its own.
+pub(crate) async fn acquire_prefill<C, E, S, P>(
     admission: Option<&PrefillAdmission>,
     routing_key: Option<&str>,
     prefill_of: P,
@@ -175,13 +200,13 @@ pub async fn acquire_prefill<C, E, S, P>(
 ) -> Result<(C, PrefillLoadGuard), PrefillAcquireError<E>>
 where
     S: for<'a> FnMut(Option<&PrefillSelectionContext<'a>>) -> Result<C, E> + Send,
-    P: Fn(&C) -> &Arc<dyn Worker> + Send + Sync,
+    P: Fn(&C) -> &Placed + Send + Sync,
     E: PrefillCandidateError + Send,
 {
     let Some(admission) = admission else {
         let candidate = select(None).map_err(PrefillAcquireError::Candidate)?;
         let guard = PrefillLoadGuard::Unbounded {
-            _guard: WorkerLoadGuard::with_key(Arc::clone(prefill_of(&candidate)), routing_key),
+            _guard: prefill_of(&candidate).guard(routing_key),
         };
         return Ok((candidate, guard));
     };
@@ -191,7 +216,10 @@ where
     let mut verdict = None;
     let admitted = admission
         .admit(routing_key, |capacity| match select(Some(capacity)) {
-            Ok(candidate) => capacity.select(Arc::clone(prefill_of(&candidate)), candidate),
+            Ok(candidate) => {
+                let prefill = Arc::clone(prefill_of(&candidate).worker());
+                capacity.select(prefill, candidate)
+            }
             Err(error) if error.is_at_capacity() => PrefillAdmissionAttempt::AtCapacity,
             Err(error) => {
                 verdict = Some(error);
@@ -201,12 +229,13 @@ where
         .await;
 
     match (admitted, verdict) {
-        (Ok(admitted), _) => Ok((
-            admitted.selected,
-            PrefillLoadGuard::Admission {
-                _reservation: Arc::new(admitted.reservation),
-            },
-        )),
+        (Ok(admitted), _) => {
+            let reservation = admitted.reservation.sent(prefill_of(&admitted.selected));
+            let guard = PrefillLoadGuard::Admission {
+                _reservation: Arc::new(reservation),
+            };
+            Ok((admitted.selected, guard))
+        }
         (Err(PrefillAdmissionRejection::Unavailable), Some(error)) => {
             Err(PrefillAcquireError::Candidate(error))
         }
@@ -575,7 +604,22 @@ mod tests {
     };
 
     use super::{test_support::select_worker, *};
-    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
+    use crate::{
+        config::types::PolicyConfig,
+        policies::PolicyRegistry,
+        routers::{
+            common::{
+                pair_index::PdPairIndex,
+                placement::{
+                    select_pair,
+                    tests::{hearing_pairs_on, one_pair, pairs_of, MODEL},
+                    PairFailure, PlacedPair, PlacementInputs,
+                },
+                snapshot::WorkerRegistry,
+            },
+            grpc::backend_client::BasicWorkerBuilder,
+        },
+    };
 
     fn worker(url: &str) -> Arc<dyn Worker> {
         Arc::new(
@@ -1107,5 +1151,119 @@ mod tests {
             spy.0.lock().unwrap().as_slice(),
             ["grpc://prefill-admitted"]
         );
+    }
+
+    /// A pair's selection as a pair route hands it to [`acquire_prefill`]:
+    /// the pair placement over the fleet's pair index, under `capacity`.
+    fn pair_selection<'a>(
+        registry: &'a WorkerRegistry,
+        policies: &'a PolicyRegistry,
+        pairs: &'a PdPairIndex,
+    ) -> impl for<'c> FnMut(
+        Option<&PrefillSelectionContext<'c>>,
+    ) -> Result<PlacedPair, Box<PairFailure>>
+           + Send
+           + 'a {
+        move |capacity| {
+            let inputs = PlacementInputs::default();
+            select_pair(registry, policies, MODEL, pairs, None, capacity, inputs)
+        }
+    }
+
+    /// A served pair of the policy engine through [`acquire_prefill`], with
+    /// admission off and on: the engine hears two dispatches and two ends,
+    /// and no release. With admission on the reservation's own load guard
+    /// is the prefill's: it is sent where the pair is admitted, the prefill
+    /// is counted once, and the reservation's release is the prefill
+    /// side's end.
+    #[tokio::test]
+    async fn a_served_pair_of_the_engine_is_heard_through_its_prefills_admission() {
+        for admitted in [false, true] {
+            let registry = one_pair();
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            let heard = hearing_pairs_on(&policies, false);
+            let said = || heard.lock().expect("the stage heard").clone();
+            let pairs = pairs_of(&registry, &policies);
+            let admission = admitted.then(|| PrefillAdmission::new(1, 0, Duration::from_secs(1)));
+            let acquired = acquire_prefill(
+                admission.as_ref(),
+                Some("key"),
+                |pair: &PlacedPair| &pair.prefill,
+                pair_selection(&registry, &policies, &pairs),
+            )
+            .await;
+            let Ok((pair, prefill)) = acquired else {
+                panic!("the pair is placed, admission {admitted}");
+            };
+            assert_eq!(pair.prefill.load(), 1, "admission {admitted}");
+            assert_eq!(
+                said(),
+                ["issued", "issued", "dispatched Prefill"],
+                "admission {admitted}"
+            );
+            let decode = pair.decode.sent(pair.decode.ahead(Some("key")));
+            let prefill_worker = Arc::clone(pair.prefill.worker());
+            drop(pair);
+            drop(prefill);
+            assert_eq!(prefill_worker.load(), 0, "admission {admitted}");
+            assert_eq!(said()[3..], ["dispatched Decode", "completed Cancelled"]);
+            drop(decode);
+            assert_eq!(
+                said()[3..],
+                [
+                    "dispatched Decode",
+                    "completed Cancelled",
+                    "completed Cancelled"
+                ],
+                "two dispatches, two ends, no release: admission {admitted}"
+            );
+        }
+    }
+
+    /// Under the policy engine a pair whose prefills are all at the
+    /// admission limit is answered as the wait, as a classic placement
+    /// answers it: the request is not refused, and with no queue it is
+    /// told the queue is full.
+    #[tokio::test]
+    async fn the_engines_pair_answers_prefills_at_their_limit_as_the_wait() {
+        let registry = one_pair();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let _heard = hearing_pairs_on(&policies, false);
+        let pairs = pairs_of(&registry, &policies);
+        let admission = PrefillAdmission::new(1, 0, Duration::from_secs(1));
+        let acquire = || {
+            acquire_prefill(
+                Some(&admission),
+                None,
+                |pair: &PlacedPair| &pair.prefill,
+                pair_selection(&registry, &policies, &pairs),
+            )
+        };
+        let Ok(held) = acquire().await else {
+            panic!("the first pair is admitted");
+        };
+
+        let mut verdicts = Vec::new();
+        let mut select = pair_selection(&registry, &policies, &pairs);
+        let second = admission
+            .admit(None, |capacity| match select(Some(capacity)) {
+                Ok(pair) => capacity.select(pair.prefill.into_worker(), ()),
+                Err(failure) => {
+                    verdicts.push(failure.is_at_capacity());
+                    PrefillAdmissionAttempt::AtCapacity
+                }
+            })
+            .await;
+        assert!(matches!(second, Err(PrefillAdmissionRejection::QueueFull)));
+        assert_eq!(verdicts, [true], "the engine's own answer is the wait");
+        assert!(matches!(
+            acquire().await,
+            Err(PrefillAcquireError::Rejected(
+                PrefillAdmissionRejection::QueueFull
+            ))
+        ));
+
+        drop(held);
+        assert!(acquire().await.is_ok(), "a released prefill takes the next");
     }
 }

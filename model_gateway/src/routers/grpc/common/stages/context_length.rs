@@ -394,7 +394,7 @@ pub(crate) fn selection_context_length(workers: &WorkerSelection, model_id: &str
         WorkerSelection::Single { worker } => worker.context_length(model_id),
         WorkerSelection::Disaggregated {
             prefill, decode, ..
-        } => pair_context_length(prefill.as_ref(), decode.as_ref(), model_id),
+        } => pair_context_length(prefill.as_ref(), &**decode, model_id),
     }
 }
 
@@ -533,7 +533,7 @@ mod tests {
 
     fn single(context_length: Option<u32>) -> WorkerSelection {
         WorkerSelection::Single {
-            worker: worker(WorkerType::Regular, context_length),
+            worker: worker(WorkerType::Regular, context_length).into(),
         }
     }
 
@@ -541,7 +541,7 @@ mod tests {
         WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: worker(WorkerType::Prefill, prefill),
-            decode: worker(WorkerType::Decode, decode),
+            decode: worker(WorkerType::Decode, decode).into(),
             runtime_type: RuntimeType::Sglang,
         }
     }
@@ -873,7 +873,9 @@ mod tests {
                 })
                 .build(),
         );
-        let selection = WorkerSelection::Single { worker };
+        let selection = WorkerSelection::Single {
+            worker: worker.into(),
+        };
         assert!(enforce_context_length(&input(10), &selection, "wide").is_ok());
         assert_rejected(enforce_context_length(&input(10), &selection, "narrow"));
         // An id no card matches falls back to the primary (first) card.

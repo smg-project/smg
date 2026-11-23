@@ -153,7 +153,9 @@ impl RouterFactory {
         );
 
         let config = ctx.router_config.clone();
-        if config.dp_minimum_tokens_scheduler {
+        // The rank policy is a classic policy object: none is built for a
+        // registry made for the policy engine.
+        if config.dp_minimum_tokens_scheduler && ctx.policy_registry.keeps_classic_policies() {
             let mini_tokens_policy = MinimumTokensPolicy::new(
                 ctx.worker_monitor
                     .as_ref()

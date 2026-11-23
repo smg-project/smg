@@ -1,5 +1,6 @@
 pub(crate) mod bounds;
 pub mod builder;
+mod policy_document;
 pub(crate) mod redacted;
 pub mod secrets;
 #[cfg(test)]

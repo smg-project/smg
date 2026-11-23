@@ -61,7 +61,7 @@ use crate::{
     policies::CacheNamespace,
     routers::{
         common::{
-            attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard,
+            attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard, placement::Placed,
             prefill_admission::PrefillLoadGuard, snapshot::WorkerRegistry, sse::SseSender,
         },
         error::internal_error,
@@ -1004,15 +1004,20 @@ pub(crate) struct EncodeWorkerAssignment {
 
 /// Worker selection (Step 2)
 pub(crate) enum WorkerSelection {
-    Single {
-        worker: Arc<dyn Worker>,
-    },
+    /// The one worker of a single request, as its placement answered it: the
+    /// request's load guard is made from the answer ([`LoadGuards::new`]).
+    Single { worker: Placed },
     /// Disaggregated prefill/decode selection. EPD layers per-item encode
     /// assignments on top; plain PD leaves `encode_assignments` unset.
+    ///
+    /// The decode is kept as its placement answered it: its load guard is
+    /// made from the answer ([`LoadGuards::new`],
+    /// [`LoadGuards::behind_prefill`]). The prefill's guard was made from
+    /// its answer where the Prefill admission took its slot.
     Disaggregated {
         encode_assignments: Option<Vec<EncodeWorkerAssignment>>,
         prefill: Arc<dyn Worker>,
-        decode: Arc<dyn Worker>,
+        decode: Placed,
         runtime_type: RuntimeType,
     },
 }
@@ -1085,15 +1090,85 @@ impl Drop for StreamSpan {
 }
 
 impl LoadGuards {
+    /// The guards of an attempt whose every side goes out with the dispatch
+    /// that follows: each is made from its placement's answer, which says
+    /// the dispatch where the policy engine placed the request.
     pub fn new(selection: &WorkerSelection, routing_key: Option<&str>) -> Self {
         match selection {
             WorkerSelection::Single { worker } => LoadGuards::Single {
-                _guard: WorkerLoadGuard::with_key(worker.clone(), routing_key),
+                _guard: worker.guard(routing_key),
             },
             WorkerSelection::Disaggregated { decode, .. } => LoadGuards::Disaggregated {
-                _decode: WorkerLoadGuard::with_key(decode.clone(), routing_key),
+                _decode: decode.guard(routing_key),
             },
         }
+    }
+
+    /// [`Self::new`] for a pair whose decode goes out behind its prefill:
+    /// one request of a sequential dispatch. The decode's guard is made
+    /// ahead of its send ([`Placed::ahead`]): the decode is counted from
+    /// here, and the dispatch says its send where the decode goes out
+    /// ([`Self::map_decode`], in `execute_sequential_pd`).
+    pub fn behind_prefill(selection: &WorkerSelection, routing_key: Option<&str>) -> Self {
+        match selection {
+            WorkerSelection::Disaggregated { decode, .. } => LoadGuards::Disaggregated {
+                _decode: decode.ahead(routing_key),
+            },
+            single @ WorkerSelection::Single { .. } => Self::new(single, routing_key),
+        }
+    }
+
+    /// Hands the decode's guard of a pair to `with` and keeps the guard it
+    /// answers in its place: for the decode asked again, which may move the
+    /// guard to another worker, and for the decode's send. The first decode
+    /// guard of a batch takes the call. Guards that hold no decode's are
+    /// left as they are.
+    pub(crate) fn map_decode(&mut self, with: impl FnOnce(WorkerLoadGuard) -> WorkerLoadGuard) {
+        let Some(held) = self.decode_guards() else {
+            return;
+        };
+        // The decode's guard is moved out for the call and back, where it
+        // stands: the placeholder counts nothing and allocates nothing.
+        let empty = Self::Batch {
+            _guards: Vec::new(),
+        };
+        *held = match std::mem::replace(held, empty) {
+            Self::Disaggregated { _decode } => Self::Disaggregated {
+                _decode: with(_decode),
+            },
+            other => other,
+        };
+    }
+
+    /// The guards that hold a pair's decode guard, under whatever rides
+    /// with them: the first of a batch.
+    fn decode_guards(&mut self) -> Option<&mut Self> {
+        match self {
+            Self::Disaggregated { .. } => Some(self),
+            Self::Batch { _guards } => _guards.iter_mut().find_map(Self::decode_guards),
+            Self::Admitted { _guards, .. } | Self::Traced { _guards, .. } => {
+                _guards.decode_guards()
+            }
+            Self::Single { .. } => None,
+        }
+    }
+
+    /// The decode moved to another worker behind its prefill: `claim` is
+    /// what that worker's gate seated for the dispatch, `None` where its
+    /// engine reports no window. It takes the place of the claim at the
+    /// first decode's gate, which is let go here.
+    pub(crate) fn claim_moved(&mut self, claim: Option<PdAdmissionGuard>) {
+        let guards = std::mem::replace(
+            self,
+            Self::Batch {
+                _guards: Vec::new(),
+            },
+        );
+        let guards = match guards {
+            Self::Admitted { _guards, .. } => *_guards,
+            guards => guards,
+        };
+        *self = Self::admitted(claim, guards);
     }
 
     /// Bind an admission claim to the dispatch's guards, so the rooms it
@@ -1557,7 +1632,7 @@ fn expected_shape(shape: &str) -> ! {
 impl WorkerSelection {
     pub fn single(&self) -> Option<&Arc<dyn Worker>> {
         match self {
-            Self::Single { worker } => Some(worker),
+            Self::Single { worker } => Some(worker.worker()),
             Self::Disaggregated { .. } => None,
         }
     }
@@ -1566,10 +1641,10 @@ impl WorkerSelection {
     /// prefill and decode sides.
     pub fn workers(&self) -> impl Iterator<Item = &Arc<dyn Worker>> {
         let (first, second) = match self {
-            Self::Single { worker } => (worker, None),
+            Self::Single { worker } => (worker.worker(), None),
             Self::Disaggregated {
                 prefill, decode, ..
-            } => (prefill, Some(decode)),
+            } => (prefill, Some(decode.worker())),
         };
         std::iter::once(first).chain(second)
     }
@@ -1584,14 +1659,14 @@ impl WorkerSelection {
     /// the request's ledger (one failure charge per request per worker).
     pub fn record_outcome(&self, ledger: &AttemptLedger, status_code: u16) {
         match self {
-            Self::Single { worker } => ledger.record_outcome(worker.as_ref(), status_code),
+            Self::Single { worker } => ledger.record_outcome(&**worker, status_code),
             Self::Disaggregated {
                 prefill, decode, ..
             } => {
                 // EPD encode dispatch is asynchronous and supervised by
                 // RequestExecution; this records only the prefill/decode side.
                 ledger.record_outcome(prefill.as_ref(), status_code);
-                ledger.record_outcome(decode.as_ref(), status_code);
+                ledger.record_outcome(&**decode, status_code);
             }
         }
     }
@@ -1611,7 +1686,7 @@ impl WorkerSelection {
                 ledger.record_outcome(prefill.as_ref(), status);
             }
             if let Some(status) = decode_status {
-                ledger.record_outcome(decode.as_ref(), status);
+                ledger.record_outcome(&**decode, status);
             }
         }
     }
@@ -1632,7 +1707,7 @@ impl WorkerSelection {
     pub fn record_outcome_decode(&self, ledger: &AttemptLedger, status_code: u16) {
         match self {
             Self::Disaggregated { decode, .. } => {
-                ledger.record_outcome(decode.as_ref(), status_code);
+                ledger.record_outcome(&**decode, status_code);
             }
             Self::Single { .. } => {
                 debug!("record_outcome_decode called on Single worker selection, ignoring");
@@ -1648,7 +1723,7 @@ impl WorkerSelection {
         match self {
             Self::Disaggregated {
                 prefill, decode, ..
-            } => Some((prefill, decode)),
+            } => Some((prefill, decode.worker())),
             Self::Single { .. } => None,
         }
     }
@@ -1661,8 +1736,34 @@ impl WorkerSelection {
     }
 
     pub fn decode_worker(&self) -> Option<&Arc<dyn Worker>> {
+        self.decode().map(Placed::worker)
+    }
+
+    /// A pair's decode as its placement answered it, which its load guard
+    /// is made from.
+    pub(crate) fn decode(&self) -> Option<&Placed> {
         match self {
             Self::Disaggregated { decode, .. } => Some(decode),
+            Self::Single { .. } => None,
+        }
+    }
+
+    /// This pair with `decode` in its decode's place: the selection of a
+    /// dispatch whose decode moved behind its prefill
+    /// (`placement::decode_again`). `None` for a single worker's.
+    pub(crate) fn with_decode(&self, decode: Placed) -> Option<Self> {
+        match self {
+            Self::Disaggregated {
+                encode_assignments,
+                prefill,
+                runtime_type,
+                ..
+            } => Some(Self::Disaggregated {
+                encode_assignments: encode_assignments.clone(),
+                prefill: Arc::clone(prefill),
+                decode,
+                runtime_type: *runtime_type,
+            }),
             Self::Single { .. } => None,
         }
     }
@@ -2046,7 +2147,7 @@ mod tests {
             |prefill: Arc<dyn Worker>, decode: Arc<dyn Worker>| WorkerSelection::Disaggregated {
                 encode_assignments: None,
                 prefill,
-                decode,
+                decode: decode.into(),
                 runtime_type: RuntimeType::TokenSpeed,
             };
 
@@ -2196,7 +2297,7 @@ mod tests {
         WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: Arc::clone(prefill),
-            decode: Arc::clone(decode),
+            decode: Arc::clone(decode).into(),
             runtime_type: RuntimeType::Sglang,
         }
     }
@@ -2537,7 +2638,7 @@ mod tests {
         // The regular gRPC path: one guard, one completion when the stream ends.
         drop(LoadGuards::new(
             &WorkerSelection::Single {
-                worker: Arc::clone(&single),
+                worker: Arc::clone(&single).into(),
             },
             None,
         ));
@@ -2564,7 +2665,7 @@ mod tests {
         let before = spy.0.lock().unwrap().len();
         drop(LoadGuards::scaled(
             &WorkerSelection::Single {
-                worker: Arc::clone(&single),
+                worker: Arc::clone(&single).into(),
             },
             None,
             3,

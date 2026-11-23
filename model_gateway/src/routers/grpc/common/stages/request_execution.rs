@@ -28,6 +28,7 @@ use super::{
     grouped_dp::hash_rank,
     helpers::{maybe_inject_pd_metadata, maybe_inject_pd_rendezvous},
     pd_protocol::{PdDispatch, PdProtocol},
+    worker_selection::WorkerSelectionStage,
 };
 use crate::{
     config::GroupedDpSticky,
@@ -59,7 +60,7 @@ use crate::{
                 DispatchBooking, FanoutStream, FirstItem, PrefillTicket, ProtoEmbedRequest,
                 ProtoGenerateRequest, ProtoGenerateResponse, ProtoRequest, ProtoStream,
             },
-            sequential_pd::execute_sequential_pd,
+            sequential_pd::{execute_sequential_pd, DecodeBehindPrefill},
             utils::{
                 account_pd_side_failure,
                 stream_failure::UpstreamClass,
@@ -255,13 +256,16 @@ fn pd_side_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
 /// and how, a sticky request to a grouped data-parallel worker is pinned to
 /// one of its engines (see [`pin_grouped_dp_rank`]), and a disaggregated
 /// one's bootstrap room to its grouped prefill rank (see
-/// [`pin_grouped_dp_prefill_room`]).
+/// [`pin_grouped_dp_prefill_room`]). `selection` is the selection stage,
+/// which states a pair's request again where its decode is asked again
+/// behind its prefill (see [`DecodeBehindPrefill`]).
 pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
     mut execution_plan: ExecutionPlan,
     last_attempt: bool,
     request_timeout: Option<Duration>,
     grouped_dp_sticky: GroupedDpSticky,
+    selection: &WorkerSelectionStage,
 ) -> Result<(), Response> {
     // One bootstrap room per backend request the plan will post: a batched
     // completion fans out one PD dispatch per sub-request, so admission has
@@ -307,10 +311,34 @@ pub(crate) async fn execute_plan(
     // request retried on it.
     let ledger = &ctx.ledger;
 
-    ctx.load_guards = Some(LoadGuards::admitted(
-        admission,
-        LoadGuards::scaled(workers, ctx.sticky_key.as_deref(), sub_requests),
-    ));
+    // A pair's decode goes out with the dispatch, and its guard says so
+    // where it is made. One request of a sequential dispatch is the
+    // exception: its decode goes out behind its prefill, so its guard is
+    // made ahead of that send, and the dispatch asks the decode again and
+    // says the send once the prefill has answered.
+    let behind_prefill = decode_goes_behind_its_prefill(&execution_plan, workers);
+    let sticky_key = ctx.sticky_key.as_deref();
+    let guards = if behind_prefill {
+        LoadGuards::behind_prefill(workers, sticky_key)
+    } else {
+        LoadGuards::scaled(workers, sticky_key, sub_requests)
+    };
+    let guards = ctx
+        .load_guards
+        .insert(LoadGuards::admitted(admission, guards));
+    // The selection that names the decode the dispatch sent, where a second
+    // ask moved it.
+    let mut moved = None;
+    let behind = behind_prefill.then_some(DecodeBehindPrefill {
+        stage: selection,
+        model_id: ctx.model_id.as_str(),
+        routing: &ctx.routing,
+        headers: ctx.headers.as_ref(),
+        wire: ctx.wire,
+        tried: &ctx.tried,
+        guards,
+        moved: &mut moved,
+    });
     // A sticky request to a grouped data-parallel worker goes to its key's
     // engine.
     pin_grouped_dp_rank(
@@ -404,6 +432,7 @@ pub(crate) async fn execute_plan(
                     ledger,
                     room_residue,
                     None,
+                    behind,
                 ))
                 .await
             }
@@ -422,6 +451,7 @@ pub(crate) async fn execute_plan(
                     encode_watch,
                     prefill_guard,
                     ledger,
+                    behind,
                 ))
                 .await
                 .map_err(|mut response| {
@@ -455,10 +485,21 @@ pub(crate) async fn execute_plan(
     let result = match deadline {
         Some(deadline) => match tokio::time::timeout_at(deadline.at(), dispatch).await {
             Ok(result) => result,
-            Err(_) => Err(dispatch_timed_out(deadline, workers, ledger, request_id)),
+            Err(_) => {
+                // The timeout is the decode's that was waited on: the one a
+                // second ask moved the pair to, where it moved.
+                let waited_on = moved.as_ref().unwrap_or(workers);
+                Err(dispatch_timed_out(deadline, waited_on, ledger, request_id))
+            }
         },
         None => dispatch.await,
     };
+    // A pair's decode that moved behind its prefill: the attempt's selection
+    // names the decode that was sent, for the response's stages and for a
+    // retry.
+    if let Some(moved) = moved {
+        ctx.workers = Some(moved);
+    }
     // The engines hold the request bodies now. An earlier attempt keeps its
     // share of the budget: the retained plan still owns the same media, and a
     // replay would send it again.
@@ -549,12 +590,30 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
     })
 }
 
+/// Whether the plan's decode goes out behind its prefill: one disaggregated
+/// request under a runtime whose protocol sends its two sides one behind
+/// the other. A batch's sub-requests, and both sides of the parallel shape,
+/// go out with the dispatch.
+fn decode_goes_behind_its_prefill(plan: &ExecutionPlan, workers: &WorkerSelection) -> bool {
+    matches!(
+        plan,
+        ExecutionPlan::PrefillDecode(_) | ExecutionPlan::EncodePrefillDecode { .. }
+    ) && workers
+        .disaggregated_runtime_type()
+        .and_then(|runtime| PdProtocol::for_runtime(*runtime))
+        .is_some_and(|protocol| protocol.dispatch == PdDispatch::Sequential)
+}
+
 /// Dispatch one disaggregated request in its runtime's shape.
 /// `room_residue` is the prefill rank the request's sticky key pinned its
 /// room to ([`pin_grouped_dp_prefill_room`]), which the rooms of an n>1
 /// request's samples take too.
 /// `encode` is the watch on an EPD request's encode dispatch (see
 /// [`launch_encode_dispatch`]), `None` for every other request.
+/// `behind` is what one request of the sequential shape holds for its
+/// decode, which goes out behind its prefill (see [`DecodeBehindPrefill`]);
+/// `None` for every dispatch whose decode guard said its send where it was
+/// made.
 #[expect(clippy::too_many_arguments)]
 async fn execute_pd_dispatch(
     proto_request: ProtoGenerateRequest,
@@ -565,6 +624,7 @@ async fn execute_pd_dispatch(
     ledger: &AttemptLedger,
     room_residue: Option<RoomResidue>,
     encode: Option<EncodeWatch>,
+    behind: Option<DecodeBehindPrefill<'_>>,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         error!(
@@ -600,6 +660,7 @@ async fn execute_pd_dispatch(
                 model,
                 prefill_guard,
                 ledger,
+                behind,
             )
             .await
         }
@@ -775,6 +836,7 @@ async fn execute_epd_dispatch(
     encode_watch: &mut Option<EncodeWatch>,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    behind: Option<DecodeBehindPrefill<'_>>,
 ) -> Result<ExecutionResult, Response> {
     let mut cleanup = prepare_epd_attempt(&mut proto_request, encode, encode_watch).await?;
     // An EPD request's room is left as minted: no sticky prefill rank.
@@ -787,6 +849,7 @@ async fn execute_epd_dispatch(
         ledger,
         None,
         encode_watch.clone(),
+        behind,
     )
     .await;
     if result.is_ok() {
@@ -993,6 +1056,7 @@ async fn execute_batch_dispatch(
                             ledger,
                             None, // the room as minted: no sticky prefill rank
                             None, // no encode dispatch on this path
+                            None, // the decode's guard said its send where it was made
                         )
                         .await
                     }
@@ -2959,7 +3023,7 @@ pub(crate) mod tests {
         );
         let mut workers = tokenspeed_pair();
         if let WorkerSelection::Disaggregated { decode: side, .. } = &mut workers {
-            *side = Arc::clone(&decode);
+            *side = Arc::clone(&decode).into();
         }
         let ledger = AttemptLedger::default();
         let sides = PdSides::of(&workers, &ledger, &tokenspeed_request(1, None), false);
@@ -3037,7 +3101,7 @@ pub(crate) mod tests {
             let workers = WorkerSelection::Disaggregated {
                 encode_assignments: None,
                 prefill: side_worker(WorkerType::Prefill, pk),
-                decode: side_worker(WorkerType::Decode, dk),
+                decode: side_worker(WorkerType::Decode, dk).into(),
                 runtime_type: RuntimeType::Sglang,
             };
             assert_eq!(
@@ -3066,7 +3130,7 @@ pub(crate) mod tests {
         WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: worker("grpc://prefill:30000", WorkerType::Prefill),
-            decode: worker("grpc://decode:30000", WorkerType::Decode),
+            decode: worker("grpc://decode:30000", WorkerType::Decode).into(),
             runtime_type: RuntimeType::TokenSpeed,
         }
     }
@@ -3092,7 +3156,7 @@ pub(crate) mod tests {
             let workers = WorkerSelection::Disaggregated {
                 encode_assignments: None,
                 prefill: worker("grpc://prefill:30000", WorkerType::Prefill, p_rank, p_size),
-                decode: worker("grpc://decode:30000", WorkerType::Decode, d_rank, d_size),
+                decode: worker("grpc://decode:30000", WorkerType::Decode, d_rank, d_size).into(),
                 runtime_type: RuntimeType::TokenSpeed,
             };
             let mut request = tokenspeed_request(1, None);
@@ -4350,7 +4414,7 @@ pub(crate) mod tests {
         let workers = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: worker("grpc://prefill:30000", WorkerType::Prefill),
-            decode: worker("grpc://decode:30000", WorkerType::Decode),
+            decode: worker("grpc://decode:30000", WorkerType::Decode).into(),
             runtime_type: RuntimeType::TokenSpeed,
         };
         let ledger = AttemptLedger::default();
@@ -5292,7 +5356,7 @@ pub(crate) mod tests {
             WorkerSelection::Disaggregated {
                 encode_assignments: None,
                 prefill: worker("grpc://prefill:30000", WorkerType::Prefill),
-                decode: worker("grpc://decode:30000", WorkerType::Decode),
+                decode: worker("grpc://decode:30000", WorkerType::Decode).into(),
                 runtime_type: RuntimeType::TokenSpeed,
             }
         };
@@ -5387,7 +5451,7 @@ pub(crate) mod tests {
         let selection = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill,
-            decode,
+            decode: decode.into(),
             runtime_type: RuntimeType::TokenSpeed,
         };
         assert_eq!(
@@ -5925,7 +5989,8 @@ pub(crate) mod tests {
                     .connection_mode(ConnectionMode::Zmq)
                     .zmq_engine_group(size)
                     .build(),
-            ),
+            )
+            .into(),
         }
     }
 
@@ -6056,7 +6121,8 @@ pub(crate) mod tests {
                     .runtime_type(RuntimeType::TokenSpeed)
                     .connection_mode(ConnectionMode::Zmq)
                     .build(),
-            ),
+            )
+            .into(),
         };
         let hash = |ranks: usize, key: &str| {
             attempt_on(GroupedDpSticky::Hash, &workers, Some(ranks), Some(key))
@@ -6075,7 +6141,7 @@ pub(crate) mod tests {
     #[test]
     fn only_a_grouped_worker_is_pinned() {
         let single = |builder: BasicWorkerBuilder| WorkerSelection::Single {
-            worker: Arc::new(builder.connection_mode(ConnectionMode::Zmq).build()),
+            worker: Arc::new(builder.connection_mode(ConnectionMode::Zmq).build()).into(),
         };
         for workers in [
             single(BasicWorkerBuilder::new("ipc:///tmp/ranked.ipc").dp_config(1, 2)),
@@ -6135,7 +6201,7 @@ pub(crate) mod tests {
         WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: worker("ipc:///tmp/pd-prefill.ipc", WorkerType::Prefill, prefill),
-            decode: worker("ipc:///tmp/pd-decode.ipc", WorkerType::Decode, decode),
+            decode: worker("ipc:///tmp/pd-decode.ipc", WorkerType::Decode, decode).into(),
             runtime_type: RuntimeType::TokenSpeed,
         }
     }
@@ -6312,7 +6378,7 @@ pub(crate) mod tests {
         let dp_aware = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: ranked("grpc://prefill:30000", WorkerType::Prefill),
-            decode: ranked("grpc://decode:30000", WorkerType::Decode),
+            decode: ranked("grpc://decode:30000", WorkerType::Decode).into(),
             runtime_type: RuntimeType::TokenSpeed,
         };
         let (residue, room) = pd_attempt(GroupedDpSticky::Hash, &dp_aware, None, Some("conv"));

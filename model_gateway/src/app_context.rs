@@ -14,6 +14,11 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
+use smg_policy_controller::{
+    document::AppliedSpec,
+    engine::{CacheIndexes, Members, PolicyEngine, WorkerData},
+    stages::StageRegistry,
+};
 use smg_worker::{
     connection::{
         engine::EngineConnector,
@@ -271,15 +276,20 @@ impl AppContext {
             webrtc_bind_addr,
             webrtc_stun_server,
             None,
+            None,
         )
     }
 
+    /// [`Self::from_config`] over what a host added: its worker connector,
+    /// and the table of policy stages its policy document may name. With no
+    /// table the document is checked against the stock one.
     pub(crate) fn from_config_with_extensions(
         router_config: RouterConfig,
         request_timeout_secs: u64,
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
         connector: Option<Arc<dyn EngineConnector>>,
+        policy_stages: Option<StageRegistry>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
         Box::pin(async move {
             Box::pin(AppContextBuilder::from_config_with_extensions(
@@ -288,6 +298,7 @@ impl AppContext {
                 webrtc_bind_addr,
                 webrtc_stun_server,
                 connector,
+                policy_stages,
             ))
             .await?
             .build()
@@ -700,6 +711,7 @@ impl AppContextBuilder {
             webrtc_bind_addr,
             webrtc_stun_server,
             None,
+            None,
         ))
         .await
     }
@@ -710,7 +722,14 @@ impl AppContextBuilder {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
         connector: Option<Arc<dyn EngineConnector>>,
+        policy_stages: Option<StageRegistry>,
     ) -> Result<Self, String> {
+        // The policy document comes first, checked against the stages the
+        // host registered: ahead of the stores, the storage hooks and every
+        // listener, so a document that is refused ends the start in its own
+        // words. The engine is started last, from the document that was
+        // checked here.
+        let policy = Self::policy_in_force(&router_config, policy_stages.as_ref())?;
         // A served model aliased under a vendor name keeps that vendor's
         // contract profile after the alias is resolved into the served name.
         ProviderProfile::register_model_aliases(
@@ -741,6 +760,7 @@ impl AppContextBuilder {
             .await?
             .with_wasm_manager(&router_config)
             .with_kv_event_monitor()
+            .with_policy_engine(policy)?
             .webrtc_bind_addr(
                 webrtc_bind_addr.or_else(|| Some(default_bind_addr(&router_config.host))),
             )
@@ -905,15 +925,11 @@ impl AppContextBuilder {
         self
     }
 
-    /// Create policy registry
+    /// Create policy registry: the one that makes no classic policy where
+    /// the configuration runs the policy controller
+    /// ([`PolicyRegistry::of_config`]).
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(
-            PolicyRegistry::with_override(
-                config.policy.clone(),
-                config.routing_key_override.clone(),
-            )
-            .with_pd_pairing_mode(config.pd_pairing_mode),
-        ));
+        self.policy_registry = Some(Arc::new(PolicyRegistry::of_config(config)));
         self
     }
 
@@ -996,6 +1012,124 @@ impl AppContextBuilder {
         pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
         self.worker_monitor = Some(monitor);
         Ok(self)
+    }
+
+    /// The policy document this process runs under the policy controller
+    /// (`policy_controller: on`), checked: the document in force, which is
+    /// the one the routing settings mean or a supplied one, validated
+    /// against `stages`. A host's table holds the stock stages and the
+    /// host's own, so a supplied document may name both. With no table the
+    /// document is validated against the stock one. `None` where the
+    /// configuration leaves the classic policies in place.
+    ///
+    /// A document that is refused ends the start with the refusal's own
+    /// words, before a store is opened and before the gateway listens.
+    fn policy_in_force(
+        config: &RouterConfig,
+        stages: Option<&StageRegistry>,
+    ) -> Result<Option<AppliedSpec>, String> {
+        if !config.policy_controller {
+            return Ok(None);
+        }
+        let document = config
+            .policy_document_in_force()
+            .map_err(|refused| format!("policy controller: {refused}"))?;
+        let checked = match stages {
+            Some(stages) => config.hosted_policy(&document, stages),
+            None => config.hosted_policy(&document, &StageRegistry::builtin()),
+        };
+        checked
+            .map(Some)
+            .map_err(|refused| format!("policy controller: {refused}"))
+    }
+
+    /// Starts the policy engine over `policy`, where the configuration runs
+    /// the policy controller: the checked document [`Self::policy_in_force`]
+    /// answered. It is the last step of the start, so the engine is handed
+    /// where this process keeps its workers' data, each once: the worker
+    /// registry, the load monitor's channel and the cache-event monitor.
+    fn with_policy_engine(self, policy: Option<AppliedSpec>) -> Result<Self, String> {
+        let Some(spec) = policy else {
+            return Ok(self);
+        };
+        let unset = |field: &str| format!("{field} must be set before the policy engine");
+        let policies = self
+            .policy_registry
+            .as_ref()
+            .ok_or_else(|| unset("policy_registry"))?;
+        let registry = self
+            .worker_registry
+            .as_ref()
+            .ok_or_else(|| unset("worker_registry"))?;
+        let monitor = self
+            .worker_monitor
+            .as_ref()
+            .ok_or_else(|| unset("worker_monitor"))?;
+        let cache_events = self
+            .kv_event_monitor
+            .as_ref()
+            .ok_or_else(|| unset("kv_event_monitor"))?;
+        let data = WorkerData {
+            registry: Arc::clone(registry) as Arc<dyn Members>,
+            loads: Some(monitor.subscribe()),
+            cache_indexes: Some(Arc::clone(cache_events) as Arc<dyn CacheIndexes>),
+        };
+        Self::start_policy_engine(spec, data, policies)?;
+        Ok(self)
+    }
+
+    /// Starts the policy engine that places every request of this process:
+    /// one engine, by the policy crate's one start call, over the checked
+    /// document ([`Self::policy_in_force`]) and `data`, where this process
+    /// keeps its workers' data. The engine's task follows the registry's
+    /// events and tells the document's stages a worker that joined or was
+    /// removed, and it keeps the newest load snapshot at hand. It is
+    /// spawned on the runtime this context is built on, and the placement
+    /// functions find the engine through `policies`.
+    fn start_policy_engine(
+        spec: AppliedSpec,
+        data: WorkerData,
+        policies: &PolicyRegistry,
+    ) -> Result<(), String> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+            format!("policy controller: the engine's task needs a Tokio runtime: {error}")
+        })?;
+        // One engine for the life of the process: its placements borrow it.
+        let (engine, task) = PolicyEngine::start(spec, data);
+        // The engine's task keeps nothing a shutdown waits for: its upkeep,
+        // its load snapshot and its follow of the registry end with the
+        // runtime.
+        runtime.spawn(task);
+        policies.set_engine(engine);
+        Ok(())
+    }
+
+    /// The policy engine's start for a context a test builds by hand, field
+    /// by field, where no builder step of this file runs: the start's own
+    /// two steps, in their order and with nothing added (`policy_in_force`,
+    /// then `start_policy_engine`). It is not a second start. `stages` is
+    /// the table a host would bring, where the test brings one, and a
+    /// configuration that leaves the policy controller off starts nothing.
+    /// The engine is handed the test's worker registry and its load
+    /// monitor's channel. Such a context keeps no cache-event monitor, so
+    /// the engine is handed none.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn start_policy_engine_by_hand(
+        config: &RouterConfig,
+        stages: Option<&StageRegistry>,
+        policies: &PolicyRegistry,
+        registry: &Arc<WorkerRegistry>,
+        monitor: &WorkerMonitor,
+    ) -> Result<(), String> {
+        if let Some(spec) = Self::policy_in_force(config, stages)? {
+            let data = WorkerData {
+                registry: Arc::clone(registry) as Arc<dyn Members>,
+                loads: Some(monitor.subscribe()),
+                cache_indexes: None,
+            };
+            Self::start_policy_engine(spec, data, policies)?;
+        }
+        Ok(())
     }
 
     /// Create worker job queue OnceLock container

@@ -341,10 +341,11 @@ impl Router {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
+        rid: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
         candidate_filter: Option<CandidateFilter<'_>>,
         tried: &[String],
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Option<placement::Placed> {
         // This router proxies plain HTTP to the worker's URL, so only HTTP
         // workers are candidates; nothing pins a wire on this path.
         placement::select_single(
@@ -358,6 +359,7 @@ impl Router {
                 tokens,
                 headers,
                 rid_key,
+                rid,
                 cache_namespace,
                 candidate_filter,
                 tried,
@@ -703,10 +705,11 @@ impl Router {
         &self,
         attempt: &TypedAttempt<'_, T>,
     ) -> Response {
-        let worker = match self.select_worker_for_attempt(attempt) {
-            Ok(worker) => worker,
+        let placed = match self.select_worker_for_attempt(attempt) {
+            Ok(placed) => placed,
             Err(refusal) => return refusal,
         };
+        let worker = placed.worker();
 
         // Dispatch-time re-check of the one chosen worker: O(1), and the only
         // thing that closes the window between selection and dispatch in which
@@ -726,7 +729,7 @@ impl Router {
             };
 
         let response = self
-            .dispatch_attempt(attempt, &worker, &mut decision_adapter)
+            .dispatch_attempt(attempt, &placed, &mut decision_adapter)
             .await;
 
         // A streamed head's success was recorded before its relay task was
@@ -746,16 +749,17 @@ impl Router {
 
         events::RequestReceivedEvent {}.emit();
 
-        self.account_attempt_outcome(attempt, &worker, response, head_success_recorded)
+        self.account_attempt_outcome(attempt, worker, response, head_success_recorded)
     }
 
-    /// The worker of one attempt: selected away from the engines the request
-    /// already tried and from those whose answer was definitive, or the
-    /// refusal this router answers when the pool has none to give.
-    fn select_worker_for_attempt<T>(
+    /// The worker of one attempt, as the placement answered it: selected
+    /// away from the engines the request already tried and from those whose
+    /// answer was definitive, or the refusal this router answers when the
+    /// pool has none to give.
+    fn select_worker_for_attempt<T: GenerationRequest>(
         &self,
         attempt: &TypedAttempt<'_, T>,
-    ) -> Result<Arc<dyn Worker>, Response> {
+    ) -> Result<placement::Placed, Response> {
         let model_id = attempt.model_id;
         match attempt.lease.with_view(|view| {
             // A retry re-selects away from the engines this request already
@@ -771,13 +775,14 @@ impl Router {
                     view.tokens,
                     attempt.headers,
                     view.rid_key,
+                    view.request.rid(),
                     view.cache_namespace,
                     candidate_filter,
                     &tried,
                 )
             })
         }) {
-            Some(worker) => Ok(worker),
+            Some(placed) => Ok(placed),
             None => {
                 // The verdict is judged from exactly the pool selection drew
                 // from, wildcard model included: that is what makes the shed
@@ -831,16 +836,18 @@ impl Router {
         }
     }
 
-    /// The attempt's dispatch: the worker's load guard, the request-sent
+    /// The attempt's dispatch: the request's load guard, made from the
+    /// placement's answer ([`placement::Placed::guard`]), the request-sent
     /// event, the trace headers, the relay mode, the serialized body and the
     /// send through the relay. Once the bytes exist the lease frees the parsed
     /// request when retries are disabled.
     async fn dispatch_attempt<T: GenerationRequest + serde::Serialize>(
         &self,
         attempt: &TypedAttempt<'_, T>,
-        worker: &Arc<dyn Worker>,
+        placed: &placement::Placed,
         decision_adapter: &mut Option<SglangDecisionAdapter>,
     ) -> Response {
+        let worker = placed.worker();
         let headers = attempt.headers;
         let lease = attempt.lease;
         let route = attempt.route;
@@ -850,12 +857,8 @@ impl Router {
             route
         };
 
-        let load_guard = lease.with_view(|view| {
-            WorkerLoadGuard::with_key(
-                worker.clone(),
-                self.policy_registry.sticky_key(headers, view.rid_key),
-            )
-        });
+        let load_guard = lease
+            .with_view(|view| placed.guard(self.policy_registry.sticky_key(headers, view.rid_key)));
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent {
@@ -1161,13 +1164,15 @@ impl Router {
         // exit below.
         let outcome = self.begin_route(route, model_id, is_stream);
 
-        let worker = match self.select_transcription_worker(headers, model_id, &routing) {
-            Ok(worker) => worker,
+        let placed = match self.select_transcription_worker(headers, model_id, &routing, body.rid())
+        {
+            Ok(placed) => placed,
             Err(refusal) => {
                 outcome.pre_send_error(&refusal);
                 return refusal;
             }
         };
+        let worker = placed.worker();
 
         // Same dispatch-time re-check the regular path takes. A transcription
         // occupies its worker for far longer than a chat completion, so a
@@ -1183,10 +1188,7 @@ impl Router {
         }
 
         // Streamed requests have no rid; the header is the whole sticky key.
-        let load_guard = WorkerLoadGuard::with_key(
-            worker.clone(),
-            self.policy_registry.sticky_header_key(headers),
-        );
+        let load_guard = placed.guard(self.policy_registry.sticky_header_key(headers));
 
         let res = match Self::send_transcription(
             headers,
@@ -1210,7 +1212,7 @@ impl Router {
         events::RequestReceivedEvent {}.emit();
 
         if is_stream {
-            relay_transcription_stream(res, status, &worker, load_guard, outcome, start)
+            relay_transcription_stream(res, status, worker, load_guard, outcome, start)
         } else {
             buffer_transcription_response(
                 res,
@@ -1237,7 +1239,8 @@ impl Router {
         headers: Option<&HeaderMap>,
         model_id: &str,
         routing: &RoutingDerivatives,
-    ) -> Result<Arc<dyn Worker>, Response> {
+        rid: Option<&str>,
+    ) -> Result<placement::Placed, Response> {
         let all_workers = self
             .worker_registry
             .get_routing_pool(model_id, RoutingPool::HttpRegular);
@@ -1259,16 +1262,18 @@ impl Router {
                 "/v1/audio/transcriptions does not yet support DP-aware workers",
             ));
         }
-        let Some(worker) = placement::select_from(
+        let Some(placed) = placement::select_from(
             &self.worker_registry,
             &self.policy_registry,
             model_id,
+            RoutingPool::HttpRegular,
             &non_dp_workers,
             PlacementInputs {
                 text: routing.text.as_deref(),
                 tokens: routing.tokens.as_deref(),
                 headers,
                 rid_key: routing.rid_key.as_deref(),
+                rid,
                 cache_namespace: routing.cache_namespace,
                 candidate_filter: None,
                 tried: &[],
@@ -1304,7 +1309,7 @@ impl Router {
                 resp,
             ));
         };
-        Ok(worker)
+        Ok(placed)
     }
 
     /// The send of a transcription to its worker: the trace headers, the
@@ -2350,11 +2355,12 @@ impl Router {
         // that needs partitioned affinity must take the buffered path.
         // Routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
-        let Some(worker) = self.select_worker_for_model(
+        let Some(placed) = self.select_worker_for_model(
             model_id,
             None,
             hinted_tokens.as_deref(),
             Some(req.headers()),
+            None,
             None,
             None,
             None,
@@ -2363,6 +2369,7 @@ impl Router {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
             return Err(req);
         };
+        let worker = placed.worker();
         // Guard the registration races the decision left open: a mutating
         // worker that joined after the fleet check must not receive an
         // unmutated stream, and a second model appearing re-opens
@@ -2390,10 +2397,7 @@ impl Router {
             "false",
         );
 
-        let load_guard = WorkerLoadGuard::with_key(
-            worker.clone(),
-            self.policy_registry.sticky_header_key(Some(req.headers())),
-        );
+        let load_guard = placed.guard(self.policy_registry.sticky_header_key(Some(req.headers())));
         events::RequestSentEvent {
             url: worker.redacted_url(),
         }
@@ -2408,7 +2412,7 @@ impl Router {
                 &headers_with_trace,
                 body,
                 route,
-                RelaySource::new(model_id, route, Arc::clone(&worker)),
+                RelaySource::new(model_id, route, Arc::clone(worker)),
                 load_guard,
             )
             .await;
@@ -3021,6 +3025,7 @@ mod tests {
                     REASON_RETRYABLE, REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE,
                     REASON_WASM_REQUEST_HOOK,
                 },
+                placement::tests::hearing_engine_on,
                 request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
                 test_support::fast_retry_config,
             },
@@ -3507,7 +3512,17 @@ mod tests {
         let router = create_test_unhealthy_router();
 
         let selected = router
-            .select_worker_for_model(UNKNOWN_MODEL_ID, None, None, None, None, None, None, &[])
+            .select_worker_for_model(
+                UNKNOWN_MODEL_ID,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
             .unwrap();
         assert!(selected.is_available());
 
@@ -3515,7 +3530,17 @@ mod tests {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
         }
         assert!(router
-            .select_worker_for_model(UNKNOWN_MODEL_ID, None, None, None, None, None, None, &[])
+            .select_worker_for_model(
+                UNKNOWN_MODEL_ID,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
             .is_none());
     }
 
@@ -7391,6 +7416,37 @@ mod tests {
                 "{model}: the bytes are whole"
             );
         }
+    }
+
+    /// A typed request the policy engine placed reaches the engine by its
+    /// load guard: one dispatch where this route makes the guard, one end
+    /// where the answer's body is read and the guard dropped, and no release.
+    #[tokio::test]
+    async fn the_engine_hears_a_typed_request_by_its_load_guard() {
+        let url = spawn_sized_worker(r#"{"choices":[]}"#, "application/json").await;
+        let router = streaming_router(
+            PolicyConfig::RoundRobin,
+            1024 * 1024,
+            vec![plain_worker(&url)],
+        );
+        let heard = hearing_engine_on(&router.policy_registry);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        .unwrap();
+
+        let response = router
+            .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            ["issued", "dispatched Single", "completed Cancelled"]
+        );
     }
 
     /// The plain path ends a cut stream with its error event too, so a sized

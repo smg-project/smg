@@ -661,6 +661,7 @@ impl RequestPipeline {
             last_attempt,
             self.request_timeout,
             self.grouped_dp_sticky,
+            &self.stages.worker_selection,
         )
         .await?;
         self.stages
@@ -902,8 +903,8 @@ impl RequestPipeline {
         }
         if let Some(workers) = ctx.workers.as_ref() {
             let worker = match workers {
-                WorkerSelection::Single { worker } => worker,
-                WorkerSelection::Disaggregated { decode, .. } => decode,
+                WorkerSelection::Single { worker } => worker.worker(),
+                WorkerSelection::Disaggregated { decode, .. } => decode.worker(),
             };
             insert_routed_worker_id(response.headers_mut(), worker.redacted_url());
         }

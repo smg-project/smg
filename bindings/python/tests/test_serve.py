@@ -283,7 +283,9 @@ class TestParseServeArgs:
     def test_trtllm_router_args_defaults(self):
         """Router args should have sensible defaults."""
         _, args, _ = parse_serve_args(["--backend", "trtllm"])
-        assert args.router_policy == "cache_aware"
+        # The parser holds no default: the launcher tells an unset policy from
+        # a given one, and builds cache_aware from an unset one.
+        assert args.router_policy is None
         assert args.router_pd_disaggregation is False
         assert args.router_disable_retries is False
 

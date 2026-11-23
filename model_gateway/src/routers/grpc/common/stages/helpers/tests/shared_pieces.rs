@@ -61,7 +61,9 @@ async fn context_with_media_refs() -> (RequestContext, JoinHandle<()>) {
             .model(ModelCard::new("test-model"))
             .build(),
     );
-    ctx.state.workers = Some(WorkerSelection::Single { worker });
+    ctx.state.workers = Some(WorkerSelection::Single {
+        worker: worker.into(),
+    });
     ctx.state.clients = Some(ClientSelection::Single {
         client: BackendClient::Grpc(GrpcClient::Vllm(client)),
     });

@@ -10,6 +10,7 @@ use std::{
 };
 
 use openai_protocol::{worker::TagVocabulary, UNKNOWN_MODEL_ID};
+use smg_policy_controller::engine::{LentList, ListCell};
 use smg_worker::{
     identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
     load,
@@ -174,6 +175,10 @@ pub(crate) struct ModelLabels {
 pub struct ModelWorkerSnapshot {
     all: WorkerSnapshot,
     pools: [LazyRoutingPool; RoutingPool::COUNT],
+    /// The cell beside each pool's list, empty until the policy engine is
+    /// asked over that list (see [`Self::lent`]). A gateway that starts no
+    /// engine leaves every cell empty.
+    cells: [ListCell; RoutingPool::COUNT],
     /// The compatible prefill/decode pairs per wire and pairing mode, built
     /// once from the pools above (see [`PdPairIndex`]).
     pd_pairs: [[OnceLock<Arc<PdPairIndex>>; PdPairingMode::COUNT]; PdWire::COUNT],
@@ -200,6 +205,7 @@ impl ModelWorkerSnapshot {
         Self {
             all,
             pools: std::array::from_fn(|_| OnceLock::new()),
+            cells: std::array::from_fn(|_| ListCell::default()),
             pd_pairs: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
             harmony: OnceLock::new(),
             window_floors: std::array::from_fn(|_| OnceLock::new()),
@@ -385,6 +391,20 @@ impl ModelWorkerSnapshot {
                 .cloned()
                 .collect()
         })
+    }
+
+    /// The list of `pool` as the policy engine is lent it: the pool's own
+    /// list ([`Self::pool`]) with the cell that stands beside it. The engine
+    /// keeps its value of the list in that cell from the list's first
+    /// request on, and the value falls with this snapshot, as the list
+    /// does: a membership change publishes the next one with empty cells.
+    /// The gateway states no fact of a worker beside its object.
+    pub(crate) fn lent(&self, pool: RoutingPool) -> LentList<'_> {
+        LentList {
+            workers: self.pool(pool),
+            cell: &self.cells[pool.index()],
+            facts: None,
+        }
     }
 }
 
