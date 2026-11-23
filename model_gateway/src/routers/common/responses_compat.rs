@@ -112,6 +112,18 @@ pub(crate) fn lower_responses_request_for_local_backend(
         })
     });
 
+    let custom_choice_name = match &request.tool_choice {
+        Some(ResponsesToolChoice::Custom { name, .. }) => Some(name.as_str()),
+        _ => None,
+    };
+    let mut has_literal_custom_choice = custom_choice_name.is_some_and(|choice_name| {
+        request.tools.as_deref().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| callable_tool_name(tool) == Some(choice_name))
+        })
+    });
+
     let mut lowered_items = Vec::with_capacity(original_items.len());
     let mut lifted_tools: Vec<ResponseTool> = Vec::new();
     let mut unwrapped_default_namespace = false;
@@ -138,7 +150,14 @@ pub(crate) fn lower_responses_request_for_local_backend(
                                 push_or_replace_tool(&mut lifted_tools, lifted);
                             }
                         }
-                        other => push_or_replace_tool(&mut lifted_tools, other),
+                        other => {
+                            if custom_choice_name.is_some_and(|choice_name| {
+                                callable_tool_name(&other) == Some(choice_name)
+                            }) {
+                                has_literal_custom_choice = true;
+                            }
+                            push_or_replace_tool(&mut lifted_tools, other);
+                        }
                     }
                 }
             }
@@ -247,12 +266,7 @@ pub(crate) fn lower_responses_request_for_local_backend(
                     .strip_prefix(DEFAULT_FUNCTION_NAMESPACE)
                     .and_then(|rest| rest.strip_prefix('.'))
                 {
-                    let has_literal_tool = request.tools.as_deref().is_some_and(|tools| {
-                        tools
-                            .iter()
-                            .any(|tool| callable_tool_name(tool) == Some(name.as_str()))
-                    });
-                    if !has_literal_tool
+                    if !has_literal_custom_choice
                         && unwrapped_custom_names
                             .iter()
                             .any(|unwrapped| unwrapped == bare)
@@ -468,6 +482,34 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&literal_custom_req.tool_choice).unwrap(),
             json!({"type": "custom", "name": "functions.apply_patch"})
+        );
+
+        // An unwrapped `functions.apply_patch` member must not block rewriting
+        // `tool_choice: functions.apply_patch` to the unwrapped `apply_patch`.
+        let mut collision_req = parse_request(json!({
+            "model": "test-model",
+            "tool_choice": {"type": "custom", "name": "functions.apply_patch"},
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "functions",
+                        "description": "",
+                        "tools": [
+                            {"type": "custom", "name": "apply_patch"},
+                            {"type": "custom", "name": "functions.apply_patch"}
+                        ]
+                    }]
+                },
+                {"role": "user", "content": "patch it"}
+            ]
+        }));
+        lower_responses_request_for_local_backend(&mut collision_req)
+            .expect("lowering rewrites choice to unwrapped apply_patch");
+        assert_eq!(
+            serde_json::to_value(&collision_req.tool_choice).unwrap(),
+            json!({"type": "custom", "name": "apply_patch"})
         );
 
         lower_responses_request_for_local_backend(&mut req).expect("lowering succeeds");
