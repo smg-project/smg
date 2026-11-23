@@ -26,7 +26,7 @@ Paths without a crate name are under `crates/policy_controller/src/`.
 | worker | One inference engine endpoint that a request can be sent to. |
 | worker list | The workers of one model that serve one role, in a fixed order. The gateway keeps its lists by role and protocol, and the controller by role alone. |
 | classic | The gateway's routing policies of today (`--policy round_robin`, `cache_aware` and the others). |
-| policy document | A YAML or JSON file that says how workers are chosen. Section 3. |
+| policy document | A YAML or JSON file that says how workers are chosen. The code calls it a policy spec (`PolicySpec`, `--policy-spec FILE`). Section 3. |
 | profile | One way to choose: filters, then scorers, then one picker. |
 | stage | A filter, a scorer or a picker. |
 | binding | A rule of the document: which requests use which profile. |
@@ -273,7 +273,8 @@ The mode and the gateway decide what the document binds:
 A gateway of many routers serves pairs and single workers, however it reaches them, so its
 document binds both. In a gateway of one router the second binding of a prefill-decode mode is
 there for one request, the token count. Over HTTP the gateway still places it as a single request,
-on one prefill worker, and classic places it by the main policy. Over gRPC or ZMQ the mode counts
+on one prefill worker, and classic places it by the model's policy, which is the main policy
+unless a worker's label names another (below). Over gRPC or ZMQ the mode counts
 with no worker, as the encode mode does, so the document binds no single request. The settings
 state how the gateway reaches its workers.
 
@@ -296,6 +297,46 @@ the routing settings say the same document or say nothing. Otherwise the start i
 error names the first difference. A supplied document that binds no single request refuses each
 single request, in any gateway. For a prefill-decode mode of one router over HTTP that is the
 token count.
+
+**A worker's `policy` label [planned].** With the classic policies a registration can name its
+model's policy. The engine follows no such label today.
+
+What classic does: the registry builds a model's policy at the registration that finds the model
+with none, from that worker's `policy` label, for the worker's primary model. Where two such
+registrations overlap, the policy inserted last stands. The model keeps the policy until the
+last of the gateway's own workers for it has left, and the label of a worker registered
+meanwhile changes nothing (`PolicyRegistry::on_worker_added` and `on_model_unserved`,
+`model_gateway/src/policies/registry.rs`). A worker of any role names the policy this way. The
+policy so named places the model's single requests: on its regular workers, and the token count
+of a prefill-decode mode over HTTP on a prefill worker. A pair's and an encode request's workers
+are placed by their side's policy. A label names a policy in any letter case, with all its
+underscores or with none. A label that names the default policy's own type takes the settings'
+options, any other name takes that policy's defaults, and an unknown name leaves the default.
+
+What is planned: the label becomes one more input of the document built from the routing
+settings (`RoutingSettings::policy_document()`), by classic's rule. The registration that finds
+the model with none decides: its label adds a binding of that model's single requests, ahead of
+the binding of every model (section 5.6, step 4), and the binding leaves with the model's last
+worker. Where the document binds no single request, a label adds no binding, and the model's
+single requests stay refused. The name is resolved as classic resolves it. The default policy's
+own type gives the profile the settings state. Any other name gives the binding the settings
+would write for a single request under that policy, with the policy at the defaults classic
+builds it with by name. An unknown name adds no binding.
+
+The gateway then puts the new document in force on the running engine. A document put in force
+keeps the stages of every profile that did not change: one whose name stands in both documents
+and whose stages are built from the same text (the profile's own block, `view` and `signals`).
+Such a profile's stages keep what they hold, and a decision under way and a new one run the same
+stage objects. A profile that changed, and a new one, start empty. So a label's binding resets
+nothing of another model's policy where it leaves the document's `view` and `signals` as they
+stand. A label whose binding writes into them, as `manual` writes its header into the view,
+restarts every profile's stages. Where the new document cannot be built, the document in force
+stays and the registration is answered with a warning.
+
+That holds where the document is built from the routing settings. Where the operator supplies a
+document, and on a controller, the document decides, and a registration whose label names
+another policy is answered with a warning. As a first step the gateway warns at a registration
+whose label it does not follow.
 
 ### 3.4 A validated document
 
@@ -2208,6 +2249,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `canary`, `override: allowed`, `admission` | **[planned]** | in the schema; a document that writes one is refused, and the error names the field |
 | `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; a pair's shadows run in no engine, and `explain.sample` is kept by the served controller alone (decision 7) |
 | The ten presets and the conversion from routing settings | **[built]** | |
+| A worker's `policy` label names its model's policy | **[planned]** | section 3.3: a warning at a registration first, then a binding for the model in the document built from the routing settings; a document put in force keeps the stages of a profile that did not change |
 | The stage interfaces and a builder's own stages | **[built]** | |
 | The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, an encode request's demand, mixed protocols; of the recorded lines only the three hard-demand sheets and `sticky_rank` (34), and 31 lines of `prefix_hash`, replay through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |
