@@ -555,7 +555,9 @@ fn a_failed_fallback_keeps_an_internal_origin() {
 }
 
 /// A reservation a loader was refused ends the decode: the fallback, which
-/// would decode the clip again, is never polled.
+/// would decode the clip again, is never polled. Any other error of the
+/// loader runs the fallback, and a fallback that fails too names both
+/// decoders.
 #[tokio::test]
 async fn a_loader_refused_its_memory_starts_no_fallback() {
     let refused = super::out_of_memory("failed to reserve 4 frame records".to_string());
@@ -566,6 +568,19 @@ async fn a_loader_refused_its_memory_starts_no_fallback() {
             .err()
             .expect("the loader's error");
     assert!(super::is_out_of_memory(&error), "{error}");
+
+    let no_frames = MediaConnectorError::VideoDecode("no frames".to_string());
+    let fallback = async { Err(MediaConnectorError::VideoDecode("bad frame".to_string())) };
+    let error =
+        super::opencv_frames_or_fallback(Err(no_frames), "event", "loader", "fallback", fallback)
+            .await
+            .err()
+            .expect("both decoders failed");
+    assert_eq!(
+        error.to_string(),
+        "video decode error: loader failed: video decode error: no frames; \
+         fallback failed: video decode error: bad frame"
+    );
 }
 
 #[tokio::test]

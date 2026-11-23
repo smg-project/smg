@@ -75,14 +75,20 @@ impl RgbOutputBuffer {
             .ok_or_else(|| {
                 MediaConnectorError::VideoDecode("OpenCV RGB frame byte size overflow".to_string())
             })?;
-        self.data.try_reserve(frame_size).map_err(|error| {
-            out_of_memory(format!(
-                "failed to reserve {frame_size} decoded video bytes: {error}"
-            ))
-        })?;
+        // A growth asks for the amortized capacity first and, where that larger
+        // ask is refused, for what this frame needs: only a refusal of the
+        // needed length ends the decode.
+        self.data
+            .try_reserve(frame_size)
+            .or_else(|_| self.data.try_reserve_exact(frame_size))
+            .map_err(|error| {
+                out_of_memory(format!(
+                    "failed to reserve {frame_size} decoded video bytes: {error}"
+                ))
+            })?;
         let offset = self.data.len();
         let output_data = self.data.spare_capacity_mut().as_mut_ptr().cast::<u8>();
-        // SAFETY: `try_reserve` made at least `frame_size` writable bytes
+        // SAFETY: the reservation above made at least `frame_size` writable bytes
         // available, and the Vec cannot move while `output` borrows that region.
         let mut output = unsafe {
             Mat::new_rows_cols_with_data_unsafe_def(
