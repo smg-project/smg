@@ -1,9 +1,17 @@
 //! One request's routing under the classic policies, over one fleet of
 //! workers a model, every one ready unless the cell says otherwise.
 //!
-//! `--path classic`, the default, is the one path: the classic policies
-//! over the worker registry. The paths `object`, `records` and `engine`
-//! are refused by name: they are no longer part of this bench.
+//! `--path classic`, the default, routes by the classic policies over the
+//! worker registry. `--path engine` routes the same cell by the policy
+//! engine, over what a gateway builds with the policy controller on: a
+//! registry that makes no classic policy object, workers with no
+//! completion sink, and the engine of the document the cell's routing
+//! settings mean, started over the cell's registry and its load feed by
+//! the gateway's own start. Where that document reads the prefixes sent to
+//! each worker, as `cache_aware`'s does, the start lends the engine the
+//! gateway's token trees. The same routing calls then place by it.
+//! The paths `object` and `records` are refused by name: they are no
+//! longer part of this bench.
 //!
 //! A cell is one route, one policy, one fleet size and one count of
 //! callers. Each caller routes requests back to back: the placement, the
@@ -98,6 +106,7 @@ use openai_protocol::{
     worker::{HealthCheckConfig, WorkerLoadResponse, WorkerStatus},
 };
 use smg::{
+    app_context::AppContextBuilder,
     config::{
         types::{PolicyConfig, RoutingMode},
         RouterConfig,
@@ -473,6 +482,9 @@ struct Feed {
 struct Built {
     routing: Routing,
     feed: Option<Feed>,
+    /// The runtime the policy engine's task runs on, kept for the cell's
+    /// life: `None` on the classic path, which starts no engine.
+    runtime: Option<tokio::runtime::Runtime>,
 }
 
 /// A cell's path, built: a registry with the fleet, the policies a
@@ -502,8 +514,15 @@ fn build(cell: &Cell) -> Built {
             }
             Arc::new(policies)
         }
-        gone @ ("object" | "records" | "engine") => {
-            panic!("the path {gone} was removed from this bench: it runs the classic path only")
+        "engine" => {
+            // The registry a gateway builds with the policy controller on:
+            // it makes no classic policy object, and a pair's two side
+            // policies are not set on it.
+            config.policy_controller = true;
+            Arc::new(PolicyRegistry::of_config(&config))
+        }
+        gone @ ("object" | "records") => {
+            panic!("the path {gone} was removed from this bench: it runs the classic and the engine path")
         }
         other => panic!("no path {other}"),
     };
@@ -522,7 +541,9 @@ fn build(cell: &Cell) -> Built {
             for worker in &fleet {
                 registry.register(Arc::clone(worker)).unwrap();
                 policies.on_worker_added(model, None);
-                worker.set_completion_sink(Some(policies.completion_sink()));
+                // The sink a registration gives a worker: the registry's own
+                // under the classic policies, none where the engine places.
+                worker.set_completion_sink(policies.worker_completion_sink());
             }
             leave_not_ready(&fleet, cell.not_ready);
             leave_ready(&fleet, cell.ready);
@@ -543,9 +564,42 @@ fn build(cell: &Cell) -> Built {
         feed.publish(&loads);
         Feed { feed, loads }
     });
+    let engine_loads = receiver.clone();
     if cell.reports {
         attach_loads(&policies, receiver);
     }
+    // The engine path: the gateway's own start over the stock stages, with
+    // the policy controller on in the cell's settings, behind the fleet's
+    // registration and the feed's first publication. The engine is handed
+    // the feed's channel where a gateway hands it its load monitor's. Its
+    // task runs on a runtime of its own thread, kept for the cell's life.
+    let runtime = (cell.path == "engine").then(|| {
+        config.policy_controller = true;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            let _entered = runtime.enter();
+            AppContextBuilder::start_policy_engine_over_loads(
+                &config,
+                None,
+                &policies,
+                &registry,
+                engine_loads,
+            )
+            .unwrap();
+        }
+        // The engine's task takes its first step ahead of the cell's
+        // first decision, as a served gateway's does long before its
+        // first request: that step reads the registry whole and keeps
+        // the feed's newest snapshot at hand. A task spawned behind the
+        // engine's on the runtime's one thread ends behind its first
+        // poll.
+        runtime.block_on(runtime.spawn(async {})).unwrap();
+        runtime
+    });
     let (route, pair) = (cell.route, cell.pair);
     assert!(
         !(pair && cell.keys != 0),
@@ -568,7 +622,11 @@ fn build(cell: &Cell) -> Built {
             route_classic(&registry, &policies, model, route, Some(tokens), headers)
         }
     });
-    Built { routing, feed }
+    Built {
+        routing,
+        feed,
+        runtime,
+    }
 }
 
 fn main() {
@@ -576,7 +634,11 @@ fn main() {
     let recorder = start_prometheus(PrometheusConfig::default());
     let prompts = prompts(cell.prompts);
     let tokens_at = |turn: u64| &prompts[(turn % prompts.len() as u64) as usize][..];
-    let Built { routing, feed } = build(&cell);
+    let Built {
+        routing,
+        feed,
+        runtime: _engine_runtime,
+    } = build(&cell);
     // The path's first sight of the pool, untimed: what a registration and
     // the first request after it build once.
     let warm = (cell.workers as u64 * 8).max(4_096) * cell.models.max(1) as u64;

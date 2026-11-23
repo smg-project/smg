@@ -12,7 +12,10 @@ use http::{header::HeaderName, HeaderMap};
 use openai_protocol::UNKNOWN_MODEL_ID;
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxBuildHasher;
-use smg_policy_controller::{document::Needs, engine::PolicyEngine};
+use smg_policy_controller::{
+    document::{Needs, PolicySpec},
+    engine::PolicyEngine,
+};
 use smg_worker::{
     identity::{
         basic::{RequestCompletionSink, Worker, WorkerType},
@@ -33,8 +36,8 @@ use super::{
     hash_ring::HashRing,
     kept_rings::KeptRings,
     manual::{ExecutionBranch, PinState},
-    normalize_model_key, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
-    PolicyFactory, SelectWorkerInfo, WorkerRole,
+    normalize_model_key, DPRankLoadPolicy, LentTrees, LoadBalancingPolicy, ManualConfig,
+    ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
 use crate::{
     config::types::{
@@ -271,6 +274,12 @@ pub struct PolicyRegistry {
     /// every request.
     engine: Arc<OnceLock<&'static PolicyEngine>>,
 
+    /// The token trees the policy engine is lent, where its start asked
+    /// for them ([`Self::lend_token_trees`]). A worker that left is taken
+    /// out of them where it is taken out of a cache-aware policy's trees
+    /// ([`Self::remove_workers_from_cache_aware`]).
+    lent_trees: Arc<OnceLock<Arc<LentTrees>>>,
+
     /// Shared sticky selector for the routing-key override. `Some` when the
     /// override is enabled; consulted (instead of the configured policy) for keyed
     /// requests via [`PolicyRegistry::select_worker_for_model`]. `None` in a
@@ -470,6 +479,7 @@ impl PolicyRegistry {
             mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
             engine: Arc::new(OnceLock::new()),
+            lent_trees: Arc::new(OnceLock::new()),
             routing_key_sticky,
             routing_key_override: routing_key_override.enabled,
             classic,
@@ -839,6 +849,24 @@ impl PolicyRegistry {
             warn!("a policy engine is already set: the second one is not taken");
         }
         self.refresh_text_needs();
+    }
+
+    /// The token trees the policy engine is lent, made at the first call
+    /// under the numbers of `document`, the document the engine runs, whose
+    /// block size is `page` tokens ([`LentTrees::of_document`]), and kept
+    /// here. The engine's start calls it, and only where its document reads
+    /// the prefixes sent to each worker: with the engine on no classic
+    /// policy is made that would keep such trees.
+    pub(crate) fn lend_token_trees(&self, document: &PolicySpec, page: u32) -> Arc<LentTrees> {
+        let made = || Arc::new(LentTrees::of_document(document.clone(), page));
+        Arc::clone(self.lent_trees.get_or_init(made))
+    }
+
+    /// The token trees the policy engine is lent, where its start asked
+    /// for them: for a case that reads what the start made.
+    #[cfg(test)]
+    pub(crate) fn lent_trees(&self) -> Option<Arc<LentTrees>> {
+        self.lent_trees.get().cloned()
     }
 
     /// The name the settings give the main policy: what a classic selection
@@ -1516,6 +1544,11 @@ impl PolicyRegistry {
                     model_id
                 );
             }
+        }
+        // The trees the policy engine is lent stand where a policy's would:
+        // a registry made for the engine finds no policy above.
+        if let Some(trees) = self.lent_trees.get() {
+            trees.remove_workers_from_model(model_id, worker_urls);
         }
     }
 
@@ -3400,6 +3433,42 @@ mod tests {
         let urls: HashSet<String> = workers.iter().map(|w| w.url().to_string()).collect();
         registry.remove_workers_from_cache_aware("llama-3", &urls);
         assert!(tree_of(&policy, "llama-3").is_empty());
+    }
+
+    /// A registry made for the policy engine keeps the token trees the
+    /// engine is lent: none until the start asks, one owner however often
+    /// it asks, under the numbers of the document the start hands it. A
+    /// worker that left is taken out of its model's tree by the call that
+    /// takes it out of a cache-aware policy's trees, which finds no policy
+    /// in such a registry.
+    #[test]
+    fn a_worker_that_left_is_taken_out_of_the_lent_trees() {
+        let config = RouterConfig {
+            policy: cache_aware_config(),
+            ..RouterConfig::default()
+        };
+        let document = config.policy_document().expect("the settings' document");
+        let registry = PolicyRegistry::for_policy_engine(
+            config.policy.clone(),
+            RoutingKeyOverrideConfig::default(),
+        );
+        assert!(registry.lent_trees().is_none());
+        let trees = registry.lend_token_trees(&document, 8);
+        assert!(Arc::ptr_eq(
+            &trees,
+            &registry.lend_token_trees(&document, 8)
+        ));
+        let tokens: Vec<u32> = (0..64).collect();
+        let tree = trees.token_tree("llama-3");
+        assert_eq!(tree.page_size(), 8, "the block size the start handed");
+        tree.insert_tokens(&tokens, "http://w1:8000");
+        tree.insert_tokens(&tokens, "http://w2:8000");
+
+        let left = HashSet::from(["http://w1:8000".to_owned()]);
+        registry.remove_workers_from_cache_aware("llama-3", &left);
+        let kept: Vec<String> = tree.get_tenant_token_counts().into_keys().collect();
+        assert_eq!(kept, ["http://w2:8000"]);
+        assert_eq!(registry.classic_made_or_asked(), 0);
     }
 
     #[test]

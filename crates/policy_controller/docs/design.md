@@ -502,8 +502,8 @@ A decision of the engine publishes no insert to other gateways.
 
 One change was made outside the policy crate first **[built]**: classic's trees moved out of
 its policy object into one store type of the kv-index crate (`ModelTrees`), with no behaviour
-change. Classic's policy object keeps its trees in that type. The engine's host keeps the trees
-it lends in the same type **[planned]**.
+change. Classic's policy object keeps its trees in that type. The gateway keeps the token trees
+it lends the engine in the same type **[built]**.
 
 ### 4.6 Who writes and who reads
 
@@ -1352,9 +1352,11 @@ request ──> route (HTTP or gRPC, any family)
 
 - **Start.** One function builds the engine from the routing settings or a supplied document and
   hands it the worker registry, the load monitor's channel and the cache-event monitor. With
-  the engine on, no classic policy object is built. So the start function owns the trees the
-  engine is lent **[planned]**: it keeps them, runs their size pass on a timer and tells them a
-  worker that left.
+  the engine on, no classic policy object is built. So the start makes the token trees the
+  engine is lent **[built]**, where the document reads the prefixes sent to each worker. The
+  policy registry keeps them, classic's size pass runs over them on its timer, and a worker that
+  left is taken out of them. The trees take the document's numbers: its block size is a tree's
+  page, and a model's `index` entry states the size its tree is held to and how often.
 
   The start makes the policy crate's one start call as the last step of the context's build. The document is checked first against the table of stages the gateway's host hands the start, or the stock table where it hands none, and a refused document ends the start before the gateway listens. The engine's task follows the registry's events and tells the document's stages a worker that joined and a worker that was removed. Where the configuration runs the policy controller the gateway builds its policy registry with no classic policy object: a stand-in that places nothing stands in its default and encode slots, and a worker's registration and a router's build add no policy.
 
