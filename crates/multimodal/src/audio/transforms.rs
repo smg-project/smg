@@ -1,6 +1,11 @@
 //! Shared digital-signal-processing transforms for audio frontends.
 
-use std::{f32::consts::PI as PI_F32, f64::consts::PI};
+use std::{
+    f32::consts::PI as PI_F32,
+    f64::consts::PI,
+    mem::size_of,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+};
 
 use crate::error::TransformError;
 
@@ -90,9 +95,8 @@ pub(super) fn mel_basis(sample_rate: usize, n_fft: usize, n_mels: usize) -> Vec<
 
 /// The two bounds that keep a resampling kernel cheap, shared by the
 /// single-precision and the exact resampler and applied before anything is
-/// built. Each output costs a `kernel_len` dot product, and the table holds
-/// `new_freq` phases of `kernel_len` coefficients, so a rate that shares
-/// little with the frontend's is expensive on both counts, and a corrupt
+/// built. Before each phase trims its zero taps, a rate sharing little with the
+/// frontend's swells both `kernel_len` and `new_freq * kernel_len`, and a corrupt
 /// header can name any rate: 2 147 491 648 Hz (8 kHz with one bit flipped) to
 /// 16 kHz reduces to 33 554 557 : 250, a table of 8.8 G coefficients that
 /// took minutes to build for the two samples it yields. The rates audio is
@@ -114,6 +118,157 @@ pub(super) fn mel_basis(sample_rate: usize, n_fft: usize, n_mels: usize) -> Vec<
 /// products of 2^40 by 2^62 stay under 2^114 in i128.
 const MAX_RESAMPLE_KERNEL_LEN: usize = 1 << 12;
 const MAX_RESAMPLE_KERNEL_VALUES: usize = 1 << 22;
+
+const _: () = assert!(MAX_RESAMPLE_KERNEL_LEN <= u16::MAX as usize);
+const _: () = assert!(MAX_RESAMPLE_KERNEL_VALUES <= u32::MAX as usize);
+
+const MAX_CACHED_KERNELS: usize = 16;
+const MAX_CACHED_KERNEL_BYTES: usize = 4 << 20;
+
+#[derive(Clone, Copy)]
+struct PhaseSpan {
+    tap_start: u32,
+    window_offset: u16,
+    tap_len: u16,
+}
+
+struct PolyphaseKernel<T> {
+    key: (usize, usize),
+    kernel_len: usize,
+    taps: Vec<T>,
+    phases: Vec<PhaseSpan>,
+}
+
+impl<T> PolyphaseKernel<T> {
+    fn byte_size(&self) -> usize {
+        self.taps.capacity() * size_of::<T>() + self.phases.capacity() * size_of::<PhaseSpan>()
+    }
+}
+
+struct KernelCache<T>(Mutex<Vec<Arc<PolyphaseKernel<T>>>>);
+
+impl<T> KernelCache<T> {
+    const fn new() -> Self {
+        Self(Mutex::new(Vec::new()))
+    }
+
+    fn entries(&self) -> MutexGuard<'_, Vec<Arc<PolyphaseKernel<T>>>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lookup(
+        entries: &mut Vec<Arc<PolyphaseKernel<T>>>,
+        key: (usize, usize),
+    ) -> Option<Arc<PolyphaseKernel<T>>> {
+        let pos = entries.iter().rposition(|kernel| kernel.key == key)?;
+        let hit = Arc::clone(&entries[pos]);
+        if pos + 1 < entries.len() {
+            let entry = entries.remove(pos);
+            entries.push(entry);
+        }
+        Some(hit)
+    }
+
+    fn get_or_build(
+        &self,
+        key: (usize, usize),
+        build: impl FnOnce() -> Result<PolyphaseKernel<T>, TransformError>,
+    ) -> Result<Arc<PolyphaseKernel<T>>, TransformError> {
+        if let Some(hit) = Self::lookup(&mut self.entries(), key) {
+            return Ok(hit);
+        }
+
+        let built = Arc::new(build()?);
+        let cost = built.byte_size();
+        if cost > MAX_CACHED_KERNEL_BYTES {
+            return Ok(built);
+        }
+
+        let mut evicted: [Option<Arc<PolyphaseKernel<T>>>; MAX_CACHED_KERNELS] =
+            [const { None }; MAX_CACHED_KERNELS];
+        let out = {
+            let mut entries = self.entries();
+            if let Some(existing) = Self::lookup(&mut entries, key) {
+                existing
+            } else {
+                let mut held: usize = entries.iter().map(|kernel| kernel.byte_size()).sum();
+                let mut slot = 0;
+                while !entries.is_empty()
+                    && (entries.len() >= MAX_CACHED_KERNELS
+                        || held + cost > MAX_CACHED_KERNEL_BYTES)
+                {
+                    let old = entries.remove(0);
+                    held -= old.byte_size();
+                    evicted[slot] = Some(old);
+                    slot += 1;
+                }
+                entries.push(Arc::clone(&built));
+                built
+            }
+        };
+        drop(evicted);
+        Ok(out)
+    }
+}
+
+static SINGLE_KERNELS: KernelCache<f32> = KernelCache::new();
+static EXACT_KERNELS: KernelCache<i64> = KernelCache::new();
+
+/// Support for half-width `width` falls in `shift + 1..=shift + 2 * width`.
+/// The extra taps on each end cover `f32` rounding of the tap coordinate.
+fn build_polyphase_kernel<T: Copy + PartialEq>(
+    key: (usize, usize),
+    width: usize,
+    kernel_len: usize,
+    zero: T,
+    mut tap_at: impl FnMut(usize, usize) -> T,
+) -> Result<PolyphaseKernel<T>, TransformError> {
+    let (orig_freq, new_freq) = key;
+    let tap_budget = new_freq.saturating_mul(2 * width).saturating_add(5);
+    let mut taps = Vec::new();
+    taps.try_reserve_exact(tap_budget).map_err(|error| {
+        TransformError::ShapeError(format!("failed to allocate audio resample kernel: {error}"))
+    })?;
+    let mut phases = Vec::new();
+    phases.try_reserve_exact(new_freq).map_err(|error| {
+        TransformError::ShapeError(format!("failed to allocate audio resample phases: {error}"))
+    })?;
+
+    for phase in 0..new_freq {
+        let start = taps.len();
+        let mut end = start;
+        let mut window_offset = 0_u16;
+        let shift = ((phase as u64 * orig_freq as u64) / new_freq as u64) as usize;
+        let k_lo = shift.saturating_sub(2);
+        let k_hi = shift.saturating_add(2 * width + 3).min(kernel_len);
+        for kernel_index in k_lo..k_hi {
+            let weight = tap_at(phase, kernel_index);
+            if taps.len() == start {
+                if weight == zero {
+                    continue;
+                }
+                window_offset = kernel_index as u16;
+            }
+            taps.push(weight);
+            if weight != zero {
+                end = taps.len();
+            }
+        }
+        taps.truncate(end);
+        phases.push(PhaseSpan {
+            tap_start: start as u32,
+            window_offset,
+            tap_len: (end - start) as u16,
+        });
+    }
+
+    Ok(PolyphaseKernel {
+        key,
+        kernel_len,
+        taps,
+        phases,
+    })
+}
 
 /// The size of the band-limited sinc kernel from `src_sample_rate` to
 /// `dst_sample_rate` over the reduced ratio `orig_freq : new_freq` with the
@@ -168,31 +323,37 @@ pub(super) fn bandlimited_resample(
     let new_freq = dst_sample_rate / gcd;
     let base_freq = orig_freq.min(new_freq) as f32 * ROLLOFF;
     let width = (LOWPASS_FILTER_WIDTH * orig_freq as f32 / base_freq).ceil() as usize;
-    let (kernel_len, kernel_values) =
+    let (kernel_len, _) =
         resample_kernel_size(src_sample_rate, dst_sample_rate, orig_freq, new_freq, width)?;
-    let mut kernels = Vec::new();
-    kernels.try_reserve_exact(kernel_values).map_err(|error| {
-        TransformError::ShapeError(format!("failed to allocate audio resample kernel: {error}"))
+    let kernel = SINGLE_KERNELS.get_or_build((orig_freq, new_freq), || {
+        let orig_freq_f32 = orig_freq as f32;
+        let new_freq_f32 = new_freq as f32;
+        let scale = base_freq / orig_freq_f32;
+        build_polyphase_kernel(
+            (orig_freq, new_freq),
+            width,
+            kernel_len,
+            0.0_f32,
+            |phase, kernel_index| {
+                let idx = (kernel_index as f32 - width as f32) / orig_freq_f32;
+                let t = (idx - phase as f32 / new_freq_f32) * base_freq;
+                // Clamping `t` to `LOWPASS_FILTER_WIDTH` keeps dead end taps non-zero:
+                // `(PI_F32 / 2.0).cos().powi(2)` is 1.9e-15 in `f32`.
+                if t.abs() < LOWPASS_FILTER_WIDTH {
+                    let window = (t * PI_F32 / LOWPASS_FILTER_WIDTH / 2.0).cos().powi(2);
+                    let radians = t * PI_F32;
+                    let sinc = if radians == 0.0 {
+                        1.0
+                    } else {
+                        radians.sin() / radians
+                    };
+                    sinc * window * scale
+                } else {
+                    0.0
+                }
+            },
+        )
     })?;
-
-    let orig_freq_f32 = orig_freq as f32;
-    let new_freq_f32 = new_freq as f32;
-    let scale = base_freq / orig_freq_f32;
-    for phase in 0..new_freq {
-        for kernel_index in 0..kernel_len {
-            let idx = (kernel_index as f32 - width as f32) / orig_freq_f32;
-            let mut t = (idx - phase as f32 / new_freq_f32) * base_freq;
-            t = t.clamp(-LOWPASS_FILTER_WIDTH, LOWPASS_FILTER_WIDTH);
-            let window = (t * PI_F32 / LOWPASS_FILTER_WIDTH / 2.0).cos().powi(2);
-            let radians = t * PI_F32;
-            let sinc = if radians == 0.0 {
-                1.0
-            } else {
-                radians.sin() / radians
-            };
-            kernels.push(sinc * window * scale);
-        }
-    }
 
     let target_len_u128 = (samples.len() as u128 * new_freq as u128).div_ceil(orig_freq as u128);
     let target_len = usize::try_from(target_len_u128).map_err(|_| {
@@ -204,26 +365,10 @@ pub(super) fn bandlimited_resample(
     })?;
 
     #[cfg(target_arch = "x86_64")]
-    if convolve_rows(
-        &mut output,
-        samples,
-        &kernels,
-        orig_freq,
-        new_freq,
-        width,
-        target_len,
-    )? {
+    if convolve_rows(&mut output, samples, &kernel, orig_freq, width, target_len)? {
         return Ok(output);
     }
-    convolve_blocks(
-        &mut output,
-        samples,
-        &kernels,
-        orig_freq,
-        new_freq,
-        width,
-        target_len,
-    )?;
+    convolve_blocks(&mut output, samples, &kernel, orig_freq, width, target_len)?;
     Ok(output)
 }
 
@@ -233,13 +378,12 @@ pub(super) fn bandlimited_resample(
 fn convolve_blocks(
     output: &mut Vec<f32>,
     samples: &[f32],
-    kernels: &[f32],
+    kernel: &PolyphaseKernel<f32>,
     orig_freq: usize,
-    new_freq: usize,
     width: usize,
     target_len: usize,
 ) -> Result<(), TransformError> {
-    let kernel_len = kernels.len() / new_freq;
+    let kernel_len = kernel.kernel_len;
     // The convolution reads `width` samples before the signal and up to a
     // kernel beyond its end, where it previously contributed nothing: a tap
     // whose index fell outside the input was skipped. Materialising those
@@ -265,13 +409,19 @@ fn convolve_blocks(
     'blocks: for block in 0..blocks {
         let input_start = block * orig_freq;
         let window = &padded[input_start..input_start + kernel_len];
-        for phase in 0..new_freq {
+        for span in &kernel.phases {
             if output.len() == target_len {
                 break 'blocks;
             }
-            let kernel = &kernels[phase * kernel_len..(phase + 1) * kernel_len];
+            let (ts, wo, len) = (
+                span.tap_start as usize,
+                span.window_offset as usize,
+                span.tap_len as usize,
+            );
             let mut value = 0.0_f32;
-            for (&coefficient, &sample) in kernel.iter().zip(window) {
+            for (&coefficient, &sample) in
+                kernel.taps[ts..ts + len].iter().zip(&window[wo..wo + len])
+            {
                 value = sample.mul_add(coefficient, value);
             }
             output.push(value);
@@ -313,9 +463,8 @@ struct RowValues([f32; RESAMPLE_ROW_BLOCKS]);
 fn convolve_rows(
     output: &mut Vec<f32>,
     samples: &[f32],
-    kernels: &[f32],
+    kernel: &PolyphaseKernel<f32>,
     orig_freq: usize,
-    new_freq: usize,
     width: usize,
     target_len: usize,
 ) -> Result<bool, TransformError> {
@@ -323,7 +472,8 @@ fn convolve_rows(
     if !fused {
         return Ok(false);
     }
-    let kernel_len = kernels.len() / new_freq;
+    let (_, new_freq) = kernel.key;
+    let kernel_len = kernel.kernel_len;
     let blocks = samples.len().div_ceil(orig_freq);
     let strand_len = blocks.min(RESAMPLE_ROW_BLOCKS) + (kernel_len - 1) / orig_freq;
     let mut strands: Vec<f32> = Vec::new();
@@ -349,13 +499,20 @@ fn convolve_rows(
                 *position = sample;
             }
         }
-        for (phase, kernel) in kernels.chunks_exact(kernel_len).enumerate() {
+        for (phase, span) in kernel.phases.iter().enumerate() {
             values.fill(0.0);
-            for (shift, coefficients) in kernel.chunks(orig_freq).enumerate() {
-                for (strand, &coefficient) in strands.chunks_exact(strand_len).zip(coefficients) {
-                    for (value, &sample) in values.iter_mut().zip(&strand[shift..]) {
-                        *value = sample.mul_add(coefficient, *value);
-                    }
+            let (ts, len) = (span.tap_start as usize, span.tap_len as usize);
+            let mut shift = span.window_offset as usize / orig_freq;
+            let mut strand = span.window_offset as usize % orig_freq;
+            for &coefficient in &kernel.taps[ts..ts + len] {
+                let row = &strands[strand * strand_len..(strand + 1) * strand_len];
+                for (value, &sample) in values.iter_mut().zip(&row[shift..]) {
+                    *value = sample.mul_add(coefficient, *value);
+                }
+                strand += 1;
+                if strand == orig_freq {
+                    strand = 0;
+                    shift += 1;
                 }
             }
             let slots = output
@@ -413,36 +570,35 @@ pub(super) fn bandlimited_resample_exact(
     let width = (LOWPASS_FILTER_WIDTH * orig_freq as f64 / base_freq).ceil() as usize;
     // The shared bounds refuse an impractical rate before anything is built;
     // the kernel bound is also what keeps the accumulator below in range.
-    let (kernel_len, kernel_values) =
+    let (kernel_len, _) =
         resample_kernel_size(src_sample_rate, dst_sample_rate, orig_freq, new_freq, width)?;
 
-    // Coefficients on the 2^-62 grid, from the filter evaluated in f64 as
-    // torchaudio writes it: t = (idx - phase / new) * base, clamped to the
-    // width, a squared cosine window, sin(pi t) / (pi t), scaled.
-    let mut kernels: Vec<i64> = Vec::new();
-    kernels.try_reserve_exact(kernel_values).map_err(|error| {
-        TransformError::ShapeError(format!("failed to allocate audio resample kernel: {error}"))
+    let kernel = EXACT_KERNELS.get_or_build((orig_freq, new_freq), || {
+        let orig_freq_f64 = orig_freq as f64;
+        let new_freq_f64 = new_freq as f64;
+        let scale = base_freq / orig_freq_f64;
+        let coefficient_scale = 2f64.powi(EXACT_RESAMPLE_COEFFICIENT_BITS);
+        build_polyphase_kernel(
+            (orig_freq, new_freq),
+            width,
+            kernel_len,
+            0_i64,
+            |phase, kernel_index| {
+                let idx = (kernel_index as f64 - width as f64) / orig_freq_f64;
+                let mut t = (idx - phase as f64 / new_freq_f64) * base_freq;
+                // `(PI / 2.0).cos().powi(2)` is 3.75e-33 (~2^-108), rounding to `0_i64` at 2^-62.
+                t = t.clamp(-LOWPASS_FILTER_WIDTH, LOWPASS_FILTER_WIDTH);
+                let window = (t * PI / LOWPASS_FILTER_WIDTH / 2.0).cos().powi(2);
+                let radians = t * PI;
+                let sinc = if radians == 0.0 {
+                    1.0
+                } else {
+                    radians.sin() / radians
+                };
+                ((sinc * window * scale) * coefficient_scale).round_ties_even() as i64
+            },
+        )
     })?;
-    let orig_freq_f64 = orig_freq as f64;
-    let new_freq_f64 = new_freq as f64;
-    let scale = base_freq / orig_freq_f64;
-    let coefficient_scale = 2f64.powi(EXACT_RESAMPLE_COEFFICIENT_BITS);
-    for phase in 0..new_freq {
-        for kernel_index in 0..kernel_len {
-            let idx = (kernel_index as f64 - width as f64) / orig_freq_f64;
-            let mut t = (idx - phase as f64 / new_freq_f64) * base_freq;
-            t = t.clamp(-LOWPASS_FILTER_WIDTH, LOWPASS_FILTER_WIDTH);
-            let window = (t * PI / LOWPASS_FILTER_WIDTH / 2.0).cos().powi(2);
-            let radians = t * PI;
-            let sinc = if radians == 0.0 {
-                1.0
-            } else {
-                radians.sin() / radians
-            };
-            let coefficient = sinc * window * scale;
-            kernels.push((coefficient * coefficient_scale).round_ties_even() as i64);
-        }
-    }
 
     // Samples on the 2^-40 grid of the peak bound 2^peak_exponent.
     let peak = samples
@@ -482,13 +638,19 @@ pub(super) fn bandlimited_resample_exact(
     'blocks: for block in 0..samples.len().div_ceil(orig_freq) {
         let input_start = block * orig_freq;
         let window = &quantized[input_start..input_start + kernel_len];
-        for phase in 0..new_freq {
+        for span in &kernel.phases {
             if output.len() == target_len {
                 break 'blocks;
             }
-            let kernel = &kernels[phase * kernel_len..(phase + 1) * kernel_len];
+            let (ts, wo, len) = (
+                span.tap_start as usize,
+                span.window_offset as usize,
+                span.tap_len as usize,
+            );
             let mut acc: i128 = 0;
-            for (&coefficient, &sample) in kernel.iter().zip(window) {
+            for (&coefficient, &sample) in
+                kernel.taps[ts..ts + len].iter().zip(&window[wo..wo + len])
+            {
                 acc += i128::from(coefficient) * i128::from(sample);
             }
             // The exact sum to f64 (one rounding), the power-of-two scale
@@ -729,12 +891,25 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn the_rows_convolve_like_the_plain_loop() {
-        use super::{convolve_blocks, convolve_rows, RESAMPLE_ROW_BLOCKS};
+        use super::{build_polyphase_kernel, convolve_blocks, convolve_rows, RESAMPLE_ROW_BLOCKS};
 
         for (orig_freq, new_freq, width) in [(441, 160, 17), (3, 1, 19), (1, 2, 7), (2, 3, 7)] {
-            let kernels: Vec<f32> = (0..new_freq * (2 * width + orig_freq))
-                .map(|i| ((i * 37 + 11) % 251) as f32 / 251.0 - 0.5)
-                .collect();
+            let kernel_len = 2 * width + orig_freq;
+            let kernel = build_polyphase_kernel(
+                (orig_freq, new_freq),
+                width,
+                kernel_len,
+                0.0_f32,
+                |p, k| {
+                    let shift = (p * orig_freq) / new_freq;
+                    if k <= shift || k > shift + 2 * width {
+                        0.0
+                    } else {
+                        (((p * kernel_len + k) * 37 + 11) % 251) as f32 / 251.0 - 0.5
+                    }
+                },
+            )
+            .unwrap();
             let row = RESAMPLE_ROW_BLOCKS * orig_freq;
             for len in [1, orig_freq + 1, row - 1, row + 1] {
                 let samples: Vec<f32> = (0..len)
@@ -742,17 +917,14 @@ mod tests {
                     .collect();
                 let target_len = (len * new_freq).div_ceil(orig_freq);
                 let (mut rows, mut plain) = (Vec::new(), Vec::new());
-                let by_rows = convolve_rows(
-                    &mut rows, &samples, &kernels, orig_freq, new_freq, width, target_len,
-                )
-                .unwrap();
+                let by_rows =
+                    convolve_rows(&mut rows, &samples, &kernel, orig_freq, width, target_len)
+                        .unwrap();
                 if !by_rows {
                     return;
                 }
-                convolve_blocks(
-                    &mut plain, &samples, &kernels, orig_freq, new_freq, width, target_len,
-                )
-                .unwrap();
+                convolve_blocks(&mut plain, &samples, &kernel, orig_freq, width, target_len)
+                    .unwrap();
                 assert!(
                     rows.iter()
                         .map(|value| value.to_bits())
@@ -761,5 +933,129 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn compacted_resample_matches_full_block_rows_bit_for_bit() {
+        use super::{
+            greatest_common_divisor, EXACT_RESAMPLE_COEFFICIENT_BITS, EXACT_RESAMPLE_SAMPLE_BITS,
+            PI, PI_F32,
+        };
+
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let pairs = [
+            (1, 16_000),
+            (11_025, 16_000),
+            (44_100, 16_000),
+            (47_952, 24_000),
+            (768_000, 16_000),
+        ];
+        for (src, dst) in pairs {
+            let gcd = greatest_common_divisor(src, dst);
+            let (orig, new) = (src / gcd, dst / gcd);
+            let sig: Vec<f32> = (0..orig + 2)
+                .map(|i| (i as f32 * 0.37).sin() * 0.8 + (i as f32 * 1.13).cos() * 0.15)
+                .collect();
+            let out_len = ((sig.len() as u128 * new as u128).div_ceil(orig as u128)) as usize;
+
+            let base32 = orig.min(new) as f32 * 0.99;
+            let w32 = (6.0 * orig as f32 / base32).ceil() as usize;
+            let len32 = 2 * w32 + orig;
+            let mut pad32 = vec![0.0_f32; sig.len() + len32];
+            pad32[w32..w32 + sig.len()].copy_from_slice(&sig);
+            let ref32: Vec<f32> = (0..out_len)
+                .map(|i| {
+                    let (win, p) = (&pad32[(i / new) * orig..][..len32], (i % new) as f32);
+                    win.iter().enumerate().fold(0.0_f32, |val, (k, &s)| {
+                        let t = ((k as f32 - w32 as f32) / orig as f32 - p / new as f32) * base32;
+                        let r = t * PI_F32;
+                        let c = if t.abs() < 6.0 {
+                            (if r == 0.0 { 1.0 } else { r.sin() / r })
+                                * (t * PI_F32 / 6.0 / 2.0).cos().powi(2)
+                                * (base32 / orig as f32)
+                        } else {
+                            0.0
+                        };
+                        s.mul_add(c, val)
+                    })
+                })
+                .collect();
+            assert_eq!(
+                bits(&bandlimited_resample(&sig, src, dst).unwrap()),
+                bits(&ref32),
+                "{src}->{dst}"
+            );
+
+            let base64 = orig.min(new) as f64 * 0.99;
+            let w64 = (6.0 * orig as f64 / base64).ceil() as usize;
+            let len64 = 2 * w64 + orig;
+            let exp = frexp_exponent(sig.iter().fold(0.0f32, |p, &s| p.max(s.abs())));
+            let s_scale = 2f64.powi(EXACT_RESAMPLE_SAMPLE_BITS - exp);
+            let out_scale =
+                2f64.powi(exp - EXACT_RESAMPLE_SAMPLE_BITS - EXACT_RESAMPLE_COEFFICIENT_BITS);
+            let c_scale = 2f64.powi(EXACT_RESAMPLE_COEFFICIENT_BITS);
+            let mut pad64 = vec![0_i64; sig.len() + len64];
+            for (slot, &s) in pad64[w64..w64 + sig.len()].iter_mut().zip(&sig) {
+                *slot = (f64::from(s) * s_scale).round_ties_even() as i64;
+            }
+            let ref64: Vec<f32> = (0..out_len)
+                .map(|i| {
+                    let (win, p) = (&pad64[(i / new) * orig..][..len64], (i % new) as f64);
+                    let acc: i128 = win
+                        .iter()
+                        .enumerate()
+                        .map(|(k, &s)| {
+                            let t = (((k as f64 - w64 as f64) / orig as f64 - p / new as f64)
+                                * base64)
+                                .clamp(-6.0, 6.0);
+                            let r = t * PI;
+                            let sinc = if r == 0.0 { 1.0 } else { r.sin() / r };
+                            let w = (t * PI / 6.0 / 2.0).cos().powi(2);
+                            let c = (sinc * w * (base64 / orig as f64) * c_scale).round_ties_even();
+                            i128::from(c as i64) * i128::from(s)
+                        })
+                        .sum();
+                    ((acc as f64) * out_scale) as f32
+                })
+                .collect();
+            assert_eq!(
+                bits(&bandlimited_resample_exact(&sig, src, dst).unwrap()),
+                bits(&ref64),
+                "{src}->{dst}"
+            );
+        }
+    }
+
+    #[test]
+    fn kernel_cache_promotes_recent_hits_and_evicts_past_either_bound() {
+        use std::sync::Arc;
+
+        use super::{
+            build_polyphase_kernel, KernelCache, MAX_CACHED_KERNELS, MAX_CACHED_KERNEL_BYTES,
+        };
+
+        let cache: KernelCache<i64> = KernelCache::new();
+        let build = |o, n, w| {
+            build_polyphase_kernel((o, n), w, 2 * w + o, 0_i64, |_, k| i64::from(k < 2 * w))
+        };
+        let get = |o, n, w| cache.get_or_build((o, n), || build(o, n, w)).unwrap();
+        let hit = |o, n| cache.get_or_build((o, n), || panic!("miss")).unwrap();
+        let hot = get(3, 1, 7);
+        let cold = get(5, 2, 7);
+        assert!(Arc::ptr_eq(&hot, &hit(3, 1)));
+
+        for n in 1..MAX_CACHED_KERNELS {
+            get(n * 2 + 7, 2, 7);
+        }
+        assert_eq!(cache.entries().len(), MAX_CACHED_KERNELS);
+        assert!(Arc::ptr_eq(&hot, &hit(3, 1)));
+        assert!(!Arc::ptr_eq(&cold, &get(5, 2, 7)));
+
+        for n in 1..=4 {
+            get(n, 4_000, 24);
+        }
+        let held: usize = cache.entries().iter().map(|k| k.byte_size()).sum();
+        assert!(cache.entries().len() < 4 && held <= MAX_CACHED_KERNEL_BYTES);
+        assert!(get(1, 8_000, 40).byte_size() > MAX_CACHED_KERNEL_BYTES);
     }
 }
