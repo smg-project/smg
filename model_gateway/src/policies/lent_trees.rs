@@ -196,13 +196,15 @@ impl LentTrees {
     /// address. The trees fill again from the requests that follow.
     ///
     /// The trees are emptied by the size pass's own call, at no size
-    /// ([`TokenTree::evict_tenant_by_size`]), and not by name: the workers
-    /// that stand are written to meanwhile. The call takes one leaf out at
-    /// a time and debits it from its worker, so a prompt a request writes
-    /// meanwhile stays counted. It stays in the tree too, with the prompt
-    /// it extends: it was sent to the worker that stands. The call ends
-    /// where the tree's total reads zero. Every address stays listed, at
-    /// no tokens.
+    /// ([`TokenTree::evict_tenant_by_size`]): one pass, where a purge by
+    /// name walks a tree once for each address. The call takes one leaf
+    /// out at a time and debits it from its worker. A prompt a request
+    /// writes meanwhile is never left uncounted. It stays, with the prompt
+    /// it extends, as it was sent to the worker that stands. Or it leaves
+    /// with its count kept, where the pass takes it between its attach
+    /// and its count. The call ends where the tree's total reads zero.
+    /// Every address stays listed at no tokens, but one a removal named:
+    /// that one is purged by name behind the pass.
     fn forget_the_removed(&self, left: &Left) {
         if left.unheard > 0 {
             warn!(
@@ -221,16 +223,16 @@ impl LentTrees {
             .map(|store| Arc::clone(&store.trees))
             .collect();
         for tree in stores.iter().flat_map(|trees| trees.token_trees()) {
-            if left.unheard == 0 {
-                for address in &left.addresses {
-                    tree.remove_tenant_all(&TenantId::from(address.as_str()));
-                }
-            } else {
-                // A purge by name drops a worker's whole count, and a
-                // tree's own `clear` asks for no writer beside it. This
+            if left.unheard > 0 {
+                // A tree's own `clear` asks for no writer beside it. This
                 // call may run beside the size pass's own: the second of
                 // the two to take a worker out of a node debits nothing.
                 tree.evict_tenant_by_size(0);
+            }
+            // Behind an eviction a named address's count reads zero, and
+            // the purge drops its entries alone.
+            for address in &left.addresses {
+                tree.remove_tenant_all(&TenantId::from(address.as_str()));
             }
         }
     }
@@ -585,13 +587,17 @@ mod tests {
     /// The worker that rejoined starts with no prompt, and so does the one
     /// that stood throughout, as nothing heard tells the two apart. Each
     /// is debited what left and stays listed: no count is dropped whole.
+    /// A third worker's removal is the last event, so it is kept and heard
+    /// in the same wake: that address leaves the tree's list too.
     #[tokio::test]
     async fn events_that_went_unheard_empty_every_tree() {
         let trees = Arc::new(owner(document(1_000, 0)));
         let registry = WorkerRegistry::new();
-        worker_at(&registry, "http://a:1");
-        worker_at(&registry, "http://b:1");
-        sent(&trees, MODEL, &["http://a:1", "http://b:1"]);
+        let all = ["http://a:1", "http://b:1", "http://c:1"];
+        for worker in all {
+            worker_at(&registry, worker);
+        }
+        sent(&trees, MODEL, &all);
         trees.follow_removals(&registry, &Handle::current());
 
         let mut witness = registry.subscribe_events();
@@ -600,33 +606,44 @@ mod tests {
         for wave in 0..1_500 {
             worker_at(&registry, &format!("http://wave-{wave}:1"));
         }
+        registry.remove_by_url("http://c:1").expect("the removal");
         assert!(
             matches!(witness.try_recv(), Err(TryRecvError::Lagged(_))),
             "the burst must overflow the channel, or this case holds nothing"
         );
-        let mut kept = std::iter::from_fn(|| witness.try_recv().ok());
-        let of_a_wave = |event: WorkerEvent| {
+        let kept: Vec<WorkerEvent> = std::iter::from_fn(|| witness.try_recv().ok()).collect();
+        let (last, waves) = kept.split_last().expect("the events that are kept");
+        assert!(
+            matches!(last, WorkerEvent::Removed { worker, .. } if worker.url() == "http://c:1"),
+            "the third worker's removal is kept, and heard"
+        );
+        let of_a_wave = |event: &WorkerEvent| {
             let WorkerEvent::Registered { worker, .. } = event else {
                 return false;
             };
             worker.url().starts_with("http://wave-")
         };
         assert!(
-            kept.all(of_a_wave),
+            waves.iter().all(of_a_wave),
             "an event that names the address would be heard, and purge it by its name"
         );
+        // The purge by name runs behind the eviction: the list is waited
+        // for, and the prompts are gone by then.
+        let tree = trees.token_tree(MODEL);
+        let listed = || {
+            let mut listed: Vec<(String, usize)> =
+                tree.get_tenant_token_counts().into_iter().collect();
+            listed.sort();
+            listed
+        };
+        let debited = ["http://a:1", "http://b:1"].map(|stands| (stands.to_owned(), 0));
         until("the trees emptied behind unheard events", || {
-            held(&trees, MODEL).is_empty()
+            listed() == debited
         })
         .await;
-        let tree = trees.token_tree(MODEL);
         // The root's own entry lists the addresses, and is no prompt.
         let prompts = tree.iter_entries().filter(|(prompt, _)| !prompt.is_empty());
         assert_eq!(prompts.count(), 0, "no prompt is left");
-        let mut listed: Vec<(String, usize)> = tree.get_tenant_token_counts().into_iter().collect();
-        listed.sort();
-        let debited = ["http://a:1", "http://b:1"].map(|stands| (stands.to_owned(), 0));
-        assert_eq!(listed, debited);
         for stands in ["http://a:1", "http://b:1"] {
             assert!(registry.get_by_url(stands).is_some(), "{stands} stands");
         }
