@@ -914,7 +914,7 @@ impl HarmonyBuilder {
             // Function call output (separate from call) - requires looking up the original call
             ResponseInputOutputItem::FunctionCallOutput {
                 call_id, output, ..
-            } => replay_tool_result(prev_outputs, call_id, &output.to_text_only()?),
+            } => replay_tool_result(prev_outputs, call_id, output.to_text_only()?),
             ResponseInputOutputItem::CustomToolCallOutput {
                 call_id, output, ..
             } => {
@@ -934,7 +934,7 @@ impl HarmonyBuilder {
                         .collect::<Result<Vec<_>, _>>()?
                         .join("\n"),
                 };
-                replay_tool_result(prev_outputs, call_id, &text)
+                replay_tool_result(prev_outputs, call_id, text)
             }
 
             // Simple input message (usually user message)
@@ -1301,7 +1301,7 @@ impl Default for HarmonyBuilder {
 fn replay_tool_result(
     prev_outputs: &[&ResponseInputOutputItem],
     call_id: &str,
-    text: &str,
+    text: String,
 ) -> Result<HarmonyMessage, String> {
     let name = prev_outputs
         .iter()
@@ -1326,7 +1326,20 @@ fn replay_tool_result(
             _ => None,
         })
         .ok_or_else(|| format!("No function call found for call_id: {call_id}"))?;
-    Ok(tool_call_message(name, "", Some(text)))
+    Ok(tool_result_message(format!("functions.{name}"), text))
+}
+
+fn tool_result_message(author_name: String, text: String) -> HarmonyMessage {
+    HarmonyMessage {
+        author: Author {
+            role: Role::Tool,
+            name: Some(author_name),
+        },
+        recipient: Some("assistant".to_string()),
+        content: vec![Content::Text(TextContent { text })],
+        channel: None,
+        content_type: None,
+    }
 }
 
 /// The harmony message of a tool call the assistant issued, by the name the
@@ -1342,20 +1355,10 @@ fn tool_call_message(name: String, arguments: &str, output: Option<&str>) -> Har
         debug!(
             tool_name = %name,
             author_name = %author_name,
+            output_preview = %output_str.chars().take(100).collect::<String>(),
             "Building tool result message with Tool role (recipient=assistant, no channel)"
         );
-        HarmonyMessage {
-            author: Author {
-                role: Role::Tool,
-                name: Some(author_name),
-            },
-            recipient: Some("assistant".to_string()),
-            content: vec![Content::Text(TextContent {
-                text: output_str.to_string(),
-            })],
-            channel: None,
-            content_type: None,
-        }
+        tool_result_message(author_name, output_str.to_owned())
     } else {
         // Tool call - assistant message in commentary channel with recipient
         // msg.with_channel("commentary").with_recipient(f"functions.{name}")
