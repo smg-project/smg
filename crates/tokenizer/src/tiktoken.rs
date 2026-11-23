@@ -800,11 +800,11 @@ impl TiktokenTokenizer {
                 OwnEncoder::built(CoreBPE::new(ranks, special_tokens_encoder, &pattern)?)
             }
         });
-        let text_index = byte_level.as_deref().map(TextIndex::build);
+        let text_index = byte_level.as_deref().map(|table| TextIndex::build(table).0);
         // Beside the index the map keeps only an added token the index does
         // not answer with its own id (one whose id a rank holds in the
         // table, or whose text a lower id has): none, as a rule.
-        let vocab = match (text_map, &text_index, &byte_level) {
+        let vocab = match (text_map, &text_index, byte_level.as_deref()) {
             (Some(map), _, _) => map,
             (None, Some(index), Some(table)) => specials
                 .iter()

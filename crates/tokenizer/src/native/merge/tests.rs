@@ -1605,6 +1605,7 @@ fn a_model_with_more_merges_than_the_keys_carry_is_declined() {
         max_id: None,
         dense: false,
         tokens: None,
+        index: None,
     };
     assert_eq!(
         MergeTable::from_model(&model, ByteTokens::Alphabet, Some(&read)).err(),

@@ -63,7 +63,7 @@ use tokenizers::{
 use crate::{
     encode_path::Declined,
     tiktoken::MAX_BYTE_LEVEL_TABLE_IDS,
-    word_cache::{entries_of, Listing, ReadBpe},
+    word_cache::{entries_of, Listing, ModelView, ReadBpe},
 };
 
 mod preformed;
@@ -304,11 +304,14 @@ impl MergeTable {
     /// `read` is what the file's one-pass read saw of the model (its merges
     /// as ids, its largest id), so that neither is read back from the built
     /// model; `None` for a model built in memory.
-    pub(super) fn from_model(
-        model: &ModelWrapper,
+    pub(super) fn from_model<M: Model + ModelView>(
+        view: &M,
         tokens: ByteTokens,
         read: Option<&ReadBpe>,
     ) -> Result<Self, Declined> {
+        // The view answers for the byte tokens where the section's model was
+        // not built.
+        let model = view.wrapper();
         let ModelWrapper::BPE(bpe) = model else {
             return Err(Declined::from("the model is not BPE"));
         };
@@ -336,7 +339,7 @@ impl MergeTable {
             // here; the character symbols' table spells a byte only for a
             // character that is no token, and declines a missing byte that
             // could be reached (`CharSymbols::from_model`).
-            byte_ids[byte] = match model.token_to_id(&spelling) {
+            byte_ids[byte] = match view.token_to_id(&spelling) {
                 Some(id) => id,
                 None => {
                     missing.get_or_insert_with(|| Box::new([false; 256]))[byte] = true;
@@ -819,6 +822,28 @@ impl MergeTable {
             }
             bucket = self.next_bucket(bucket);
         }
+    }
+
+    /// Every merge of a table without the grid, as its operands, in rank
+    /// order: what the model's own merge map holds, read back from the
+    /// buckets for a model that is built after the load.
+    pub(super) fn pairs_by_rank(&self) -> Vec<[u32; 2]> {
+        debug_assert!(
+            self.hot.is_empty(),
+            "a table with the grid keeps pairs there"
+        );
+        let mut ranked: Vec<(u32, u64)> = self
+            .buckets
+            .iter()
+            .flat_map(|bucket| bucket.0.iter())
+            .filter(|entry| entry.key != EMPTY_KEY)
+            .map(|entry| (entry.merge.rank(), entry.key))
+            .collect();
+        ranked.sort_unstable();
+        ranked
+            .into_iter()
+            .map(|(_, key)| [(key >> 32) as u32, key as u32])
+            .collect()
     }
 
     /// Reads one word of every line of the table, the buckets first, then
