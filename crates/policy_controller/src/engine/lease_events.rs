@@ -40,6 +40,14 @@ use crate::{
 /// that worker. Under the rule's other word, the default, the request is
 /// the profile's own and every word of it is told.
 ///
+/// What is kept of where a request's prompt went asks the same: the
+/// record of sent prefixes takes no entry, and a lent token tree stores no
+/// prompt, behind a pick the stages do not hear of
+/// (`policy_engine::overlap`). A pin the keyed entry followed is handed to
+/// that lookup only where the stages hear of it (`policy_engine::single`).
+/// So the rule's word has this one reader, at the words of a lease and at
+/// those writes.
+///
 /// A pair's sides are not read here: each side keeps a verdict of its own,
 /// and a pick's one word does not say which side the rule placed.
 ///

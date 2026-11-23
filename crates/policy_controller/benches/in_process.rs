@@ -82,7 +82,7 @@ use std::{
 use counting_alloc::{calls, Counting};
 use parking_lot::{Condvar, Mutex};
 use smg_policy_controller::{
-    document::{AppliedSpec, PolicySpec, ShadowSpec},
+    document::{AppliedSpec, PolicySpec, RulePlaced, ShadowSpec},
     engine::{
         Constraints, Decided, Identity, LentList, ListCell, Phase, Plain, PolicyEngine, Request,
         RequestFacts, RequestMaker, TokenEntry, TokenKey, WorkerId, WorkerLists,
@@ -197,7 +197,14 @@ const CELLS: &[Cell] = &[
     },
     Cell {
         name: "cache_aware_sessions",
-        document: || sessions_over("cache_aware"),
+        document: || sessions_over("cache_aware", RulePlaced::Untold),
+        behind: sessions,
+        request: session,
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "cache_aware_sessions_told",
+        document: || sessions_over("cache_aware", RulePlaced::Told),
         behind: sessions,
         request: session,
         ..Cell::PLAIN
@@ -276,14 +283,20 @@ fn preset(name: &str) -> PolicySpec {
 }
 
 /// The profile of the preset `name` under the stock sessions rule, a new
-/// session placed by the profile's own stages.
-fn sessions_over(name: &str) -> PolicySpec {
+/// session placed by the profile's own stages, and `kept`, the rule's word
+/// of a request it places alone. A gateway's routing settings write
+/// `untold` for the sticky override's rule: a pinned request is kept from
+/// the profile, and its prompt is handed to no record. Under `told`, the
+/// rule's default, a pinned request is the profile's own: it is named its
+/// prompt's holders, and its prompt is handed to the record for its worker.
+fn sessions_over(name: &str, kept: RulePlaced) -> PolicySpec {
     let mut document = preset("manual");
     document.profiles = preset(name).profiles;
     let binding = &mut document.bindings[0];
     binding.profile = Some(name.into());
     let rule = binding.sessions.as_mut().expect("the stock rule");
     rule.assignment = smg_policy_controller::document::Assignment::Delegate;
+    rule.rule_placed = kept;
     document
 }
 

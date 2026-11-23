@@ -81,9 +81,12 @@ impl Engine {
     /// A pick made here states no holding, as [`Self::decide`]'s states
     /// none. A host that feeds a scorer the request's holders, and keeps
     /// for each pick the worker a prompt was sent to, does both around the
-    /// whole decision: for a pin followed here it names no holder and
-    /// keeps nothing, as a gateway's own sticky map keeps a pinned request
-    /// from its policy.
+    /// whole decision. For a pin followed here it asks no scorer, and what
+    /// it keeps is by the rule's own word of a request it places
+    /// (`rule_placed`): nothing where the rule keeps the request from the
+    /// profile, as a gateway's own sticky map keeps a pinned request from
+    /// its policy, and where the request is the profile's own, what it
+    /// keeps behind the whole decision's pick.
     ///
     /// The session table is read as the whole decision reads it: a pin
     /// followed renews its key's idle time, and a request not decided here
@@ -174,10 +177,12 @@ impl Engine {
         }
         let mut targets = Targets::new();
         targets.push(target_of(&pinned));
-        // The rule's pin placed the request, as in the whole decision. The
-        // engine over worker lists writes no record behind this entry's
-        // answer: the word is here so a followed pin says the same on both
-        // paths.
+        // The rule's pin placed the request, as in the whole decision, and
+        // the pick carries the rule's word of it on both paths. The engine
+        // over worker lists reads that word behind this entry's answer as
+        // behind the whole decision's: by it a followed pin is told to the
+        // stages or kept from them, and its prompt handed to the record or
+        // not, the same on both.
         targets.by_rule(rule.rule_placed);
         Some(Decision::Pick(Pick {
             targets,
