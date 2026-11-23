@@ -258,7 +258,7 @@ impl Engine {
         // The stage's share of the profile's weights, as the whole pass
         // folds it into a score: a weight's share of itself need not be
         // one.
-        let share = weighted.weight * (1.0 / weighted.weight);
+        let share = weighted.sole_share();
         let lifted = Constraints {
             overload_lifted: true,
             ..*cx
