@@ -1575,10 +1575,9 @@ Five things follow, and they are the first work of section 16.
    change cuts both into functions that classic and the lender call, and a gateway test puts
    all 47 lines through them, classic's ring and the engine, count for count.
 
-Hosted CI's test of the crate does not enable the feature the kept engine is behind, so it runs
-none of that engine's own tests. Only the gateway enables that feature today, so after stage 0
-only the lint with every feature still compiles the kept engine. Decision 11 has three ways to
-close this.
+Hosted CI's first test line of the crate enables the feature `client`. It takes `controller`,
+which takes the feature the kept engine is behind, so that line runs that engine's own tests.
+Decision 11 says how this was closed.
 
 ### 13.2 Speed
 
@@ -1820,7 +1819,7 @@ applied; that refusal is planned, not built, and the validator takes such a docu
 
 | Question | Fact | Options | Recommendation |
 |---|---|---|---|
-| How does CI run the kept engine's own tests? | The kept engine compiles only under the feature `in-process`. CI tests the crate on four lines of `scripts/ci_rust_tests.sh` and none enables that feature, so CI runs none of the 82 cases behind it (65 of the engine, 17 of its record writer). After stage 0 only the lint with every feature still compiles it. | (a) The crate's default build includes the feature: one line in the crate's manifest. Measured: two of CI's four lines then run the 82 cases, in under a second more. But a default build of the crate goes from 147 to 272 packages, the controller's image and three bench workflows then build the engine in, and two READMEs become wrong, one of them outside the crate. (b) CI's first test line names the feature: one line in the script, outside the crate. That line builds the same 364 packages with it and without it, and nothing else builds differently. (c) The crate's test-only dependency on itself names the feature: inside the crate, and no product build changes. But every build that takes the crate's test-only dependencies then builds the engine too: CI's two lines that test one feature alone, the lint of `operator` alone, and the three bench workflows that (a) names. Not measured. | (b), as one small change of its own. Its proof is the count of cases CI's first line runs before and after. |
+| How does CI run the kept engine's own tests? | The kept engine compiles only under the feature `in-process`. The feature `controller` takes it. The first of CI's four test lines of the crate in `scripts/ci_rust_tests.sh` enables `client`, which takes `controller`, so that line runs the cases behind `in-process` and the test target `caller`. | (a) The crate's default build includes the feature: one line in the crate's manifest. Measured: two of CI's four lines then run the 82 cases, in under a second more. But a default build of the crate goes from 147 to 272 packages, the controller's image and three bench workflows then build the engine in, and two READMEs become wrong, one of them outside the crate. (b) CI's first test line names the feature: one line in the script, outside the crate. That line builds the same 364 packages with it and without it, and nothing else builds differently. (c) The crate's test-only dependency on itself names the feature: inside the crate, and no product build changes. But every build that takes the crate's test-only dependencies then builds the engine too: CI's two lines that test one feature alone, the lint of `operator` alone, and the three bench workflows that (a) names. Not measured. | Closed a fourth way, inside the crate: `controller` takes `in-process` and `worker-host`, the two features the controller's switch (section 10.2) builds on. A build with `controller` or `client` then compiles the kept engine and the worker objects, and a controller built with `controller` alone keeps worker objects as the stock binary does. No line outside the crate changed. |
 | Is the crate published before it is ready? | The earlier integration added the crate to the published set: four lines in two release workflows and the release version check. | (a) Stage 0's change takes the four lines out, and they return with the gateway's integration (stage 3). (b) They stay. | (a). |
 
 ## 16. The order of work
