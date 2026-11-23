@@ -28,7 +28,7 @@ use crate::{
             mcp_utils::{ensure_request_mcp_routing, DEFAULT_MAX_ITERATIONS},
             openai_bridge,
             persistence_utils::{
-                persist_conversation_items, persist_conversation_items_if_open, PersistError,
+                persist_conversation_items_if_open, persist_conversation_items_owned, PersistError,
                 PersistStep,
             },
             snapshot::WorkerRegistry,
@@ -643,7 +643,7 @@ pub(crate) async fn persist_response_if_needed(
     } else {
         "foreground"
     };
-    let response_json = match to_value(response) {
+    let mut response_json = match to_value(response) {
         Ok(mut json) => {
             exact_sampling_numbers(&mut json, response);
             json
@@ -689,11 +689,12 @@ pub(crate) async fn persist_response_if_needed(
             )
             .await
         } else {
-            persist_conversation_items(
+            // Only a background persist comes round again: the store takes the tree.
+            persist_conversation_items_owned(
                 conversation_storage.clone(),
                 conversation_item_storage.clone(),
                 response_storage.clone(),
-                &response_json,
+                std::mem::take(&mut response_json),
                 original_request,
                 tenant,
                 request_context.clone(),

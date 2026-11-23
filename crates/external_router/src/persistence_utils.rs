@@ -1,6 +1,6 @@
 //! Utilities for persisting responses and conversation items across router implementations.
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use openai_protocol::responses::{
@@ -494,7 +494,34 @@ pub async fn persist_conversation_items(
         conversation_storage,
         item_storage,
         response_storage,
-        response_json,
+        Cow::Borrowed(response_json),
+        original_body,
+        tenant,
+        false,
+    );
+    match request_context {
+        Some(ctx) => with_request_context(ctx, inner).await,
+        None => inner.await,
+    }
+    .map(|_| ())
+}
+
+/// [`persist_conversation_items`] for a caller that is done with the
+/// response: the tree is taken, where the borrowing entry copies it first.
+pub async fn persist_conversation_items_owned(
+    conversation_storage: Arc<dyn ConversationStorage>,
+    item_storage: Arc<dyn ConversationItemStorage>,
+    response_storage: Arc<dyn ResponseStorage>,
+    response_json: Value,
+    original_body: &ResponsesRequest,
+    tenant: Option<&str>,
+    request_context: Option<StorageRequestContext>,
+) -> Result<(), PersistError> {
+    let inner = persist_conversation_items_inner(
+        conversation_storage,
+        item_storage,
+        response_storage,
+        Cow::Owned(response_json),
         original_body,
         tenant,
         false,
@@ -527,7 +554,7 @@ pub async fn persist_conversation_items_if_open(
         conversation_storage,
         item_storage,
         response_storage,
-        response_json,
+        Cow::Borrowed(response_json),
         original_body,
         tenant,
         true,
@@ -634,7 +661,7 @@ async fn persist_conversation_items_inner(
     conversation_storage: Arc<dyn ConversationStorage>,
     item_storage: Arc<dyn ConversationItemStorage>,
     response_storage: Arc<dyn ResponseStorage>,
-    response_json: &Value,
+    response_json: Cow<'_, Value>,
     original_body: &ResponsesRequest,
     tenant: Option<&str>,
     if_open: bool,
@@ -644,15 +671,18 @@ async fn persist_conversation_items_inner(
         return Ok(false);
     }
 
-    // Clone once, then strip multi-MB base64 from any `image_generation_call`
+    // Own the tree, then strip multi-MB base64 from any `image_generation_call`
     // items before they reach storage. Replay only references images by `id`,
     // so storing the bytes per turn would balloon the response chain.
-    let mut response_json = response_json.clone();
+    let mut response_json = response_json.into_owned();
     if let Some(outputs) = response_json
         .get_mut("output")
         .and_then(|v| v.as_array_mut())
     {
         openai_bridge::compact_image_generation_outputs_json(outputs);
+        // The record keeps this array: drop the room a caller's filter left
+        // (at most one move of its slots, where the copy moved every node).
+        outputs.shrink_to_fit();
     }
 
     // Extract the response ID and read the (already-compacted) output array
