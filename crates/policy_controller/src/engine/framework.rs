@@ -4885,7 +4885,8 @@ impl Engine {
         }
     }
 
-    /// The session table: the pins of every key a sessions rule placed.
+    /// The session table: the pins of the keys it holds, each placed by a
+    /// sessions rule.
     pub fn sessions(&self) -> &SessionTable {
         &self.sessions
     }
@@ -6322,6 +6323,9 @@ impl Engine {
                 };
                 match claim {
                     Claim::Made(id) => pick.session_verdict = SessionVerdict::Claimed(id),
+                    // A full table records nothing of the key: the
+                    // placement stands as the profile made it.
+                    Claim::NoRoom => {}
                     // The table took no claim of this decision's: another
                     // request's stands, or the pins moved under the
                     // decision. The worker it names is a pin of the key
