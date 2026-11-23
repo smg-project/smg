@@ -773,8 +773,9 @@ pub struct Candidate {
     pub load: Option<LoadRow>,
     /// The sample instant of `load` on the host's clock, in microseconds since
     /// the host's origin: dispatches made at or before it are the engine's by
-    /// now and leave a load scorer's credit. In-process only; the wire carries
-    /// the row's age.
+    /// now and leave a load scorer's credit, or those made a profile's
+    /// `sent_report_delay_ms` before it where the profile sets one.
+    /// In-process only; the wire carries the row's age.
     pub load_sampled_at_micros: u64,
     /// The session key of the request is pinned to this worker. A host
     /// writes it into a row it copies for the decision. Over a publication's

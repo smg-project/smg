@@ -40,42 +40,66 @@ pub struct DispatchCounts {
     pub tokens: u64,
 }
 
+/// A profile's two settings on its count of sends, as its document writes
+/// them: an unset one is `None`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SentSettings {
+    /// `sent_ttl_ms`: how long a send counts.
+    pub(crate) ttl_ms: Option<u32>,
+    /// `sent_report_delay_ms`: how long behind a send a report is sampled
+    /// before it ends the send.
+    pub(crate) report_delay_ms: Option<u32>,
+}
+
 /// A profile's count of what its host sent each row since the row's last
-/// report, under the profile's time limit. The engine feeds it and stages
-/// read it: a registered stage, `least-cost` through its `sent.` terms,
-/// and `least-load` for its credit. Under a standalone controller it
-/// counts sends from every gateway through that controller.
+/// report, under the profile's time limit and its report delay. The engine
+/// feeds it and stages read it: a registered stage, `least-cost` through
+/// its `sent.` terms, and `least-load` for its credit. Under a standalone
+/// controller it counts sends from every gateway through that controller.
 ///
 /// A new document's count takes over the rows' entries of the standing
 /// profile of the same name and shares them with it
 /// ([`Engine::succeed`](crate::engine::Engine::succeed)). Each count reads them
-/// under its own time limit, and a send that one read releases has left
-/// the other count too.
+/// under its own time limit and its own report delay, and a send that one
+/// read releases has left the other count too: of two report delays, a
+/// read under the shorter ends a send for both counts.
 ///
 /// Two stages of a decision read under the same row sample and clock. With
 /// the same membership, their reads differ only if a send lands or another
 /// decision releases sends between them. The later read has the newer count.
 ///
 /// A report sampled at or after a send ends it, as do the profile's time
-/// limit and the row's removal. When a send arrives with 8,192 already
-/// held on a row, the tally retires the oldest batch to bound the count.
-/// This threshold applies at any age.
+/// limit and the row's removal. Under a report delay the report that ends
+/// a send is one sampled that long after the send, or longer: a report
+/// sampled sooner behind it leaves it counted. When a send arrives with
+/// 8,192 already held on a row, the tally retires the oldest batch to
+/// bound the count. This threshold applies at any age.
 #[derive(Debug)]
 pub struct DispatchCredit {
     pub(crate) credits: Credits,
     /// The profile's time limit, `u64::MAX` where it sets none: no clock
     /// reaches a cutoff that far back.
     ttl_micros: u64,
+    /// The profile's report delay: a report ends the sends made this long
+    /// before its sample, or longer. Zero where the profile sets none: a
+    /// report then ends the sends made at its sample and before.
+    report_delay_micros: u64,
+    /// Whether the profile sets either of the two: what a pass asks once
+    /// ([`Self::limited`]).
+    limited: bool,
     /// The profile's name: the count of a later document's profile of
     /// this name takes over this one's entries.
     pub(crate) profile: String,
 }
 
 impl DispatchCredit {
-    pub(crate) fn new(profile: &str, ttl_ms: Option<u32>) -> Self {
+    pub(crate) fn new(profile: &str, settings: SentSettings) -> Self {
+        let micros = |ms: u32| u64::from(ms) * 1000;
         Self {
             credits: Credits::default(),
-            ttl_micros: ttl_ms.map_or(u64::MAX, |ms| u64::from(ms) * 1000),
+            ttl_micros: settings.ttl_ms.map_or(u64::MAX, micros),
+            report_delay_micros: settings.report_delay_ms.map_or(0, micros),
+            limited: settings.ttl_ms.is_some() || settings.report_delay_ms.is_some(),
             profile: profile.to_owned(),
         }
     }
@@ -111,11 +135,13 @@ impl DispatchCredit {
         self.credits.membership(change, |_| {});
     }
 
-    /// Whether the profile sets a time limit on its sends. A pass over a
-    /// count with none compares no cutoff.
+    /// Whether the profile sets a time limit or a report delay on its
+    /// sends. The pass a stage's row loop makes over a count with neither
+    /// ([`Self::reads_unlimited`]) compares no cutoff and takes no delay
+    /// off a sample.
     #[inline(always)]
     pub(crate) fn limited(&self) -> bool {
-        self.ttl_micros != u64::MAX
+        self.limited
     }
 
     /// One row's sends.
@@ -130,19 +156,19 @@ impl DispatchCredit {
         DispatchCreditPass {
             tally: self.credits.tally.load(),
             cutoff: facts.now_micros.saturating_sub(self.ttl_micros),
+            delay: self.report_delay_micros,
             credit: PhantomData,
         }
     }
 
-    /// [`Self::pass`] for a count that sets no time limit
-    /// ([`Self::limited`]): the pass has no cutoff, and none is worked
-    /// out.
+    /// [`Self::pass`] for a count that sets no time limit and no report
+    /// delay ([`Self::limited`]): the pass holds the tally map alone, and
+    /// neither a cutoff nor a delay is worked out or kept.
     #[inline(always)]
-    pub(crate) fn reads_unlimited(&self) -> DispatchCreditPass<'_> {
-        debug_assert!(!self.limited(), "the count sets no time limit");
-        DispatchCreditPass {
+    pub(crate) fn reads_unlimited(&self) -> UnlimitedPass<'_> {
+        debug_assert!(!self.limited(), "the count sets no limit and no delay");
+        UnlimitedPass {
             tally: self.credits.tally.load(),
-            cutoff: 0,
             credit: PhantomData,
         }
     }
@@ -154,10 +180,23 @@ type Tally = FxHashMap<(WorkerId, u16), Arc<RankCredit>>;
 pub struct DispatchCreditPass<'a> {
     tally: Guard<Arc<Tally>>,
     cutoff: u64,
+    /// The count's report delay, zero where its profile sets none.
+    delay: u64,
     credit: PhantomData<&'a DispatchCredit>,
 }
 
 impl DispatchCreditPass<'_> {
+    /// The instant a row's read releases through, where the row's report
+    /// was sampled at `sample`: the sample less the count's report delay,
+    /// or the time cutoff where that is later. The one place the delay is
+    /// applied, so every reader of the count follows it. A sample sooner
+    /// than the delay behind the clock's start releases through instant
+    /// zero, as a row without a report does.
+    #[inline(always)]
+    fn through(&self, sample: u64) -> u64 {
+        sample.saturating_sub(self.delay).max(self.cutoff)
+    }
+
     /// Whether the count holds an entry of any row. A row enters at its
     /// first send and leaves with its removal, so a count that holds none
     /// reads zero of every row: a pass that only sums its reads skips
@@ -167,8 +206,9 @@ impl DispatchCreditPass<'_> {
         !self.tally.is_empty()
     }
 
-    /// The sends since the later of the row's sample and the time cutoff.
-    /// A row without a report has a sample instant of zero.
+    /// The sends since the later of the row's sample, less the count's
+    /// report delay, and the time cutoff. A row without a report has a
+    /// sample instant of zero.
     ///
     /// Inlined into its caller's row loop, so the three numbers come back
     /// in no memory. Where the row holds sends it loads three words, read
@@ -180,7 +220,7 @@ impl DispatchCreditPass<'_> {
             .get(&(row.id, row.dp_rank))
             .map_or_else(CreditedDispatches::default, |since| {
                 let sample = row.load.map_or(0, |_| row.load_sampled_at_micros);
-                let sent = since.sent_through(sample.max(self.cutoff));
+                let sent = since.sent_through(self.through(sample));
                 // The count of sends of no stated size is read apart from
                 // the other two: beside a send that lands between the
                 // reads it is held to the sends counted.
@@ -202,34 +242,59 @@ impl DispatchCreditPass<'_> {
             .get(&(row.id, row.dp_rank))
             .map_or_else(DispatchCounts::default, |since| {
                 let sample = row.load.map_or(0, |_| row.load_sampled_at_micros);
-                since.credit_through(sample.max(self.cutoff)).counts()
+                since.credit_through(self.through(sample)).counts()
             })
     }
+}
 
-    /// [`Self::of`] for a row that holds a report, in a stage's row loop.
-    /// `TIMED` is whether the count sets a time limit
-    /// ([`DispatchCredit::limited`]), settled once a pass: a pass over a count
-    /// with none compares no cutoff. The count of sends of no stated size
-    /// is as its word stands: beside a send that lands between the reads
-    /// it may differ by that send.
+/// A pass over a count that sets no time limit and no report delay
+/// ([`DispatchCredit::reads_unlimited`]). A row's report alone ends its
+/// sends there, so the pass keeps the tally map and nothing else: a profile
+/// that sets neither setting stores no cutoff and no delay.
+pub(crate) struct UnlimitedPass<'a> {
+    tally: Guard<Arc<Tally>>,
+    credit: PhantomData<&'a DispatchCredit>,
+}
+
+/// [`DispatchCreditPass::of`] for a row that holds a report, in a stage's
+/// row loop. Each of a count's two passes answers it by its own rule, and
+/// which pass reads is settled once a pass ([`DispatchCredit::limited`]):
+/// the pass of a count with no time limit and no report delay compares no
+/// cutoff and takes no delay off a sample. The count of sends of no stated
+/// size is as its word stands: beside a send that lands between the reads
+/// it may differ by that send.
+pub(crate) trait ReportedSends {
+    fn reported(&self, row: &Candidate) -> CreditedDispatches;
+}
+
+impl ReportedSends for DispatchCreditPass<'_> {
     #[inline(always)]
-    pub(crate) fn reported<const TIMED: bool>(&self, row: &Candidate) -> CreditedDispatches {
-        debug_assert!(row.load.is_some(), "the row holds a report");
-        debug_assert!(
-            TIMED || self.cutoff == 0,
-            "a count with no limit has no cutoff"
-        );
-        self.tally
-            .get(&(row.id, row.dp_rank))
-            .map_or_else(CreditedDispatches::default, |since| {
-                let sample = row.load_sampled_at_micros;
-                since.sent_through(if TIMED {
-                    sample.max(self.cutoff)
-                } else {
-                    sample
-                })
-            })
+    fn reported(&self, row: &Candidate) -> CreditedDispatches {
+        reported_through(&self.tally, row, |sample| self.through(sample))
     }
+}
+
+impl ReportedSends for UnlimitedPass<'_> {
+    #[inline(always)]
+    fn reported(&self, row: &Candidate) -> CreditedDispatches {
+        reported_through(&self.tally, row, |sample| sample)
+    }
+}
+
+/// The sends of a row that holds a report, released through the instant
+/// `through` makes of the report's sample.
+#[inline(always)]
+fn reported_through(
+    tally: &Tally,
+    row: &Candidate,
+    through: impl FnOnce(u64) -> u64,
+) -> CreditedDispatches {
+    debug_assert!(row.load.is_some(), "the row holds a report");
+    tally
+        .get(&(row.id, row.dp_rank))
+        .map_or_else(CreditedDispatches::default, |since| {
+            since.sent_through(through(row.load_sampled_at_micros))
+        })
 }
 
 #[cfg(test)]

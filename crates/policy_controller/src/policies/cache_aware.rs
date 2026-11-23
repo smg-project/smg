@@ -77,6 +77,7 @@ pub(crate) fn profile() -> ProfileSpec {
         // rows the host names: its holders and its warming rows.
         pick: PickStage::Best(BestParams { sample: 16 }).into(),
         sent_ttl_ms: None,
+        sent_report_delay_ms: None,
     }
 }
 

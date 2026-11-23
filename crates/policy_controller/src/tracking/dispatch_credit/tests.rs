@@ -96,12 +96,34 @@ fn document(limit: Option<u32>) -> PolicySpec {
 }
 
 fn built(limit: Option<u32>) -> (Engine, Arc<DispatchCredit>) {
+    counting(document(limit))
+}
+
+/// The engine of `document` over the catalog with the registered reader,
+/// and the count that reader was handed.
+fn counting(document: PolicySpec) -> (Engine, Arc<DispatchCredit>) {
     let (catalog, readers) = catalog();
-    let engine = document(limit)
+    let engine = document
         .validate_in(&catalog, &[])
         .expect("the profile validates");
     let sent = Arc::clone(&readers.lock()[0]);
     (engine, sent)
+}
+
+/// The report delay most cases set: five milliseconds, as a profile
+/// writes it and as the count's clock reads it.
+const REPORT_DELAY_MS: u32 = 5;
+const REPORT_DELAY: u64 = 5_000;
+
+/// [`document`] with a report delay of `delay` milliseconds on its profile.
+fn delayed(limit: Option<u32>, delay: u32) -> PolicySpec {
+    let mut document = document(limit);
+    document
+        .profiles
+        .get_mut(POOL)
+        .expect("the profile")
+        .sent_report_delay_ms = Some(delay);
+    document
 }
 
 fn row(id: u64, dp_rank: u16) -> Candidate {
@@ -286,6 +308,97 @@ fn the_limit_ends_sends_at_its_cutoff_and_earlier() {
         sent.read(&clock(at + 17_001), &a),
         CreditedDispatches::default()
     );
+}
+
+#[test]
+fn a_report_sampled_sooner_than_the_delay_behind_a_send_leaves_it_counted() {
+    let (engine, sent) = counting(delayed(None, REPORT_DELAY_MS));
+    // One row is read whole and the other by its two numbers.
+    let mut rows = [row(211, 3), row(223, 3)];
+    for row in &mut rows {
+        send(&engine, row, START, TOKENS);
+        row.load = Some(LoadRow::default());
+    }
+    let sent_at = START + u64::from(DELAY);
+    let facts = clock(sent_at + 9_000);
+    // Three milliseconds behind the send, a microsecond short of the
+    // delay, and the delay itself.
+    for (behind, counted) in [(3_000, 1), (REPORT_DELAY - 1, 1), (REPORT_DELAY, 0)] {
+        for row in &mut rows {
+            row.load_sampled_at_micros = sent_at + behind;
+        }
+        assert_eq!(sent.read(&facts, &rows[0]).requests, counted, "{behind}");
+        let numbers = sent.pass(&facts).counts(&rows[1]);
+        assert_eq!(numbers.requests, counted, "{behind}");
+    }
+}
+
+#[test]
+fn a_delayed_report_ends_the_sends_its_delay_reaches_and_keeps_the_newer() {
+    let (engine, sent) = counting(delayed(None, REPORT_DELAY_MS));
+    let mut a = row(227, 3);
+    send(&engine, &a, START, 281);
+    send(&engine, &a, START + 4_000, TOKENS);
+    // Six milliseconds behind the first send and two behind the second.
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = START + u64::from(DELAY) + 6_000;
+    assert_eq!(sent.read(&clock(0), &a), one(TOKENS));
+}
+
+#[test]
+fn a_sample_earlier_on_the_clock_than_the_delay_ends_no_send() {
+    let (engine, sent) = counting(delayed(None, REPORT_DELAY_MS));
+    let mut a = row(229, 3);
+    send(&engine, &a, 0, TOKENS);
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = REPORT_DELAY - 2_000;
+    assert_eq!(sent.read(&clock(0), &a), one(TOKENS));
+}
+
+#[test]
+fn the_limit_ends_a_send_whose_report_is_too_soon_for_the_delay() {
+    let (engine, sent) = counting(delayed(Some(2), REPORT_DELAY_MS));
+    let mut a = row(233, 3);
+    send(&engine, &a, START, TOKENS);
+    let sent_at = START + u64::from(DELAY);
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = sent_at + 1_000;
+    assert_eq!(sent.read(&clock(sent_at + 1_999), &a), one(TOKENS));
+    assert_eq!(
+        sent.read(&clock(sent_at + 2_000), &a),
+        CreditedDispatches::default()
+    );
+}
+
+#[test]
+fn a_read_under_the_shorter_of_two_documents_delays_ends_a_send_for_both() {
+    let (standing, long) = counting(delayed(None, 9));
+    let mut a = row(239, 3);
+    send(&standing, &a, START, TOKENS);
+    let (next, short) = counting(delayed(None, REPORT_DELAY_MS));
+    next.succeed(&standing);
+    // Six milliseconds behind the send: under the delay of nine and past
+    // the delay of five.
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = START + u64::from(DELAY) + 6_000;
+    let facts = clock(0);
+    assert_eq!(long.read(&facts, &a), one(TOKENS));
+    assert_eq!(short.read(&facts, &a), CreditedDispatches::default());
+    assert_eq!(long.read(&facts, &a), CreditedDispatches::default());
+}
+
+#[test]
+fn a_delay_longer_than_a_u32_of_microseconds_holds_to_its_end() {
+    // 705 microseconds past the most a `u32` of microseconds holds.
+    const LONG_MS: u32 = 4_294_968;
+    let (engine, sent) = counting(delayed(None, LONG_MS));
+    let mut a = row(241, 3);
+    send(&engine, &a, START, TOKENS);
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = START + u64::from(DELAY) + u64::from(LONG_MS) * 1000 - 1;
+    assert_eq!(sent.read(&clock(0), &a), one(TOKENS));
+    a.load_sampled_at_micros += 1;
+    assert_eq!(sent.read(&clock(0), &a), CreditedDispatches::default());
 }
 
 #[test]
@@ -891,6 +1004,62 @@ fn the_profiles_limit_ends_least_loads_credit() {
     assert_eq!(sent_to, other);
 }
 
+/// [`load_engine`] under the report delay and the time limit `limit`.
+fn delayed_load_engine(limit: Option<u32>) -> Engine {
+    let mut document = load_document(POOL, limit, false);
+    document
+        .profiles
+        .get_mut(POOL)
+        .expect("the profile")
+        .sent_report_delay_ms = Some(REPORT_DELAY_MS);
+    document.validate().expect("the profile validates")
+}
+
+/// [`reporting`]'s rows, their reports sampled `behind` microseconds after
+/// the send [`send`] makes of a lease issued at [`START`].
+fn sampled(behind: u64) -> [Candidate; 2] {
+    reporting().map(|row| Candidate {
+        load_sampled_at_micros: START + u64::from(DELAY) + behind,
+        ..row
+    })
+}
+
+#[test]
+fn the_profiles_report_delay_keeps_least_loads_credit_past_a_report_sampled_sooner() {
+    let delayed = delayed_load_engine(None);
+    let plain = load_engine(POOL, None);
+    let rows = reporting();
+    for engine in [&delayed, &plain] {
+        send(engine, &rows[0], START, TOKENS);
+    }
+    let now = START + u64::from(DELAY) + 9_000;
+    // A report three milliseconds behind the send reflects it where the
+    // profile sets no delay, and leaves the credit under a delay of five.
+    let [sent_to, other] = scores(&plain, &sampled(3_000), now);
+    assert_eq!(sent_to, other);
+    let [sent_to, other] = scores(&delayed, &sampled(3_000), now);
+    assert!(sent_to < other, "{sent_to} against {other}");
+    // A report five behind it ends the credit.
+    let [sent_to, other] = scores(&delayed, &sampled(REPORT_DELAY), now);
+    assert_eq!(sent_to, other);
+}
+
+#[test]
+fn least_load_under_a_limit_and_a_delay_follows_both() {
+    let engine = delayed_load_engine(Some(20));
+    send(&engine, &reporting()[0], START, TOKENS);
+    let sent_at = START + u64::from(DELAY);
+    // A report three milliseconds behind the send: the delay keeps the
+    // credit.
+    let [sent_to, other] = scores(&engine, &sampled(3_000), sent_at + 4_000);
+    assert!(sent_to < other, "{sent_to} against {other}");
+    // The limit ends it at twenty, under the same report.
+    let [sent_to, other] = scores(&engine, &sampled(3_000), sent_at + 19_999);
+    assert!(sent_to < other, "{sent_to} against {other}");
+    let [sent_to, other] = scores(&engine, &sampled(3_000), sent_at + 20_000);
+    assert_eq!(sent_to, other);
+}
+
 #[test]
 fn a_new_documents_least_load_keeps_the_sends_of_the_standing_one() {
     let standing = load_engine(POOL, None);
@@ -971,6 +1140,37 @@ fn a_limit_without_a_reader_is_refused_at_the_profiles_field() {
 }
 
 #[test]
+fn a_zero_report_delay_is_refused_at_the_profiles_field() {
+    let (catalog, _) = catalog();
+    assert_eq!(
+        delayed(None, 0).validate_in(&catalog, &[]).err(),
+        Some(SpecError::BadField {
+            path: "profiles.work.sent_report_delay_ms".into(),
+            value: "0".into(),
+            reason: "above zero",
+        })
+    );
+}
+
+#[test]
+fn a_report_delay_without_a_reader_is_refused_at_the_profiles_field() {
+    let mut document = PolicySpec::preset("random").expect("a preset");
+    document
+        .profiles
+        .get_mut("random")
+        .expect("the profile")
+        .sent_report_delay_ms = Some(71);
+    assert_eq!(
+        document.validate().err(),
+        Some(SpecError::BadField {
+            path: "profiles.random.sent_report_delay_ms".into(),
+            value: "71".into(),
+            reason: "a delay any stage of this profile reads",
+        })
+    );
+}
+
+#[test]
 fn a_document_with_no_reader_keeps_no_send_tallies() {
     let engine = PolicySpec::preset("random")
         .expect("a preset")
@@ -995,6 +1195,35 @@ fn an_unset_limit_leaves_a_documents_canonical_form_and_digest_intact() {
         document.digest().expect("a digest").to_string(),
         "sha256:5d615ed114ca79046283cd72596dd3428baa2ec110170a5bb72ea4bc525b1ade"
     );
+}
+
+#[test]
+fn a_written_report_delay_stands_in_a_documents_canonical_form() {
+    let canonical = format!(
+        r#"{{"apiVersion":"{API_VERSION}","generation":0,"profiles":{{"work":{{"filter":["healthy"],"score":["least-load"],"pick":"best","sent_report_delay_ms":5}}}},"bindings":[]}}"#
+    );
+    let document: PolicySpec = serde_json::from_str(&canonical).expect("a document");
+    assert_eq!(
+        serde_json::to_string(&document).expect("the form"),
+        canonical
+    );
+    let profile = document.profiles.get(POOL).expect("the profile");
+    assert_eq!(profile.sent_report_delay_ms, Some(5));
+}
+
+/// Holds `sent` to a report delay of nine milliseconds, over the two
+/// sends [`send`] made `row` at [`START`]: the count a stage's factory was
+/// handed is under its profile's delay, whichever kind of stage asked.
+fn held_to_a_delay_of_nine(sent: &DispatchCredit, row: &Candidate) {
+    let sent_at = START + u64::from(DELAY);
+    let reported = |behind: u64| Candidate {
+        load: Some(LoadRow::default()),
+        load_sampled_at_micros: sent_at + behind,
+        ..*row
+    };
+    let facts = clock(sent_at + 9_700);
+    assert_eq!(sent.read(&facts, &reported(8_999)).requests, 2);
+    assert_eq!(sent.read(&facts, &reported(9_000)).requests, 0);
 }
 
 /// Keeps the rows its profile sent fewer than `most` requests.
@@ -1045,6 +1274,7 @@ fn a_registered_filter_reads_the_sends_of_its_profile() {
         "profiles": {
             "work": {
                 "sent_ttl_ms": 24_001,
+                "sent_report_delay_ms": 9,
                 "filter": [{ "sent-under": { "requests": 2 } }],
                 "pick": "random"
             }
@@ -1075,6 +1305,7 @@ fn a_registered_filter_reads_the_sends_of_its_profile() {
             ..CreditedDispatches::default()
         }
     );
+    held_to_a_delay_of_nine(&readers.lock()[0], &a);
 }
 
 /// Picks the kept row its profile sent the fewest requests, the first of
@@ -1129,6 +1360,7 @@ fn a_registered_picker_reads_the_sends_of_its_profile() {
         "profiles": {
             "work": {
                 "sent_ttl_ms": 24_001,
+                "sent_report_delay_ms": 9,
                 "filter": ["healthy"],
                 "score": ["least-requests"],
                 "pick": "least-sent"
@@ -1153,6 +1385,7 @@ fn a_registered_picker_reads_the_sends_of_its_profile() {
             ..CreditedDispatches::default()
         }
     );
+    held_to_a_delay_of_nine(&readers.lock()[0], &a);
 }
 
 /// A send told through a decision's handle, over the engine that decides

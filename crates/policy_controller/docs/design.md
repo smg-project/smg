@@ -167,6 +167,7 @@ pub struct ProfileSpec {
     pub score: Vec<ScoreSpec>,    // the scorers, each with a weight
     pub pick: PickSpec,           // exactly one picker
     pub sent_ttl_ms: Option<u32>, // how long a dispatched request counts in the profile's records
+    pub sent_report_delay_ms: Option<u32>, // how long behind a dispatch a load report ends its count
 }
 
 pub struct BindingSpec {
