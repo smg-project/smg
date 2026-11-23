@@ -11,13 +11,23 @@
 //! A host that serves requests itself counts each by its load guard and
 //! files no lease for it: a lease filed for a request a guard counts is
 //! counted twice on the object.
+//!
+//! The object's count of one session key's requests moves the same way.
+//! A guard counts a request under its key's text. A lease carries its
+//! session as a number, so the store's step counts it under that number
+//! written as text. One object stands in one process, which counts by
+//! guards or by leases: the two texts never meet on it.
 
 use std::sync::Arc;
 
 use smg_worker::{identity::basic::Worker, registry::Generation};
 
 use super::Objects;
-use crate::{engine::view::WorkerId, store::WorkersStore, tracking::HostCount};
+use crate::{
+    engine::view::{Session, WorkerId},
+    store::WorkersStore,
+    tracking::HostCount,
+};
 
 /// The count of the object laid for a row: the object itself.
 ///
@@ -35,6 +45,20 @@ impl HostCount for ObjectCount {
 
     fn freed(&self) {
         self.0.decrement_load();
+    }
+
+    /// The object counts a key's requests under a text. A lease names its
+    /// session by a number, so the count stands under that number as
+    /// [`Session::text`] writes it, the text the engine's reader asks
+    /// under for a request whose held decisions count it.
+    fn session_booked(&self, session: Session) {
+        let mut text = [0; Session::TEXT_LEN];
+        self.0.increment_routing_key_load(session.text(&mut text));
+    }
+
+    fn session_freed(&self, session: Session) {
+        let mut text = [0; Session::TEXT_LEN];
+        self.0.decrement_routing_key_load(session.text(&mut text));
     }
 }
 
@@ -65,6 +89,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        engine::view::{Identity, RequestFacts, SessionCountedUnder},
         store::{
             GatewayId, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord, Registrant,
             WorkerFacts, WorkerPatch,
@@ -141,10 +166,17 @@ mod tests {
 
         /// File a single's lease under `id` that books `target`.
         fn file(&self, id: u64, target: WorkerId) {
+            self.file_of(id, target, Session::NONE);
+        }
+
+        /// File a single's lease of `session` under `id` that books
+        /// `target`.
+        fn file_of(&self, id: u64, target: WorkerId, session: Session) {
             let now = Instant::now();
             let record = LeaseRecord {
                 lease: Lease {
                     id: LeaseId(id),
+                    session,
                     ..Lease::default()
                 },
                 gateway: GATEWAY,
@@ -212,6 +244,127 @@ mod tests {
         replica.end(2);
         replica.end(3);
         assert_eq!(loads(), (0, 0));
+    }
+
+    /// The two sessions of the keyed cases.
+    const ONE: Session = Session::from_raw(0x1f);
+    const TWO: Session = Session::from_raw(u64::MAX);
+
+    /// What `object` counts of the two sessions' requests, each under its
+    /// number as text, and how many keys it counts requests of.
+    fn keyed(object: &Arc<dyn Worker>) -> (usize, usize, usize) {
+        let (mut one, mut two) = ([0; Session::TEXT_LEN], [0; Session::TEXT_LEN]);
+        (
+            object.routing_key_inflight(ONE.text(&mut one)),
+            object.routing_key_inflight(TWO.text(&mut two)),
+            object.routing_key_load(),
+        )
+    }
+
+    /// A lease that names a session counts on its worker's object under
+    /// the session's number as text, from its filing to its end: the count
+    /// a capped sessions rule reads there. A lease with no session counts
+    /// under no key.
+    #[test]
+    fn a_keyed_lease_counts_on_its_workers_object_under_its_sessions_text() {
+        let replica = Replica::new();
+        let (a, b) = (replica.write(A), replica.write(B));
+        let (at_a, at_b) = (replica.at(A), replica.at(B));
+        replica.file_of(1, a, ONE);
+        replica.file_of(2, a, ONE);
+        replica.file_of(3, a, TWO);
+        replica.file_of(4, b, ONE);
+        replica.file(5, a);
+        assert_eq!((keyed(&at_a), keyed(&at_b)), ((2, 1, 2), (1, 0, 1)));
+        assert_eq!((at_a.load(), at_b.load()), (4, 1));
+        replica.end(1);
+        replica.end(3);
+        assert_eq!(
+            keyed(&at_a),
+            (1, 0, 1),
+            "a key leaves with its last request"
+        );
+        for id in [2, 4, 5] {
+            replica.end(id);
+        }
+        assert_eq!((keyed(&at_a), keyed(&at_b)), ((0, 0, 0), (0, 0, 0)));
+    }
+
+    /// The sessions of the leases that stand follow their row's object: a
+    /// lease filed ahead of the object is on it once it is laid, and an
+    /// object laid in its place reads the same sessions, whose ends are
+    /// taken off it.
+    #[test]
+    fn the_sessions_that_stand_follow_their_rows_object() {
+        let replica = Replica::new();
+        let a = replica.row(A, 1);
+        replica.file_of(1, a, ONE);
+        replica.file_of(2, a, ONE);
+        replica.file_of(3, a, TWO);
+        replica.follow();
+        let before = replica.at(A);
+        assert_eq!(keyed(&before), (2, 1, 2), "the leases that stood");
+
+        // The row's facts move: the holder builds another object for it.
+        replica.relabel(A);
+        replica.follow();
+        let after = replica.at(A);
+        assert!(!Arc::ptr_eq(&before, &after), "another object");
+        assert_eq!(keyed(&after), (2, 1, 2), "the sessions that stand");
+        replica.end(1);
+        replica.end(3);
+        assert_eq!(keyed(&after), (1, 0, 1));
+        replica.end(2);
+        assert_eq!((keyed(&after), keyed(&before)), ((0, 0, 0), (0, 0, 0)));
+    }
+
+    /// A row that leaves takes the sessions of the leases that book it off
+    /// its object: their ends step nothing.
+    #[test]
+    fn a_row_that_leaves_takes_its_sessions_off_its_object() {
+        let replica = Replica::new();
+        let a = replica.write(A);
+        let object = replica.at(A);
+        replica.file_of(1, a, ONE);
+        replica.file_of(2, a, TWO);
+        assert_eq!(keyed(&object), (1, 1, 2));
+        let row = replica.store.by_key(A).expect("a row");
+        assert!(replica.store.remove(row.id, row.revision).is_some());
+        assert_eq!(keyed(&object), (0, 0, 0), "at the store's write");
+        replica.end(1);
+        replica.end(2);
+        assert_eq!(keyed(&object), (0, 0, 0));
+    }
+
+    /// What moves a lease's count onto its worker's object and what reads
+    /// a record's count write one text. A lease of a request's session is
+    /// read under the name the request's facts make for a count that
+    /// stands under the session's number, with the key in either form. The
+    /// key's own text names no count of a lease.
+    #[test]
+    fn a_leases_session_is_read_under_the_name_its_requests_facts_make() {
+        let replica = Replica::new();
+        let a = replica.write(A);
+        let object = replica.at(A);
+        let plain = RequestFacts {
+            model: "model-a",
+            session_key: Identity::plain("conversation-7"),
+            ..RequestFacts::default()
+        };
+        let hashed = RequestFacts {
+            session_key: Identity::hashed(plain.session_key.hash),
+            ..plain
+        };
+        replica.file_of(1, a, plain.session());
+        for facts in [plain, hashed] {
+            let mut name = [0; Session::TEXT_LEN];
+            let name = SessionCountedUnder::SessionNumber.name(&facts, &mut name);
+            let read = name.map(|name| object.routing_key_inflight(name));
+            assert_eq!(read, Some(1));
+        }
+        assert_eq!(object.routing_key_inflight("conversation-7"), 0);
+        replica.end(1);
+        assert_eq!(object.routing_key_load(), 0);
     }
 
     /// A lease filed between a row's write and its object's lay is on the

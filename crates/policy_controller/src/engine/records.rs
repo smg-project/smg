@@ -200,8 +200,9 @@ pub struct Live<'a> {
     clock: &'a DecisionClock,
     now_micros: u64,
     loads: Option<&'a Arc<LoadSnapshot>>,
-    /// The request's session key, where a stage of the document reads a
-    /// worker's count of the key's requests in flight.
+    /// The name the request's session key is counted under on a worker's
+    /// object, where a stage of the document reads a worker's count of the
+    /// key's requests in flight.
     counted_key: Option<&'a str>,
     /// Whether a stage of the document reads a worker's count of session
     /// keys with a request in flight.
@@ -215,7 +216,9 @@ impl<'a> Live<'a> {
     /// The reads of one decision at `now` on `clock`, under `engine`'s
     /// document: the workers' reports from `loads`, the load monitor's
     /// snapshot as the caller holds it for the decision, and `session_key`,
-    /// the text of the request's session key where it carries one.
+    /// the name the request's session key is counted under on a worker's
+    /// object where it has one
+    /// ([`SessionCountedUnder::name`](super::view::SessionCountedUnder::name)).
     ///
     /// The two counts of sessions a worker object keeps are read only for a
     /// document one of whose stages reads them ([`Engine::needs`]): the

@@ -27,7 +27,7 @@ use crate::{
         framework::{DecisionScope, Filter, Picker, TieBand},
         view::{
             AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Phase, PoolFacts,
-            RequestFacts, Role, WireModes, WorkerId,
+            RequestFacts, Role, Session, WireModes, WorkerId,
         },
     },
     policies::random::Random,
@@ -116,10 +116,16 @@ fn keyed(mut frame: proto::DecideRequest, key: u64) -> proto::DecideRequest {
 
 /// Files one issued lease of [`GATEWAY`] on `target`, under `id`.
 fn file(store: &MemoryStore, id: u64, target: WorkerId, now: Instant) {
+    file_of(store, id, target, Session::NONE, now);
+}
+
+/// [`file`] for a lease of `session`, which counts for its key.
+fn file_of(store: &MemoryStore, id: u64, target: WorkerId, session: Session, now: Instant) {
     let leases: &dyn LeasesStore = store;
     let filed = leases.issue(LeaseRecord {
         lease: Lease {
             id: LeaseId(1 << 63 | id),
+            session,
             ..Lease::default()
         },
         gateway: GATEWAY,
@@ -197,12 +203,15 @@ fn a_served_decision_whose_stages_refuse_by_no_report_applies_nothing_at_the_oth
     );
 }
 
-/// A key under a sessions rule with an in-flight cap leaves an owner over
-/// its thresholds in a decision this service makes. A frame states no
-/// count of the key's requests, so the cap could not hand the key on: the
-/// veto stands for the key, and it goes to another worker.
+/// A key under a sessions rule with an in-flight cap keeps an owner over
+/// its thresholds in a decision this service makes, as under a host that
+/// counts its requests. The leases this service holds count the key's
+/// requests on each worker, and the request its maker makes says so: the
+/// cap can hand the key on, so the veto is lifted for the key. With the
+/// cap's two requests of the key on file on its owner, the key goes to
+/// another worker.
 #[test]
-fn a_served_key_under_a_capped_rule_leaves_an_owner_over_its_thresholds() {
+fn a_served_key_under_a_capped_rule_keeps_an_owner_over_its_thresholds_below_its_cap() {
     let mut document = PolicySpec::preset("consistent_hashing").expect("a preset of this build");
     let manual = PolicySpec::preset("manual").expect("a preset of this build");
     let rule = manual.bindings.first();
@@ -242,11 +251,19 @@ fn a_served_key_under_a_capped_rule_leaves_an_owner_over_its_thresholds() {
     let object = objects.registry().get_by_url(&url).expect("its object");
     object.set_overloaded(true);
     assert!(object.is_overloaded(), "the owner reads overloaded");
-    let next = decided(3).expect("a pick beside two workers under their thresholds");
-    assert_ne!(
-        next, owner,
-        "the cap's count is not stated, so the veto stands for the key"
+    assert_eq!(
+        decided(3),
+        Some(owner),
+        "the cap's count stands, so the key keeps its owner"
     );
+    // The cap's two requests of the key on file on its owner: the frame's
+    // session is the number its key hashes to.
+    LeasesStore::set_term(&*store, 1);
+    for id in 1..=2 {
+        file_of(&store, id, owner, Session::from_raw(17), now);
+    }
+    let next = decided(4).expect("a pick beside two workers under their thresholds");
+    assert_ne!(next, owner, "the key's owner is at its cap");
 }
 
 /// The requests in flight a decision read of each candidate, by worker.

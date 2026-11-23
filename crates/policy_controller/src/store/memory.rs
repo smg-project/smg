@@ -3461,11 +3461,24 @@ fn state_after_deadline(state: LeaseState) -> LeaseState {
 }
 
 /// Moves a side's booking to the slot `to`: the count it booked is free
-/// and `to`'s is booked.
-fn rebook(counts: &InFlightCounts, booked: &mut Option<WorkerSlot>, to: Option<WorkerSlot>) {
+/// and `to`'s is booked, and with them the count of `session` on each,
+/// where the side counts for its key.
+fn rebook(
+    counts: &InFlightCounts,
+    booked: &mut Option<WorkerSlot>,
+    to: Option<WorkerSlot>,
+    session: Session,
+) {
     let first = *booked;
     *booked = to;
-    counts.moved(first, to);
+    counts.moved(first, to, session);
+}
+
+/// The session a part's booking counts for on its worker's count
+/// ([`InFlightCounts::book`]): its key's where the part counts for its
+/// key ([`keyed`], [`keyed_decode`]), and none where it does not.
+fn session_of(counted: Option<(Session, WorkerId)>) -> Session {
+    counted.map_or(Session::NONE, |(session, _)| session)
 }
 
 /// The session and the worker `record`'s own part books of its key's
@@ -3560,10 +3573,11 @@ impl Leases {
     /// the key's ([`keyed`]), and its dispatch deadline is queued where it
     /// is filed as issued.
     fn laid(&mut self, key: Key, record: &LeaseRecord, booked: Option<WorkerSlot>, counts: bool) {
+        let counted = keyed(counts, record);
         if let Some(booked) = booked {
-            self.counts.book(booked);
+            self.counts.book(booked, session_of(counted));
         }
-        if let Some((session, worker)) = keyed(counts, record) {
+        if let Some((session, worker)) = counted {
             self.sessions.book(session, worker);
         }
         if record.state.is_issued() {
@@ -3578,10 +3592,11 @@ impl Leases {
     /// it where the record's own filing queued none: a lease takes one
     /// place of the queue.
     fn decode_laid(&mut self, key: Key, record: &LeaseRecord, decode: &FiledDecode, counts: bool) {
+        let counted = keyed_decode(counts, &decode.side);
         if let Some(booked) = decode.booked {
-            self.counts.book(booked);
+            self.counts.book(booked, session_of(counted));
         }
-        if let Some((session, worker)) = keyed_decode(counts, &decode.side) {
+        if let Some((session, worker)) = counted {
             self.sessions.book(session, worker);
         }
         if decode.side.state.is_issued() && !record.state.is_issued() {
@@ -3637,7 +3652,7 @@ impl Leases {
         held.record.dispatch_deadline = deadline;
         let ended = !held.record.state.is_live() && !decode.side.state.is_live();
         if let Some(booked) = decode.booked.take() {
-            self.counts.free(booked);
+            self.counts.free(booked, session_of(side_key));
         }
         if let Some((session, worker)) = side_key {
             self.sessions.free(session, worker);
@@ -3735,10 +3750,11 @@ impl Leases {
         key: &Key,
         shape: impl FnOnce(Held, Option<DecodeSide>) -> T,
     ) -> T {
+        let counted = keyed(held.keyed, &held.record);
         if let Some(booked) = held.booked {
-            self.counts.free(booked);
+            self.counts.free(booked, session_of(counted));
         }
-        if let Some((session, worker)) = keyed(held.keyed, &held.record) {
+        if let Some((session, worker)) = counted {
             self.sessions.free(session, worker);
         }
         let decode = if held.record.decode.is_some() {
@@ -3756,10 +3772,11 @@ impl Leases {
     #[inline(never)]
     fn unpaired(&mut self, at: u32, key: &Key, counts: bool) -> Option<DecodeSide> {
         let decode = self.decodes.take(at, key)?;
+        let counted = keyed_decode(counts, &decode.side);
         if let Some(booked) = decode.booked {
-            self.counts.free(booked);
+            self.counts.free(booked, session_of(counted));
         }
-        if let Some((session, worker)) = keyed_decode(counts, &decode.side) {
+        if let Some((session, worker)) = counted {
             self.sessions.free(session, worker);
         }
         Some(decode.side)
@@ -3841,9 +3858,13 @@ impl Leases {
         if target != held.record.target {
             let first = held.booked;
             held.booked = slots.of(target);
-            self.counts.moved(first, held.booked);
+            let session = if held.keyed {
+                held.record.lease.session
+            } else {
+                Session::NONE
+            };
+            self.counts.moved(first, held.booked, session);
             if held.keyed {
-                let session = held.record.lease.session;
                 self.sessions.moved(session, held.record.target, target);
             }
             held.record.target = target;
@@ -3881,7 +3902,12 @@ impl Leases {
                 if let Some((target, _)) = named {
                     if target != side.target {
                         let to = slots.of(target);
-                        rebook(counts, &mut decode.booked, to);
+                        let session = if held.keyed {
+                            side.session
+                        } else {
+                            Session::NONE
+                        };
+                        rebook(counts, &mut decode.booked, to, session);
                         if held.keyed {
                             sessions.moved(side.session, side.target, target);
                         }
@@ -3898,10 +3924,11 @@ impl Leases {
                 }
                 side.state = LeaseState::Dispatched { at };
                 decode.booked = slots.of(side.target);
+                let counted = keyed_decode(held.keyed, side);
                 if let Some(booked) = decode.booked {
-                    counts.book(booked);
+                    counts.book(booked, session_of(counted));
                 }
-                if let Some((session, worker)) = keyed_decode(held.keyed, side) {
+                if let Some((session, worker)) = counted {
                     sessions.book(session, worker);
                 }
             }
@@ -3962,7 +3989,7 @@ impl Leases {
         }
         *state = ended;
         if let Some(booked) = booked.take() {
-            self.counts.free(booked);
+            self.counts.free(booked, session_of(side_key));
         }
         if let Some((session, worker)) = side_key {
             self.sessions.free(session, worker);
@@ -4223,6 +4250,29 @@ impl MemoryStore {
         let (lease, issue) = leases.issue_decode((gateway, lease), decode, booked, now)?;
         issued(&lease);
         Ok((lease, issue))
+    }
+
+    /// [`Self::issue_decided`] for a keyed decision made under a sessions
+    /// rule with an in-flight cap: the lease books one request of its key
+    /// on its worker until it leaves the file, whatever the decision did
+    /// with the key's pin, and the worker's count of the key's requests
+    /// steps with the lease's own ([`InFlightCounts::book`]). The lease of
+    /// any other decision books no key.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::issue_decided`].
+    #[cfg_attr(
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "called by the served controller alone")
+    )]
+    pub(crate) fn issue_keyed(
+        &self,
+        record: LeaseRecord,
+        booked: Option<WorkerSlot>,
+        issued: impl Fn(&crate::tracking::Lease),
+    ) -> Result<crate::tracking::Lease, LeaseRefused> {
+        self.issue_minted(record, booked, None, true, issued)
     }
 
     /// Takes back the issue that stands of the decode side of `gateway`'s

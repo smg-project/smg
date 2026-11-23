@@ -3485,20 +3485,20 @@ fn a_count_is_found_by_its_slot_in_whichever_piece_holds_it() {
     // more stands in the third.
     let slots: Vec<WorkerSlot> = (0..3_073).map(|_| counts.claim()).collect();
     for &slot in &slots {
-        counts.book(slot);
+        counts.book(slot, Session::NONE);
     }
     assert!(counts.of(&slots).all(|count| count == 1), "a cell a slot");
     for &slot in &slots {
-        counts.free(slot);
+        counts.free(slot, Session::NONE);
     }
     // Both ends of each piece, a count of its own on each.
     let marked = [0, 1, 1_023, 1_024, 3_071, 3_072];
     for (times, &at) in (1..).zip(&marked) {
         for _ in 0..times {
-            counts.book(slots[at]);
+            counts.book(slots[at], Session::NONE);
         }
     }
-    counts.book(WorkerSlot::NONE);
+    counts.book(WorkerSlot::NONE, Session::NONE);
     let ends = marked.iter().rev().map(|&at| slots[at]);
     let run: Vec<WorkerSlot> = ends.chain([WorkerSlot::NONE, slots[2]]).collect();
     assert_eq!(
@@ -3507,7 +3507,7 @@ fn a_count_is_found_by_its_slot_in_whichever_piece_holds_it() {
     );
     // A lease that leaves gives one back, and a count at zero stays there.
     for slot in [slots[1_024], slots[2], WorkerSlot::NONE] {
-        counts.free(slot);
+        counts.free(slot, Session::NONE);
     }
     let read: Vec<u32> = counts.of(&[slots[1_024], slots[2]]).collect();
     assert_eq!(read, [3, 0]);

@@ -41,7 +41,7 @@ use super::{
     decision::{Decision, Pick, ShadowKind, Survivors, Target, Targets, Trace},
     prompt_hashes::{HashSeeds, PromptHashes},
     sticky_sessions::SessionVerdict,
-    view::{Constraints, Phase, RequestFacts, Session, WireModes, WorkerId},
+    view::{Constraints, Phase, RequestFacts, Session, SessionCountedUnder, WireModes, WorkerId},
 };
 use crate::{
     document::AppliedSpec,
@@ -112,6 +112,21 @@ pub trait RequestMaker {
     /// for the same lease. It costs no pass over the text.
     fn prompt_bytes(&self) -> u32 {
         0
+    }
+
+    /// Where a worker's object counts the requests of the request's
+    /// session key ([`SessionCountedUnder`]). The trait's answer is the
+    /// key's own text, where the caller's own guard counts each request it
+    /// sends. A host that serves no request counts by the decisions it
+    /// holds on file, and answers the session's number.
+    ///
+    /// An engine that decides over its host's lists asks this for a
+    /// document with a stage that reads the count
+    /// ([`Needs::session_in_flight`](crate::document::spec::Needs::session_in_flight)),
+    /// and reads each worker's count under the name it gives
+    /// ([`SessionCountedUnder::name`]). It asks under no other document.
+    fn session_counted_under(&self) -> SessionCountedUnder {
+        SessionCountedUnder::KeyText
     }
 
     /// The workers the request may be sent to, where its host holds them:

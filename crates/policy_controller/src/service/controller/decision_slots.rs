@@ -5468,6 +5468,19 @@ pub(crate) mod tests {
         assert_eq!((counts.undialed(), counts.hashes_cut()), (whole, 3 * whole));
     }
 
+    /// The bed's frame under a session key in the clear.
+    fn keyed_in_the_clear(key: &str, seed: u64) -> proto::DecideRequest {
+        let mut frame = frame(u8::try_from(seed % 251).expect("under 251"), seed);
+        frame
+            .facts
+            .as_mut()
+            .expect("the case's frame has facts")
+            .session_key = Some(proto::Identity {
+            form: Some(proto::identity::Form::Plain(key.to_owned())),
+        });
+        frame
+    }
+
     /// The bed's frame under a session key.
     fn keyed(key: u64, seed: u64) -> proto::DecideRequest {
         let mut frame = frame(u8::try_from(seed % 251).expect("under 251"), seed);
@@ -5560,10 +5573,25 @@ pub(crate) mod tests {
     /// with an in-flight cap the request that finds the cap met on its
     /// key's worker is placed again and lands on a worker with fewer
     /// requests, and the key's next request returns once one of them
-    /// ended.
+    /// ended. The frames carry the key as its hash.
     #[tokio::test]
-    #[ignore = "a sessions rule's cap counts no request of a key through a controller yet"]
     async fn the_service_hands_a_key_on_at_its_rules_cap() {
+        handed_on_at_the_cap(|seed| keyed(1, seed)).await;
+    }
+
+    /// The same of a key in the clear, the form a gateway sends a key it
+    /// holds as text in. The lease carries the session's number alone, so
+    /// the count stands under that number whichever form the frame took.
+    #[tokio::test]
+    async fn the_service_hands_a_key_in_the_clear_on_at_its_rules_cap() {
+        handed_on_at_the_cap(|seed| keyed_in_the_clear("talk-1", seed)).await;
+    }
+
+    /// One key's four requests under a rule whose in-flight cap is two,
+    /// each made by `frame` from its seed: the first claims a worker, the
+    /// second stays, the third is placed again, and the fourth returns
+    /// behind an end.
+    async fn handed_on_at_the_cap(frame: impl Fn(u64) -> proto::DecideRequest) {
         use crate::{
             engine::sticky_sessions::SessionVerdict,
             service::controller::lifecycle::{self, tests::a_dispatched},
@@ -5585,19 +5613,19 @@ pub(crate) mod tests {
         };
         // The key's first request claims a worker, and its gateway's
         // Dispatched frame pins the key there.
-        let first = bed.ask(keyed(1, 1_001)).await;
+        let first = bed.ask(frame(1_001)).await;
         let owner = picked(&first);
         assert_eq!(verdict(&bed, &first), SessionVerdict::Claimed(owner));
         let hand = lifecycle::open(&bed.store, GATEWAY);
         lifecycle::dispatched(&bed.store, &hand, &a_dispatched(lease_of(&first).id), at)
             .expect("the frame reads");
         // One request of the key in flight: the second stays.
-        let second = bed.ask(keyed(1, 1_002)).await;
+        let second = bed.ask(frame(1_002)).await;
         assert_eq!(picked(&second), owner);
         assert_eq!(verdict(&bed, &second), SessionVerdict::Pinned);
         // Two in flight on the key's worker: the third is placed again,
         // on a worker with fewer requests.
-        let third = bed.ask(keyed(1, 1_003)).await;
+        let third = bed.ask(frame(1_003)).await;
         assert_ne!(picked(&third), owner);
         assert_eq!(verdict(&bed, &third), SessionVerdict::Respill);
         // One of the two ended: the key's next request is under the cap.
@@ -5610,8 +5638,28 @@ pub(crate) mod tests {
             None,
             gone
         ));
-        let fourth = bed.ask(keyed(1, 1_004)).await;
+        let fourth = bed.ask(frame(1_004)).await;
         assert_eq!(picked(&fourth), owner);
         assert_eq!(verdict(&bed, &fourth), SessionVerdict::Pinned);
+    }
+
+    /// The service counts a key's requests under a rule with an in-flight
+    /// cap, and under no other: the lease of a keyed request whose rule
+    /// has none counts for no key, and no worker object counts a request
+    /// of it. The stock rule's cap is disabled.
+    #[tokio::test]
+    async fn the_service_counts_a_key_under_a_rule_with_a_cap_alone() {
+        for (cap, counted) in [(None, 0), (Some(2), 1)] {
+            let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+            if let Some(cap) = cap {
+                let rule = document.bindings[0].sessions.as_mut();
+                rule.expect("the preset's rule").inflight_cap = cap;
+            }
+            let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
+            bed.ask(keyed(1, 1_001)).await;
+            let objects = bed.reads.objects.registry().get_all();
+            let keys = objects.iter().map(|object| object.routing_key_load());
+            assert_eq!(keys.sum::<usize>(), counted, "a cap of {cap:?}");
+        }
     }
 }

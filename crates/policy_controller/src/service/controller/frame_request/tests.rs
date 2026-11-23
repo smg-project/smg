@@ -24,7 +24,7 @@ use crate::{
         policy_engine::PolicyEngine,
         view::{
             fingerprint, Constraints, FixedFacts, HashKind, Header, Identity, MediaCounts,
-            ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
+            ModelFingerprint, Phase, RequestFacts, SessionCountedUnder, WireModes, WorkerId,
         },
         PairAdmission, PairLists,
     },
@@ -196,12 +196,14 @@ fn shed_of(decided: Decided) -> (ShedReason, &'static str) {
 }
 
 /// Every field of a frame reaches the request its maker makes.
-/// Three things are a controller's own and not the frame's: the
-/// budget is what is left, the wires are not stated, and the places and
-/// held-back positions are the ones the maker was handed. Of the subset
-/// hint a 0 alone is stated. The frame's whole budget and the wires its
-/// gateway states are read on the frame, where it was checked: no request
-/// states them. The frame gives its id whole for its answer.
+/// Four things are a controller's own and not the frame's: the
+/// budget is what is left, the wires are not stated, the places and
+/// held-back positions are the ones the maker was handed, and a key's
+/// requests are said counted
+/// (`a_keyed_frames_request_says_its_keys_requests_are_counted`). Of the
+/// subset hint a 0 alone is stated. The frame's whole budget and the wires
+/// its gateway states are read on the frame, where it was checked: no
+/// request states them. The frame gives its id whole for its answer.
 #[test]
 fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
     // A ring keyed by the prompt reads a text's hashes: the frame's three
@@ -308,6 +310,33 @@ fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
     // The id goes back whole on the frame's answer.
     let answered = Checked::new(full()).expect("a frame the record holds");
     assert_eq!(answered.into_id(), [7, 8, 9]);
+}
+
+/// A controller serves no request: the decisions it holds on file count a
+/// key's requests on each worker. So the request its maker makes of a keyed
+/// frame says that the count stands, the key in either form, and the maker
+/// says under what name: the session's number. A frame with no key states
+/// no count. The frame's one reader states none of this: the maker does.
+#[test]
+fn a_keyed_frames_request_says_its_keys_requests_are_counted() {
+    let spec = applied(&preset("random"));
+    let counted = |key: Option<Form>| {
+        let frame = frame_of(1, |frame| {
+            let facts = frame.facts.as_mut().expect("the frame has facts");
+            facts.session_key = key.map(|form| proto::Identity { form: Some(form) });
+        });
+        let mut buffers = Lists::default();
+        let lists = buffers.of(&frame);
+        assert!(!frame.facts(&lists, 0, 0).session_counted);
+        let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::None);
+        let under = maker.session_counted_under();
+        assert_eq!(under, SessionCountedUnder::SessionNumber);
+        maker.make(&spec).facts.session_counted
+    };
+    assert!(counted(Some(Form::Hash(17))));
+    let clear = Form::Plain("talk-1".to_owned());
+    assert!(counted(Some(clear)));
+    assert!(!counted(None));
 }
 
 /// A decider reads frame after frame onto the same buffers: a later frame's

@@ -12,10 +12,12 @@ use crate::engine::{
 
 /// A session key's requests in flight: the workers that carry them, and
 /// how many each carries. The store keeps one for a key while a lease of
-/// the key stands on file. No decision reads it: a controller serves no
-/// in-flight cap yet. The first worker stands in the entry itself: a
-/// key whose requests all stand on one worker, as a pinned key's do,
-/// allocates nothing. A worker whose count falls to zero leaves.
+/// the key stands on file. No decision reads it: a controller's in-flight
+/// cap reads the count its leases step on each worker object
+/// ([`InFlightCounts::book`](crate::tracking::in_flight::InFlightCounts::book)).
+/// The first worker stands in the entry itself: a key whose requests all
+/// stand on one worker, as a pinned key's do, allocates nothing. A worker
+/// whose count falls to zero leaves.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct InFlight {
     /// The first worker and its count. A count of zero is no worker, and
