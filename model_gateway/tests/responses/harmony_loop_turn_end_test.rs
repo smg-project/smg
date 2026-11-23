@@ -432,3 +432,64 @@ async fn harmony_replays_and_emits_codex_custom_patch_calls() {
         }
     }
 }
+
+/// A generation returned an exec command and started a patch before it ended.
+/// The parser returned only the command. Close the announced patch item without
+/// telling the client that it received an empty patch to run.
+#[tokio::test]
+async fn harmony_omits_a_cut_patch_after_a_complete_client_call() {
+    let text = concat!(
+        "<|channel|>commentary to=functions.exec_command <|constrain|>json<|message|>",
+        r#"{"cmd":"ls"}"#,
+        "<|call|><|start|>assistant",
+        "<|channel|>commentary to=functions.apply_patch <|constrain|>json<|message|>",
+        r#"{"input":"*** Begin Patch"#,
+    );
+    let turns = [Turn {
+        output_ids: token_ids(&[text]).remove(0),
+        prompt_tokens: 24,
+        end: End::Finish("stop"),
+    }];
+    let input = json!([
+        {"type":"additional_tools","role":"developer","tools":[
+            {"type":"function","name":"exec_command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}},
+            {"type":"custom","name":"apply_patch"}
+        ]},
+        {"role":"user","content":"List the files and patch the README."}
+    ]);
+    for stream in [false, true] {
+        let served = serve_with_input(&turns, stream, input.clone()).await;
+        assert_eq!(
+            served.response["status"], "completed",
+            "stream={stream}: {}",
+            served.response
+        );
+        assert_eq!(served.stored["status"], "completed");
+        assert_eq!(served.response["output"], served.stored["output"]);
+        let calls: Vec<_> = served.response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["name"].as_str())
+            .collect();
+        assert_eq!(calls, ["exec_command"]);
+        if stream {
+            let patch = served
+                .events
+                .iter()
+                .find(|event| {
+                    event["type"] == "response.output_item.added"
+                        && event["item"]["name"] == "apply_patch"
+                })
+                .unwrap();
+            let id = &patch["item"]["id"];
+            assert!(served
+                .events
+                .iter()
+                .any(|event| event["type"] == "response.output_item.done"
+                    && event["item"]["id"] == *id
+                    && event["item"]["status"] == "incomplete"));
+            assert!(served.events.iter().all(|event| event["item_id"] != *id));
+        }
+    }
+}

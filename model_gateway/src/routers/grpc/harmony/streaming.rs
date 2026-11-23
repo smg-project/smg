@@ -879,7 +879,6 @@ impl OpenCall {
     async fn close_custom(
         &self,
         arguments: &str,
-        retain: bool,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &SseSender,
     ) {
@@ -892,7 +891,7 @@ impl OpenCall {
         item["input"] = json!(input);
         ResponseStreamEventEmitter::sent(
             emitter
-                .send_output_item_done(self.output_index, item, retain, tx)
+                .send_output_item_done(self.output_index, item, RETAIN_OUTPUT_ITEM, tx)
                 .await,
         );
         emitter.complete_output_item(self.output_index);
@@ -1330,14 +1329,12 @@ impl ResponsesDecode {
                     && emitter.is_custom_tool(tool_name)
                 {
                     let open = OpenCall::open_custom(tool_name, &tool_call.id, emitter, tx).await;
-                    open.close_custom(args_str, RETAIN_OUTPUT_ITEM, emitter, tx)
-                        .await;
+                    open.close_custom(args_str, emitter, tx).await;
                 }
                 continue;
             };
             if open.custom {
-                open.close_custom(args_str, RETAIN_OUTPUT_ITEM, emitter, tx)
-                    .await;
+                open.close_custom(args_str, emitter, tx).await;
                 continue;
             }
 
@@ -1417,12 +1414,7 @@ impl ResponsesDecode {
             let Some(open) = self.calls.get(&index) else {
                 continue;
             };
-            if open.custom {
-                open.close_custom(&arguments, OMIT_OUTPUT_ITEM, emitter, tx)
-                    .await;
-                continue;
-            }
-            if streams_arguments(open.response_format.as_ref()) {
+            if !open.custom && streams_arguments(open.response_format.as_ref()) {
                 let event = match open.response_format {
                     Some(_) => emitter.emit_mcp_call_arguments_done(
                         open.output_index,
@@ -1438,7 +1430,10 @@ impl ResponsesDecode {
                 emitter.send_event_best_effort(&event, tx).await;
             }
             let mut item = open.item.clone();
-            item["arguments"] = json!(&arguments);
+            // A discarded custom call never supplied decoded input for the client.
+            if !open.custom {
+                item["arguments"] = json!(&arguments);
+            }
             item["status"] = json!("incomplete");
             ResponseStreamEventEmitter::sent(
                 emitter
