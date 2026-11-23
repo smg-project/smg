@@ -175,6 +175,19 @@ impl DecodeAhead {
         self.answer.worker().as_ref()
     }
 
+    /// This decode asked again behind its prefill's answer, by the attempt's
+    /// `ask`. Where the answer names another decode, the request goes to
+    /// that one: its answer and the guard that counts it take the first's
+    /// place here, so the send that follows is that decode's. Everywhere
+    /// else the first decode stands as it was.
+    fn again(self, ask: &DecodeAsk<'_>) -> Self {
+        let (moved, guard) = ask(&self.answer, self.guard);
+        Self {
+            guard,
+            answer: moved.unwrap_or(self.answer),
+        }
+    }
+
     /// The decode's request goes out now: the worker it goes to, and the load
     /// guard that holds the worker's count to the request's end.
     fn sent(self) -> (Arc<dyn Worker>, WorkerLoadGuard) {
@@ -182,6 +195,15 @@ impl DecodeAhead {
         (self.answer.into_guarded_worker(), guard)
     }
 }
+
+/// A pair's decode asked again behind its prefill's answer
+/// ([`placement::decode_again`]), as an attempt states it for the dispatch
+/// that sends the two sides one behind the other: the attempt holds what
+/// the placement reads of the request. In go the decode's answer and its
+/// guard made ahead of the send; out come the guard to keep, and the decode
+/// the request goes to now where that is another worker.
+type DecodeAsk<'a> =
+    dyn Fn(&Placed, WorkerLoadGuard) -> (Option<Placed>, WorkerLoadGuard) + Sync + 'a;
 
 /// What every dispatch body sets up before its first side goes out: the two
 /// serialized sides and the two load guards taken apart (the decode's still
@@ -961,10 +983,11 @@ impl PDRouter {
             if attempt == 0 { None } else { Some(&admits) };
         // The dispatch takes the context; the settle reads the model after it.
         let model_id = context.model_id;
-        let selected = {
-            // Copied out: the selection may wait for admission.
-            let tried = tried.lock().clone();
-            self.select_pd_pair_with_admission(
+        // Copied out: the selection may wait for admission. The ask behind a
+        // prefill's answer states the same list again.
+        let tried_before = tried.lock().clone();
+        let selected = self
+            .select_pd_pair_with_admission(
                 model_id,
                 PlacementInputs {
                     text: text.as_deref(),
@@ -974,12 +997,11 @@ impl PDRouter {
                     rid: None,
                     cache_namespace,
                     candidate_filter,
-                    tried: &tried,
+                    tried: &tried_before,
                 },
                 sticky_key,
             )
-            .await
-        };
+            .await;
         let ((prefill, decode), guards) = match selected {
             Ok(admitted) => admitted,
             Err(e) => {
@@ -1163,6 +1185,34 @@ impl PDRouter {
                 return response;
             }
 
+            // The prefill goes first: behind its answer the pair's decode is
+            // asked again, with what the selection read of the request and
+            // its rule for a retry, over the pair index as it stands then.
+            // The request goes to the decode that answer names. A MoRI-IO
+            // prefill was told its decode's endpoints, so that pair's decode
+            // is not asked.
+            let moved_to = parking_lot::Mutex::new(None);
+            let ask = |first: &Placed, ahead: WorkerLoadGuard| {
+                let inputs = PlacementInputs {
+                    text: text.as_deref(),
+                    tokens: tokens.as_deref(),
+                    headers,
+                    rid_key: rid_key.as_deref(),
+                    rid: None,
+                    cache_namespace,
+                    candidate_filter,
+                    tried: &tried_before,
+                };
+                let pairs = || self.pd_pairs(model_id);
+                let (moved, guard) = self.decode_again(model_id, &pairs, inputs, first, ahead);
+                if let Some(moved) = &moved {
+                    *moved_to.lock() = Some(Arc::clone(moved.worker()));
+                }
+                (moved, guard)
+            };
+            let ask: &DecodeAsk<'_> = &ask;
+            let again = (mode != KvConnectorMode::MoriIo).then_some(ask);
+
             // Outcome accounting happens per-side inside the sequential path:
             // a prefill-only failure must not feed the decode worker's
             // circuit breaker (the decode side was never contacted).
@@ -1177,10 +1227,14 @@ impl PDRouter {
                     Arc::clone(&prefill),
                     guards,
                     ledger,
+                    again,
                 )
                 .await;
-            let response = self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
-            Self::join_tried(tried, [&prefill, &decode], &response);
+            // The attempt is settled on the decode the request went to.
+            let moved_to = moved_to.into_inner();
+            let decode = moved_to.as_ref().unwrap_or(&decode);
+            let response = self.settle_attempt(ledger, model_id, [&prefill, decode], response);
+            Self::join_tried(tried, [&prefill, decode], &response);
             return response;
         }
 
@@ -1989,6 +2043,11 @@ impl PDRouter {
     /// vLLM PD over HTTP: send the tagged prefill side, wait for it, harvest
     /// (or synthesize) the KV handoff params, then dispatch the decode side
     /// carrying them. Mirrors the gRPC pipeline's `execute_sequential_pd`.
+    ///
+    /// `again` asks the pair's decode again once the prefill has answered
+    /// ([`DecodeAsk`]): the decode side goes to the decode that answer names.
+    /// `None` where the decode the selection named stands whatever happens
+    /// meanwhile.
     #[expect(
         clippy::too_many_arguments,
         reason = "mirrors execute_dual_dispatch_internal's dispatch surface"
@@ -2004,6 +2063,7 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         guards: PdLoadGuards,
         ledger: &AttemptLedger,
+        again: Option<&DecodeAsk<'_>>,
     ) -> Response {
         let PdSetup {
             prefill_body,
@@ -2147,6 +2207,13 @@ impl PDRouter {
             None => decode_body,
         };
 
+        // The prefill has answered: the pair's decode is asked again, and the
+        // decode side is built for the decode that answer names. A fan-out
+        // sent no prefill, so nothing has changed that an ask would read.
+        let decode = match again {
+            Some(ask) if relay => decode.again(ask),
+            _ => decode,
+        };
         let decode_request = self.build_post_with_headers(
             decode.worker(),
             context.route,
@@ -2548,6 +2615,33 @@ impl PDRouter {
             decode: DecodeAhead::new(decode, sticky_key),
         };
         Ok((pair, guards))
+    }
+
+    /// A pair's decode asked again behind its prefill's answer: this route's
+    /// one call of the placement's ask ([`placement::decode_again`]), over
+    /// this router's registries, with no wire pinned and no test around it.
+    /// `pairs` reads the pair index again. It is handed as a call, so that
+    /// a pair the classic policies picked, which has nothing to ask, reads
+    /// nothing: the placement makes the call for an answer of the policy
+    /// engine alone.
+    fn decode_again(
+        &self,
+        model_id: &str,
+        pairs: placement::PairsAgain<'_>,
+        inputs: PlacementInputs<'_>,
+        first: &Placed,
+        ahead: WorkerLoadGuard,
+    ) -> (Option<Placed>, WorkerLoadGuard) {
+        placement::decode_again(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            pairs,
+            None,
+            inputs,
+            first,
+            ahead,
+        )
     }
 
     /// The pair index `model_id` routes within. Shared HTTP-transport
@@ -9063,7 +9157,10 @@ mod tests {
     /// The prefill first: the engine hears the decode's dispatch where the
     /// decode's request goes out, behind the prefill's answer, and not at the
     /// selection, where the decode's guard is made. The prefill's guard is
-    /// dropped at its answer, ahead of that send.
+    /// dropped at its answer, ahead of that send. This document picks the
+    /// decode with its prefill, so the engine refuses the ask behind the
+    /// prefill's answer as a decode that was not left to choose: the first
+    /// decode goes out, and nothing more is heard of the ask.
     #[tokio::test]
     async fn the_engine_hears_the_decode_of_a_pair_sent_behind_its_prefill() {
         assert_eq!(
@@ -9131,6 +9228,184 @@ mod tests {
             ]
         );
         assert_eq!(decode.load(), 0);
+    }
+
+    /// Under a document that picks a pair's decode behind its prefill, the
+    /// prefill-first dispatch asks the decode again once the prefill has
+    /// answered. With one decode the answer names it again, and it stands:
+    /// the engine books the decode at the ask and tells the prefill's end,
+    /// which it held back for that booking, and it hears the decode's
+    /// dispatch where the decode's request goes out.
+    #[tokio::test]
+    async fn a_decode_asked_again_behind_its_prefill_stands_where_it_is_named_again() {
+        let router = single_attempt_router();
+        let heard = hearing_pairs_on(&router.policy_registry, true);
+        let prefill = healthy_stub(Shape::Sequential, PdSide::Prefill).await;
+        let decode = healthy_stub(Shape::Sequential, PdSide::Decode).await;
+        for worker in sequential_pair(prefill, decode) {
+            router.worker_registry.register_or_replace(worker);
+        }
+
+        let response = chat_through(&router, false).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            [
+                "issued",
+                "dispatched Prefill",
+                "issued",
+                "completed Cancelled",
+                "dispatched Decode",
+                "completed Cancelled",
+            ]
+        );
+    }
+
+    /// A pair the classic policies picked has nothing to ask behind its
+    /// prefill's answer: the route's one call answers the guard it was
+    /// handed, which counts the decode as before, and never makes the call
+    /// that reads the pair index again.
+    #[test]
+    fn a_classic_pair_reads_no_pair_index_behind_its_prefill() {
+        let router = create_test_pd_router();
+        let [_, decode] = sequential_pair("http://p:1".to_owned(), "http://d:1".to_owned());
+        let first = Placed::from(Arc::clone(&decode));
+        let ahead = first.ahead(None);
+
+        let (moved, guard) = router.decode_again(
+            UNKNOWN_MODEL_ID,
+            &|| panic!("a classic pair reads the pair index again"),
+            PlacementInputs::default(),
+            &first,
+            ahead,
+        );
+        assert!(moved.is_none(), "a classic pair's decode stands");
+        assert!(guard.counts(&decode));
+        assert_eq!(decode.load(), 1);
+        drop(first.sent(guard));
+        assert_eq!(decode.load(), 0);
+    }
+
+    /// A server that says when a request reached it and answers when the
+    /// case lets it, with how many requests reached it.
+    struct HeldStub {
+        url: String,
+        hits: Arc<AtomicUsize>,
+        reached: Arc<tokio::sync::Notify>,
+        answers: Arc<tokio::sync::Notify>,
+    }
+
+    /// A [`HeldStub`] that answers `reply` as JSON on every path.
+    async fn spawn_held_stub(reply: &'static str) -> HeldStub {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let answers = Arc::new(tokio::sync::Notify::new());
+        let held = (
+            Arc::clone(&hits),
+            Arc::clone(&reached),
+            Arc::clone(&answers),
+        );
+        let app = axum::Router::new().fallback(axum::routing::any(move || {
+            let (hits, reached, answers) = held.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                reached.notify_one();
+                answers.notified().await;
+                ([(CONTENT_TYPE, "application/json")], reply)
+            }
+        }));
+        HeldStub {
+            url: spawn_stub(app).await,
+            hits,
+            reached,
+            answers,
+        }
+    }
+
+    /// The request moves where the answer names another decode. Here the
+    /// decode the selection named stops being ready while the prefill runs:
+    /// the ask behind the prefill's answer names the other decode, which is
+    /// sent the request and counted for it, and the first is sent nothing
+    /// and is counted no more. The engine hears one decode's dispatch and
+    /// end, and no release.
+    #[tokio::test]
+    async fn a_decode_that_stops_being_ready_behind_its_prefill_hands_the_request_on() {
+        let prefill_stub =
+            spawn_held_stub(healthy_answer(Shape::Sequential, PdSide::Prefill)).await;
+        let first_stub = spawn_held_stub(r#"{"choices":[]}"#).await;
+        let second_stub = spawn_held_stub(r#"{"choices":[]}"#).await;
+
+        let router = single_attempt_router();
+        let heard = hearing_pairs_on(&router.policy_registry, true);
+        let [prefill, first] = sequential_pair(prefill_stub.url.clone(), first_stub.url.clone());
+        let second: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(second_stub.url.clone())
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::Vllm)
+                .build(),
+        );
+        second.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        for worker in [&prefill, &first, &second] {
+            router
+                .worker_registry
+                .register_or_replace(Arc::clone(worker));
+        }
+
+        let leaves = async {
+            prefill_stub.reached.notified().await;
+            // The decode the selection named is the one counted from then on.
+            let (named, other) = if first.load() == 1 {
+                (&first, &second)
+            } else {
+                (&second, &first)
+            };
+            assert_eq!((named.load(), other.load()), (1, 0));
+            named.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+            prefill_stub.answers.notify_one();
+
+            tokio::select! {
+                () = first_stub.reached.notified() => {}
+                () = second_stub.reached.notified() => {}
+            }
+            assert_eq!(
+                (named.load(), other.load()),
+                (0, 1),
+                "the request is counted on the decode it went to"
+            );
+            first_stub.answers.notify_one();
+            second_stub.answers.notify_one();
+            (named, other)
+        };
+        let (response, (named, other)) = tokio::join!(chat_through(&router, false), leaves);
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!((named.load(), other.load()), (0, 0));
+
+        let sent_to = |worker: &Arc<dyn Worker>| {
+            let stub = if worker.url() == first.url() {
+                &first_stub
+            } else {
+                &second_stub
+            };
+            stub.hits.load(Ordering::SeqCst)
+        };
+        assert_eq!((sent_to(named), sent_to(other)), (0, 1));
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            [
+                "issued",
+                "dispatched Prefill",
+                "issued",
+                "completed Cancelled",
+                "dispatched Decode",
+                "completed Cancelled",
+            ]
+        );
     }
 
     /// A decode policy with a favourite: the worker at that address whenever

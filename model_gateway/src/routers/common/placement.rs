@@ -657,13 +657,6 @@ impl Placed {
         );
         self.worker
     }
-
-    /// NOT FOR MAIN: [`Self::into_worker`] for a route that does not make
-    /// its load guard from the answer yet, which is a pair's decode. The
-    /// call leaves with its last caller.
-    pub(crate) fn worker_alone_for_now(self) -> Arc<dyn Worker> {
-        self.into_worker()
-    }
 }
 
 impl ByEngine {
