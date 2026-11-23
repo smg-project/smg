@@ -4950,6 +4950,7 @@ mod tests {
         let mut read = Vec::new();
         for (prefill, decode, logprobs, stream) in [
             ("{}", OVER, false, false),
+            ("{}", OVER, true, false),
             (OVER, "{}", true, false),
             (OVER, "{}", true, true),
         ] {
@@ -4994,7 +4995,7 @@ mod tests {
         // Charged, prefill then decode: the side above the limit, alone.
         assert_eq!(
             read,
-            [[false, true], [true, false], [true, false]].map(refused)
+            [[false, true], [false, true], [true, false], [true, false]].map(refused)
         );
     }
 
