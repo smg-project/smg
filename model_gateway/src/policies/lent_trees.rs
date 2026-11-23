@@ -188,12 +188,21 @@ impl LentTrees {
     /// worker that rejoins starts with no prompt, as its cache may not have
     /// outlived it.
     ///
-    /// Where events went unheard, every address leaves every tree, and a
+    /// Where events went unheard, every prompt leaves every tree, and a
     /// line at warn says so. A removal may be among those events, and a
     /// registration under its address behind it. The worker that stands
     /// there is then not the one the prompts were sent to, and no event
     /// that was heard tells the two apart: the registry's word keeps no
     /// address. The trees fill again from the requests that follow.
+    ///
+    /// The trees are emptied by the size pass's own call, at no size
+    /// ([`TokenTree::evict_tenant_by_size`]), and not by name: the workers
+    /// that stand are written to meanwhile. The call takes one leaf out at
+    /// a time and debits it from its worker, so a prompt a request writes
+    /// meanwhile stays counted. It stays in the tree too, with the prompt
+    /// it extends: it was sent to the worker that stands. The call ends
+    /// where the tree's total reads zero. Every address stays listed, at
+    /// no tokens.
     fn forget_the_removed(&self, left: &Left) {
         if left.unheard > 0 {
             warn!(
@@ -217,12 +226,11 @@ impl LentTrees {
                     tree.remove_tenant_all(&TenantId::from(address.as_str()));
                 }
             } else {
-                // Address by address, by the call a named purge makes: a
-                // tree's own `clear` asks for no writer beside it, and
-                // requests write these trees.
-                for address in tree.get_tenant_token_counts().into_keys() {
-                    tree.remove_tenant_all(&TenantId::from(address));
-                }
+                // A purge by name drops a worker's whole count, and a
+                // tree's own `clear` asks for no writer beside it. This
+                // call may run beside the size pass's own: the second of
+                // the two to take a worker out of a node debits nothing.
+                tree.evict_tenant_by_size(0);
             }
         }
     }
@@ -297,6 +305,8 @@ impl CacheIndexes for EngineCaches {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
+        sync::atomic::{AtomicUsize, Ordering},
         thread,
         time::{Duration, Instant},
     };
@@ -338,10 +348,14 @@ mod tests {
         }
     }
 
-    /// The workers `model`'s tree holds a prompt for, sorted.
+    /// The workers `model`'s tree holds a prompt for, sorted: a worker it
+    /// lists at no tokens holds none.
     fn held(trees: &LentTrees, model: &str) -> Vec<String> {
-        let tree = trees.token_tree(model);
-        let mut workers: Vec<String> = tree.get_tenant_token_counts().into_keys().collect();
+        let counts = trees.token_tree(model).get_tenant_token_counts();
+        let mut workers: Vec<String> = counts
+            .into_iter()
+            .filter_map(|(worker, tokens)| (tokens > 0).then_some(worker))
+            .collect();
         workers.sort();
         workers
     }
@@ -569,7 +583,8 @@ mod tests {
     /// removal's own event to every listener, and the registration under
     /// its address behind it: no event that is kept names that address.
     /// The worker that rejoined starts with no prompt, and so does the one
-    /// that stood throughout, as nothing heard tells the two apart.
+    /// that stood throughout, as nothing heard tells the two apart. Each
+    /// is debited what left and stays listed: no count is dropped whole.
     #[tokio::test]
     async fn events_that_went_unheard_empty_every_tree() {
         let trees = Arc::new(owner(document(1_000, 0)));
@@ -604,8 +619,72 @@ mod tests {
             held(&trees, MODEL).is_empty()
         })
         .await;
+        let tree = trees.token_tree(MODEL);
+        // The root's own entry lists the addresses, and is no prompt.
+        let prompts = tree.iter_entries().filter(|(prompt, _)| !prompt.is_empty());
+        assert_eq!(prompts.count(), 0, "no prompt is left");
+        let mut listed: Vec<(String, usize)> = tree.get_tenant_token_counts().into_iter().collect();
+        listed.sort();
+        let debited = ["http://a:1", "http://b:1"].map(|stands| (stands.to_owned(), 0));
+        assert_eq!(listed, debited);
         for stands in ["http://a:1", "http://b:1"] {
             assert!(registry.get_by_url(stands).is_some(), "{stands} stands");
+        }
+    }
+
+    /// A prompt a request writes while the trees are emptied stays counted
+    /// to its worker. Two threads write prompts by the engine's own call,
+    /// four to a worker, and the trees are emptied again and again until
+    /// 2,000 are written. No prompt that is left then is one its worker's
+    /// count lacks. A purge by name would leave such a prompt: it drops a
+    /// worker's whole count behind its walk, with a prompt written between
+    /// the two.
+    #[test]
+    fn a_prompt_written_while_the_trees_are_emptied_stays_counted() {
+        let trees = owner(document(1_000, 0));
+        let tree = trees.token_tree(MODEL);
+        let unheard = Left {
+            unheard: 1,
+            ..Left::default()
+        };
+        let written = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            for writer in 0..2_u32 {
+                let (tree, written) = (&tree, &written);
+                scope.spawn(move || {
+                    for prompt in 0..20_000_u32 {
+                        if written.load(Ordering::Relaxed) >= 2_000 {
+                            break;
+                        }
+                        // 64 tokens no other prompt begins with.
+                        let first = writer * 2_000_000 + prompt * 64;
+                        let tokens: Vec<u32> = (first..first + 64).collect();
+                        let worker = format!("http://{writer}-{}:1", prompt / 4);
+                        tree.match_and_insert(&tokens, &worker);
+                        written.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            while written.load(Ordering::Relaxed) < 2_000 {
+                trees.forget_the_removed(&unheard);
+            }
+        });
+
+        let counted = tree.get_tenant_token_counts();
+        let mut left: HashMap<String, usize> = HashMap::new();
+        // The root's own entry lists the addresses, and is no prompt.
+        let prompts = tree.iter_entries().filter(|(prompt, _)| !prompt.is_empty());
+        for (prompt, workers) in prompts {
+            assert_eq!(prompt.len(), 64, "a whole prompt, of one worker");
+            assert_eq!(workers.len(), 1, "a whole prompt, of one worker");
+            *left.entry(workers[0].0.to_string()).or_default() += 64;
+        }
+        for (worker, tokens) in left {
+            let count = counted.get(&worker).copied().unwrap_or(0);
+            assert!(
+                count >= tokens,
+                "{worker} holds {tokens} tokens, counted {count}"
+            );
         }
     }
 
