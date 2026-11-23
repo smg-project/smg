@@ -1073,10 +1073,11 @@ impl AppContextBuilder {
             .kv_event_monitor
             .as_ref()
             .ok_or_else(|| unset("kv_event_monitor"))?;
+        let events = Some(cache_events);
         let data = WorkerData {
             registry: Arc::clone(registry) as Arc<dyn Members>,
             loads: Some(monitor.subscribe()),
-            cache_indexes: Self::engine_caches(&document, &spec, Some(cache_events), policies),
+            cache_indexes: Self::engine_caches(&document, &spec, events, policies, registry),
         };
         Self::start_policy_engine(spec, data, policies)?;
         Ok(self)
@@ -1093,18 +1094,20 @@ impl AppContextBuilder {
     /// checked form of `document`, reads the prefixes sent to each worker:
     /// the document's own word, whatever the settings name the policy. The
     /// trees take the document's numbers too: its block size, and each
-    /// model's `index` entry. `None` where the process keeps neither a
-    /// monitor nor trees.
+    /// model's `index` entry. They follow `workers`, the registry the engine
+    /// is handed: a worker it lost is taken out of them. `None` where the
+    /// process keeps neither a monitor nor trees.
     fn engine_caches(
         document: &PolicySpec,
         spec: &AppliedSpec,
         events: Option<&Arc<KvEventMonitor>>,
         policies: &PolicyRegistry,
+        workers: &Arc<WorkerRegistry>,
     ) -> Option<Arc<dyn CacheIndexes>> {
         let trees = spec
             .needs()
             .sent_prefixes
-            .then(|| policies.lend_token_trees(document, spec.block_size()));
+            .then(|| policies.lend_token_trees(document, spec.block_size(), workers));
         let caches = EngineCaches::of(events.cloned(), trees)?;
         Some(Arc::new(caches) as Arc<dyn CacheIndexes>)
     }
@@ -1173,7 +1176,7 @@ impl AppContextBuilder {
             let data = WorkerData {
                 registry: Arc::clone(registry) as Arc<dyn Members>,
                 loads,
-                cache_indexes: Self::engine_caches(&document, &spec, None, policies),
+                cache_indexes: Self::engine_caches(&document, &spec, None, policies, registry),
             };
             Self::start_policy_engine(spec, data, policies)?;
         }
@@ -1659,6 +1662,8 @@ mod tests {
     /// `select_worker_with_tokens`).
     #[tokio::test]
     async fn the_start_lends_the_engine_the_token_trees_its_document_reads() {
+        use std::time::Instant;
+
         use openai_protocol::worker::RuntimeType;
 
         use crate::routers::common::{
@@ -1708,7 +1713,17 @@ mod tests {
         }
         let tree = trees.token_tree("m");
         let held: Vec<String> = tree.get_tenant_token_counts().into_keys().collect();
-        assert_eq!(held, [first]);
+        assert_eq!(held, [first.as_str()]);
+
+        // The start made the trees with the task that follows the context's
+        // own registry: the worker that leaves it is taken out of them.
+        let registry = &context.worker_registry;
+        registry.remove_by_url(&first).expect("the removal");
+        let bound = Instant::now() + Duration::from_secs(60);
+        while !tree.get_tenant_token_counts().is_empty() {
+            assert!(Instant::now() < bound, "the trees' task never purged");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
 
         // The trees take the document's numbers. The document the settings
         // mean states the settings' block size. A supplied document states

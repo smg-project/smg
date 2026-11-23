@@ -275,9 +275,9 @@ pub struct PolicyRegistry {
     engine: Arc<OnceLock<&'static PolicyEngine>>,
 
     /// The token trees the policy engine is lent, where its start asked
-    /// for them ([`Self::lend_token_trees`]). A worker that left is taken
-    /// out of them where it is taken out of a cache-aware policy's trees
-    /// ([`Self::remove_workers_from_cache_aware`]).
+    /// for them ([`Self::lend_token_trees`]). A worker the registry lost is
+    /// taken out of them by their own task
+    /// ([`LentTrees::follow_removals`]).
     lent_trees: Arc<OnceLock<Arc<LentTrees>>>,
 
     /// Shared sticky selector for the routing-key override. `Some` when the
@@ -857,8 +857,25 @@ impl PolicyRegistry {
     /// here. The engine's start calls it, and only where its document reads
     /// the prefixes sent to each worker: with the engine on no classic
     /// policy is made that would keep such trees.
-    pub(crate) fn lend_token_trees(&self, document: &PolicySpec, page: u32) -> Arc<LentTrees> {
-        let made = || Arc::new(LentTrees::of_document(document.clone(), page));
+    ///
+    /// The trees are made with the task that takes a worker `workers` lost
+    /// out of them ([`LentTrees::follow_removals`]), on the runtime the
+    /// call is made on. The start runs on one, the engine's own task needs
+    /// it. Where none is entered no task is started, and nothing takes a
+    /// worker out of the trees.
+    pub(crate) fn lend_token_trees(
+        &self,
+        document: &PolicySpec,
+        page: u32,
+        workers: &Arc<WorkerRegistry>,
+    ) -> Arc<LentTrees> {
+        let made = || {
+            let trees = Arc::new(LentTrees::of_document(document.clone(), page));
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                trees.follow_removals(workers, &runtime);
+            }
+            trees
+        };
         Arc::clone(self.lent_trees.get_or_init(made))
     }
 
@@ -1545,11 +1562,6 @@ impl PolicyRegistry {
                 );
             }
         }
-        // The trees the policy engine is lent stand where a policy's would:
-        // a registry made for the engine finds no policy above.
-        if let Some(trees) = self.lent_trees.get() {
-            trees.remove_workers_from_model(model_id, worker_urls);
-        }
     }
 
     /// Drop the state every policy keeps on a removed worker (a load-aware
@@ -1635,6 +1647,8 @@ impl LoadConsumer for PolicyRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
     use smg_policy_controller::document::{AppliedSpec, Pairing, PolicySpec};
     use smg_worker::{
@@ -3437,12 +3451,12 @@ mod tests {
 
     /// A registry made for the policy engine keeps the token trees the
     /// engine is lent: none until the start asks, one owner however often
-    /// it asks, under the numbers of the document the start hands it. A
-    /// worker that left is taken out of its model's tree by the call that
-    /// takes it out of a cache-aware policy's trees, which finds no policy
-    /// in such a registry.
-    #[test]
-    fn a_worker_that_left_is_taken_out_of_the_lent_trees() {
+    /// it asks, under the numbers of the document the start hands it. The
+    /// trees are made with their task: a worker the worker registry lost is
+    /// taken out of them, and the call that takes a worker out of a
+    /// cache-aware policy's trees finds no policy in such a registry.
+    #[tokio::test]
+    async fn a_worker_that_left_is_taken_out_of_the_lent_trees() {
         let config = RouterConfig {
             policy: cache_aware_config(),
             ..RouterConfig::default()
@@ -3452,11 +3466,15 @@ mod tests {
             config.policy.clone(),
             RoutingKeyOverrideConfig::default(),
         );
+        let workers = Arc::new(WorkerRegistry::new());
+        for url in ["http://w1:8000", "http://w2:8000"] {
+            workers.register(ready_worker(url, "llama-3"));
+        }
         assert!(registry.lent_trees().is_none());
-        let trees = registry.lend_token_trees(&document, 8);
+        let trees = registry.lend_token_trees(&document, 8, &workers);
         assert!(Arc::ptr_eq(
             &trees,
-            &registry.lend_token_trees(&document, 8)
+            &registry.lend_token_trees(&document, 8, &workers)
         ));
         let tokens: Vec<u32> = (0..64).collect();
         let tree = trees.token_tree("llama-3");
@@ -3464,8 +3482,14 @@ mod tests {
         tree.insert_tokens(&tokens, "http://w1:8000");
         tree.insert_tokens(&tokens, "http://w2:8000");
 
-        let left = HashSet::from(["http://w1:8000".to_owned()]);
-        registry.remove_workers_from_cache_aware("llama-3", &left);
+        workers
+            .remove_by_url("http://w1:8000")
+            .expect("the removal");
+        let bound = Instant::now() + Duration::from_secs(60);
+        while tree.get_tenant_token_counts().len() > 1 {
+            assert!(Instant::now() < bound, "the trees' task never purged");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         let kept: Vec<String> = tree.get_tenant_token_counts().into_keys().collect();
         assert_eq!(kept, ["http://w2:8000"]);
         assert_eq!(registry.classic_made_or_asked(), 0);
