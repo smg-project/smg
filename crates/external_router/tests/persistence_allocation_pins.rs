@@ -23,7 +23,9 @@ use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     NewConversation, ResponseStorage,
 };
-use smg_external_router::persistence_utils::{item_to_json, persist_conversation_items};
+use smg_external_router::persistence_utils::{
+    item_to_json, persist_conversation_items, persist_conversation_items_owned,
+};
 
 #[global_allocator]
 static GLOBAL: Counting = Counting;
@@ -209,6 +211,11 @@ fn stores() -> Stores {
 /// and a half times the items' content. (With the output list copied for a
 /// linking that never happens: two times the content.)
 ///
+/// The same persist handed its response copies none of the items' content:
+/// its bytes stay under half the content. (With the tree copied: once.)
+/// Handed spare room in its `output` and `tools` arrays, it makes one call
+/// more an array: each is moved to its length before the record keeps it.
+///
 /// Linking a turn's items into a conversation copies each item's content
 /// twice more and not a third time: the output list the item records are
 /// built from and the memory store's own copy of the record it keeps. The
@@ -241,6 +248,47 @@ fn linking_a_turns_items_stores_each_once() {
     stored.expect("the response is stored");
 
     let (conversations, items, responses) = stores();
+    let mut owned = response("resp_owned");
+    owned["tools"] = json!([{"type": "function", "name": "f"}]);
+    let mut roomy = owned.clone();
+    for array in ["output", "tools"] {
+        roomy[array].as_array_mut().expect("an array").reserve(8);
+    }
+    let record_store = responses.clone();
+    let (stored, calls_owned, bytes_owned) = allocations_during(|| {
+        runtime.block_on(persist_conversation_items_owned(
+            conversations,
+            items,
+            responses,
+            owned,
+            &request,
+            None,
+            None,
+        ))
+    });
+    stored.expect("the response is stored");
+    assert_eq!(record_store.stored_record_count(), Some(1));
+
+    let (conversations, items, responses) = stores();
+    let (stored, calls_roomy, _) = allocations_during(|| {
+        runtime.block_on(persist_conversation_items_owned(
+            conversations,
+            items,
+            responses,
+            roomy,
+            &request,
+            None,
+            None,
+        ))
+    });
+    stored.expect("the response is stored");
+    assert_eq!(
+        calls_roomy,
+        calls_owned + 2,
+        "allocation calls of the same persist handed spare room in `output` and `tools`"
+    );
+
+    let (conversations, items, responses) = stores();
     let conversation = runtime
         .block_on(conversations.create_conversation(NewConversation::default()))
         .expect("a conversation");
@@ -266,12 +314,16 @@ fn linking_a_turns_items_stores_each_once() {
 
     let linking = bytes_linked.saturating_sub(bytes_alone);
     eprintln!(
-        "bytes allocated by a persist of eight 64 KiB messages: without a conversation {bytes_alone}, with one {bytes_linked}, the linking {linking} ({}% of the content)",
+        "bytes allocated by a persist of eight 64 KiB messages: without a conversation {bytes_alone} (handed its response: {bytes_owned}), with one {bytes_linked}, the linking {linking} ({}% of the content)",
         linking * 100 / content_bytes
     );
     assert!(
         bytes_alone < content_bytes * 3 / 2,
         "bytes allocated by a persist of eight 64 KiB messages without a conversation: {bytes_alone} (the content is {content_bytes})"
+    );
+    assert!(
+        bytes_owned < content_bytes / 2,
+        "bytes allocated by the same persist handed its response: {bytes_owned} (the content is {content_bytes})"
     );
     assert!(
         linking < content_bytes * 5 / 2,
