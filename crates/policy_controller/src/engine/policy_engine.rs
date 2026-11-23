@@ -47,6 +47,7 @@
 //! ([`overlap`]).
 
 mod budget;
+mod document;
 pub(super) mod encode;
 mod keys;
 mod labels;
@@ -77,6 +78,7 @@ use rustc_hash::FxHasher;
 use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, runtime::RoutingState};
 
 use self::{
+    document::InForce,
     encode::EncodeLists,
     overlap::{Affinity, PoolAffinity},
 };
@@ -88,19 +90,18 @@ use super::{
     },
     framework::{
         release, AloneProfile, EncodeItems, EncodePlaced, NotAlone, Picker, Place, PoolWord,
-        ShadowRows, SHADOWS,
+        ShadowRows,
     },
     lease_events,
     list_cell::LentList,
     prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
-    shadow::{Counted, ShadowCounts, Shadowed},
+    shadow::{Counted, Shadowed},
     sticky_sessions::{shards_for_this_host, SessionTable},
     view::{FixedFacts, Phase, WireModes, WorkerId},
 };
 use crate::{
     document::spec::AppliedSpec,
-    stages::Lifecycle,
     store::GatewayId,
     tracking::lease::{EventKind, EventSet, Membership, Said, Side},
 };
@@ -121,10 +122,9 @@ fn next_applied() -> u64 {
 /// the document's stages and their state, and no worker.
 #[derive(Debug)]
 pub struct PolicyEngine {
-    spec: AppliedSpec,
-    /// The number of the document the engine decides under
-    /// ([`Self::applied`]).
-    applied: u64,
+    /// What the engine holds of its document ([`InForce`]): the document,
+    /// its number, and what the engine reads of the document once.
+    document: InForce,
     /// The pools made so far: each draws the place its turns start at from
     /// its number.
     epochs: AtomicU64,
@@ -144,15 +144,6 @@ pub struct PolicyEngine {
     /// The id of the last lease issued. A pick that is issued one writes
     /// it: one atomic step, on cache lines of its own.
     leases: OwnWord,
-    /// The kinds of event the document takes ([`Lifecycle::hears`]), read
-    /// once, here. A document that takes no word on a lease
-    /// ([`EventSet::LEASE`]) costs a request no lease, no id and no word,
-    /// and its plain requests are answered a place ([`Decided::Alone`]).
-    hears: EventSet,
-    /// Each profile's name as a label that lives as long as the process,
-    /// by the profile's position in the document ([`Self::label_at`]).
-    /// Made once, here: naming the profile of a placement takes no lock.
-    labels: Box<[&'static str]>,
     /// The session table, one for the engine's life: the pins of every key
     /// a sessions rule placed. The document's engine reads and writes it
     /// through a pointer ([`AppliedSpec::share_sessions`]), so a pin
@@ -170,21 +161,6 @@ pub struct PolicyEngine {
     /// The host's worker registry, once it handed it
     /// ([`Self::set_registry`]): the engine's own task follows its events.
     members: membership::Handed,
-    /// Whether a stage of the document reads a named signal
-    /// ([`Needs::signal_cells`](crate::document::spec::Needs::signal_cells)),
-    /// read once, here. Under such a document a single request whose
-    /// profile reads one is decided with its list's signal cells in its
-    /// facts ([`signals::decide`]), and any other document pays one test
-    /// of this word.
-    signals: bool,
-    /// Whether a binding of the document names a shadow profile
-    /// ([`SHADOWS`]), read once, here. A whole decision of a single request
-    /// pays one test of it, and a place picked alone pays none.
-    any_shadow: bool,
-    /// The shadow decisions counted so far ([`DecisionEngine::shadowed`]),
-    /// by binding and kind. The table is allocated at the first of them: a
-    /// document that names no shadow keeps none.
-    shadow_counts: OnceLock<Box<ShadowCounts>>,
 }
 
 /// The document's word of a binding's shadow: the binding's position, and
@@ -340,20 +316,12 @@ impl PolicyEngine {
     /// builds it here and makes every hand-over.
     #[must_use]
     pub fn new(mut spec: AppliedSpec) -> Self {
-        let hears = spec.engine().hears();
-        let signals = spec.needs().signal_cells;
-        let any_shadow = spec.engine().seat_flags() & SHADOWS != 0;
         // The table takes the document's two times where the document's
         // engine takes the pointer.
         let sessions = Arc::new(SessionTable::new(0).with_shards(shards_for_this_host()));
         spec.share_sessions(Arc::clone(&sessions));
         Self {
-            hears,
-            labels: labels::of(&spec),
-            signals,
-            any_shadow,
-            spec,
-            applied: next_applied(),
+            document: InForce::of(spec),
             epochs: AtomicU64::new(0),
             clock: DecisionClock::new(),
             faults: AtomicU64::new(0),
@@ -364,7 +332,6 @@ impl PolicyEngine {
             affinity: Affinity::default(),
             loads: task::Loads::default(),
             members: membership::Handed::default(),
-            shadow_counts: OnceLock::new(),
         }
     }
 
@@ -452,7 +419,7 @@ impl PolicyEngine {
     /// here and counted ([`Self::unheard`]): the registration or the removal
     /// goes on.
     fn told(&self, change: &Membership<'_>) {
-        let engine = self.spec.engine();
+        let engine = self.document.spec.engine();
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| engine.membership_stages(change))) {
             release(payload);
             self.unheard.fetch_add(1, Ordering::Relaxed);
@@ -483,14 +450,14 @@ impl PolicyEngine {
     /// The document the engine decides under.
     #[must_use]
     pub fn spec(&self) -> &AppliedSpec {
-        &self.spec
+        &self.document.spec
     }
 
     /// The number of the document the engine decides under, which no other
     /// applied document of the process has. A list's value is made under it
     /// and read under it alone ([`Self::members_of`]).
     pub(super) fn applied(&self) -> u64 {
-        self.applied
+        self.document.applied
     }
 
     /// How many values of a list the engine made so far, for a case that
@@ -548,7 +515,8 @@ impl PolicyEngine {
         pool: &Arc<[Arc<dyn Worker>]>,
         facts_of: impl FnMut(&Arc<dyn Worker>) -> FixedFacts,
     ) -> PoolMembers {
-        let records = PoolRecords::with_fixed_facts(pool, &self.spec, &self.clock, facts_of);
+        let records =
+            PoolRecords::with_fixed_facts(pool, &self.document.spec, &self.clock, facts_of);
         PoolMembers {
             records: OnceLock::from(records),
             ..self.pool_members(pool)
@@ -572,7 +540,7 @@ impl PolicyEngine {
     /// [`Engine::place_for`]: super::framework::Engine::place_for
     #[must_use]
     pub fn place_for(&self, model: &str, phase: Phase) -> Place<'_> {
-        self.spec.engine().place_for(model, phase)
+        self.document.spec.engine().place_for(model, phase)
     }
 
     /// The first place a binding of the document names that the engine
@@ -584,7 +552,7 @@ impl PolicyEngine {
     /// [`Engine::not_alone`]: super::framework::Engine::not_alone
     #[must_use]
     pub fn not_alone(&self) -> Option<NotAlone<'_>> {
-        self.spec.engine().not_alone()
+        self.document.spec.engine().not_alone()
     }
 
     /// One pick under `profile` over `list`, a pool its caller lends with
@@ -652,7 +620,7 @@ impl PolicyEngine {
     /// The picker of `profile`.
     #[inline]
     fn picker_of(&self, profile: AloneProfile) -> Option<&dyn Picker> {
-        let profiles = self.spec.engine().profiles();
+        let profiles = self.document.spec.engine().profiles();
         Some(profiles.get(usize::from(profile.0))?.picker.as_ref())
     }
 
@@ -664,7 +632,7 @@ impl PolicyEngine {
     /// reads the number as the time left ([`budget::shown`]).
     #[inline(always)]
     fn made<'w>(&'w self, maker: &'w impl RequestMaker) -> Request<'w> {
-        let mut request = maker.make(&self.spec);
+        let mut request = maker.make(&self.document.spec);
         request.constraints.pins = None;
         request.facts.budget_micros = budget::shown(request.facts.budget_micros);
         request
@@ -850,7 +818,8 @@ impl PolicyEngine {
         let loads = read.snapshot();
         // Under a document a stage of which reads a named signal the
         // list's word says whether this request's profile reads one.
-        if self.signals && members.reads_signal(&self.spec, request.facts.model, Phase::Single) {
+        let spec = &self.document.spec;
+        if self.document.signals && members.reads_signal(spec, request.facts.model, Phase::Single) {
             return signals::decide(self, request, members, maker, loads, now, said);
         }
         self.decide_with_loads(request, members, maker, loads, now, said)
@@ -878,8 +847,8 @@ impl PolicyEngine {
     ) -> super::decision::Decision {
         // Under a document that names a shadow the list's word says
         // whether this binding does.
-        if self.any_shadow {
-            if let Some(binding) = members.shadow(&self.spec, request.facts.model) {
+        if self.document.any_shadow {
+            if let Some(binding) = members.shadow(&self.document.spec, request.facts.model) {
                 let (decision, shadow) =
                     with_shadow::decide(self, request, members, maker, loads, now, binding);
                 *said = shadow;
@@ -920,7 +889,7 @@ impl PolicyEngine {
                 if let Some(pick) = single::alone(self, maker.model(), plain, members) {
                     // No stage takes a word of the request: the place
                     // is the whole answer.
-                    if !self.hears.intersects(EventSet::LEASE) {
+                    if !self.document.hears.intersects(EventSet::LEASE) {
                         return Ok(Some(pick));
                     }
                     picked = Some((pick, members, plain));
@@ -1055,10 +1024,10 @@ impl DecisionEngine for PolicyEngine {
             Said::Completed(_) => EventKind::Completed,
             Said::Released(..) => EventKind::Released,
         };
-        if held.lease.side == Side::Single && !self.hears.contains(kind) {
+        if held.lease.side == Side::Single && !self.document.hears.contains(kind) {
             return;
         }
-        let engine = self.spec.engine();
+        let engine = self.document.spec.engine();
         let tell = || match held.lease.side {
             Side::Single => lease_events::single(engine, held, said),
             // A pair's guard holds its prefill side's lease.
@@ -1084,7 +1053,7 @@ impl DecisionEngine for PolicyEngine {
     }
 
     fn with_spec<R>(&self, read: impl FnOnce(&AppliedSpec) -> R) -> R {
-        read(&self.spec)
+        read(&self.document.spec)
     }
 
     // By the block size the model's cache events taught the host's index,
@@ -1098,7 +1067,7 @@ impl DecisionEngine for PolicyEngine {
         seeds: HashSeeds,
     ) -> PromptHashes {
         let size = self.affinity.block_size(model);
-        PromptHashes::under_document(&self.spec, size, tokens, text, seeds)
+        PromptHashes::under_document(&self.document.spec, size, tokens, text, seeds)
     }
 
     fn faults(&self) -> u64 {
@@ -1108,7 +1077,7 @@ impl DecisionEngine for PolicyEngine {
     // The shadow decisions counted for single requests. No shadow profile
     // runs on a pair's side here.
     fn shadowed(&self, binding: u32, kind: ShadowKind) -> u64 {
-        let counts = self.shadow_counts.get();
+        let counts = self.document.shadow_counts.get();
         counts.map_or(0, |counts| {
             counts
                 .of(binding, Counted::Single, kind)
@@ -1267,7 +1236,7 @@ mod tests {
         });
         assert_eq!(asked.get(), 4, "asked at the call, once a worker");
         let sees = |members: &PoolMembers| {
-            let fixed = members.records(&engine.spec, &engine.clock).fixed();
+            let fixed = members.records(engine.spec(), &engine.clock).fixed();
             fixed.iter().map(|row| row.vision).collect::<Vec<_>>()
         };
         assert_eq!(sees(&members), [false, true, false, false]);

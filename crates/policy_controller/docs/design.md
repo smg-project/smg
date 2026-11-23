@@ -524,10 +524,10 @@ document's stages and what they remember. It holds no worker of its own: the reg
 ```rust
 // engine/policy_engine.rs
 pub struct PolicyEngine {
-    spec: AppliedSpec,    // the validated document: profiles, bindings, stage objects and their state
+    document: InForce,    // the validated document (profiles, bindings, stage objects and their state), its
+                          // number, and what is read of it once: which lease events its stages need
     clock: DecisionClock, // one clock for every decision and every load report's age
     leases: OwnWord,      // the id of the last lease issued: one atomic counter
-    hears: EventSet,      // which lease events the document's stages need, read once at start
     affinity: Affinity,   // cache affinity: the host's index of cache events, and the engine's own
                           // record of the prefixes it sent, one for each model
     epochs: AtomicU64,    // how many list values were made

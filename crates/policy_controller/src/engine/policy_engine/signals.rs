@@ -124,7 +124,7 @@ pub(super) fn decide(
     now: Instant,
     said: &mut Option<Shadowed>,
 ) -> Decision {
-    let spec = &own.spec;
+    let spec = &own.document.spec;
     let live = Live::at(spec.engine(), &own.clock, now, loads, None);
     let records = members.records(spec, &own.clock);
     let held = records.cells(members.workers(), &live);

@@ -112,7 +112,7 @@ impl PolicyEngine {
     /// and counted ([`Self::upkeep_faults`]), each report under a catch of
     /// its own: the stage hears the ones behind it.
     pub(super) fn tell_loads(&self, members: &mut Option<Follow>, newest: &LoadSnapshot) {
-        let engine = self.spec.engine();
+        let engine = self.document.spec.engine();
         if !engine.keeps_loads() {
             return;
         }

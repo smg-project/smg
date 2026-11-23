@@ -125,12 +125,12 @@ pub(super) fn alone(
     if !plain.wires.is_empty() && !plain.wires.contains(members.wires()) {
         return None;
     }
-    let profile = members.alone(&own.spec, model)?;
+    let profile = members.alone(&own.document.spec, model)?;
     let position = own.pick_over(profile, members, |state: RoutingState| state.eligible())?;
     Some(AlonePick {
         place: u32::try_from(position).ok()?,
         profile: profile.0,
-        generation: own.spec.generation(),
+        generation: own.document.spec.generation(),
     })
 }
 
@@ -152,7 +152,9 @@ pub(super) fn noted(
     let worker = members.workers().get(position)?;
     // The list's records name each worker once a list: a pick reads the id
     // there and hashes no address.
-    let id = *members.records(&own.spec, &own.clock).ids().get(position)?;
+    let document = &own.document;
+    let records = members.records(&document.spec, &own.clock);
+    let id = *records.ids().get(position)?;
     let dp_rank = records::worker_rank(worker.as_ref());
     let lease = Lease {
         id: LeaseId(own.leases.0.fetch_add(1, Ordering::Relaxed) + 1),
@@ -174,10 +176,9 @@ pub(super) fn noted(
         }),
         decode_session: Session::NONE,
     };
-    if own.hears.contains(EventKind::Issued) {
-        own.spec
-            .engine()
-            .on_decision_issued(&lease, &decided.decision);
+    if document.hears.contains(EventKind::Issued) {
+        let stages = document.spec.engine();
+        stages.on_decision_issued(&lease, &decided.decision);
     }
     Some(decided)
 }
@@ -258,7 +259,7 @@ pub(super) fn decide(
     now: Instant,
     whole: impl WholeDecision,
 ) -> Decision {
-    let spec = &own.spec;
+    let spec = &own.document.spec;
     let cx = request.constraints;
     if cx.subset_hint.is_some() {
         return declined(own, request, SUBSET_HINT);
@@ -337,7 +338,7 @@ fn by_facts<const RETRY: bool>(
     maker: &(impl RequestMaker + ?Sized),
     mut whole: impl WholeDecision,
 ) -> Decision {
-    let spec = &own.spec;
+    let spec = &own.document.spec;
     let (engine, workers) = (spec.engine(), members.workers());
     // A keyed request is decided by the rows its key names, where they say
     // what the whole pass would: its key's pin.
@@ -460,7 +461,7 @@ fn shed(
         wait_allowed: false,
         trace: Trace {
             seed: request.facts.seed,
-            generation: own.spec.generation(),
+            generation: own.document.spec.generation(),
             ..Trace::default()
         },
     })
@@ -485,7 +486,8 @@ pub(super) fn issued(
     now: Instant,
 ) -> DecideOutcome {
     let facts = &request.facts;
-    let leased = own.hears.intersects(EventSet::LEASE);
+    let document = &own.document;
+    let leased = document.hears.intersects(EventSet::LEASE);
     let noted = decision.pick().filter(|_| leased);
     let lease = noted.and_then(|pick| {
         let first = pick.targets.first()?;
@@ -502,12 +504,12 @@ pub(super) fn issued(
             tokens: facts.prompt_tokens,
         })
     });
-    let issue = own.hears.contains(EventKind::Issued);
+    let issue = document.hears.contains(EventKind::Issued);
     if let Some(lease) = lease.as_ref().filter(|_| issue) {
         // Asked behind the document's own word: a document whose stages
         // take no issue reads nothing of the pick here.
         if lease_events::stages_hear(&decision) {
-            own.spec.engine().on_decision_issued(lease, &decision);
+            document.spec.engine().on_decision_issued(lease, &decision);
         }
     }
     DecideOutcome {
@@ -921,7 +923,7 @@ pub(crate) mod tests {
         });
         let records = engine
             .members_of(members.lent())
-            .records(&engine.spec, &engine.clock);
+            .records(engine.spec(), &engine.clock);
         let stated: Vec<WorkerId> = (0..4).map(wide).collect();
         assert_eq!(records.ids(), stated);
         for (row, worker) in records.fixed().iter().zip(list.iter()) {
@@ -951,7 +953,7 @@ pub(crate) mod tests {
             .map(|worker| worker_id(worker.as_ref()))
             .collect();
         let unsaid = engine.members_of(unsaid.lent());
-        let records = unsaid.records(&engine.spec, &engine.clock);
+        let records = unsaid.records(engine.spec(), &engine.clock);
         assert_eq!(records.ids(), prints);
     }
 
@@ -976,7 +978,7 @@ pub(crate) mod tests {
             .collect();
         let records = engine
             .members_of(members.lent())
-            .records(&engine.spec, &engine.clock);
+            .records(engine.spec(), &engine.clock);
         assert_eq!(records.ids(), prints);
 
         // The stock sessions rule: a key's first request is placed and
@@ -3261,7 +3263,7 @@ pub(crate) mod tests {
                 takes: EventSet::NONE,
             }))
         });
-        assert_eq!(engine.hears, EventSet::LEASE);
+        assert_eq!(engine.document.hears, EventSet::LEASE);
         assert_eq!(
             told(&engine, &heard),
             ["issued", "dispatched", "completed", "issued", "released"]
@@ -3338,7 +3340,7 @@ pub(crate) mod tests {
     fn a_worker_said_gone_and_back_at_its_address_serves_its_sessions_again() {
         let (engine, both) = (preset("manual"), pool(2));
         let start = Instant::now();
-        let absence = Duration::from_micros(engine.spec.engine().pins_absence_micros());
+        let absence = Duration::from_micros(engine.spec().engine().pins_absence_micros());
         // The key's request over `list` in quarter `turn`: its worker.
         let sent = |list: &Arc<[Arc<dyn Worker>]>, turn: u32| {
             let members = PublishedList::new(Arc::clone(list));
