@@ -67,9 +67,10 @@ impl PolicyEngine {
     ///   the task ends at its first poll with a panic. The task runs the
     ///   engine's upkeep off a request's path, keeps the newest load
     ///   snapshot at hand, tells the document's stages a worker that
-    ///   joined or was removed, and tells the stages that keep load reports
-    ///   each new one: an engine whose task is never spawned does none of
-    ///   the four.
+    ///   joined or was removed, tells the stages that keep load reports
+    ///   each new one, and fills the cells of the worker lists the program
+    ///   handed ([`Self::set_lists`]): an engine whose task is never
+    ///   spawned does none of the five.
     ///
     /// Every hand-over of `data` is made when the call returns: no decision
     /// of the engine runs ahead of one. The task takes them at its first
@@ -84,6 +85,10 @@ impl PolicyEngine {
     /// channel, where it builds another load monitor ([`Self::set_loads`]),
     /// since a channel ends with its monitor. The registry and the indexes
     /// are handed here alone, and stand.
+    ///
+    /// The program's worker lists are not handed here yet: a program that
+    /// keeps a cell beside each list hands them by [`Self::set_lists`],
+    /// beside this call.
     ///
     /// [`DecisionGuard`]: crate::tracking::DecisionGuard
     #[must_use = "the engine's task does nothing until it is spawned"]

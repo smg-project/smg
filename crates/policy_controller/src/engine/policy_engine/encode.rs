@@ -170,8 +170,8 @@ impl EncodeLists<'_> {
     /// [`Self::decide`] over the engine's values of the pair's two lists,
     /// which its caller asked of their cells, and of the encoders' where
     /// its caller read it. The encoders' cell is else asked here, behind
-    /// every answer that reads no row of an encoder: a cell no decision
-    /// reads is not filled.
+    /// every answer that reads no row of an encoder: a decision fills no
+    /// cell it does not read.
     #[expect(
         clippy::too_many_arguments,
         reason = "a pair's inputs and the encode side's"

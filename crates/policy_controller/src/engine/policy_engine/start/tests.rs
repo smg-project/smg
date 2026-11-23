@@ -14,9 +14,10 @@ use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
         decision_engine::DecisionEngine,
-        list_cell::tests::PublishedList,
+        list_cell::{tests::PublishedList, ModelLists},
         policy_engine::{
             membership::tests::{
+                fills::{answered, Program},
                 handed, id, in_id_order, register, registry, remove, told, Registry,
             },
             overlap::{CacheIndex, CacheIndexes},
@@ -168,6 +169,46 @@ async fn a_started_engine_follows_the_registry_it_was_handed() {
     remove(&registry, 0);
     settle().await;
     assert_eq!(told(&heard), [("joined", id(2)), ("left", id(0))]);
+    task.abort();
+}
+
+/// The lists a program hands beside the start
+/// ([`PolicyEngine::set_lists`]) are the ones the engine's task fills, with
+/// no further call of the program's. The start spawns nothing: with the
+/// runtime turned and no task spawned, the program is asked for no model
+/// and no value is made. At its first step the task fills the cell of the
+/// list that stands, and behind a registration the cell of the model's
+/// newer list, each ahead of a request: a request over a list filled so
+/// makes no value.
+#[tokio::test(start_paused = true)]
+async fn a_started_engine_fills_the_cells_of_the_lists_it_was_handed() {
+    let program = Program::of(2);
+    let data = WorkerData {
+        registry: handed(&program.registry),
+        loads: None,
+        cache_indexes: None,
+    };
+    let (engine, task) = PolicyEngine::start(preset("least_load"), data);
+    engine.set_lists(Arc::clone(&program) as Arc<dyn ModelLists>);
+    settle().await;
+    assert!(program.asked().is_empty(), "nothing is asked with no task");
+    assert_eq!(engine.values_made(), 0);
+
+    let task = spawned(task).await;
+    assert_eq!(program.asked(), [MODEL]);
+    assert_eq!(engine.values_made(), 1, "the first step filled the cell");
+    let standing = program.published();
+    assert_eq!(answered(engine, &program, &standing), [true; 2]);
+    assert_eq!(engine.values_made(), 1, "the requests read the cell");
+
+    program.register(2);
+    settle().await;
+    assert_eq!(program.asked(), [MODEL]);
+    assert_eq!(engine.values_made(), 2, "the task filled the new cell");
+    let newer = program.published();
+    assert_eq!(answered(engine, &program, &newer), [true; 2]);
+    assert_eq!(engine.values_made(), 2, "the requests read the cell");
+    assert_eq!(engine.upkeep_faults(), 0);
     task.abort();
 }
 
