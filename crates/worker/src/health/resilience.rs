@@ -74,9 +74,15 @@ pub fn resolve_resilience(
 
     // Resolve circuit breaker config
     let cb_config = CircuitBreakerConfig {
-        failure_threshold: overrides
-            .cb_failure_threshold
-            .unwrap_or(base_cb.failure_threshold),
+        // A worker's own `disable_circuit_breaker` works as the router's
+        // flag does: by the threshold `u32::MAX`.
+        failure_threshold: if overrides.disable_circuit_breaker == Some(true) {
+            u32::MAX
+        } else {
+            overrides
+                .cb_failure_threshold
+                .unwrap_or(base_cb.failure_threshold)
+        },
         success_threshold: overrides
             .cb_success_threshold
             .unwrap_or(base_cb.success_threshold),
@@ -243,6 +249,32 @@ mod tests {
         assert_eq!(cb_config.timeout_duration, Duration::from_secs(60));
         // Non-overridden
         assert_eq!(cb_config.success_threshold, base_cb.success_threshold);
+    }
+
+    /// A worker registered with its breaker disabled gets the threshold the
+    /// router's flag gives every worker, whatever threshold stands beside
+    /// the flag.
+    #[test]
+    fn a_worker_with_its_breaker_disabled_keeps_its_circuit_closed() {
+        let overrides = ResilienceUpdate {
+            disable_circuit_breaker: Some(true),
+            cb_failure_threshold: Some(2),
+            ..Default::default()
+        };
+
+        let (_, cb_config) = resolve_resilience(
+            &RetryConfig::default(),
+            &CircuitBreakerConfig::default(),
+            true,
+            true,
+            &overrides,
+        );
+
+        assert_eq!(
+            cb_config.failure_threshold,
+            u32::MAX,
+            "a worker with its breaker disabled got a threshold its failures reach"
+        );
     }
 
     #[test]
