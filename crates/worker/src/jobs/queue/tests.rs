@@ -307,7 +307,7 @@ async fn a_mark_takes_the_failure_kept_under_its_id() {
     type Queue = JobQueue<Script<Work>>;
     let statuses = DashMap::new();
     let queue = ScriptQueue::<Work>::new(false).queue;
-    let Marks { marks, holders } = &*queue.cancelled_before_start;
+    let marks = &queue.cancelled_before_start;
     let id = WorkerId::new();
     // A mark set before the job's end: no failure is kept.
     queue.set_cancel_mark(&id);
@@ -322,8 +322,11 @@ async fn a_mark_takes_the_failure_kept_under_its_id() {
     queue.set_cancel_mark(&id);
     queue.set_cancel_mark(&id);
     queue.clear_cancel_mark(&id);
-    Queue::end_mark(&statuses, marks, holders, &id);
-    assert!(statuses.is_empty() && marks.is_empty() && holders.is_empty());
+    Queue::end_mark(&statuses, marks, &id);
+    assert!(statuses.is_empty() && marks.is_empty());
+    // The count of a mark that is gone goes when the next mark is set.
+    queue.set_cancel_mark(&WorkerId::new());
+    assert_eq!(queue.mark_holders.len(), 1);
 }
 
 #[tokio::test(start_paused = true)]

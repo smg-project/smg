@@ -117,16 +117,11 @@ pub struct JobQueue<H: JobHost> {
     /// That job's completion runs them in turn (`run_kept`).
     kept: Arc<DashMap<String, Kept<H::Job>>>,
     /// Cancel marks by id. A job reads and clears only the mark it owns.
-    cancelled_before_start: Arc<Marks>,
-}
-
-/// The cancel marks a job reads and, by id, how many `DELETE`s hold each:
-/// one that takes its own mark back leaves it while another holds it. The
-/// count ends with the job (`end_mark`), whoever took the mark.
-#[derive(Default)]
-struct Marks {
-    marks: DashSet<WorkerId>,
-    holders: DashMap<WorkerId, usize>,
+    cancelled_before_start: Arc<DashSet<WorkerId>>,
+    /// How many `DELETE`s hold the mark of an id: one that takes its own
+    /// mark back leaves it while another holds it. A count ends with its
+    /// mark: the next mark set drops the count of a mark that is gone.
+    mark_holders: DashMap<WorkerId, usize>,
 }
 
 /// A job handed to the dispatcher with the id of the waiter for its outcome,
@@ -297,7 +292,7 @@ impl<H: JobHost> JobQueue<H> {
         let concurrency_limit = Arc::new(Semaphore::new(config.max_concurrent_jobs));
         let outcomes: Outcomes = Arc::new(DashMap::new());
         let kept: Arc<DashMap<String, Kept<H::Job>>> = Arc::new(DashMap::new());
-        let cancelled_before_start = Arc::<Marks>::default();
+        let cancelled_before_start = Arc::new(DashSet::new());
 
         let queue = Arc::new(Self {
             tx,
@@ -308,6 +303,7 @@ impl<H: JobHost> JobQueue<H> {
             next_waiter_id: AtomicU64::new(1),
             kept: kept.clone(),
             cancelled_before_start: cancelled_before_start.clone(),
+            mark_holders: DashMap::new(),
         });
 
         // Single dispatcher task
@@ -510,7 +506,6 @@ impl<H: JobHost> JobQueue<H> {
         status_map: &Arc<DashMap<String, JobStatus>>,
         kept: &DashMap<String, Kept<H::Job>>,
         cancelled_before_start: &DashSet<WorkerId>,
-        holders: &DashMap<WorkerId, usize>,
     ) {
         while let Some(job) = Self::take_next(kept, worker_url, |next| {
             Self::claim_unless_in_flight(status_map, worker_url, next.job_type())
@@ -553,7 +548,7 @@ impl<H: JobHost> JobQueue<H> {
             }
             Self::record_job_completion(job_type, worker_url, start.elapsed(), &result, status_map);
             if let Some(id) = own_id {
-                Self::end_mark(status_map, cancelled_before_start, holders, &id);
+                Self::end_mark(status_map, cancelled_before_start, &id);
             }
         }
     }
@@ -707,21 +702,25 @@ impl<H: JobHost> JobQueue<H> {
 
     /// Sets the cancel mark a job of this id reads when it starts.
     pub fn set_cancel_mark(&self, id: &WorkerId) {
-        let Marks { marks, holders } = &*self.cancelled_before_start;
+        let marks = &self.cancelled_before_start;
+        // A mark its job or the job's end took leaves its count behind.
+        self.mark_holders.retain(|held, _| marks.contains(held));
         // The set changes under the count's lock, here and in a take-back.
-        let mut count = holders.entry(id.clone()).or_insert(0);
-        *count += 1;
-        marks.insert(id.clone());
+        let mut count = self.mark_holders.entry(id.clone()).or_insert(0);
+        *count = if marks.insert(id.clone()) {
+            1
+        } else {
+            *count + 1
+        };
     }
 
     /// Takes back the mark one `DELETE` set for this id. The mark stays
     /// while another `DELETE` holds it.
     pub fn clear_cancel_mark(&self, id: &WorkerId) {
-        let Marks { marks, holders } = &*self.cancelled_before_start;
-        if let Entry::Occupied(mut count) = holders.entry(id.clone()) {
+        if let Entry::Occupied(mut count) = self.mark_holders.entry(id.clone()) {
             *count.get_mut() -= 1;
             if *count.get() == 0 {
-                marks.remove(id);
+                self.cancelled_before_start.remove(id);
                 count.remove();
             }
         }
@@ -734,7 +733,7 @@ impl<H: JobHost> JobQueue<H> {
         status_map: Arc<DashMap<String, JobStatus>>,
         outcomes: Outcomes,
         kept: Arc<DashMap<String, Kept<H::Job>>>,
-        cancelled_before_start: Arc<Marks>,
+        cancelled_before_start: Arc<DashSet<WorkerId>>,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) {
         let Queued { job, waiter } = queued;
@@ -768,10 +767,9 @@ impl<H: JobHost> JobQueue<H> {
             Some(host) => {
                 // Read the id first. The host can release it when the job fails.
                 let own_id = host.mark_id(&job);
-                let Marks { marks, holders } = &*cancelled_before_start;
                 let ended_by_delete = AtomicBool::new(false);
                 let run = JobRun {
-                    cancelled_before_start: marks,
+                    cancelled_before_start: &cancelled_before_start,
                     own_id: own_id.as_ref(),
                     ended_by_delete: &ended_by_delete,
                 };
@@ -780,7 +778,7 @@ impl<H: JobHost> JobQueue<H> {
                 if let (Some(id), Err(error)) = (&own_id, &result) {
                     Self::keep_own_failure(
                         &status_map,
-                        marks,
+                        &cancelled_before_start,
                         id,
                         ended_by_delete.load(Ordering::Relaxed),
                         job_type,
@@ -793,10 +791,17 @@ impl<H: JobHost> JobQueue<H> {
                 }
                 Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
                 if let Some(id) = own_id {
-                    Self::end_mark(&status_map, marks, holders, &id);
+                    Self::end_mark(&status_map, &cancelled_before_start, &id);
                 }
                 Self::deliver_outcome(&outcomes, &worker_url, waiter, result);
-                Self::run_kept(&worker_url, &host, &status_map, &kept, marks, holders).await;
+                Self::run_kept(
+                    &worker_url,
+                    &host,
+                    &status_map,
+                    &kept,
+                    &cancelled_before_start,
+                )
+                .await;
             }
             None => {
                 let error_msg = format!("{} dropped", H::NAME);
@@ -841,15 +846,7 @@ impl<H: JobHost> JobQueue<H> {
     /// Ends the mark of a job's id with the job. A mark still set was set
     /// after the job's reads, by a `DELETE` that was told it ended the
     /// registration: the failure kept under the id goes with the mark.
-    fn end_mark(
-        status_map: &DashMap<String, JobStatus>,
-        marks: &DashSet<WorkerId>,
-        holders: &DashMap<WorkerId, usize>,
-        id: &WorkerId,
-    ) {
-        // The count first: a mark set between the two keeps its count for
-        // its take-back.
-        holders.remove(id);
+    fn end_mark(status_map: &DashMap<String, JobStatus>, marks: &DashSet<WorkerId>, id: &WorkerId) {
         if marks.remove(id).is_some() {
             status_map.remove(id.as_str());
         }
