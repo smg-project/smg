@@ -2225,7 +2225,11 @@ impl<G: Generation> WorkerMonitor<G> {
                 let one_engine = answer.ranks_are_dp_ranks();
                 let left =
                     value_bounds::bound_ranks(&mut answer.loads, member.dp_rank(), one_engine);
-                if one_engine && left != 0 {
+                if member.dp_rank().is_some() {
+                    // `for_dp_rank` counted the scoped rows, a repeated one
+                    // among them: a pinned member's count is its rows kept.
+                    answer.dp_rank_count = i32::try_from(answer.loads.len()).unwrap_or(i32::MAX);
+                } else if one_engine && left != 0 {
                     let left = i32::try_from(left).unwrap_or(i32::MAX);
                     answer.dp_rank_count = answer.dp_rank_count.saturating_sub(left).max(0);
                 }
@@ -3451,7 +3455,9 @@ mod native_loads_tests {
     /// rank, by either path: the rows its poll's answer states and the
     /// records its stream pushes. Rank 64 is dropped on both, and of a rank
     /// an answer states twice the first row stands: the bound is by rank,
-    /// not by place, and the answer counts the ranks kept.
+    /// not by place, and the answer counts the ranks kept. The worker
+    /// registered for rank 64 keeps it by either path, counted once where
+    /// the engine states it twice.
     #[tokio::test]
     async fn a_load_report_considers_the_ranks_below_64() {
         let mut answer = host_answer(65);
@@ -3463,13 +3469,25 @@ mod native_loads_tests {
             .pop()
             .flatten()
             .expect("the source's answer");
+        let mut twice = host_answer(65);
+        twice.loads.push(twice.loads[64].clone());
+        let connector = SourceConnector::keeping(Some(twice));
+        let ranked = hosted_worker("http://ranked.invalid:8000", &connector, Some((64, 65)));
+        let kept = engine_fetch(vec![Arc::clone(&ranked)], &DashMap::new())
+            .await
+            .pop()
+            .flatten()
+            .expect("the source's answer");
 
         let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
         registry.register(Arc::clone(&worker)).unwrap();
+        registry.register(Arc::clone(&ranked)).unwrap();
         for rank in 0..65 {
             monitor.apply_pushed_load(&worker, rank, &PushedRecord::requests(3, 0), Instant::now());
         }
+        monitor.apply_pushed_load(&ranked, 64, &PushedRecord::requests(3, 0), Instant::now());
         let pushed = monitor.pushed_reports.lock();
+        let filed = &pushed[ranked.url()].report.loads;
         let pushed = &pushed[worker.url()].report.loads;
 
         let last = |loads: &[SchedulerLoadSnapshot]| loads.last().map(|load| load.dp_rank);
@@ -3478,6 +3496,8 @@ mod native_loads_tests {
             (64, 64, 64)
         );
         assert_eq!((last(&polled.loads), last(pushed)), (Some(63), Some(63)));
+        assert_eq!((kept.loads.len(), kept.dp_rank_count), (1, 1));
+        assert_eq!((last(&kept.loads), last(filed)), (Some(64), Some(64)));
     }
 
     /// The rank workers of one engine share one call of their source: the
@@ -5098,6 +5118,9 @@ mod native_loads_tests {
         const RANK_1_OF_FOUR: &str = r#"{"dp_rank_count":4,"loads":[
             {"dp_rank":1,"num_running_reqs":8,"num_waiting_reqs":0,
              "num_used_tokens":500,"max_total_num_tokens":1000}]}"#;
+        const RANK_64_OF_65: &str = r#"{"dp_rank_count":65,"loads":[
+            {"dp_rank":64,"num_running_reqs":8,"num_waiting_reqs":0,
+             "num_used_tokens":500,"max_total_num_tokens":1000}]}"#;
         let after = next_record_after_a_poll_omits_quiet_rank_0(RANK_1_OF_FOUR, &[]).await;
         assert_eq!(
             after.rows,
@@ -5114,6 +5137,15 @@ mod native_loads_tests {
             after.cached_after_poll,
             Some(vec![(1, 500)]),
             "the rank cache takes the short answer's row"
+        );
+
+        // The same of a short answer whose one row is of a rank the report
+        // does not consider: it lists no row and still counts ranks.
+        let after = next_record_after_a_poll_omits_quiet_rank_0(RANK_64_OF_65, &[]).await;
+        assert_eq!(
+            (after.rows, after.mode),
+            (vec![(0, 10), (1, 8)], PollMode::Fallback),
+            "the rows and rank 0's receipt stay on file"
         );
     }
 
