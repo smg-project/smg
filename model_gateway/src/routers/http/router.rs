@@ -329,7 +329,12 @@ impl Router {
     /// Filters to workers serving the specified model. When model is "unknown"
     /// (generate endpoint without model), considers all HTTP workers. `tried`
     /// are the engines the request's failed attempts dispatched to (see
-    /// `PlacementInputs::tried`).
+    /// `PlacementInputs::tried`). `stated` states what the policy engine
+    /// alone reads of the request ([`placement::Stated`]): the placement
+    /// calls it where the engine decides and nowhere else, so a body is read
+    /// for it under the engine alone. Always inlined, as the placement's
+    /// front is: a classic placement's way builds nothing for the call.
+    #[inline(always)]
     #[expect(
         clippy::too_many_arguments,
         reason = "selection threads every routing input the policy consumes"
@@ -345,6 +350,7 @@ impl Router {
         cache_namespace: Option<CacheNamespace>,
         candidate_filter: Option<CandidateFilter<'_>>,
         tried: &[String],
+        stated: impl FnOnce() -> placement::Stated,
     ) -> Option<placement::Placed> {
         // This router proxies plain HTTP to the worker's URL, so only HTTP
         // workers are candidates; nothing pins a wire on this path.
@@ -364,6 +370,7 @@ impl Router {
                 candidate_filter,
                 tried,
             },
+            stated,
         )
     }
 
@@ -779,6 +786,7 @@ impl Router {
                     view.cache_namespace,
                     candidate_filter,
                     &tried,
+                    move || placement::Stated::of_limit(view.request.max_output_tokens()),
                 )
             })
         }) {
@@ -1278,6 +1286,7 @@ impl Router {
                 candidate_filter: None,
                 tried: &[],
             },
+            placement::Stated::nothing,
         ) else {
             // Judged from the same candidates whether the pre-filter emptied
             // or a self-filtering policy missed on an all-overloaded pool, so
@@ -2365,6 +2374,8 @@ impl Router {
             None,
             None,
             &[],
+            // No body is parsed on this path: nothing is stated.
+            placement::Stated::nothing,
         ) else {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
             return Err(req);
@@ -3522,6 +3533,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                placement::Stated::nothing,
             )
             .unwrap();
         assert!(selected.is_available());
@@ -3540,6 +3552,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                placement::Stated::nothing,
             )
             .is_none());
     }
@@ -7446,6 +7459,44 @@ mod tests {
         assert_eq!(
             *heard.lock().expect("the stage heard"),
             ["issued", "dispatched Single", "completed Cancelled"]
+        );
+    }
+
+    /// A typed request states its body's output limit to the policy engine:
+    /// the route reads the body for it where the engine decides, through the
+    /// body's own reader. A body that names no limit states none, as the
+    /// case above hears.
+    #[tokio::test]
+    async fn the_engine_reads_the_output_limit_a_typed_request_states() {
+        let url = spawn_sized_worker(r#"{"choices":[]}"#, "application/json").await;
+        let router = streaming_router(
+            PolicyConfig::RoundRobin,
+            1024 * 1024,
+            vec![plain_worker(&url)],
+        );
+        let heard = hearing_engine_on(&router.policy_registry);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_completion_tokens": 64,
+        }))
+        .unwrap();
+
+        let response = router
+            .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            [
+                "limit 64",
+                "issued",
+                "dispatched Single",
+                "completed Cancelled"
+            ]
         );
     }
 

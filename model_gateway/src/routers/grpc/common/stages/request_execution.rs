@@ -5454,7 +5454,7 @@ pub(crate) mod tests {
             routers::common::placement::{
                 select_pair,
                 tests::{hearing_pairs_on, one_pair, pairs_of, MODEL},
-                PlacementInputs,
+                PlacementInputs, Stated,
             },
         };
 
@@ -5463,7 +5463,16 @@ pub(crate) mod tests {
         let selected = |policies: &PolicyRegistry, runtime_type| {
             let pairs = pairs_of(&registry, policies);
             let inputs = PlacementInputs::default();
-            let pair = select_pair(&registry, policies, MODEL, &pairs, None, None, inputs);
+            let pair = select_pair(
+                &registry,
+                policies,
+                MODEL,
+                &pairs,
+                None,
+                None,
+                inputs,
+                Stated::nothing,
+            );
             let pair = pair.expect("the pair is placed");
             WorkerSelection::Disaggregated {
                 encode_assignments: None,

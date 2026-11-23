@@ -235,7 +235,7 @@ pub mod bench_support {
     use super::{
         attempt_ledger::AttemptLedger,
         overload,
-        placement::{select_pair, select_single, Placed, PlacementInputs},
+        placement::{select_pair, select_single, Placed, PlacementInputs, Stated},
     };
     use crate::{
         config::RouterConfig,
@@ -334,7 +334,15 @@ pub mod bench_support {
             headers,
             ..Default::default()
         };
-        let worker = select_single(registry, policies, model, pool, None, inputs)?;
+        let worker = select_single(
+            registry,
+            policies,
+            model,
+            pool,
+            None,
+            inputs,
+            Stated::nothing,
+        )?;
         let shed =
             overload::shed_if_worker_overloaded(&*worker, model, registry.overload_shed_enabled());
         if shed.is_some() {
@@ -365,7 +373,17 @@ pub mod bench_support {
             tokens,
             ..Default::default()
         };
-        let pair = select_pair(registry, policies, model, &pairs, None, None, inputs).ok()?;
+        let pair = select_pair(
+            registry,
+            policies,
+            model,
+            &pairs,
+            None,
+            None,
+            inputs,
+            Stated::nothing,
+        )
+        .ok()?;
         let went = placed_on(pair.prefill.worker());
         let key = policies.sticky_key(None, None);
         let prefill = pair.prefill.into_guard(key);
@@ -451,6 +469,7 @@ pub mod bench_support {
                 RoutingPool::GrpcPipelineRegular,
                 None,
                 inputs,
+                Stated::nothing,
             )
             .map(Placed::into_worker)
         }
@@ -504,6 +523,7 @@ pub mod bench_support {
                     None,
                     None,
                     inputs,
+                    Stated::nothing,
                 )
                 .ok()
                 .map(|pair| (pair.prefill.into_worker(), pair.decode.into_worker()))

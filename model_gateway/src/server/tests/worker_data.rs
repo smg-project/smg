@@ -26,7 +26,7 @@ use crate::{
     policies::kv_index::{event_monitor::bench_support::IndexFeed, index_backend::KvIndex},
     routers::{
         common::{
-            placement::{select_single, PlacementInputs},
+            placement::{select_single, PlacementInputs, Stated},
             snapshot::RoutingPool,
         },
         grpc::backend_client::BasicWorkerBuilder,
@@ -246,6 +246,7 @@ async fn the_started_engine_places_by_the_cache_events_the_monitor_applied() {
                 tokens: Some(tokens),
                 ..Default::default()
             },
+            Stated::nothing,
         )
         .expect("a worker is selectable");
         assert_eq!(placed.worker().url(), HOLDER);

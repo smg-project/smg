@@ -36,7 +36,7 @@ use crate::{
     config::{PolicyConfig, RouterConfig},
     routers::{
         common::{
-            placement::{select_single, PlacementInputs},
+            placement::{select_single, PlacementInputs, Stated},
             snapshot::RoutingPool,
         },
         grpc::backend_client::{get_backend_client, BackendConnector, BasicWorkerBuilder, Fronted},
@@ -601,6 +601,7 @@ async fn a_model_only_a_peers_worker_serves_is_placed_by_the_default_policy() {
         RoutingPool::GrpcPipelineRegular,
         None,
         PlacementInputs::default(),
+        Stated::nothing,
     )
     .unwrap();
     assert!(Arc::ptr_eq(placed.worker(), &worker));

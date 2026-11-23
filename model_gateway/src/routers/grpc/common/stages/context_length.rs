@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use openai_protocol::common::GenerationRequest;
 use smg_worker::identity::basic::{ConnectionMode, Worker, WorkerType};
 use tracing::debug;
 
@@ -110,6 +111,14 @@ impl ContextRequirements {
             scoring_position,
             output_tokens,
         }
+    }
+
+    /// The request's completion budget as [`Self::new`] captured it: what a
+    /// selection states to the policy engine as the answer's limit. `None`
+    /// where the body names none, and for requirements that were not
+    /// captured (the encode-prefill-decode mode's default).
+    pub(crate) fn output_tokens(self) -> Option<u32> {
+        self.output_tokens
     }
 
     /// Unknown windows remain eligible; no character estimate or token sum is used.
@@ -337,22 +346,17 @@ fn output_context_length(workers: &WorkerSelection, model_id: &str) -> Option<u3
     }
 }
 
-/// The completion budget the request names, on the routes that carry one.
-fn output_budget(request_type: &RequestType) -> Option<u32> {
+/// The completion budget the request names, on the routes that carry one:
+/// the body's one reader answers it
+/// ([`GenerationRequest::max_output_tokens`]), which the HTTP routes read
+/// too, so the two wires state one limit.
+pub(crate) fn output_budget(request_type: &RequestType) -> Option<u32> {
     match request_type {
-        RequestType::Chat(request) => {
-            #[expect(deprecated, reason = "the request may predate normalization")]
-            {
-                request.max_completion_tokens.or(request.max_tokens)
-            }
-        }
-        RequestType::Completion(request) => request.max_tokens,
-        RequestType::Messages(request) => Some(request.max_tokens),
-        RequestType::Responses(request) => request.max_output_tokens,
-        RequestType::Generate(request) => request
-            .sampling_params
-            .as_ref()
-            .and_then(|params| params.max_new_tokens),
+        RequestType::Chat(request) => request.max_output_tokens(),
+        RequestType::Completion(request) => request.max_output_tokens(),
+        RequestType::Messages(request) => request.max_output_tokens(),
+        RequestType::Responses(request) => request.max_output_tokens(),
+        RequestType::Generate(request) => request.max_output_tokens(),
         RequestType::Embedding(_)
         | RequestType::Classify(_)
         | RequestType::Decisions(_)

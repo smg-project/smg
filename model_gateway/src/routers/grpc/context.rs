@@ -1104,8 +1104,10 @@ impl LoadGuards {
         }
     }
 
-    /// [`Self::new`] for a pair whose decode goes out behind its prefill:
-    /// one request of a sequential dispatch. The decode's guard is made
+    /// [`Self::new`] for a pair whose decode is owed its ask and its send
+    /// behind its prefill ([`Placed::owed_behind_prefill`]): one request of
+    /// a sequential dispatch that the policy engine placed. A classic
+    /// pair's takes [`Self::new`]. The decode's guard is made
     /// ahead of its send ([`Placed::ahead`]): the decode is counted from
     /// here, and the dispatch says its send where the decode goes out
     /// ([`Self::map_decode`], in `execute_sequential_pd`).

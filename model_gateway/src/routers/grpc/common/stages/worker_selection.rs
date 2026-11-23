@@ -2127,14 +2127,17 @@ impl WorkerSelectionStage {
         tried: &[String],
     ) -> Option<Placed> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
-        let context = context.left_by(&snapshot, &[RoutingPool::GrpcPipelineRegular], model_id);
+        // What the pool's windows leave of the demand narrows the candidates.
+        // The demand as the request states it keeps the budget the policy
+        // engine is told.
+        let left = context.left_by(&snapshot, &[RoutingPool::GrpcPipelineRegular], model_id);
         let accepts = |worker: &dyn Worker| {
             admits.is_none_or(|admits| admits(worker))
                 && media.accepts(worker)
-                && context.admits(worker, model_id)
+                && left.admits(worker, model_id)
         };
         let candidate_filter: Option<CandidateFilter<'_>> =
-            if admits.is_none() && media == MediaDemands::NONE && context.binds_nobody() {
+            if admits.is_none() && media == MediaDemands::NONE && left.binds_nobody() {
                 None
             } else {
                 Some(&accepts)
@@ -2151,6 +2154,7 @@ impl WorkerSelectionStage {
             wire,
             candidate_filter,
             tried,
+            move || placement::Stated::of_limit(context.output_tokens()),
         )
     }
 
@@ -2184,6 +2188,7 @@ impl WorkerSelectionStage {
             wire,
             candidate_filter,
             &[],
+            placement::Stated::nothing,
         )
         .map(Placed::into_worker)
     }
@@ -2192,7 +2197,9 @@ impl WorkerSelectionStage {
     /// snapshot the caller read the pool's window floor from. `tried` are
     /// the engines the request's failed attempts dispatched to, skipped
     /// while another available candidate is left (see
-    /// `PlacementInputs::tried`); a first attempt has none.
+    /// `PlacementInputs::tried`); a first attempt has none. `stated` states
+    /// what the policy engine alone reads of the request, and is called
+    /// where the engine decides and nowhere else ([`placement::Stated`]).
     #[expect(
         clippy::too_many_arguments,
         reason = "selection threads every routing input the policy consumes"
@@ -2210,6 +2217,7 @@ impl WorkerSelectionStage {
         wire: Option<WireConstraint>,
         candidate_filter: Option<CandidateFilter<'_>>,
         tried: &[String],
+        stated: impl FnOnce() -> placement::Stated,
     ) -> Option<Placed> {
         // A retry pins the retained wire, and with it the media pin and the
         // pipeline pin, on top of whatever the caller excludes.
@@ -2246,6 +2254,7 @@ impl WorkerSelectionStage {
                 candidate_filter,
                 tried,
             },
+            stated,
         )
     }
 
@@ -2329,12 +2338,15 @@ impl WorkerSelectionStage {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
         let (prefill_pool, decode_pool) = PdWire::Grpc.pools();
-        let demand = demand.with_context(demand.context.left_by(
+        // What the pools' windows leave of the demand narrows the pairs. The
+        // demand as the request states it keeps the budget the policy engine
+        // is told.
+        let left = demand.with_context(demand.context.left_by(
             &snapshot,
             &[prefill_pool, decode_pool],
             model_id,
         ));
-        let pair = Self::with_pd_pair_inputs(model_id, inputs, wire, demand, &pairs, |inputs| {
+        let pair = Self::with_pd_pair_inputs(model_id, inputs, wire, left, &pairs, |inputs| {
             placement::select_pair(
                 &self.worker_registry,
                 &self.policy_registry,
@@ -2343,6 +2355,7 @@ impl WorkerSelectionStage {
                 wire,
                 prefill_capacity,
                 inputs,
+                move || placement::Stated::of_limit(demand.context.output_tokens()),
             )
         })?;
         Ok((pair.prefill, pair.decode, pair.runtime))
@@ -2586,6 +2599,10 @@ impl WorkerSelectionStage {
                 candidate_filter: Some(&eligible),
                 ..inputs
             },
+            // This mode states nothing for the policy engine alone: its
+            // admission is handed no reading of the body, and under the
+            // engine it refuses a request that carries an item (above).
+            placement::Stated::nothing,
         )
         .map_err(EpdSelectionFailure::Placement)?;
         let handoff = PdProtocol::encode_handoff(pair.runtime);
@@ -3949,6 +3966,62 @@ mod tests {
         // A selection no guard was made from gives its lease up.
         drop(regular_pick(&stage, model_id, None));
         assert_eq!(said()[3..], ["issued", "released Abandoned"]);
+    }
+
+    /// The stage states the request's completion budget to the policy engine
+    /// as the answer's limit. The regular selection reads it off the context
+    /// requirements it is handed, a first attempt's and a retry's alike, and
+    /// the pair selection off its demand as the request states it. What the
+    /// pools' windows leave of the demand is not what is stated: here no
+    /// worker names a window, so nothing of the demand is left to check. A
+    /// request with no budget states none.
+    #[test]
+    fn the_stage_states_the_requests_budget_to_the_engine() {
+        use crate::routers::common::placement::tests::{hearing_engine_on, hearing_pairs_on};
+
+        let budget = ContextRequirements::of_demand(8, false, Some(64));
+
+        let model_id = "test-model-engine-limit";
+        let (stage, policies) = stage_and_policies(model_id, 2);
+        let heard = hearing_engine_on(&policies);
+        let pick = |context: ContextRequirements| {
+            stage
+                .select_regular(
+                    model_id,
+                    context,
+                    MediaDemands::NONE,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &[],
+                )
+                .expect("a worker")
+        };
+        drop(pick(budget));
+        drop(pick(ContextRequirements::default()));
+        let released = "released Abandoned";
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            ["limit 64", "issued", released, "issued", released]
+        );
+
+        let model_id = "test-model-engine-pair-limit";
+        let registry = Arc::new(WorkerRegistry::new());
+        register_pd_workers(&registry, model_id, 1);
+        let stage = round_robin_pd_stage(Arc::clone(&registry));
+        let heard = hearing_pairs_on(&stage.policy_registry, false);
+        let demand = PairDemands::default().with_context(budget);
+        let placed = stage.placed_pd_pair(model_id, PlacementInputs::default(), None, None, demand);
+        drop(placed.unwrap_or_else(|_| panic!("the engine places the pair")));
+        assert_eq!(
+            heard.lock().expect("the stage heard")[..2],
+            ["limit 64", "issued"]
+        );
     }
 
     /// The regular stage hands the engine the body's `rid` as the request

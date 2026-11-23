@@ -1244,6 +1244,10 @@ impl GenerationRequest for ChatCompletionRequest {
         self.rid.as_deref()
     }
 
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.output_token_cap()
+    }
+
     fn is_stream(&self) -> bool {
         self.stream
     }

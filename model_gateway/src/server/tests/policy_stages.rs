@@ -17,7 +17,7 @@ use crate::{
     config::RouterConfig,
     routers::{
         common::{
-            placement::{select_single, PlacementInputs},
+            placement::{select_single, PlacementInputs, Stated},
             snapshot::RoutingPool,
         },
         grpc::backend_client::BasicWorkerBuilder,
@@ -121,6 +121,7 @@ async fn a_hosts_stage_named_by_its_document_places_the_gateways_requests() {
             RoutingPool::HttpRegular,
             None,
             PlacementInputs::default(),
+            Stated::nothing,
         )
         .expect("the stage keeps one worker");
         assert_eq!(placed.worker().url(), KEPT);
