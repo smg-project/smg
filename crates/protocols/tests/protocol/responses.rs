@@ -5778,3 +5778,67 @@ fn agent_message_rejects_unknown_content_part() {
         "expected part-scoped refusal, got: {msg}"
     );
 }
+
+#[test]
+fn reasoning_input_accepts_null_content_and_optional_id() {
+    // Matches cross-model continuation history (reasoning with explicit
+    // `content: null`, omitted `content`, empty `[]`, and non-empty content)
+    // and Codex tool-output follow-ups where `reasoning.id` is omitted or null.
+    let req: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "input": [
+            {
+                "type": "reasoning",
+                "id": "rs_omitted_content",
+                "summary": [{"type": "summary_text", "text": "s0"}]
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_empty_content",
+                "summary": [],
+                "content": []
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_null_content",
+                "summary": [{"type": "summary_text", "text": "s1"}],
+                "content": null,
+                "encrypted_content": "gAAAAB-opaque"
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_with_content",
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": "step 1"}]
+            },
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "no id"}]
+            },
+            {
+                "type": "reasoning",
+                "id": null,
+                "summary": [],
+                "content": null
+            }
+        ]
+    }))
+    .expect("reasoning items with null content and optional id should deserialize");
+
+    req.validate().expect("reasoning items should validate");
+
+    let wire = serde_json::to_value(&req).unwrap();
+    let items = wire["input"].as_array().unwrap();
+    assert_eq!(items[0]["id"], "rs_omitted_content");
+    assert!(items[0].get("content").is_none());
+    assert_eq!(items[1]["id"], "rs_empty_content");
+    assert!(items[1].get("content").is_none());
+    assert_eq!(items[2]["id"], "rs_null_content");
+    assert!(items[2].get("content").is_none());
+    assert_eq!(items[2]["summary"][0]["text"], "s1");
+    assert_eq!(items[2]["encrypted_content"], "gAAAAB-opaque");
+    assert_eq!(items[3]["content"][0]["text"], "step 1");
+    assert!(items[4].get("id").is_none());
+    assert!(items[5].get("id").is_none());
+    assert!(items[5].get("content").is_none());
+}

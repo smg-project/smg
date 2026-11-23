@@ -80,10 +80,10 @@ pub(crate) fn format_agent_message_text(
 }
 
 /// Lower Codex-specific Responses input items (`additional_tools`,
-/// `agent_message`) into standard top-level `tools` and `user` `message` items
+/// `agent_message`, and `reasoning` items missing an `id`) into standard forms
 /// understood by local HTTP/PD/gRPC inference backends.
 ///
-/// Requests that contain neither item return immediately without allocating.
+/// Requests that need no lowering return immediately without allocating.
 pub(crate) fn lower_responses_request_for_local_backend(
     request: &mut ResponsesRequest,
 ) -> Result<(), Response> {
@@ -91,12 +91,11 @@ pub(crate) fn lower_responses_request_for_local_backend(
         return Ok(());
     };
 
-    let needs_lowering = items.iter().any(|item| {
-        matches!(
-            item,
-            ResponseInputOutputItem::AdditionalTools { .. }
-                | ResponseInputOutputItem::AgentMessage { .. }
-        )
+    let needs_lowering = items.iter().any(|item| match item {
+        ResponseInputOutputItem::AdditionalTools { .. }
+        | ResponseInputOutputItem::AgentMessage { .. } => true,
+        ResponseInputOutputItem::Reasoning { id, .. } => id.as_deref().is_none_or(str::is_empty),
+        _ => false,
     });
     if !needs_lowering {
         return Ok(());
@@ -164,7 +163,14 @@ pub(crate) fn lower_responses_request_for_local_backend(
                     phase: None,
                 });
             }
-            other => lowered_items.push(other),
+            mut other => {
+                if let ResponseInputOutputItem::Reasoning { id, .. } = &mut other {
+                    if id.as_deref().is_none_or(str::is_empty) {
+                        *id = Some(generate_id("rs"));
+                    }
+                }
+                lowered_items.push(other);
+            }
         }
     }
 
@@ -618,5 +624,56 @@ mod tests {
         assert_eq!(members[1]["name"], "exec_command");
         assert_eq!(wire["tool_choice"]["namespace"], "functions");
         assert_eq!(wire["tool_choice"]["name"], "exec_command");
+    }
+
+    #[test]
+    fn lowers_missing_reasoning_id_for_local_backends() {
+        let mut req = parse_request(json!({
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "check status"},
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "thinking"}],
+                    "content": null
+                },
+                {
+                    "type": "reasoning",
+                    "id": null,
+                    "summary": []
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_existing",
+                    "summary": [],
+                    "encrypted_content": "opaque"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "exec_command",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok"
+                }
+            ]
+        }));
+
+        lower_responses_request_for_local_backend(&mut req)
+            .expect("missing/null reasoning ids should be lowered");
+
+        let wire = serde_json::to_value(&req).unwrap();
+        let items = wire["input"].as_array().unwrap();
+        let generated_1 = items[1]["id"].as_str().expect("missing id synthesized");
+        let generated_2 = items[2]["id"].as_str().expect("null id synthesized");
+        assert!(generated_1.starts_with("rs_"), "{generated_1}");
+        assert!(generated_2.starts_with("rs_"), "{generated_2}");
+        assert_ne!(generated_1, generated_2);
+        assert!(items[1].get("content").is_none());
+        assert_eq!(items[3]["id"], "rs_existing");
+        assert_eq!(items[3]["encrypted_content"], "opaque");
     }
 }

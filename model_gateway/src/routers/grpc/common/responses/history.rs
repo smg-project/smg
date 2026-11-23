@@ -618,7 +618,6 @@ async fn resolve_item_references(
 fn input_item_id(item: &ResponseInputOutputItem) -> Option<&str> {
     match item {
         ResponseInputOutputItem::Message { id, .. }
-        | ResponseInputOutputItem::Reasoning { id, .. }
         | ResponseInputOutputItem::McpApprovalRequest { id, .. }
         | ResponseInputOutputItem::ImageGenerationCall { id, .. }
         | ResponseInputOutputItem::ComputerCall { id, .. }
@@ -626,7 +625,8 @@ fn input_item_id(item: &ResponseInputOutputItem) -> Option<&str> {
         | ResponseInputOutputItem::LocalShellCallOutput { id, .. }
         | ResponseInputOutputItem::McpCall { id, .. }
         | ResponseInputOutputItem::McpListTools { id, .. } => Some(id.as_str()),
-        ResponseInputOutputItem::AdditionalTools { id, .. }
+        ResponseInputOutputItem::Reasoning { id, .. }
+        | ResponseInputOutputItem::AdditionalTools { id, .. }
         | ResponseInputOutputItem::AgentMessage { id, .. }
         | ResponseInputOutputItem::FunctionToolCall { id, .. }
         | ResponseInputOutputItem::FunctionCallOutput { id, .. }
@@ -1490,7 +1490,7 @@ pub(crate) mod tests {
         assert!(matches!(
             reasoning,
             ResponseInputOutputItem::Reasoning { ref id, ref content, .. }
-                if id == "reasoning_1" && content.len() == 1
+                if id.as_deref() == Some("reasoning_1") && content.len() == 1
         ));
 
         // a row with no input form is left out, not an error

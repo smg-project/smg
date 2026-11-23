@@ -1891,11 +1891,17 @@ pub enum ResponseInputOutputItem {
     #[serde(rename = "reasoning")]
     #[non_exhaustive]
     Reasoning {
-        id: String,
-        #[serde(default)]
+        /// Optional on input: Codex models `reasoning.id` as optional and
+        /// strips non-conforming IDs before resending history.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
         summary: Vec<SummaryTextContent>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        #[serde(default)]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_null_as_empty_vec",
+            skip_serializing_if = "Vec::is_empty"
+        )]
         content: Vec<ResponseReasoningContent>,
         /// Encrypted reasoning payload for gpt-5 / o-series round-trip via
         /// `previous_response_id`. Opaque to SMG; preserved verbatim.
@@ -2615,10 +2621,11 @@ enum TaggedItem {
     },
     #[serde(rename = "reasoning")]
     Reasoning {
-        id: String,
         #[serde(default)]
+        id: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
         summary: Vec<SummaryTextContent>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
         content: Vec<ResponseReasoningContent>,
         #[serde(default)]
         encrypted_content: Option<String>,
@@ -3208,12 +3215,12 @@ pub enum ResponseOutputItem {
     #[non_exhaustive]
     Reasoning {
         id: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
         summary: Vec<SummaryTextContent>,
         /// The reasoning text. The public API does not require the key and
-        /// often leaves it out, so an item written without it reads as
-        /// having none.
-        #[serde(default)]
+        /// often leaves it out (or writes `null`), so an item written without
+        /// it reads as having none.
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
         content: Vec<ResponseReasoningContent>,
         /// Encrypted reasoning payload for gpt-5 / o-series round-trip.
         /// Opaque to SMG; preserved verbatim.
@@ -5658,7 +5665,7 @@ impl ResponseInputOutputItem {
         status: Option<String>,
     ) -> Self {
         Self::Reasoning {
-            id,
+            id: Some(id),
             summary,
             content,
             encrypted_content: None,
@@ -5677,7 +5684,7 @@ impl ResponseInputOutputItem {
         status: Option<String>,
     ) -> Self {
         Self::Reasoning {
-            id,
+            id: Some(id),
             summary,
             content,
             encrypted_content: Some(encrypted_content),
@@ -6011,7 +6018,7 @@ mod tests {
         r#"{"type":"additional_tools","tools":[]}"#,
         r#"{"type":"agent_message","author":"root","recipient":"worker","content":[]}"#,
         r#"{"type":"message","id":"msg_1","role":"user","content":[]}"#,
-        r#"{"type":"reasoning","id":"rs_1"}"#,
+        r#"{"type":"reasoning","content":null}"#,
         r#"{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}"#,
         r#"{"type":"function_call_output","call_id":"call_1","output":"found"}"#,
         r#"{"type":"mcp_approval_request","id":"mcpr_1","server_label":"docs","name":"search","arguments":"{}"}"#,
@@ -6694,7 +6701,7 @@ mod tests {
                     phase: None,
                 },
                 ResponseInputOutputItem::Reasoning {
-                    id: "r1".to_string(),
+                    id: Some("r1".to_string()),
                     summary: vec![],
                     content: vec![ResponseReasoningContent::ReasoningText {
                         text: "five".to_string(),
