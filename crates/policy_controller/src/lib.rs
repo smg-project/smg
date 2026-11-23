@@ -173,6 +173,9 @@ mod address;
 pub mod document;
 pub mod engine;
 pub mod load;
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+pub mod mirrored;
 #[cfg(any(feature = "wasm", feature = "controller", feature = "in-process"))]
 mod names;
 pub mod plugins;

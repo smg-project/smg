@@ -83,7 +83,22 @@ const CHARS_PER_TOKEN: usize = 4;
 /// How a prefix-form stage cuts a request into the heads it is placed by
 /// on a ring its caller lends
 /// ([`Scorer::places_by_heads`](crate::engine::framework::Scorer::places_by_heads)).
+///
+/// The rule gains fields: code outside this crate makes it by
+/// [`HeadRule::new`], and matches it with `..`.
+///
+/// ```
+/// use smg_policy_controller::policies::prefix_hash::HeadRule;
+/// let rule = HeadRule::new(256, &[64, 128]);
+/// assert_eq!((rule.depth, rule.boundaries), (256, &[64, 128][..]));
+/// ```
+///
+/// ```compile_fail
+/// use smg_policy_controller::policies::prefix_hash::HeadRule;
+/// let _ = HeadRule { depth: 256, boundaries: &[64, 128] };
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HeadRule<'a> {
     /// The depth in tokens of the one head of a prompt that reaches no
     /// boundary.
@@ -91,6 +106,15 @@ pub struct HeadRule<'a> {
     /// The view's boundaries in tokens, ascending: a prompt has a head at
     /// each one it reaches.
     pub boundaries: &'a [u32],
+}
+
+impl<'a> HeadRule<'a> {
+    /// The rule of a head `depth` tokens deep and of the view's
+    /// `boundaries`, ascending.
+    #[must_use]
+    pub const fn new(depth: u32, boundaries: &'a [u32]) -> Self {
+        Self { depth, boundaries }
+    }
 }
 
 impl HeadRule<'_> {

@@ -1529,14 +1529,8 @@ fn the_memory_cap_is_the_specs_and_a_growth_past_it_traps() {
 #[test]
 fn a_view_carries_block_hashes_to_a_row_that_declares_them_alone() {
     let hashes: Vec<u64> = (1..=300).collect();
-    let token = Needs {
-        token_hashes: true,
-        ..Needs::default()
-    };
-    let text = Needs {
-        text_hashes: true,
-        ..Needs::default()
-    };
+    let token = Needs::NONE.with_token_hashes();
+    let text = Needs::NONE.with_text_hashes();
     let candidates = pool(4);
     for (world, component) in guest::hash_counting_guests() {
         for (needs, handed) in [(Needs::default(), 0), (token, 300), (text, 300)] {
@@ -1603,10 +1597,10 @@ fn the_lifecycle_reaches_the_plugin_once_per_profile_on_the_hosts_clock() {
         WorkerId(1),
         WorkerId(2),
     ]));
-    engine.on_signal(&smg_policy_controller::tracking::Signal::GatewayVeto {
-        worker: WorkerId(1),
-        until_micros: 500_000,
-    });
+    engine.on_signal(&smg_policy_controller::tracking::Signal::gateway_veto(
+        WorkerId(1),
+        500_000,
+    ));
     assert_eq!(counter_value(&plugin, counter::OBSERVED), 4);
     assert_eq!(plugin.stats().observed, 4);
 }
@@ -2154,10 +2148,10 @@ fn a_module_hears_the_kinds_of_event_its_row_lists_and_no_other() {
             WorkerId(1),
             WorkerId(2),
         ]));
-        engine.on_signal(&smg_policy_controller::tracking::Signal::GatewayVeto {
-            worker: WorkerId(1),
-            until_micros: 500_000,
-        });
+        engine.on_signal(&smg_policy_controller::tracking::Signal::gateway_veto(
+            WorkerId(1),
+            500_000,
+        ));
     };
     let runtime = runtime();
     // The default row lists nothing.
@@ -8791,10 +8785,7 @@ fn a_plugin_stages_fallback_counts_in_the_stages_needs() {
     struct ColumnReader;
 
     fn reads_the_column() -> Needs {
-        Needs {
-            affinity: true,
-            ..Needs::default()
-        }
+        Needs::NONE.with_affinity()
     }
 
     impl Lifecycle for ColumnReader {}
@@ -9308,10 +9299,7 @@ fn a_guest_level_with_the_feed_hears_the_models_a_worker_left() {
     assert_eq!(pick(), Some(102), "two members stand");
     let level = plugin.stats().observed;
     let models = ["a".to_owned()];
-    engine.on_membership(&Membership::Left {
-        id: WorkerId(100),
-        models: &models,
-    });
+    engine.on_membership(&Membership::left(WorkerId(100), &models));
     assert_eq!(pick(), Some(102), "the same two members");
     assert_eq!(plugin.stats().observed, level + 1, "one call for the word");
 }
@@ -9361,10 +9349,7 @@ fn an_instance_behind_more_than_the_feed_keeps_hears_one_snapshot() {
     assert_eq!(pick(), (Some(103), 0), "level: no call");
     // A replacement is folded into the list: an instance made after it
     // counts what stands.
-    engine.on_membership(&Membership::Replaced {
-        old: WorkerId(303),
-        new: WorkerId(304),
-    });
+    engine.on_membership(&Membership::replaced(WorkerId(303), WorkerId(304)));
     engine.on_membership(&Membership::Removed(WorkerId(304)));
     plugin.forget_instance();
     assert_eq!(
@@ -9897,10 +9882,7 @@ fn the_feeds_list_holds_a_worker_once_and_takes_an_unknown_ones_replacement() {
         engine.on_membership(&Membership::Added(WorkerId(100)));
     }
     for old in [900, 901] {
-        engine.on_membership(&Membership::Replaced {
-            old: WorkerId(old),
-            new: WorkerId(101),
-        });
+        engine.on_membership(&Membership::replaced(WorkerId(old), WorkerId(101)));
     }
     // Two members: one told twice, and one for a worker the list never
     // held, told twice. A list that held either twice, or left the second
@@ -10065,10 +10047,7 @@ fn an_instance_behind_hears_the_models_a_worker_left_ahead_of_its_relabelling() 
         engine.on_membership(&Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
         plugin.warm().expect("it warms");
         let warmed = plugin.stats().observed;
-        engine.on_membership(&Membership::Left {
-            id: WorkerId(100),
-            models: &models,
-        });
+        engine.on_membership(&Membership::left(WorkerId(100), &models));
         engine.on_membership(&Membership::Relabelled(WorkerId(100)));
         // One up each name of the word and one more up the relabelling
         // behind it: the row at three. A word not told, or told behind its
@@ -10118,10 +10097,7 @@ fn an_instance_that_hears_a_snapshot_for_what_it_missed_hears_no_left_word() {
     engine.on_membership(&Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
     plugin.warm().expect("it warms");
     let warmed = plugin.stats().observed;
-    engine.on_membership(&Membership::Left {
-        id: WorkerId(100),
-        models: &models,
-    });
+    engine.on_membership(&Membership::left(WorkerId(100), &models));
     // The feed keeps 64 changes, and the word is the oldest of 65.
     for _ in 0..64 {
         engine.on_membership(&Membership::Resized(WorkerId(101)));

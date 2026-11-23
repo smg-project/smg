@@ -942,10 +942,9 @@ mod sends {
             let worker = &self.list[place];
             for guard in &mut guards {
                 let pick = guard.decision().pick().expect("a pick");
-                let outcome = tracking::Outcome {
-                    served: pick.targets.first().expect("a target").id,
-                    ..tracking::Outcome::reported(200, TransportClass::Ok)
-                };
+                let served = pick.targets.first().expect("a target").id;
+                let outcome = tracking::Outcome::reported(200, TransportClass::Ok)
+                    .with_served(tracking::Side::Single, served);
                 guard.completed(&outcome, self.at(nth));
             }
             worker.decrement_load();

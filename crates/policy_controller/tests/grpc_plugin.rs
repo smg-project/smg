@@ -3447,10 +3447,7 @@ fn the_models_a_worker_left_reach_a_plugin_on_protocol_2_alone() {
         let runtime = runtime();
         let plugin = load(&runtime, &served, "leaver");
         let engine = single_engine(profile(&plugin, ALL));
-        engine.on_membership(&Membership::Left {
-            id: WorkerId(7),
-            models: &models,
-        });
+        engine.on_membership(&Membership::left(WorkerId(7), &models));
         engine.on_membership(&Membership::Relabelled(WorkerId(7)));
         // While a stream stands on 1 the left word is not raised.
         let raised = if version == 2 { 2 } else { 1 };
@@ -3496,10 +3493,7 @@ fn left_words_past_the_queues_bound_cost_a_stream_on_protocol_1_nothing() {
     let models = ["m-chat".to_owned()];
     // The queue holds 1,024 events.
     for _ in 0..2_048 {
-        engine.on_membership(&Membership::Left {
-            id: WorkerId(7),
-            models: &models,
-        });
+        engine.on_membership(&Membership::left(WorkerId(7), &models));
     }
     engine.on_membership(&Membership::Relabelled(WorkerId(7)));
     assert!(
@@ -3545,10 +3539,7 @@ fn a_left_word_that_waited_for_a_stream_is_not_written_on_protocol_1() {
         "the load's stream ended: no stream stands"
     );
     let models = ["m-chat".to_owned()];
-    engine.on_membership(&Membership::Left {
-        id: WorkerId(7),
-        models: &models,
-    });
+    engine.on_membership(&Membership::left(WorkerId(7), &models));
     engine.on_membership(&Membership::Relabelled(WorkerId(7)));
     assert_eq!(
         plugin.stats().observed,
@@ -3589,10 +3580,7 @@ fn the_lifecycle_reaches_the_plugin_once_in_order() {
     engine.on_dispatched(&lease, &Target::default(), Side::Single, 3);
     engine.on_released(&lease, ReleaseReason::ClientGone);
     engine.on_membership(&Membership::Snapshot(&[WorkerId(1), WorkerId(2)]));
-    engine.on_signal(&Signal::GatewayVeto {
-        worker: WorkerId(1),
-        until_micros: 500_000,
-    });
+    engine.on_signal(&Signal::gateway_veto(WorkerId(1), 500_000));
     assert_eq!(plugin.stats().observed, 4);
     assert!(eventually(|| served.seen().events.len() == 4));
     let seen = served.seen();
@@ -3639,10 +3627,7 @@ fn a_plugin_hears_the_kinds_of_event_its_row_lists_and_no_other() {
         engine.on_dispatched(&lease, &Target::default(), Side::Single, 3);
         engine.on_released(&lease, ReleaseReason::ClientGone);
         engine.on_membership(&Membership::Snapshot(&[WorkerId(1), WorkerId(2)]));
-        engine.on_signal(&Signal::GatewayVeto {
-            worker: WorkerId(1),
-            until_micros: 500_000,
-        });
+        engine.on_signal(&Signal::gateway_veto(WorkerId(1), 500_000));
     };
     // The default row lists nothing.
     let mut unlisted = GrpcPluginSpec::new("unlisted", unix(&served));
@@ -4217,15 +4202,9 @@ fn a_frame_carries_block_hashes_to_a_row_that_declares_them_alone() {
         sent("reads-none", Needs::default()).is_empty(),
         "a row that declares no hashes is sent none"
     );
-    let tokens = Needs {
-        token_hashes: true,
-        ..Needs::default()
-    };
+    let tokens = Needs::NONE.with_token_hashes();
     assert_eq!(sent("reads-tokens", tokens), hashes);
-    let text = Needs {
-        text_hashes: true,
-        ..Needs::default()
-    };
+    let text = Needs::NONE.with_text_hashes();
     assert_eq!(sent("reads-text", text), hashes);
 }
 

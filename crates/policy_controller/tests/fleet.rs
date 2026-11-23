@@ -2904,20 +2904,13 @@ async fn a_handle_over_a_link_ends_each_lease_on_the_worker_that_served() {
             assert_eq!(class, Class::Ok);
             assert!(frames > 0);
             let ended = Instant::now();
-            handle.completed(
-                &Outcome {
-                    side: Side::Single,
-                    served: alternate.id,
-                    status: 0,
-                    class: TransportClass::Ok,
-                    ttft_micros: 0,
-                    tokens_in: 8,
-                    tokens_out: frames,
-                    duration_micros: u32::try_from(ended.duration_since(sent).as_micros())
-                        .unwrap_or(u32::MAX),
-                },
-                ended,
-            );
+            let mut outcome =
+                Outcome::reported(0, TransportClass::Ok).with_served(Side::Single, alternate.id);
+            outcome.tokens_in = 8;
+            outcome.tokens_out = frames;
+            outcome.duration_micros =
+                u32::try_from(ended.duration_since(sent).as_micros()).unwrap_or(u32::MAX);
+            handle.completed(&outcome, ended);
             leases_before_expiry(&harness, &link, GATEWAY, 0, started)
                 .await
                 .expect("the completion ends the lease");

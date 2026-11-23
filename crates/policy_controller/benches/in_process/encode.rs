@@ -91,16 +91,9 @@ fn keys(seed: u64) -> [Identity<'static>; ITEMS] {
 
 /// The end of a served side, as its host says it.
 fn end(side: Side, served: WorkerId) -> Outcome {
-    Outcome {
-        side,
-        served,
-        status: 200,
-        class: TransportClass::Ok,
-        ttft_micros: 0,
-        tokens_in: 1_024,
-        tokens_out: 0,
-        duration_micros: 0,
-    }
+    let mut end = Outcome::reported(200, TransportClass::Ok).with_served(side, served);
+    end.tokens_in = 1_024;
+    end
 }
 
 /// What an encode request's host keeps beside its prefills (the host's own

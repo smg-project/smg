@@ -195,7 +195,25 @@ const SIDES: [&str; 4] = ["single", "prefill", "decode", "encode"];
 
 /// What the host must feed for the spec's stages to mean anything, per
 /// deployment. Read at apply, never per request.
+///
+/// The record gains flags. Code outside this crate writes its needs as one
+/// chain from [`Needs::NONE`], a call a flag
+/// (`Needs::NONE.with_loads().with_prompt_size()`), or assigns a flag that
+/// follows a value (`needs.signal_cells = keeps`). It reads a field, and
+/// matches the record with `..`: a literal of it does not build there.
+///
+/// ```
+/// use smg_policy_controller::document::Needs;
+/// let needs = Needs::NONE.with_loads().with_prompt_size();
+/// assert!(needs.loads && needs.prompt_size && !needs.events);
+/// ```
+///
+/// ```compile_fail
+/// use smg_policy_controller::document::Needs;
+/// let _ = Needs { loads: true, ..Needs::NONE };
+/// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Needs {
     /// The request's text itself, for a controller that hashes it into
     /// windows for a foreign host. No stage of this build declares it: a
@@ -293,7 +311,75 @@ pub struct Needs {
     pub signal_cells: bool,
 }
 
+/// Writes one call a flag of [`Needs`]: the needs with that flag declared.
+/// The flags are listed once, below.
+macro_rules! declares {
+    ($($call:ident => $flag:ident),+ $(,)?) => {
+        impl Needs {
+            $(
+                #[doc = concat!("These needs with [`Self::", stringify!($flag), "`] declared.")]
+                #[must_use]
+                pub const fn $call(mut self) -> Self {
+                    self.$flag = true;
+                    self
+                }
+            )+
+        }
+
+        // Never run: the pattern names every field, so a flag the list
+        // lacks stops the build and no flag comes without its call.
+        const _: () = {
+            let Needs { $($flag: _,)+ sample: _ } = Needs::NONE;
+        };
+    };
+}
+
+declares! {
+    with_text => text,
+    with_token_hashes => token_hashes,
+    with_text_hashes => text_hashes,
+    with_prompt_size => prompt_size,
+    with_loads => loads,
+    with_events => events,
+    with_sent_prefixes => sent_prefixes,
+    with_ring => ring,
+    with_headers => headers,
+    with_media => media,
+    with_active_sessions => active_sessions,
+    with_session_in_flight => session_in_flight,
+    with_affinity => affinity,
+    with_signal_cells => signal_cells,
+}
+
 impl Needs {
+    /// No need: what a stage that reads nothing the host feeds declares,
+    /// and where every other stage's chain starts. The default, as a
+    /// constant.
+    pub const NONE: Self = Self {
+        text: false,
+        token_hashes: false,
+        text_hashes: false,
+        prompt_size: false,
+        loads: false,
+        events: false,
+        sent_prefixes: false,
+        ring: false,
+        headers: false,
+        media: false,
+        active_sessions: false,
+        session_in_flight: false,
+        affinity: false,
+        sample: 0,
+        signal_cells: false,
+    };
+
+    /// These needs with a sample of `rows` rows ([`Self::sample`]).
+    #[must_use]
+    pub const fn with_sample(mut self, rows: u32) -> Self {
+        self.sample = rows;
+        self
+    }
+
     /// Whether these declare a request's block hashes, in the token form or
     /// the text form. A stage that declares neither reads none of them.
     pub(crate) fn request_hashes(self) -> bool {
