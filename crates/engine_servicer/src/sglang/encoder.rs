@@ -452,14 +452,13 @@ impl EncoderRuntime {
         remaining: Duration,
     ) -> Result<(), Status> {
         if !self.ready() {
+            self.forget_unowned(&request.req_id);
             return Err(Status::unavailable("encoder is not ready"));
         }
         let owner = match self.admit(&request, remaining) {
             Ok(owner) => owner,
             Err(status) => {
-                if status.code() != tonic::Code::AlreadyExists {
-                    self.native.notify_forget(&request.req_id);
-                }
+                self.forget_unowned(&request.req_id);
                 return Err(status);
             }
         };
@@ -529,6 +528,17 @@ impl EncoderRuntime {
     fn release_owner(&self, rid: &str) {
         if let Ok(mut owners) = self.owners.lock() {
             owners.remove(rid);
+        }
+    }
+
+    /// Wake P's early facade waiters for a rid that no live owner holds.
+    fn forget_unowned(&self, rid: &str) {
+        if self
+            .owners
+            .lock()
+            .is_ok_and(|owners| !owners.contains_key(rid))
+        {
+            self.native.notify_forget(rid);
         }
     }
 
@@ -1253,5 +1263,82 @@ mod tests {
             .as_deref()
             .is_some_and(|msg| msg.contains("timed out")));
         assert_eq!(runtime.loads().0, 1);
+    }
+
+    #[tokio::test]
+    async fn forget_unowned_protects_live_owner_and_notifies_while_draining() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands = format!("ipc://{}/commands.sock", dir.path().display());
+        let events = format!("ipc://{}/events.sock", dir.path().display());
+        let link = NativeEncoderLink::bind(&commands, &events, 32)
+            .await
+            .unwrap();
+        let mut pull = PullSocket::new();
+        let mut push = PushSocket::new();
+        pull.connect(&commands).await.unwrap();
+        push.connect(&events).await.unwrap();
+        let processor: EncoderProcessor = Arc::new(|_| {
+            Box::pin(async {
+                Ok(EncoderArtifact {
+                    bytes: Bytes::from_static(b"pixels"),
+                    embedding_tokens: 4,
+                })
+            })
+        });
+        let runtime = EncoderRuntime::new(test_config(), link, processor).unwrap();
+        let ready_msg = serde_json::to_vec(&json!({"ready": true})).unwrap();
+        push.send(ZmqMessage::from(Bytes::from(ready_msg)))
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if runtime.ready() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(runtime.ready());
+
+        let _live = tokio::spawn({
+            let rt = runtime.clone();
+            async move {
+                rt.encode(encode_request("req-live"), Duration::from_secs(5))
+                    .await
+            }
+        });
+        let exec = recv_cmd(&mut pull).await;
+        assert_eq!(exec["operation"], "execute");
+        assert_eq!(exec["rid"], "req-live");
+
+        // Malformed request reusing a live rid fails InvalidArgument but must NOT emit forget.
+        let mut malformed = encode_request("req-live");
+        malformed.mm_items.clear();
+        let err = runtime
+            .encode(malformed, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), pull.recv())
+                .await
+                .is_err(),
+            "malformed duplicate rid must not emit forget while owner is live"
+        );
+
+        // Draining rejections on an unowned rid emit forget while IPC is still connected.
+        runtime.drain();
+        let err = runtime
+            .encode(encode_request("req-draining"), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        let mut saw_forget = false;
+        for _ in 0..2 {
+            let cmd = recv_cmd(&mut pull).await;
+            if cmd["operation"] == "forget" && cmd["rid"] == "req-draining" {
+                saw_forget = true;
+                break;
+            }
+        }
+        assert!(saw_forget, "expected forget notification while draining");
     }
 }

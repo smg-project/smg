@@ -354,7 +354,9 @@ async def serve(config, args):
             )
 
         def remaining():
-            return max(0.1, shutdown_deadline - asyncio.get_running_loop().time())
+            # Post-drain cleanup gets its own small budget so a drain that finishes near
+            # the deadline still exits cleanly while keeping total shutdown bounded.
+            return max(5.0, shutdown_deadline - asyncio.get_running_loop().time())
 
         try:
             if native_task is not None:
