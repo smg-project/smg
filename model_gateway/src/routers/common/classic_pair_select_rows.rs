@@ -32,6 +32,10 @@
 //!   cargo test -p smg --lib routers::common::classic_pair_select_rows -- --ignored --nocapture
 //! ```
 //!
+//! That filter also runs this module's child recorder
+//! ([`classic_pair_bound_rows`]), which writes a sheet of its own beside
+//! this one: its rows draw nothing.
+//!
 //! A sequence row is recorded twenty times from fresh pools and fresh
 //! policies and must come out the same each time; a drawn row records how
 //! often each pair took the row's one request over its draws, each draw from
@@ -929,9 +933,9 @@ fn rows() -> Vec<Row> {
     rows
 }
 
-#[test]
-#[ignore = "records the classic rows into CLASSIC_ROWS_OUT"]
-fn record_the_classic_pair_select_rows() {
+/// Writes `rows` as the sheet `file` of `policy` under `CLASSIC_ROWS_OUT`,
+/// naming `CLASSIC_ROWS_COMMIT` as the commit they were recorded from.
+fn write(file: &str, policy: &'static str, rows: Vec<Row>) {
     let out = PathBuf::from(
         std::env::var_os("CLASSIC_ROWS_OUT").expect("CLASSIC_ROWS_OUT names the output directory"),
     );
@@ -939,12 +943,22 @@ fn record_the_classic_pair_select_rows() {
         std::env::var("CLASSIC_ROWS_COMMIT").expect("CLASSIC_ROWS_COMMIT names the commit");
     let sheet = Sheet {
         recorded_from: commit,
-        policy: "pair-select",
-        rows: rows(),
+        policy,
+        rows,
     };
     fs::create_dir_all(&out).expect("the output directory");
-    let path = out.join("pair_select.json");
+    let path = out.join(file);
     let text = serde_json::to_string_pretty(&sheet).expect("the sheet serializes");
     fs::write(&path, text + "\n").expect("the sheet is written");
     println!("{} rows -> {}", sheet.rows.len(), path.display());
 }
+
+#[test]
+#[ignore = "records the classic rows into CLASSIC_ROWS_OUT"]
+fn record_the_classic_pair_select_rows() {
+    write("pair_select.json", "pair-select", rows());
+}
+
+/// The rows behind the prefill admission's bound where a prefill that holds
+/// it has an open partner or none, on a sheet of their own.
+mod classic_pair_bound_rows;

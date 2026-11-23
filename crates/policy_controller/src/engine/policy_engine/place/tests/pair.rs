@@ -374,8 +374,8 @@ fn no_pair_crosses_the_classes_its_caller_states() {
 /// The classic router answers the same way where each prefill at its limit
 /// has a partner that can be sent to: "Selection was not run; the request
 /// waits for a slot"
-/// (`model_gateway/src/routers/common/placement.rs:307-309`, `:1470-1480`).
-/// Where a prefill at its limit has none the two answers part
+/// (`model_gateway/src/routers/common/placement.rs:332-334`, `:2532-2545`).
+/// Where a prefill at its limit has none, neither waits for it
 /// ([`a_pairs_shed_is_answered_by_its_name`]).
 #[test]
 fn prefills_all_at_their_limit_answer_the_word_their_caller_waits_on() {
@@ -401,14 +401,14 @@ fn prefills_all_at_their_limit_answer_the_word_their_caller_waits_on() {
 /// `healthy` filter.
 ///
 /// The classic router answers such lists that no pair is open
-/// (`model_gateway/src/routers/common/placement.rs:1438-1464`). It judges
-/// a prefill's limit over the prefills that still have a partner to send
-/// to (`:1422-1437`, `:1470-1480`); the engine's decision judges it over
-/// every prefill. So two inputs are answered otherwise here. One prefill
-/// at its limit whose one partner is not ready waits for room, where the
-/// classic router has no pair. And with two classes, the first prefill at
-/// its limit and the second's decode not ready, the request has no worker,
-/// where the classic router waits for the first prefill.
+/// (`model_gateway/src/routers/common/placement.rs:2503-2530` on main
+/// `30f636706`). It asks a prefill's limit of the prefills that still have
+/// a partner to send to, and of no other (`:2479-2502`, `:2532-2545`
+/// there), and so does the pair's decision. One prefill at its limit whose
+/// one partner is not ready has no pair, and no request waits for it. With
+/// two classes, one prefill at its limit beside its ready decode and the
+/// other's decode not ready, the request waits for the full prefill,
+/// whichever of the two it is.
 #[test]
 fn a_pairs_shed_is_answered_by_its_name() {
     let mut document = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
@@ -434,7 +434,8 @@ fn a_pairs_shed_is_answered_by_its_name() {
     let answer = engine.place(&request).err();
     assert!(no_worker(answer, "healthy"), "{answer:?}");
 
-    // One prefill at its limit, whose one partner is not ready.
+    // One prefill at its limit, whose one partner is not ready: no pair,
+    // ahead of the limit.
     let engine = stock();
     let lists = Lists::of(1, 1);
     let classes = lists.every();
@@ -442,19 +443,26 @@ fn a_pairs_shed_is_answered_by_its_name() {
     let full = Gates(|_| false, |_| true);
     let pair = lists.under(&classes, &full);
     let request = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
-    assert_eq!(engine.place(&request).err(), Some(Unplaced::PrefillsFull));
-
-    // Two classes: the first prefill is at its limit, and the second's
-    // decode is not ready.
-    let engine = stock();
-    let lists = Lists::of(2, 2);
-    let classes = PartnerClasses::number(2, [&[0_u32][..], &[1][..]]);
-    lists.decodes[1].set_status(WorkerStatus::NotReady);
-    let first = Gates(|prefill| prefill != 0, |_| true);
-    let pair = lists.under(&classes, &first);
-    let request = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
     let answer = engine.place(&request).err();
     assert!(no_worker(answer, "healthy"), "{answer:?}");
+
+    // Two classes: one prefill is at its limit beside its ready decode, and
+    // the other's decode is not ready. The request waits for the full
+    // prefill, asked both ways round.
+    let one_full = [
+        Gates(|prefill| prefill != 0, |_| true),
+        Gates(|prefill| prefill != 1, |_| true),
+    ];
+    for (full, gates) in one_full.iter().enumerate() {
+        let engine = stock();
+        let lists = Lists::of(2, 2);
+        let classes = PartnerClasses::number(2, [&[0_u32][..], &[1][..]]);
+        lists.decodes[1 - full].set_status(WorkerStatus::NotReady);
+        let pair = lists.under(&classes, gates);
+        let request = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
+        let answer = engine.place(&request).err();
+        assert_eq!(answer, Some(Unplaced::PrefillsFull), "prefill {full}");
+    }
 }
 
 /// A pair's placement names the request's routing value where its document

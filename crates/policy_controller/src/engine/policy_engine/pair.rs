@@ -99,11 +99,12 @@ use crate::{
 /// request could take is at its admission limit.
 const HAS_CAPACITY: &str = "has-capacity";
 
-/// Whether `decision` sheds a pair at the prefill admission limit: its
-/// prefill list was emptied by the capacity bit its host stated
-/// ([`PairAdmission::has_capacity`]), or the one prefill the pair's default
-/// took by load is at its limit. Such a request is not refused. Its host
-/// makes it wait for a prefill's room and decides it again.
+/// Whether `decision` sheds a pair at the prefill admission limit: the
+/// capacity bit its host stated ([`PairAdmission::has_capacity`]) alone
+/// left the prefills with an open partner nobody, or the one prefill the
+/// pair's default took by load is at its limit. Such a request is not
+/// refused. Its host makes it wait for a prefill's room and decides it
+/// again.
 #[must_use]
 pub fn prefills_full(decision: &Decision) -> bool {
     matches!(decision, Decision::Shed(shed) if shed.emptied_by == HAS_CAPACITY)
@@ -314,8 +315,9 @@ impl<'a> PairLists<'a> {
     /// prefills' first. A request that states places of its own beside a
     /// demand is declined under the places' name.
     ///
-    /// Prefills that are all at their admission limit shed a first
-    /// decision, which reads as a request that waits ([`prefills_full`]).
+    /// Prefills with an open partner that are all at their admission limit
+    /// shed a first decision, which reads as a request that waits
+    /// ([`prefills_full`]).
     ///
     /// The call writes the widest budget into the facts of a request that
     /// states none: a decision in process is unbounded

@@ -27,7 +27,7 @@ use crate::{
     load::signals::SignalCells,
     policies::{prefix_hash::HeadRule, random::Random},
     stages::{
-        filters::RowTests,
+        filters::{HasCapacity, RowTests},
         lifecycle::Lifecycle,
         pickers::{target_of, Best},
         scorers::{FewestSessions, LeastRequests},
@@ -6794,6 +6794,14 @@ impl Engine {
     /// whole pairs so, and so does a decode pool the liveness veto refuses
     /// on every worker. Each side's workers are those at the places its
     /// host states.
+    ///
+    /// The prefill admission limit is judged over the prefills that still
+    /// have a partner to go to. Where one of them stands but for its limit,
+    /// the limit alone left the run nobody, and the request is shed under
+    /// the limit's stage, on which its host waits for room. Outside the
+    /// pair's default, a prefill at its limit with no open partner makes no
+    /// request wait: its refusal is named by what its partners' own stages
+    /// say, as the refusal of a prefill under its limit is.
     pub fn decide_pair(
         &self,
         facts: &RequestFacts<'_>,
@@ -6954,13 +6962,14 @@ impl Engine {
         // 256 bytes, and taking it out copies them.
         let Decision::Pick(prefill_pick) = &prefill else {
             // A prefill pool its filters emptied says what the decode pool's
-            // own stages say about the partners of the prefills the prefill
-            // filters keep (those were dropped by the partnered test alone):
-            // a saturated decode fleet is saturation, not a missing endpoint,
-            // and a class with no decode at all is "partnered", as is a
-            // routable prefill of class 0. When no prefill passes its own
-            // filters, the prefill side's stage is named instead. A picker's
-            // decline passes through.
+            // own stages say about the partners of the prefills that stand
+            // but for their admission limit (those were dropped by the
+            // partnered test alone): a saturated decode fleet is saturation,
+            // not a missing endpoint, and a class with no decode at all is
+            // "partnered", as is a routable prefill of class 0. When no
+            // prefill stands so, the prefill side's stage is named instead.
+            // The limit names the shed for a prefill with an open partner
+            // alone. A picker's decline passes through.
             if let Decision::Shed(prefill_shed) = &prefill {
                 if prefill_shed.reason != ShedReason::PolicyDeclined {
                     // A refused pool vetoed on every usable worker goes to
@@ -6977,19 +6986,29 @@ impl Engine {
                     if let Some(pair) = vetoed::paired(sides, &pools.table, words, pool, scratch) {
                         return pair;
                     }
+                    // The admission limit is judged over the prefills with
+                    // an open partner. Where one of them stands but for its
+                    // limit, the limit alone left the run nobody: the shed
+                    // is the limit's, and a host waits on it. Asked before
+                    // the classes with an open partner are written over,
+                    // of a side that reads the constraints the run itself
+                    // read: the default above read the stated ones.
+                    let takes = Half::new(prefill_profile, first, &prefill_facts, prefills, run_cx);
+                    let open = |c: &&Candidate| classed(&scratch.classes, c.pair_class);
+                    let mut partnered = takes.places().filter(open);
+                    if partnered.any(|c| takes.but_for_the_limit(c)) {
+                        let limit = HasCapacity.name();
+                        return shed(reason_of(limit), limit, prefill_shed.trace);
+                    }
                     let mut routable = 0usize;
                     scratch.classes.clear();
-                    // Of the prefills the request may take: one outside
-                    // its side's places is no routable prefill of it. A
-                    // prefill is routable under the constraints the run
+                    // Of the prefills the request may take, the limit set
+                    // aside: one outside its side's places is no routable
+                    // prefill of it, and one at its limit with no open
+                    // partner is named by its partners' stage as any other.
+                    // A prefill is routable under the constraints the run
                     // itself read.
-                    for c in places::rows(prefills, run_cx).filter(|c| {
-                        prefill_profile
-                            .filters
-                            .iter()
-                            .filter(|f| !f.soft())
-                            .all(|f| f.keep(&prefill_facts, c, run_cx))
-                    }) {
+                    for c in takes.places().filter(|c| takes.but_for_the_limit(c)) {
                         routable += 1;
                         if c.pair_class != 0 {
                             scratch.classes.push(c.pair_class);
