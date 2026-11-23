@@ -3281,7 +3281,8 @@ impl RouterTrait for PDRouter {
                     candidate_filter: None,
                     tried: &[],
                 },
-            ) else {
+            )
+            .map(placement::Placed::worker_alone_for_now) else {
                 return error::service_unavailable(
                     "no_prefill_servers",
                     "No available prefill servers to count tokens",

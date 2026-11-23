@@ -235,7 +235,7 @@ pub mod bench_support {
     use super::{
         attempt_ledger::AttemptLedger,
         overload,
-        placement::{select_pair, select_single, PlacementInputs},
+        placement::{select_pair, select_single, Placed, PlacementInputs},
     };
     use crate::{
         config::RouterConfig,
@@ -335,16 +335,13 @@ pub mod bench_support {
             ..Default::default()
         };
         let worker = select_single(registry, policies, model, pool, None, inputs)?;
-        let shed = overload::shed_if_worker_overloaded(
-            worker.as_ref(),
-            model,
-            registry.overload_shed_enabled(),
-        );
+        let shed =
+            overload::shed_if_worker_overloaded(&*worker, model, registry.overload_shed_enabled());
         if shed.is_some() {
             return None;
         }
-        let went = placed_on(&worker);
-        let guard = WorkerLoadGuard::with_key(worker, policies.sticky_key(headers, None));
+        let went = placed_on(worker.worker());
+        let guard = worker.into_guard(policies.sticky_key(headers, None));
         drop(guard);
         Some(went)
     }
@@ -451,6 +448,7 @@ pub mod bench_support {
                 None,
                 inputs,
             )
+            .map(Placed::into_worker)
         }
     }
 

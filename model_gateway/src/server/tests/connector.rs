@@ -603,5 +603,5 @@ async fn a_model_only_a_peers_worker_serves_is_placed_by_the_default_policy() {
         PlacementInputs::default(),
     )
     .unwrap();
-    assert!(Arc::ptr_eq(&placed, &worker));
+    assert!(Arc::ptr_eq(placed.worker(), &worker));
 }

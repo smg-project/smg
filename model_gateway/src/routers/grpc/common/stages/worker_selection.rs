@@ -1930,6 +1930,7 @@ impl WorkerSelectionStage {
                 tried,
             },
         )
+        .map(placement::Placed::worker_alone_for_now)
     }
 
     /// Workers from one role pool of `snapshot` that also pass the live

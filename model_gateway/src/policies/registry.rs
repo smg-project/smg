@@ -12,6 +12,7 @@ use http::{header::HeaderName, HeaderMap};
 use openai_protocol::UNKNOWN_MODEL_ID;
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxBuildHasher;
+use smg_policy_controller::engine::PolicyEngine;
 use smg_worker::{
     identity::{
         basic::{RequestCompletionSink, Worker, WorkerType},
@@ -193,6 +194,12 @@ pub struct PolicyRegistry {
     // DP-rank policy: Supports the selection of dp-rank outside the engine.
     dp_rank_policy: Arc<OnceLock<Arc<dyn DPRankLoadPolicy>>>,
 
+    /// The policy engine, where the gateway started one
+    /// (`policy_controller: on`): set once at start
+    /// ([`Self::set_engine`]). The placement functions ask it then, for
+    /// every request.
+    engine: Arc<OnceLock<&'static PolicyEngine>>,
+
     /// Shared sticky selector for the routing-key override. `Some` when the
     /// override is enabled; consulted (instead of the configured policy) for keyed
     /// requests via [`PolicyRegistry::select_worker_for_model`].
@@ -283,6 +290,7 @@ impl PolicyRegistry {
             load_rx: Arc::new(RwLock::new(None)),
             mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
+            engine: Arc::new(OnceLock::new()),
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
@@ -623,6 +631,22 @@ impl PolicyRegistry {
     ) {
         if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
             cache_aware.set_kv_event_monitor(monitor.cloned());
+        }
+    }
+
+    /// The policy engine that places every request, where the gateway
+    /// started one. `None` under the classic policies, which is every
+    /// gateway that does not set `policy_controller: on`.
+    #[inline]
+    pub(crate) fn engine(&self) -> Option<&'static PolicyEngine> {
+        self.engine.get().copied()
+    }
+
+    /// Hands the registry the engine the gateway started, once: a second
+    /// engine is not taken.
+    pub(crate) fn set_engine(&self, engine: &'static PolicyEngine) {
+        if self.engine.set(engine).is_err() {
+            warn!("a policy engine is already set: the second one is not taken");
         }
     }
 

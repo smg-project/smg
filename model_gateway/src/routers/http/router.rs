@@ -365,6 +365,7 @@ impl Router {
                 tried,
             },
         )
+        .map(placement::Placed::worker_alone_for_now)
     }
 
     /// Select a local, realtime-capable worker for the given model.
@@ -1279,7 +1280,8 @@ impl Router {
                 candidate_filter: None,
                 tried: &[],
             },
-        ) else {
+        )
+        .map(placement::Placed::worker_alone_for_now) else {
             // Judged from the same candidates whether the pre-filter emptied
             // or a self-filtering policy missed on an all-overloaded pool, so
             // a shed keeps its Retry-After, retryability and metric.

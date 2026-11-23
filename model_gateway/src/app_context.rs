@@ -14,6 +14,7 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
+use smg_policy_controller::{engine::PolicyEngine, stages::StageRegistry};
 use smg_worker::{
     connection::{
         engine::EngineConnector,
@@ -23,6 +24,7 @@ use smg_worker::{
         },
     },
     health::liveness,
+    load::state::LoadReceiver,
     settings::RegistrationSettings,
     workflow::WorkflowHost,
 };
@@ -985,6 +987,9 @@ impl AppContextBuilder {
             None => monitor,
         });
         policy_registry.set_load_receiver(Some(monitor.subscribe()));
+        if config.policy_controller {
+            Self::start_policy_engine(config, &policy_registry, monitor.subscribe())?;
+        }
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(shed_retry_after_secs(config.load_monitor_interval()));
@@ -996,6 +1001,34 @@ impl AppContextBuilder {
         pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
         self.worker_monitor = Some(monitor);
         Ok(self)
+    }
+
+    /// Starts the policy engine that places every request of this process
+    /// (`policy_controller: on`): one engine, built from the document in
+    /// force, which is the one the routing settings mean or a supplied one.
+    /// The engine is handed the load monitor's channel, its own task is
+    /// spawned on the runtime this context is built on, and the placement
+    /// functions find the engine through `policies`.
+    ///
+    /// A document that is refused ends the start with the refusal's own
+    /// words, before the gateway listens.
+    fn start_policy_engine(
+        config: &RouterConfig,
+        policies: &PolicyRegistry,
+        loads: LoadReceiver,
+    ) -> Result<(), String> {
+        let document = config
+            .policy_document_in_force()
+            .map_err(|refused| format!("policy controller: {refused}"))?;
+        let spec = config
+            .hosted_policy(&document, &StageRegistry::builtin())
+            .map_err(|refused| format!("policy controller: {refused}"))?;
+        // One engine for the life of the process: its placements borrow it.
+        let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(spec)));
+        engine.set_loads(loads);
+        tokio::spawn(engine.run());
+        policies.set_engine(engine);
+        Ok(())
     }
 
     /// Create worker job queue OnceLock container
