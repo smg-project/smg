@@ -341,7 +341,7 @@ impl Inkling2ImageProcessor {
 
 /// A refused reserve of the batch's storage, reported alike by both outputs.
 fn refused(error: TryReserveError) -> TransformError {
-    TransformError::ShapeError(format!("Inkling2 patch allocation failed: {error}"))
+    TransformError::ReserveRefused(format!("Inkling2 patch allocation failed: {error}"))
 }
 
 impl VisionPreProcessor for Inkling2ImageProcessor {

@@ -1346,7 +1346,7 @@ impl ImageBatchPlan {
 impl QwenVLProcessorBase {
     /// The request's error for a patch buffer the allocator refuses.
     fn refused(&self, error: TryReserveError) -> TransformError {
-        TransformError::ShapeError(format!(
+        TransformError::ReserveRefused(format!(
             "cannot reserve {} patch output: {error}",
             self.config.model_name
         ))
@@ -1868,7 +1868,8 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         let plan = self.plan_video(frames.len(), frames[0].width, frames[0].height, clip)?;
         let temporal_patch_size = self.config.temporal_patch_size;
         // A pooled buffer, written end to end by the bands below.
-        let mut all_patches = buffer_pool::take(plan.output_values);
+        let mut all_patches =
+            buffer_pool::try_take(plan.output_values).map_err(|error| self.refused(error))?;
         for frame in frames {
             let expected_len = (frame.width as usize)
                 .checked_mul(frame.height as usize)
