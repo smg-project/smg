@@ -1281,7 +1281,7 @@ The design adds no second mechanism where one exists.
 | which worker was sent a prompt | the host's own trees, of the kv-index crate's two tree types | one more question on the trait the host already answers for cache events |
 | a request's lifetime on a worker | the load guard every route keeps | one optional field (decision 4) |
 | the place where a worker is chosen | classic's five placement functions | one call in each |
-| the rank a request is sent with | the worker object's own rank, where its registration states one | nothing: no rank choice runs behind the pick, and the classic rank option is refused at the start beside the engine |
+| the rank a request is sent with | the worker object's own rank, where its registration states one | nothing: no rank choice runs behind the pick of a worker registered rank by rank, and the classic rank option is refused at the start beside the engine (section 9.2 names the one place a rank is still chosen) |
 | the lease's reporting | `DecisionGuard` | `Placement`, which holds it |
 | proof against classic | classic's recorders and their sheets | replays through the kept engine |
 
@@ -1342,6 +1342,8 @@ request ──> route (HTTP or gRPC, any family)
 
   Where the document asks a pair's decode again, the two pair routes make one more call between the prefill's answer and the decode's dispatch (section 8.2).
 
+  A retry held to its wire is placed over the pool's whole list: the gateway holds it there by the route's own rule for a worker, and a pair's retry by the places of each pool on that wire. It does not yet give each runtime and transport it dials a number, as a worker's fact and as the retry's demand (section 8.2) **[planned]**.
+
 - **The request's end.** The placement stays with the request's load guard, which every route
   already keeps to the end of the response, streamed or not (decision 4).
 
@@ -1349,7 +1351,7 @@ request ──> route (HTTP or gRPC, any family)
 
 - **Membership.** The gateway's value for a model's workers gets one cell for each list, which
   the engine fills.
-- **The rank.** A data-parallel worker registered rank by rank (the gateway's `--dp-aware`) is the shape the engine serves in full. Each rank is then a worker object, and a record of its own in its list (`Candidate::dp_rank`, section 5.3). The record reads its own rank's named values (section 5.8). A stage that keeps load reports is told each rank's own report, under that rank (`Signal::Load`). `Candidate::engine` is the same number on every rank of one such worker. The request is sent with the rank of the record the engine picked, and no rank choice runs behind the pick. One rank choice still runs behind the pick, on the HTTP pair route: under a connector that holds both sides of a pair to one rank, a worker is registered once for all its ranks, and the route's own turn names the rank both sides are sent to, with the engine on as under classic.
+- **The rank.** A data-parallel worker registered rank by rank (the gateway's `--dp-aware`) is the shape the engine serves in full. Each rank is then a worker object, and a record of its own in its list (`Candidate::dp_rank`, section 5.3). The record reads its own rank's named values (section 5.8). A stage that keeps load reports is told each rank's own report, under that rank (`Signal::Load`). `Candidate::engine` is the same number on every rank of one such worker. The request is sent with the rank of the record the engine picked: where a record is one rank, no rank choice runs behind the pick. A rank is chosen behind the pick in one place only: on the HTTP pair route, under a connector that holds both sides of a pair to one rank, a worker is registered once for all its ranks, and the route's own turn names the rank both sides are sent to, with the engine on as under classic.
 
   The gateway's rank option (`dp_minimum_tokens_scheduler`) is refused at the start beside the engine, under the settings' own document and under a supplied one. A worker object that stands for several ranks states no rank, and its request is sent with none.
 
