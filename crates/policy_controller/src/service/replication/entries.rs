@@ -52,13 +52,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     // standby's prober starts it again.
     ("HealthSink", "probe_outcome", EntryReplication::Journaled),
     ("HealthSink", "connected", EntryReplication::Journaled),
-    // What the leader's own worker object knows is that replica's alone: a
-    // standby holds none of it.
-    (
-        "HealthSink",
-        "leader_bits",
-        EntryReplication::Rebuilt("a new leader writes what its own worker objects know"),
-    ),
     (
         "HealthSink",
         "gateway_veto",

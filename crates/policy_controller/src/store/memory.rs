@@ -33,7 +33,7 @@ use crate::{
     stages::lifecycle::Lifecycle,
     store::{
         applied::Applied,
-        health::{HealthSink, HealthWrite, LeaderBits, VetoWrite},
+        health::{HealthSink, HealthWrite, VetoWrite},
         index::{indexed_under, KvEvent, KvTables, LaneCounts, LaneWriter},
         journal::{Journal, JournalKinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
@@ -454,9 +454,8 @@ impl MemoryStore {
     /// drops is filed as gone by this store's own clock, as a followed
     /// removal files it. A worker still present keeps its count
     /// slot, admission instant, gateway vetoes, completed-dispatch times
-    /// and local loads, and the bits its own host wrote of it as the
-    /// leader ([`HealthSink::leader_bits`]). Its KV lane stays while its
-    /// cache events still belong to the same model and rank.
+    /// and local loads. Its KV lane stays while its cache events still
+    /// belong to the same model and rank.
     ///
     /// Loads in the cut are ignored. Returns `false` with the store as it
     /// was if the journal refuses the snapshot's place.
@@ -1706,10 +1705,6 @@ struct Workers {
 struct Row {
     row: WorkerRow,
     probes: Probes,
-    /// What the leader's own worker object knows of the worker
-    /// ([`HealthSink::leader_bits`]): this replica's own, in no journal and
-    /// no snapshot. It stands across the row's revisions.
-    leader: LeaderBits,
     /// The slot of the worker's count of the leases on file, given at the
     /// write that first files it ([`MemoryStore::join`]). A member keeps
     /// it across builds, and the slot of a worker that left is given to no
@@ -1718,13 +1713,11 @@ struct Row {
 }
 
 impl Row {
-    /// A row at its first write: no probe is counted, and the leader's own
-    /// worker object said no word of the worker.
+    /// A row at its first write: no probe is counted.
     fn new(row: WorkerRow, slot: WorkerSlot) -> Self {
         Self {
             row,
             probes: Probes::default(),
-            leader: LeaderBits::default(),
             slot,
         }
     }
@@ -1859,12 +1852,9 @@ impl Workers {
         (follows, ended)
     }
 
-    /// Every member as a build reads it: its row, the slot of its count
-    /// and what the leader's own worker object knows of it.
-    fn members(&self) -> impl Iterator<Item = (&WorkerRow, WorkerSlot, LeaderBits)> {
-        self.rows
-            .values()
-            .map(|row| (&row.row, row.slot, row.leader))
+    /// Every member as a build reads it: its row and the slot of its count.
+    fn members(&self) -> impl Iterator<Item = (&WorkerRow, WorkerSlot)> {
+        self.rows.values().map(|row| (&row.row, row.slot))
     }
 
     /// The row under `id` when `revision` is still its revision.
@@ -2322,35 +2312,6 @@ impl HealthSink for MemoryStore {
             from,
             to: WorkerStatus::Ready,
         }
-    }
-
-    fn leader_bits(
-        &self,
-        id: WorkerId,
-        revision: u64,
-        bits: LeaderBits,
-        leads: &dyn Fn() -> bool,
-    ) -> HealthWrite {
-        // The membership lock with no word to the journal: the bits are
-        // this replica's own, and no standby applies them.
-        let mut workers = self.workers.lock();
-        let Some(row) = workers.guarded(id, revision) else {
-            return workers.unjudged(id);
-        };
-        let mut loads = self.loads.lock();
-        // The writer's last word, behind both locks this write waits for:
-        // what follows waits for nothing.
-        if !leads() {
-            return HealthWrite::Stale;
-        }
-        let status = row.row.status;
-        if mem::replace(&mut row.leader, bits) != bits {
-            // Folded into the world and published at once, under the
-            // workers lock, as the bits were written.
-            let world = loads.writer.fold_leader(id, bits);
-            self.show(&mut loads.writer, world);
-        }
-        HealthWrite::Stood(status)
     }
 
     fn gateway_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) {

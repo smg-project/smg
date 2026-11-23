@@ -124,7 +124,6 @@ use crate::{
     store::{
         applied::Applied,
         encoding::{EncodeClasses, EncodeMember},
-        health::LeaderBits,
         index::{AffinityRowsBuffers, KvTables, PoolIndex, Predict, Reading},
         loads::LoadSample,
         pairing::{known, Derivation, Member, PairClasses, Pool},
@@ -1964,13 +1963,12 @@ struct Held {
 }
 
 /// The candidate row of one member: its fixed fields from its registration,
-/// its status bits, the bits the leader's own worker object sets, its load
-/// record when one is on file, and its engine family, zone and labels as
-/// `listed` reads them under the standing generation's lists. Its pair
-/// class is the membership's to derive ([`pair_up`]).
+/// its status bits, its load record when one is on file, and its engine
+/// family, zone and labels as `listed` reads them under the standing
+/// generation's lists. Its pair class is the membership's to derive
+/// ([`pair_up`]).
 fn row_of(
     member: &WorkerRow,
-    leader: LeaderBits,
     sample: Option<&LoadSample>,
     origin: Instant,
     listed: ViewListPositions,
@@ -1981,10 +1979,7 @@ fn row_of(
         role: facts.role,
         dp_rank: facts.dp_rank,
         dp_size: facts.dp_size,
-        health: Health {
-            stalled: leader.stalled,
-            ..health_of(member.status)
-        },
+        health: health_of(member.status),
         wire_modes: facts.wire_modes,
         load: sample.map(|sample| sample.row),
         load_sampled_at_micros: sample.map_or(0, |sample| micros(origin, sample.sampled_at)),
@@ -2849,7 +2844,7 @@ impl Writer {
         &mut self,
         spec: Arc<Applied>,
         epoch: u64,
-        members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot, LeaderBits)>,
+        members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>,
         on_file: impl OnFile,
     ) -> Result<(Arc<StoreSnapshot>, Option<Arc<Applied>>), StaleGeneration> {
         let standing = self.spec.generation();
@@ -2893,7 +2888,7 @@ impl Writer {
     /// the members written since the last and carries every other's
     /// ([`Writer::rebuild`]). A pool with a row that moved is published
     /// whole.
-    fn list<'a>(&mut self, members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot, LeaderBits)>) {
+    fn list<'a>(&mut self, members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>) {
         let Self {
             places,
             working,
@@ -3539,7 +3534,7 @@ impl Writer {
     pub(super) fn rebuild<'a>(
         &mut self,
         epoch: u64,
-        members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot, LeaderBits)>,
+        members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>,
         on_file: impl OnFile,
         classes: Classes,
     ) -> Arc<StoreSnapshot> {
@@ -3594,12 +3589,12 @@ impl Writer {
         let standing = !self.vetoes.by_gateway.is_empty();
         let mut ids = Vec::new();
         // The members in id order, by this write's one sort, each id beside
-        // its row, the slot its write gave it and the leader's bits: an id
-        // is one member, so every pool's entries, the ranks and the ids are
-        // pushed in order and nothing below sorts them. The sort moves an
-        // id, a reference, a slot and those bits, never a whole entry.
-        let mut members: Vec<(WorkerId, &'a WorkerRow, WorkerSlot, LeaderBits)> = members
-            .map(|(member, slot, leader)| (member.id, member, slot, leader))
+        // its row and the slot its write gave it: an id is one member, so
+        // every pool's entries, the ranks and the ids are pushed in order
+        // and nothing below sorts them. The sort moves an id, a reference
+        // and a slot, never a whole entry.
+        let mut members: Vec<(WorkerId, &'a WorkerRow, WorkerSlot)> = members
+            .map(|(member, slot)| (member.id, member, slot))
             .collect();
         members.sort_unstable_by_key(|&(id, ..)| id);
         // Every member's entry, in that order. A pool's list of whole
@@ -3619,7 +3614,7 @@ impl Writer {
         incoming.clear();
         let mut from = 0;
         let mut outside = OutsideLists::default();
-        for &(_, member, slot, leader) in &members {
+        for &(_, member, slot) in &members {
             if standing {
                 ids.push(member.id);
             }
@@ -3679,7 +3674,7 @@ impl Writer {
                 ViewListPositions::default()
             };
             let entry = Entry {
-                row: row_of(member, leader, sample.as_ref(), origin, listed),
+                row: row_of(member, sample.as_ref(), origin, listed),
                 facts,
                 admitted_micros: micros(origin, member.admitted_at),
                 local: match facts.reachable_from {
@@ -4021,7 +4016,7 @@ impl Writer {
         let unpooled: Box<[(WorkerId, WorkerSlot)]> = bare
             .iter()
             .filter_map(|&at| members.get(at as usize))
-            .map(|&(id, _, slot, _)| (id, slot))
+            .map(|&(id, _, slot)| (id, slot))
             .collect();
         debug_assert!(unpooled.is_sorted_by(|a, b| a.0 < b.0));
         let before = mem::replace(
@@ -4226,21 +4221,6 @@ impl Writer {
         })
     }
 
-    /// Fold what the leader's own worker object knows of a member into its
-    /// rows and publish at once, as a status change is: a decision does
-    /// not wait a window for a worker the leader doubts. `None` for a
-    /// worker with no row, and for the bits its rows carry already.
-    #[must_use]
-    pub(super) fn fold_leader(
-        &mut self,
-        id: WorkerId,
-        bits: LeaderBits,
-    ) -> Option<Arc<StoreSnapshot>> {
-        self.fold_health(id, |row| {
-            mem::replace(&mut row.stalled, bits.stalled) != bits.stalled
-        })
-    }
-
     /// Write `fold` over the health bits of each of the member's rows, and
     /// publish at once where it says a bit of one moved: a pool with a row
     /// that moved is published whole. `None` where none did.
@@ -4372,7 +4352,7 @@ impl Writer {
         &mut self,
         at: Option<Instant>,
         epoch: u64,
-        members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot, LeaderBits)>,
+        members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>,
         on_file: impl OnFile,
     ) -> Option<Arc<StoreSnapshot>> {
         let owed = self.owed.take()?;
