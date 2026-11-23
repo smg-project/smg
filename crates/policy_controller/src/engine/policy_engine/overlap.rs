@@ -327,6 +327,9 @@ pub struct Affinity {
     /// change of membership and at the timer's sweep: never by a decision's naming
     /// or its write, which hold their record by the list's table.
     records: Mutex<FxHashMap<Box<str>, Arc<PrefixRecord>>>,
+    /// What the records that left the map had left out
+    /// ([`Self::left_out`]). Written under the map's mutex.
+    left_out: AtomicU64,
 }
 
 impl fmt::Debug for Affinity {
@@ -379,24 +382,51 @@ impl Affinity {
     /// placements of workers that left, and the blocks past a bound that
     /// came down. For the engine's timer. A record a decision holds is
     /// passed over.
+    ///
+    /// A record leaves the map here once the map alone holds it and it
+    /// holds no worker's place: no list's table reads it, and every worker
+    /// it was written for was forgotten. So a model's record goes behind
+    /// its last worker, and a record with no placement yet can go between
+    /// two tables of its list. The model's next table read makes a fresh
+    /// record. A pick named from a record that left writes to the fresh
+    /// one or writes nothing: an entry is a prediction, and the next
+    /// request of the prefix writes it.
     pub fn sweep(&self) {
-        for record in self.records.lock().values() {
-            if record.sweeping.load(Ordering::Relaxed) {
-                if let Some(mut predictor) = record.predictor.try_write() {
-                    record.sweep(&mut predictor);
+        let mut records = self.records.lock();
+        // Nobody takes a record from the map but by a clone under this
+        // mutex, so one the map alone holds is read by no table and written
+        // by no pick.
+        let left: Vec<_> = records
+            .extract_if(|_, record| {
+                let lone = Arc::get_mut(record)
+                    .is_some_and(|record| record.predictor.get_mut().held().next().is_none());
+                if !lone && record.sweeping.load(Ordering::Relaxed) {
+                    if let Some(mut predictor) = record.predictor.try_write() {
+                        record.sweep(&mut predictor);
+                    }
                 }
-            }
-        }
+                lone
+            })
+            .collect();
+        let left_out = left
+            .iter()
+            .map(|(_, record)| record.left_out.load(Ordering::Relaxed))
+            .sum();
+        self.left_out.fetch_add(left_out, Ordering::Relaxed);
+        // What left is freed once the mutex is given back, so the read of a
+        // list's table waits for no free.
+        drop(records);
     }
 
     /// How many picks' prefixes the records left out in whole or in part,
-    /// every model's together: a write that meets a held record ends there
-    /// and waits for nobody. For a host's own count beside its count of
-    /// decisions, never for a decision.
+    /// every model's together, those of the records that left the map among
+    /// them: a write that meets a held record ends there and waits for
+    /// nobody. For a host's own count beside its count of decisions, never
+    /// for a decision.
     pub fn left_out(&self) -> u64 {
         let records = self.records.lock();
         let left_out = |record: &Arc<PrefixRecord>| record.left_out.load(Ordering::Relaxed);
-        records.values().map(left_out).sum()
+        self.left_out.load(Ordering::Relaxed) + records.values().map(left_out).sum::<u64>()
     }
 
     /// The record of `model`, made at its first asking and held to `bound`

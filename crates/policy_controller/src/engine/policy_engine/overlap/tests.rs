@@ -1072,6 +1072,33 @@ fn a_list_of_no_worker_keeps_no_record() {
     assert_eq!(host.asked.load(Ordering::Relaxed), 0);
 }
 
+/// A model's record leaves the map at the timer's sweep once its worker
+/// left and no list's table holds it, and what it left out stays counted.
+/// Until then it stays: a worker that stands keeps its prefixes when its
+/// list is published again, and a table that stands reads its record.
+#[test]
+fn a_record_leaves_behind_its_models_last_worker() {
+    let (affinity, _, _) = hosted(false);
+    let mut bed = Bed::new(affinity, preset("cache_aware"), 1);
+    let asked = prompt(1_000, 4);
+    bed.decide(&request(&asked, 7, NOW), Some(0));
+    bed.affinity.records.lock()[MODEL]
+        .left_out
+        .store(1, Ordering::Relaxed);
+    // The list is published again, with no table yet; its worker stands.
+    bed.pool = PoolAffinity::default();
+    bed.affinity.sweep();
+    assert_eq!(bed.holders(&asked, NOW), [(0, 0, 4)]);
+    bed.affinity.forget(bed.ids[0]);
+    bed.affinity.sweep();
+    assert_eq!(bed.affinity.records.lock().len(), 1, "a table reads it");
+    // The list falls, and its table with it.
+    bed.pool = PoolAffinity::default();
+    bed.affinity.sweep();
+    assert!(bed.affinity.records.lock().is_empty());
+    assert_eq!(bed.affinity.left_out(), 1);
+}
+
 /// A prompt of more blocks than one turn of the record's lock writes is
 /// recorded to its end.
 #[test]
