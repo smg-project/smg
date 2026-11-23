@@ -151,26 +151,28 @@ impl LentTrees {
         let registry = Arc::downgrade(registry);
         runtime.spawn(async move {
             loop {
-                let mut left = match events.recv().await {
-                    Ok(event) => is_removal(&event),
-                    Err(RecvError::Lagged(_)) => true,
+                let mut left = Left::default();
+                match events.recv().await {
+                    Ok(event) => left.note(&event),
+                    Err(RecvError::Lagged(_)) => left.unheard = true,
                     Err(RecvError::Closed) => return,
-                };
+                }
                 loop {
                     match events.try_recv() {
-                        Ok(event) => left |= is_removal(&event),
-                        Err(TryRecvError::Lagged(_)) => left = true,
+                        Ok(event) => left.note(&event),
+                        Err(TryRecvError::Lagged(_)) => left.unheard = true,
                         Err(TryRecvError::Empty | TryRecvError::Closed) => break,
                     }
                 }
                 let (Some(trees), Some(registry)) = (trees.upgrade(), registry.upgrade()) else {
                     return;
                 };
-                if !left {
+                if !left.asks_for_a_purge() {
                     continue;
                 }
-                let purge =
-                    tokio::task::spawn_blocking(move || trees.forget_the_removed(&registry));
+                let purge = tokio::task::spawn_blocking(move || {
+                    trees.forget_the_removed(&registry, &left);
+                });
                 // A purge that panicked is this task's last: the size pass
                 // alone bounds the trees from here on.
                 if let Err(ended) = purge.await {
@@ -183,15 +185,20 @@ impl LentTrees {
         });
     }
 
-    /// Takes out of every tree each address no worker of `registry` has. A
-    /// worker that left is never written again, so the size pass alone
-    /// would keep its prompts for good. The registry is asked after each
-    /// address a tree holds, so the purge needs no word of which worker
-    /// left or which models it served. An address a worker is registered
-    /// under again by then keeps what the trees hold for it. An address
-    /// written behind its purge, by a decision made on the list of a moment
-    /// before, leaves at the next purge.
-    fn forget_the_removed(&self, registry: &WorkerRegistry) {
+    /// Takes the workers `left` says left out of every tree. A worker that
+    /// left is never written again, so the size pass alone would keep its
+    /// prompts for good.
+    ///
+    /// An address a removal named leaves, and nobody is asked: it leaves
+    /// whether or not a worker is registered under it again by now. The
+    /// worker that rejoins starts with no prompt, as its cache may not have
+    /// outlived it. So a purge walks no tree for a worker that stands.
+    ///
+    /// Where events went unheard, `registry` is asked after each address a
+    /// tree holds, and each that no worker has is taken out. A removal that
+    /// went unheard is purged so, unless a worker stands under its address
+    /// again by then.
+    fn forget_the_removed(&self, registry: &WorkerRegistry, left: &Left) {
         // The stores are copied out and the lock is let go ahead of the
         // purge: a purge walks a tree once for every worker that left, and
         // a decision that builds a model's table asks for its tree under
@@ -203,6 +210,12 @@ impl LentTrees {
             .map(|store| Arc::clone(&store.trees))
             .collect();
         for tree in stores.iter().flat_map(|trees| trees.token_trees()) {
+            for address in &left.addresses {
+                tree.remove_tenant_all(&TenantId::from(address.as_str()));
+            }
+            if !left.unheard {
+                continue;
+            }
             for address in tree.get_tenant_token_counts().into_keys() {
                 if registry.get_by_url(&address).is_none() {
                     tree.remove_tenant_all(&TenantId::from(address));
@@ -212,10 +225,30 @@ impl LentTrees {
     }
 }
 
-/// Whether an event of the registry's took a worker away. A registration, a
-/// replacement and a status change take none.
-fn is_removal(event: &WorkerEvent) -> bool {
-    matches!(event, WorkerEvent::Removed { .. })
+/// What the registry's events of one wake ask of the trees.
+#[derive(Debug, Default)]
+struct Left {
+    /// The addresses of the workers a removal took away.
+    addresses: Vec<String>,
+    /// Events went unheard, and may hold a removal.
+    unheard: bool,
+}
+
+impl Left {
+    /// Notes `event`: a removal names the address that left. A
+    /// registration, a replacement and a status change take no worker
+    /// away.
+    fn note(&mut self, event: &WorkerEvent) {
+        if let WorkerEvent::Removed { worker, .. } = event {
+            self.addresses.push(worker.url().to_owned());
+        }
+    }
+
+    /// Whether the events ask for a purge: a removal was heard, or events
+    /// went unheard.
+    fn asks_for_a_purge(&self) -> bool {
+        self.unheard || !self.addresses.is_empty()
+    }
 }
 
 /// What a gateway answers the policy engine of its workers' caches, as one
@@ -395,8 +428,9 @@ mod tests {
             .expect("a worker");
     }
 
-    /// Of the registry's events a removal alone asks for a purge: a
-    /// registration, a replacement and a status change take no worker away.
+    /// Of the registry's events a removal alone asks for a purge, and it
+    /// names the address that left: a registration, a replacement and a
+    /// status change take no worker away.
     #[test]
     fn a_removal_alone_asks_for_a_purge() {
         let registry = WorkerRegistry::new();
@@ -409,7 +443,7 @@ mod tests {
         }
         registry.remove(&id).expect("the removal");
 
-        let mut heard: Vec<(&str, bool)> = std::iter::from_fn(|| events.try_recv().ok())
+        let mut heard: Vec<(&str, Vec<String>)> = std::iter::from_fn(|| events.try_recv().ok())
             .map(|event| {
                 let kind = match event {
                     WorkerEvent::Registered { .. } => "a registration",
@@ -417,18 +451,27 @@ mod tests {
                     WorkerEvent::StatusChanged { .. } => "a status change",
                     WorkerEvent::Removed { .. } => "a removal",
                 };
-                (kind, is_removal(&event))
+                let mut left = Left::default();
+                left.note(&event);
+                assert_eq!(left.asks_for_a_purge(), !left.addresses.is_empty());
+                (kind, left.addresses)
             })
             .collect();
         heard.sort_unstable();
         heard.dedup();
-        let asked = [
-            ("a registration", false),
-            ("a removal", true),
-            ("a replacement", false),
-            ("a status change", false),
+        let named = [
+            ("a registration", vec![]),
+            ("a removal", vec!["http://a:1".to_owned()]),
+            ("a replacement", vec![]),
+            ("a status change", vec![]),
         ];
-        assert_eq!(heard, asked);
+        assert_eq!(heard, named);
+        let unheard = Left {
+            unheard: true,
+            ..Left::default()
+        };
+        assert!(unheard.asks_for_a_purge(), "events that went unheard");
+        assert!(!Left::default().asks_for_a_purge());
     }
 
     /// One prompt of 64 tokens sent to each of `workers`, in `model`'s tree.
@@ -453,8 +496,6 @@ mod tests {
     /// model's it is and whichever size its store is held to. It leaves the
     /// trees whichever way it left the registry: by a mesh peer's word,
     /// which runs no step of a removal here, or by this process's removal.
-    /// The purge asks the registry after each address, so it takes out an
-    /// address no worker has.
     #[tokio::test]
     async fn a_worker_the_registry_lost_is_taken_out_of_every_tree() {
         let mut stated = document(1_000, 0);
@@ -473,7 +514,7 @@ mod tests {
             spec: Vec::new(),
         });
         let imported = registry.get_id_by_url("http://peer:1").expect("the import");
-        let all = ["http://a:1", "http://b:1", "http://gone:1", "http://peer:1"];
+        let all = ["http://a:1", "http://b:1", "http://peer:1"];
         for model in [MODEL, "another"] {
             sent(&trees, model, &all);
         }
@@ -493,6 +534,28 @@ mod tests {
             held(&trees, MODEL) == ["http://a:1"] && held(&trees, "another") == ["http://a:1"]
         })
         .await;
+    }
+
+    /// A worker a removal named leaves the trees whether or not a worker is
+    /// registered under its address again by the purge: the one that
+    /// rejoins starts with no prompt. The two events wait together here,
+    /// so the purge finds the address registered.
+    #[tokio::test]
+    async fn a_worker_that_rejoins_under_its_address_starts_with_no_prompt() {
+        let trees = Arc::new(owner(document(1_000, 0)));
+        let registry = Arc::new(WorkerRegistry::new());
+        worker_at(&registry, "http://a:1");
+        worker_at(&registry, "http://b:1");
+        sent(&trees, MODEL, &["http://a:1", "http://b:1"]);
+        trees.follow_removals(&registry, &Handle::current());
+
+        registry.remove_by_url("http://b:1").expect("the removal");
+        worker_at(&registry, "http://b:1");
+        until("the purge of the address that rejoined", || {
+            held(&trees, MODEL) == ["http://a:1"]
+        })
+        .await;
+        assert!(registry.get_by_url("http://b:1").is_some(), "it rejoined");
     }
 
     /// A removal the task did not hear is purged too. More events than the

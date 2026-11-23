@@ -861,8 +861,8 @@ impl PolicyRegistry {
     /// The trees are made with the task that takes a worker `workers` lost
     /// out of them ([`LentTrees::follow_removals`]), on the runtime the
     /// call is made on. The start runs on one, the engine's own task needs
-    /// it. Where none is entered no task is started, and nothing takes a
-    /// worker out of the trees.
+    /// it. Where none is entered no task is started, nothing takes a worker
+    /// out of the trees, and a debug line says so.
     pub(crate) fn lend_token_trees(
         &self,
         document: &PolicySpec,
@@ -871,8 +871,9 @@ impl PolicyRegistry {
     ) -> Arc<LentTrees> {
         let made = || {
             let trees = Arc::new(LentTrees::of_document(document.clone(), page));
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                trees.follow_removals(workers, &runtime);
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => trees.follow_removals(workers, &runtime),
+                Err(_) => debug!("No runtime is entered: no task takes a worker that leaves out of the lent token trees"),
             }
             trees
         };
@@ -3492,6 +3493,9 @@ mod tests {
         }
         let kept: Vec<String> = tree.get_tenant_token_counts().into_keys().collect();
         assert_eq!(kept, ["http://w2:8000"]);
+        // The removal step makes its call with the engine on too.
+        let left = HashSet::from(["http://w1:8000".to_owned()]);
+        registry.remove_workers_from_cache_aware("llama-3", &left);
         assert_eq!(registry.classic_made_or_asked(), 0);
     }
 
