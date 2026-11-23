@@ -109,6 +109,16 @@ pub struct EncodeItems<'a> {
     pub decode_images: bool,
 }
 
+impl EncodeItems<'_> {
+    /// Whether the request's decode is held to the decodes that take
+    /// images: by its demand, or by image references beside an image.
+    /// `images` says whether the request states an image.
+    #[must_use]
+    pub const fn holds_decode_to_images(&self, images: bool) -> bool {
+        self.decode_images || (self.references && images)
+    }
+}
+
 /// Where an encode-pair decision puts each placed key's encoder. The host
 /// keeps it beside its [`Scratch`], so a decision allocates nothing after
 /// the first.
@@ -564,7 +574,7 @@ impl Engine {
         // A request with no item that asks no images of its decode is the
         // pair's alone: the pair entry answers it over the pools as handed,
         // and no pass of the encode side is laid for it.
-        if !needs && !items.decode_images && !(items.references && images) {
+        if !needs && !items.holds_decode_to_images(images) {
             return self.decide_pair(facts, pool, pools, cx, decode_cx, scratch);
         }
         let encode_facts = RequestFacts {

@@ -14,8 +14,8 @@
 //!
 //! **Who makes one.** The host contract has one call for a request, which
 //! answers a placement ([`PolicyEngine::place`], the design's section 8.2).
-//! No host makes one itself. The call places a single request and a pair
-//! over its two lists today.
+//! No host makes one itself. The call places a single request, a pair
+//! over its two lists and an encode request over its three today.
 //!
 //! **A decode decided again.** A pair whose first decision booked its
 //! prefill alone names a decode that stands chosen
@@ -60,6 +60,65 @@ use crate::{
     store::GatewayId,
 };
 
+/// The encoders of an encode request's items, as the host's own worker
+/// objects. Nothing is owed of an encoder: the placement's lease is the
+/// pair's, and no word of an encode side reaches a stage.
+///
+/// The value is one pointer wide, and names nothing for a request with no
+/// item: a placement of such a request allocates nothing for it.
+#[derive(Debug, Default)]
+pub struct Encoders(Option<Box<Named>>);
+
+/// What an encode request's placement names of its encoders.
+#[derive(Debug)]
+struct Named {
+    workers: Vec<Arc<dyn Worker>>,
+    one: bool,
+}
+
+impl Encoders {
+    /// The encoders the call that placed a request read for it: `workers`
+    /// in the items' order, and whether the items were placed as `one`.
+    #[must_use]
+    pub(crate) fn named(workers: Vec<Arc<dyn Worker>>, one: bool) -> Self {
+        Self(Some(Box::new(Named { workers, one })))
+    }
+
+    /// Each item's encoder, in the items' order, read at the place the
+    /// decision names in the host's encoder list. One worker where the
+    /// items were placed as one. Empty for a request with no item.
+    #[must_use]
+    pub fn workers(&self) -> &[Arc<dyn Worker>] {
+        self.0.as_deref().map_or(&[], |named| &named.workers)
+    }
+
+    /// Whether the items were placed as one, on the one encoder
+    /// ([`EncodePlaced::one`](crate::engine::EncodePlaced::one)).
+    #[must_use]
+    pub fn one(&self) -> bool {
+        self.0.as_deref().is_some_and(|named| named.one)
+    }
+}
+
+impl Drop for Encoders {
+    /// One test where no encoder is named, which is the end of every
+    /// placement but an encode request's: what is named is released out of
+    /// line.
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(named) = self.0.take() {
+            release(named);
+        }
+    }
+}
+
+/// Releases an encode request's named encoders. It stands out of line, so
+/// that the end of a placement that names none holds one test and no call.
+#[inline(never)]
+fn release(named: Box<Named>) {
+    drop(named);
+}
+
 /// One placed request, kept by its host until the request ends.
 ///
 /// `'a` is the life of what the request lends: the text its routing key
@@ -73,6 +132,12 @@ pub struct Placement<'a> {
     /// A pair's decode worker. Its host reads it and leaves it in place:
     /// [`Placement::decode_id`] answers `None` once it is taken out.
     pub decode: Option<Arc<dyn Worker>>,
+    /// An encode request's encoders ([`Encoders`]). It names none for every
+    /// other request, and allocates nothing then. A host that splits the
+    /// placement into its sides ([`Placement::sides`]) reads the encoders
+    /// first: a side names none, and they stay in the placement the sides
+    /// share until the request ends.
+    pub encoders: Encoders,
     /// The routing key the document derived for the request, for its
     /// host's in-flight counters. `None` where none was derived. Neither
     /// constructor derives one: the call that places the request writes it.
@@ -109,6 +174,7 @@ impl Placement<'_> {
         Self {
             worker,
             decode: None,
+            encoders: Encoders::default(),
             routing_key: None,
             profile,
             decode_profile: None,
@@ -165,6 +231,7 @@ impl Placement<'_> {
         Some(Self {
             worker,
             decode,
+            encoders: Encoders::default(),
             routing_key: None,
             profile,
             decode_profile: None,
@@ -181,6 +248,7 @@ impl Placement<'_> {
         Placement {
             worker: self.worker,
             decode: self.decode,
+            encoders: self.encoders,
             routing_key: None,
             profile: self.profile,
             decode_profile: self.decode_profile,

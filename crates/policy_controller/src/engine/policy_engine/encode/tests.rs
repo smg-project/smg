@@ -213,13 +213,15 @@ impl Host {
 
     /// The host's request as the engine's entries take it: made at the
     /// prefill phase over the three lists, held to no wire, its decode
-    /// sent with its prefill, with the snapshot the host hands.
+    /// sent with its prefill, with the snapshot the host hands and the
+    /// image it states.
     fn asks<'a>(&'a self, said: (&'a [EncoderFacts], &'a [u32])) -> Asks<'a> {
         Asks {
             lists: WorkerLists::Encode(self.lists(said)),
             phase: Phase::Prefill,
             wires: WireModes::NONE,
             later: false,
+            images: self.images,
             loads: self.loads.as_ref(),
         }
     }
@@ -688,13 +690,15 @@ fn the_engines_call_is_shown_the_prefill_lists_pool_facts() {
 }
 
 /// A host's request as the engine's entries take it: made at `phase` over
-/// `lists`, held to `wires`, with whether its decode is sent `later` and
-/// the snapshot of `loads` its host gives it, where it gives one.
+/// `lists`, held to `wires`, with whether its decode is sent `later`,
+/// whether it states an image (`images`) and the snapshot of `loads` its
+/// host gives it, where it gives one.
 struct Asks<'a> {
     lists: WorkerLists<'a>,
     phase: Phase,
     wires: WireModes,
     later: bool,
+    images: bool,
     loads: Option<&'a Arc<LoadSnapshot>>,
 }
 
@@ -709,6 +713,10 @@ impl RequestMaker for Asks<'_> {
             facts: RequestFacts {
                 model: "model-a",
                 phase: self.phase,
+                media: MediaCounts {
+                    images: u16::from(self.images),
+                    ..MediaCounts::NONE
+                },
                 ..RequestFacts::default()
             },
             constraints: Constraints {
@@ -1159,58 +1167,109 @@ fn a_decode_takes_images_where_its_host_says_so() {
     }
 }
 
-/// A request that asks images of its decode and states the later decode is
-/// declined under `decode-later`, through both entries: a decode asked
-/// again takes no items, so that decision would hold it to no decode that
-/// takes images. Nothing is issued, no id is taken, no word is told, and
-/// the key an earlier decision placed is gone. With its decode sent with
-/// its prefill the request is decided, and so is one that states the later
-/// decode and asks no images of it.
+/// A request that states the later decode is declined under `decode-later`,
+/// through both entries, where its decode is held to the ones that take
+/// images: by its demand, or by image references beside an image. A decode
+/// asked again takes no items, so that decision would hold it to no decode
+/// that takes images. Nothing is issued, no id is taken, no word is told,
+/// and the key an earlier decision placed is gone. The decline reads the
+/// request's own facts: it stands where no decode of the lists takes
+/// images. With its decode sent with its prefill the request is decided,
+/// and so is one that states the later decode under no such hold.
 ///
 /// The classic router picks a decode a second time in a retry alone, and
-/// states the request's image demand of its decode there again
-/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:827-837`
-/// on main b8c15d40a).
+/// states there again the request's image demand of its decode and its
+/// media references
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:827-838`
+/// on main 3d0315f3d). It prefers a decode that takes images for
+/// references beside an image only where a pair has one (`:2211-2212`).
 #[test]
-fn a_request_that_asks_images_of_a_decode_sent_later_is_declined() {
+fn a_request_whose_decode_is_held_to_images_and_sent_later_is_declined() {
     let (mut host, heard) = hearing(1, 2, 1);
     host.says_the_decode_takes_images(1);
-    let said = (&[of(1)][..], &[1][..]);
+    // The one encoder takes references.
+    let takes = [EncoderFacts {
+        references: true,
+        ..of(1)
+    }];
+    let said = (&takes[..], &[1][..]);
     let keys = [Identity::plain("item")];
     let plain = EncodeItems {
         keys: &keys,
         ..EncodeItems::default()
     };
-    let images = EncodeItems {
+    let demands = EncodeItems {
         decode_images: true,
+        ..plain
+    };
+    let refers = EncodeItems {
+        references: true,
         ..plain
     };
     let (mut placed, now) = (EncodePlaced::new(), Instant::now());
     let entry = &host.engine;
-    // Sent with its prefill: decided, its key placed, its pair leased.
-    let asks = host.asks(said);
-    let decided = entry.decide_encode_at(&asks, images, &mut placed, || now);
-    let (decided, _) = decided.expect("a decision");
-    assert_eq!(decode_of(&decided.decision), Some(1));
-    assert!(decided.lease.is_some() && placed.encoders().len() == 1);
-    // Sent later: declined whole, and that key is gone.
-    let later = Asks {
-        later: true,
+    let with_image = |later| Asks {
+        later,
+        images: true,
         ..host.asks(said)
     };
-    let leased = entry.decide_encode_at(&later, images, &mut placed, || now);
-    let (leased, _) = leased.expect("a decision");
-    assert_eq!(declined_under(&leased.decision), Some("decode-later"));
-    assert!(leased.lease.is_none() && placed.encoders().is_empty());
-    let unleased = entry.decide_encode_without_lease(&later, images, &mut placed, now);
-    let unleased = unleased.expect("a decision");
-    assert_eq!(declined_under(&unleased), Some("decode-later"));
-    assert_eq!(entry.leases.0.load(Ordering::Relaxed), 1);
-    assert_eq!(*heard.lock(), [Side::Prefill, Side::Decode]);
-    // A request that asks no images of its decode states the later decode.
-    let decided = entry.decide_encode_at(&later, plain, &mut placed, || now);
-    let (decided, stated) = decided.expect("a decision");
-    assert!(decided.lease.is_some() && stated);
+    for (held, asks) in [(demands, host.asks(said)), (refers, with_image(false))] {
+        // Sent with its prefill: decided on the decode that takes images,
+        // its key placed, its pair leased.
+        let decided = entry.decide_encode_at(&asks, held, &mut placed, || now);
+        let (decided, _) = decided.expect("a decision");
+        assert_eq!(decode_of(&decided.decision), Some(1));
+        assert!(decided.lease.is_some() && placed.encoders().len() == 1);
+        // Sent later: declined whole by the entry that issues nothing, and
+        // that key is gone.
+        let later = Asks {
+            later: true,
+            ..asks
+        };
+        let unleased = entry.decide_encode_without_lease(&later, held, &mut placed, now);
+        let unleased = unleased.expect("a decision");
+        assert_eq!(declined_under(&unleased), Some("decode-later"));
+        assert!(placed.encoders().is_empty(), "no key stays placed");
+        // And by the entry that issues a pair's lease, behind a key placed.
+        let decided = entry.decide_encode_at(&asks, held, &mut placed, || now);
+        assert!(decided.is_ok() && placed.encoders().len() == 1);
+        let leased = entry.decide_encode_at(&later, held, &mut placed, || now);
+        let (leased, _) = leased.expect("a decision");
+        assert_eq!(declined_under(&leased.decision), Some("decode-later"));
+        assert!(leased.lease.is_none() && placed.encoders().is_empty());
+    }
+    // Two decisions a hold were issued, and no decline said a word.
+    assert_eq!(entry.leases.0.load(Ordering::Relaxed), 4);
+    let issued = [Side::Prefill, Side::Decode].repeat(4);
+    assert_eq!(*heard.lock(), issued);
+    // Under no hold the later decode is stated: a request that asks no
+    // images of its decode, and references that state no image.
+    for (free, asks) in [(plain, with_image(true)), (refers, host.asks(said))] {
+        let later = Asks {
+            later: true,
+            ..asks
+        };
+        let decided = entry.decide_encode_at(&later, free, &mut placed, || now);
+        let (decided, stated) = decided.expect("a decision");
+        assert!(decided.lease.is_some() && stated);
+    }
+    // The decline reads no list: where no decode takes images, references
+    // beside an image are decided with their prefill and declined later.
+    let none = Host::of(1, 2, 1);
+    let entry = &none.engine;
+    let asks = Asks {
+        images: true,
+        ..none.asks(said)
+    };
+    let decided = entry.decide_encode_at(&asks, refers, &mut placed, || now);
+    assert!(decided.expect("a decision").0.lease.is_some());
+    let later = Asks {
+        later: true,
+        ..asks
+    };
+    let declined = entry.decide_encode_at(&later, refers, &mut placed, || now);
+    let (declined, _) = declined.expect("a decision");
+    assert_eq!(declined_under(&declined.decision), Some("decode-later"));
 }
 
 /// Three lists through the engine's other entries are the pair's two: a

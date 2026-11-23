@@ -17,14 +17,15 @@
 
 use std::{sync::Arc, time::Instant};
 
-use super::{decide, sendable, walk, Call, Made, PlaceRequest, Unplaced};
+use super::{decide, sendable, walk, Call, Made, PlaceRequest, Sides, Unplaced};
 use crate::{
     engine::{
+        decision::Target,
         decision_engine::{Decided, DecisionRefused},
         list_cell::LentList,
         policy_engine::PolicyEngine,
         prefills_full,
-        view::Phase,
+        view::{Phase, WorkerId},
         PairLists,
     },
     tracking::Placement,
@@ -34,7 +35,7 @@ use crate::{
 /// engine's document: the decode profile of the binding `model` resolves
 /// to, and that binding's one profile where it names no other. The empty
 /// label where no binding matches.
-fn decode_label(engine: &PolicyEngine, model: &str) -> &'static str {
+pub(super) fn decode_label(engine: &PolicyEngine, model: &str) -> &'static str {
     let binding = engine.spec().engine().binding(model, Phase::Prefill);
     let position = binding.map(|binding| binding.decode_profile.unwrap_or(binding.profile));
     position.map_or("", |position| engine.label_at(position))
@@ -79,28 +80,39 @@ pub(super) fn ask<'a>(
         return Err(Unplaced::PrefillsFull);
     }
     let now = dated.unwrap_or_else(Instant::now);
-    let side = |list: LentList<'_>, place: u32| {
-        let worker = list.workers.get(place as usize)?;
-        sendable(request, worker.as_ref()).then(|| Arc::clone(worker))
-    };
-    let placement = walk(engine, decided, later, now, &mut call.missed, |target| {
-        // A target with no decode side is no pair: it names nobody.
-        let pair = target.pair.ok_or([None; 2])?;
-        let prefill = side(lists.prefill, target.position);
-        let decode = side(lists.decode, pair.decode_position);
-        match (prefill, decode) {
-            (Some(prefill), Some(decode)) => Ok((prefill, Some(decode))),
-            (prefill, decode) => Err([
-                prefill.is_none().then_some(target.id),
-                decode.is_none().then_some(pair.decode_id),
-            ]),
-        }
-    })?;
+    let held = |target: &Target| sides(request, lists, target);
+    let placement = walk(engine, decided, later, now, &mut call.missed, held)?;
     Ok(placement.map(|mut placement| {
         placement.routing_key = key;
         placement.decode_profile = Some(decode_label(engine, request.model));
         placement
     }))
+}
+
+/// The two workers of `target` in `lists`, where `request` can be sent to
+/// both ([`sendable`]): what a walk of a pair's targets asks of each
+/// ([`walk`]), over a pair's two lists and over the pair's two of an encode
+/// request's three. Else the ids of the sides it cannot be sent to.
+pub(super) fn sides(
+    request: &PlaceRequest<'_>,
+    lists: &PairLists<'_>,
+    target: &Target,
+) -> Result<Sides, [Option<WorkerId>; 2]> {
+    let side = |list: LentList<'_>, place: u32| {
+        let worker = list.workers.get(place as usize)?;
+        sendable(request, worker.as_ref()).then(|| Arc::clone(worker))
+    };
+    // A target with no decode side is no pair: it names nobody.
+    let pair = target.pair.ok_or([None; 2])?;
+    let prefill = side(lists.prefill, target.position);
+    let decode = side(lists.decode, pair.decode_position);
+    match (prefill, decode) {
+        (Some(prefill), Some(decode)) => Ok((prefill, Some(decode))),
+        (prefill, decode) => Err([
+            prefill.is_none().then_some(target.id),
+            decode.is_none().then_some(pair.decode_id),
+        ]),
+    }
 }
 
 /// The asks of one call for a pair over `lists` ([`ask`]): where no target

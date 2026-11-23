@@ -34,6 +34,11 @@
 //! its workers ([`pair`]), three decisions a call at most. Its later
 //! decisions are not held to the workers the rule takes.
 //!
+//! A request with an encode request's three lists is placed the same way:
+//! a decision names its pair and each item's encoder, and the request is
+//! placed where its pair's two workers and every encoder can be sent to
+//! ([`encode`]).
+//!
 //! A pair's decode decided again behind its prefill is placed by the same
 //! read of a worker, over the decodes that decision names
 //! ([`decode_again`]). Its caller states the request again, and the
@@ -41,6 +46,7 @@
 //! blocks hashed a second time.
 
 mod decode_again;
+mod encode;
 mod pair;
 
 use std::{
@@ -174,8 +180,8 @@ pub struct PlaceRequest<'a> {
     /// The model the request is for, as its caller resolved it.
     pub model: &'a str,
     /// The workers the request may be sent to, as the caller holds them
-    /// for this request: one list, or a pair's two with their pair
-    /// classes.
+    /// for this request: one list, a pair's two with their pair classes,
+    /// or an encode request's three.
     pub lists: WorkerLists<'a>,
     /// The request's prompt.
     pub prompt: Prompt<'a>,
@@ -196,7 +202,9 @@ pub struct PlaceRequest<'a> {
     pub media: MediaCounts,
     /// What the request demands of the worker that takes it.
     pub demands: Demands,
-    /// The items of an encode request, and `None` for every other.
+    /// The items of an encode request, which hands its three lists
+    /// ([`WorkerLists::Encode`]), and `None` for every other. Three lists
+    /// with `None` are placed as their pair.
     pub encode: Option<EncodeItems<'a>>,
     /// The retry number, `0` for the first attempt. It is stated and not
     /// counted: a failed attempt of a pair names two workers as tried.
@@ -209,14 +217,18 @@ pub struct PlaceRequest<'a> {
     /// and each later one what its call has left: the call reads the
     /// clock once ahead of its first decision, for a request that states
     /// a budget and for no other. Each decision of a pair is given all of
-    /// it.
+    /// it, and each of an encode request.
     pub budget_micros: u32,
     /// Whether the caller asks a pair's decode again behind its prefill's
     /// answer. Where the document picks the decode after the prefill, such
     /// a request's first decision books the prefill alone. A caller that
     /// sends both sides at once states nothing here and keeps one decision
     /// under every document. The word is a pair's: over one list it asks
-    /// nothing, and a first attempt that carries it is plain still.
+    /// nothing, and a first attempt that carries it is plain still. An
+    /// encode request whose decode is held to the workers that take images
+    /// ([`EncodeItems::decode_images`], or references beside an image)
+    /// books its decode with its prefill whatever it states here: a decode
+    /// asked again reads no image fact.
     pub decode_again: bool,
     /// The hash ring the caller keeps of the model's workers, lent to the
     /// request's decision ([`LentRing`]): one ring for a pair's two lists,
@@ -242,6 +254,9 @@ pub struct PlaceRequest<'a> {
     /// refuses is passed over like one that is not ready. A rule that
     /// holds for every request of a route belongs to the list its caller
     /// hands.
+    ///
+    /// For an encode request the rule is its pair's: it is asked of the
+    /// pair's two workers and of no encoder.
     pub admits: Option<WorkerRule<'a>>,
 }
 
@@ -481,8 +496,16 @@ impl RequestMaker for Made<'_, '_> {
             hashes.write_to(&mut facts);
         }
         // The document's word, like the keys: read from the generation
-        // that decides.
-        let later = request.decode_again && spec.decode_pick() == DecodePick::AfterPrefill;
+        // that decides. An encode request whose decode is held to the ones
+        // that take images, by its demand or by the preference of image
+        // references, states no later decode: a decode asked again reads
+        // no image fact. The hold is read last, so a request that asks no
+        // decode again reads none of it.
+        let later = request.decode_again
+            && spec.decode_pick() == DecodePick::AfterPrefill
+            && !request
+                .encode
+                .is_some_and(|items| items.holds_decode_to_images(request.media.images > 0));
         Request {
             id: request.request_id.map_or(&[], str::as_bytes),
             facts,
@@ -499,12 +522,13 @@ impl RequestMaker for Made<'_, '_> {
     // A first attempt that names nothing tried or missed, demands nothing,
     // carries no encode item and asks no decode again is plain. Its size
     // is the one the request made would state. A decode asked again is a
-    // pair's word: over one list it asks nothing, and the request is plain
-    // still.
+    // pair's word, over its two lists or an encode request's three: over
+    // one list it asks nothing, and the request is plain still.
     fn plain(&self) -> Option<Plain> {
         let request = self.request;
         let first = request.attempt == 0 && request.tried.is_empty() && self.missed.is_empty();
-        let again = request.decode_again && matches!(request.lists, WorkerLists::Pair(_));
+        let pair = matches!(request.lists, WorkerLists::Pair(_) | WorkerLists::Encode(_));
+        let again = request.decode_again && pair;
         let asks_more = !request.demands.is_none() || request.encode.is_some() || again;
         (first && !asks_more).then(|| Plain {
             phase: request.phase(),
@@ -572,6 +596,9 @@ pub enum Unplaced {
     /// For a pair, the answer does not say whether the rule refused the
     /// picks or they were not ready: a caller that answers the two apart
     /// reads its lists itself.
+    ///
+    /// An encode request has no worker also where each decision of its
+    /// call named an encoder that could not be sent to.
     NoWorkers,
     /// The engine refused the call's last decision, for the reason it
     /// carries: it made none in its place. Where the call decided again,
@@ -602,13 +629,9 @@ pub(super) fn sendable(request: &PlaceRequest<'_>, worker: &dyn Worker) -> bool 
     ready(worker) && admitted(request, worker)
 }
 
-/// What a request that carries encode items is declined under.
+/// What a request that carries encode items over other lists than an
+/// encode request's three is declined under: no list of it holds an encoder.
 const ENCODE_ITEMS: &str = "encode-items";
-
-/// What a request that hands an encode request's three lists and carries
-/// no item is declined under: this call does not ask the engine's entry for
-/// an encode request yet.
-const ENCODE_LISTS: &str = "encode-lists";
 
 /// What a request is shed under where its route's rule takes no worker of
 /// its list: the rule's own name on a request ([`PlaceRequest::admits`]).
@@ -1055,15 +1078,25 @@ impl PolicyEngine {
     /// caller's limit answer [`Unplaced::PrefillsFull`], on which the
     /// caller waits for room and places the request again.
     ///
-    /// Not placed by this call yet, and declined by name
-    /// ([`ShedReason::PolicyDeclined`]): a request that carries encode
-    /// items (`encode-items`). A pair that states a demand is shed with no
+    /// A request with an encode request's three lists is decided over the
+    /// three ([`PolicyEngine::decide_encode_at`]), with the items it
+    /// carries. Its pair's targets are tried as a pair's are, and the
+    /// placement names each item's encoder beside the pair
+    /// ([`Placement::encoders`]). An item has one encoder: where it cannot
+    /// be sent to, the decision is given up and the engine decides again
+    /// with that encoder excluded, and with each side of the pair that
+    /// could not be sent to either. Its call is a pair's in what follows a
+    /// decision given up: three decisions at most, each given the
+    /// request's whole budget, and the rule asked of no list. An encoder
+    /// is read by its state alone: the route's rule is asked of the pair's
+    /// two workers. With no item the three lists are placed as their pair.
+    ///
+    /// Declined by name ([`ShedReason::PolicyDeclined`]): a request that
+    /// carries encode items over other lists than an encode request's
+    /// three (`encode-items`). A pair that states a demand is shed with no
     /// worker for it ([`ShedReason::NoEndpoints`], under `wires`) where
     /// each of its lists holds a worker: a pair's decision narrows neither
     /// list by a demand.
-    ///
-    /// A request that hands an encode request's three lists and carries no
-    /// item is declined by name too (`encode-lists`).
     ///
     /// Its caller counts each request it sends under the placement's
     /// routing value on the request's worker, as that worker's load guard
@@ -1102,14 +1135,17 @@ impl PolicyEngine {
     /// a decision. A route's rule that panics passes its panic to the
     /// caller, behind the same release.
     pub fn place<'a>(&'static self, request: &PlaceRequest<'a>) -> Result<Placement<'a>, Unplaced> {
-        if request.encode.is_some() {
+        if request.encode.is_some() && !matches!(request.lists, WorkerLists::Encode(_)) {
             return Err(declined(ENCODE_ITEMS));
         }
         match request.lists {
-            WorkerLists::Pair(lists) => pair::place(self, request, &lists, &mut Call::default()),
+            WorkerLists::Pair(ref lists) => pair::place(self, request, lists, &mut Call::default()),
             WorkerLists::Single(list) => single(self, request, Some(list), &mut Call::default()),
             WorkerLists::None => single(self, request, None, &mut Call::default()),
-            WorkerLists::Encode(_) => Err(declined(ENCODE_LISTS)),
+            // A pair's lists and an encode request's are read where the
+            // request holds them: a copy of either here costs every request
+            // a larger frame.
+            WorkerLists::Encode(ref lists) => encode::three(self, request, lists),
         }
     }
 }

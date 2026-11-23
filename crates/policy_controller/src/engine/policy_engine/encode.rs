@@ -32,8 +32,9 @@ use crate::engine::{
 #[cfg(test)]
 mod tests;
 
-/// What a request that states the later decode and asks images of its
-/// decode is declined under: a decode asked again takes no items, so
+/// What a request that states the later decode is declined under where its
+/// decode is held to the ones that take images, by its demand or by image
+/// references beside an image: a decode asked again takes no items, so
 /// nothing there holds it to a decode that takes images.
 const DECODE_LATER: &str = "decode-later";
 
@@ -244,10 +245,14 @@ impl PolicyEngine {
     /// worker of a list it reads is dialed on a wire it does not state:
     /// the pair's two lists, and the encoders for a request with items.
     ///
-    /// A request that states the later decode and asks images of its
-    /// decode ([`EncodeItems::decode_images`]) is declined under
-    /// `decode-later`: a decode asked again takes no items, so nothing
-    /// there holds it to a decode that takes images.
+    /// A request that states the later decode is declined under
+    /// `decode-later` where it asks images of its decode
+    /// ([`EncodeItems::decode_images`]), and where it carries image
+    /// references beside an image ([`EncodeItems::references`]), which
+    /// prefer a decode that takes images: a decode asked again takes no
+    /// items, so nothing there holds it to such a decode. The decline reads
+    /// the request's own facts and no list: it stands also where no decode
+    /// of the lists takes images.
     ///
     /// # Errors
     ///
@@ -342,12 +347,13 @@ impl PolicyEngine {
 /// placed. A request with items reads the three lists, and one with none
 /// the pair's two: it takes no encoder.
 ///
-/// A request that states the later decode and asks images of its decode is
-/// declined under [`DECODE_LATER`], and no key is placed: the entries that
-/// decide a decode again take no items
-/// ([`WorkerLists::Encode`]). The preference of a request with image
-/// references for a decode that takes images
-/// ([`EncodeItems::references`]) is no demand: that request is decided.
+/// A request that states the later decode is declined under
+/// [`DECODE_LATER`], and no key is placed, where its decode is held to the
+/// ones that take images: by its demand ([`EncodeItems::decode_images`]),
+/// or by the preference of image references beside an image
+/// ([`EncodeItems::references`]). The entries that decide a decode again
+/// take no items ([`WorkerLists::Encode`]). The decline reads the request's
+/// own facts and no list, so it stands also where no decode takes images.
 #[inline]
 pub(super) fn decide(
     own: &PolicyEngine,
@@ -378,7 +384,8 @@ pub(super) fn decide(
             return single::declined(own, request, WIRES);
         }
     }
-    if items.decode_images && request.constraints.decode_later {
+    let images = items.holds_decode_to_images(request.facts.media.images != 0);
+    if images && request.constraints.decode_later {
         placed.clear();
         return single::declined(own, request, DECODE_LATER);
     }

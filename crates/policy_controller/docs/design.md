@@ -1061,10 +1061,10 @@ that needs a list asks its cell. The start does not take the lists' trait yet.
 **2. For each request, one call.**
 
 ```rust
-// engine/policy_engine/place.rs, behind the feature `in-process`: built for a single request and a pair
+// engine/policy_engine/place.rs, behind the feature `in-process`: built for a single request, a pair and an encode request
 pub struct PlaceRequest<'a> {
     pub model: &'a str,
-    pub lists: WorkerLists<'a>,       // one list, or a pair's two lists with their pair classes
+    pub lists: WorkerLists<'a>,       // one list, a pair's two lists with their pair classes, or an encode request's three
     pub prompt: Prompt<'a>,           // token ids or text, and the seeds of its cache partition
     pub headers: &'a dyn HeaderRead,  // the engine reads the headers the document names
     pub request_id: Option<&'a str>,
@@ -1092,6 +1092,7 @@ impl PolicyEngine {
 pub struct Placement<'a> {               // built, see part 3
     pub worker: Arc<dyn Worker>,         // where the request goes
     pub decode: Option<Arc<dyn Worker>>, // a pair's decode worker
+    pub encoders: Encoders,              // an encode request's encoders, one an item: one pointer wide
     pub routing_key: Option<&'a str>,    // the key the document derived, for the in-flight counters
     pub profile: &'static str,           // the label of the profile that picked, for the host's own counts
     pub decode_profile: Option<&'static str>, // a pair's decode side's profile, by its label
@@ -1112,11 +1113,9 @@ targets best first: health and circuit breaker are read again, and the route's r
 the picked worker. If none holds, it decides again over what is left. The host sees a worker or a
 reason.
 
-Built so far, for a single request and for a pair over its two lists: the key, the hashes, the decision, and its targets tried
+Built so far, for a single request, a pair over its two lists and an encode request over its three: the key, the hashes, the decision, and its targets tried
 best first by health, circuit breaker and the route's rule. Where none holds, a lease the pick was issued is given up at once and the decision is made again, told to leave out the workers that could not be sent to, three decisions a call at most, or a single request's fourth where its third found the workers the rule takes; then the request has no worker
-(`NoWorkers`). Planned: a pair's later decisions held to the workers the rule takes
-and an encode request. `place`
-declines the last by name until then.
+(`NoWorkers`). Planned: the later decisions of a pair and of an encode request held to the workers the rule takes.
 
 A pair's target holds where both its workers can be sent to.
 
@@ -1136,6 +1135,17 @@ one an earlier attempt tried is handed again where no other is left. A request w
 no worker of the list is shed with no endpoint, under `admits`. A single request's later decision
 is given what the call has left of the request's budget, and a request with none left when a
 decision is due is shed under `budget`. A pair's decisions are each given the whole budget.
+
+An encode request is placed over its three lists as a pair is over its two: three decisions a
+call at most, each given the whole budget, and none held to the workers the rule takes. One
+decision names its pair and each item's encoder, and the pair's targets are tried as a pair's
+are. The placement names each item's encoder beside the pair (`Placement::encoders`). An item has
+one encoder: where it cannot be sent to, the decision is given up and made again with that
+encoder left out, and each side of the pair that could not be sent to either. An encoder is read by its health and its circuit breaker alone: the route's
+rule is asked of the pair's two workers. Three lists with no item are placed as their pair. A
+request whose decode is held to the workers that take images books its decode with its prefill,
+whatever its caller states of asking the decode again: a decode asked again reads no image fact.
+That decode never stands chosen.
 
 A retry stays on its wire by its demand alone. The host gives one number to each runtime and
 transport it dials. It writes that number as each worker's fact and as the retry's demand, and
@@ -1657,9 +1667,9 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `manual` and sticky sessions on that engine | **[partly]** | their sheets replay through the decision function, not through the engine |
 | `bucket` on that engine | **[partly]** | the same |
 | Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; five of its 40 lines are held to an answer of the crate's own |
-| Encode-prefill-decode on that engine | **[partly]** | `PolicyEngine::decide_encode_at` decides it over a host's three lists and issues the pair's lease; it declines a request held to a wire that one worker of the three lists is not dialed on, and one that asks images of its decode and states the later decode; `place` does not take it |
+| Encode-prefill-decode on that engine | **[partly]** | `PolicyEngine::decide_encode_at` decides it over a host's three lists and issues the pair's lease, and `place` places it; the entry declines a request held to a wire that a worker of a list it reads is not dialed on, and one that states the later decode where its decode is held to the workers that take images: a decode asked again takes no items |
 | The lease and its events; the guard | **[built]** | |
-| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request and for a pair, with the route's rule and the decision made again, three decisions a call at most or a single request's fourth where the third found the workers the route's rule takes, and a single request's later decisions held to those workers; `place` for an encode request and a pair's later decisions held to them are not |
+| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request, for a pair and for an encode request, with the route's rule and the decision made again, three decisions a call at most or a single request's fourth where the third found the workers the route's rule takes, and a single request's later decisions held to those workers; the later decisions of a pair and of an encode request held to them are not |
 | The crate's bench of the kept engine | **[planned]** | |
 | The gateway as a host | **[planned]** | section 9; the earlier integration, still on main, is taken out first (stage 0) |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |
