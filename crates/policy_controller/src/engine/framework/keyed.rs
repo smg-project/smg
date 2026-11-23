@@ -113,9 +113,7 @@ impl Engine {
     ///
     /// The session table is read as the whole decision reads it: a pin
     /// followed renews its key's idle time, and a request not decided here
-    /// writes nothing. No decision lent pins of record
-    /// ([`Constraints::pins`]) comes here: the entry's one caller, the engine
-    /// over worker lists, reads none from its host.
+    /// writes nothing.
     ///
     /// [`Scorer::own_by_place`]: super::Scorer::own_by_place
     pub fn decide_keyed<R: PoolRows>(

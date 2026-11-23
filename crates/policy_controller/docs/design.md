@@ -703,7 +703,6 @@ pub struct Constraints<'a> {
     pub demands: Demands,         // what the request needs of its worker
     pub stalled: &'a [u32],       // positions the host itself holds back
     pub held: &'a [u32],          // those of `stalled` that no rule may lift
-    pub pins: Option<&'a dyn PinSource>, // session pins kept outside the engine (the old engine)
     pub places: Option<&'a [u32]>, // the places of the list the request may take; `None`: every place
 }
 ```
@@ -884,13 +883,17 @@ The types the two engines shared stay where they were moved ahead of the deletio
   request states the positions of its list in `Constraints::places` and is decided, which is
   built); an encode request's demands (a single request's and a pair's are kept, which is built).
 - Four request fields that only the old engine's host fills leave with it (`pinned_at`,
-  `lent_in_flight`, `lent_session_in_flight`, `model_fingerprint`), and `Constraints::pins`.
+  `lent_in_flight`, `lent_session_in_flight`, `model_fingerprint`).
   A fifth, `session_counted`, stays, which is built: by it a host says that somebody counts a
   key's requests on each worker, and a sessions rule with a cap asks nothing more of it. Where
   that count stands on a worker object is the request's maker's to say
   (`RequestMaker::session_counted_under`, a provided method): under the key's text for a host
   whose own load guard counts, and under the session's number for a controller, which counts
   by the leases it holds (10.2).
+  `Constraints::pins`, the session pins a host kept outside the engine, is removed with
+  its trait `PinSource`: no host lent any. A session's worker is to outlive a document in the
+  engine's own table, which the front shares with its document's engine
+  (`Engine::share_sessions`), once a running engine takes a new document.
 - The trait's method that the kept engine answers with a constant, `decide_encode_pair`, is built
   or removed. It is removed, and the guard's maker of that name with it, which is done: a host
   asks the engine's own entry with its three lists (`PolicyEngine::decide_encode_at`) and holds
@@ -1537,7 +1540,7 @@ Its data is one in-memory store (`store/memory.rs`):
 | health | the worker crate's health checker over the worker objects, on the leader | copied into the records |
 | loads | the worker crate's load monitor over the worker objects, every 10 seconds while the replica leads; the crate's own poller still runs beside it | `PushLoad` is not served; a single request's decision is given the monitor's snapshot where the document reads reports and keeps none; no decision reads the poller's table |
 | cache index | a follower of each worker's cache events | an index of the store's own; `PushKvEvents` is not served; a single request's decision reads none yet, only the engine's own record of sent prompts |
-| sessions, leases | decisions (leases only) | not replicated to a standby; a single request's session pins are the engine's own table, one for each document |
+| sessions, leases | decisions: a filed lease books its session key's count of requests in flight | not replicated to a standby; no decision reads the counts: a controller's in-flight cap reads the count its leases step on each worker object (10.2); a single request's session pins are the engine's own table, one for each document |
 
 The gRPC service (`crates/policy_controller/contracts/policy_controller.proto`):
 

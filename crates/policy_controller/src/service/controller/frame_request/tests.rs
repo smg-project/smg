@@ -284,7 +284,7 @@ fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
         (constraints.stalled, constraints.held),
         (&stalled[..], &held[..])
     );
-    assert!(constraints.pins.is_none() && constraints.demands.is_none());
+    assert!(constraints.demands.is_none());
 
     // Before it is held to anything, a request may take every place.
     let unheld = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::None);

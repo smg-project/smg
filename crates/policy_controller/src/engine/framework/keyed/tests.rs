@@ -809,7 +809,8 @@ fn a_pin_under_a_scope_or_a_shadow_is_left_to_the_whole_decision() {
             ..RequestFacts::default()
         };
         let table = engine.sessions();
-        let _ = table.restore(request.session(), 1_000, &rule, rows[0].id);
+        table.lookup(request.session(), 1_000, &rule);
+        table.dispatched(request.session(), SessionVerdict::Pinned, rows[0].id);
         let followed = engine.decide_keyed(&request, &listed, &cx);
         let left = scoped || shadow.is_some();
         assert_eq!(followed.is_none(), left, "{scoped} {shadow:?}");
