@@ -469,6 +469,11 @@ impl PrefixPredictor {
         self.places.contains_key(&worker)
     }
 
+    /// The workers the record holds a place for.
+    pub fn held(&self) -> impl Iterator<Item = WorkerId> + '_ {
+        self.places.keys().copied()
+    }
+
     /// A worker left the pool, or was replaced: the next read skips it.
     /// Its placements are taken out by [`PrefixPredictor::sweep`]. A worker
     /// told gone that comes back under the same id starts with nothing.

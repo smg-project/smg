@@ -2123,7 +2123,7 @@ pub(crate) mod tests {
 
     /// What a stage heard of a lease: the word, the worker the lease told
     /// books (the target's own at a dispatch), and the lease's index.
-    type Heard = Arc<Mutex<Vec<(&'static str, WorkerId, u8)>>>;
+    pub(in crate::engine::policy_engine) type Heard = Arc<Mutex<Vec<(&'static str, WorkerId, u8)>>>;
 
     /// The `random` picker, keeping what it hears of the words it names
     /// (`takes`). `panics` makes its pick panic. `alone` makes it place a
@@ -2166,6 +2166,12 @@ pub(crate) mod tests {
             let heard = match *change {
                 Membership::Added(id) => ("joined", id, 0),
                 Membership::Removed(id) => ("left", id, 0),
+                // The ids that stand, one word each.
+                Membership::Snapshot(ids) => {
+                    let standing = ids.iter().map(|&id| ("standing", id, 0));
+                    self.heard.lock().extend(standing);
+                    return;
+                }
                 _ => return,
             };
             self.heard.lock().push(heard);
@@ -2211,7 +2217,7 @@ pub(crate) mod tests {
 
     /// The engine of the `random` preset with [`Hears`] in its pick's place,
     /// taking every word of a lease, and what it heard.
-    fn hearing(panics: bool) -> (PolicyEngine, Heard) {
+    pub(in crate::engine::policy_engine) fn hearing(panics: bool) -> (PolicyEngine, Heard) {
         hearing_as(panics, false, EventSet::LEASE)
     }
 
@@ -2957,12 +2963,12 @@ pub(crate) mod tests {
     }
 
     /// A worker said gone and back at its address serves its sessions
-    /// again, however long it was gone and with no join said: the session
-    /// table is not told a leave, as the classic policies' map is not. A
-    /// key is pinned on a worker that leaves, and is served by the worker
-    /// that stayed for twice the time the table holds an absent worker's
-    /// pins, a quarter of that time apart, by the engine's own number. Back
-    /// in the list, its first worker serves it again.
+    /// again, with no join said: the session table is not told a leave, as
+    /// the classic policies' map is not. A key is pinned on a worker that
+    /// leaves, and is served by the worker that stayed for twice the time
+    /// the table holds an absent worker's pins, a quarter of that time
+    /// apart, by the engine's own number. Back in the list, its first
+    /// worker serves it again.
     #[test]
     fn a_worker_said_gone_and_back_at_its_address_serves_its_sessions_again() {
         let (engine, both) = (preset("manual"), pool(2));
