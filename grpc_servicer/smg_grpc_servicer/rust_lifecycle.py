@@ -57,6 +57,7 @@ from smg_grpc_servicer.warmup import (
     parse_setting,
     plan_for,
     run_warmup,
+    transport_failure,
 )
 
 logger = logging.getLogger(__name__)
@@ -1499,17 +1500,36 @@ class _WarmupHold:
         return False
 
 
-def _warmup_over(server: Any, task: asyncio.Task) -> None:
-    """The planned warm-up's task ended: the servicer is SERVING either way.
-    The engine connected and answers; a warm-up that failed is an error line
-    for the operator, not a worker kept out of rotation."""
+def _warmup_over(server: Any, task: asyncio.Task) -> bool:
+    """Release readiness unless a request's engine-side completion is unknown.
+
+    Warm-up coverage, ordinary errors and a refused cache flush remain best
+    effort. A Generate transport failure is different: the current wire has
+    no acknowledgement that the engine cancelled/drained that request, even
+    if another request or a cache flush later succeeds. Return False so the
+    supervisor stops this server and engine instead of serving or holding
+    readiness forever. A fresh engine can attempt its unchanged plan again.
+    """
     try:
         report = task.result()
-    except Exception:
+    except Exception as error:
+        if transport_failure(error):
+            logger.exception(
+                "The planned warm-up lost its transport; engine-side completion is "
+                "unconfirmed, so the servicer stays NOT_SERVING and the engine stops"
+            )
+            return False
         logger.exception("The planned warm-up failed; the servicer is SERVING without it")
     else:
+        if report.unrecovered_transport_errors:
+            logger.error(
+                "Warm-up over (%s); the servicer stays NOT_SERVING and the engine stops",
+                report.summary(),
+            )
+            return False
         logger.info("Warm-up over (%s); the servicer is SERVING", report.summary())
     hold_readiness(server, True)
+    return True
 
 
 async def supervise(
@@ -1540,8 +1560,10 @@ async def supervise(
     connected and the KV-event relay's subscription reached the engine's
     publisher (``kv_relay_subscribed``, waited for up to
     :data:`RELAY_JOIN_GRACE_SECS` so the warm-up's batches start the relay's
-    history), with the engine polled meanwhile; the health flips to SERVING
-    when it returned, whatever it returned.
+    history), with the engine polled meanwhile. Ordinary warm-up errors and
+    partial coverage are best effort; a Generate transport failure whose
+    engine-side completion is unknown exits nonzero through the same owned
+    server/engine cleanup as any engine failure, without releasing readiness.
 
     Signals drain: health flips to NOT_SERVING at once (the Router stops
     routing here), in-flight streams get up to ``drain_secs`` to finish with
@@ -1585,9 +1607,6 @@ async def supervise(
             if held is not None and held.released(server, loop.time()):
                 warming = asyncio.create_task(asyncio.to_thread(held.warmup))
                 held = None
-            if warming is not None and warming.done():
-                _warmup_over(server, warming)
-                warming = None
             error = server.last_error
             if error or not server.running:
                 logger.error("Rust servicer cannot serve: %s", error or "server exited")
@@ -1598,6 +1617,12 @@ async def supervise(
                 logger.error("Headless engine exited with code %s", rc)
                 exit_code = 1
                 break
+            if warming is not None and warming.done():
+                can_serve = _warmup_over(server, warming)
+                warming = None
+                if not can_serve:
+                    exit_code = 1
+                    break
             if not announced_ready and note_engine_alive is not None:
                 note_engine_alive()
             try:

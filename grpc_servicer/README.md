@@ -645,9 +645,18 @@ itself. Every request carries its own token ids, so prefix caching never
 hides a prefill, and the engine's prefix cache is flushed at the end. One INFO line per shape
 with its time (a chunk remainder's at DEBUG, with an INFO progress line every
 500 remainders and one at their end); readiness (the gRPC health service, so the startup and
-readiness probes) stays NOT_SERVING until the pass ran, and flips SERVING
-whatever the pass returned (a failed request is a logged line, never a worker
-kept out of rotation). `SMG_VLLM_SERVICER_WARMUP` = `full` (the default:
+readiness probes) stays NOT_SERVING until the pass ran. Partial coverage,
+explicit request refusals and ordinary warm-up errors remain best effort,
+subject to the supervisor's current server/engine health checks. On the Rust
+path, a Generate deadline, cancellation or lost connection leaves its
+engine-side completion unconfirmed: a later successful request or cache flush
+is not an acknowledgement that the old request was cancelled or drained.
+That worker keeps NOT_SERVING and exits nonzero through server/engine cleanup;
+a fresh engine must start before admission. The plan, request shapes and
+budget are unchanged, and an unsupported cache flush alone is still a logged
+line. The shared asynchronous pass records the same transport facts; the
+Python servicer's existing health/shutdown policy is unchanged by this Rust
+lifecycle rule. `SMG_VLLM_SERVICER_WARMUP` = `full` (the default:
 every 128-token class; about a minute on a 16k step), `fast` (the tuners'
 bucket grid only: seconds), `off`, a budget in seconds (`120`) or
 `<level>:<seconds>` (`fast:30`); the budget (default 300 s; 900 s for

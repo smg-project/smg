@@ -673,6 +673,31 @@ def refused(error: BaseException) -> UnservedRequest | None:
     return UnservedRequest(f"the engine refused the request: {name}: {details or 'no details'}")
 
 
+def transport_failure(error: BaseException) -> bool:
+    """A Generate whose transport ended without confirming the engine's end.
+
+    An admission refusal is a terminal answer, unlike a client deadline,
+    cancellation or lost connection: those do not acknowledge that a request
+    already sent to the engine was cancelled or drained. Do not infer this
+    distinction from an exception's words, or turn every warm-up error into
+    an engine failure. This helper deliberately needs no grpc import.
+    """
+    if isinstance(error, UnservedRequest):
+        return False
+    if isinstance(
+        error, (TimeoutError, asyncio.TimeoutError, ConnectionError, asyncio.CancelledError)
+    ):
+        return True
+    code = getattr(error, "code", None)
+    if not callable(code):
+        return False
+    try:
+        name = getattr(code(), "name", None)
+    except Exception:  # a diagnostic error is not evidence of a transport failure
+        return False
+    return name in {"DEADLINE_EXCEEDED", "UNAVAILABLE", "CANCELLED"}
+
+
 @dataclasses.dataclass
 class StepResult:
     step: WarmupStep
@@ -692,6 +717,11 @@ class WarmupReport:
     #: answered the refusal with a message: the servicer's own words (a
     #: status' details, else its code), for the end line.
     flush_refusal: str | None = None
+    #: Requests whose engine-side completion is unknown after a transport
+    #: failure. A later request or cache flush is not an acknowledgement for
+    #: those requests. The current wire has no cancellation/drain receipt, so
+    #: the Rust lifecycle must restart this engine before admitting clients.
+    unrecovered_transport_errors: int = 0
 
     @property
     def covered(self) -> int:
@@ -720,6 +750,11 @@ class WarmupReport:
             text += "; the engine's cache was not flushed (the warm-up's blocks stay cached)"
             if self.flush_refusal:
                 text += f": {self.flush_refusal}"
+        if self.unrecovered_transport_errors:
+            text += (
+                f"; {self.unrecovered_transport_errors} request transport errors"
+                "; engine-side completion unconfirmed"
+            )
         return text
 
 
@@ -782,6 +817,9 @@ class _Pass:
 
     def record(self, step: WarmupStep, secs: float, errors: list[BaseException]) -> None:
         self.report.results.append(StepResult(step, secs, len(errors)))
+        self.report.unrecovered_transport_errors += sum(
+            transport_failure(error) for error in errors
+        )
         index = len(self.report.results)
         remainder = step.kind == "remainder"
         if errors:
