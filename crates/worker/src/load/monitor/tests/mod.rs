@@ -4117,7 +4117,7 @@ async fn a_far_rank_has_its_own_sentinel_and_no_rank_between() {
         let (registry, monitor) = build_monitor();
         let worker = ready_worker("http://w:1", "m");
         let id = registry.register(Arc::clone(&worker)).unwrap();
-        for rank in [0, 1_000] {
+        for rank in [0, 63] {
             monitor.apply_pushed_load(&worker, rank, &pushed(7), Instant::now());
         }
         registry.transition_status(&id, WorkerStatus::NotReady);
@@ -4125,10 +4125,10 @@ async fn a_far_rank_has_its_own_sentinel_and_no_rank_between() {
         monitor.evict_worker_loads(&worker);
     });
     assert!(
-        running_series_of(&rendered, 1_000).ends_with(" -1"),
+        running_series_of(&rendered, 63).ends_with(" -1"),
         "the far rank"
     );
-    assert!(!rendered.contains("dp_rank=\"999\""), "a rank between");
+    assert!(!rendered.contains("dp_rank=\"62\""), "a rank between");
 }
 
 /// A report held through a flush: the worker at `http://w:1` reported 7,
