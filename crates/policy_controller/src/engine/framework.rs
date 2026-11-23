@@ -3010,8 +3010,8 @@ fn shadow_index(binding: &Binding, phase: Phase) -> Option<u16> {
 }
 
 /// The overload thresholds a binding hands the pools decided under it
-/// ([`Engine::pool_binding`]): its block's two values, each else the spec's
-/// default, resolved once by validation.
+/// ([`Engine::pool_binding`]): the crate's two defaults where its block is
+/// switched on, resolved once by validation. A block names no number.
 /// The host judges an engine's load reports against them and latches the
 /// verdict on the engine's rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

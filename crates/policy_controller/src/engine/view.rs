@@ -254,8 +254,8 @@ impl Health {
 }
 
 /// A ratio as a permille field: the one rounding a report's ratio and a
-/// spec's usage threshold both take, so one rank's usage at or above a
-/// threshold in the document's unit is never read as under it. A mean of
+/// usage threshold both take, so one rank's usage at or above a threshold
+/// stated as a ratio is never read as under it. A mean of
 /// several ranks' rounded usages within a permille of the threshold can
 /// read on either side of it.
 pub fn permille(ratio: f64) -> u16 {

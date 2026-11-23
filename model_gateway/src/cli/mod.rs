@@ -180,8 +180,10 @@ struct CliArgs {
 /// typed beside a document is refused by both names, at its default value
 /// too. A flag the gateway still reads under a document is not listed, but
 /// for `grouped_dp_sticky`: the dispatch pins by the gateway's own key, and
-/// a supplied document names its own key sources.
-const DOCUMENT_REPLACES: [&str; 45] = [
+/// a supplied document names its own key sources. The two overload
+/// thresholds are not listed: no document names one, and the gateway builds
+/// its worker objects with them.
+const DOCUMENT_REPLACES: [&str; 43] = [
     "policy",
     "cache_threshold",
     "balance_abs_threshold",
@@ -193,8 +195,6 @@ const DOCUMENT_REPLACES: [&str; 45] = [
     "overload_token_usage_threshold",
     "worker_overload_protection",
     "disable_worker_overload_protection",
-    "worker_overload_waiting_requests",
-    "worker_overload_token_usage",
     "worker_overload_shed",
     "overlap_decay",
     "selection_temperature",
@@ -729,8 +729,9 @@ struct RoutingArgs {
 
     /// Run this policy document in place of the one the routing flags mean.
     /// The document replaces those flags. A policy name, a policy's own
-    /// setting and the overload, warm-up and pairing settings are each
-    /// refused beside it by name
+    /// setting, the overload switch and shed flag and the warm-up and pairing
+    /// settings are each refused beside it by name. The two overload
+    /// thresholds stand beside it: the gateway builds its workers with them
     #[arg(
         long,
         value_name = "FILE",
@@ -2245,15 +2246,42 @@ mod tests {
         assert_eq!(config.policy_document_in_force(), Ok(document));
     }
 
+    /// No document names an overload threshold. The two flags stand beside
+    /// a document, the document stays in force, and the settings a worker
+    /// object is built with hold the two.
+    #[test]
+    fn the_overload_thresholds_stand_beside_a_document() {
+        let (file, document) = policy_file("round_robin").expect("a policy document file");
+        let path = file.path().to_str().expect("a UTF-8 path");
+        let config = cli_args_from(&[
+            "--policy-controller",
+            "on",
+            "--policy-spec",
+            path,
+            "--worker-overload-waiting-requests",
+            "32",
+            "--worker-overload-token-usage",
+            "0.9",
+        ])
+        .to_router_config(vec![], vec![])
+        .expect("the routing configuration");
+        assert_eq!(config.policy_document_in_force(), Ok(document));
+        let built = config.registration_settings().overload_defaults;
+        assert_eq!(built.waiting_requests, Some(32));
+        assert_eq!(built.token_usage, Some(0.9));
+    }
+
     /// The flags under the routing policy heading a document does not
     /// replace: the controller's own, and what the gateway reads itself.
-    const BESIDE_A_DOCUMENT: [&str; 6] = [
+    const BESIDE_A_DOCUMENT: [&str; 8] = [
         "policy_controller",
         "policy_spec",
         "print_policy_spec",
         "dp_aware",
         "routing_key_headers",
         "enable_igw",
+        "worker_overload_waiting_requests",
+        "worker_overload_token_usage",
     ];
 
     #[test]

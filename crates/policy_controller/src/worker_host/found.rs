@@ -521,7 +521,7 @@ mod tests {
     }
 
     /// A threshold of the object's own under half a permille is held as
-    /// one, as a document's is.
+    /// one.
     #[test]
     fn a_threshold_under_half_a_permille_is_held_as_one() {
         let spec = WorkerSpec {
