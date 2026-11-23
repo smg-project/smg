@@ -397,13 +397,12 @@ fails once the reason no longer holds.
 - `encode_pair.json`: all 52 rows replay. In the nine that place items by consistent hashing a key's encoder is
   not held to the recorded one: two rings place no key alike. The replay holds each key to the encoders it was
   offered and equal keys to one encoder.
-- `pair_select.json`: five rows are decided apart, each named by the replay with the answer the pair's decision
-  gives. Four run a prefill policy that weighs load against cache affinity itself (`cache_aware`): the gateway
-  lifts the overload veto for such a policy and lets it place, and no profile of the crate places over a lifted
-  veto yet. A prefill of such a profile that is only over its thresholds keeps its refusal. One is a refusal's
-  reason: where the only ready prefill's partners are all over their thresholds beside a free decode of another
-  transport, the gateway answers unavailable and the pair's decision names the overload veto. The other 35 rows
-  replay.
+- `pair_select.json`: one row is decided apart, named by the replay with the answer the pair's decision gives. It
+  is a refusal's reason: where the only ready prefill's partners are all over their thresholds beside a free decode
+  of another transport, the gateway answers unavailable and the pair's decision names the overload veto. The other
+  39 rows replay, the four of a prefill policy that weighs load against cache affinity itself (`cache_aware`)
+  among them: the gateway lifts the overload veto for such a policy and lets it place, and a prefill profile that
+  reads affinity runs with that veto lifted under a binding that steers.
 - `overload.json`: none where the worker is one object for all its ranks, as the recording gateway held it. All 25
   rows replay there, verdict for verdict, through the worker crate's load monitor. The replay builds the holder of
   worker objects with the calls a controller builds its own with, and writes the row's worker into the store the

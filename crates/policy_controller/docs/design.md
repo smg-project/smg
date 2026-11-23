@@ -1791,7 +1791,7 @@ On main: 18 sheets, 482 lines.
 | replayed and passing | 16 | 459 |
 | recorded, replayed by nothing (`constraint_decider`, `minimum_tokens`) | 2 | 23 |
 | replayed through the engine that stays (`PolicyEngine`) | **5**, and 31 lines of `prefix_hash` | **76** |
-| replayed lines held to an answer of the crate's own, not classic's | | 12 |
+| replayed lines held to an answer of the crate's own, not classic's | | 8 |
 
 A replay of all fourteen decision sheets through `PolicyEngine` over worker objects is in work and not on main yet: on main the four hard-demand sheets (`retry_wire`, `media_refs`, `context_window`, `rank_pin`; 37 lines), `sticky_rank` (8 lines) and 31 lines of `prefix_hash` replay through it. Measured
 with it locally on 2026-11-22, on main (`096c0f5ea`): of the 408 lines that record a decision
@@ -1923,7 +1923,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | placed on the ring the host lends (decision 3): through `place` the plain ring at the place the engine reads with the request's keys, and `prefix_hash` at the places the host's ring answers for the request's heads, where it answers for a head; that both are classic's is proven at stage 3; a host that lends none is placed on the crate's ring, which may be another worker than classic's |
 | `manual` and sticky sessions on that engine | **[partly]** | their sheets replay through the decision function, not through the engine |
 | `bucket` on that engine | **[partly]** | the same |
-| Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; five of its 40 lines are held to an answer of the crate's own |
+| Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; one of its 40 lines is held to an answer of the crate's own |
 | Encode-prefill-decode on that engine | **[partly]** | `PolicyEngine::decide_encode_at` decides it over a host's three lists and issues the pair's lease, and `place` places it; the entry declines a request held to a wire that a worker of its pair's two lists is not dialed on, places its items on the encoders dialed on a wire it states, declines a request with items where the list holds encoders and none is, and declines one that states the later decode where its decode is held to the workers that take images: a decode asked again takes no items |
 | The lease and its events; the guard | **[built]** | |
 | The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request, for a pair and for an encode request, with the route's rule and the decision made again, three decisions a call at most or a single request's fourth where the third found the workers the route's rule takes, and a single request's later decisions held to those workers; the later decisions of a pair and of an encode request held to them are not |
