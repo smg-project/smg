@@ -200,6 +200,9 @@ pub mod worker_host;
 ///   picker that draws first reads it too, and whatever follows that draw
 ///   (the order of the rows drawn, or the whole pass behind a draw that kept
 ///   nobody) reads it past those values;
+/// - the seed under a mask made of a stage's name ([`Draw::for_stage`]): the
+///   draws of a filter or a scorer that opens it, the call for one its host
+///   registers;
 /// - one value of the seed's stream, read behind the draw of a picker whose
 ///   unit is the engine: the seed of the stream that draws between equal
 ///   rows of the engine taken;
@@ -224,6 +227,32 @@ impl Draw {
     /// A draw sequence from a decision's seed.
     pub const fn new(seed: u64) -> Self {
         Self(seed)
+    }
+
+    /// A stage's own stream of the seed it is handed: the seed under a mask
+    /// made of `stage`, the name the stage answers by. It is the call for a
+    /// filter or a scorer its host registers, where that stage draws:
+    /// `Draw::for_stage(facts.seed, self.name())`. The stream of
+    /// [`Draw::new`] of the seed is the one the profile's picker reads: a
+    /// stage that drew from it would read the picker's values, one for one,
+    /// and where the picker draws, the worker it takes would follow what
+    /// the stage drew.
+    ///
+    /// The mask is the fingerprint of the name's bytes
+    /// ([`engine::fingerprint`]), which is never zero, so the stream is
+    /// never the seed's own. Two names of two fingerprints open two
+    /// streams, and a catalog of stages holds a name once
+    /// ([`stages::StageRegistry`]). The stream is another of those listed
+    /// on [`Draw`] only where two 64-bit values meet.
+    ///
+    /// The stream is that of
+    /// `Draw::new(seed ^ fingerprint(stage.as_bytes()))`: a stage may keep
+    /// its name's fingerprint from its build and open its stream with one
+    /// exclusive-or at each call. Every call opens the stream at its start:
+    /// under one seed and one name it draws the same values every time.
+    #[must_use]
+    pub fn for_stage(seed: u64, stage: &str) -> Self {
+        Self(seed ^ engine::fingerprint(stage.as_bytes()))
     }
 
     /// The next 64 bits.
@@ -255,6 +284,7 @@ impl Draw {
 #[cfg(test)]
 mod tests {
     use super::Draw;
+    use crate::engine::fingerprint;
 
     #[test]
     fn the_draw_is_deterministic_per_seed_and_stays_below_the_bound() {
@@ -266,5 +296,37 @@ mod tests {
             assert!(x < 13);
         }
         assert_eq!(Draw::new(1).below(0), 0);
+    }
+
+    /// A stage's stream shares no value, place for place, with the seed's
+    /// own stream, which the picker reads: under the empty name too. It is
+    /// the seed's stream under the fingerprint of the stage's name: the
+    /// equality a stage that keeps its fingerprint opens its stream by.
+    #[test]
+    fn a_stages_stream_is_the_seeds_under_its_names_fingerprint() {
+        for seed in [0, 1, 7, 0x9e37_79b9_7f4a_7c15, u64::MAX] {
+            for name in ["pack", "spread", "a", ""] {
+                let mut own = Draw::for_stage(seed, name);
+                let mut pickers = Draw::new(seed);
+                let mut by_hand = Draw::new(seed ^ fingerprint(name.as_bytes()));
+                for place in 0..8 {
+                    let value = own.next_u64();
+                    assert_ne!(value, pickers.next_u64(), "{name} at {seed}, {place}");
+                    assert_eq!(value, by_hand.next_u64(), "{name} at {seed}, {place}");
+                }
+            }
+        }
+    }
+
+    /// The two names, of two fingerprints, open two streams from one seed.
+    /// One name opens the same stream from one seed every time: the call
+    /// keeps nothing between two calls.
+    #[test]
+    fn two_names_open_two_streams_and_one_name_replays() {
+        for seed in 0..256u64 {
+            let first = |name| Draw::for_stage(seed, name).next_u64();
+            assert_ne!(first("pack"), first("spread"), "seed {seed}");
+            assert_eq!(first("pack"), first("pack"), "seed {seed}");
+        }
     }
 }

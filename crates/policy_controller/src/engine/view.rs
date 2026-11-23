@@ -1092,7 +1092,11 @@ pub struct RequestFacts<'a> {
     pub headers: &'a [Header<'a>],
     pub media: MediaCounts,
     /// The per-decision seed, recorded in the trace: the only randomness a
-    /// stage gets.
+    /// stage gets. The seed's own stream is the one the profile's picker
+    /// reads. A filter or a scorer its host registers is to draw from the
+    /// stream of its own name
+    /// ([`Draw::for_stage`](crate::Draw::for_stage)), whose values are not
+    /// the picker's.
     pub seed: u64,
     /// The size of one of the request's blocks as the host counted them.
     /// Under the token kind it is in tokens: an index's learned block size
