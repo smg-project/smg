@@ -12,6 +12,8 @@ use opencv::{
     videoio,
 };
 
+use crate::{error::MediaConnectorError, media::out_of_memory};
+
 unsafe extern "C" {
     fn smg_opencv_capture_from_buffer(
         data: *const u8,
@@ -32,10 +34,12 @@ pub(crate) struct RgbOutputBuffer {
 }
 
 impl RgbOutputBuffer {
-    pub(crate) fn with_capacity(capacity: usize) -> Result<Self, String> {
+    pub(crate) fn with_capacity(capacity: usize) -> Result<Self, MediaConnectorError> {
         let mut data = Vec::new();
         data.try_reserve_exact(capacity).map_err(|error| {
-            format!("failed to reserve {capacity} decoded video bytes: {error}")
+            out_of_memory(format!(
+                "failed to reserve {capacity} decoded video bytes: {error}"
+            ))
         })?;
         Ok(Self { data })
     }
@@ -49,11 +53,17 @@ impl RgbOutputBuffer {
         bgr_frame: &Mat,
         width: u32,
         height: u32,
-    ) -> Result<(usize, usize), String> {
-        let width_i32 = i32::try_from(width)
-            .map_err(|_| format!("OpenCV RGB output width does not fit i32: {width}"))?;
-        let height_i32 = i32::try_from(height)
-            .map_err(|_| format!("OpenCV RGB output height does not fit i32: {height}"))?;
+    ) -> Result<(usize, usize), MediaConnectorError> {
+        let width_i32 = i32::try_from(width).map_err(|_| {
+            MediaConnectorError::VideoDecode(format!(
+                "OpenCV RGB output width does not fit i32: {width}"
+            ))
+        })?;
+        let height_i32 = i32::try_from(height).map_err(|_| {
+            MediaConnectorError::VideoDecode(format!(
+                "OpenCV RGB output height does not fit i32: {height}"
+            ))
+        })?;
         let frame_size = usize::try_from(width)
             .ok()
             .and_then(|width| {
@@ -62,13 +72,23 @@ impl RgbOutputBuffer {
                     .and_then(|height| width.checked_mul(height))
             })
             .and_then(|pixels| pixels.checked_mul(3))
-            .ok_or_else(|| "OpenCV RGB frame byte size overflow".to_string())?;
-        self.data.try_reserve(frame_size).map_err(|error| {
-            format!("failed to reserve {frame_size} decoded video bytes: {error}")
-        })?;
+            .ok_or_else(|| {
+                MediaConnectorError::VideoDecode("OpenCV RGB frame byte size overflow".to_string())
+            })?;
+        // A growth asks for the amortized capacity first and, where that larger
+        // ask is refused, for what this frame needs: only a refusal of the
+        // needed length ends the decode.
+        self.data
+            .try_reserve(frame_size)
+            .or_else(|_| self.data.try_reserve_exact(frame_size))
+            .map_err(|error| {
+                out_of_memory(format!(
+                    "failed to reserve {frame_size} decoded video bytes: {error}"
+                ))
+            })?;
         let offset = self.data.len();
         let output_data = self.data.spare_capacity_mut().as_mut_ptr().cast::<u8>();
-        // SAFETY: `try_reserve` made at least `frame_size` writable bytes
+        // SAFETY: the reservation above made at least `frame_size` writable bytes
         // available, and the Vec cannot move while `output` borrows that region.
         let mut output = unsafe {
             Mat::new_rows_cols_with_data_unsafe_def(
@@ -78,15 +98,17 @@ impl RgbOutputBuffer {
                 output_data.cast(),
             )
         }
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| MediaConnectorError::VideoDecode(error.to_string()))?;
         imgproc::cvt_color_def(bgr_frame, &mut output, imgproc::COLOR_BGR2RGB)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| MediaConnectorError::VideoDecode(error.to_string()))?;
         if output.data() != output_data
             || output.rows() != height_i32
             || output.cols() != width_i32
             || output.typ() != CV_8UC3
         {
-            return Err("OpenCV replaced the caller-provided RGB output buffer".to_string());
+            return Err(MediaConnectorError::VideoDecode(
+                "OpenCV replaced the caller-provided RGB output buffer".to_string(),
+            ));
         }
         drop(output);
         // SAFETY: cvtColor successfully initialized exactly `frame_size` bytes in
