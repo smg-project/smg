@@ -7780,23 +7780,62 @@ mod tests {
     }
 
     /// Profiles under one time limit and one report delay read one count
-    /// of sends. A profile under another limit keeps a count of its own.
+    /// of sends. A profile under another limit or another delay keeps a
+    /// count of its own.
     #[test]
     fn profiles_under_one_sent_setting_read_one_count_of_sends() {
-        for (limit, want) in [(None, 1), (Some(43), 2)] {
+        for (sent, want) in [
+            ((None, None), 1),
+            ((Some(43), None), 2),
+            ((None, Some(5)), 2),
+        ] {
             let mut spec = doc(
                 r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["least-load"],"pick":"best"},"q":{"score":["least-load"],"pick":"best"}},"bindings":[{"match":{"model":"m"},"profile":"p"},{"match":{"model":"*"},"profile":"q"}]}"#,
             );
-            spec.profiles.get_mut("q").expect("the profile").sent_ttl_ms = limit;
+            let q = spec.profiles.get_mut("q").expect("the profile");
+            (q.sent_ttl_ms, q.sent_report_delay_ms) = sent;
             let engine = spec.validate().expect("a valid document");
-            assert_eq!(engine.sent_credits.len(), want, "q under {limit:?}");
+            assert_eq!(engine.sent_credits.len(), want, "q under {sent:?}");
             // Both scorers hold a count of the list, the ones the engine
             // feeds: the list holds each count once beside its readers.
             let readers = engine
                 .sent_credits
                 .iter()
                 .map(|count| Arc::strong_count(count) - 1);
-            assert_eq!(readers.sum::<usize>(), 2, "q under {limit:?}");
+            assert_eq!(readers.sum::<usize>(), 2, "q under {sent:?}");
+        }
+    }
+
+    /// A later document takes over a shared count by the name of the
+    /// profile that made it: the same profiles again keep its sends, and
+    /// where that profile is gone the count of the one that stays starts
+    /// empty.
+    #[test]
+    fn a_later_document_takes_a_shared_count_by_the_name_of_its_maker() {
+        let both = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["least-load"],"pick":"best"},"q":{"score":["least-load"],"pick":"best"}},"bindings":[{"match":{"model":"m"},"profile":"p"},{"match":{"model":"*"},"profile":"q"}]}"#;
+        let q_alone = r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"score":["least-load"],"pick":"best"}},"bindings":[{"match":{"model":"*"},"profile":"q"}]}"#;
+        let worker = crate::engine::WorkerId(7);
+        let target = crate::engine::Target {
+            id: worker,
+            ..Default::default()
+        };
+        // The later document, and the sends its one count holds.
+        for (later, want) in [(both, 1), (q_alone, 0)] {
+            let standing = doc(both).validate().expect("a valid document");
+            standing.on_dispatched(
+                &crate::tracking::Lease::default(),
+                &target,
+                crate::tracking::Side::Single,
+                0,
+            );
+            let next = doc(later).validate().expect("a valid document");
+            next.succeed(&standing);
+            let held: Vec<_> = next
+                .sent_credits
+                .iter()
+                .map(|count| count.credits.held(worker))
+                .collect();
+            assert_eq!(held, [want], "{later}");
         }
     }
 

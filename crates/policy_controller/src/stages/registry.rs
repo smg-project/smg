@@ -172,9 +172,12 @@ impl StageBuild<'_> {
         self.written
     }
 
-    /// The profile's count of sends. The first call for a profile makes
-    /// its tally under that profile's `sent_ttl_ms` and its
-    /// `sent_report_delay_ms`.
+    /// The profile's count of sends, under its `sent_ttl_ms` and its
+    /// `sent_report_delay_ms`. The profiles of a document that set the same
+    /// two read one count: the first call hands an earlier profile's count
+    /// where one stands under them, and makes one otherwise. A read by any
+    /// of those profiles' decisions lets go the sends the row's report
+    /// covers, for all of them.
     pub fn dispatch_credit(&mut self) -> Arc<DispatchCredit> {
         profile_sent(self.sent, self.profile, self.sent_settings)
     }
