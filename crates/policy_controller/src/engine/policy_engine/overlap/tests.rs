@@ -574,7 +574,9 @@ fn the_record_names_the_worker_a_prefix_was_sent_to() {
 /// decision named its rows, and the one behind a decision handed the column
 /// whole. A pick the rule keeps from the profile leaves no prefix. One that
 /// is the profile's own, the rule's default, is written as a pick by the
-/// profile's stages is. The lookup returns the answer it is handed either
+/// profile's stages is. A pick is written for the first of its targets its
+/// caller sends to (`sends_to`), and for none where it sends to none. The
+/// lookup returns the answer it is handed either
 /// way, but for what the pick states of its first target
 /// ([`a_pick_its_rule_keeps_from_the_profile_states_nothing`]): a pin the
 /// keyed entry followed passes through it with its answer made. A profile
@@ -630,7 +632,8 @@ fn a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word_at_both_writes(
                 &bed.ids,
                 &mut request(asked, 7, NOW),
                 |_| None,
-                |_| true,
+                // The caller sends to every worker but the one at 3.
+                |target| target.position != 3,
                 |facts| {
                     assert_eq!(facts.named.is_none(), whole);
                     match facts.named {
@@ -665,14 +668,26 @@ fn a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word_at_both_writes(
         let told = ruled(1, bed.ids[1], RulePlaced::Told);
         assert_eq!(decided(&own, told), [0; 4], "whole: {whole}");
         assert_eq!(decided(&own, shed()), [0, 4, 0, 0], "whole: {whole}: told");
-        // The stages' pick of the first prompt is written as that one was.
-        let by_stages = picked(2, bed.ids[2]);
+        // The stages' pick of the first prompt is written as that one was,
+        // behind a lead its caller passes over: the worker at 3.
+        let mut by_stages = picked(2, bed.ids[2]);
+        if let Decision::Pick(pick) = &mut by_stages {
+            pick.targets.lead(Target {
+                position: 3,
+                id: bed.ids[3],
+                ..Target::default()
+            });
+        }
         assert_eq!(decided(&kept, by_stages), [0; 4], "whole: {whole}");
         assert_eq!(
             decided(&kept, shed()),
             [0, 0, 4, 0],
             "whole: {whole}: the stages'"
         );
+        // A pick whose one target its caller passes over: nothing is written.
+        let (lost, alone) = (prompt(3_000, 4), picked(3, bed.ids[3]));
+        assert_eq!(decided(&lost, alone), [0; 4], "whole: {whole}");
+        assert_eq!(decided(&lost, shed()), [0; 4], "whole: {whole}: to none");
     }
 }
 

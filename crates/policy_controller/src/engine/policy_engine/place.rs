@@ -301,13 +301,15 @@ pub struct PlaceRequest<'a> {
     /// `None` for a route that has none. It is asked of the workers the
     /// engine picked: a request whose first pick it admits pays one call
     /// of it, and a pair's request one for each of its two workers. A
-    /// request decided inside a token tree its caller lends
-    /// ([`Prompt::entry`]) has the rule asked inside that decision, ahead
-    /// of the tree's write, so the tree stores the prompt for a worker the
-    /// rule takes. The pick takes that answer and asks the rule of that
-    /// worker no second time. A rule asked there runs inside a decision:
-    /// it asks the engine nothing, and where it panics the tree stores
-    /// nothing and the panic reaches the caller behind the decision.
+    /// request whose decision stores where its prompt went, in a token
+    /// tree its caller lends ([`Prompt::entry`]) or in the record of sent
+    /// prefixes a `cache_aware` profile keeps, has the rule asked inside
+    /// that decision, ahead of the write, so the prompt is stored for a
+    /// worker the rule takes. The pick takes that answer and asks the rule
+    /// of that worker no second time. A rule asked there runs inside a
+    /// decision: it asks the engine nothing, and where it panics the prompt
+    /// is stored for no worker and the panic reaches the caller behind the
+    /// decision.
     /// Behind
     /// a single request's decision none of whose picks can be sent to,
     /// where it refused one that was ready, it is asked of every worker of
@@ -415,20 +417,21 @@ pub(super) struct Made<'r, 'a> {
     /// of the ring stage: asked of the lender at the request's first
     /// making, like the key's place.
     heads: OnceCell<Places>,
-    /// The panic of the route's rule where it was asked inside the lookup
-    /// of a lent token tree ([`RequestMaker::sends_to`]): kept for the
-    /// call, which raises it again outside the decision ([`raise`]).
+    /// The panic of the route's rule where it was asked inside a decision
+    /// ([`RequestMaker::sends_to`]): kept for the call, which raises it
+    /// again outside the decision ([`raise`]).
     panicked: OnceCell<Box<dyn Any + Send>>,
-    /// What the lookup of a lent token tree was answered on the targets it
-    /// asked ([`RequestMaker::sends_to`]): the call's pick takes these
-    /// answers, and reads none of those targets again.
+    /// What a decision was answered on the targets it asked
+    /// ([`RequestMaker::sends_to`]): the call's pick takes these answers,
+    /// and reads none of those targets again.
     sent: Cell<Sent>,
 }
 
-/// What a call's maker answered on a decision's targets inside the lookup
-/// of a lent token tree: each place asked, and whether the call sends to
-/// it. The lookup asks a pick's targets best first and stops at the first
-/// one the call sends to, so a pick's targets fit.
+/// What a call's maker answered on a decision's targets where the decision
+/// asked which of them a prompt is stored for, in a lent token tree or in
+/// the record of sent prefixes: each place asked, and whether the call
+/// sends to it. A pick's targets are asked best first up to the first one
+/// the call sends to, so a pick's targets fit.
 #[derive(Clone, Copy)]
 struct Sent {
     /// The places asked, in the order asked.
@@ -813,8 +816,9 @@ impl RequestMaker for Made<'_, '_> {
     }
 
     // The walk's own read of a single request's target, made ahead of the
-    // walk for the tree's write: ready, and admitted by the route's rule,
-    // which is asked of a worker that is ready and of no other.
+    // walk for the write of where the prompt went, a lent tree's or the
+    // record's: ready, and admitted by the route's rule, which is asked of
+    // a worker that is ready and of no other.
     //
     // A rule that panics here panics inside a decision, where the engine's
     // own catch would answer it as a decision that faulted. It is the
@@ -1242,12 +1246,12 @@ fn named(engine: Loaded<'_, '_>, list: Option<LentList<'_>>, place: u32) -> Opti
     records.ids().get(place as usize).copied()
 }
 
-/// Raises again the panic of a route's rule that was asked inside the
-/// lookup of a lent token tree ([`RequestMaker::sends_to`]), behind the
-/// decision that asked it. That decision stored nothing in the tree. A
-/// lease it was issued is given up by name first, as the walk gives one up
-/// behind a rule that panics there. Out of line: a rule that panics is no
-/// request's path.
+/// Raises again the panic of a route's rule that was asked inside a
+/// decision ([`RequestMaker::sends_to`]), behind the decision that asked
+/// it. That decision stored the prompt for no worker. A lease it was
+/// issued is given up by name first, as the walk gives one up behind a
+/// rule that panics there. Out of line: a rule that panics is no request's
+/// path.
 #[cold]
 #[inline(never)]
 fn raise(
@@ -1265,9 +1269,8 @@ fn raise(
 /// one decision, and the first of its targets that can be sent to
 /// ([`walk`]): ready ([`ready`]) and admitted by its route's rule. At a
 /// pick the rule is asked of a worker that is ready, and of no other. A
-/// target the lookup of a lent token tree asked is taken by the answer
-/// it was given there ([`Sent`]): it is read once a decision, and its
-/// rule asked once.
+/// target the decision asked is taken by the answer it was given there
+/// ([`Sent`]): it is read once a decision, and its rule asked once.
 /// Where none can be sent to, the decision is given up by name, its
 /// targets join the ones the call's next ask leaves out
 /// ([`Call::missed`]), and the call's next ask answers ([`Call::again`]).
@@ -1322,7 +1325,7 @@ fn single<'a>(
         Decided::Whole(decided, later) => {
             let now = dated.unwrap_or_else(Instant::now);
             // Whether the rule refused a target that was ready: inside
-            // the lookup of a lent tree, or here.
+            // the decision, or here.
             let refused = Cell::new(sent.refused);
             let taken = walk(engine, decided, later, now, &mut call.missed, |target| {
                 let worker = at(target.position);
@@ -1383,7 +1386,7 @@ impl PolicyEngine {
     /// A worker the rule refuses is left out like one that is not ready.
     /// The rule is asked of a decision's picks first: a request whose
     /// first pick it admits pays one call of it, inside the decision where
-    /// that is made in a lent token tree. Behind the first decision
+    /// that stores the prompt for a worker. Behind the first decision
     /// none of whose picks can be sent to, where the rule refused one that
     /// was ready, the decision is given up and the rule is asked of every
     /// worker of the list, ready or not, once a call. The call's later
@@ -1400,26 +1403,20 @@ impl PolicyEngine {
     ///
     /// A decision that is given up has written what its stages write as
     /// they decide, and its release takes none of that back: the tokens a
-    /// `bucket` profile books on a worker a prefill decision listed, the
-    /// prompt's holder a `cache_aware` profile records, a new session's
-    /// claim of its worker.
+    /// `bucket` profile books on a worker a prefill decision listed, a new
+    /// session's claim of its worker. A decision whose later target is
+    /// taken has written for its first target all the same.
     ///
-    /// A decision whose later target is taken has written for its first
-    /// target all the same. A `cache_aware` profile records the prompt's
-    /// holder inside the decision, as the worker it picked first. A
-    /// placement on a later target tells that record nothing, and the next
-    /// decision does not learn that the rule refused the first: the
-    /// prompt's next request is drawn to the refused worker again.
-    ///
-    /// A token tree the caller lends is written otherwise. A decision made
-    /// inside its lookup ([`Prompt::entry`]) asks, ahead of the write,
-    /// which of its targets this call can send to
-    /// ([`RequestMaker::sends_to`]): ready, and admitted by the route's
-    /// rule. The tree stores the prompt for the first such target, and the
-    /// call takes that target by the same answer: a worker is read, and
-    /// its rule asked, once a decision. Where there is none the tree
-    /// stores the prompt for no worker: a decision that is given up
-    /// leaves no holder in it.
+    /// Where a prompt went is written otherwise, in the record of sent
+    /// prefixes a `cache_aware` profile keeps and in a token tree the
+    /// caller lends ([`Prompt::entry`]). A decision that writes either
+    /// asks, ahead of the write, which of its targets this call can send
+    /// to ([`RequestMaker::sends_to`]): ready, and admitted by the route's
+    /// rule. The prompt is stored for the first such target, and the call
+    /// takes that target by the same answer: a worker is read, and its
+    /// rule asked, once a decision. Where there is none the prompt is
+    /// stored for no worker: a decision that is given up leaves no holder
+    /// behind.
     ///
     /// A request with a pair's two lists is placed over both, a target at
     /// a time. The first target both of whose workers can be sent to is
