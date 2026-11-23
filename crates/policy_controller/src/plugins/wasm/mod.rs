@@ -43,9 +43,12 @@
 //! (`needs`, either form), the first
 //! [`MAX_BLOCK_HASHES`](crate::document::spec::MAX_BLOCK_HASHES) of a longer
 //! list, so a prompt's length sizes no view of a module that reads none. Every
-//! call runs under fuel: the plugin's frame budget clamped to the decision's
-//! remaining budget (one remainder per thread per decision, shared by every
-//! plugin and side it opens, of any runtime built over the same
+//! call runs under fuel: the plugin's frame budget, or the default frame where
+//! it states none
+//! ([`FrameBudget::DEFAULT_MICROS`](crate::plugins::shared::FrameBudget::DEFAULT_MICROS)),
+//! clamped to the decision's remaining budget (one remainder per thread per
+//! decision, shared by every plugin and side it opens, of any runtime built
+//! over the same
 //! [`OpenDecisions`](crate::plugins::shared::OpenDecisions)), times the host's
 //! calibration of fuel to microseconds, and under a bound on the clock of what
 //! the decision has left (at most the frame). Fuel prices every operator, a
@@ -83,11 +86,14 @@
 //! its own name beside its stall. At its bound a call is the plugin's. A hold
 //! short of late is no late call, and on a thread nothing armed its decision's
 //! sample takes the time the call took. So a sample that is slow by time
-//! nothing read alone (past half the budget, or past the budget, where the fuel
+//! nothing read alone (past half of its frames, or past them, where the fuel
 //! of its unread calls leaves it short of that mark) arms the thread too,
-//! counted with the unread calls. So a ring never holds two slow samples no
-//! reading covered, and the latency rule, which wants two slow samples, never
-//! opens on time nothing read alone; `unread` counts the first event of each
+//! counted with the unread calls. Where the bound ended a call of the
+//! decision under the plugin's own bound it arms the thread and is not
+//! counted: at its bound a call is the plugin's. So a ring never holds two
+//! slow samples no reading covered, and the latency rule, which wants two
+//! slow samples, never opens on time nothing read alone; `unread` counts the
+//! first event of each
 //! window no reading covered, the host's hold or the guest's own unpriced time,
 //! and `stalls` the late holds read inside one, and on a busy thread, where a
 //! window is short, the two are read together. This is the rule of this plugin
@@ -162,15 +168,17 @@
 //! destructor long on the clock cannot stretch a decision.
 //!
 //! The breaker opens for a cool-down on a run of failures within its window,
-//! or when the moving p50 of the plugin's decisions passes half the budget
-//! or the p99 (the second-slowest of the ring) passes it: one sample per
+//! or when the moving p50 of the plugin's decisions passes half of the frames
+//! the plugin was given in a decision, at most the decision's budget, or the
+//! p99 (the second-slowest of the ring) passes them: one sample per
 //! decision, the plugin's own time in it (its constructor and stage calls,
 //! whatever ended them, each its charge, or for a late call a reading
 //! covers its fuel or the CPU its thread had and never the time the host
-//! held it; and a lazy `init` the decision paid) over the
-//! decision's budget, taken at its last close, the ring the thread's across
-//! rebuilds. An opening writes one warning with the plugin, the rule and the
-//! cool-down; a report stamped while the breaker was open, by a call
+//! held it; and a lazy `init` the decision paid) over those frames (each
+//! call's own frame whole, whatever the remainder left of it, and the init
+//! frame of a lazy `init`), taken at its last close, the ring the thread's
+//! across rebuilds. An opening writes one warning with the plugin, the rule
+//! and the cool-down; a report stamped while the breaker was open, by a call
 //! admitted before it opened, is dropped whenever it arrives, so one
 //! incident is one opening.
 //! Open, the stages take their fallbacks without a call. Without a fallback

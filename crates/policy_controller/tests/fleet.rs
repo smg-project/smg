@@ -3419,6 +3419,10 @@ mod hosted {
             let runtime = Arc::new(wasm::Runtime::new(&open).expect("a runtime"));
             let mut spec = PluginSpec::new(GUEST, wasm_guest::record_guest());
             spec.config = vec![wasm_guest::mode::LEAST_IN_FLIGHT];
+            // A budget of its own as wide as an ask's ([`ask`]): a plugin
+            // that states none is cut at the default frame, and a hold of
+            // the runner past that frame would be the plugin's own failure.
+            spec.budget_micros = 5_000_000;
             // The guest adds to its counters by id: each id has a name.
             spec.metrics = (0..=wasm_guest::counter::PICK_RANDOM)
                 .map(|id| format!("counter-{id}"))
@@ -3440,8 +3444,10 @@ mod hosted {
             };
             let mut spec = GrpcPluginSpec::new(REMOTE, socket);
             // The load's connect and hello, far past a loaded host's round
-            // trip.
+            // trip, and a budget of its own as wide as an ask's, as the
+            // guest states one.
             spec.connect_micros = 5_000_000;
+            spec.budget_micros = 5_000_000;
             let served = grpc::Plugin::load(&runtime, spec).expect("the served plugin loads");
 
             let mut catalog = StageRegistry::builtin();

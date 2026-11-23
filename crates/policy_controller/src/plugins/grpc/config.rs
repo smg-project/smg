@@ -63,7 +63,9 @@ pub struct GrpcPluginSpec {
     /// at most the decision's; the frame names it as the plugin's deadline. A
     /// missed deadline of a budget no longer than the I/O thread's promise
     /// (four milliseconds) is never counted as the plugin's failure: the
-    /// latency rule alone judges it.
+    /// latency rule alone judges it. That rule sets the plugin's time in a
+    /// decision against the frames it was given there, at most the
+    /// decision's budget: state at least twice the plugin's usual time.
     pub budget_micros: u32,
     /// The connect and the hello run under this: at the apply, and on the
     /// I/O thread behind a cold thread's first decision, which takes its
