@@ -1395,7 +1395,7 @@ pub struct Placement<'a> {               // built, see part 3
 pub enum Unplaced {
     Shed { reason: ShedReason, emptied_by: &'static str, retry_after_secs: u16 },
     Queued,
-    PrefillsFull, // the host's admission holds back every prefill of a pair: the host waits for room
+    PrefillsFull, // the host's admission holds back every prefill of a pair that has an open partner: the host waits for room
     NoWorkers,
     Refused(DecisionRefused),
 }
@@ -1982,18 +1982,18 @@ classic code gave. A *recorder* is an ignored test beside classic's own code tha
 writes the sheet. The sheets are in `crates/policy_controller/tests/classic/sheets/`. A crate
 test replays each line through the crate and compares.
 
-On main: 17 sheets, 471 lines.
+On main: 18 sheets, 479 lines.
 
 | | Sheets | Lines |
 |---|---|---|
-| replayed and passing | 16 | 466 |
+| replayed and passing | 17 | 474 |
 | recorded, replayed by nothing (`constraint_decider`) | 1 | 5 |
 | replayed through the engine that stays (`PolicyEngine`) | **4**, and 31 lines of `prefix_hash` | **65** |
 | replayed lines held to an answer of the crate's own, not classic's | | 8 |
 
-A replay of all thirteen decision sheets through `PolicyEngine` over worker objects is in work and not on main yet: on main the three hard-demand sheets (`retry_wire`, `media_refs`, `context_window`; 26 lines), `sticky_rank` (8 lines) and 31 lines of `prefix_hash` replay through it. Measured
+A replay of all fourteen decision sheets through `PolicyEngine` over worker objects is in work and not on main yet: on main the three hard-demand sheets (`retry_wire`, `media_refs`, `context_window`; 26 lines), `sticky_rank` (8 lines) and 31 lines of `prefix_hash` replay through it. Measured
 with it locally on 2026-11-22, on main (`096c0f5ea`): of the 408 lines that recorded a decision
-then (the 397 of point 1 below, and the 11 of a rank sheet that has left with its rule), the engine answers 286 as classic recorded and 28 differently, and 94 cannot
+then (397 of the 405 of point 1 below, and the 11 of a rank sheet that has left with its rule), the engine answers 286 as classic recorded and 28 differently, and 94 cannot
 be asked yet. Of the 94, 25 are declined because the request states a hard demand, 16 need a
 word a request cannot state, 52 are encode requests and 1 is refused at validation. Runs with
 one input left off the worker objects (the requests in flight, the load reports, the status,
@@ -2002,8 +2002,8 @@ the ring) lose lines, so the replay can fail.
 Five things follow, and they are the first work of section 16.
 
 1. **Only the three hard-demand sheets, `sticky_rank` and 31 lines of `prefix_hash` (65 lines) go through the engine that stays** in main's own tests. The other replays
-   call the decision function over hand-built candidates. Thirteen sheets
-   (397 lines) record a decision, and each has to replay through `PolicyEngine` over worker
+   call the decision function over hand-built candidates. Fourteen sheets
+   (405 lines) record a decision, and each has to replay through `PolicyEngine` over worker
    objects. The other four (74 lines: `overload` 25, `pair_index` 23, `minimum_tokens` 18,
    `sticky_rank` 8) record an answer of the host, which the kept engine is never asked for. It
    reads the overload verdict that the host's load monitor wrote on the worker object. It is
@@ -2151,7 +2151,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | placed on the ring the host lends (decision 3): through `place` the plain ring at the place the engine reads with the request's keys, and `prefix_hash` at the places the host's ring answers for the request's heads, where it answers for a head; that both are classic's is proven at stage 3; a host that lends none is placed on the crate's ring, which may be another worker than classic's |
 | `manual` and sticky sessions on that engine | **[partly]** | their sheets replay through the decision function, not through the engine |
 | `bucket` on that engine | **[partly]** | the same |
-| Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; one of its 40 lines is held to an answer of the crate's own |
+| Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; one of its 40 lines is held to an answer of the crate's own; the 8 lines behind the prefill admission's bound (`pair_bound`) replay through that function as recorded |
 | Encode-prefill-decode on that engine | **[partly]** | `PolicyEngine::decide_encode_at` decides it over a host's three lists and issues the pair's lease, and `place` places it; the entry declines a request held to a wire that a worker of its pair's two lists is not dialed on, places its items on the encoders dialed on a wire it states, declines a request with items where the list holds encoders and none is, and declines one that states the later decode where its decode is held to the workers that take images: a decode asked again takes no items |
 | The lease and its events; the guard | **[built]** | |
 | The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request, for a pair and for an encode request, with the route's rule and the decision made again, three decisions a call at most or a single request's fourth where the third found the workers the route's rule takes, and a single request's later decisions held to those workers; the later decisions of a pair and of an encode request held to them are not |
@@ -2349,7 +2349,7 @@ The crate first (rule 7). Each stage ends with a test, and the next does not sta
 | Stage | Work | Ends when |
 |---|---|---|
 | 0 | The earlier gateway integration is taken out. | The gateway routes by classic alone; every classic test and bench cell is as before. |
-| 1 | **The policies, proven in the crate.** Each classic policy decided by `PolicyEngine` over worker objects: its sheet replays through that engine, and its bench cell meets classic's count. | Every line of the 13 sheets that record a decision (397 of section 13.1's 471) replays through the kept engine over worker objects. Each difference from classic is fixed or accepted as a named difference. Under decision 3 (a) the 16 `prefix_hash` lines that test a key's tokens replay there with no ring lent, and their proof for a gateway is stage 3's. |
+| 1 | **The policies, proven in the crate.** Each classic policy decided by `PolicyEngine` over worker objects: its sheet replays through that engine, and its bench cell meets classic's count. | Every line of the 14 sheets that record a decision (405 of section 13.1's 479) replays through the kept engine over worker objects. Each difference from classic is fixed or accepted as a named difference. Under decision 3 (a) the 16 `prefix_hash` lines that test a key's tokens replay there with no ring lent, and their proof for a gateway is stage 3's. |
 | 2 | **The host contract.** `place`, `Placement`, the engine's own upkeep and membership events (section 8.2). | A test host in the crate serves every plan through `place` alone. |
 | 3 | **The gateway, one change** (section 9), off by default. | The four points of section 9.2's bar; under decision 3 (a), the 47 `prefix_hash` lines and the 12 ring lines of `all_vetoed` read as recorded, count for count, through the gateway's own entry with the engine on and the recorder's own workers and prompts; a cluster run beside classic. |
 | 4 | **The controller on the one engine** (section 10.2); the old engine is deleted. | The controller's own tests pass on `PolicyEngine`; the store-backed engine is gone; each of the 74 lines of the four host sheets (section 13.1) is answered by the host's code that the controller takes from the worker crate, or by a rule of the crate's with its differences named. One difference is named so far, and 11 `overload` lines answer by it: where ranks are worker objects, a threshold that judged an engine's summed queue judges each rank's own queue, and a usage threshold each rank's own usage in place of the mean (two ranks that queue 4 requests each under a threshold of 8 are vetoed as one worker and not as two). The 18 `minimum_tokens` lines are answered as recorded by the worker crate's rank cache behind that monitor, which no code of a controller asks. They are not answers of the engine: it serves no rank option (`refuse_unsupported` in `src/document/routing_settings.rs` refuses classic's at the start), and where ranks are worker objects it picks among them by its profile. That pick was measured once, on 2026-11-23 over `55c35100d`, outside the tests: under a resident-work profile with a picker of two it names the recorded ranks on 5 of the 18 lines and other ranks on 13, by four rules. On 6 lines classic finds no rank on a worker its cache holds nothing of, and the engine places on a ready object that has no report (`with_no_survivor_reporting_resident_tokens_the_in_flight_count_decides`). On 3 a rank that the answer omits or reports with no token capacity is no rank to classic, and the engine scores it from its best reporting peer (`a_worker_without_resident_tokens_scores_from_the_best_reporting_peer`). On 3 the engine reads resident tokens and draws among equal ranks, where classic reads used tokens and takes the lowest rank (`equal_resident_work_ties_and_a_token_apart_does_not`). On 1 classic keeps a worker's last answer and its bookings behind a failed poll, and the monitor publishes no report of that worker (`publish_polled` in the worker crate's load monitor). Three of the lines move with how the caller counts a pick in flight and with the picker, and the count stays at 5 or 6. |

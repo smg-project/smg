@@ -884,13 +884,18 @@ pub enum Unplaced {
     /// The engine queued the request. A caller that holds no request
     /// answers as for overloaded workers.
     Queued,
-    /// The document's capacity filter left a pair's request no prefill:
-    /// each one the filters ahead of it kept is at its caller's admission
-    /// limit
-    /// ([`PairAdmission::has_capacity`](crate::engine::PairAdmission::has_capacity)),
-    /// whether or not a decode it pairs with can be sent to. The request
-    /// is not refused: its caller waits for a prefill's room and places
-    /// it again. A document with no capacity filter never answers this.
+    /// The caller's admission limit alone left a pair's request no prefill
+    /// ([`PairAdmission::has_capacity`](crate::engine::PairAdmission::has_capacity)):
+    /// a prefill with an open partner stands but for its limit, and no
+    /// such prefill is under its limit. A partner is open where the decode
+    /// side's hard filters keep it, and where the binding's all-vetoed
+    /// rule lifts the overload veto for a decode pool that is over its
+    /// thresholds whole. The pair's default answers this too, where the
+    /// one prefill it took by load is at its limit. The request is not
+    /// refused: its caller waits for a prefill's room and places it again.
+    /// Outside that default, a prefill at its limit with no open partner
+    /// makes no request wait: a request with no other prefill is answered
+    /// its shed. A document with no capacity filter never answers this.
     PrefillsFull,
     /// The call's decisions named workers and none of their targets could
     /// be sent to when the call came to it: a target holds where its
@@ -1435,9 +1440,10 @@ impl PolicyEngine {
     /// refuses is not, and where an earlier attempt of the request tried
     /// it.
     /// Which workers pair is the caller's word, in the classes its lists
-    /// carry: no pair is tested here again. Prefills that are all at the
-    /// caller's limit answer [`Unplaced::PrefillsFull`], on which the
-    /// caller waits for room and places the request again.
+    /// carry: no pair is tested here again. Prefills with an open partner
+    /// that are all at the caller's limit answer
+    /// [`Unplaced::PrefillsFull`], on which the caller waits for room and
+    /// places the request again.
     ///
     /// A request with an encode request's three lists is decided over the
     /// three ([`PolicyEngine::decide_encode_at`]), with the items it
