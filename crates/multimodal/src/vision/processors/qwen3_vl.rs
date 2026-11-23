@@ -129,7 +129,8 @@ impl Qwen3VLProcessor {
     }
 
     /// Create a processor with custom settings.
-    pub fn with_config(
+    #[cfg(test)]
+    pub(crate) fn with_config(
         patch_size: usize,
         merge_size: usize,
         min_pixels: usize,
