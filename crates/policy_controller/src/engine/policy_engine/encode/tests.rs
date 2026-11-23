@@ -15,7 +15,7 @@ use smg_worker::{
     load::state::{one_rank_load, TestFeed},
     model_card::ModelCard,
     test_support::{no_health_check, ready_worker},
-    worker::{WorkerLoadResponse, WorkerStatus, WorkerType},
+    worker::{WorkerLoadResponse, WorkerSpec, WorkerStatus, WorkerType},
 };
 
 use super::*;
@@ -65,7 +65,8 @@ impl PairAdmission for Gates {
 /// `vetoes` are the places of each of the two its standing vetoes mask, and
 /// those of them a hold stands on. `encoder_vetoes` are the same two of the
 /// encoder list. `own` is a mask the request states itself: its stalled
-/// places, and those a hold stands on.
+/// places, and those a hold stands on. `tried` are the workers a retry says
+/// its failed attempts were sent to, and `seed` is the request's seed.
 struct Host {
     engine: PolicyEngine,
     lists: [PublishedList; 3],
@@ -78,6 +79,8 @@ struct Host {
     vetoes: [[Vec<u32>; 2]; 2],
     encoder_vetoes: [Vec<u32>; 2],
     own: [Vec<u32>; 2],
+    tried: Vec<WorkerId>,
+    seed: u64,
 }
 
 /// Where the worker at `place` of a host's list `list` answers.
@@ -172,6 +175,8 @@ impl Host {
             vetoes: Default::default(),
             encoder_vetoes: Default::default(),
             own: Default::default(),
+            tried: Vec::new(),
+            seed: 0,
         }
     }
 
@@ -259,6 +264,9 @@ impl Host {
                 images: u16::from(self.images),
                 ..MediaCounts::NONE
             },
+            attempt: u8::from(!self.tried.is_empty()),
+            tried: &self.tried,
+            seed: self.seed,
             ..RequestFacts::default()
         };
         let constraints = Constraints {
@@ -933,6 +941,122 @@ fn a_worker_the_requests_host_excludes_steps_aside_in_each_of_the_three_lists() 
     let (decision, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
     assert_eq!((prefill, encoders), (Some(1), vec![1]));
     assert_eq!(decode_of(&decision), Some(1));
+}
+
+/// A host whose three lists are each two data-parallel engines of two
+/// ranks, engine after engine: the worker at `place` of a list is a rank of
+/// that list's engine `place / 2`.
+fn ranked() -> Host {
+    let mut host = Host::of(4, 4, 4);
+    let types = [WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode];
+    for (list, worker_type) in types.into_iter().enumerate() {
+        let rank = |place: usize| {
+            let spec = WorkerSpec {
+                worker_type,
+                ..WorkerSpec::new(format!("grpc://list-{list}-engine-{}:9000", place / 2))
+            };
+            let built = <BasicWorkerBuilder>::from_spec(spec).dp_config(place % 2, 2);
+            let worker = built.health_config(no_health_check()).build();
+            worker.set_status(WorkerStatus::Ready);
+            Arc::new(worker) as Arc<dyn Worker>
+        };
+        let ranks: Arc<[Arc<dyn Worker>]> = (0..4).map(rank).collect();
+        host.lists[list] = PublishedList::with_facts(ranks, |_| FixedFacts::default());
+    }
+    host
+}
+
+/// An encode request's retry leaves every rank of the engines it tried,
+/// each of its three lists by its own engines, as a pair's retry does over
+/// its two. A tried prefill takes its engine's other rank out of the
+/// prefills and leaves the decodes and the encoders as they were. A tried
+/// decode and a tried encoder do the same on their lists, and the three
+/// together move all three. Named the tried rank alone, each list kept its
+/// engine's other rank.
+#[test]
+fn an_encode_requests_retry_leaves_every_rank_of_the_engines_it_tried() {
+    use std::collections::BTreeSet;
+
+    let mut host = ranked();
+    let said = (&[of(1), of(1), of(1), of(1)][..], &[1, 1, 1, 1][..]);
+    let keys = [Identity::plain("item")];
+    // One rank of the first engine of each list.
+    let rank = |list: usize, place: usize| worker_id(host.worker(list, place).as_ref());
+    let (prefill, decode, encoder) = (rank(0, 1), rank(1, 0), rank(2, 1));
+    let mut placed = EncodePlaced::new();
+    // The engines a retry's prefill, decode and encoder stand on, over the
+    // draws of the three lists.
+    let mut landed = |tried: &[WorkerId]| {
+        let mut on = [BTreeSet::new(), BTreeSet::new(), BTreeSet::new()];
+        host.tried = tried.to_vec();
+        for seed in 0..32 {
+            host.seed = seed;
+            let (decision, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+            on[0].insert(prefill.expect("a pick") / 2);
+            on[1].insert(decode_of(&decision).expect("a pair") / 2);
+            on[2].extend(encoders.iter().map(|&at| at / 2));
+        }
+        on
+    };
+    let (both, second) = (BTreeSet::from([0, 1]), BTreeSet::from([1]));
+    let untried = [both.clone(), both.clone(), both.clone()];
+    assert_eq!(landed(&[]), untried, "nobody tried");
+    assert_eq!(
+        landed(&[prefill]),
+        [second.clone(), both.clone(), both.clone()],
+        "the tried prefill's engine steps aside, and no other list moves"
+    );
+    assert_eq!(
+        landed(&[decode]),
+        [both.clone(), second.clone(), both.clone()],
+        "the tried decode's engine steps aside, and no other list moves"
+    );
+    assert_eq!(
+        landed(&[encoder]),
+        [both.clone(), both, second.clone()],
+        "the tried encoder's engine steps aside, and no other list moves"
+    );
+    assert_eq!(
+        landed(&[prefill, decode, encoder]),
+        [second.clone(), second.clone(), second],
+        "three tried workers move all three lists"
+    );
+}
+
+/// The workers an encode request's retry is decided to have tried stand in
+/// the calling thread's own list, as a single request's do. A first
+/// attempt takes no list, and neither does a retry over workers that each
+/// stand alone. A retry over ranks grows the list once and hands it back
+/// behind its decision: the retries behind it allocate nothing for it.
+#[test]
+fn an_encode_requests_retry_hands_the_threads_list_back() {
+    let mut host = ranked();
+    let said = (&[of(1), of(1), of(1), of(1)][..], &[1, 1, 1, 1][..]);
+    let keys = [Identity::plain("item")];
+    let mut placed = EncodePlaced::new();
+    // Where the thread's list stands and what it holds room for.
+    let kept = || {
+        let list = single::TRIED.take();
+        let stands = (list.as_ptr(), list.capacity());
+        single::TRIED.set(list);
+        stands
+    };
+    let mut asked = |host: &Host| {
+        let (decision, ..) = host.decide(said, &keys, None, &mut placed);
+        assert!(decision.pick().is_some(), "a pair");
+    };
+    asked(&host);
+    assert_eq!(kept().1, 0, "a first attempt takes no list");
+    let mut alone = Host::of(4, 4, 4);
+    alone.tried = vec![worker_id(alone.worker(0, 1).as_ref())];
+    asked(&alone);
+    assert_eq!(kept().1, 0, "nor a retry over workers that stand alone");
+    host.tried = vec![worker_id(host.worker(0, 1).as_ref())];
+    asked(&host);
+    let grown = kept();
+    assert!(grown.1 >= 2, "the tried rank and its engine's other rank");
+    asked(&host);
+    assert_eq!(kept(), grown, "the list is kept as it grew");
 }
 
 /// The pair's records take their pair classes and their host's admission
