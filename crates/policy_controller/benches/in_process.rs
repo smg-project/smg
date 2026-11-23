@@ -233,6 +233,12 @@ const CELLS: &[Cell] = &[
         ..Cell::PLAIN
     },
     Cell {
+        name: "pair_signal_cost",
+        document: signals::pair_document,
+        request: pair::request,
+        ..Cell::PLAIN
+    },
+    Cell {
         name: "passthrough",
         document: || preset("passthrough"),
         ..Cell::PLAIN

@@ -832,8 +832,14 @@ has, ahead of a routing key's short answer too. A row that is one rank of a data
 reads its own rank's values. One limit stands: a worker object that stands for several ranks
 reads no named value, because its report holds one sample instant for all its ranks. So a
 signal's `across_ranks` has no effect under the kept engine until the worker crate's report
-states each rank's own sample instant. A pair's two sides and an encode request's encoders are
-not lent cells yet.
+states each rank's own sample instant. An encode request decided over its three lists is not
+lent cells yet: neither its encoders nor the two sides of its pair.
+
+A pair is lent them a side. Where the prefill profile reads a named signal, the prefill side
+reads its prefill list's cells, and the decode side reads its decode list's where the decode
+profile reads one. Both are of the snapshot the decision holds, and a decode decided again
+reads those of its own call. The pair's pools carry each side's cells
+(`PairPools::prefill_signal_cells`, `decode_signal_cells`), so the request is not copied.
 
 ## 6. The lease and its events **[built]**
 

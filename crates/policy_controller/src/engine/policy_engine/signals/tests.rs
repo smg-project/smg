@@ -46,6 +46,8 @@ use crate::{
     },
 };
 
+mod pair;
+
 const MODEL: &str = "model-a";
 /// A model the two-profile document binds to the profile that reads no
 /// signal.
@@ -607,7 +609,7 @@ fn a_report_of_several_ranks_gives_no_value() {
 /// The two token counts a report offers by name are read with no list of
 /// named values in the report: a rule of the two keeps the workers whose
 /// report says the request fits, and no worker the snapshot holds no
-/// report of.
+/// report of. The entry that issues no lease keeps the same workers.
 #[test]
 fn a_rule_of_the_two_token_counts_keeps_the_workers_the_request_fits() {
     let built = built(&format!(
@@ -629,6 +631,9 @@ fn a_rule_of_the_two_token_counts_keeps_the_workers_the_request_fits() {
             asks.request.facts.prompt_tokens = 200;
             let decision = decided_at(&built.engine, &asks, Instant::now());
             assert_eq!(first_of(&decision), fits, "seed {seed}");
+            let bare = built.engine.decide_without_lease(&asks, Instant::now());
+            let (bare, _) = bare.expect("a decision");
+            assert_eq!(first_of(&bare), fits, "seed {seed}, no lease");
         }
     }
 }

@@ -1022,6 +1022,10 @@ impl PoolRecords {
     /// decision that converted the list's rows) writes the cells of its
     /// own snapshot into the calling thread's buffer and waits for
     /// nothing.
+    // In line at its two callers, a single request's lend and a pair's: as
+    // a call it costs a single request's decision 32 instructions, counted
+    // with Callgrind.
+    #[inline(always)]
     pub(crate) fn cells(&self, workers: &[Arc<dyn Worker>], live: &Live<'_>) -> Option<HeldCells> {
         let loads = live.loads?;
         let held = self.reported.load();

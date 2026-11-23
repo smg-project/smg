@@ -14,6 +14,13 @@
 //! snapshot a list ([`PoolRecords::cells`]). A host hands its load channel
 //! and nothing more, and cells a caller put on a request are not read.
 //!
+//! **Who is lent them.** A single request whose profile reads a signal
+//! ([`decide`]), and each side of a pair whose profile reads one: the
+//! prefill side its prefill list's cells, the decode side its decode
+//! list's ([`sides`]). An encode request decided over its three lists is
+//! lent none, for its encoders or for the two sides of its pair. Decided
+//! as its pair, over the pair's two lists, it is lent what a pair is.
+//!
 //! **What a value is.** The cells hold what the snapshot's reports state,
 //! and nothing of an earlier snapshot. A worker with no report, a name its
 //! report leaves out, a value under another unit than the document's and a
@@ -54,23 +61,26 @@ use crate::{
     engine::{
         decision::Decision,
         decision_engine::{Request, RequestMaker},
-        records::{HeldCells, Live},
+        records::{DecisionClock, HeldCells, Live},
         shadow::Shadowed,
         view::{Phase, RequestFacts},
     },
 };
 
 impl PoolMembers {
-    /// Whether a single request of `model` reads a named signal: a stage of
-    /// its profile does, or one of its binding's shadow ([`needs_for`]).
-    /// Found once a list, as the profile the engine picks alone is: a
-    /// request of the list's model pays no second read of its binding.
+    /// Whether a decision of `phase` for `model` reads a named signal: a
+    /// stage of its profile does, or one of its binding's shadow
+    /// ([`needs_for`]). The decode phase answers for the decode profile of
+    /// the model's pair too, as the needs do. Found once a list, as the
+    /// profile the engine picks alone is: a request of the list's model at
+    /// the list's phase pays no second read of its binding. Any other model
+    /// or phase asks the document.
     ///
     /// [`needs_for`]: crate::engine::framework::Engine::needs_for
-    pub(super) fn reads_signal(&self, spec: &AppliedSpec, model: &str) -> bool {
-        let find = || spec.engine().needs_for(model, Phase::Single).signal_cells;
-        let (named, reads) = self.signal.get_or_init(|| (model.into(), find()));
-        if **named == *model {
+    pub(super) fn reads_signal(&self, spec: &AppliedSpec, model: &str, phase: Phase) -> bool {
+        let find = || spec.engine().needs_for(model, phase).signal_cells;
+        let (named, asked, reads) = self.signal.get_or_init(|| (model.into(), phase, find()));
+        if **named == *model && *asked == phase {
             *reads
         } else {
             find()
@@ -128,6 +138,63 @@ pub(super) fn decide(
     let decision = own.decide_with_loads(&mut lent, members, maker, loads, now, said);
     hand_back(request, &lent);
     decision
+}
+
+/// The signal cells one decision of a pair lends its two sides, the
+/// prefills' first: for each side whose profile reads a named signal, its
+/// own list's cells of the decision's snapshot ([`PoolRecords::cells`]).
+/// The prefill list is asked for the prefill phase and the decode list for
+/// the decode phase ([`PoolMembers::reads_signal`]). `None` for a side that
+/// reads no signal, and for both under no snapshot, where every worker
+/// reads no value.
+///
+/// `first` says the decision is the pair's first. The decode decided again
+/// asks no prefill stage, so its prefill side is lent nothing. Its decode
+/// side is lent the cells of `live`, the snapshot of its own call, and
+/// never those the pair's first decision read.
+///
+/// The cells are held by the caller to the decision's end, and the pair's
+/// pools carry them
+/// ([`PairPools`](crate::engine::framework::PairPools)): the engine writes
+/// each side's facts itself, so no copy of the request is made, and cells
+/// a caller put on the request are read by neither side.
+///
+/// Called behind the two lists' records' writes. A write converts its
+/// list's reports where the list holds none of the decision's snapshot,
+/// and the cells are made by that conversion: so a side's cells are mostly
+/// its list's own, by one read. A decision that was not the one to convert
+/// writes the cells of its own snapshot. The calling thread keeps one
+/// buffer for that: where both sides write their own, the second
+/// allocates.
+///
+/// Out of line: a document that reads no signal pays one test for it, in
+/// the pair's decision ([`PairLists::decide`]), which hands the engine's
+/// values of its two lists as `members`, the prefills' first.
+///
+/// [`PairLists::decide`]: super::pair::PairLists::decide
+/// [`PoolRecords::cells`]: crate::engine::records::PoolRecords::cells
+#[inline(never)]
+pub(super) fn sides(
+    [prefill, decode]: [&PoolMembers; 2],
+    spec: &AppliedSpec,
+    clock: &DecisionClock,
+    live: &Live<'_>,
+    model: &str,
+    first: bool,
+) -> [Option<HeldCells>; 2] {
+    let lent = |members: &PoolMembers, phase| {
+        if !members.reads_signal(spec, model, phase) {
+            return None;
+        }
+        let records = members.records(spec, clock);
+        records.cells(members.workers(), live)
+    };
+    let prefills = if first {
+        lent(prefill, Phase::Prefill)
+    } else {
+        None
+    };
+    [prefills, lent(decode, Phase::Decode)]
 }
 
 /// Writes into `request` every fact a decision writes, from `lent`, the
