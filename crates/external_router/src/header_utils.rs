@@ -136,6 +136,8 @@ pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {
 /// client's to read, and the gateway's own answers carry no `server` header. An
 /// answer that also carries `transfer-encoding` loses its `content-length`
 /// (RFC 9112, 6.3): the gateway's own framing describes the body it sends.
+/// The upstream's `access-control-*` fields stay behind as well: only the
+/// gateway's CORS layer writes them.
 pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
     // A message with both fields is framed by its transfer coding: the length
@@ -188,9 +190,12 @@ pub fn is_smg_owned_error_code_header(name: &str) -> bool {
 /// and the OpenAI-style streamed answers, `anthropic::sse::build_sse_response` for the
 /// Messages streamed ones.
 pub(crate) fn should_forward_header_no_alloc(name: &str) -> bool {
+    const ACCESS_CONTROL_PREFIX: &str = "access-control-";
+
     // List of headers that should NOT be forwarded: hop-by-hop, the SMG error-code
-    // marker, and the upstream's `server` header, which names the upstream's software
-    // and version to every client while the gateway's own answers carry none.
+    // marker, the upstream's `server` header, which names the upstream's software
+    // and version to every client while the gateway's own answers carry none, and
+    // the `access-control-*` family, which only the gateway's CORS layer writes.
     !(name.eq_ignore_ascii_case("connection")
         || name.eq_ignore_ascii_case("keep-alive")
         || name.eq_ignore_ascii_case("proxy-authenticate")
@@ -202,6 +207,9 @@ pub(crate) fn should_forward_header_no_alloc(name: &str) -> bool {
         || name.eq_ignore_ascii_case("content-encoding")
         || name.eq_ignore_ascii_case("host")
         || name.eq_ignore_ascii_case("server")
+        || name
+            .get(..ACCESS_CONTROL_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(ACCESS_CONTROL_PREFIX))
         || is_smg_owned_error_code_header(name))
 }
 
@@ -585,6 +593,17 @@ mod tests {
             "41"
         );
         assert_eq!(forwarded.get("retry-after").unwrap(), "3");
+    }
+
+    #[test]
+    fn the_response_filter_refuses_the_access_control_family() {
+        assert!(!should_forward_header_no_alloc("Access-Control-Made-Up"));
+        assert!(!should_forward_header_no_alloc(
+            "access-control-allow-origin"
+        ));
+        // Only a leading `access-control-` names the family.
+        assert!(should_forward_header_no_alloc("x-access-control-note"));
+        assert!(should_forward_header_no_alloc("access-control"));
     }
 
     /// The tests' HTTP client, the process-level TLS crypto provider
