@@ -32,35 +32,35 @@ use crate::{
 };
 
 /// Qwen3-VL normalization mean values (simple [0.5, 0.5, 0.5]).
-pub const QWEN3_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
+pub(crate) const QWEN3_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
 
 /// Qwen3-VL normalization std values (simple [0.5, 0.5, 0.5]).
-pub const QWEN3_STD: [f64; 3] = [0.5, 0.5, 0.5];
+pub(crate) const QWEN3_STD: [f64; 3] = [0.5, 0.5, 0.5];
 
 /// Default minimum pixels for Qwen3-VL
 /// This corresponds to shortest_edge = 65536 from HF config
-pub const DEFAULT_MIN_PIXELS: usize = 65536;
+pub(crate) const DEFAULT_MIN_PIXELS: usize = 65536;
 
 /// Default maximum pixels for Qwen3-VL
 /// This corresponds to longest_edge = 16777216 from HF config
-pub const DEFAULT_MAX_PIXELS: usize = 16777216;
+pub(crate) const DEFAULT_MAX_PIXELS: usize = 16777216;
 
 /// Default minimum pixels for a complete Qwen3-VL video volume.
 /// This corresponds to shortest_edge = 4096 from the HF video config.
-pub const DEFAULT_VIDEO_MIN_PIXELS: usize = 4096;
+pub(crate) const DEFAULT_VIDEO_MIN_PIXELS: usize = 4096;
 
 /// Default maximum pixels for a complete Qwen3-VL video volume.
 /// This corresponds to longest_edge = 25165824 from the HF video config.
-pub const DEFAULT_VIDEO_MAX_PIXELS: usize = 25165824;
+pub(crate) const DEFAULT_VIDEO_MAX_PIXELS: usize = 25165824;
 
 /// Default patch size for Qwen3-VL (16, vs 14 in Qwen2-VL)
-pub const DEFAULT_PATCH_SIZE: usize = 16;
+pub(crate) const DEFAULT_PATCH_SIZE: usize = 16;
 
 /// Default merge size for token reduction
-pub const DEFAULT_MERGE_SIZE: usize = 2;
+pub(crate) const DEFAULT_MERGE_SIZE: usize = 2;
 
 /// Default temporal patch size (for video frames)
-pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
+pub(crate) const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
 
 /// Qwen3-VL image processor.
 ///

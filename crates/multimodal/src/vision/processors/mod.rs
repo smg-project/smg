@@ -27,23 +27,23 @@
 //! - **Step3-VL** (`step3_vl`): a 728px global view and 504px sliding-window crops with CLIP normalization
 
 pub mod deepseek_v41;
-pub mod gemma4;
-pub mod glm53_flash;
+pub(crate) mod gemma4;
+pub(crate) mod glm53_flash;
 pub mod inkling;
-pub mod inkling2;
-pub mod kimi_k25;
-pub mod kimi_k3;
-pub mod llama4_vision;
-pub mod llava;
-pub mod minimax_m3;
-pub mod moonvit;
-pub mod muse_spark;
+pub(crate) mod inkling2;
+pub(crate) mod kimi_k25;
+pub(crate) mod kimi_k3;
+pub(crate) mod llama4_vision;
+pub(crate) mod llava;
+pub(crate) mod minimax_m3;
+pub(crate) mod moonvit;
+pub(crate) mod muse_spark;
 pub mod nemotron_omni;
 pub mod phi3_vision;
-pub mod pixtral;
-pub mod qwen2_vl;
-pub mod qwen3_omni_vision;
-pub mod qwen3_vl;
+pub(crate) mod pixtral;
+pub(crate) mod qwen2_vl;
+pub(crate) mod qwen3_omni_vision;
+pub(crate) mod qwen3_vl;
 pub mod qwen_vl_base;
 pub mod step3_vl;
 

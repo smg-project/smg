@@ -113,13 +113,16 @@ use crate::{
 /// rooms. The two overload thresholds are the gateway's too: the default it
 /// builds its worker objects with, under each worker's own registration. No
 /// document carries a threshold, so one off its default means the same
-/// document. The pin of a sticky key to one engine of a grouped worker is
-/// the dispatch's as well: it runs behind the decision, on the worker the
-/// decision names. Its key is the gateway's own, read from the routing-key
-/// headers. A supplied document names its own key sources, which need not
-/// be that key, so the pin is refused beside one. The copy of the cache
-/// boundaries at the top of the configuration decides nothing either: each
-/// policy reads its own.
+/// document. Both at none leave nothing to veto by, and the settings' own
+/// document switches the block off. Beside a supplied document the two are
+/// no difference, whatever they are: its host says what a block that is on
+/// means over no threshold. The pin of a sticky key to one engine of a
+/// grouped worker is the dispatch's as well: it runs behind the decision, on
+/// the worker the decision names. Its key is the gateway's own, read from
+/// the routing-key headers. A supplied document names its own key sources,
+/// which need not be that key, so the pin is refused beside one. The copy
+/// of the cache boundaries at the top of the configuration decides nothing
+/// either: each policy reads its own.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RoutingSettings {
     /// The kinds of worker the gateway routes to, with each side's own policy.
@@ -210,8 +213,8 @@ impl Default for RoutingSettings {
 impl RoutingSettings {
     /// The provider's name, where every router of the gateway is that
     /// provider's: a provider mode of a gateway that does not run many routers.
-    /// Such a gateway places its requests by no routing policy.
-    fn provider_alone(&self) -> Option<&'static str> {
+    /// It places by no routing policy: a host asks here ahead of the document.
+    pub fn provider_alone(&self) -> Option<&'static str> {
         match self.mode {
             ModeSettings::Provider(provider) => (!self.enable_igw).then_some(provider),
             ModeSettings::Regular
@@ -566,6 +569,11 @@ impl RoutingSettings {
     /// another value. A conflict names the first difference and the two
     /// values.
     ///
+    /// The two overload thresholds are no part of the comparison: no
+    /// document carries one, so they stand beside a supplied document
+    /// whatever they are, both at none too. What a supplied document's
+    /// switch means over no threshold is its host's to say.
+    ///
     /// Both launchers refuse a routing setting beside a document before
     /// this runs, so the comparison judges a configuration built by hand.
     /// The generation is no part of it: it numbers the document, and no
@@ -597,10 +605,14 @@ impl RoutingSettings {
         // The default configuration of this gateway's kind: a provider mode
         // has a document under the multi-router setting alone, and a pair
         // mode binds a single request by how the gateway reaches its workers.
+        // The two overload thresholds are the gateway's own beside a
+        // document, so the default configuration states them as they are.
         let plain = Self {
             mode: self.mode.with_defaults(),
             enable_igw: self.enable_igw,
             connection_mode: self.connection_mode,
+            worker_overload_waiting_requests: self.worker_overload_waiting_requests,
+            worker_overload_token_usage: self.worker_overload_token_usage,
             ..defaults.clone()
         }
         .policy_document()?;
@@ -726,9 +738,10 @@ type Planned<'a> = (PolicySpec, Vec<Vec<Side<'a>>>);
 /// gateway reads as the regular mode: the document says the policy of its
 /// self-hosted workers.
 ///
-/// A pair mode's document binds two families ([`both_families`]). Its arm
-/// here is reached only where the main policy's single binding has no
-/// document, and plans the pair alone.
+/// A pair mode's document binds two families ([`both_families`]), and the
+/// encode mode's does in a gateway of many routers. The mode's arm here is
+/// then reached only where the main policy's single binding has no
+/// document, and plans the mode's own family alone.
 fn presets(config: &RoutingSettings) -> Result<Planned<'_>, RoutingSettingsError> {
     let (mode, main) = (&config.mode, &config.policy);
     let (prefill, decode) = (mode.prefill_policy(main), mode.decode_policy(main));
@@ -782,47 +795,58 @@ fn presets(config: &RoutingSettings) -> Result<Planned<'_>, RoutingSettingsError
 /// encode mode does. A gateway of one router then places no single request
 /// and its document plans the pair alone: a binding no request reaches
 /// would still add the main policy's needs to the document's. A gateway of
-/// many routers serves single workers however it reaches them.
+/// many routers serves single workers however it reaches them, in the
+/// encode mode too: there the first binding is the mode's own, its three
+/// sides over their three phases.
 ///
 /// `None` where the document plans one family: a regular configuration of
-/// one router, the encode mode, a pair mode of one router over gRPC or ZMQ,
-/// and a regular configuration whose main policy runs on no side of a
-/// pair. The manual policy is that one: its picker leaves the placement to
-/// the binding's session rule, and a rule runs under the single plan alone.
-/// A gateway in the encode mode counts tokens with no worker, so its
-/// document binds no single request.
+/// one router, the encode mode of one router, a pair mode of one router
+/// over gRPC or ZMQ, and a regular configuration whose main policy runs on
+/// no side of a pair. The manual policy is that one: its picker leaves the
+/// placement to the binding's session rule, and a rule runs under the
+/// single plan alone. A gateway of one router in the encode mode counts
+/// tokens with no worker, so its document binds no single request.
 fn both_families(config: &RoutingSettings) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
     let (mode, main) = (&config.mode, &config.policy);
-    let both = match mode {
-        ModeSettings::Regular | ModeSettings::Provider(_) => {
-            config.enable_igw && !matches!(main, PolicySettings::Manual { .. })
-        }
+    let (both, encode) = match mode {
+        ModeSettings::Regular | ModeSettings::Provider(_) => (
+            config.enable_igw && !matches!(main, PolicySettings::Manual { .. }),
+            None,
+        ),
         ModeSettings::PrefillDecode {
             prefill_policy: _,
             decode_policy: _,
-        } => config.enable_igw || config.connection_mode == ConnectionModeSetting::Http,
+        } => (
+            config.enable_igw || config.connection_mode == ConnectionModeSetting::Http,
+            None,
+        ),
         ModeSettings::EncodePrefillDecode {
             encode_policy: _,
             prefill_policy: _,
             decode_policy: _,
-        } => false,
+        } => (config.enable_igw, Some(mode.encode_policy(&ENCODE_DEFAULT))),
     };
     if !both {
         return Ok(None);
     }
     let (prefill, decode) = (mode.prefill_policy(main), mode.decode_policy(main));
-    let mut document = PolicySpec::pair_presets(prefill.name(), decode.name())?;
+    let mut sides = vec![("prefill", prefill), ("decode", decode)];
+    let mut phases = vec![Phase::Prefill, Phase::Decode];
+    let mut document = match encode {
+        Some(encode) => {
+            sides.insert(0, (ENCODE_SIDE, encode));
+            phases.insert(0, Phase::Encode);
+            PolicySpec::epd_presets(encode.name(), prefill.name(), decode.name())?
+        }
+        None => PolicySpec::pair_presets(prefill.name(), decode.name())?,
+    };
     for binding in &mut document.bindings {
-        binding.matcher.phase = vec![Phase::Prefill, Phase::Decode];
+        binding.matcher.phase.clone_from(&phases);
     }
     let single = PolicySpec::preset(main.name())?;
     document.profiles.extend(single.profiles);
     document.bindings.extend(single.bindings);
-    let sides = vec![
-        vec![("prefill", prefill), ("decode", decode)],
-        vec![(main.name(), main)],
-    ];
-    Ok(Some((document, sides)))
+    Ok(Some((document, vec![sides, vec![(main.name(), main)]])))
 }
 
 /// Writes the configuration's settings over a planned document: each side's
@@ -865,8 +889,11 @@ fn written<'a>(
     // A pair mode of one router binds its single request for one side
     // route, a token count: that binding leaves the pairs' keys where they
     // were. Many routers serve each family as a fleet of its own, and keep
-    // the document's one size for both, as they did.
-    if !config.enable_igw {
+    // the document's one size for both, as they did. The encode mode of
+    // many routers had its own document alone: its rings keep their blocks
+    // too, so the single binding costs it no document that was taken.
+    let encode_mode = matches!(config.mode, ModeSettings::EncodePrefillDecode { .. });
+    if !config.enable_igw || encode_mode {
         rings_keep_their_blocks(shared.block_size, &bound)?;
     }
     shared.write(&mut document)?;
@@ -887,14 +914,14 @@ fn written<'a>(
 }
 
 /// A prefix ring keeps the blocks of its own binding's document, in a
-/// gateway of one router. The view holds one block size for every profile.
-/// A ring names none: its key ends with the last whole block at or under its
-/// depth, counted in the view's size. So a size another binding's policy
-/// names would end the key at another token, or leave it no whole block,
-/// which the controller's check refuses. Such settings are an unsupported
-/// setting of the other family, and the document plans the pair alone.
-/// Sides of one binding that name a size beside a ring say one document
-/// together, as they did.
+/// gateway of one router and in the encode mode of many routers. The view
+/// holds one block size for every profile. A ring names none: its key ends
+/// with the last whole block at or under its depth, counted in the view's
+/// size. So a size another binding's policy names would end the key at
+/// another token, or leave it no whole block, which the controller's check
+/// refuses. Such settings are an unsupported setting of the other family,
+/// and the document plans the mode's own family alone. Sides of one binding
+/// that name a size beside a ring say one document together, as they did.
 fn rings_keep_their_blocks(
     block_size: Option<usize>,
     bound: &[(usize, Bound)],
@@ -2886,6 +2913,49 @@ mod tests {
         }
     }
 
+    /// The two thresholds are no part of the comparison with a supplied
+    /// document. Beside settings that state nothing else, a document is in
+    /// force with one threshold at none and with both at none, whether its
+    /// block is on or off: what a block that is on means over no threshold
+    /// is its host's to say. The settings' own document still switches the
+    /// block off for both at none.
+    #[test]
+    fn overload_thresholds_at_none_beside_a_given_document_are_no_disagreement() {
+        let on = preset("least_load");
+        let off = edited(preset("least_load"), |document| {
+            document["bindings"][0]["overload"] = json!({ "enabled": false });
+        });
+        for (waiting, usage) in [(None, Some(0.9)), (Some(32), None), (None, None)] {
+            for given in [&on, &off] {
+                let beside = RoutingSettings {
+                    policy_spec: Some(given.clone()),
+                    worker_overload_waiting_requests: waiting,
+                    worker_overload_token_usage: usage,
+                    ..defaults()
+                };
+                assert_eq!(
+                    beside.policy_document_in_force(&defaults()),
+                    Ok(given.clone()),
+                    "{waiting:?} and {usage:?}"
+                );
+            }
+        }
+        let own = RoutingSettings {
+            worker_overload_waiting_requests: None,
+            worker_overload_token_usage: None,
+            ..defaults()
+        };
+        let block = |document: PolicySpec| {
+            document
+                .bindings
+                .first()
+                .and_then(|binding| binding.overload.clone())
+        };
+        let switched_off = own.policy_document_in_force(&defaults());
+        assert_eq!(switched_off, own.policy_document());
+        assert_eq!(switched_off.map(block), Ok(block(off)));
+    }
+
     #[test]
     fn a_setting_no_document_says_is_refused_by_its_name() {
         let round_robin = || config(PolicySettings::RoundRobin);
@@ -2919,6 +2989,39 @@ mod tests {
             (selection, "selection_policy", "another"),
         ] {
             assert_eq!(refusal(&refused), (setting, value.to_string()));
+        }
+    }
+
+    /// What a host asks ahead of the document: a provider mode of a gateway
+    /// of one router is named, and no other configuration is.
+    #[test]
+    fn a_provider_mode_of_one_router_is_named_alone() {
+        let named = |mode: ModeSettings, enable_igw: bool| {
+            RoutingSettings {
+                mode,
+                enable_igw,
+                ..config(PolicySettings::RoundRobin)
+            }
+            .provider_alone()
+        };
+        let provider = || ModeSettings::Provider("a_provider");
+        assert_eq!(named(provider(), false), Some("a_provider"));
+        // Under the multi-router setting the document plans the gateway's
+        // self-hosted workers.
+        assert_eq!(named(provider(), true), None);
+        for many in [false, true] {
+            let pair = ModeSettings::PrefillDecode {
+                prefill_policy: None,
+                decode_policy: None,
+            };
+            let encode = ModeSettings::EncodePrefillDecode {
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            };
+            for mode in [ModeSettings::Regular, pair, encode] {
+                assert_eq!(named(mode, many), None);
+            }
         }
     }
 
@@ -3513,21 +3616,6 @@ mod tests {
             manual.policy_document()
         );
 
-        // The encode mode's document is its own.
-        let encode = RoutingSettings {
-            mode: ModeSettings::EncodePrefillDecode {
-                encode_policy: None,
-                prefill_policy: None,
-                decode_policy: None,
-            },
-            ..config(PolicySettings::RoundRobin)
-        };
-        assert!(encode.policy_document().is_ok());
-        assert_eq!(
-            many_routers(encode.clone()).policy_document(),
-            encode.policy_document()
-        );
-
         // Under the override the main policy's keyed requests have no
         // document yet, while the hash ring on both sides of the pair has
         // one. The pair configuration's document then plans pairs alone.
@@ -3549,6 +3637,108 @@ mod tests {
             refusal(&many_routers(keyed)),
             ("routing_key_override.enabled", "true".to_string())
         );
+    }
+
+    /// A gateway of many routers in the encode mode serves single workers
+    /// beside its encoders and pairs: a model of single workers is placed
+    /// by the main policy. So its document binds the mode's three sides
+    /// over their phases and every other request behind them, in that
+    /// order: the first binding that matches a request decides it.
+    #[test]
+    fn the_encode_mode_of_many_routers_binds_a_single_request_behind_its_sides() {
+        let encode_mode = |encode: Option<PolicySettings>, sides: Option<PolicySettings>| {
+            ModeSettings::EncodePrefillDecode {
+                encode_policy: encode,
+                decode_policy: sides.clone(),
+                prefill_policy: sides,
+            }
+        };
+        let settings = many_routers(RoutingSettings {
+            mode: encode_mode(None, None),
+            ..config(PolicySettings::RoundRobin)
+        });
+        let document = settings.policy_document().expect("the mode's document");
+        assert_eq!(
+            serde_json::to_value(&document.bindings).expect("a written form"),
+            json!([
+                {
+                    "match": { "model": "*", "phase": ["encode", "prefill", "decode"] },
+                    "plan": "epd",
+                    "profiles": { "decode": "decode", "encode": "encode", "prefill": "prefill" },
+                },
+                { "match": { "model": "*", "phase": [] }, "profile": "round_robin" },
+            ]),
+        );
+        let applied = validated(&document).expect("the controller takes the document");
+        assert_ne!(applied.engine().place_for("", Phase::Single), Place::NoSide);
+
+        // A prefix ring counts its key in its own binding's blocks. Where
+        // the main policy names another size, the mode's own document
+        // stands, as it does under one router, and the controller takes it.
+        let ringed = RoutingSettings {
+            mode: encode_mode(None, Some(at_flag_defaults("prefix_hash"))),
+            ..config(cache_aware_over(512))
+        };
+        let own = ringed.policy_document().expect("the mode's own document");
+        assert!(validated(&own).is_ok());
+        assert_eq!(many_routers(ringed).policy_document().as_ref(), Ok(&own));
+
+        // No configuration of the mode loses its document to its single
+        // request. Every policy is the main one in turn, the encode side
+        // and the pair's sides are unnamed or of one policy, and the sticky
+        // override is off and on. Where the mode's own document, as
+        // `presets` plans it, is refused, the settings' is refused by the
+        // same sentence. Where the controller's check takes the mode's
+        // own, it takes the settings', which binds a single request behind
+        // the mode's sides in all but these: under the override, beside
+        // sides of the hash ring, every main policy but
+        // `consistent_hashing` and `manual` has no document for its keyed
+        // requests, and the mode is planned alone, whatever its encode
+        // side.
+        let unnamed_or_each = || std::iter::once(None).chain(PRESETS.iter().copied().map(Some));
+        let mut alone_still = Vec::new();
+        for main in PRESETS {
+            for encode in unnamed_or_each() {
+                for sides in unnamed_or_each() {
+                    for sticky in [false, true] {
+                        let named = format!("{main} over {encode:?} and {sides:?}, {sticky}");
+                        let mut swept = many_routers(RoutingSettings {
+                            mode: encode_mode(
+                                encode.map(at_flag_defaults),
+                                sides.map(at_flag_defaults),
+                            ),
+                            ..config(at_flag_defaults(main))
+                        });
+                        swept.routing_key_override.enabled = sticky;
+                        let alone = presets(&swept).and_then(|planned| written(&swept, planned));
+                        let said = swept.policy_document();
+                        let (Ok(one), Ok(both)) = (&alone, &said) else {
+                            assert_eq!(said, alone, "{named}");
+                            continue;
+                        };
+                        let taken = validated(one).is_ok();
+                        assert_eq!(validated(both).is_ok(), taken, "{named}");
+                        if taken && both.bindings.len() == 1 {
+                            assert_eq!(both, one, "{named}");
+                            alone_still.push((main, sides, sticky));
+                        }
+                    }
+                }
+            }
+        }
+        alone_still.dedup();
+        let ring = Some("consistent_hashing");
+        let keyless = [
+            "random",
+            "round_robin",
+            "passthrough",
+            "power_of_two",
+            "least_load",
+            "prefix_hash",
+            "cache_aware",
+            "bucket",
+        ];
+        assert_eq!(alone_still, keyless.map(|main| (main, ring, true)));
     }
 
     /// A pair configuration with round robin on both sides, under `main`.

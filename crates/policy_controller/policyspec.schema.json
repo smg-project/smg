@@ -1582,7 +1582,7 @@
       ]
     },
     "OverloadSpec": {
-      "description": "What a binding says of the overload veto on the workers of the pools\ndecided under it, as its `overload` field: whether the default\nthresholds veto at all, and what a decision does where every worker is\nvetoed. The veto is evaluated per load report by the host and latched,\nnever per request. The block names no threshold: a worker's\nregistration states its own two, over its program's default where the\nprogram has one. The store's judge reads the switch; a host that judges\non its worker objects does not read it yet.",
+      "description": "What a binding says of the overload veto on the workers of the pools\ndecided under it, as its `overload` field: whether the default\nthresholds veto at all, and what a decision does where every worker is\nvetoed. The veto is evaluated per load report by the host and latched,\nnever per request. The block names no threshold: a worker's\nregistration states its own two, over its program's default where the\nprogram has one. The store's judge reads the switch, for each binding's\npools. A gateway that runs the document in its own process reads the\nswitch once, where it builds its workers' default thresholds, and its\nroutes read one shed word: it refuses a document whose bindings differ\non either word. A controller that judges on its worker objects does not\nread the switch yet.",
       "type": "object",
       "properties": {
         "enabled": {

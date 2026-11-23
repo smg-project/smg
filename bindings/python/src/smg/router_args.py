@@ -1039,7 +1039,8 @@ class RouterArgs:
                 "Run a policy document with the policy controller."
                 " The document replaces the routing options: one that is not at its"
                 " default is refused beside it by name. The two overload thresholds"
-                " stand beside it: the gateway builds its workers with them."
+                " stand beside it: the gateway builds its workers with them, unless"
+                " the document switches its overload block off."
             ),
         )
         routing_group.add_argument(

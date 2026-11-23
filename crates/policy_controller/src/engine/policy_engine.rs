@@ -774,7 +774,16 @@ impl PolicyEngine {
                 ) => {
                     let read = self.loads_read(maker);
                     let loads = read.snapshot();
-                    Ok(pair::decide(own, &lists, &mut request, None, loads, now))
+                    let sends_to = |target: &_| maker.sends_to(target);
+                    Ok(pair::decide(
+                        own,
+                        &lists,
+                        &mut request,
+                        None,
+                        loads,
+                        now,
+                        sends_to,
+                    ))
                 }
                 (Phase::Single | Phase::Prefill, _) => Ok(single::over_none(own, &request)),
                 (Phase::Decode | Phase::Encode, _) => Err(DecisionRefused::PairSide),
@@ -796,11 +805,8 @@ impl PolicyEngine {
     ///
     /// [`DecisionRefused::Faulted`] where the decision panicked.
     #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the controller's service calls it once it decides by this engine"
-        )
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "a controller's deciding thread calls it")
     )]
     pub(crate) fn decide_decode_without_lease(
         &self,
@@ -815,7 +821,8 @@ impl PolicyEngine {
                 WorkerLists::Pair(lists) | WorkerLists::Encode(EncodeLists { pair: lists, .. }) => {
                     let read = self.loads_read(maker);
                     let loads = read.snapshot();
-                    pair::decide(own, &lists, &mut request, Some(held), loads, now)
+                    // The decode asked again writes for its first target.
+                    pair::decide(own, &lists, &mut request, Some(held), loads, now, |_| true)
                 }
                 _ => single::over_none(own, &request),
             })
@@ -971,7 +978,8 @@ impl Loaded<'_, '_> {
             ) => {
                 let read = self.loads_read(maker);
                 let loads = read.snapshot();
-                let decided = pair::decided(self, &lists, &mut request, None, loads, now);
+                let sends_to = |target: &_| maker.sends_to(target);
+                let decided = pair::decided(self, &lists, &mut request, None, loads, now, sends_to);
                 *whole = Some((decided, later));
                 return Ok(None);
             }
@@ -1032,7 +1040,8 @@ impl DecisionEngine for PolicyEngine {
                 WorkerLists::Pair(lists) | WorkerLists::Encode(EncodeLists { pair: lists, .. }) => {
                     let read = self.loads_read(maker);
                     let loads = read.snapshot();
-                    pair::decided(own, &lists, &mut request, Some(held), loads, now)
+                    // The decode asked again writes for its first target.
+                    pair::decided(own, &lists, &mut request, Some(held), loads, now, |_| true)
                 }
                 _ => single::issued(own, single::over_none(own, &request), &request, now),
             })

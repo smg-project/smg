@@ -19,13 +19,15 @@ use crate::{
 
 /// The overload thresholds an object states for each signal its row names
 /// none for: the worker crate's two default numbers, which a gateway hands
-/// its workers too. They are the policy document's two default numbers
+/// its workers too. They are this crate's own two defaults, by which the
+/// store judges under a binding whose block is on
 /// ([`OVERLOAD_WAITING_REQUESTS`](crate::document::spec::OVERLOAD_WAITING_REQUESTS),
-/// [`OVERLOAD_TOKEN_USAGE`](crate::document::spec::OVERLOAD_TOKEN_USAGE)).
+/// [`OVERLOAD_TOKEN_USAGE`](crate::document::spec::OVERLOAD_TOKEN_USAGE)):
+/// no document names a threshold.
 /// One set a worker: a registration's own values, each over these.
 ///
 /// The usage is the worker crate's 64-bit number, as an engine reports it.
-/// The document's constant is 32 bits wide: widened, it reads just above
+/// This crate's constant is 32 bits wide: widened, it reads just above
 /// the 0.8 an engine reports, and a worker at the threshold would not be
 /// over it.
 const OVERLOAD_DEFAULTS: OverloadThresholds = OverloadThresholds {
@@ -328,7 +330,11 @@ mod tests {
         let leader = Replica::new();
         leader.store.set_term(1);
         let standby = Replica::new();
-        let follower = Follower::new(Arc::clone(&standby.store), Arc::clone(&standby.feed.log));
+        let follower = Follower::new(
+            Arc::clone(&standby.store),
+            Arc::clone(&standby.feed.log),
+            standby.workers.holder(),
+        );
         let row = |store: &MemoryStore| store.by_key(URL).expect("a row");
         let writes: [Write<'_>; 6] = [
             ("a registration", &|store| {
@@ -384,7 +390,11 @@ mod tests {
         let standby = Replica::new();
         standby.caught_up("the standby's start").await;
         assert!(standby.held().is_empty());
-        let follower = Follower::new(Arc::clone(&standby.store), Arc::clone(&standby.feed.log));
+        let follower = Follower::new(
+            Arc::clone(&standby.store),
+            Arc::clone(&standby.feed.log),
+            standby.workers.holder(),
+        );
         let cut = leader.store.checkpoint();
         assert_eq!(follower.restore(cut, None), Ok(true));
         standby.caught_up("the restore").await;

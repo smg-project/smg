@@ -21,18 +21,69 @@ use engine_zmq_client::{
     },
     ConnectedEngine,
 };
+use smg_grpc_client::sglang_proto;
 
-pub(crate) const PREFIX: &str = "DeepSeek-V4.1 image batch:";
+const PREFIX: &str = "DeepSeek-V4.1 image batch:";
 
 /// The grid only the Router's DeepSeek-V4.1 preprocessor sends with an image
 /// batch; GLM-5.3 Flash sends `patches_per_image` as well.
-pub(crate) const MARKER: &str = "vit_grid";
+const MARKER: &str = "vit_grid";
 
-/// Whether an image batch's model tensors are a V4.1 batch's. Its other
-/// fields are then required, so a batch missing one is refused, not sent on
-/// as one item.
-pub(crate) fn is_v41_batch(tensors: &BTreeMap<String, SglangWireTensor>) -> bool {
-    tensors.contains_key(MARKER)
+/// A batch that goes to the scheduler as one item an image, as one
+/// connection takes it: what its ranks declared to check such a batch
+/// against. Read from the handshakes once ([`Self::declared`]); every
+/// translated batch is then put to it ([`Self::cut`]). Which batch is such
+/// a batch is read off the batch alone ([`Self::claims`]), whatever the
+/// ranks declared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PerImageItems {
+    vision: Option<V41Vision>,
+}
+
+impl PerImageItems {
+    pub(crate) fn declared(ranks: &[ConnectedEngine]) -> Self {
+        Self {
+            vision: V41Vision::from_handshakes(ranks),
+        }
+    }
+
+    /// Whether a payload's model tensors lay its images out one by one. Its
+    /// other fields are then required, so a batch missing one is refused, not
+    /// sent on as one item.
+    pub(crate) fn claims(payload: &sglang_proto::MultimodalInputs) -> bool {
+        payload.model_specific_tensors.contains_key(MARKER)
+    }
+
+    /// The items a translated `batch` is cut into, one an image; `None` for
+    /// a batch that is not laid out so, which stays one item.
+    pub(crate) fn cut(
+        self,
+        batch: &SglangWireMmItem,
+        im_token_id: Option<u32>,
+    ) -> Result<Option<Vec<SglangWireMmItem>>, String> {
+        if !batch.model_specific_data.contains_key(MARKER) {
+            return Ok(None);
+        }
+        // Only an image batch is cut into V4.1 items. Under the video label the
+        // batch would go on as a video item, which SGLang's V4.1 model has no
+        // embedder for.
+        if batch.modality != SglangWireModality::Image {
+            return Err(format!("{PREFIX} vit_grid on a video batch"));
+        }
+        // SGLang pads the image positions only when the id is set. Without it
+        // the model finds no position for the items' embeddings and fails in
+        // the scheduler.
+        if im_token_id.is_none() {
+            return Err(format!("{PREFIX} no im_token_id"));
+        }
+        deepseek_v41_items(
+            batch.feature.as_ref(),
+            &batch.model_specific_data,
+            batch.offsets.as_deref().unwrap_or_default(),
+            self.vision,
+        )
+        .map(Some)
+    }
 }
 
 /// The served DeepSeek-V4.1 model's patch size and downsample ratio, as its
@@ -41,7 +92,7 @@ pub(crate) fn is_v41_batch(tensors: &BTreeMap<String, SglangWireTensor>) -> bool
 /// loads, so model overrides are in them; the Python servicer loads that
 /// config the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct V41Vision {
+struct V41Vision {
     patch_size: u64,
     downsample_ratio: u64,
 }
@@ -63,7 +114,7 @@ impl V41Vision {
     /// declared the same one. A request without a pin is placed on a rank at
     /// submit, by load, after its batch is checked, so a batch is checked
     /// only against a geometry all the ranks share.
-    pub(crate) fn from_handshakes(ranks: &[ConnectedEngine]) -> Option<Self> {
+    fn from_handshakes(ranks: &[ConnectedEngine]) -> Option<Self> {
         let mut declared = ranks
             .iter()
             .map(|rank| Self::from_handshake(&rank.ready_response));
@@ -97,8 +148,8 @@ impl V41Vision {
 /// carry none: the scheduler, or the opt-in hasher, hashes each. With the
 /// served model's `vision`, a batch whose patch rows or spans do not fit that
 /// model is refused as well.
-pub(crate) fn deepseek_v41_items(
-    feature: Option<SglangWireTensor>,
+fn deepseek_v41_items(
+    feature: Option<&SglangWireTensor>,
     tensors: &BTreeMap<String, SglangWireTensor>,
     offsets: &[(u64, u64)],
     vision: Option<V41Vision>,
@@ -293,7 +344,7 @@ mod tests {
     use openai_protocol::worker::RuntimeType;
     use smg_grpc_client::sglang_proto;
 
-    use super::V41Vision;
+    use super::{PerImageItems, V41Vision};
     use crate::{
         client::ZmqEngineClient, eos::EosTokenIds, sglang::translate_sglang_multimodal,
         test_support::connected_pair_declaring,
@@ -315,7 +366,14 @@ mod tests {
 
     /// The batch alone, translated for the served model `VISION`.
     fn translate(batch: sglang_proto::MultimodalInputs) -> Result<SglangWireMmInputs, String> {
-        translate_sglang_multimodal(batch, Vec::new(), PROMPT_LEN, Some(VISION))
+        translate_sglang_multimodal(
+            batch,
+            Vec::new(),
+            PROMPT_LEN,
+            PerImageItems {
+                vision: Some(VISION),
+            },
+        )
     }
 
     /// `batch` with `rows` patch rows of zeros, each of `row_shape`.
@@ -611,7 +669,9 @@ mod tests {
             12,
             &[3, 2, 3],
         );
-        let output = translate_sglang_multimodal(batch, Vec::new(), PROMPT_LEN, None).unwrap();
+        let output =
+            translate_sglang_multimodal(batch, Vec::new(), PROMPT_LEN, PerImageItems::default())
+                .unwrap();
         assert_eq!(output.mm_items.len(), 2);
     }
 
@@ -776,8 +836,13 @@ mod tests {
     fn patch_rows_without_values_are_refused() {
         for row_shape in [&[0][..], &[3, 0, 2]] {
             let batch = with_pixel_rows(v41_batch(&GRIDS, &PATCHES, &SPANS), 8, row_shape);
-            let error =
-                translate_sglang_multimodal(batch, Vec::new(), PROMPT_LEN, None).unwrap_err();
+            let error = translate_sglang_multimodal(
+                batch,
+                Vec::new(),
+                PROMPT_LEN,
+                PerImageItems::default(),
+            )
+            .unwrap_err();
             assert!(
                 error.contains("not rows of patches"),
                 "{row_shape:?}: {error:?}"
@@ -797,8 +862,15 @@ mod tests {
         let error = translate(video.clone()).unwrap_err();
         assert!(error.contains(needle), "{error:?}");
         let image = v41_batch(&GRIDS, &PATCHES, &SPANS);
-        let error =
-            translate_sglang_multimodal(image, vec![video], PROMPT_LEN, Some(VISION)).unwrap_err();
+        let error = translate_sglang_multimodal(
+            image,
+            vec![video],
+            PROMPT_LEN,
+            PerImageItems {
+                vision: Some(VISION),
+            },
+        )
+        .unwrap_err();
         assert!(error.contains(needle), "{error:?}");
     }
 
@@ -815,8 +887,15 @@ mod tests {
         assert!(error.contains(needle), "{error:?}");
         // Also as the extra batch of a mixed request, after a video batch.
         let extras = vec![batch.clone()];
-        let error = translate_sglang_multimodal(video_batch(), extras, PROMPT_LEN, Some(VISION))
-            .unwrap_err();
+        let error = translate_sglang_multimodal(
+            video_batch(),
+            extras,
+            PROMPT_LEN,
+            PerImageItems {
+                vision: Some(VISION),
+            },
+        )
+        .unwrap_err();
         assert!(error.contains(needle), "{error:?}");
         batch.model_specific_tensors.remove("vit_grid");
         let output = translate(batch).unwrap();
@@ -834,9 +913,15 @@ mod tests {
             error.contains("DeepSeek-V4.1 image batch: no images"),
             "{error:?}"
         );
-        let error =
-            translate_sglang_multimodal(video_batch(), vec![empty], PROMPT_LEN, Some(VISION))
-                .unwrap_err();
+        let error = translate_sglang_multimodal(
+            video_batch(),
+            vec![empty],
+            PROMPT_LEN,
+            PerImageItems {
+                vision: Some(VISION),
+            },
+        )
+        .unwrap_err();
         assert!(error.contains("no images"), "{error:?}");
     }
 

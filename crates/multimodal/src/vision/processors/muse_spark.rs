@@ -42,26 +42,26 @@ use crate::{
 };
 
 /// Spatial patch size of the reference image and video processors.
-pub const DEFAULT_PATCH_SIZE: usize = 14;
+pub(crate) const DEFAULT_PATCH_SIZE: usize = 14;
 /// Patches merged into one token along each spatial axis.
-pub const DEFAULT_MERGE_SIZE: usize = 2;
+pub(crate) const DEFAULT_MERGE_SIZE: usize = 2;
 /// Frames per temporal patch.
-pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
+pub(crate) const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
 /// The reference image processor's merged-token cap per image.
-pub const DEFAULT_MAX_IMAGE_TOKENS: usize = 4096;
+pub(crate) const DEFAULT_MAX_IMAGE_TOKENS: usize = 4096;
 /// The reference video processor class's merged-token cap per frame; the
 /// released checkpoints raise it in their processor config.
-pub const DEFAULT_MAX_VIDEO_FRAME_TOKENS: usize = 144;
+pub(crate) const DEFAULT_MAX_VIDEO_FRAME_TOKENS: usize = 144;
 /// Normalization mean of the family.
-pub const MUSE_SPARK_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
+pub(crate) const MUSE_SPARK_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
 /// Normalization std of the family.
-pub const MUSE_SPARK_STD: [f64; 3] = [0.5, 0.5, 0.5];
+pub(crate) const MUSE_SPARK_STD: [f64; 3] = [0.5, 0.5, 0.5];
 
 const CHANNELS: usize = 3;
 
 /// The processor's view of one preprocessor config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MuseSparkVisionSettings {
+pub(crate) struct MuseSparkVisionSettings {
     pub patch_size: usize,
     pub merge_size: usize,
     pub temporal_patch_size: usize,
@@ -72,7 +72,7 @@ pub struct MuseSparkVisionSettings {
 
 impl MuseSparkVisionSettings {
     /// The settings of an image config: the cap is `max_image_tokens`.
-    pub fn for_images(config: &PreProcessorConfig) -> Self {
+    pub(crate) fn for_images(config: &PreProcessorConfig) -> Self {
         Self::read(
             config,
             config
@@ -83,7 +83,7 @@ impl MuseSparkVisionSettings {
 
     /// The settings of a video config: the cap is `max_video_frame_tokens`,
     /// applied to every frame.
-    pub fn for_video(config: &PreProcessorConfig) -> Self {
+    pub(crate) fn for_video(config: &PreProcessorConfig) -> Self {
         Self::read(
             config,
             config
@@ -136,7 +136,7 @@ impl MuseSparkVisionSettings {
 
 /// One item's resize target and patch grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResizePlan {
+pub(crate) struct ResizePlan {
     /// Resized height in pixels.
     pub height: usize,
     /// Resized width in pixels.
@@ -160,7 +160,7 @@ pub struct ResizePlan {
 /// CPython's hash table, is reproduced here because near-square inputs have
 /// two grids of identical distortion. `max_tokens / ratio` is raised to `0.5`
 /// through the C library's `pow`, as the interpreter does.
-pub fn smart_resize_grid(
+pub(crate) fn smart_resize_grid(
     height: usize,
     width: usize,
     factor: usize,
@@ -438,7 +438,7 @@ impl MuseSparkVisionProcessor {
 
     /// Resolve the image and video settings, the resize switch and the
     /// normalization of `config` once.
-    pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
+    pub(crate) fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
         let image = MuseSparkVisionSettings::for_images(config);
         Self {
             image,

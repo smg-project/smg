@@ -161,8 +161,11 @@ fn a_call_whose_decision_reads_no_tree_never_asks_the_entry() {
 
 /// A request that states no entry is decided as before, by the engine's
 /// record of hashed prefixes, though its host lends a tree: the tree is
-/// neither read nor written. A request that states one beside it is stored
-/// in the tree for the worker it was sent to.
+/// neither read nor written. The record keeps its prompt for the worker it
+/// was sent to: a rule that refuses the prompt's worker is asked once a
+/// target, and the prompt's next request goes to the worker the rule took.
+/// A request that states one beside it is stored in the tree for the
+/// worker it was sent to.
 #[test]
 fn a_request_that_states_no_entry_leaves_the_tree_alone() {
     let (engine, tree) = lent("cache_aware", Also::Nothing);
@@ -170,14 +173,28 @@ fn a_request_that_states_no_entry_leaves_the_tree_alone() {
     let list = pool(4);
     let members = PublishedList::new(Arc::clone(&list));
     let tokens: Vec<u32> = (0..256).collect();
-    let plain = PlaceRequest {
+    let mut plain = PlaceRequest {
         prompt: Prompt {
             tokens: Some(&tokens),
             ..Prompt::NONE
         },
         ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
-    engine.place(&plain).expect("a placement");
+    let first = engine.place(&plain).expect("a placement").id();
+    // The rule now refuses the prompt's worker: a longer prompt goes to the
+    // target behind it, and its next request goes there again.
+    let asked = RefCell::new(Vec::new());
+    let admits = |worker: &dyn Worker| {
+        asked.borrow_mut().push(worker_id(worker));
+        worker_id(worker) != first
+    };
+    let longer: Vec<u32> = (0..512).collect();
+    plain.prompt.tokens = Some(&longer);
+    plain.admits = Some(&admits);
+    let moved = engine.place(&plain).expect("a placement").id();
+    assert_eq!(*asked.borrow(), [first, moved]);
+    plain.admits = None;
+    assert_eq!(engine.place(&plain).expect("a placement").id(), moved);
     assert!(tree.get_tenant_token_counts().is_empty());
 
     let entry = Entry::of(&tokens);

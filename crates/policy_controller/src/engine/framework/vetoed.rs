@@ -50,7 +50,7 @@ use crate::{
     engine::{
         decision::{Decision, LiftedVeto, Pick, Survivors, Targets, Trace},
         sticky_sessions::SessionVerdict,
-        view::{Candidate, Constraints, Health, PoolFacts, RequestFacts},
+        view::{Candidate, Constraints, Health, PoolFacts, RequestFacts, Role},
     },
     stages::{
         filters::{HasCapacity, Healthy, NotOverloaded, NotTried},
@@ -205,7 +205,8 @@ impl Engine {
 /// Whether a keyed request keeps its key's worker over the overload veto:
 /// a request of the single plan that carries a session key, under a binding
 /// that steers ([`AllVetoed::Steer`]). A decision asks it for a profile the
-/// plain ring alone places ([`Engine::places_by_key`]) and then
+/// plain ring alone places ([`Engine::places_by_key`]) over a pool of
+/// regular workers ([`regular`]) and then
 /// decides the request with the veto lifted ([`Engine::keep`]). The key's
 /// worker takes the request while it is over its thresholds, beside free
 /// workers too, as a session keeps its owner. A binding that sheds keeps
@@ -232,6 +233,14 @@ pub(super) fn keeps_its_key(
                     && (sessions.inflight_cap == 0 || facts.session_counted)
             }
         }
+}
+
+/// Whether every candidate the request may take is a regular worker. A key
+/// keeps its worker over the overload veto among regular workers alone, as
+/// the gateway's own placement lifts the veto for a key: a worker of
+/// another role over its thresholds passes the key on.
+pub(super) fn regular(candidates: &[Candidate], cx: &Constraints<'_>) -> bool {
+    places::rows(candidates, cx).all(|row| row.role == Role::Single)
 }
 
 /// The profile's filters again with the overload veto lifted, for a keyed
@@ -668,8 +677,21 @@ impl<'a> Half<'a> {
     }
 
     /// The side's rows the request may take ([`places::rows`]).
-    fn places(&self) -> impl Iterator<Item = &'a Candidate> {
+    pub(super) fn places(&self) -> impl Iterator<Item = &'a Candidate> {
         places::rows(self.rows, self.cx)
+    }
+
+    /// Whether `row` stands but for the side's admission limit: the side's
+    /// hard filters keep it with the limit set aside, under the side's own
+    /// constraints. A pair's decision judges the limit over the prefills
+    /// that stand so and have an open partner, and names a refusal by the
+    /// partners of every prefill that stands so ([`Engine::decide_pair`]).
+    pub(super) fn but_for_the_limit(&self, row: &Candidate) -> bool {
+        let aside = Self {
+            limit_aside: true,
+            ..*self
+        };
+        aside.stands(row, aside.cx)
     }
 
     /// The side's rows that stand in the pass that lifts `lifted`
@@ -1886,6 +1908,14 @@ mod tests {
             let prefills = [classed(free(0, 4), 1), room(vetoed)];
             assert_eq!(shed_of(&decide_pair(&engine, &prefills, &decodes)), full);
         }
+        // So it does where every decode is over its thresholds and the rule
+        // opened their class: the free prefill stands at its limit with an
+        // open partner, and the busy prefill with a slot is not taken. The
+        // gateway judges the limit over the prefills with an open partner
+        // (`:2515-2528` there on main `7526c6664e`).
+        let busy = [classed(over(0, 0), 1)];
+        let prefills = [classed(free(0, 4), 1), room(over(1, 0))];
+        assert_eq!(shed_of(&decide_pair(&engine, &prefills, &busy)), full);
         // Two prefills over their thresholds: the less loaded is taken, at
         // its limit and then with a slot.
         let busier = room(over(1, 5));

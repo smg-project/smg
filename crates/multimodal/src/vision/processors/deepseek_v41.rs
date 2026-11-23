@@ -33,10 +33,10 @@ use crate::{
 
 /// Span role tags carried by the per-image `types` tensor (the reference's
 /// out-of-band `token_types`).
-pub const IMAGE_START: i64 = 0;
-pub const IMAGE: i64 = 1;
-pub const IMAGE_NEW_LINE: i64 = 2;
-pub const IMAGE_END: i64 = 3;
+pub(crate) const IMAGE_START: i64 = 0;
+pub(crate) const IMAGE: i64 = 1;
+pub(crate) const IMAGE_NEW_LINE: i64 = 2;
+pub(crate) const IMAGE_END: i64 = 3;
 
 /// Padding color of the reference `ImageOps.pad` call.
 const PAD_COLOR: Rgb<u8> = Rgb([127, 127, 127]);
@@ -63,7 +63,7 @@ pub struct GridPlan {
 
 impl GridPlan {
     /// Total number of LLM tokens the image span occupies.
-    pub fn num_image_tokens(&self) -> usize {
+    pub(crate) fn num_image_tokens(&self) -> usize {
         num_image_tokens(self.n_llm_h, self.n_llm_w)
     }
 }
@@ -137,7 +137,7 @@ fn safe_resize(
 }
 
 /// Reading-order span layout: one IMAGE_NEW_LINE per row.
-pub fn image_token_types(n_llm_h: usize, n_llm_w: usize) -> Vec<i64> {
+pub(crate) fn image_token_types(n_llm_h: usize, n_llm_w: usize) -> Vec<i64> {
     let mut types = Vec::with_capacity(num_image_tokens(n_llm_h, n_llm_w));
     types.push(IMAGE_START);
     for _ in 0..n_llm_h {

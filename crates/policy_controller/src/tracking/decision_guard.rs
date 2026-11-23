@@ -809,13 +809,14 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         }
     }
 
-    /// Whether the prefill's end would take the pair's decode with it: the
-    /// prefill went out, and the decode still stands chosen
+    /// Whether the prefill's last word would take the pair's decode with
+    /// it: the prefill is still owed one, its end where it went out and
+    /// its release where it never did, and the decode still stands chosen
     /// ([`Self::decode_chosen`]).
     #[cfg(feature = "in-process")]
     #[must_use]
     pub(crate) fn end_takes_decode(&self) -> bool {
-        matches!(self.owed, Owed::Completion { .. }) && self.decode_chosen()
+        !matches!(self.owed, Owed::Nothing) && self.decode_chosen()
     }
 
     /// The span from `side`'s dispatch to `at`, in whole microseconds: what

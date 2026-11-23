@@ -74,7 +74,7 @@ pub(super) fn decide(
         workers,
         live,
     };
-    engine.decide_keyed(facts, &rows, cx)
+    engine.decide_keyed_among(facts, &rows, cx, records.regular())
 }
 
 #[cfg(test)]

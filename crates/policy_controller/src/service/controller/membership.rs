@@ -37,8 +37,8 @@
 //! table. So behind a write that answered, the door follows the store into
 //! the objects before the call answers: a decision made behind an
 //! acknowledged registration, drain or removal reads the fleet the call
-//! left. A standby's applied rows reach the objects by the holder's own
-//! task.
+//! left. A standby's applier writes its leader's rows through the holder
+//! too ([`Objects::follow_at`]).
 //!
 //! **A registration that states several ranks is one write.** Each rank's
 //! facts are read by the call's own rules, a rank at a time. The host

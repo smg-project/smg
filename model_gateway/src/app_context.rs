@@ -732,6 +732,13 @@ impl AppContextBuilder {
         // words. The engine is started last, from the document that was
         // checked here.
         let policy = Self::policy_in_force(&router_config, policy_stages.as_ref())?;
+        // The overload veto's two words are read once below, where the
+        // registration settings are made and the registry's shed word is set.
+        // A supplied document this gateway refuses for them ends the start
+        // here, behind the document's own check and in the same form.
+        router_config
+            .supplied_overload_words()
+            .map_err(|refused| format!("policy controller: {refused}"))?;
         // A served model aliased under a vendor name keeps that vendor's
         // contract profile after the alias is resolved into the served name.
         ProviderProfile::register_model_aliases(
@@ -1006,8 +1013,10 @@ impl AppContextBuilder {
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(shed_retry_after_secs(config.load_monitor_interval()));
+        // The shed word in force: a supplied document's own where the policy
+        // controller runs one, else the configuration's.
         if let Some(registry) = self.worker_registry.as_ref() {
-            registry.set_overload_shed(config.worker_overload_shed);
+            registry.set_overload_shed(config.overload_words_in_force().shed);
         }
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.
@@ -1026,11 +1035,24 @@ impl AppContextBuilder {
     ///
     /// A document that is refused ends the start with the refusal's own
     /// words, before a store is opened and before the gateway listens.
+    ///
+    /// The classic policies stay in place with the option off, and with it
+    /// on in a gateway whose every router is one provider's
+    /// (`RouterConfig::policy_engine_decides`). That gateway places its
+    /// requests by no routing policy, so the option moves nothing there,
+    /// and this start says so in one log line.
     fn policy_in_force(
         config: &RouterConfig,
         stages: Option<&StageRegistry>,
     ) -> Result<Option<(PolicySpec, AppliedSpec)>, String> {
         if !config.policy_controller {
+            return Ok(None);
+        }
+        if !config.policy_engine_decides() {
+            info!(
+                "Policy controller on and placing no request: mode = {} places its requests by no routing policy",
+                config.mode_type()
+            );
             return Ok(None);
         }
         let document = config
@@ -1799,6 +1821,116 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+    }
+
+    /// A gateway whose one router is a provider's, with the policy
+    /// controller on.
+    fn a_providers_gateway_with_the_option_on() -> RouterConfig {
+        let mut config = RouterConfig {
+            mode: crate::config::RoutingMode::OpenAI {
+                worker_urls: Vec::new(),
+            },
+            policy_controller: true,
+            ..RouterConfig::default()
+        };
+        config.health_check.disable_health_check = true;
+        config
+    }
+
+    /// A gateway whose one router is a provider's places its requests by no
+    /// routing policy, so the policy controller's option moves nothing
+    /// there. The gateway starts, no engine runs, the registry keeps the
+    /// classic policies, and the pairing mode is the configuration's own.
+    #[tokio::test]
+    async fn a_providers_gateway_starts_with_the_option_on_and_runs_no_engine() {
+        use crate::config::PdPairingMode;
+
+        let config = RouterConfig {
+            pd_pairing_mode: PdPairingMode::Strict,
+            ..a_providers_gateway_with_the_option_on()
+        };
+        let context = AppContext::from_config(config, 30, None, None)
+            .await
+            .expect("the gateway starts");
+        let registry = &context.policy_registry;
+        assert!(registry.engine().is_none(), "no engine runs");
+        assert!(registry.keeps_classic_policies());
+        assert_eq!(registry.pd_pairing_mode(), PdPairingMode::Strict);
+    }
+
+    /// A supplied document is never dropped in silence: beside a provider's
+    /// mode alone the start refuses it in the policy crate's words, which
+    /// name the mode.
+    #[tokio::test]
+    async fn a_document_supplied_to_a_providers_gateway_is_refused_at_the_start() {
+        use smg_policy_controller::document::PolicySpec;
+
+        let config = RouterConfig {
+            policy_spec: Some(PolicySpec::preset("round_robin").expect("a preset")),
+            ..a_providers_gateway_with_the_option_on()
+        };
+        let words = config
+            .policy_document()
+            .expect_err("the mode has no document")
+            .to_string();
+        assert!(words.contains("openai"), "{words}");
+
+        let refused = AppContext::from_config(config, 30, None, None)
+            .await
+            .expect_err("the start is refused");
+        assert_eq!(refused, format!("policy controller: {words}"));
+    }
+
+    /// Under the multi-router setting a provider's mode has the regular
+    /// document: the engine starts, and it decides for the gateway's
+    /// self-hosted routers.
+    #[tokio::test]
+    async fn a_providers_mode_beside_other_routers_starts_the_engine() {
+        let config = RouterConfig {
+            enable_igw: true,
+            ..a_providers_gateway_with_the_option_on()
+        };
+        let regular = RouterConfig {
+            mode: RouterConfig::default().mode,
+            ..config.clone()
+        };
+        assert_eq!(
+            config.policy_document_in_force(),
+            regular.policy_document_in_force(),
+            "the regular document"
+        );
+
+        let context = AppContext::from_config(config, 30, None, None)
+            .await
+            .expect("the gateway starts");
+        let registry = &context.policy_registry;
+        assert!(registry.engine().is_some(), "the engine runs");
+        assert!(!registry.keeps_classic_policies());
+    }
+
+    /// The start says that the option moves nothing, once. The option's
+    /// other readers say nothing.
+    #[traced_test]
+    #[tokio::test]
+    async fn the_start_alone_says_once_that_the_option_moves_nothing() {
+        use crate::config::validation::ConfigValidator;
+
+        const LINE: &str = "Policy controller on and placing no request: mode = openai";
+        let config = a_providers_gateway_with_the_option_on();
+        assert!(PolicyRegistry::of_config(&config).keeps_classic_policies());
+        assert_eq!(config.pd_pairing_in_force(), config.pd_pairing_mode);
+        ConfigValidator::validate_policy_document(&config).expect("no document to refuse");
+        assert!(!logs_contain(LINE), "a reader other than the start said it");
+
+        AppContext::from_config(config, 30, None, None)
+            .await
+            .expect("the gateway starts");
+        logs_assert(|lines: &[&str]| {
+            match lines.iter().filter(|line| line.contains(LINE)).count() {
+                1 => Ok(()),
+                said => Err(format!("the start said the line {said} times")),
+            }
+        });
     }
 
     #[test]

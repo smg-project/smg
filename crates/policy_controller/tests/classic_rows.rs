@@ -49,6 +49,10 @@
 //! replay answer for answer, and a drawn row pair for pair and share for
 //! share. The pair-select module holds five recorded rows the pair's
 //! decision answers apart to the answer each entry gives.
+//! A pair-bound row is a pair-select row behind the prefill admission,
+//! where a prefill that holds the admission's bound has an open partner or
+//! has none. Its sheet is its own and its replay the pair-select module's,
+//! answer for answer.
 //! No row is decided differently but where its module names it. The prefix
 //! hash module holds a recorded row that a key of whole blocks cannot
 //! decide as recorded to the outcome its entry gives. The sticky rank
@@ -90,6 +94,7 @@ mod classic {
     pub mod media_refs;
     pub mod minimum_tokens;
     pub mod overload;
+    pub mod pair_bound;
     pub mod pair_index;
     pub mod pair_select;
     pub mod power_of_two;
@@ -311,7 +316,10 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// workers a request may take or its refusal, so each module brings its
 /// own replay too, over one bed; their copied rows name each runtime by a
 /// token, or name none, and the pair index's rule holds them as well.
-const MODULES: [Module; 16] = [
+/// A pair-bound row has the pair-select row's shape: its module names its
+/// own sheet and replays it by the pair-select module's replay, and holds a
+/// copied row whole.
+const MODULES: [Module; 17] = [
     module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
     module::<classic::bucket::Row>(classic::bucket::INLINE),
     module::<classic::cache_aware::Row>(classic::cache_aware::INLINE),
@@ -344,6 +352,12 @@ const MODULES: [Module; 16] = [
         policy: classic::overload::POLICY,
         inline: classic::overload::INLINE,
         replay: classic::overload::replay_rows,
+        copied: whole_row_defects,
+    },
+    Module {
+        policy: classic::pair_bound::POLICY,
+        inline: classic::pair_bound::INLINE,
+        replay: classic::pair_bound::replay_rows,
         copied: whole_row_defects,
     },
     Module {
@@ -1319,6 +1333,7 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
             "media-refs.json",
             "minimum_tokens.json",
             "overload.json",
+            "pair-bound.json",
             "pair-index.json",
             "pair-select.json",
             "power_of_two.json",

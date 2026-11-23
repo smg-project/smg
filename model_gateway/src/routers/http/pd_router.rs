@@ -5637,6 +5637,88 @@ mod tests {
             .is_empty());
     }
 
+    /// The count route asks the pair's text question, and its request is
+    /// decided as a single one over the prefill pool: by the model's main
+    /// policy under the classic policies, by the binding of single requests
+    /// under the policy engine. Beside a cache-aware main policy with
+    /// round-robin sides the two sides read no text. So neither kind builds
+    /// the count's text, and both place it on the same worker, the one that
+    /// holds less.
+    #[tokio::test]
+    async fn a_count_beside_quiet_sides_is_placed_with_no_text_under_either_kind() {
+        use smg_policy_controller::document::AppliedSpec;
+
+        use crate::{
+            config::types::{RouterConfig, RoutingMode},
+            policies::Side,
+        };
+
+        let settings = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy: Some(PolicyConfig::RoundRobin),
+            },
+            policy: PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096),
+            ..Default::default()
+        };
+        let classic = PolicyRegistry::new(settings.policy.clone());
+        let engine = PolicyRegistry::for_policy_engine(
+            settings.policy.clone(),
+            settings.routing_key_override.clone(),
+        );
+        let document = settings.policy_document().expect("the settings' document");
+        engine_on(
+            &engine,
+            AppliedSpec::validate(&document).expect("a valid document"),
+        );
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let body = || -> CountMessageTokensRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "count me"}],
+            }))
+            .expect("valid count_tokens request")
+        };
+        for (kind, policies) in [("classic", classic), ("engine", engine)] {
+            // The router factory names each side's policy at the start.
+            for side in [Side::Prefill, Side::Decode] {
+                policies.set_side_policy(side, &PolicyConfig::RoundRobin);
+            }
+            let router = PDRouter {
+                policy_registry: Arc::new(policies),
+                ..create_test_pd_router()
+            };
+            let reads = router.policies_need_request_text();
+            let (text, _) = PDRouter::count_tokens_routing_text(body(), reads);
+            assert!(text.is_none(), "{kind}: the two sides read no text");
+
+            let (busy_url, busy_seen) = spawn_recording_stub(r#"{"input_tokens":42}"#).await;
+            let (idle_url, idle_seen) = spawn_recording_stub(r#"{"input_tokens":42}"#).await;
+            let busy: Arc<dyn Worker> =
+                Arc::from(create_test_worker(busy_url, WorkerType::Prefill, true));
+            let idle: Arc<dyn Worker> =
+                Arc::from(create_test_worker(idle_url, WorkerType::Prefill, true));
+            for _ in 0..3 {
+                busy.increment_load();
+            }
+            for worker in [busy, idle] {
+                router.worker_registry.register_or_replace(worker);
+            }
+            let response = router
+                .route_messages_count_tokens(None, &tenant, body(), UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{kind}");
+            let arrived = [&busy_seen, &idle_seen].map(|seen| {
+                seen.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+            });
+            assert_eq!(arrived, [0, 1], "{kind}: the worker that holds less");
+        }
+    }
+
     /// The prefill/decode relay renders no prompt either: `max_tokens: 0` is
     /// refused with the 400 naming the field before any side is dispatched, and
     /// neither worker sees the request; a positive `max_tokens` takes both sides.
