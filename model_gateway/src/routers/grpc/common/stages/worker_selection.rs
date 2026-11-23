@@ -918,16 +918,16 @@ impl WorkerSelectionStage {
     /// A classic pair reads nothing here.
     ///
     /// The route's rule for a decode the request may move to: the request's
-    /// ledger admits it, as at every selection; it reads the built request
-    /// as the first decode does ([`reads_the_request_alike`]), in a window
-    /// no narrower ([`holds_what_the_first_holds`]); the gateway holds its
-    /// client, since a connect behind the prefill's answer could fail a
-    /// request the first decode would have served; and its admission gate
-    /// takes the request now, by one try with no wait
-    /// ([`pd_admission::try_admit_decode`]). The first decode holds with no
-    /// try: its client and its claim stand. A claim tried for a decode the
-    /// engine then passes over is given back at the next try, and at the
-    /// call's end.
+    /// ledger admits it, as at every selection; it takes the built request
+    /// ([`takes_the_built_request`]): it reads it as the first decode does,
+    /// in a window no narrower, and takes the media references the wire
+    /// forwards; the gateway holds its client, since a connect behind the
+    /// prefill's answer could fail a request the first decode would have
+    /// served; and its admission gate takes the request now, by one try
+    /// with no wait ([`pd_admission::try_admit_decode`]). The first decode
+    /// holds with no try: its client and its claim stand. A claim tried for
+    /// a decode the engine then passes over is given back at the next try,
+    /// and at the call's end.
     ///
     /// Answers the guard to keep, and the decode the request moved to where
     /// it moved, with its client and its gate's claim.
@@ -954,8 +954,7 @@ impl WorkerSelectionStage {
         let takes_the_request = |worker: &dyn Worker| {
             let mut brought = brought.lock();
             *brought = None;
-            let alike = reads_the_request_alike(&**first, worker)
-                && holds_what_the_first_holds(&**first, worker, model_id);
+            let alike = takes_the_built_request(&**first, worker, model_id, request.wire);
             if !alike || !request.ledger.admits(worker) {
                 return false;
             }
@@ -1214,6 +1213,27 @@ struct Brought {
 /// Whether `held` and `worker` name one worker object.
 fn same_worker(held: &Arc<dyn Worker>, worker: &dyn Worker) -> bool {
     std::ptr::addr_eq(Arc::as_ptr(held), std::ptr::from_ref(worker))
+}
+
+/// Whether the decode request built for `first` may go to `worker` in its
+/// place: `worker` reads it as `first` does ([`reads_the_request_alike`]),
+/// in a window no narrower ([`holds_what_the_first_holds`]), and takes the
+/// media references the retained plan's wire forwards, on the side of its
+/// pipeline pin, as every selection asks of a candidate
+/// ([`MediaDemands::accepts_refs`]). A decode request can keep its
+/// references: a request of more than one sample works its prompt out again
+/// on its decode, and a decode that processes none would refuse it.
+fn takes_the_built_request(
+    first: &dyn Worker,
+    worker: &dyn Worker,
+    model: &str,
+    wire: WireConstraint,
+) -> bool {
+    reads_the_request_alike(first, worker)
+        && holds_what_the_first_holds(first, worker, model)
+        && MediaDemands::NONE
+            .with_wire(Some(wire))
+            .accepts_refs(worker)
 }
 
 /// Whether `worker` reads a decode request built for `first` as `first`
@@ -8668,6 +8688,55 @@ mod tests {
         assert!(!holds(Some(32_768), Some(4_096)), "a narrower window");
         assert!(holds(Some(32_768), None), "no window stated binds nothing");
         assert!(!holds(None, Some(4_096)), "the first stated none");
+    }
+
+    /// A decode request can keep the media references its plan forwards. A
+    /// decode the pair moves to takes them as every selection asks of a
+    /// candidate: it processes references, on the side of the wire's
+    /// pipeline pin. Each worker here reads the request as the first does.
+    #[test]
+    fn a_moved_decode_takes_the_media_references_its_wire_forwards() {
+        let decode = |processor: Option<&str>| {
+            let worker = BasicWorkerBuilder::new("grpc://decode:30000")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm);
+            match processor {
+                Some(processor) => worker.label("mm_processor", processor).build(),
+                None => worker.build(),
+            }
+        };
+        let forwards = |pipeline: PipelinePin| WireConstraint {
+            requires_media_refs: true,
+            pipeline,
+            ..grpc_wire(RuntimeType::Vllm)
+        };
+        let first = decode(Some("inprocess"));
+        let takes = |processor: Option<&str>, wire: WireConstraint| {
+            let other = decode(processor);
+            assert!(reads_the_request_alike(&first, &other));
+            takes_the_built_request(&first, &other, "m", wire)
+        };
+        let gateways = Some(multimodal::GATEWAY_PIPELINE_PROCESSOR);
+
+        assert!(takes(Some("inprocess"), forwards(PipelinePin::Any)));
+        assert!(
+            !takes(None, forwards(PipelinePin::Any)),
+            "a decode that processes no references"
+        );
+        assert!(
+            takes(None, grpc_wire(RuntimeType::Vllm)),
+            "a request that forwards none"
+        );
+        assert!(takes(gateways, forwards(PipelinePin::Only)));
+        assert!(
+            !takes(Some("inprocess"), forwards(PipelinePin::Only)),
+            "the engine's own processor, where the gateway's pipeline is pinned"
+        );
+        assert!(
+            !takes(gateways, forwards(PipelinePin::Never)),
+            "the gateway's pipeline, where the engine's processor is pinned"
+        );
     }
 }
 
