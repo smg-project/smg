@@ -1647,8 +1647,8 @@ registration, a drain or a deregistration is on the worker objects when its call
 decision behind the acknowledgment reads the fleet the call left. A controller that starts over
 standing rows holds their worker objects before it serves.
 
-A standby's applied records reach its worker objects at the next pass of the task that follows the
-worker records. A replica that takes the lead reads its last leader's last change at that pass.
+A standby's applied records are on its worker objects when its applier goes on to the next event.
+A replica that takes the lead holds its last leader's last change in them at once.
 
 ### 10.3 The controller's worker data **[partly]**
 
@@ -1666,7 +1666,7 @@ tells the data once more:
 | the membership log's event | `service/replication/log.rs` | a watcher behind its first copy; a standby |
 
 A leader's write of a record is decided over the worker object since step 1 below, and the
-table follows it. The record still leads a status, a standby's data and a first copy, and the
+table follows it. The record still leads a status and a first copy, and the
 object follows it there. After the switch the object leads: a worker's data
 stands once, as its worker object with its remainder beside it, and the log still tells it. The
 remainder is the copy that stays. The table of records and the second copy of the facts end
@@ -1734,8 +1734,8 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    table, while that task stands. A change that moves a fact the object holds builds the object again: the
    new object takes the standing one's place under its id, with its running state, as the code
    that keeps the objects does today for a record that changed.
-2. A standby applies the leader's events to its own worker objects, and a watcher's and a
-   standby's first copy is cut from the objects and their remainders.
+2. A standby applies the leader's events to its own worker objects **[built]**. A watcher's and a
+   standby's first copy is cut from the objects and their remainders **[planned]**.
 3. No health outcome is copied into a record: a decision reads the object's status, as a single
    request's does on main.
 4. The table of records, the second copy of the facts, the two conversions between a record
@@ -1748,6 +1748,16 @@ record it leaves. The store's own write decides by it over the table's record. I
 the decided change by the one body a standby's applier writes a leader's change by
 (`MemoryStore::follow`). The rule's second caller is the code that keeps the worker
 objects, over the record read back from an object (step 1).
+
+**A standby's events through the worker objects [built].** A standby's applier hands each
+membership event of its leader's log, and each restore, to the code that keeps the worker
+objects (the first part of step 2). For an event with a record that code builds the object,
+hands the store the event at its place in the log, and puts the object in the registry where
+the store took the event. A removal's object leaves the registry first. A record changed in
+place keeps the instant it was admitted at. A status is still the table's word, and it is
+copied onto the object in the same turn. A restore is the store's restore and the read of its
+records in one turn of that code. A first copy is still cut from the table, and a watcher
+still writes a table of its own: the two other parts of step 2.
 
 A lease keeps naming its worker by the record's id, never by a place in a list: a gateway
 reports on a lease later and across membership changes.

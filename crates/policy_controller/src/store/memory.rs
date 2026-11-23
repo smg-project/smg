@@ -595,10 +595,21 @@ impl MemoryStore {
         change: MembershipChange,
         row: Option<WorkerRow>,
     ) {
+        self.follow_landed(at, epoch, change, row);
+    }
+
+    /// [`Self::follow`], and whether the change landed. A holder of worker
+    /// objects asks it: the object of the row a change leaves is put in
+    /// its registry only where the store took the change.
+    pub(crate) fn follow_landed(
+        &self,
+        at: Position,
+        epoch: u64,
+        change: MembershipChange,
+        row: Option<WorkerRow>,
+    ) -> bool {
         let workers = self.writing_at(Some(at));
-        if epoch == workers.epoch + 1 {
-            self.decided(workers, Instant::now(), change, row);
-        }
+        epoch == workers.epoch + 1 && self.decided(workers, Instant::now(), change, row)
     }
 
     /// A decided membership change, written under the write's hold of the
