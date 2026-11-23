@@ -2309,10 +2309,8 @@ pub struct SessionsSpec {
     /// neither the engine's record of sent prefixes nor a lent token tree
     /// takes its prompt. The session table still hears its dispatch,
     /// and the stages its completion and its release. A pair's sides are
-    /// told under either word. A host that tells a lease's words off its
-    /// file keeps no such word of a pick: it takes the rule, and tells such
-    /// a request as it tells any other. Its decision is the engine's own,
-    /// so its record of sent prefixes follows the word all the same.
+    /// told under either word. A controller keeps the word on the lease it
+    /// files, and tells such a request off its file by it all the same.
     #[serde(default, skip_serializing_if = "is_default")]
     pub rule_placed: RulePlaced,
 }

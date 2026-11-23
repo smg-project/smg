@@ -651,6 +651,7 @@ fn a_lease_filed_dispatched_and_completed_at_the_store_allocates_nothing() {
                 target: worker,
                 picked: PickRecord::default(),
                 decode: None,
+                untold: false,
                 term,
                 issued_at: now,
                 dispatch_deadline: now + SPAN,

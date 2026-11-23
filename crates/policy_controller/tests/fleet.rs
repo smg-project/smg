@@ -3122,6 +3122,7 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
                 target: late,
                 picked: PickRecord::default(),
                 decode: None,
+                untold: false,
                 term: 0,
                 issued_at: now,
                 dispatch_deadline: now + ROOM,

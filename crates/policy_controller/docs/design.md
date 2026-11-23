@@ -1069,9 +1069,11 @@ gateway's policy. The kept engine keeps the word on the pick, and one function r
 (`lease_events::stages_hear`) at four places: a single's lease words, the record's two writes, the
 tree's store, and the hand-over of a pin followed by one row. Such a pin that is the profile's own
 goes through the lookup that names a request's holders with its answer made, so its prompt is
-recorded as a pin's the whole decision follows. A controller that tells a dispatch off a lease on
-file has no such word yet: it takes the document, and its stages hear such a request as any other.
-Its decision is the engine's own, so its record of sent prefixes follows the word all the same.
+recorded as a pin's the whole decision follows. A controller asks the same function where it files
+a pick's lease, and keeps the answer on the lease's record (`LeaseRecord::untold`): no stage hears
+that issue, and the dispatch it tells off the file moves the session's pin and reaches no stage
+and no count of sends. Its decision is the engine's own, so its record of sent prefixes follows the
+word too.
 
 Upkeep, about once a second (`sweep`): expired session keys are removed, and the record of sent
 prefixes gets a bounded step of clean-up. A record leaves the engine's map once no list's table
