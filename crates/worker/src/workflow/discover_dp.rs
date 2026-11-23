@@ -9,11 +9,13 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use super::{
     data::{DpInfo, WorkerKind, WorkerRegistrationWorkflowData},
-    host::WorkflowHost,
+    host::{require_host, WorkflowHost},
+    registration::DISCOVER_DP_STEP,
     runtimes::reports_dp,
 };
 use crate::{
-    identity::{basic::ConnectionMode, endpoint::Endpoint},
+    identity::{basic::ConnectionMode, endpoint::Endpoint, metadata::join_base},
+    load::monitor::{NativeLoads, WorkerMonitor, ENGINE_LOADS_ROUTE},
     worker::WorkerSpec,
     UNKNOWN_MODEL_ID,
 };
@@ -110,6 +112,31 @@ fn dp_info_of(labels: &HashMap<String, String>, url: &str) -> Option<DpInfo> {
     }
 }
 
+/// What one read of an HTTP engine's load route lacks for rank workers: none
+/// where it holds a row for every one of the `ranks` the engine's server
+/// info counted, else what the read found, as the warning says it. A read
+/// that learned nothing lacks them too: the step has no later read.
+fn missing_rank_loads(loads: &NativeLoads, ranks: usize) -> Option<&'static str> {
+    match loads {
+        NativeLoads::Available(answer) if answer.names_dp_ranks(ranks) => None,
+        NativeLoads::Available(_) => Some("does not name every rank"),
+        NativeLoads::Absent => Some("is not served"),
+        NativeLoads::Unreadable => Some("answered what is no load report"),
+        NativeLoads::Inconclusive => Some("gave no answer"),
+    }
+}
+
+/// The warning for an HTTP engine at `url` that counts `ranks` and registers
+/// as one plain worker: the engine, the route and what one read of it found.
+fn plain_worker_warning(url: &str, ranks: usize, read: &str) -> String {
+    format!(
+        "{} reports {ranks} DP ranks, but its load route {ENGINE_LOADS_ROUTE} {read}; registering \
+         as a single non-DP worker with no rank pinning (remove the worker and register it \
+         again once the route answers by rank)",
+        Endpoint::redacted_str(url)
+    )
+}
+
 /// Reads a local worker's DP shape into `dp_info`, on every registration:
 /// how many ranks the worker runs, and the model they serve. A worker left
 /// with no shape registers as one plain worker, and nothing the read finds
@@ -121,6 +148,14 @@ fn dp_info_of(labels: &HashMap<String, String>, url: &str) -> Option<DpInfo> {
 /// other runtime, or of none detected, is left with no shape whatever its
 /// labels hold, since a host that fronts an engine answers with that
 /// engine's labels and is one worker. A ZMQ worker's shape is its spec's.
+///
+/// An HTTP worker of several ranks keeps its shape only where one read of
+/// its load route holds a row for every rank. Its rank workers read their
+/// loads there alone: without those rows none would report a load or be
+/// held back as overloaded. Any other outcome of that read, a failed one
+/// too, leaves no shape and is logged, and the plain worker reads the
+/// engine's own gauges. The route is not read where the host keeps its own
+/// load source for the worker, which then serves each rank's load.
 pub struct DiscoverDpInfoStep;
 
 #[async_trait]
@@ -166,7 +201,39 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Discov
                 // reports it there, and a runtime nobody detected has no row.
                 let runtime = context.data.detected_runtime_type.as_deref();
                 if runtime.is_some_and(reports_dp) {
-                    dp_info_of(labels, &config.url)
+                    match dp_info_of(labels, &config.url) {
+                        // Rank workers read their loads rank by rank. One
+                        // read says whether the engine's route names them
+                        // all: an outcome, never an error. A host that
+                        // keeps its own load source for the engine reads
+                        // them there, and the route is not asked.
+                        Some(info) if info.dp_size > 1 => {
+                            let host = require_host(context.data.host.as_ref())?;
+                            let client = context.data.http_client(DISCOVER_DP_STEP)?;
+                            let read = WorkerMonitor::<H::Generation>::read_engine_loads(
+                                host.engine_connector().as_ref(),
+                                // The runtime the creation gives the worker.
+                                runtime
+                                    .and_then(|id| id.parse().ok())
+                                    .unwrap_or(config.runtime_type),
+                                &client,
+                                join_base(&config.url),
+                                config.api_key.as_deref(),
+                            )
+                            .await;
+                            match read.and_then(|loads| missing_rank_loads(&loads, info.dp_size)) {
+                                None => Some(info),
+                                Some(read) => {
+                                    warn!(
+                                        "{}",
+                                        plain_worker_warning(&config.url, info.dp_size, read)
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        shape => shape,
+                    }
                 } else {
                     debug!(
                         "No DP size is read for {} HTTP workers ({}); registering as a single \

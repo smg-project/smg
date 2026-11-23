@@ -2193,6 +2193,17 @@ impl WorkerLoadResponse {
         self.loads.iter().all(|l| l.worker.is_none())
     }
 
+    /// Whether one engine's answer holds a row for every one of its `ranks`,
+    /// so that [`Self::for_dp_rank`] finds each rank's own report in it.
+    pub fn names_dp_ranks(&self, ranks: usize) -> bool {
+        self.ranks_are_dp_ranks()
+            && (0..ranks).all(|rank| {
+                self.loads
+                    .iter()
+                    .any(|load| usize::try_from(load.dp_rank) == Ok(rank))
+            })
+    }
+
     pub fn dp_rank_loads(&self) -> HashMap<isize, isize> {
         let mut map = HashMap::new();
         for snapshot in &self.loads {

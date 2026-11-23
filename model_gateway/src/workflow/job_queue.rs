@@ -1834,11 +1834,13 @@ mod tests {
     }
 
     /// A gateway given no setting for it registers one worker per
-    /// data-parallel rank an engine names. An HTTP engine whose server info
-    /// names four ranks stands as four rank workers and none at its base
-    /// address. An engine that names one rank, one that names no size and
-    /// one whose server info fails to read each stand as one plain worker,
-    /// and none of the four registrations fails.
+    /// data-parallel rank an engine names, where the engine's load route
+    /// holds a row for every rank. An HTTP engine whose server info names
+    /// four ranks and whose load route names the four stands as four rank
+    /// workers and none at its base address. One whose load route is not
+    /// served, or names three of the four, stands as one plain worker, and
+    /// so does an engine that names one rank, one that names no size and
+    /// one whose server info fails to read. No registration fails.
     #[tokio::test]
     async fn a_registration_registers_one_worker_per_rank_the_engine_names() {
         use http::StatusCode;
@@ -1853,11 +1855,33 @@ mod tests {
         let context = live_app_context();
         let registry = &context.worker_registry;
         let marks = DashSet::new();
-        for (status, server_info, ranks) in [
-            (StatusCode::OK, json!({"dp_size": 2, "attn_dp_size": 2}), 4),
-            (StatusCode::OK, json!({"dp_size": 1}), 1),
-            (StatusCode::OK, json!({"version": "test"}), 1),
-            (StatusCode::INTERNAL_SERVER_ERROR, json!({"dp_size": 4}), 1),
+        let loads_of = |ranks: std::ops::Range<usize>| {
+            let rows: Vec<_> = ranks.map(|rank| json!({"dp_rank": rank})).collect();
+            (StatusCode::OK, json!({ "loads": rows }))
+        };
+        let unserved = (StatusCode::NOT_FOUND, json!({}));
+        for (status, server_info, loads, ranks) in [
+            (
+                StatusCode::OK,
+                json!({"dp_size": 2, "attn_dp_size": 2}),
+                loads_of(0..4),
+                4,
+            ),
+            (StatusCode::OK, json!({"dp_size": 4}), unserved, 1),
+            (StatusCode::OK, json!({"dp_size": 4}), loads_of(0..3), 1),
+            (StatusCode::OK, json!({"dp_size": 1}), loads_of(0..4), 1),
+            (
+                StatusCode::OK,
+                json!({"version": "test"}),
+                loads_of(0..4),
+                1,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"dp_size": 4}),
+                loads_of(0..4),
+                1,
+            ),
         ] {
             // The model list names the runtime whose server info reports the
             // size, so each of the four is read the same way.
@@ -1874,6 +1898,7 @@ mod tests {
                     json!({"model_path": "m", "is_generation": true}),
                 ),
                 ("/server_info", status, server_info.clone()),
+                ("/v1/loads", loads.0, loads.1.clone()),
             ])
             .await;
             let job = Job::AddWorker {
@@ -1884,7 +1909,7 @@ mod tests {
 
             let result = execute_job(&job, &context, &marks, None).await;
 
-            let case = format!("{status} {server_info}");
+            let case = format!("{status} {server_info}, loads {} {}", loads.0, loads.1);
             assert!(result.is_ok(), "{case}: {result:?}");
             let mut workers = find_workers_by_url(registry, &base);
             workers.sort_by_key(|worker| worker.dp_rank());
@@ -2056,10 +2081,82 @@ mod tests {
         );
     }
 
+    /// An engine keeps the shape of its first registration when its load
+    /// route turns, either way. One that answered by rank stands as two rank
+    /// workers, and an upsert made once the route is no longer served reads
+    /// no ranks: it is refused by name and the rank workers stay. One whose
+    /// route was not served stands as one plain worker, and an upsert made
+    /// once the route names both ranks is refused by name too.
+    #[tokio::test]
+    async fn an_engine_keeps_its_first_shape_when_its_load_route_turns() {
+        use std::sync::atomic::Ordering;
+
+        use http::StatusCode;
+        use serde_json::json;
+
+        use crate::app_context::testing::live_app_context;
+
+        let by_rank = (
+            StatusCode::OK,
+            json!({"loads": [{"dp_rank": 0}, {"dp_rank": 1}]}),
+        );
+        let unserved = (StatusCode::NOT_FOUND, json!({}));
+        for (first, then, ranked, refusal) in [
+            (
+                by_rank.clone(),
+                unserved.clone(),
+                true,
+                "stands as 2 rank workers and this registration read no data-parallel ranks",
+            ),
+            (
+                unserved,
+                by_rank,
+                false,
+                "stands as one worker and this registration read 2 data-parallel ranks",
+            ),
+        ] {
+            let (base, turned) = engine_whose_route_turns("/v1/loads", first, then).await;
+            let context = live_app_context();
+            let marks = DashSet::new();
+            let upsert = add_worker(&base, WorkerRegistrationMode::Upsert);
+            let stands = if ranked {
+                vec![format!("{base}@0"), format!("{base}@1")]
+            } else {
+                vec![base.clone()]
+            };
+
+            let first = execute_job(&upsert, &context, &marks, None).await;
+            assert!(first.is_ok(), "{first:?}");
+            assert_eq!(standing_at(&context, &base), stands);
+
+            turned.store(true, Ordering::Relaxed);
+            let second = execute_job(&upsert, &context, &marks, None).await;
+            assert!(
+                matches!(&second, Err(said) if said.contains(refusal)),
+                "{second:?}"
+            );
+            assert_eq!(standing_at(&context, &base), stands, "the first shape");
+        }
+    }
+
     /// An engine stub whose server info answers `first` until the switch it
     /// returns is set, and `then` from then on: a read that fails, or one
-    /// that comes back. Returns its base address and the switch.
+    /// that comes back. Its load route names two ranks. Returns its base
+    /// address and the switch.
     async fn engine_whose_server_info_turns(
+        first: (http::StatusCode, serde_json::Value),
+        then: (http::StatusCode, serde_json::Value),
+    ) -> (String, Arc<AtomicBool>) {
+        engine_whose_route_turns("/server_info", first, then).await
+    }
+
+    /// An engine stub of two ranks, one of whose routes turns: `path`
+    /// answers `first` until the switch it returns is set, and `then` from
+    /// then on. Its server info names two ranks and its load route holds a
+    /// row for each, where neither is the route that turns. Returns its base
+    /// address and the switch.
+    async fn engine_whose_route_turns(
+        path: &'static str,
         first: (http::StatusCode, serde_json::Value),
         then: (http::StatusCode, serde_json::Value),
     ) -> (String, Arc<AtomicBool>) {
@@ -2072,7 +2169,7 @@ mod tests {
         use crate::workflow::steps::local::test_support::{json_router, serve_router};
 
         let turned = Arc::new(AtomicBool::new(false));
-        let server_info = {
+        let turning = {
             let turned = Arc::clone(&turned);
             move || {
                 let (status, body) = if turned.load(Ordering::Relaxed) {
@@ -2083,7 +2180,7 @@ mod tests {
                 async move { (status, Json(body)) }
             }
         };
-        let router = json_router(vec![
+        let steady = vec![
             ("/health", StatusCode::OK, json!({"status": "ok"})),
             (
                 "/v1/models",
@@ -2095,8 +2192,15 @@ mod tests {
                 StatusCode::OK,
                 json!({"model_path": "m", "is_generation": true}),
             ),
-        ])
-        .route("/server_info", get(server_info));
+            ("/server_info", StatusCode::OK, json!({"dp_size": 2})),
+            (
+                "/v1/loads",
+                StatusCode::OK,
+                json!({"loads": [{"dp_rank": 0}, {"dp_rank": 1}]}),
+            ),
+        ];
+        let steady = steady.into_iter().filter(|(route, ..)| *route != path);
+        let router = json_router(steady.collect()).route(path, get(turning));
         (serve_router(router).await, turned)
     }
 
