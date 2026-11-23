@@ -6064,13 +6064,21 @@ fn a_guest_another_plugins_draw_left_little_is_read_against_its_own_frames() {
     let picker_micros = (picker.stats().fuel_used - before.1).div_ceil(SLOW_CALIBRATION);
     // The scorer's draw, and thirteen tenths of the picker's.
     let budget_micros = u32::try_from(scorer_micros + picker_micros * 13 / 10).expect("fits");
+    let spent_before = picker.stats().budget_spent;
     for seed in 1..=64 {
         decide_under(budget_micros, seed);
     }
     let stats = picker.stats();
+    // The picker's own calls ran in each of them: a stage the remainder
+    // left nothing would fall back, and its window would read no sample.
     assert_eq!(
-        (stats.traps, stats.fuel_exhausted, stats.breaker_opens),
-        (0, 0, 0),
+        (
+            stats.traps,
+            stats.fuel_exhausted,
+            stats.budget_spent - spent_before,
+            stats.breaker_opens
+        ),
+        (0, 0, 0, 0),
         "under half the budget a decision, whatever the scorer left: {stats:?}"
     );
 }
@@ -7524,6 +7532,217 @@ fn a_lazy_inits_time_is_in_the_sample_of_the_decision_that_paid_it_alone() {
         (1, 0),
         "one decision paid the init and its sample alone is slow: {s:?}"
     );
+}
+
+/// A lazy `init`'s frame is in the frames of the decision that paid it, and
+/// in no later one. A guest whose three stages each burn nine tenths of
+/// their frame pays its `init` in one cold decision, and sixty-four warm
+/// ones follow on the thread, under a request that states no budget. Each
+/// warm sample is past half of the four frames of its own calls, and the
+/// ring's first read opens the breaker. Read over those frames and the first
+/// decision's init frame, 100 ms more, each would be under half of them, and
+/// nothing would open.
+#[test]
+fn a_lazy_inits_frame_is_in_the_frames_of_the_decision_that_paid_it_alone() {
+    let runtime = runtime();
+    // A calibration that prices one stage's burn near 30 ms: four frames of
+    // such a guest are well under the 100 ms an init frame adds to them.
+    let burn_fuel = u64::from(one_burn_micros(&runtime)) * SLOW_CALIBRATION;
+    let calibration = burn_fuel.div_ceil(30_000).max(1);
+    let burn_micros = u32::try_from(burn_fuel.div_ceil(calibration)).expect("fits");
+    let mut near = spec(
+        "near-behind-an-init",
+        guest::record_guest(),
+        mode::BURN_IN_STAGES,
+    );
+    near.fuel_per_micro = calibration;
+    near.budget_micros = burn_micros * 10 / 9;
+    let plugin = loaded(&runtime, near);
+    let engine = plugin_engine(&plugin);
+    let made = plugin.stats().lazy_instantiations;
+    plugin.forget_instance();
+    for seed in 1..=65 {
+        let decision = engine.decide(
+            &RequestFacts {
+                budget_micros: u32::MAX,
+                ..facts(seed)
+            },
+            &four(),
+            &pool(4),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        assert!(
+            matches!(decision, Decision::Pick(_)),
+            "decision {seed}: {decision:?}"
+        );
+    }
+    let stats = plugin.stats();
+    assert_eq!(
+        stats.lazy_instantiations - made,
+        1,
+        "the first decision paid the one `init`: {stats:?}"
+    );
+    assert_eq!(
+        (stats.fuel_exhausted, stats.traps, stats.budget_spent),
+        (0, 0, 0),
+        "every call fit its frame: {stats:?}"
+    );
+    assert_eq!(
+        stats.breaker_opens, 1,
+        "the warm samples read slow over the frames of their own calls: {stats:?}"
+    );
+}
+
+/// A decision that pays an `init` and charges no call is read over the init
+/// frame alone, whatever the calls of an earlier decision left on its
+/// thread. One warm decision makes four calls under one-second frames. Then
+/// the `init` of sixty-four cold slots spins its frame out, the plugin's own
+/// failure each time under a threshold of a hundred: 100 ms of the init
+/// frame's 100 ms. The ring's first read opens the breaker by its latency
+/// rule. Read over the four seconds of the first decision's frames beside
+/// the init frame, no sample would be slow.
+#[test]
+fn an_inits_sample_is_read_over_the_init_frame_alone_behind_a_decision_that_charged_calls() {
+    let (clock, _runtime, plugin) = plugin_whose_init_asks(0, |row| {
+        row.fuel_per_micro = SLOW_CALIBRATION;
+        row.budget_micros = SLOW_FRAME_MICROS;
+        row.breaker = BreakerSpec {
+            failures: 100,
+            ..BreakerSpec::default()
+        };
+    });
+    let engine = plugin_engine(&plugin);
+    let decide_at = |steer: u8, seed: u64| {
+        clock.store(steer, Ordering::Relaxed);
+        let decision = engine.decide(
+            &RequestFacts {
+                budget_micros: u32::MAX,
+                ..facts(seed)
+            },
+            &four(),
+            &pool(4),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        clock.store(0, Ordering::Relaxed);
+        assert!(
+            matches!(decision, Decision::Pick(_)),
+            "decision {seed}: {decision:?}"
+        );
+    };
+    decide_at(0, 0);
+    let warm = plugin.stats();
+    assert_eq!(
+        (warm.answered, warm.lazy_instantiations),
+        (4, 0),
+        "four calls on the instance the load made: {warm:?}"
+    );
+    for seed in 1..=64 {
+        plugin.forget_instance();
+        // The clock's answer of two makes the guest's `init` spin.
+        decide_at(3, seed);
+    }
+    let stats = plugin.stats();
+    assert_eq!(
+        (stats.answered, stats.lazy_instantiations),
+        (4, 0),
+        "no cold decision kept an instance or charged a call: {stats:?}"
+    );
+    assert_eq!(
+        stats.breaker_opens, 1,
+        "each `init` is the whole of its own frame, and the window reads slow: {stats:?}"
+    );
+}
+
+/// A call its own bound ended marks its decision, and no later one. A cold
+/// slot's first decision ends a score that spins at the plugin's own bound:
+/// the plugin's failure. Its sample is under half of its frames at both its
+/// ends, the init frame among them, so it arms nothing. The next decision
+/// on the thread pays an `init` the host holds past half the budget: its
+/// sample is slow by time nothing read alone, and it is counted with the
+/// unread calls. That holds where the held `init` keeps its instance and its
+/// calls follow under what the budget has left, and where it refuses and is
+/// all the decision pays. Read with the earlier decision's mark, neither
+/// would be counted.
+///
+/// The first decision's score ends on the clock. A runner that keeps its
+/// thread off the CPU as long as the plugin's frame makes that sample one
+/// slow by time nothing read, which arms the thread: such a try says so and
+/// is made again, [`TRIES`] at most.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_call_its_own_bound_ended_marks_no_later_decision() {
+    const CASE: &str = "a call its own bound ended marks no later decision";
+    const OWN_FRAME_MICROS: u32 = 100_000;
+    const BUDGET_MICROS: u32 = 50_000;
+    const WAIT: std::time::Duration = std::time::Duration::from_millis(30);
+    // The clock's answer of zero keeps the held `init`, of one refuses it.
+    for steer in [1, 2] {
+        tried(|made| {
+            let clock = Arc::new(AtomicU8::new(0));
+            let runtime = steered_runtime(&clock, WAIT);
+            let mut row = spec(
+                "ended-then-held",
+                guest::record_guest(),
+                mode::SPIN_IN_SCORE,
+            );
+            row.config.push(mode::INIT_ASKS_THE_CLOCK);
+            // No call runs out of fuel: the clock ends the score that spins.
+            row.fuel_per_micro = 20_000_000;
+            row.budget_micros = OWN_FRAME_MICROS;
+            let plugin = loaded(&runtime, row);
+            let engine = plugin_engine(&plugin);
+            let decide_cold = |seed: u64, budget_micros: u32| {
+                plugin.forget_instance();
+                let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+                let decision = engine.decide(
+                    &RequestFacts {
+                        budget_micros,
+                        ..facts(seed)
+                    },
+                    &four(),
+                    &pool(4),
+                    &Constraints::default(),
+                    &mut Scratch::new(),
+                );
+                let off_the_cpu = off_cpu_since(wall, cpu);
+                assert!(
+                    matches!(decision, Decision::Pick(_)),
+                    "steer {steer}: decision {seed}: {decision:?}"
+                );
+                off_the_cpu
+            };
+            // The score spins a whole frame of its own, under a request
+            // that states no budget.
+            let off_the_cpu = decide_cold(1, u32::MAX);
+            let first = plugin.stats();
+            let frame = std::time::Duration::from_micros(u64::from(OWN_FRAME_MICROS));
+            if off_the_cpu >= frame && made < TRIES {
+                made_again(
+                    CASE,
+                    "the first decision's thread was off the CPU a whole frame of the plugin",
+                );
+                return false;
+            }
+            assert_eq!(
+                (first.fuel_exhausted, first.budget_spent, first.unread),
+                (1, 0, 0),
+                "steer {steer}: the plugin's own bound ended its score (try {made}, the thread off the CPU {off_the_cpu:?}): {first:?}"
+            );
+            // The `init` waits 30 ms on the host, of a budget of 50 ms.
+            clock.store(steer, Ordering::Relaxed);
+            decide_cold(2, BUDGET_MICROS);
+            clock.store(0, Ordering::Relaxed);
+            let s = plugin.stats();
+            assert_eq!(
+                (s.fuel_exhausted, s.unread),
+                (1, 1),
+                "steer {steer}: the held decision's sample is its own, and nothing read it (try {made}): {s:?}"
+            );
+            true
+        });
+    }
 }
 
 /// A sample slow by time nothing read is in its window as it is: the rule

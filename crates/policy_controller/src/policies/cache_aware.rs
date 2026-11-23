@@ -34,7 +34,7 @@ use crate::{
         ProfileSpec, ScoreStage, WarmupSliceParams,
     },
     engine::{
-        decision::{Overlap, OverlapSource},
+        decision::Overlap,
         framework::{ScoreFront, ScoreSpread, Scorer, TieBand},
         prefix_pass::{keep_prefix_pass, take_prefix_pass, withdraw_prefix_pass, PrefixStageId},
         view::{
@@ -255,11 +255,7 @@ impl Gates {
     /// The size of one of the request's blocks: the facts' own when the
     /// host counted with one (an index's learned size), else the view's.
     fn block_size_of(&self, facts: &RequestFacts<'_>) -> u32 {
-        if facts.block_size > 0 {
-            facts.block_size
-        } else {
-            self.block_size
-        }
+        facts.block_size_or(self.block_size)
     }
 
     /// How many whole blocks of the request lie within its first `tokens`
@@ -269,16 +265,12 @@ impl Gates {
         blocks_within(tokens, facts.hash_kind, self.block_size_of(facts))
     }
 
-    /// The request's size in blocks: its token count over the block size
-    /// (the text kind's bytes over the window's size in bytes, as
-    /// `tokens_of` reads them back), never under one and never under the
-    /// block hashes the host sent. The host caps that list, so a long
-    /// request's hashes alone would understate it and overstate every
-    /// holder's share.
+    /// The request's size in blocks ([`RequestFacts::blocks`]): its token
+    /// count over the block size (the text kind's bytes over the window's
+    /// size in bytes, as `tokens_of` reads them back), never under one and
+    /// never under the block hashes the host sent.
     fn request_blocks(&self, facts: &RequestFacts<'_>) -> u32 {
-        let from_tokens = self.whole_blocks(facts.prompt_size(), facts).max(1);
-        let from_hashes = u32::try_from(facts.block_hashes.len()).unwrap_or(u32::MAX);
-        from_tokens.max(from_hashes)
+        facts.blocks(self.block_size)
     }
 
     /// What a sent prefix's share of the request is taken of
@@ -698,19 +690,9 @@ impl Scorer for PrefixAffinity {
     /// own fits, so the share they say stays true.
     fn said(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], row: u32) -> Overlap {
         let request_blocks = self.gates.request_blocks(facts);
-        // A row past a column holds nothing, as a row no host named.
-        let held = match facts.feed() {
-            Feed::Column(column) => column.get(row as usize).copied().unwrap_or_default(),
-            Feed::Named(named) => named.entry(row),
-        };
+        let held = facts.feed().entry_or_default(row);
         let blocks = self.matched(held, self.gates.whole(facts));
-        let source = if blocks == 0 {
-            OverlapSource::None
-        } else if self.source != AffinitySource::Predictor && held.overlap_blocks == blocks {
-            OverlapSource::Index
-        } else {
-            OverlapSource::Predictor
-        };
+        let indexed = self.source != AffinitySource::Predictor && held.overlap_blocks == blocks;
         // The pass's word is taken whichever row is asked about: it is
         // the word of one decision.
         let judged = take_prefix_pass(self.id);
@@ -723,15 +705,9 @@ impl Scorer for PrefixAffinity {
                         self.gates.over(load, mean, 0.0) && !self.gates.over(load, mean, price)
                     })
             });
-        // Both counts by one shift: the share they say holds for a
-        // request past sixteen bits.
-        let shift = (u32::BITS - request_blocks.leading_zeros()).saturating_sub(u16::BITS);
-        Overlap {
-            blocks: u16::try_from(blocks >> shift).unwrap_or(u16::MAX),
-            of: u16::try_from(request_blocks >> shift).unwrap_or(u16::MAX),
-            source,
-            margin_held,
-        }
+        // Both counts by one shift, and the source, where every statement
+        // of an overlap ends.
+        Overlap::of(blocks, indexed, request_blocks, margin_held)
     }
 
     fn score_front(
@@ -1358,6 +1334,7 @@ mod tests {
     use crate::{
         document::spec::{PolicySpec, SpillParams},
         engine::{
+            decision::OverlapSource,
             framework::{Engine, Scratch},
             prefix_pass::forget_prefix_pass,
             view::{AffinityHolder, Constraints, Health, LoadRow, PoolFacts},

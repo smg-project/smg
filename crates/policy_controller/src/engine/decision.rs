@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+#[cfg(any(test, feature = "in-process"))]
+use crate::engine::view::AffinityFacts;
 #[cfg(feature = "controller")]
 use crate::service::proto;
 use crate::{
@@ -98,9 +100,8 @@ pub struct Targets {
     /// whether the rule keeps it from the profile (`Pick::untold`), in
     /// the byte the count and the overlap left spare between them.
     placing: Placing,
-    /// What the profile's prefix stage says of the first target
-    /// ([`Pick::overlap`]), in the bytes the count left spare. Nothing
-    /// states it: it reads [`Overlap::NONE`].
+    /// What the rows the decision was given say the first target holds
+    /// ([`Pick::overlap`]), in the bytes the count left spare.
     overlap: Overlap,
 }
 
@@ -142,6 +143,13 @@ impl Targets {
             placing: Placing::Stages,
             overlap: Overlap::NONE,
         }
+    }
+
+    /// States what the first target holds of the request. A list led anew
+    /// ([`Self::lead`]) says nothing of its new first target.
+    #[cfg(any(test, feature = "in-process"))]
+    pub(crate) fn state(&mut self, overlap: Overlap) {
+        self.overlap = overlap;
     }
 
     /// States that the binding's sessions rule placed the pick, with no
@@ -435,7 +443,7 @@ impl Trace {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum OverlapSource {
-    /// Nothing is held, or no stage said.
+    /// Nothing is held, or nothing is stated.
     #[default]
     None,
     /// The event index.
@@ -444,46 +452,94 @@ pub enum OverlapSource {
     Predictor,
 }
 
-/// What a profile's prefix stage says of a pick's first target: how many
-/// leading blocks of the request the worker holds, of how many, and where
-/// they were read. A host observes its cache series from it: the share
-/// held is `blocks` over `of`, and a miss reads zero of `of`. `of` is zero
-/// only where no stage said. A stage counts a request as one block at the
-/// least.
+/// What a pick states of its first target: how many leading blocks of the
+/// request the worker holds, of how many, and where they were read. A host
+/// observes its cache series from it: the share held is `blocks` over `of`,
+/// and a miss reads zero of `of`. `of` is zero only where nothing is stated
+/// ([`Overlap::NONE`]): a request counts as one block at the least.
 ///
-/// No entry of the engine asks a stage for it: every pick's overlap is
-/// [`Overlap::NONE`].
+/// The engine over a host's worker lists (`PolicyEngine`) states it behind
+/// a single decision, from the first target's entry of the rows that
+/// decision was given: the rows the engine named from the host's own data,
+/// a caller's column, or the rows a caller named. No stage is asked. A
+/// decision given no rows states nothing. Neither does a pair, a request
+/// decided inside a caller's token tree, or a pick the binding's sessions
+/// rule keeps from the profile. [`Engine::decide`](crate::engine::Engine::decide)
+/// itself states nothing.
 ///
 /// Six bytes, in bytes a pick's targets had spare behind their count: a
 /// pick is no larger for it ([`Pick::overlap`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Overlap {
-    /// The leading blocks the worker holds, by the stage's source: the
-    /// index's, the predictor's past the stage's threshold, the larger of
-    /// the two under `merged`. Halved with `of` where the request's count
-    /// is past sixteen bits.
+    /// The leading blocks the worker holds: the larger of its entry's two
+    /// readings, the index's and the sent-prefix predictor's. Halved with
+    /// `of` where the request's count is past sixteen bits.
     pub blocks: u16,
-    /// The request's blocks as the stage counts them. A request of more
-    /// than 65,535 halves this count and `blocks` together until it fits,
-    /// so their share stays true.
+    /// The request's blocks as the prefix stage counts them: its tokens
+    /// over the block size, one at the least, and never under the block
+    /// hashes its host sent. A request of more than 65,535 halves this
+    /// count and `blocks` together until it fits, so their share stays
+    /// true.
     pub of: u16,
-    /// Where `blocks` was read: the index on a tie under `merged`.
+    /// Where `blocks` was read: the index on a tie.
     pub source: OverlapSource,
     /// The held prefix's price kept the worker in front: a deepest holder
     /// that stood over the swing's margin and under the priced one, at the
-    /// mean its pass judged by. `false` under a document that prices no
-    /// margin, and for a decode phase.
+    /// mean its pass judged by. It is a prefix stage's own word
+    /// ([`Scorer::said`](crate::engine::Scorer::said)): the engine over
+    /// worker lists asks no stage and states `false`.
     pub margin_held: bool,
 }
 
 impl Overlap {
-    /// No stage said.
+    /// Nothing is stated.
     pub const NONE: Self = Self {
         blocks: 0,
         of: 0,
         source: OverlapSource::None,
         margin_held: false,
     };
+
+    /// `blocks` held of a request of `request_blocks` blocks, read from the
+    /// index where `indexed` and else from the predictor, with a margin's
+    /// word. Both counts are halved together, by one shift, until the
+    /// request's fits sixteen bits: the share they say stays true. Whoever
+    /// states an overlap ends here: a prefix stage's own word
+    /// ([`Scorer::said`](crate::engine::Scorer::said)) and the engine over
+    /// worker lists ([`Self::held`]), so the two say one thing of one count.
+    pub(crate) fn of(blocks: u32, indexed: bool, request_blocks: u32, margin_held: bool) -> Self {
+        let source = if blocks == 0 {
+            OverlapSource::None
+        } else if indexed {
+            OverlapSource::Index
+        } else {
+            OverlapSource::Predictor
+        };
+        let shift = (u32::BITS - request_blocks.leading_zeros()).saturating_sub(u16::BITS);
+        Self {
+            blocks: u16::try_from(blocks >> shift).unwrap_or(u16::MAX),
+            of: u16::try_from(request_blocks >> shift).unwrap_or(u16::MAX),
+            source,
+            margin_held,
+        }
+    }
+
+    /// What a worker's entry of a decision's rows says it holds of a request
+    /// of `request_blocks` blocks: the larger of the entry's two readings,
+    /// the index's on a tie, and no word of a margin. No stage's gate is
+    /// applied: a prefix stage counts a predicted prefix only past its
+    /// threshold and reads its own source alone, so its word of the same
+    /// worker may be less.
+    #[cfg(any(test, feature = "in-process"))]
+    pub(crate) fn held(entry: AffinityFacts, request_blocks: u32) -> Self {
+        let blocks = entry.overlap_blocks.max(entry.predicted_blocks);
+        Self::of(
+            blocks,
+            entry.overlap_blocks == blocks,
+            request_blocks,
+            false,
+        )
+    }
 }
 
 /// Who placed a pick's first target. It answers one question: did the
@@ -544,9 +600,9 @@ pub struct Pick {
 }
 
 impl Pick {
-    /// What the profile's prefix stage says of the first target
-    /// ([`Overlap`]); nothing where no stage said. No entry of the engine
-    /// asks a stage for it, so it is [`Overlap::NONE`].
+    /// What the pick states of its first target ([`Overlap`]): what the
+    /// rows its decision was given say the worker holds of the request.
+    /// [`Overlap::NONE`] where nothing is stated.
     pub const fn overlap(&self) -> Overlap {
         self.targets.overlap
     }
@@ -898,7 +954,8 @@ mod tests {
     }
 
     /// The overlap costs the pick no byte: it shares the eight bytes the
-    /// targets' count stood alone in, and a pick reads none.
+    /// targets' count stood alone in, a pick nothing is stated of reads
+    /// none, and a list led anew or cleared says nothing of a first target.
     #[test]
     fn the_overlap_costs_the_pick_no_byte() {
         assert_eq!(size_of::<Overlap>(), 6);
@@ -909,6 +966,82 @@ mod tests {
         );
         assert_eq!(Pick::default().overlap(), Overlap::NONE);
         assert_eq!(Overlap::default(), Overlap::NONE);
+        let held = Overlap {
+            blocks: 3,
+            of: 4,
+            source: OverlapSource::Index,
+            margin_held: false,
+        };
+        let mut targets = Targets::new();
+        for position in 0..2u32 {
+            targets.push(Target {
+                position,
+                id: WorkerId(u64::from(position) + 1),
+                dp_rank: 0,
+                pair: None,
+            });
+        }
+        targets.state(held);
+        let mut pick = Pick {
+            targets,
+            ..Pick::default()
+        };
+        assert_eq!(pick.overlap(), held);
+        let second = *pick.targets.as_slice().last().expect("two targets");
+        pick.targets.lead(second);
+        assert_eq!(pick.overlap(), Overlap::NONE);
+        pick.targets.state(held);
+        pick.targets.clear();
+        assert_eq!(pick.overlap(), Overlap::NONE);
+    }
+
+    /// An entry of a decision's rows is stated by the larger of its two
+    /// readings, the index's on a tie, with no word of a margin. An entry
+    /// that holds nothing is a miss of the request's blocks, not "nothing
+    /// stated". A request past sixteen bits halves both counts together.
+    #[test]
+    fn an_entry_is_stated_by_its_larger_reading_of_the_requests_blocks() {
+        let entry = |index: u32, predicted: u32| AffinityFacts {
+            overlap_blocks: index,
+            predicted_blocks: predicted,
+            ..AffinityFacts::default()
+        };
+        let stated = |blocks: u16, of: u16, source: OverlapSource| Overlap {
+            blocks,
+            of,
+            source,
+            margin_held: false,
+        };
+        let cases = [
+            (entry(3, 0), 8, stated(3, 8, OverlapSource::Index)),
+            (entry(0, 5), 8, stated(5, 8, OverlapSource::Predictor)),
+            (entry(2, 5), 8, stated(5, 8, OverlapSource::Predictor)),
+            (entry(5, 2), 8, stated(5, 8, OverlapSource::Index)),
+            // A tie reads as the index's.
+            (entry(4, 4), 8, stated(4, 8, OverlapSource::Index)),
+            // A miss: zero of the request's blocks, which is not `NONE`.
+            (entry(0, 0), 8, stated(0, 8, OverlapSource::None)),
+            // 65,536 blocks are one bit past sixteen: one halving.
+            (
+                entry(40_000, 0),
+                65_536,
+                stated(20_000, 32_768, OverlapSource::Index),
+            ),
+            // 262,143 blocks are two bits past: two halvings, rounded down.
+            (
+                entry(0, 262_143),
+                262_143,
+                stated(65_535, 65_535, OverlapSource::Predictor),
+            ),
+        ];
+        for (held, request_blocks, said) in cases {
+            assert_eq!(
+                Overlap::held(held, request_blocks),
+                said,
+                "{held:?} of {request_blocks}"
+            );
+        }
+        assert_ne!(Overlap::held(entry(0, 0), 8), Overlap::NONE);
     }
 
     /// The word of who placed a pick costs the pick no byte: it sits in the
@@ -1029,10 +1162,19 @@ mod tests {
         let mut new = Targets::new();
         new.push(target(2));
         assert_eq!(used, new);
-        // A count is a part of it still.
+        // A count and what a list states of its first target are parts
+        // of it still.
         let mut longer = new;
         longer.push(target(1));
         assert_ne!(used, longer);
+        let mut stated = new;
+        stated.state(Overlap {
+            blocks: 1,
+            of: 2,
+            source: OverlapSource::Index,
+            margin_held: false,
+        });
+        assert_ne!(used, stated);
         // A list prints what its equality reads.
         assert_eq!(format!("{used:?}"), format!("{new:?}"));
         assert_ne!(format!("{used:?}"), format!("{longer:?}"));
@@ -1098,7 +1240,8 @@ mod tests {
 
     /// A decode side's targets turn into a pair's where they stand. Each
     /// names the prefill with the decode it held, in the order they had.
-    /// The list equals the one a new list takes push by push.
+    /// The list equals the one a new list takes push by push, and nothing
+    /// is stated of its first target.
     #[test]
     fn a_decodes_targets_turn_into_a_pairs_where_they_stand() {
         let prefill = Target {
@@ -1127,8 +1270,19 @@ mod tests {
                 ..prefill
             });
         }
+        turned.state(Overlap {
+            blocks: 3,
+            of: 4,
+            source: OverlapSource::Index,
+            margin_held: false,
+        });
         turned.pair_under(&prefill);
         assert_eq!(turned, pushed);
+        let pick = Pick {
+            targets: turned,
+            ..Pick::default()
+        };
+        assert_eq!(pick.overlap(), Overlap::NONE);
         // An empty list stays empty.
         let mut none = Targets::new();
         none.pair_under(&prefill);

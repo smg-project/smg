@@ -15,7 +15,7 @@ use crate::{
         PolicySpec, ProfileSpec, RulePlaced, ScoreStage, ShadowSpec, WarmupSliceParams,
     },
     engine::{
-        decision::{Pick, Shed, ShedReason, Target, Targets, Trace},
+        decision::{OverlapSource, Pick, Shed, ShedReason, Target, Targets, Trace},
         framework::Scratch,
         prompt_hashes::{HashSeeds, PromptHashes},
         sticky_sessions::SessionVerdict,
@@ -250,6 +250,49 @@ fn shed() -> Decision {
     })
 }
 
+/// `decision` with nothing stated of its first target: the answer a lookup
+/// was handed, where it stated what that target holds behind it.
+fn unstated(mut decision: Decision) -> Decision {
+    if let Decision::Pick(pick) = &mut decision {
+        pick.targets.state(Overlap::NONE);
+    }
+    decision
+}
+
+/// `blocks` of `of` read from `source`, with no word of a margin: what the
+/// lookup states of a pick's first target.
+fn holds(blocks: u16, of: u16, source: OverlapSource) -> Overlap {
+    Overlap {
+        blocks,
+        of,
+        source,
+        margin_held: false,
+    }
+}
+
+/// The cache-aware preset with a second warm-up stage that rules by another
+/// window: no one ruling names its warming rows, so the profile is named no
+/// row and its decision is handed the column whole.
+fn handed_whole() -> AppliedSpec {
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    document.generation = 1;
+    let profile = document
+        .profiles
+        .get_mut("cache_aware")
+        .expect("the preset's profile");
+    profile.score.push(
+        ScoreStage::WarmupSlice(WarmupSliceParams {
+            weight: 1.0,
+            secs: Some(7),
+            ..WarmupSliceParams::default()
+        })
+        .into(),
+    );
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    assert_eq!(spec.engine().affinity_rows_cap(MODEL, Phase::Single), 0);
+    spec
+}
+
 /// One list and what the engine keeps of it.
 struct Bed {
     affinity: Affinity,
@@ -313,6 +356,37 @@ impl Bed {
         );
         assert_eq!(decision.pick().is_some(), target.is_some());
         named
+    }
+
+    /// What the lookup states of the first target of `answer`, the decision
+    /// of `facts`: the request as its host made it, with whatever that host
+    /// fed, and `key` its entry in a lent tree where the host names one. The
+    /// lookup returns the answer it was handed but for that statement.
+    fn stated(
+        &self,
+        facts: &RequestFacts<'_>,
+        key: Option<TokenKey<'_>>,
+        answer: Decision,
+    ) -> Overlap {
+        let returned = decide(
+            &self.affinity,
+            &self.pool,
+            &self.spec,
+            &self.workers,
+            &self.ids,
+            &mut { *facts },
+            |_| key,
+            |_| true,
+            |_| answer,
+        );
+        assert_eq!(unstated(returned), answer, "the answer handed");
+        returned.pick().map(Pick::overlap).unwrap_or_default()
+    }
+
+    /// [`Self::stated`] behind a pick of the worker at `row` by the
+    /// profile's stages, for a request that names no entry.
+    fn states(&self, facts: &RequestFacts<'_>, row: u32) -> Overlap {
+        self.stated(facts, None, picked(row, self.ids[row as usize]))
     }
 
     /// The holders a request of `prompt` is named, decided by a shed.
@@ -501,12 +575,14 @@ fn the_record_names_the_worker_a_prefix_was_sent_to() {
 /// whole. A pick the rule keeps from the profile leaves no prefix. One that
 /// is the profile's own, the rule's default, is written as a pick by the
 /// profile's stages is. The lookup returns the answer it is handed either
-/// way: a pin the keyed entry followed passes through it with its answer
-/// made. A profile that is named no row keeps no record of its own: its
+/// way, but for what the pick states of its first target
+/// ([`a_pick_its_rule_keeps_from_the_profile_states_nothing`]): a pin the
+/// keyed entry followed passes through it with its answer made. A profile
+/// that is named no row keeps no record of its own: its
 /// list keeps one for a shadow that is named rows, and the column shows
 /// what that record holds. A gateway's sticky map hands a request it places
 /// to no policy, so the policy's record never takes it
-/// (`model_gateway/src/policies/registry.rs:543-546`, `:589-590`).
+/// (`model_gateway/src/policies/registry.rs:736-739`, `:782-783`).
 #[test]
 fn a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word_at_both_writes() {
     for whole in [false, true] {
@@ -572,7 +648,11 @@ fn a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word_at_both_writes(
                     answer
                 },
             );
-            assert_eq!(returned, answer, "whole: {whole}: the answer handed");
+            assert_eq!(
+                unstated(returned),
+                answer,
+                "whole: {whole}: the answer handed"
+            );
             held
         };
         let (kept, own) = (prompt(1_000, 4), prompt(2_000, 4));
@@ -616,7 +696,7 @@ fn an_entrys_debug_form_holds_no_token() {
 /// is. The lookup returns the answer it is handed either way. A gateway's
 /// sticky map hands a request it places to no policy, so the policy's tree
 /// never takes that request's prompt
-/// (`model_gateway/src/policies/registry.rs:543-546`, `:589-590`).
+/// (`model_gateway/src/policies/registry.rs:736-739`, `:782-783`).
 #[test]
 fn a_pick_the_sessions_rule_placed_is_written_to_a_tree_by_the_rules_word() {
     let (affinity, _tree) = lending(false);
@@ -1422,22 +1502,7 @@ fn a_sides_pick_is_recorded_and_its_next_column_holds_it() {
 /// ruling names its warming rows.
 #[test]
 fn a_profile_named_no_row_is_handed_the_column() {
-    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
-    document.generation = 1;
-    let profile = document
-        .profiles
-        .get_mut("cache_aware")
-        .expect("the preset's profile");
-    profile.score.push(
-        ScoreStage::WarmupSlice(WarmupSliceParams {
-            weight: 1.0,
-            secs: Some(7),
-            ..WarmupSliceParams::default()
-        })
-        .into(),
-    );
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
-    assert_eq!(spec.engine().affinity_rows_cap(MODEL, Phase::Single), 0);
+    let spec = handed_whole();
     let (affinity, _, index) = hosted(true);
     let index = index.expect("the index");
     let asked = prompt(1_000, 4);
@@ -1462,6 +1527,290 @@ fn a_profile_named_no_row_is_handed_the_column() {
     assert!(decision.pick().is_none());
     let seen = seen.expect("a decision");
     assert_eq!(seen, [(0, 0), (0, 0), (4, 0), (0, 0)]);
+}
+
+/// A pick states what its first target holds of the request, read from the
+/// rows the engine named for its decision. A worker the index speaks for is
+/// stated by the blocks the index holds for it, of the request's blocks. A
+/// worker the rows do not name holds nothing: a miss of the request's
+/// blocks, which is not "nothing stated". A worker the record of sent
+/// prefixes speaks for is stated by the blocks it was sent, read from the
+/// predictor: here the miss's own pick wrote them. A shed holds no pick.
+#[test]
+fn a_pick_states_its_workers_entry_of_the_rows_the_engine_named() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 4);
+    let hashes = hashes_of(&asked);
+    store(&index, 5, &hashes[..2]);
+    store(&index, 2, &hashes);
+    let bed = Bed::new(affinity, preset("cache_aware"), 8);
+    let facts = request(&asked, 7, NOW);
+    assert_eq!(bed.states(&facts, 2), holds(4, 4, OverlapSource::Index));
+    assert_eq!(bed.states(&facts, 5), holds(2, 4, OverlapSource::Index));
+    assert_eq!(bed.states(&facts, 0), holds(0, 4, OverlapSource::None));
+    // That pick wrote the request's prefix for its worker in the record.
+    assert_eq!(bed.states(&facts, 0), holds(4, 4, OverlapSource::Predictor));
+    assert_eq!(bed.stated(&facts, None, shed()), Overlap::NONE);
+}
+
+/// A pick states its worker's entry of a column the request's host filled,
+/// read as an entry of the engine's own rows is: the larger of its two
+/// readings, the index's on a tie, a miss where the entry holds nothing or
+/// the column ends before the row. The engine names no row for such a
+/// request and reads no table.
+#[test]
+fn a_pick_states_its_workers_entry_of_a_column_its_host_filled() {
+    let (affinity, host, _) = hosted(true);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = prompt(1_000, 4);
+    let entry = |index: u32, predicted: u32| AffinityFacts {
+        overlap_blocks: index,
+        predicted_blocks: predicted,
+        ..AffinityFacts::default()
+    };
+    let column = [entry(0, 0), entry(3, 0), entry(1, 4), entry(2, 2)];
+    let facts = RequestFacts {
+        affinity: &column,
+        ..request(&asked, 7, NOW)
+    };
+    assert_eq!(bed.states(&facts, 1), holds(3, 4, OverlapSource::Index));
+    assert_eq!(bed.states(&facts, 2), holds(4, 4, OverlapSource::Predictor));
+    assert_eq!(bed.states(&facts, 3), holds(2, 4, OverlapSource::Index));
+    assert_eq!(bed.states(&facts, 0), holds(0, 4, OverlapSource::None));
+    // A row past a shorter column holds nothing, as a row no host named.
+    let short = RequestFacts {
+        affinity: &column[..3],
+        ..facts
+    };
+    assert_eq!(bed.states(&short, 3), holds(0, 4, OverlapSource::None));
+    assert_eq!(host.asked.load(Ordering::Relaxed), 0, "no index is asked");
+    assert!(bed.pool.table.load().is_none(), "no table is read");
+}
+
+/// A pick states its worker's entry of the rows the request's host named in
+/// a column's place: a row named by what it holds, a row not named as a
+/// miss of the request's blocks.
+#[test]
+fn a_pick_states_its_workers_entry_of_the_rows_its_host_named() {
+    let (affinity, host, _) = hosted(true);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = prompt(1_000, 4);
+    let holders = [
+        AffinityHolder {
+            row: 1,
+            overlap_blocks: 3,
+            predicted_blocks: 0,
+        },
+        AffinityHolder {
+            row: 3,
+            overlap_blocks: 0,
+            predicted_blocks: 2,
+        },
+    ];
+    let facts = RequestFacts {
+        named: Some(AffinityRows {
+            holders: &holders,
+            warming: &[],
+            thin: false,
+            mean_in_flight: None,
+        }),
+        ..request(&asked, 7, NOW)
+    };
+    assert_eq!(bed.states(&facts, 1), holds(3, 4, OverlapSource::Index));
+    assert_eq!(bed.states(&facts, 3), holds(2, 4, OverlapSource::Predictor));
+    assert_eq!(bed.states(&facts, 0), holds(0, 4, OverlapSource::None));
+    assert_eq!(host.asked.load(Ordering::Relaxed), 0, "no index is asked");
+}
+
+/// A profile that is named no row is handed the column whole, and its pick
+/// states its worker's entry of that column.
+#[test]
+fn a_pick_states_its_workers_entry_of_the_column_the_engine_filled() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 4);
+    store(&index, 2, &hashes_of(&asked)[..3]);
+    let bed = Bed::new(affinity, handed_whole(), 4);
+    let facts = request(&asked, 7, NOW);
+    assert_eq!(bed.states(&facts, 2), holds(3, 4, OverlapSource::Index));
+    assert_eq!(bed.states(&facts, 1), holds(0, 4, OverlapSource::None));
+}
+
+/// A request decided inside its host's token tree states nothing of its
+/// pick: the tree's match is a count of tokens and no entry of blocks. The
+/// match names the worker all the same. The same request with no entry
+/// named is decided over the rows the engine names, and states.
+#[test]
+fn a_pick_made_inside_a_hosts_token_tree_states_nothing() {
+    let (affinity, _tree) = lending(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = tokens(1_000, 4);
+    let hashes = hashed(&asked);
+    let facts = request(&hashes, 7, NOW);
+    let key = || TokenKey {
+        tokens: Cow::Borrowed(asked.as_slice()),
+        marker: 0,
+    };
+    let answer = picked(1, bed.ids[1]);
+    assert_eq!(bed.stated(&facts, Some(key()), answer), Overlap::NONE);
+    // The tree holds the prompt for that worker now, and its match names it.
+    assert_eq!(bed.keyed(&asked, 0, None), [(1, 0, 4)]);
+    assert_eq!(bed.stated(&facts, Some(key()), answer), Overlap::NONE);
+    // No entry named: the record of hashed prefixes, which nothing wrote.
+    assert_eq!(bed.states(&facts, 1), holds(0, 4, OverlapSource::None));
+}
+
+/// A pick the binding's sessions rule placed alone and keeps from the
+/// profile states nothing, over the engine's own rows and over a column its
+/// host filled: the request is none of the profile's. One the rule places
+/// under its default word is the profile's own, and states its worker's
+/// entry as a pick by the profile's stages does. A gateway's sticky map
+/// hands a request it places to no policy, so the policy observes nothing
+/// of it (`model_gateway/src/policies/registry.rs:736-739`, `:782-783`).
+#[test]
+fn a_pick_its_rule_keeps_from_the_profile_states_nothing() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 4);
+    store(&index, 1, &hashes_of(&asked));
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let column = [AffinityFacts {
+        overlap_blocks: 4,
+        ..AffinityFacts::default()
+    }; 4];
+    let named = request(&asked, 7, NOW);
+    let fed = RequestFacts {
+        affinity: &column,
+        ..named
+    };
+    let untold = ruled(1, bed.ids[1], RulePlaced::Untold);
+    let told = ruled(1, bed.ids[1], RulePlaced::Told);
+    for facts in [&named, &fed] {
+        assert_eq!(bed.stated(facts, None, untold), Overlap::NONE);
+        assert_eq!(
+            bed.stated(facts, None, told),
+            holds(4, 4, OverlapSource::Index)
+        );
+    }
+}
+
+/// A decision whose profile reads no affinity states nothing, whatever its
+/// host fed: under a document none of whose bindings reads affinity, and
+/// under one where another model's profile does. The reader's pick states.
+#[test]
+fn a_profile_that_reads_no_affinity_states_nothing() {
+    let asked = prompt(1_000, 4);
+    let column = [AffinityFacts {
+        overlap_blocks: 4,
+        ..AffinityFacts::default()
+    }; 4];
+    let plain = request(&asked, 7, NOW);
+    let fed = RequestFacts {
+        affinity: &column,
+        ..plain
+    };
+    let (affinity, _, _) = hosted(true);
+    let bed = Bed::new(affinity, preset("least_load"), 4);
+    assert_eq!(bed.states(&plain, 1), Overlap::NONE);
+    assert_eq!(bed.states(&fed, 1), Overlap::NONE);
+    // One model's profile reads affinity in the single phase. Another
+    // model's reads none there.
+    let mut document = PolicySpec::preset("least_load").expect("the preset");
+    let reader = PolicySpec::preset("cache_aware").expect("the preset");
+    let mut binding = reader.bindings[0].clone();
+    binding.matcher.model = MODEL.into();
+    binding.matcher.phase = vec![Phase::Single];
+    document.bindings.insert(0, binding);
+    document.profiles.extend(reader.profiles);
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let (affinity, _, _) = hosted(true);
+    let bed = Bed::new(affinity, spec, 4);
+    let other = |facts: &RequestFacts<'_>| {
+        bed.states(
+            &RequestFacts {
+                model: "model-b",
+                ..*facts
+            },
+            1,
+        )
+    };
+    assert_eq!(other(&plain), Overlap::NONE);
+    assert_eq!(other(&fed), Overlap::NONE);
+    assert_eq!(bed.states(&fed, 1), holds(4, 4, OverlapSource::Index));
+}
+
+/// A shadow that reads affinity states nothing of the live pick. Under a
+/// binding whose own profile reads no affinity and whose shadow does, the
+/// lookup fills the column for the shadow, and the pick the live profile
+/// made says nothing of what its worker holds, over that column and over
+/// one its host filled. With the two profiles the other way round the pick
+/// states. The gateway's classic router observes a match ratio inside its
+/// cache-aware policy alone
+/// (`model_gateway/src/policies/cache_aware.rs:2686-2687`, `:3137`).
+#[test]
+fn a_shadow_that_reads_affinity_states_nothing_of_the_live_pick() {
+    // One preset's profile live, and another's as its shadow.
+    let bound = |live: &str, shadow: &str| {
+        let mut document = PolicySpec::preset(live).expect("the preset");
+        document.generation = 1;
+        let other = PolicySpec::preset(shadow).expect("the preset");
+        document.profiles.extend(other.profiles);
+        document.bindings[0].shadow = Some(ShadowSpec::Profile(shadow.into()));
+        AppliedSpec::validate(&document).expect("the document validates")
+    };
+    let asked = prompt(1_000, 4);
+    let column = [AffinityFacts {
+        overlap_blocks: 4,
+        ..AffinityFacts::default()
+    }; 4];
+    let plain = request(&asked, 7, NOW);
+    let fed = RequestFacts {
+        affinity: &column,
+        ..plain
+    };
+    // What the decision was given for the second worker, and what its pick
+    // of that worker states.
+    let decided = |bed: &Bed, facts: &RequestFacts<'_>| {
+        let mut held = None;
+        let returned = decide(
+            &bed.affinity,
+            &bed.pool,
+            &bed.spec,
+            &bed.workers,
+            &bed.ids,
+            &mut { *facts },
+            |_| None,
+            |_| true,
+            |facts| {
+                held = Some(facts.affinity_at(1).overlap_blocks);
+                picked(1, bed.ids[1])
+            },
+        );
+        (held, returned.pick().map(Pick::overlap).unwrap_or_default())
+    };
+    for (live, shadow, stated) in [
+        ("least_load", "cache_aware", Overlap::NONE),
+        (
+            "cache_aware",
+            "least_load",
+            holds(4, 4, OverlapSource::Index),
+        ),
+    ] {
+        let spec = bound(live, shadow);
+        let needs = spec.engine().needs_for(MODEL, Phase::Single);
+        assert!(needs.affinity, "{live} live: the binding reads affinity");
+        let (affinity, _, index) = hosted(true);
+        store(&index.expect("the index"), 1, &hashes_of(&asked));
+        let bed = Bed::new(affinity, spec, 4);
+        for facts in [&plain, &fed] {
+            assert_eq!(
+                decided(&bed, facts),
+                (Some(4), stated),
+                "{live} live, {shadow} its shadow"
+            );
+        }
+    }
 }
 
 /// Three workers publish no blocks on their cache event streams.

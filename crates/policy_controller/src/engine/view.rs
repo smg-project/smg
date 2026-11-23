@@ -707,6 +707,18 @@ impl Feed<'_> {
         }
     }
 
+    /// Row `index`'s entry behind a decision: a row past a column holds
+    /// nothing, as a row no host named. Only what is stated of a pick reads
+    /// this way: it orders nothing, and the decision may have read no entry
+    /// of that row. A pass reads [`Self::entry`].
+    #[inline]
+    pub(crate) fn entry_or_default(self, index: u32) -> AffinityFacts {
+        match self {
+            Self::Column(column) => column.get(index as usize).copied().unwrap_or_default(),
+            Self::Named(named) => named.entry(index),
+        }
+    }
+
     /// Row `index`'s entry as one pass reads it: by the pass's own `reads`
     /// where the pool is read whole, and by a search behind a draw
     /// (`DRAWN`), where the rows stand in the draw's order and a pass
@@ -1432,6 +1444,33 @@ impl<'a> RequestFacts<'a> {
         }
     }
 
+    /// The request's size in blocks: its token count over the block size
+    /// (the text kind's bytes over the window's size in bytes), never under
+    /// one and never under the block hashes the host sent. The host caps
+    /// that list, so a long request's hashes alone would understate it and
+    /// overstate every holder's share. The block size is the request's
+    /// ([`Self::block_size_or`]), and the count is the request's size
+    /// ([`Self::prompt_size`]): a request of text states its length and no
+    /// count of tokens. The prefix stage's gates and the overlap a pick
+    /// states both count here.
+    pub(crate) fn blocks(&self, view_block: u32) -> u32 {
+        let block = self.block_size_or(view_block);
+        let from_tokens = blocks_within(self.prompt_size(), self.hash_kind, block).max(1);
+        let from_hashes = u32::try_from(self.block_hashes.len()).unwrap_or(u32::MAX);
+        from_tokens.max(from_hashes)
+    }
+
+    /// The size of one of the request's blocks: the request's own where its
+    /// host counted with one (an index's learned size), else `view_block`,
+    /// the view's.
+    pub(crate) fn block_size_or(&self, view_block: u32) -> u32 {
+        if self.block_size > 0 {
+            self.block_size
+        } else {
+            view_block
+        }
+    }
+
     /// Whether the request's session key is pinned to the row at
     /// `position`, beside the row's own session bit.
     #[inline]
@@ -1950,6 +1989,43 @@ mod tests {
             engine,
         );
         assert_eq!(ends.into_iter().max(), Some(107));
+    }
+
+    /// A request's size in blocks is its tokens over its block size: the size
+    /// its host counted with where the request states one, the view's where
+    /// it states none. It is never under one, and never under the block
+    /// hashes the host sent. A request of text states its length and no
+    /// count of tokens: its windows are bytes.
+    #[test]
+    fn a_requests_blocks_are_its_tokens_over_its_block_size_and_never_under_its_hashes() {
+        let hashes = [1u64, 2, 3];
+        let sized = |prompt_tokens: u32, block_size: u32, hashed: usize| RequestFacts {
+            prompt_tokens,
+            block_size,
+            block_hashes: &hashes[..hashed],
+            ..RequestFacts::default()
+        };
+        // 100 tokens at the view's 16 are six whole blocks.
+        assert_eq!(sized(100, 0, 0).blocks(16), 6);
+        assert_eq!(sized(100, 0, 0).block_size_or(16), 16);
+        // At the size its host counted with, the view's is not read.
+        assert_eq!(sized(100, 32, 0).blocks(16), 3);
+        assert_eq!(sized(100, 32, 0).block_size_or(16), 32);
+        // Under one block, and with no token counted: one block.
+        assert_eq!(sized(5, 0, 0).blocks(16), 1);
+        assert_eq!(sized(0, 0, 0).blocks(16), 1);
+        // Never under the hashes the host sent, and over them by its tokens.
+        assert_eq!(sized(20, 0, 3).blocks(16), 3);
+        assert_eq!(sized(100, 0, 3).blocks(16), 6);
+        // A text of 200 two-byte characters is 400 bytes: six windows of 64.
+        // Read by its characters it would be three.
+        let text = RequestFacts {
+            hash_kind: HashKind::Text,
+            prompt_chars: 200,
+            prompt_bytes: 400,
+            ..sized(0, 64, 0)
+        };
+        assert_eq!(text.blocks(16), 6);
     }
 
     #[test]
