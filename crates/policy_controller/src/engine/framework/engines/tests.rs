@@ -199,8 +199,9 @@ struct Ruled {
     values: u32,
 }
 
-/// The rule of a decision by engines, written out; `None` where no row is
-/// kept.
+/// The rule of a decision by engines, written out; `None` where the whole
+/// pass decides: no row is kept, or a pool of several engines yields one
+/// engine's row and no second engine's.
 fn rule(seed: u64, rows: &[Candidate], engines: Engines<'_>) -> Option<Ruled> {
     let keeps = |row: u32| rows[row as usize].health.healthy;
     let mut draw = Draw::new(seed);
@@ -244,7 +245,7 @@ fn rule(seed: u64, rows: &[Candidate], engines: Engines<'_>) -> Option<Ruled> {
     let mut handed = Vec::new();
     let (taken, held, other) = match (first, second) {
         (None, _) => (0, None, None),
-        (Some((engine, row)), None) => (engine, Some(row), None),
+        (Some(_), None) => return None,
         (Some((a_engine, a)), Some((b_engine, b))) => {
             handed.push(vec![a, b]);
             // The picker's compare reads the stream past the values above:
@@ -332,7 +333,8 @@ fn a_decision_by_engines_is_the_rule_row_for_row_over_drawn_pools() {
             let decision = decide(&engine, seed, &rows, engines);
             let (asked, handed) = read();
             let Some(ruled) = rule(seed, &rows, engines) else {
-                // Nobody kept: the whole pass decided, and counted its pool.
+                // The draw decided nothing: the whole pass did, and counted
+                // its pool.
                 let healthy = rows.iter().filter(|row| row.health.healthy).count() as u32;
                 let trace = match &decision {
                     Decision::Pick(pick) => pick.trace,
@@ -457,6 +459,24 @@ fn the_alternate_of_a_pick_by_engines_is_another_engines_row() {
             assert_eq!(targets.len(), 2, "shape {case} seed {seed}");
             assert_ne!(of(targets[0]), of(targets[1]), "shape {case} seed {seed}");
         }
+    }
+}
+
+#[test]
+fn a_second_engine_not_drawn_inside_the_bound_leaves_the_pool_to_the_whole_pass() {
+    let engine = engine_with(Box::new(PowerOfTwo));
+    let (mut rows, listed, ends) = pool_of(&[1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1], 1);
+    for row in &mut rows {
+        // Two engines stand, the first of them busy and the second idle.
+        row.health.healthy = row.position < 2;
+        row.in_flight = if row.position == 0 { 8 } else { 0 };
+    }
+    let engines = Engines::new(0, &listed, &ends);
+    for seed in 0..200 {
+        let seed = Draw::new(seed).next_u64();
+        let decision = decide(&engine, seed, &rows, engines);
+        let targets = positions(&decision.pick().expect("a pick").targets);
+        assert_eq!(targets[0], 1, "the idle engine leads, seed {seed}");
     }
 }
 
@@ -1363,27 +1383,43 @@ fn a_pick_the_whole_pass_makes_behind_the_unit_reads_the_stream_on() {
         let decision = decide(&engine, seed, &rows, engines);
         positions(&decision.pick().expect("a row is kept").targets)
     };
-    let (mut widened, mut apart) = (0, 0);
+    let (mut widened, mut past_first, mut apart) = (0, 0, 0);
     for seed in 1..=400 {
         // The unit's draws, as the rule draws them: this case reads the
-        // seeds whose every draw is refused.
+        // seeds whose draws find no two engines inside the bound.
         let mut draw = Draw::new(seed);
-        let refused = (0..DRAW_BOUND).all(|_| {
-            let of = engines.rows(draw.below(engines.len()));
-            !rows[of[draw.below(of.len())] as usize].health.healthy
-        });
-        if !refused {
+        let mut refused = 0;
+        let mut stand_in = |but: Option<usize>, draw: &mut Draw| {
+            while refused < DRAW_BOUND {
+                let mut engine = draw.below(engines.len() - usize::from(but.is_some()));
+                if but.is_some_and(|taken| engine >= taken) {
+                    engine += 1;
+                }
+                let of = engines.rows(engine);
+                if rows[of[draw.below(of.len())] as usize].health.healthy {
+                    return Some(engine);
+                }
+                refused += 1;
+            }
+            None
+        };
+        let first = stand_in(None, &mut draw);
+        let second = first.and_then(|first| stand_in(Some(first), &mut draw));
+        if second.is_some() {
             continue;
         }
         // The whole pass picks by the stream where the draws left it, and
         // reads no value of it twice.
         assert_eq!(pick(seed, engines), pick(draw.state(), Engines::default()));
         widened += 1;
+        past_first += usize::from(first.is_some());
         apart += usize::from(pick(seed, engines) != pick(seed, Engines::default()));
     }
+    // Both misses are read: no engine found, and a first engine with no
+    // second.
     assert!(
-        widened >= 20 && apart > 0,
-        "{widened} widened, {apart} apart"
+        widened - past_first >= 20 && past_first >= 20 && apart > 0,
+        "{widened} widened, {past_first} of them past a first engine, {apart} apart"
     );
 }
 
