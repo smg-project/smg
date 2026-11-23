@@ -44,13 +44,14 @@ use crate::{
             },
             pd_admission,
             pd_failure::{PdSide, SidePhase},
+            placement::Placed,
             prefill_admission::PrefillLoadGuard,
             retry::mark_non_retryable,
         },
         error,
         grpc::{
             backend_client::BackendClient,
-            common::stages::encode::EncodeDispatchPlan,
+            common::stages::{dispatch_metadata::weight_version_of, encode::EncodeDispatchPlan},
             context::{
                 stage_output, ClientSelection, DispatchContext, EncodeOutputs, ExecutionPlan,
                 ExecutionPlanKind, ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
@@ -313,10 +314,11 @@ pub(crate) async fn execute_plan(
 
     // A pair's decode goes out with the dispatch, and its guard says so
     // where it is made. One request of a sequential dispatch is the
-    // exception: its decode goes out behind its prefill, so its guard is
-    // made ahead of that send, and the dispatch asks the decode again and
-    // says the send once the prefill has answered.
-    let behind_prefill = decode_goes_behind_its_prefill(&execution_plan, workers);
+    // exception, where its decode is owed anything behind its prefill: the
+    // guard is made ahead of the decode's send, and the dispatch asks the
+    // decode again and says the send once the prefill has answered. A
+    // classic pair is owed neither and takes the rule.
+    let behind_prefill = decode_is_owed_behind_its_prefill(&execution_plan, workers);
     let sticky_key = ctx.sticky_key.as_deref();
     let guards = if behind_prefill {
         LoadGuards::behind_prefill(workers, sticky_key)
@@ -329,7 +331,9 @@ pub(crate) async fn execute_plan(
     // The selection that names the decode the dispatch sent, where a second
     // ask moved it.
     let mut moved = None;
-    let behind = behind_prefill.then_some(DecodeBehindPrefill {
+    // The dispatch below borrows this slot and a pair arm takes the hold out
+    // of it: moved in, the hold would sit in every request's dispatch future.
+    let mut behind = behind_prefill.then(|| DecodeBehindPrefill {
         stage: selection,
         model_id: ctx.model_id.as_str(),
         routing: &ctx.routing,
@@ -432,7 +436,7 @@ pub(crate) async fn execute_plan(
                     ledger,
                     room_residue,
                     None,
-                    behind,
+                    behind.take(),
                 ))
                 .await
             }
@@ -451,7 +455,7 @@ pub(crate) async fn execute_plan(
                     encode_watch,
                     prefill_guard,
                     ledger,
-                    behind,
+                    behind.take(),
                 ))
                 .await
                 .map_err(|mut response| {
@@ -498,6 +502,11 @@ pub(crate) async fn execute_plan(
     // names the decode that was sent, for the response's stages and for a
     // retry.
     if let Some(moved) = moved {
+        // The response states the weight version of the decode that answers
+        // it: the metadata was prepared for the decode named first.
+        if let Some(dispatch) = ctx.dispatch.as_mut() {
+            dispatch.weight_version = Some(weight_version_of(Some(&moved)));
+        }
         ctx.workers = Some(moved);
     }
     // The engines hold the request bodies now. An earlier attempt keeps its
@@ -590,18 +599,23 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
     })
 }
 
-/// Whether the plan's decode goes out behind its prefill: one disaggregated
-/// request under a runtime whose protocol sends its two sides one behind
-/// the other. A batch's sub-requests, and both sides of the parallel shape,
-/// go out with the dispatch.
-fn decode_goes_behind_its_prefill(plan: &ExecutionPlan, workers: &WorkerSelection) -> bool {
+/// Whether the dispatch owes the plan's decode anything behind its prefill
+/// ([`DecodeBehindPrefill`]): one disaggregated request under a runtime
+/// whose protocol sends its two sides one behind the other, with a decode
+/// that is owed its ask and its send there
+/// ([`Placed::owed_behind_prefill`]). A batch's sub-requests, and both sides
+/// of the parallel shape, go out with the dispatch. A decode the classic
+/// policies picked goes out behind its prefill and is owed nothing there:
+/// its answer's test is made first, and is all that pair pays here.
+fn decode_is_owed_behind_its_prefill(plan: &ExecutionPlan, workers: &WorkerSelection) -> bool {
     matches!(
         plan,
         ExecutionPlan::PrefillDecode(_) | ExecutionPlan::EncodePrefillDecode { .. }
-    ) && workers
-        .disaggregated_runtime_type()
-        .and_then(|runtime| PdProtocol::for_runtime(*runtime))
-        .is_some_and(|protocol| protocol.dispatch == PdDispatch::Sequential)
+    ) && workers.decode().is_some_and(Placed::owed_behind_prefill)
+        && workers
+            .disaggregated_runtime_type()
+            .and_then(|runtime| PdProtocol::for_runtime(*runtime))
+            .is_some_and(|protocol| protocol.dispatch == PdDispatch::Sequential)
 }
 
 /// Dispatch one disaggregated request in its runtime's shape.
@@ -5432,6 +5446,56 @@ pub(crate) mod tests {
                 .collect(),
         };
         assert_eq!(plan_sub_requests(&batch, None), 4);
+    }
+
+    /// One request of a sequential dispatch holds something for its decode
+    /// where the policy engine placed the pair: the decode is owed its ask
+    /// and its send behind the prefill. A pair the classic policies picked
+    /// is owed neither, so its dispatch holds nothing and makes the guard
+    /// it made with no engine. The parallel shape holds nothing for either.
+    #[test]
+    fn a_sequential_dispatch_holds_nothing_for_a_classic_pairs_decode() {
+        use crate::{
+            config::types::PolicyConfig,
+            policies::PolicyRegistry,
+            routers::common::placement::{
+                select_pair,
+                tests::{hearing_pairs_on, one_pair, pairs_of, MODEL},
+                PlacementInputs,
+            },
+        };
+
+        let plan = ExecutionPlan::PrefillDecode(ProtoGenerateRequest::Vllm(Box::default()));
+        let registry = one_pair();
+        let selected = |policies: &PolicyRegistry, runtime_type| {
+            let pairs = pairs_of(&registry, policies);
+            let inputs = PlacementInputs::default();
+            let pair = select_pair(&registry, policies, MODEL, &pairs, None, None, inputs);
+            let pair = pair.expect("the pair is placed");
+            WorkerSelection::Disaggregated {
+                encode_assignments: None,
+                prefill: Arc::clone(pair.prefill.worker()),
+                decode: pair.decode,
+                runtime_type,
+            }
+        };
+
+        let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        assert!(!decode_is_owed_behind_its_prefill(
+            &plan,
+            &selected(&classic, RuntimeType::Vllm)
+        ));
+
+        let by_engine = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let _heard = hearing_pairs_on(&by_engine, true);
+        assert!(decode_is_owed_behind_its_prefill(
+            &plan,
+            &selected(&by_engine, RuntimeType::Vllm)
+        ));
+        assert!(
+            !decode_is_owed_behind_its_prefill(&plan, &selected(&by_engine, RuntimeType::Sglang)),
+            "both sides of the parallel shape go out with the dispatch"
+        );
     }
 
     #[test]

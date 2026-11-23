@@ -9,7 +9,7 @@ use ndarray::Array2;
 use super::*;
 use crate::routers::grpc::multimodal::{
     config::MultimodalConfigRegistry, encoder_budget::ItemOverEncoderBudget,
-    settings::MultimodalSettings,
+    is_request_media_fault, processing_failed_response, settings::MultimodalSettings,
 };
 
 #[derive(Default)]
@@ -587,6 +587,79 @@ async fn every_image_family_is_held_to_the_budget_on_its_header_size() {
             "{model_type}{mode}: the produced count is the size-only count"
         );
     }
+}
+
+/// A size the processor's own rule refuses is refused on the header, in the
+/// words the preprocessing reports it in and as the request's own media
+/// (a 400 under the media stage's code), before any image of the batch is
+/// decoded: the allowed frame in front has no bytes, so a decode of it would
+/// fail first. With a budget and without one, with the pixel cache and
+/// without it.
+#[tokio::test]
+async fn a_size_the_processors_rule_refuses_is_refused_before_any_decode() {
+    let (mut components, _, _) = setup(true, false);
+    let config = MultimodalModelConfig::new(
+        serde_json::json!({"model_type": "qwen2_vl"}),
+        PreProcessorConfig::default(),
+        None,
+    );
+    let metadata = ModelMetadata {
+        model_id: "qwen2_vl",
+        tokenizer: &NoTokenizer,
+        config: &config.config,
+    };
+    let spec = components.model_registry.lookup(&metadata).unwrap();
+    let header_only = |hash: &str, width, height| {
+        Arc::new(ImageFrame::encoded(
+            Default::default(),
+            Default::default(),
+            ImageSource::InlineBytes,
+            hash.to_string(),
+            ImageSize::new(width, height),
+            None,
+        ))
+    };
+    // The second is past the aspect ratio the Qwen size rule takes.
+    let pair = MediaBatch::Images(vec![
+        header_only("fits", 64, 64),
+        header_only("thin", 4020, 20),
+    ]);
+    // Without the pixel cache first (the default, where the whole batch is
+    // decoded at once), then with it.
+    let cache = components.pixel_cache.take();
+    for (cached, budget) in [
+        (false, None),
+        (false, Some(usize::MAX)),
+        (true, None),
+        (true, Some(usize::MAX)),
+    ] {
+        if cached {
+            components.pixel_cache.clone_from(&cache);
+        }
+        let ctx = context(&components, &config, spec, "qwen2_vl", "tok", None, budget);
+        let error = preprocess_modality(&pair, &ctx).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Image preprocessing failed: Invalid tensor shape: expected aspect ratio < 200:1, \
+             got [20, 4020]",
+            "pixel cache {cached}, budget {budget:?}"
+        );
+        let response = processing_failed_response(&error);
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers()["x-smg-error-code"],
+            "invalid_multimodal_request"
+        );
+        assert!(is_request_media_fault(&error));
+    }
+    // A header with a side of zero is left to the decode, as before.
+    let empty = MediaBatch::Images(vec![header_only("empty", 0, 64)]);
+    let ctx = context(&components, &config, spec, "qwen2_vl", "tok", None, None);
+    let error = preprocess_modality(&empty, &ctx).await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "image decode error: The image format could not be determined"
+    );
 }
 
 /// Hits and misses per model, as `(hits, misses)`; `None` until both series

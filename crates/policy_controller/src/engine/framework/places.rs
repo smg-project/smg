@@ -21,9 +21,10 @@
 //!   aside** ([`stated`]): the one pass that asks a profile's filters as
 //!   one test of a row, the draw, the draw over a pool's engines, a
 //!   scorer's own walk over them, and the keyed decision, which reads a
-//!   key's pin by its place. Each says nothing of such a request, inside
-//!   itself, and the staged pass decides, as it does under the draw's
-//!   floor and behind a draw that keeps nobody.
+//!   key's pin and the workers of a ring's walk by their places. Each
+//!   says nothing of such a request, inside itself, and the staged pass
+//!   decides, as it does under the draw's floor and behind a draw that
+//!   keeps nobody.
 //! - **A look at a side's rows that opens no set reads the places' rows**
 //!   ([`rows`]): a pair's list of open decodes, the decodes whose classes
 //!   its all-vetoed rule opens, and what its prefill side's shed says of

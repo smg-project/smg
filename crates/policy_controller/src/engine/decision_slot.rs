@@ -1,20 +1,17 @@
 //! A decision slot's name: how a stage kind that keeps state a slot finds it.
 //!
 //! A host decides on its deciders, one decision at a time on each. The
-//! served controller gives a model's requests one decider. A door in
-//! process gives a calling thread one, and a model's requests one under a
-//! generation that holds a stage keeping state a decider
-//! ([`crate::engine::StoreBackedEngine`]). Whoever decides for a decider holds
-//! its turn: the decider's own thread, or another thread the host lets take the
-//! turn. What a stage kind keeps a decider (a WebAssembly plugin's instance) is
-//! that decider's, behind its turn, whichever thread holds it. A stage's calls
-//! and the lifecycle's carry no handle of the host, so the holder of a turn
-//! says whose it is: [`DecisionSlot::enter`] names the decider the calling
-//! thread acts as until the guard drops, and a kind reads
-//! [`DecisionSlot::acting`].
+//! served controller gives a model's requests one decider. Whoever decides
+//! for a decider holds its turn: the decider's own thread, or another thread
+//! the host lets take the turn. What a stage kind keeps a decider (a
+//! WebAssembly plugin's instance) is that decider's, behind its turn,
+//! whichever thread holds it. A stage's calls and the lifecycle's carry no
+//! handle of the host, so the holder of a turn says whose it is:
+//! [`DecisionSlot::enter`] names the decider the calling thread acts as until
+//! the guard drops, and a kind reads [`DecisionSlot::acting`].
 //!
-//! A host enters where it takes a decider's turn: no stage, no plugin kind
-//! and no door of a store does. The served controller enters at two
+//! A host enters where it takes a decider's turn: no stage and no plugin
+//! kind does. The served controller enters at two
 //! places. A decider's own thread enters for each request it decides. And
 //! whoever applies a lease's event enters as the decider whose file of
 //! leases the lease is on, under that file's turn: the decider's thread

@@ -220,7 +220,9 @@ impl OwnTime {
 /// read part: by the time the plugin's unread calls took the run-out is its
 /// own, by their fuel it is not. So does a sample slow at its high end alone
 /// ([`ThreadRing::uncovered`]), late call or none: a window never holds two
-/// slow samples no reading covered.
+/// slow samples no reading covered. Where the bound ended a call of the
+/// decision under the plugin's own bound, such a sample arms the ring and
+/// is not counted: at its bound a call is the plugin's.
 #[derive(Debug)]
 struct ThreadRing {
     ring: Latency,
@@ -257,6 +259,31 @@ impl ThreadRing {
     fn uncovered(micros: u32, low_micros: u32, frame_micros: u32) -> bool {
         Latency::share(micros, frame_micros).map(Latency::marks)
             != Latency::share(low_micros, frame_micros).map(Latency::marks)
+    }
+
+    /// Takes one decision's sample of `micros`, whose low end is
+    /// `low_micros`, under a frame of `frame_micros`. Says whether it is
+    /// counted unread and whether a window it completed reads slow
+    /// ([`ThreadRing::record`]). A sample no reading covers
+    /// ([`ThreadRing::uncovered`]) on a ring nothing armed arms the ring,
+    /// and it is counted unread. Where the bound `ended` a call of the
+    /// decision under the plugin's own bound it arms the ring all the same
+    /// and is not counted: the bound counted the time the thread had, so at
+    /// its bound a call is the plugin's, never unread by its own verdict or
+    /// through its decision's sample. A call the decision's remainder
+    /// clamped is not one: the plugin failed nothing there.
+    fn take(
+        &mut self,
+        micros: u32,
+        low_micros: u32,
+        frame_micros: u32,
+        ended: bool,
+    ) -> (bool, bool) {
+        let parted = !self.armed() && Self::uncovered(micros, low_micros, frame_micros);
+        if parted {
+            self.arm();
+        }
+        (parted && !ended, self.record(micros, frame_micros))
     }
 
     /// Records one call in the ring ([`Latency::record`]); `true` when a
@@ -707,7 +734,7 @@ pub struct Stats {
     /// time they took the plugin's. It is the budget's, and `budget_spent`
     /// counts it too. One call can be both, and counts twice. And a
     /// decision's sample that is slow by time nothing read alone, on a
-    /// thread nothing armed: past half the budget, or past the budget, by
+    /// thread nothing armed: past half of its frames, or past them, by
     /// the time its calls and a cold slot's `init` took, and short of that
     /// mark by their fuel. Through the next 128 decisions the plugin samples
     /// on an armed thread, each of its calls and a cold slot's `init` reads
@@ -715,7 +742,10 @@ pub struct Stats {
     /// late and whose fuel covers the time it took. That window is short on a
     /// busy thread (128 ms at a thousand decisions a second), so a host that
     /// holds a thread less often leaves every hold here and none in
-    /// `stalls`: read the two together.
+    /// `stalls`: read the two together. The sample of a decision in which
+    /// the bound ended one of the plugin's calls under the plugin's own
+    /// bound arms its thread all the same and is never counted here: at its
+    /// bound a call is the plugin's.
     pub unread: u64,
     /// Times the breaker opened.
     pub breaker_opens: u64,
@@ -956,11 +986,15 @@ pub struct Plugin {
     /// (its constructor and stage calls): its spend, so a call the budget
     /// ends is charged to the plugin only once that spend reached the
     /// decision's budget, and its part of the decision's latency sample.
-    spent: ThreadLocal<Cell<(u64, OwnTime)>>,
+    /// Beside it, the frames of those calls, in microseconds: what the
+    /// sample is taken over where they are less than the budget. And
+    /// whether the bound ended one of them under the plugin's own bound.
+    spent: ThreadLocal<Cell<(u64, OwnTime, u64, bool)>>,
     /// Per thread: the latency ring, one sample per decision (the plugin's
     /// own charged time in it and a lazy `init` the decision paid, over the
-    /// decision's budget), kept across rebuilds so a plugin dropped every
-    /// decision still completes a window, and the ring's arm.
+    /// decision's frame: [`Latency::frame`]), kept across rebuilds so a
+    /// plugin dropped every decision still completes a window, and the
+    /// ring's arm.
     latency: ThreadLocal<RefCell<ThreadRing>>,
     /// Per thread: this plugin's part in the open decision (its number, the
     /// plugin's opens of it still to close, each side of a pair and each
@@ -968,8 +1002,8 @@ pub struct Plugin {
     /// of it, and whether the plugin already failed it: the decision is the
     /// breaker's unit, so it counts one failure however many opens fail),
     /// and the time of a lazy `init` the decision paid at its two ends (part
-    /// of its sample, not of its own spend).
-    decision_opens: ThreadLocal<Cell<(Part, OwnTime)>>,
+    /// of its sample, not of its own spend), with the init frame of each.
+    decision_opens: ThreadLocal<Cell<(Part, OwnTime, u64)>>,
     /// Per thread: the decision, by its number on this thread, whose open
     /// caught the thread's instance up with the membership feed. A decision
     /// does so once, at the plugin's first open of it that reaches the
@@ -1683,11 +1717,13 @@ impl Plugin {
             }
         }
         // The plugin's own time in the decision before this call: its two
-        // sums.
+        // sums. The call's frame joins the decision's frames whole, whatever
+        // the remainder left of its grant: a call that others' draws starved
+        // is not read against the little it was left.
         let before = if frame.decision == 0 {
             OwnTime::default()
         } else {
-            self.spend(frame.decision, own)
+            self.spend(frame.decision, own, u64::from(frame.frame_micros))
         };
         self.tally.fuel_used.fetch_add(used, Ordering::Relaxed);
         match answer {
@@ -1755,6 +1791,13 @@ impl Plugin {
                 } else {
                     Fault::Trap
                 };
+                if end == End::OnTheClock {
+                    // The bound ended the call under the plugin's own bound:
+                    // the call is the plugin's, and its decision's sample is
+                    // never counted unread. One the remainder clamped left
+                    // above: there the plugin failed nothing.
+                    self.note_ended(frame.decision);
+                }
                 tracing::debug!(plugin = self.name, error = %format!("{error:#}"), "a guest call failed");
                 self.fault(instance, fault);
                 Call::Failed
@@ -1781,9 +1824,9 @@ impl Plugin {
     /// placement. Outside a decision (a lifecycle event) nothing is marked.
     fn fail(&self, now: u64) {
         let opens = self.decision_opens.get_or_default();
-        let (mut part, init) = opens.get();
+        let (mut part, init, frames) = opens.get();
         part.fail();
-        opens.set((part, init));
+        opens.set((part, init, frames));
         self.report(now);
     }
 
@@ -1811,7 +1854,7 @@ impl Plugin {
     /// thread; true until the thread's next decision opens it. Read at the
     /// close, and only when a rebuild failed.
     fn failed_in(&self, decision: u64) -> bool {
-        let (part, _) = self.decision_opens.get_or_default().get();
+        let (part, _, _) = self.decision_opens.get_or_default().get();
         part.failed_in(decision)
     }
 
@@ -1820,25 +1863,27 @@ impl Plugin {
     /// of the cell an open makes).
     fn note_open(&self, decision: u64) -> bool {
         let opens = self.decision_opens.get_or_default();
-        let (mut part, init) = opens.get();
-        let init = if part.is_of(decision) {
-            init
+        let (mut part, init, frames) = opens.get();
+        let (init, frames) = if part.is_of(decision) {
+            (init, frames)
         } else {
-            OwnTime::default()
+            (OwnTime::default(), 0)
         };
         let failed = part.open(decision);
-        opens.set((part, init));
+        opens.set((part, init, frames));
         failed
     }
 
     /// The time of a lazy `init` decision `decision` paid on this thread:
     /// judged under the init frame, never the plugin's own spend, but part of
-    /// what the decision cost it, at its two ends like a call's.
+    /// what the decision cost it, at its two ends like a call's. The init
+    /// frame joins the frames the decision's sample is taken over.
     fn note_init(&self, decision: u64, own: OwnTime) {
         let opens = self.decision_opens.get_or_default();
-        let (part, init) = opens.get();
+        let (part, init, frames) = opens.get();
         if part.is_of(decision) {
-            opens.set((part, init.plus(own)));
+            let frames = frames.saturating_add(u64::from(INIT_FRAME_MICROS));
+            opens.set((part, init.plus(own), frames));
         }
     }
 
@@ -1846,30 +1891,32 @@ impl Plugin {
     /// the decision's latency sample, the plugin's own charged time in the
     /// decision (its constructor and stage calls, whatever ended them) plus
     /// the time of a lazy `init` the decision paid, over the decision's
-    /// budget. A decision that charged the plugin nothing records nothing.
-    /// Says whether this close was the plugin's last of the decision.
+    /// budget or over the frames of those where they are the lesser
+    /// ([`Latency::frame`]). A decision that charged the plugin nothing
+    /// records nothing. Says whether this close was the plugin's last of the
+    /// decision.
     fn note_close(&self, decision: u64, seed_micros: u64) -> bool {
         let opens = self.decision_opens.get_or_default();
-        let (mut part, init) = opens.get();
+        let (mut part, init, init_frames) = opens.get();
         let last = part.close(decision);
-        opens.set((part, init));
+        opens.set((part, init, init_frames));
         if !last {
             return false;
         }
-        let (spent_stamp, spent) = self.spent.get_or_default().get();
-        let own = if spent_stamp == decision {
-            spent.plus(init)
+        let (spent_stamp, spent, frames, ended) = self.spent.get_or_default().get();
+        let (own, frames, ended) = if spent_stamp == decision {
+            (spent.plus(init), frames.saturating_add(init_frames), ended)
         } else {
-            init
+            (init, init_frames, false)
         };
         if own.sample > 0 {
-            self.sample(own, seed_micros);
+            self.sample(own, Latency::frame(seed_micros, frames), ended);
         }
         true
     }
 
     /// One latency sample into the thread's ring: a decision's time as a
-    /// share of its budget, at the high end of what nothing read; a window
+    /// share of its frame, at the high end of what nothing read; a window
     /// that reads slow opens the breaker. A sample slow at that end alone
     /// (past a mark of the ring its low end is short of) is slow by time
     /// nothing read, a hold of the host or the guest's own, and nothing says
@@ -1877,21 +1924,20 @@ impl Plugin {
     /// arms the thread: the decisions that share its window are read, so no
     /// window holds two such samples. That bounds the samples no reading
     /// covered, not what one of them completes: the ring's allowance of one
-    /// outlier is the window's, and a hold of the host spends it.
-    fn sample(&self, own: OwnTime, seed_micros: u64) {
+    /// outlier is the window's, and a hold of the host spends it. Where the
+    /// bound `ended` a call of the decision as the plugin's own, such a
+    /// sample arms the thread and is not counted ([`ThreadRing::take`]).
+    fn sample(&self, own: OwnTime, frame_micros: u32, ended: bool) {
         let micros = |micros: u64| u32::try_from(micros).unwrap_or(u32::MAX);
-        let (sample, low, seed) = (micros(own.sample), micros(own.spend), micros(seed_micros));
-        let slow = {
-            let mut ring = self
-                .latency
-                .get_or(|| RefCell::new(ThreadRing::new()))
-                .borrow_mut();
-            if !ring.armed() && ThreadRing::uncovered(sample, low, seed) {
-                bump(&self.tally.unread);
-                ring.arm();
-            }
-            ring.record(sample, seed)
-        };
+        let (sample, low) = (micros(own.sample), micros(own.spend));
+        let (unread, slow) = self
+            .latency
+            .get_or(|| RefCell::new(ThreadRing::new()))
+            .borrow_mut()
+            .take(sample, low, frame_micros, ended);
+        if unread {
+            bump(&self.tally.unread);
+        }
         if slow && self.breaker.slow(self.runtime.now_micros()) {
             self.opened("latency");
         }
@@ -1923,17 +1969,30 @@ impl Plugin {
     }
 
     /// Adds a call's own time to this plugin's two sums of decision
-    /// `decision` on this thread and returns the sums before it.
-    fn spend(&self, decision: u64, own: OwnTime) -> OwnTime {
+    /// `decision` on this thread, and the call's frame of `frame_micros` to
+    /// the decision's frames. Returns the two sums before it.
+    fn spend(&self, decision: u64, own: OwnTime, frame_micros: u64) -> OwnTime {
         let spent = self.spent.get_or_default();
-        let (stamp, before) = spent.get();
-        let before = if stamp == decision {
-            before
+        let (stamp, before, frames, ended) = spent.get();
+        let (before, frames, ended) = if stamp == decision {
+            (before, frames, ended)
         } else {
-            OwnTime::default()
+            (OwnTime::default(), 0, false)
         };
-        spent.set((decision, before.plus(own)));
+        let frames = frames.saturating_add(frame_micros);
+        spent.set((decision, before.plus(own), frames, ended));
         before
+    }
+
+    /// The bound ended a call of decision `decision` under the plugin's own
+    /// bound, on this thread: marked beside the decision's sums, for its
+    /// sample ([`ThreadRing::take`]). Outside a decision nothing is marked.
+    fn note_ended(&self, decision: u64) {
+        let spent = self.spent.get_or_default();
+        let (stamp, own, frames, _) = spent.get();
+        if decision != 0 && stamp == decision {
+            spent.set((stamp, own, frames, true));
+        }
     }
 
     /// One membership change of the host, told on whatever thread: folded
@@ -2944,7 +3003,7 @@ impl BoundPlugin for PluginBinding {
         self.plugin.hand(change);
     }
 
-    fn observe_signal(&self, signal: &Signal) {
+    fn observe_signal(&self, signal: &Signal<'_>) {
         let now = self.plugin.runtime.now_micros();
         self.plugin
             .observe(wit::LifecycleEvent::Signal(marshal::signal(signal, now)));
@@ -3476,6 +3535,43 @@ mod tests {
                 "{micros} over {low_micros} under a frame of {frame_micros}"
             );
         }
+    }
+
+    /// A parted sample, past the half mark at its high end alone, arms a
+    /// ring nothing armed and is counted unread. The same sample of a
+    /// decision in which the bound ended a call as the plugin's own arms the
+    /// ring all the same and is not counted: at its bound a call is the
+    /// plugin's.
+    #[test]
+    fn a_parted_sample_is_unread_unless_the_bound_ended_a_call_of_its_decision() {
+        // Six tenths of the frame by the time the calls took, a tenth by
+        // their fuel.
+        let (micros, low_micros, frame_micros) = (600, 100, 1_000);
+        assert!(ThreadRing::uncovered(micros, low_micros, frame_micros));
+        let mut ring = ThreadRing::new();
+        assert_eq!(
+            ring.take(micros, low_micros, frame_micros, false),
+            (true, false),
+            "no call was ended: slow by time nothing read alone"
+        );
+        assert!(ring.armed(), "and the ring is armed");
+        assert_eq!(
+            ring.take(micros, low_micros, frame_micros, false),
+            (false, false),
+            "an armed ring counts no second one"
+        );
+        let mut ring = ThreadRing::new();
+        assert_eq!(
+            ring.take(micros, low_micros, frame_micros, true),
+            (false, false),
+            "the bound ended a call: the sample is the plugin's, never unread"
+        );
+        assert!(ring.armed(), "and the ring is armed all the same");
+        // Recorded like any other: sixty-four of them are a slow window.
+        let last = (1..Latency::EVERY)
+            .map(|_| ring.take(micros, low_micros, frame_micros, true))
+            .last();
+        assert_eq!(last, Some((false, true)));
     }
 
     /// An armed ring stays armed for its own length in samples and no

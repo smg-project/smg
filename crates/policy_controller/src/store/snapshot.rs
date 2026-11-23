@@ -113,18 +113,17 @@ use crate::{
         demands::DemandFacts,
         framework::{Engine, OverloadThresholds, PairPools, PairTable},
         view::{
-            fingerprint, AffinityFacts, AffinityHolder, Candidate, Engines, HashKind, Health,
-            OverloadRegime, Phase, PoolFacts, Role, WireModes, WorkerId,
+            fingerprint, AffinityFacts, Candidate, Engines, HashKind, Health, OverloadRegime,
+            Phase, PoolFacts, Role, WireModes, WorkerId,
         },
         warm_up::WarmUpRule,
         EncodePool, EncoderFacts,
     },
-    load::signals::{SignalCell, SignalCells},
+    load::signals::{ReportSignals, SignalCell, SignalCells},
     stages::lifecycle::Lifecycle,
     store::{
         applied::Applied,
         encoding::{EncodeClasses, EncodeMember},
-        health::LeaderBits,
         index::{AffinityRowsBuffers, KvTables, PoolIndex, Predict, Reading},
         loads::LoadSample,
         pairing::{known, Derivation, Member, PairClasses, Pool},
@@ -253,118 +252,6 @@ impl ViewBuffers {
     }
 }
 
-/// Narrows a built view by the gateway's wires and subset hint. Returns
-/// how many rows the wires took. A hint of zero clears the view first.
-/// A stated wire set keeps rows that share a wire. Omitted wires keep
-/// every row. Kept rows keep their order and take their new positions.
-pub(crate) fn narrow(view: &mut ViewBuffers, wires: Option<WireModes>, subset: Option<u32>) -> u64 {
-    narrow_view::<()>(view, wires, subset, None)
-}
-
-#[inline]
-fn narrow_view<T>(
-    view: &mut ViewBuffers,
-    wires: Option<WireModes>,
-    subset: Option<u32>,
-    column: Option<&mut Vec<T>>,
-) -> u64 {
-    if subset == Some(0) {
-        view.candidates.clear();
-        view.affinity.clear();
-        view.signal_cells.refill(0);
-        if let Some(column) = column {
-            column.clear();
-        }
-        return 0;
-    }
-    let Some(wires) = wires else {
-        return 0;
-    };
-    let rows = view.candidates.len();
-    let dialed = |row: &Candidate| row.wire_modes.intersects(wires);
-    // Each column follows the rows before the rows move.
-    retain_column(&view.candidates, &mut view.affinity, dialed);
-    retain_cells(&view.candidates, &mut view.signal_cells, dialed);
-    if let Some(column) = column {
-        retain_column(&view.candidates, column, dialed);
-    }
-    view.candidates.retain(dialed);
-    let took = rows - view.candidates.len();
-    if took > 0 {
-        for (row, position) in view.candidates.iter_mut().zip(0..) {
-            row.position = position;
-        }
-    }
-    took as u64
-}
-
-fn retain_column<T>(rows: &[Candidate], column: &mut Vec<T>, dialed: impl Fn(&Candidate) -> bool) {
-    let mut beside = rows.iter();
-    column.retain(|_| beside.next().is_some_and(&dialed));
-}
-
-/// The signal cells follow the rows as a column does: a kept row's cells
-/// move to its new position, so a read by that position answers the row's
-/// own value. One test where the build wrote no cell.
-fn retain_cells(rows: &[Candidate], cells: &mut SignalCells, dialed: impl Fn(&Candidate) -> bool) {
-    let Some(mut kept) = KeptCells::of(cells, rows.len()) else {
-        return;
-    };
-    for (at, row) in rows.iter().enumerate() {
-        if dialed(row) {
-            kept.keep(at);
-        }
-    }
-    kept.end();
-}
-
-/// The signal cells of a view's rows through a narrowing in place, for
-/// every routine that narrows a built view: each kept row's cells move
-/// behind the cells kept so far, so a read by the row's new position
-/// answers the row's own value.
-pub(crate) struct KeptCells<'a> {
-    column: &'a mut Vec<SignalCell>,
-    signals: usize,
-    kept: usize,
-}
-
-impl<'a> KeptCells<'a> {
-    /// The cells a build wrote for `rows` rows; `None` where it wrote no
-    /// cell. Cells that do not fit the rows are dropped: cells of other
-    /// rows answer no row, so every read is no value.
-    pub(crate) fn of(cells: &'a mut SignalCells, rows: usize) -> Option<Self> {
-        let signals = cells.signals();
-        if signals == 0 {
-            return None;
-        }
-        let fits = cells.fits(rows);
-        let column = cells.cells_mut();
-        if !fits {
-            column.clear();
-            return None;
-        }
-        Some(Self {
-            column,
-            signals,
-            kept: 0,
-        })
-    }
-
-    /// Keeps the cells of the row at `at`, at the next kept row's place.
-    /// Rows are kept in ascending order.
-    pub(crate) fn keep(&mut self, at: usize) {
-        let signals = self.signals;
-        self.column
-            .copy_within(at * signals..(at + 1) * signals, self.kept * signals);
-        self.kept += 1;
-    }
-
-    /// Ends the narrowing: the cells past the kept rows leave.
-    pub(crate) fn end(self) {
-        self.column.truncate(self.kept * self.signals);
-    }
-}
-
 /// The buffers a host keeps across pair decisions: both sides' views and
 /// the table that says which of their classes pair, all of one publication.
 /// A pair build clears and fills them ([`StoreSnapshot::build_pair`]).
@@ -398,52 +285,6 @@ impl PairBuffers {
             decode_signal_cells: self.decode.cells(),
             table: PairTable::new(&self.ends, &self.listed),
         }
-    }
-
-    /// Narrows both sides and reports what the wires took and whether a
-    /// side went empty.
-    pub(crate) fn narrow(
-        &mut self,
-        wires: Option<WireModes>,
-        subset: Option<u32>,
-        built: &(ViewFacts, ViewFacts),
-    ) -> (u64, bool) {
-        self.narrow_with_classes(wires, subset, built, None)
-    }
-
-    #[inline]
-    fn narrow_with_classes(
-        &mut self,
-        wires: Option<WireModes>,
-        subset: Option<u32>,
-        built: &(ViewFacts, ViewFacts),
-        classes: Option<&mut Vec<u32>>,
-    ) -> (u64, bool) {
-        let prefill = narrow_view(&mut self.prefill, wires, subset, classes);
-        let decode = narrow(&mut self.decode, wires, subset);
-        (prefill + decode, self.emptied(built))
-    }
-
-    fn emptied(&self, built: &(ViewFacts, ViewFacts)) -> bool {
-        (built.0.pool_size > 0 && self.prefill.candidates.is_empty())
-            || (built.1.pool_size > 0 && self.decode.candidates.is_empty())
-    }
-
-    /// Reports the pair's narrowing when the wire cut may have included
-    /// another view. A subset of zero counts no rows as taken by wires.
-    pub(crate) fn narrowing(
-        &self,
-        built: &(ViewFacts, ViewFacts),
-        cut_by_wires: bool,
-    ) -> (u64, bool) {
-        let took = if cut_by_wires {
-            u64::from(built.0.pool_size) + u64::from(built.1.pool_size)
-                - self.prefill.candidates.len() as u64
-                - self.decode.candidates.len() as u64
-        } else {
-            0
-        };
-        (took, self.emptied(built))
     }
 
     fn clear(&mut self) {
@@ -489,31 +330,6 @@ impl EncodePairBuffers {
             signal_cells: self.encode.cells(),
         };
         (self.pair.pools(), encode)
-    }
-
-    /// The pair's buffers, for the lease counts on each side's rows.
-    pub(crate) fn pair_mut(&mut self) -> &mut PairBuffers {
-        &mut self.pair
-    }
-
-    /// Narrows the three views by the gateway's wires and subset hint.
-    /// The prefill classes and encoder facts follow their rows. Returns
-    /// how many rows the wires took and whether a populated view went empty.
-    pub(crate) fn narrow(
-        &mut self,
-        wires: Option<WireModes>,
-        subset: Option<u32>,
-        built: &(ViewFacts, ViewFacts),
-    ) -> (u64, bool) {
-        let (took, emptied) =
-            self.pair
-                .narrow_with_classes(wires, subset, built, Some(&mut self.prefill_classes));
-        let had_encoders = !self.encode.candidates.is_empty();
-        let encoded = narrow_view(&mut self.encode, wires, subset, Some(&mut self.facts));
-        (
-            took + encoded,
-            emptied || (had_encoders && self.encode.candidates.is_empty()),
-        )
     }
 }
 
@@ -1287,9 +1103,9 @@ impl StoreSnapshot {
 
     /// Tells each stage of `engine` that keeps a number of the reports
     /// each rank's report as this world shows it to a decision, with the
-    /// rank's slot and the report's sample instant ([`Signal::Load`]). A
-    /// stage that keeps none is sent nothing. A member of several pools is
-    /// told once a pool, the same word.
+    /// rank's slot, the report's sample instant and no named value
+    /// ([`Signal::Load`]). A stage that keeps none is sent nothing. A
+    /// member of several pools is told once a pool, the same word.
     pub fn tell_loads(&self, engine: &Engine) {
         engine.tell_loads(|tell| {
             for (rows, shape) in self.rows.iter().zip(self.derived.pools.iter()) {
@@ -1301,6 +1117,7 @@ impl StoreSnapshot {
                             row: load,
                             slot,
                             sampled_at_micros: row.load_sampled_at_micros,
+                            signals: ReportSignals::NONE,
                         });
                     }
                 }
@@ -1392,17 +1209,6 @@ impl StoreSnapshot {
         Some(self.derived.by_model.get(model)?[role_slot(role)]? as usize)
     }
 
-    /// The slot of worker `id`'s count of the leases on file, as the pool
-    /// `built` read names it beside the worker's row: what the lease of a
-    /// decision over that build books. `None` for a worker the pool does
-    /// not list. `built` is a build of this world.
-    pub(crate) fn booked(&self, built: &ViewFacts, id: WorkerId) -> Option<WorkerSlot> {
-        let pool = built.pool as usize;
-        let (rows, shape) = (self.rows.get(pool)?, self.derived.pools.get(pool)?);
-        let row = rows.binary_search_by_key(&id, |row| row.id).ok()?;
-        shape.booked.get(row).copied()
-    }
-
     /// The slot of worker `id`'s count wherever this world lists it: a
     /// member's rows name one. `None` for a worker in no pool: a member
     /// there is read apart ([`StoreSnapshot::unpooled_of`]). It searches every
@@ -1410,15 +1216,6 @@ impl StoreSnapshot {
     pub(crate) fn booked_of(&self, id: WorkerId) -> Option<WorkerSlot> {
         let (pool, row) = self.pooled_row(id)?;
         self.derived.pools.get(pool)?.booked.get(row).copied()
-    }
-
-    /// Whether this world lists `id` at `rank`: asked of a dispatch
-    /// report's row, which may have left or changed its rank since its
-    /// decision. A member holds one rank in every pool that lists it, so
-    /// the first pool found answers.
-    pub(crate) fn lists_rank(&self, id: WorkerId, rank: u16) -> bool {
-        self.pooled_row(id)
-            .is_some_and(|(pool, row)| self.rows[pool][row].dp_rank == rank)
     }
 
     /// The first pool that lists `id`, with the member's row there: one
@@ -2041,104 +1838,6 @@ impl StoreSnapshot {
         }
     }
 
-    /// Records the prefixes of a naming on the lease's first target. A
-    /// naming that sent none ends at this test, in its caller's line: a
-    /// decision whose profile keeps no record pays no call for it.
-    #[inline(always)]
-    pub(crate) fn sent(&self, named: &AffinityRowsBuffers, target: WorkerId) {
-        if let Some(pool) = named.sent_pool() {
-            self.sent_to(pool, named, target);
-        }
-    }
-
-    /// [`Self::sent`] for a naming that sent prefixes to the pool at
-    /// `pool`. Out of line: both of a single's orders write the record.
-    #[inline(never)]
-    fn sent_to(&self, pool: usize, named: &AffinityRowsBuffers, target: WorkerId) {
-        let (Some(rows), Some(Some(held))) = (self.rows.get(pool), self.indexes.get(pool)) else {
-            return;
-        };
-        held.sent(rows, named, target);
-    }
-
-    /// Holds the holders just named for `view`
-    /// ([`StoreSnapshot::fill_affinity_rows`] or
-    /// [`StoreSnapshot::fill_affinity_rows_narrowed`], by the same `naming`,
-    /// into `named`) to the test the decision's pass asks of a row
-    /// ([`Engine::keeps_for`](crate::engine::framework::Engine::keeps_for)),
-    /// where they fill the naming's cap. A naming shorter than its cap holds
-    /// every holder the index has, and one under no cap names them all: no
-    /// lookup made again reads another, so neither is asked anything and
-    /// `keeps`, which makes the test, is not called.
-    ///
-    /// The holders of a full cap are asked by their rows in the view, up
-    /// to the first the pass keeps. Where one passes the naming stands as
-    /// it was made: no holder outside it is deeper, and the pass drops the
-    /// refused ones itself. Where the pass refuses every holder named, the
-    /// cap is full of rows the request cannot take. Their ids leave the
-    /// rows the lookup is kept within and the lookup is made again, so the
-    /// next deepest holders are read: at most four rounds more, until one
-    /// reads a holder that passes. Where none does the first naming
-    /// stands, and the pass rules on its rows itself. The warming rows are
-    /// not asked. `keeps` answers none where the pass alone can say.
-    #[inline]
-    pub(crate) fn name_kept<K: Fn(&Candidate) -> bool>(
-        &self,
-        model: &str,
-        role: Role,
-        naming: &AffinityQuery<'_>,
-        view: &[Candidate],
-        named: &mut AffinityRowsBuffers,
-        keeps: impl FnOnce() -> Option<K>,
-    ) {
-        if naming.cap != 0 && named.holders.len() >= naming.cap as usize {
-            self.name_tested(model, role, naming, view, named, keeps);
-        }
-    }
-
-    /// [`StoreSnapshot::name_kept`] for a naming that fills its cap. Out of
-    /// line: a decision that names no row, or fewer than its cap, runs past the
-    /// call and holds nothing of the test in its frame.
-    #[inline(never)]
-    fn name_tested<K: Fn(&Candidate) -> bool>(
-        &self,
-        model: &str,
-        role: Role,
-        naming: &AffinityQuery<'_>,
-        view: &[Candidate],
-        named: &mut AffinityRowsBuffers,
-        keeps: impl FnOnce() -> Option<K>,
-    ) {
-        let Some(keeps) = keeps() else {
-            return;
-        };
-        let passes = |holder: &AffinityHolder| view.get(holder.row as usize).is_some_and(&keeps);
-        if !named.holders.iter().any(passes) {
-            self.name_again(model, role, naming, view, named, &keeps);
-        }
-    }
-
-    /// [`StoreSnapshot::name_kept`] past a cap full of refused holders, out of
-    /// line.
-    #[cold]
-    #[inline(never)]
-    fn name_again(
-        &self,
-        model: &str,
-        role: Role,
-        naming: &AffinityQuery<'_>,
-        view: &[Candidate],
-        named: &mut AffinityRowsBuffers,
-        keeps: &dyn Fn(&Candidate) -> bool,
-    ) {
-        let Some(index) = self.index(model, role) else {
-            return;
-        };
-        if let (Some(rows), Some(Some(held))) = (self.rows.get(index), self.indexes.get(index)) {
-            held.name_again(naming, rows, view, keeps, named);
-        }
-    }
-
     /// The pool's standing in its model's index, for the cases: a
     /// membership write that kept it publishes the same one.
     #[cfg(test)]
@@ -2256,13 +1955,12 @@ struct Held {
 }
 
 /// The candidate row of one member: its fixed fields from its registration,
-/// its status bits, the bits the leader's own worker object sets, its load
-/// record when one is on file, and its engine family, zone and labels as
-/// `listed` reads them under the standing generation's lists. Its pair
-/// class is the membership's to derive ([`pair_up`]).
+/// its status bits, its load record when one is on file, and its engine
+/// family, zone and labels as `listed` reads them under the standing
+/// generation's lists. Its pair class is the membership's to derive
+/// ([`pair_up`]).
 fn row_of(
     member: &WorkerRow,
-    leader: LeaderBits,
     sample: Option<&LoadSample>,
     origin: Instant,
     listed: ViewListPositions,
@@ -2273,10 +1971,7 @@ fn row_of(
         role: facts.role,
         dp_rank: facts.dp_rank,
         dp_size: facts.dp_size,
-        health: Health {
-            stalled: leader.stalled,
-            ..health_of(member.status)
-        },
+        health: health_of(member.status),
         wire_modes: facts.wire_modes,
         load: sample.map(|sample| sample.row),
         load_sampled_at_micros: sample.map_or(0, |sample| micros(origin, sample.sampled_at)),
@@ -3141,7 +2836,7 @@ impl Writer {
         &mut self,
         spec: Arc<Applied>,
         epoch: u64,
-        members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot, LeaderBits)>,
+        members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>,
         on_file: impl OnFile,
     ) -> Result<(Arc<StoreSnapshot>, Option<Arc<Applied>>), StaleGeneration> {
         let standing = self.spec.generation();
@@ -3185,7 +2880,7 @@ impl Writer {
     /// the members written since the last and carries every other's
     /// ([`Writer::rebuild`]). A pool with a row that moved is published
     /// whole.
-    fn list<'a>(&mut self, members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot, LeaderBits)>) {
+    fn list<'a>(&mut self, members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>) {
         let Self {
             places,
             working,
@@ -3831,7 +3526,7 @@ impl Writer {
     pub(super) fn rebuild<'a>(
         &mut self,
         epoch: u64,
-        members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot, LeaderBits)>,
+        members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>,
         on_file: impl OnFile,
         classes: Classes,
     ) -> Arc<StoreSnapshot> {
@@ -3886,12 +3581,12 @@ impl Writer {
         let standing = !self.vetoes.by_gateway.is_empty();
         let mut ids = Vec::new();
         // The members in id order, by this write's one sort, each id beside
-        // its row, the slot its write gave it and the leader's bits: an id
-        // is one member, so every pool's entries, the ranks and the ids are
-        // pushed in order and nothing below sorts them. The sort moves an
-        // id, a reference, a slot and those bits, never a whole entry.
-        let mut members: Vec<(WorkerId, &'a WorkerRow, WorkerSlot, LeaderBits)> = members
-            .map(|(member, slot, leader)| (member.id, member, slot, leader))
+        // its row and the slot its write gave it: an id is one member, so
+        // every pool's entries, the ranks and the ids are pushed in order
+        // and nothing below sorts them. The sort moves an id, a reference
+        // and a slot, never a whole entry.
+        let mut members: Vec<(WorkerId, &'a WorkerRow, WorkerSlot)> = members
+            .map(|(member, slot)| (member.id, member, slot))
             .collect();
         members.sort_unstable_by_key(|&(id, ..)| id);
         // Every member's entry, in that order. A pool's list of whole
@@ -3911,7 +3606,7 @@ impl Writer {
         incoming.clear();
         let mut from = 0;
         let mut outside = OutsideLists::default();
-        for &(_, member, slot, leader) in &members {
+        for &(_, member, slot) in &members {
             if standing {
                 ids.push(member.id);
             }
@@ -3971,7 +3666,7 @@ impl Writer {
                 ViewListPositions::default()
             };
             let entry = Entry {
-                row: row_of(member, leader, sample.as_ref(), origin, listed),
+                row: row_of(member, sample.as_ref(), origin, listed),
                 facts,
                 admitted_micros: micros(origin, member.admitted_at),
                 local: match facts.reachable_from {
@@ -4313,7 +4008,7 @@ impl Writer {
         let unpooled: Box<[(WorkerId, WorkerSlot)]> = bare
             .iter()
             .filter_map(|&at| members.get(at as usize))
-            .map(|&(id, _, slot, _)| (id, slot))
+            .map(|&(id, _, slot)| (id, slot))
             .collect();
         debug_assert!(unpooled.is_sorted_by(|a, b| a.0 < b.0));
         let before = mem::replace(
@@ -4518,21 +4213,6 @@ impl Writer {
         })
     }
 
-    /// Fold what the leader's own worker object knows of a member into its
-    /// rows and publish at once, as a status change is: a decision does
-    /// not wait a window for a worker the leader doubts. `None` for a
-    /// worker with no row, and for the bits its rows carry already.
-    #[must_use]
-    pub(super) fn fold_leader(
-        &mut self,
-        id: WorkerId,
-        bits: LeaderBits,
-    ) -> Option<Arc<StoreSnapshot>> {
-        self.fold_health(id, |row| {
-            mem::replace(&mut row.stalled, bits.stalled) != bits.stalled
-        })
-    }
-
     /// Write `fold` over the health bits of each of the member's rows, and
     /// publish at once where it says a bit of one moved: a pool with a row
     /// that moved is published whole. `None` where none did.
@@ -4664,7 +4344,7 @@ impl Writer {
         &mut self,
         at: Option<Instant>,
         epoch: u64,
-        members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot, LeaderBits)>,
+        members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>,
         on_file: impl OnFile,
     ) -> Option<Arc<StoreSnapshot>> {
         let owed = self.owed.take()?;

@@ -5,9 +5,10 @@ use crate::{
     document::spec::ProfileSpec,
     engine::{
         decision::{Targets, MAX_TARGETS},
-        framework::{Picker, TieBand},
+        framework::{Picker, PoolWord, TieBand, DRAW_BOUND},
         view::{Candidate, PoolFacts, RequestFacts},
     },
+    fresh_seed,
     policies::standard_filters,
     stages::{
         lifecycle::Lifecycle,
@@ -29,7 +30,8 @@ pub(crate) fn profile() -> ProfileSpec {
 }
 
 /// A uniform draw over the survivors from the decision's seed, then further
-/// distinct draws as alternates.
+/// distinct draws as alternates. A place's pick is one draw of the calling
+/// thread's own and names no alternate ([`Picker::pick_alone`]).
 #[derive(Debug, Default)]
 pub struct Random;
 
@@ -47,6 +49,36 @@ impl Picker for Random {
 
     fn draws_first(&self) -> bool {
         true
+    }
+
+    // Its draw is its whole rule: a pick alone reads no row.
+    fn picks_alone(&self) -> bool {
+        true
+    }
+
+    /// One uniform draw over the pool, drawn again while its worker is
+    /// refused, [`DRAW_BOUND`] draws at most: a uniform draw over the
+    /// workers `keep` keeps. The draws are the calling thread's own
+    /// (`fresh_seed`), as the seed of a request that states none is: no
+    /// word is shared, and two processes draw apart. Past the bound the
+    /// pool is left to its caller's pass ([`Self::pick_among`]).
+    fn pick_alone(
+        &self,
+        pool: &PoolWord<'_>,
+        keep: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<usize> {
+        if pool.rows == 0 {
+            return None;
+        }
+        let mut draw = Draw::new(fresh_seed());
+        (0..DRAW_BOUND)
+            .map(|_| draw.below(pool.rows))
+            .find(|&at| keep(at))
+    }
+
+    /// A uniform draw among the workers a pass kept.
+    fn pick_among(&self, _: u64, passed: usize) -> usize {
+        Draw::new(fresh_seed()).below(passed)
     }
 
     /// The pick is a uniform draw over the pool, drawn again while its row

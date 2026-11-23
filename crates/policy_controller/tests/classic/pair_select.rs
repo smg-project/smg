@@ -389,22 +389,14 @@ fn differences(recorded: &Outcome, here: &Replayed) -> Vec<String> {
 }
 
 /// What an entry of [`APART`] holds its row to: every request of the row,
-/// in every draw, answered alike.
+/// in every draw, answered no pair, and why.
 #[derive(Clone, Copy, Debug)]
-enum Held {
-    /// The pair, the prefill's place and then the decode's.
-    Pair([usize; 2]),
-    /// No pair, and why.
-    None(&'static str),
-}
+struct Held(&'static str);
 
 impl Held {
     fn is(self, here: &Replayed) -> bool {
-        let holds = |answer: &Here| match (self, answer) {
-            (Self::Pair(pair), Here::Pair(ours)) => pair == *ours,
-            (Self::None(why), Here::None(ours, _)) => why == *ours,
-            _ => false,
-        };
+        let Self(why) = self;
+        let holds = |answer: &Here| matches!(answer, Here::None(ours, _) if why == *ours);
         match here {
             Replayed::Sequence(answers) => answers.iter().all(holds),
             Replayed::Counts(counts) => counts.iter().all(|(answer, _)| holds(answer)),
@@ -421,48 +413,22 @@ struct Apart {
     rule: &'static str,
 }
 
-/// The gateway lifts the overload veto for a prefill policy that weighs
-/// load against cache affinity itself, while shedding is off: the policy
-/// then places over its prefills that are over their thresholds, and the
-/// decode side keeps its own policy. Here a prefill profile that reads
-/// affinity is taken to weigh so, and no profile places over a lifted veto
-/// yet: its prefill that is only over its thresholds keeps the veto's
-/// refusal, where the prefills of another profile pair by load.
-const WEIGHS: &str = "no profile places over a lifted overload veto for a policy that weighs load";
-
-/// The rows decided apart: the four of a weighing prefill policy
-/// ([`WEIGHS`]), and one refusal's reason. Where the only ready prefill's
-/// partners are all over their thresholds beside a free decode of another
-/// transport, the gateway reads the whole decode pool, finds it not vetoed
-/// on every worker and answers unavailable. The pair's decision reads the
-/// partners of the prefills it could use and names the overload veto.
-const APART: &[Apart] = &[
-    Apart {
-        row: "pair-one-prefill-over-under-a-weighing-policy",
-        here: Held::Pair([1, 2]),
-        rule: WEIGHS,
-    },
-    Apart {
-        row: "pair-every-prefill-over-under-a-weighing-policy",
-        here: Held::None("overloaded"),
-        rule: WEIGHS,
-    },
-    Apart {
-        row: "pair-one-prefill-over-and-one-stalled-under-a-weighing-policy",
-        here: Held::None("overloaded"),
-        rule: WEIGHS,
-    },
-    Apart {
-        row: "pair-every-prefill-over-under-a-weighing-policy-and-every-decode-down",
-        here: Held::None("overloaded"),
-        rule: WEIGHS,
-    },
-    Apart {
-        row: "pair-the-only-ready-prefills-partners-over-beside-a-free-decode",
-        here: Held::None("overloaded"),
-        rule: "a refusal names the overload veto where the usable prefills' partners are all over",
-    },
-];
+/// The row decided apart: one refusal's reason. Where the only ready
+/// prefill's partners are all over their thresholds beside a free decode of
+/// another transport, the gateway reads the whole decode pool, finds it not
+/// vetoed on every worker and answers unavailable. The pair's decision
+/// reads the partners of the prefills it could use and names the overload
+/// veto.
+///
+/// The four rows of a prefill policy that weighs load against cache
+/// affinity itself replay as recorded: the gateway lifts the overload veto
+/// for such a policy while shedding is off, and a prefill profile that
+/// reads affinity runs with that veto lifted under a binding that steers.
+const APART: &[Apart] = &[Apart {
+    row: "pair-the-only-ready-prefills-partners-over-beside-a-free-decode",
+    here: Held("overloaded"),
+    rule: "a refusal names the overload veto where the usable prefills' partners are all over",
+}];
 
 /// What of one row's outcome this crate does not replay: nothing when its
 /// answers are the recorded ones, or when [`APART`] names the row and its
@@ -530,17 +496,10 @@ fn every_row_decided_apart_is_an_inline_row_held_to_its_entry() {
         assert_eq!(alone(row), Vec::<String>::new(), "{}", apart.row);
         let requests = row["requests"].as_u64().expect("a number of requests");
         let mut as_here = row.clone();
-        as_here["outcome"] = match apart.here {
-            Held::Pair(pair) if row["outcome"].get("counts").is_some() => {
-                serde_json::json!({ "counts": { "draws": 600, "pairs": [[pair[0], pair[1], 600]] } })
-            }
-            Held::Pair(pair) => {
-                serde_json::json!({ "sequence": vec![serde_json::json!({ "pair": pair }); requests as usize] })
-            }
-            Held::None(why) => serde_json::json!({
-                "sequence": vec![serde_json::json!({ "none": { "role": "prefill", "why": why } }); requests as usize]
-            }),
-        };
+        let Held(why) = apart.here;
+        as_here["outcome"] = serde_json::json!({
+            "sequence": vec![serde_json::json!({ "none": { "role": "prefill", "why": why } }); requests as usize]
+        });
         let found = alone(&as_here);
         assert!(
             matches!(&found[..], [one] if one.contains("take the row out of APART") && one.contains(apart.rule)),
@@ -570,8 +529,9 @@ fn a_text_that_is_no_pair_sheet_is_a_defect() {
     );
 }
 
-/// Rows copied from the recorded sheet, whole: every row decided apart, and
-/// one or more of each form the replay reads.
+/// Rows copied from the recorded sheet, whole: every row decided apart, the
+/// four of a prefill policy that weighs load against affinity, and one or
+/// more of each form the replay reads.
 pub const INLINE: &str = r#"{
   "recorded_from": "4ba2a6431357be5411a2383cdc4916b41471d722",
   "policy": "pair-select",

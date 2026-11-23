@@ -814,7 +814,21 @@ impl<'a> EncoderInputView<'a> {
                 shape,
                 norm,
             } => {
-                let row_bytes = row_len(shape) * dtype.element_size();
+                // The bytes of a row are those of the axes after the first:
+                // one element for a wire of one axis, which `row_len` reads
+                // as one row. The wire must hold exactly its rows.
+                let row_bytes = shape
+                    .iter()
+                    .skip(1)
+                    .try_fold(dtype.element_size(), |row, &dim| row.checked_mul(dim))
+                    .filter(|&row| rows.checked_mul(row) == Some(bytes.len()))
+                    .context("wire bytes do not match their shape")?;
+                // A byte wire reads an element's channel from its place in the
+                // buffer; a part of one axis could start or end inside a cycle.
+                anyhow::ensure!(
+                    *dtype != EncoderDtype::Uint8 || shape.len() != 1 || len == rows || len == 0,
+                    "a byte wire of one axis is not sliced apart"
+                );
                 let mut sliced = shape.clone();
                 if let Some(first_dim) = sliced.first_mut() {
                     *first_dim = len;
@@ -2221,6 +2235,35 @@ mod tests {
                 assert!(wire.write_as(EncoderDtype::Float32).is_empty());
             }
         }
+    }
+
+    #[test]
+    fn a_wire_of_one_axis_slices_by_elements() {
+        let wire = |bytes: Vec<u8>, dtype, shape: &[usize]| EncoderInput::Wire {
+            bytes,
+            dtype,
+            shape: shape.to_vec(),
+            norm: PixelNorm {
+                scale: 1.0,
+                offset: [0.0, 1.0, 2.0],
+                divisor: [1.0; 3],
+                channel_block: 1,
+            },
+        };
+        let two = wire(vec![0x80, 0x3f, 0x00, 0x40], EncoderDtype::BFloat16, &[2]);
+        let second = two.slice_axis0(1, 1).unwrap();
+        assert_eq!(second.shape(), &[1]);
+        assert_eq!(second.write_as(EncoderDtype::BFloat16), [0x00, 0x40]);
+        // A trailing axis of zero: a row holds no byte.
+        let empty = wire(Vec::new(), EncoderDtype::BFloat16, &[2, 0]);
+        assert_eq!(empty.slice_axis0(1, 1).unwrap().shape(), &[1, 0]);
+        // Refused: bytes that do not match the shape, and one element of a
+        // byte wire of one axis, whose channel is its place in the buffer.
+        let long = wire(vec![0; 9], EncoderDtype::BFloat16, &[2, 2]);
+        assert!(long.slice_axis0(0, 1).is_err());
+        let pixels = wire(vec![10; 3], EncoderDtype::Uint8, &[3]);
+        assert!(pixels.slice_axis0(1, 1).is_err());
+        assert_eq!(pixels.slice_axis0(0, 3).unwrap().shape(), &[3]);
     }
 }
 

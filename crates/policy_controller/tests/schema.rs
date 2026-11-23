@@ -358,9 +358,10 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
     assert_eq!(field("CanarySpec", "percent")["maximum"], 100);
     assert_eq!(field("CanarySpec", "percent")["minimum"], 1);
     assert_eq!(field("SessionsSpec", "inflight_cap")["minimum"], 1);
-    assert_eq!(field("OverloadSpec", "waiting_requests")["minimum"], 1);
-    assert_eq!(field("OverloadSpec", "token_usage")["exclusiveMinimum"], 0);
-    assert_eq!(field("OverloadSpec", "token_usage")["maximum"], 1.0);
+    // A binding's overload block names no number: either field is left out
+    // or null.
+    assert_eq!(field("OverloadSpec", "waiting_requests")["type"], "null");
+    assert_eq!(field("OverloadSpec", "token_usage")["type"], "null");
     assert_eq!(field("Weight", "weight")["exclusiveMinimum"], 0);
     assert_eq!(field("PrefixAffinityParams", "threshold")["maximum"], 1.0);
     assert_eq!(field("BucketParams", "rel_threshold")["minimum"], 1.0);

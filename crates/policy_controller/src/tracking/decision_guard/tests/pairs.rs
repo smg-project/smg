@@ -25,7 +25,7 @@ use crate::{
         decision::{Decision, ShadowKind, Target},
         decision_engine::{
             DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused, HeldDecision,
-            Plain, Request, RequestMaker, SweepOutcome, TokenKey, WorkerLists,
+            Plain, Request, RequestMaker, TokenKey, WorkerLists,
         },
         framework::{EncodeItems, EncodePlaced, EncoderFacts},
         list_cell::tests::PublishedList,
@@ -164,20 +164,6 @@ impl DecisionEngine for Door<'_> {
         DecisionEngine::decide_decode_under(self.engine, gateway, &listed, held, now)
     }
 
-    fn decide_encode_pair(
-        &self,
-        gateway: GatewayId,
-        request: &Request<'_>,
-        items: EncodeItems<'_>,
-        placed: &mut EncodePlaced,
-        now: Instant,
-    ) -> Result<DecideOutcome, DecisionRefused> {
-        if !self.hears(gateway, None) {
-            return Err(DecisionRefused::Faulted);
-        }
-        DecisionEngine::decide_encode_pair(self.engine, gateway, request, items, placed, now)
-    }
-
     fn say(&self, gateway: GatewayId, held: &HeldDecision<'_>, said: Said, now: Instant) {
         if !self.hears(gateway, Some(held)) {
             return;
@@ -195,8 +181,8 @@ impl DecisionEngine for Door<'_> {
         DecisionEngine::say(self.engine, gateway, held, said, now);
     }
 
-    fn sweep(&self, now: Instant) -> SweepOutcome {
-        DecisionEngine::sweep(self.engine, now)
+    fn sweep(&self, now: Instant) {
+        DecisionEngine::sweep(self.engine, now);
     }
 
     fn with_spec<R>(&self, read: impl FnOnce(&AppliedSpec) -> R) -> R {

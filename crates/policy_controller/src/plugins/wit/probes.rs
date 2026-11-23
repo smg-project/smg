@@ -218,11 +218,13 @@ pub(crate) fn all() -> Vec<Probe> {
         probe!("request", before [], RequestFacts {
             model, namespace_seed, tenant, priority, streaming, max_output_tokens,
             prompt_tokens, block_hashes, hash_kind, session_key, phase, attempt, tried,
-            budget_micros, headers, media, seed, block_size, now_micros, pinned_at,
+            budget_micros, headers, media, seed, block_size, prompt_chars, prompt_bytes, now_micros,
+            pinned_at,
             lent_in_flight, lent_session_in_flight, session_counted, affinity, named,
             model_fingerprint, signal_cells, client_key, ring, ring_positions,
         } host [
-            now_micros, pinned_at, lent_in_flight, lent_session_in_flight, session_counted,
+            prompt_chars, prompt_bytes, now_micros, pinned_at, lent_in_flight, lent_session_in_flight,
+            session_counted,
             affinity, named, model_fingerprint, signal_cells, client_key, ring, ring_positions
         ],
         &request),
@@ -237,8 +239,8 @@ pub(crate) fn all() -> Vec<Probe> {
         // takes this pair out.
         probe!("lease", before [], Lease {
             id, kind, side, target_index, booked, generation, session as "session-key",
-            session_verdict, issued_micros, tokens,
-        } host [booked, session_verdict, issued_micros], &lease),
+            session_verdict, issued_micros, tokens, chars, bytes,
+        } host [booked, session_verdict, issued_micros, chars, bytes], &lease),
         probe!("pair", before [], Pair {
             decode_position, decode_id, decode_dp_rank, decode_verdict,
         } host [decode_position, decode_verdict], &pair),

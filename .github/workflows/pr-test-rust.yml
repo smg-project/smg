@@ -1709,11 +1709,12 @@ jobs:
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-chat-completions != 'true'
-    # The 1-GPU ZMQ suite with grouped workers: each ZMQ worker launches two
-    # DP engines on one socket set (tp=1 models, one GPU per engine), so the
-    # gateway's handshake, the connector's least-loaded selection, and
-    # per-rank output attribution all run against a real dp=2 group. The wave
-    # protocol is vLLM-only (TokenSpeed ranks run independently).
+    # The 1-GPU ZMQ suite with an engine count of two: each ZMQ worker launches
+    # two DP engines on one socket set (tp=1 models, one GPU per engine), and
+    # the gateway registers one worker per engine. So the gateway's handshake,
+    # the routing policy's pick of a rank, the rank pin and per-rank output
+    # attribution all run against a real dp=2 group. The wave protocol is
+    # vLLM-only (TokenSpeed ranks run independently).
     strategy:
       fail-fast: false
       matrix:

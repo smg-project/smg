@@ -1423,10 +1423,7 @@ mod tests {
         use smg_grpc_client::{engine_labels::ServerInfo, tokenspeed_proto};
         use smg_worker::workflow::dp_info_from_labels;
 
-        let host = app_context_with(RouterConfig {
-            dp_aware: true,
-            ..RouterConfig::default()
-        });
+        let host = app_context_with(RouterConfig::default());
         for (size, total, expected) in [(1, 1024, 1024), (16, 1024, 64), (16, 1031, 64)] {
             for window_key in ["max_num_seqs", "max_running_requests"] {
                 let info =
@@ -1463,7 +1460,7 @@ mod tests {
                     );
                     data.worker_kind = Some(WorkerKind::Local);
                     data.connection_mode = Some(ConnectionMode::Grpc);
-                    data.dp_info = Some(dp_info_from_labels(&labels).unwrap());
+                    data.dp_info = dp_info_from_labels(&labels).unwrap();
                     data.discovered_labels = labels.clone();
                     let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
 

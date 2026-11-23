@@ -607,9 +607,9 @@ impl Gateways {
                 _ = tick.tick() => {
                     let now = Instant::now();
                     self.sweep(now);
-                    // The pins of record ride this clock: a pass of theirs
-                    // is due far less often than a tick.
-                    self.store.sweep_pins(now);
+                    // The names that left ride this clock: one that stayed
+                    // away past its time takes its session pins with it.
+                    self.store.end_gone(now);
                     // So do the leases past their dispatch deadline in
                     // a file whose decider waits for a job: one at work
                     // ends its own file's at its issues.
@@ -908,7 +908,10 @@ pub(crate) mod tests {
     };
     use crate::{
         document::spec::{AppliedSpec, PolicySpec},
-        engine::view::{Role, WorkerId},
+        engine::{
+            sticky_sessions::SessionVerdict,
+            view::{Role, Session, WorkerId},
+        },
         service::{
             controller::lifecycle::{
                 self,
@@ -918,7 +921,7 @@ pub(crate) mod tests {
         },
         store::{
             GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord,
-            SessionsStore, ViewBuffers, ViewQuery, WorkersStore,
+            WorkersStore,
         },
         tracking::lease::{Lease, LeaseId},
     };
@@ -1107,7 +1110,7 @@ pub(crate) mod tests {
         for gateway in [A, B] {
             lifecycle::completed(
                 &store,
-                &lifecycle::open(&store, gateway),
+                &lifecycle::tests::open(&store, gateway),
                 &a_completed(1, served),
                 t0,
             )
@@ -1141,7 +1144,7 @@ pub(crate) mod tests {
         let gone = welcomed(&gateways, A, "gateway-a", TERM, t0);
         lifecycle::completed(
             &store,
-            &lifecycle::open(&store, A),
+            &lifecycle::tests::open(&store, A),
             &a_completed(1, served),
             t0,
         )
@@ -1177,7 +1180,7 @@ pub(crate) mod tests {
         // Its late frame, then its end.
         lifecycle::completed(
             &store,
-            &lifecycle::open(&store, A),
+            &lifecycle::tests::open(&store, A),
             &a_completed(1, served),
             t0 + GRACE,
         )
@@ -1274,7 +1277,7 @@ pub(crate) mod tests {
                 let seat = welcomed(&gateways, gateway, &subject, TERM, now);
                 lifecycle::completed(
                     &store,
-                    &lifecycle::open(&store, gateway),
+                    &lifecycle::tests::open(&store, gateway),
                     &a_completed(1, served),
                     now,
                 )
@@ -1682,28 +1685,43 @@ pub(crate) mod tests {
             .expect("it ended by itself");
     }
 
-    /// The pins of record ride the sweeps' task: a pin past its end leaves
-    /// by the task's own tick, which no other caller of the pins' sweep
-    /// stands in for.
+    /// The names that left ride the sweeps' task: one that stays away past
+    /// the absence's time takes its session pins with it by the task's own
+    /// tick, which no other caller of the store's tick stands in for.
     #[tokio::test]
-    async fn the_sweeps_task_drops_a_pin_of_record_past_its_end() {
-        let (_elector, store, gateways, t0) = leading(Duration::from_millis(60));
-        // A standing sessions rule: without one no pass of the pins runs.
+    async fn the_sweeps_task_ends_the_absence_of_a_key_that_stays_away() {
+        let (_elector, store, gateways, _t0) = leading(Duration::from_millis(60));
+        // The absence's time is the longest TTL of the document's session
+        // rules: one second.
         let mut document = PolicySpec::preset("manual").expect("a preset of this build");
         document.generation = 1;
+        let rule = document.bindings[0].sessions.as_mut();
+        let rule = rule.expect("the preset's rule");
+        (rule.ttl_s, rule.sweep_s) = (1, 1);
         let spec = AppliedSpec::validate(&document).expect("the document validates");
         store.apply(spec).expect("a first generation");
-        SessionsStore::pin(&*store, 7, WorkerId(1), t0, Some(store.micros(t0)));
-        assert_eq!(SessionsStore::len(&*store), 1);
+        let w = worker(&store, "http://a:8000");
+        let key = Session::from_raw(7);
+        let held = || {
+            let world = store.snapshot();
+            let table = world.spec().engine().sessions();
+            table.pins(key).map(|pins| pins[0])
+        };
+        let world = store.snapshot();
+        let table = world.spec().engine().sessions();
+        table.dispatched(key, SessionVerdict::Pinned, w);
+        let revision = WorkersStore::get(&*store, w).expect("the row").revision;
+        WorkersStore::remove(&*store, w, revision).expect("removed");
+        assert_eq!(held(), Some(w), "inside its time");
         let (stop, stopped) = watch::channel(false);
         let mut task = JoinSet::new();
         let sweeper = Arc::clone(&gateways);
         task.spawn(async move { sweeper.run(stopped).await });
         let started = Instant::now();
-        while SessionsStore::len(&*store) > 0 {
+        while held().is_some() {
             assert!(
                 started.elapsed() < Duration::from_secs(20),
-                "the task swept no pin in 20 s"
+                "the task ended no absence in 20 s"
             );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -1778,31 +1796,22 @@ pub(crate) mod tests {
         assert!(!store.vetoed(A, w, t0));
     }
 
-    /// What a view built for `gateway` at `now` reads of the worker: the
-    /// breaker bit and the stalled bit of its row.
+    /// What the published world's veto reader hands `gateway` of the worker
+    /// at `now`: whether a hold stands on it, and whether a veto does.
     fn bits(
         store: &MemoryStore,
         gateway: GatewayId,
         worker: WorkerId,
         now: Instant,
     ) -> (bool, bool) {
-        let ask = ViewQuery {
-            gateway,
-            now,
-            pinned: None,
-            affinity: false,
-            signal_cells: false,
-        };
-        let mut out = ViewBuffers::default();
         // A registration is in force at its window's publication: the case
         // asks for one.
         store.publish_now();
-        store
-            .build_view("m", Role::Single, &ask, &mut out)
-            .expect("the pool");
-        let row = out.candidates.iter().find(|row| row.id == worker);
-        let health = row.expect("the worker's row").health;
-        (health.breaker_open, health.stalled)
+        let world = store.snapshot();
+        assert!(world.first_row_of(worker).is_some(), "the worker's row");
+        let vetoes = world.gateway_vetoes("m", Role::Single, gateway);
+        let veto = vetoes.standing_at(now).find(|veto| veto.id == worker);
+        veto.map_or((false, false), |veto| (veto.held, true))
     }
 
     /// The store reads no kind: the note says which ends hold. Every kind

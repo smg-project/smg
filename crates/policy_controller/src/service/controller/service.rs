@@ -39,6 +39,7 @@ use std::{
 };
 
 use prost::Message as _;
+use smg_worker::load::state::LoadReceiver;
 use tokio::sync::watch;
 use tonic::{
     codegen::http,
@@ -234,7 +235,12 @@ impl Shared {
         address: String,
         elector: &Elector,
         standing: watch::Receiver<ElectionObservation>,
-        (store, feed, objects): (Arc<MemoryStore>, Feed, Arc<Objects<Members>>),
+        (store, feed, objects, loads): (
+            Arc<MemoryStore>,
+            Feed,
+            Arc<Objects<Members>>,
+            LoadReceiver,
+        ),
         catalog: Arc<StageRegistry>,
         deciders: usize,
     ) -> io::Result<Self> {
@@ -250,6 +256,7 @@ impl Shared {
             &Reads {
                 store: Arc::clone(&store),
                 objects: Arc::clone(&objects),
+                loads,
                 fence: elector.fence(),
                 standing: standing.clone(),
                 clock: Arc::new(Instant::now),
@@ -264,10 +271,9 @@ impl Shared {
             fence: elector.fence(),
             standing,
             generations: Arc::clone(&generations),
-            // The door leaves the worker objects its deciding threads read
-            // holding each call's write.
-            door: MembershipCalls::new(Arc::clone(&store), Arc::clone(&feed.log))
-                .following(objects),
+            // The door decides a row's write over the worker objects its
+            // deciding threads read.
+            door: MembershipCalls::new(Arc::clone(&store), Arc::clone(&feed.log), objects),
             replication: Replication::new(
                 Arc::clone(&store),
                 Arc::clone(&feed.log),
@@ -1149,12 +1155,11 @@ mod tests {
 
     use super::{unanswered, Call, RpcStatus, Service, Shared};
     use crate::{
-        engine::store_backed_engine::TERM_MARK,
         service::{
             controller,
             controller::{
                 config::Scope,
-                decision_slots::{tests as bed, Job},
+                decision_slots::{tests as bed, Job, TERM_MARK},
                 election::{self, ElectionObservation, LeasePlace},
                 gateways::tests::PATIENT,
                 generations::{tests::LEAST_LOAD, Format, Unanswered},
@@ -1175,7 +1180,7 @@ mod tests {
             proto::{self, busy::Reason, policy_controller_server::PolicyController},
         },
         stages::registry::StageRegistry,
-        store::{JournalKinds, LeasesStore, Position, WorkersStore},
+        store::{LeasesStore, Position, WorkersStore},
         tracking::lease::{LeaseId, ReleaseReason},
     };
 
@@ -1259,6 +1264,88 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    /// The service's own calls object writes the worker objects its
+    /// decisions read: the one holder the service is built with. Workers
+    /// registered through that object are named by a decision over the
+    /// holder, with no follow of the case's and no deciding thread's. One
+    /// whose deregistration the object acknowledged is named by none
+    /// behind it, and neither is one whose drain it acknowledged. A service
+    /// that handed its calls another holder would name none from the first
+    /// registration on.
+    #[tokio::test]
+    async fn the_services_calls_write_the_worker_objects_its_decisions_read() {
+        use crate::{
+            engine::view::WorkerId,
+            service::proto::{register_worker_request::Mode, worker_event::Event},
+        };
+
+        const TERM: u64 = 3;
+        let elector = Elector::alone(IDENTITY, PATIENT).expect("the settings are in order");
+        let (_standing, stood) = watch::channel(ElectionObservation::default());
+        let journaled = journaled_from(&LeasePlace::Process, 0);
+        let (store, feed, objects, loads) = bed::followed(journaled);
+        store.set_term(TERM);
+        let shared = Shared::new(
+            ID.to_owned(),
+            ADDRESS.to_owned(),
+            &elector,
+            stood,
+            (Arc::clone(&store), feed, Arc::clone(&objects), loads),
+            Arc::new(StageRegistry::builtin()),
+            1,
+        )
+        .expect("the decider starts");
+        let applied = store.apply(bed::preset("round_robin", 1));
+        applied.expect("above the unbound start");
+        let by = told("operator-a");
+        // The workers twelve decisions name over the service's holder.
+        let named = || -> BTreeSet<WorkerId> {
+            let frames = (1..=12).map(|seed| bed::frame(seed, u64::from(seed)));
+            frames
+                .filter_map(|frame| bed::lent_pick(&store, &objects, frame))
+                .collect()
+        };
+        let register = |name: &str| {
+            let spec = proto::WorkerSpec {
+                url: format!("grpc://{name}:8000"),
+                wire: proto::WireMode::Grpc as i32,
+                role: proto::Role::Single as i32,
+                models: vec![bed::MODEL.to_owned()],
+                health_policy: Some(proto::HealthPolicy {
+                    disabled: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let asked = proto::RegisterWorkerRequest {
+                spec: Some(spec),
+                mode: Mode::Add as i32,
+                wait_ready: false,
+            };
+            let told = shared.door.register(&by, || Ok(TERM), &asked);
+            match told.expect("the service's door takes the worker").event {
+                Some(Event::Registered(row)) => WorkerId(row.id),
+                other => panic!("no registration in {other:?}"),
+            }
+        };
+        let ids = ["w0", "w1", "w2"].map(register);
+        assert_eq!(named(), BTreeSet::from(ids));
+        let leave = |id: WorkerId, drain: bool| {
+            let row = WorkersStore::get(&*store, id).expect("the row stands");
+            let request = proto::DeregisterWorkerRequest {
+                worker_id: id.0,
+                revision: row.revision,
+                drain,
+            };
+            let told = shared.door.deregister(&by, || Ok(TERM), &request);
+            told.expect("the service's door acknowledges");
+        };
+        leave(ids[0], false);
+        assert_eq!(named(), BTreeSet::from([ids[1], ids[2]]));
+        leave(ids[1], true);
+        assert_eq!(named(), BTreeSet::from([ids[2]]));
     }
 
     /// A leader whose term's lease ids pass their mark leaves and decides on
@@ -3043,7 +3130,7 @@ mod tests {
             refused(service.deregister_worker(removal).await.err(), "a removal");
             let snapshot = from("operator-a", proto::SnapshotRequest::default());
             refused(service.get_snapshot(snapshot).await.err(), "a snapshot");
-            assert_eq!(service.shared.feed.log.head(JournalKinds::Watched), place);
+            assert_eq!(service.shared.feed.log.head(), place);
         }
     }
 

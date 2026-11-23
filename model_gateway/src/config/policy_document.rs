@@ -17,12 +17,13 @@
 
 use smg_policy_controller::{
     document::{
-        AppliedSpec, Assignment, IndexKind, LoadMetricSetting, ModeSettings, Pairing,
-        PolicySettings, PolicySpec, RoutingKeyOverrideSettings, RoutingSettings,
+        AppliedSpec, Assignment, ConnectionModeSetting, IndexKind, LoadMetricSetting, ModeSettings,
+        Pairing, PolicySettings, PolicySpec, RoutingKeyOverrideSettings, RoutingSettings,
         RoutingSettingsError, SpecError,
     },
     stages::StageRegistry,
 };
+use smg_worker::identity::basic::ConnectionMode;
 
 use super::{
     CacheIndexKind, GroupedDpSticky, ManualAssignmentMode, PdPairingMode, PolicyConfig,
@@ -133,6 +134,11 @@ impl RouterConfig {
             mode,
             policy: policy_settings(&self.policy),
             enable_igw: self.enable_igw,
+            connection_mode: match self.connection_mode {
+                ConnectionMode::Http => ConnectionModeSetting::Http,
+                ConnectionMode::Grpc => ConnectionModeSetting::Grpc,
+                ConnectionMode::Zmq => ConnectionModeSetting::Zmq,
+            },
             policy_spec: self.policy_spec.clone(),
             grouped_dp_sticky: match self.grouped_dp_sticky {
                 GroupedDpSticky::Off => None,
@@ -418,6 +424,7 @@ mod tests {
             },
             policy: PolicyConfig::RoundRobin,
             enable_igw: true,
+            connection_mode: ConnectionMode::Grpc,
             policy_spec: Some(document.clone()),
             grouped_dp_sticky: GroupedDpSticky::Hash,
             dp_minimum_tokens_scheduler: true,
@@ -446,6 +453,7 @@ mod tests {
                 mode: ModeSettings::Regular,
                 policy: PolicySettings::RoundRobin,
                 enable_igw: true,
+                connection_mode: ConnectionModeSetting::Grpc,
                 policy_spec: Some(document),
                 grouped_dp_sticky: Some("hash"),
                 dp_minimum_tokens_scheduler: true,
@@ -747,6 +755,31 @@ mod tests {
         RouterConfig {
             mode,
             ..RouterConfig::default()
+        }
+    }
+
+    /// A pair gateway counts tokens on a prefill worker over HTTP alone: its
+    /// document binds that single request there, behind the pair, and plans
+    /// the pair alone over gRPC and over ZMQ, where no request would reach
+    /// the binding.
+    #[test]
+    fn a_pair_gateways_document_binds_a_single_request_over_http_alone() {
+        for (connection_mode, bindings) in [
+            (ConnectionMode::Http, 2),
+            (ConnectionMode::Grpc, 1),
+            (ConnectionMode::Zmq, 1),
+        ] {
+            let config = RouterConfig {
+                connection_mode,
+                ..config_of(RoutingMode::PrefillDecode {
+                    prefill_urls: Vec::new(),
+                    decode_urls: Vec::new(),
+                    prefill_policy: None,
+                    decode_policy: None,
+                })
+            };
+            let document = config.policy_document().expect("the mode's document");
+            assert_eq!(document.bindings.len(), bindings, "{connection_mode:?}");
         }
     }
 

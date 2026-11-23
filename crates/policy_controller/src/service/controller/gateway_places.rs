@@ -8,8 +8,6 @@
 //! the engine takes it: the places of the list the frame's request may
 //! take, and the positions held back (`FrameRequest::held_to`).
 //!
-//! It answers as the engine over stored records answers the same frame:
-//!
 //! - **Reach.** A worker one gateway alone dials is a place for that
 //!   gateway and for no other.
 //! - **Wires.** A gateway that states wires takes the workers that state

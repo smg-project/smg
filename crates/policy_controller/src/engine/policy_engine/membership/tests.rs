@@ -45,6 +45,8 @@ use crate::{
     },
 };
 
+pub(in crate::engine::policy_engine) mod fills;
+
 const MODEL: &str = "model-a";
 
 /// The plainest generation of a registry: a list's members and nothing

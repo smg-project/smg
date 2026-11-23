@@ -972,6 +972,7 @@ impl CliArgs {
                     worker_ports_annotation: "smg.ai/worker-ports".to_string(),
                     kv_connector_annotation: self.discovery.kv_connector_annotation.clone(),
                     kv_engine_id_annotation: self.discovery.kv_engine_id_annotation.clone(),
+                    pairing_protocol_label: self.discovery.pairing_protocol_label.clone(),
                     router_selector: Self::parse_label_selector(&self.discovery.router_selector),
                     router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                     model_id_source: self.discovery.model_id_from.clone(),

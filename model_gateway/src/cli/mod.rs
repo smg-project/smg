@@ -180,8 +180,10 @@ struct CliArgs {
 /// typed beside a document is refused by both names, at its default value
 /// too. A flag the gateway still reads under a document is not listed, but
 /// for `grouped_dp_sticky`: the dispatch pins by the gateway's own key, and
-/// a supplied document names its own key sources.
-const DOCUMENT_REPLACES: [&str; 45] = [
+/// a supplied document names its own key sources. The two overload
+/// thresholds are not listed: no document names one, and the gateway builds
+/// its worker objects with them.
+const DOCUMENT_REPLACES: [&str; 43] = [
     "policy",
     "cache_threshold",
     "balance_abs_threshold",
@@ -193,8 +195,6 @@ const DOCUMENT_REPLACES: [&str; 45] = [
     "overload_token_usage_threshold",
     "worker_overload_protection",
     "disable_worker_overload_protection",
-    "worker_overload_waiting_requests",
-    "worker_overload_token_usage",
     "worker_overload_shed",
     "overlap_decay",
     "selection_temperature",
@@ -322,11 +322,11 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 200, value_parser = parse_job_queue_concurrency, help_heading = "Worker Configuration")]
     job_queue_concurrency: usize,
 
-    /// DP engines per startup ZMQ worker: each ipc:// or tcp:// worker becomes a
-    /// grouped worker whose handshake awaits this many engines on one socket set
-    /// (default: as many as the first engine to dial declares, one for an
-    /// engine that declares none). Under --dp-aware a worker given this count
-    /// registers as one worker per engine, which share the socket set.
+    /// DP engines per startup ZMQ worker: each ipc:// or tcp:// worker given a
+    /// count above one registers as one worker per engine, which share one
+    /// socket set whose handshake awaits this many engines (default: one
+    /// worker, whose handshake awaits as many engines as the first to dial
+    /// declares, one for an engine that declares none).
     #[arg(long, value_parser = parse_positive_usize, help_heading = "Worker Configuration")]
     zmq_engine_count: Option<usize>,
 
@@ -616,7 +616,8 @@ struct RoutingArgs {
     #[arg(long, default_value = "expected_wait", value_parser = parse_power_of_two_load_metric, help_heading = "Routing Policy")]
     power_of_two_load_metric: PowerOfTwoLoadMetric,
 
-    /// Enable data parallelism aware scheduling
+    /// Deprecated, accepted and ignored: every registration reads an engine's
+    /// data-parallel size and registers one worker per rank (warned at start-up)
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
 
@@ -657,12 +658,13 @@ struct RoutingArgs {
     routing_key_headers: Vec<String>,
 
     /// Whether, and how, a request that carries a routing key is pinned to
-    /// one engine of a grouped data-parallel worker (a ZMQ worker whose
-    /// socket set several engines dial, as many as --zmq-engine-count says
-    /// or its engines declare), so a conversation keeps one engine's prefix
-    /// cache. The key is the sticky-session key: the first valid
-    /// --routing-key-headers header, or the body rid under
-    /// --routing-key-override
+    /// one engine of a grouped data-parallel worker (a ZMQ worker given no
+    /// engine count, whose socket set as many engines dial as they declare),
+    /// so a conversation keeps one engine's prefix cache. A worker given
+    /// --zmq-engine-count registers as one worker per engine, where the
+    /// routing policy picks the engine and this option does nothing. The key
+    /// is the sticky-session key: the first valid --routing-key-headers
+    /// header, or the body rid under --routing-key-override
     #[arg(
         long,
         value_enum,
@@ -677,9 +679,9 @@ struct RoutingArgs {
 
     /// Choose a data-parallel rank per request from the ranks' reported token
     /// loads: the HTTP prefill-decode router, for an engine registered as one
-    /// worker. Under --dp-aware the engine's ranks are workers and the policy's
-    /// pick among them is the rank choice, so this flag chooses nothing there
-    /// (warned at start-up)
+    /// worker. An engine that reports its data-parallel size registers as one
+    /// worker per rank and the policy's pick among them is the rank choice, so
+    /// this flag chooses nothing there (warned at start-up)
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_minimum_tokens_scheduler: bool,
 
@@ -729,8 +731,9 @@ struct RoutingArgs {
 
     /// Run this policy document in place of the one the routing flags mean.
     /// The document replaces those flags. A policy name, a policy's own
-    /// setting and the overload, warm-up and pairing settings are each
-    /// refused beside it by name
+    /// setting, the overload switch and shed flag and the warm-up and pairing
+    /// settings are each refused beside it by name. The two overload
+    /// thresholds stand beside it: the gateway builds its workers with them
     #[arg(
         long,
         value_name = "FILE",
@@ -1041,6 +1044,18 @@ struct DiscoveryArgs {
         help_heading = "Service Discovery (Kubernetes)"
     )]
     kv_engine_id_annotation: String,
+
+    /// Pod label containing the worker's prefill/decode pairing protocol.
+    /// A prefill and a decode pair only when their protocols are equal, so
+    /// an operator that rolls both roles can label the Pods of one rollout
+    /// alike and keep a prefill of one rollout from a decode of another.
+    /// A Pod without the label states none.
+    #[arg(
+        long,
+        default_value = "smg.ai/pairing-protocol",
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    pairing_protocol_label: String,
 
     /// Label selector for encode server pods in EPD mode
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
@@ -1482,7 +1497,7 @@ struct ServingArgs {
     cb_timeout_duration_secs: u64,
 
     /// While the circuit is closed, a failed request more than this many
-    /// seconds after the last one starts the count anew
+    /// seconds after the last one starts the count anew (at least 1)
     #[arg(long, default_value_t = 120, help_heading = "Circuit Breaker")]
     cb_window_duration_secs: u64,
 
@@ -2245,15 +2260,42 @@ mod tests {
         assert_eq!(config.policy_document_in_force(), Ok(document));
     }
 
+    /// No document names an overload threshold. The two flags stand beside
+    /// a document, the document stays in force, and the settings a worker
+    /// object is built with hold the two.
+    #[test]
+    fn the_overload_thresholds_stand_beside_a_document() {
+        let (file, document) = policy_file("round_robin").expect("a policy document file");
+        let path = file.path().to_str().expect("a UTF-8 path");
+        let config = cli_args_from(&[
+            "--policy-controller",
+            "on",
+            "--policy-spec",
+            path,
+            "--worker-overload-waiting-requests",
+            "32",
+            "--worker-overload-token-usage",
+            "0.9",
+        ])
+        .to_router_config(vec![], vec![])
+        .expect("the routing configuration");
+        assert_eq!(config.policy_document_in_force(), Ok(document));
+        let built = config.registration_settings().overload_defaults;
+        assert_eq!(built.waiting_requests, Some(32));
+        assert_eq!(built.token_usage, Some(0.9));
+    }
+
     /// The flags under the routing policy heading a document does not
     /// replace: the controller's own, and what the gateway reads itself.
-    const BESIDE_A_DOCUMENT: [&str; 6] = [
+    const BESIDE_A_DOCUMENT: [&str; 8] = [
         "policy_controller",
         "policy_spec",
         "print_policy_spec",
         "dp_aware",
         "routing_key_headers",
         "enable_igw",
+        "worker_overload_waiting_requests",
+        "worker_overload_token_usage",
     ];
 
     #[test]
@@ -3831,6 +3873,37 @@ mod tests {
         };
         assert_eq!(defaults.kv_connector_annotation, "smg.ai/kv-connector");
         assert_eq!(defaults.kv_engine_id_annotation, "smg.ai/kv-engine-id");
+    }
+
+    #[test]
+    fn the_pairing_protocol_label_flows_into_both_configs() {
+        let cli = cli_args_from(&[
+            "--service-discovery",
+            "--selector",
+            "app=worker",
+            "--pairing-protocol-label",
+            "example.com/rollout",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        let Some(DiscoveryConfig::Kubernetes(discovery)) = &router.discovery else {
+            panic!("expected Kubernetes discovery");
+        };
+        assert_eq!(discovery.pairing_protocol_label, "example.com/rollout");
+
+        let server = cli.to_server_config(router).unwrap();
+        let Some(RuntimeDiscoveryConfig::Kubernetes(discovery)) = &server.service_discovery_config
+        else {
+            panic!("expected Kubernetes runtime discovery");
+        };
+        assert_eq!(discovery.pairing_protocol_label, "example.com/rollout");
+
+        let defaults = cli_args_from(&["--service-discovery", "--selector", "app=worker"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        let Some(DiscoveryConfig::Kubernetes(defaults)) = &defaults.discovery else {
+            panic!("expected Kubernetes discovery");
+        };
+        assert_eq!(defaults.pairing_protocol_label, "smg.ai/pairing-protocol");
     }
 
     /// `--discovery-provider kubernetes` is `--service-discovery` under its

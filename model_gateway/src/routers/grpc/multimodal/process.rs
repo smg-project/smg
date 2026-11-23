@@ -82,6 +82,23 @@ struct Timings {
     token_expand_ms: f64,
 }
 
+/// The refusal of an image whose size the processor's own size rule
+/// refuses, found on its header before any decode: the request's own media,
+/// refused as sent on both pipelines (a 400 under the media stage's code;
+/// from a worker, a media fault of the client's).
+#[derive(Debug, thiserror::Error)]
+#[error("Image preprocessing failed: {0}")]
+pub(crate) struct ImageSizeRefused(pub(crate) String);
+
+impl ImageSizeRefused {
+    /// Whether `error` is this refusal, at any depth of its chain.
+    pub(crate) fn is(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .any(|cause| cause.downcast_ref::<Self>().is_some())
+    }
+}
+
 /// The refusal of a video part by a process that cannot decode video
 /// (`llm_multimodal::missing_video_decoder`): the request's own answer, a
 /// 400 under the media stage's code like a modality the model does not
@@ -625,14 +642,17 @@ fn image_prompt_tokens<'a>(
 /// the same budget in [`prepared_part`]. A batch whose pixel tensors could
 /// not ride in one message to the engine is refused at the same point, on
 /// the same sizes, as the request's own, where the caller knows they ride
-/// inline in the gateway's own message ([`check_image_wire_cap`]).
+/// inline in the gateway's own message ([`check_image_wire_cap`]). A size
+/// the processor's rule refuses is refused there too, in the preprocessing's
+/// words ([`ImageSizeRefused`]).
 async fn preprocess_modality(
     media: &MediaBatch,
     ctx: &PlanContext<'_>,
 ) -> Result<PreprocessedEncoderInputs> {
     if let MediaBatch::Images(images) = media {
         if let Ok(processor) = ctx.vision_processors.image() {
-            check_image_size_feature_budget(processor.as_ref(), images, ctx.encoder_budget)?;
+            let refused =
+                check_image_size_feature_budget(processor.as_ref(), images, ctx.encoder_budget)?;
             check_image_wire_cap(
                 processor.as_ref(),
                 images,
@@ -640,6 +660,9 @@ async fn preprocess_modality(
                 ctx.image_wire_cap,
             )
             .map_err(llm_multimodal::MultiModalError::Media)?;
+            if let Some(refused) = refused {
+                return Err(ImageSizeRefused(refused.to_string()).into());
+            }
         }
     }
     if let Some(preprocessed) = cached_images(media, ctx).await? {

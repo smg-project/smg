@@ -145,6 +145,11 @@ pub struct KubernetesDiscoveryConfig {
     pub kv_connector_annotation: String,
     #[serde(default = "default_kv_engine_id_annotation")]
     pub kv_engine_id_annotation: String,
+    /// Pod label holding the worker's prefill/decode pairing protocol: a
+    /// prefill and a decode pair only when their protocols are equal. The
+    /// value is trimmed, and an absent or empty label states none.
+    #[serde(default = "default_pairing_protocol_label")]
+    pub pairing_protocol_label: String,
     /// Router node discovery for HA (Kubernetes label selector)
     #[serde(default)]
     pub router_selector: HashMap<String, String>,
@@ -172,6 +177,10 @@ fn default_kv_engine_id_annotation() -> String {
     "smg.ai/kv-engine-id".to_string()
 }
 
+fn default_pairing_protocol_label() -> String {
+    "smg.ai/pairing-protocol".to_string()
+}
+
 impl Default for KubernetesDiscoveryConfig {
     fn default() -> Self {
         Self {
@@ -186,6 +195,7 @@ impl Default for KubernetesDiscoveryConfig {
             worker_ports_annotation: default_worker_ports_annotation(),
             kv_connector_annotation: default_kv_connector_annotation(),
             kv_engine_id_annotation: default_kv_engine_id_annotation(),
+            pairing_protocol_label: default_pairing_protocol_label(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: default_router_mesh_port_annotation(),
             model_id_source: None,

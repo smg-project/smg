@@ -11,18 +11,19 @@
 //! request: the engine asks it before the request is made, so such a
 //! request is never made.
 //!
-//! **A key's rows, between** ([`keys::decide`]). A request that is made
-//! under a sessions rule is decided by the row its key names: its key's
-//! pin, which is one worker's record. It answers where that row says what
-//! the whole pass would, and nothing where it does not.
+//! **A key's rows, between** ([`keys::decide`]). A keyed request that is
+//! made is decided by the rows its key names: under a sessions rule its
+//! key's pin, which is one worker's record, and under a ring the workers
+//! its key reaches on the ring its caller lent. It answers where those rows
+//! say what the whole pass would, and nothing where they do not.
 //!
 //! **The whole pass, behind them** ([`decide`]). Every other request is made
 //! and put to the engine's whole decision over records written for it from
-//! the gateway's own data ([`records::decide`]): a retry that names the
-//! workers it tried, a list the picker's turns find no eligible worker of,
-//! and a place whose profile scores. The binding's rule for a pool every
-//! worker of which is vetoed, and the test of a tried worker, so have one
-//! home.
+//! the gateway's own data ([`records::decide`]): where no key's rows
+//! answered it, a retry that names the workers it tried, a list the
+//! picker's turns find no eligible worker of, and a place whose profile
+//! scores. The binding's rule for a pool every worker of which is vetoed,
+//! and the test of a tried worker, so have one home.
 //!
 //! **A hard demand** ([`Demands`](crate::engine::Demands)). A request that
 //! states one is held to the places of its list whose worker meets it, by
@@ -33,7 +34,8 @@
 //! a worker that does not meet the demand is not followed. A list the
 //! demands leave nobody is shed with no endpoint, under the stage of the
 //! demand that took its last worker. A pair that states a demand is
-//! shed.
+//! held to it a side at a time
+//! ([`PairLists::decide`](super::pair::PairLists::decide)).
 //!
 //! **A retry** names the workers it tried ([`RequestFacts::tried`]). Over
 //! a list where an engine holds several workers, the ranks of a
@@ -64,7 +66,7 @@ use std::{
 
 use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, runtime::RoutingState};
 
-use super::{keys, overlap, PolicyEngine, PoolMembers};
+use super::{keys, overlap, Loaded, PoolMembers};
 use crate::{
     engine::{
         decision::{Decision, Shed, ShedReason, Trace, SUBSET_HINT, WIRES},
@@ -89,8 +91,8 @@ thread_local! {
     /// The calling thread's own list of the workers a retry is decided to
     /// have tried, where an engine of its list holds several
     /// ([`retried`]): taken for one decision and put back behind it, as
-    /// [`MEETING`] is.
-    static TRIED: Cell<Vec<WorkerId>> = const { Cell::new(Vec::new()) };
+    /// [`MEETING`] is. A pair's retry takes it the same way.
+    pub(super) static TRIED: Cell<Vec<WorkerId>> = const { Cell::new(Vec::new()) };
 }
 
 /// The stage a pair whose request states places is declined under
@@ -115,7 +117,7 @@ const NO_STAGE: &str = "none";
 /// Under a document that takes no word on a lease the place is the whole
 /// answer. Under any other the pick is noted ([`noted`]).
 pub(super) fn alone(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     model: &str,
     plain: Plain,
     members: &PoolMembers,
@@ -137,22 +139,24 @@ pub(super) fn alone(
 /// The short path's pick under a document that takes a word on a lease,
 /// as its host takes it: the decision that names the worker at the place
 /// picked, alone ([`AlonePick::decision`]), and its lease, issued here as a
-/// whole pass's is ([`issued`]). The lease states the size `plain` states
-/// and no session, and is dated at `now` on the engine's clock. The issue
+/// whole pass's is ([`issued`]). The lease states the size `plain` states,
+/// the two lengths of its `text`, characters and bytes, and no session, and
+/// is dated at `now` on the engine's clock. The issue
 /// is told where a stage takes it. `None` where the list holds no worker at
 /// the place.
 pub(super) fn noted(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     pick: AlonePick,
     members: &PoolMembers,
     plain: Plain,
+    text: (u32, u32),
     now: Instant,
 ) -> Option<DecideOutcome> {
     let position = pick.place as usize;
     let worker = members.workers().get(position)?;
     // The list's records name each worker once a list: a pick reads the id
     // there and hashes no address.
-    let document = &own.document;
+    let document = own.document;
     let records = members.records(&document.spec, &own.clock);
     let id = *records.ids().get(position)?;
     let dp_rank = records::worker_rank(worker.as_ref());
@@ -167,6 +171,8 @@ pub(super) fn noted(
         session_verdict: SessionVerdict::None,
         issued_micros: own.clock.micros(now),
         tokens: plain.prompt_tokens,
+        chars: text.0,
+        bytes: text.1,
     };
     let decided = DecideOutcome {
         decision: pick.decision(id, dp_rank),
@@ -251,7 +257,7 @@ impl WholeDecision for WithoutShadow {
 /// A first attempt pays one test for it, and a retry over any other list
 /// one more.
 pub(super) fn decide(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     request: &mut Request<'_>,
     members: &PoolMembers,
     maker: &(impl RequestMaker + ?Sized),
@@ -289,11 +295,18 @@ pub(super) fn decide(
     };
     let facts = &mut request.facts;
     // One value for every record of the decision: its instant, the host's
-    // snapshot as the host holds it, the key's text for a stage that
-    // counts the key's requests on a worker, and the list's own word, the
-    // one a pick alone turns ([`PolicyEngine::pick`]): a draw of this
-    // decision takes the list's next turn.
-    let key = facts.session_key.plain;
+    // snapshot as the host holds it, the name the key's requests are
+    // counted under on a worker, as the request's maker states it, for a
+    // stage that reads that count, and the list's own word, the one a
+    // pick alone turns ([`PolicyEngine::pick`]): a draw of this decision
+    // takes the list's next turn. The maker is asked under a document
+    // that reads the count and under no other.
+    let mut name = [0; Session::TEXT_LEN];
+    let key = if spec.engine().needs().session_in_flight {
+        maker.session_counted_under().name(facts, &mut name)
+    } else {
+        None
+    };
     let live =
         records::Live::at(spec.engine(), &own.clock, now, loads, key).turning(&members.rotation.0);
     // A retry leaves every worker of the engines it tried: over a list
@@ -336,7 +349,7 @@ pub(super) fn decide(
     reason = "a decision's inputs, the request's maker and the whole decision"
 )]
 fn by_facts<const RETRY: bool>(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     members: &PoolMembers,
     records: &PoolRecords,
     live: &records::Live<'_>,
@@ -348,7 +361,7 @@ fn by_facts<const RETRY: bool>(
     let spec = &own.document.spec;
     let (engine, workers) = (spec.engine(), members.workers());
     // A keyed request is decided by the rows its key names, where they say
-    // what the whole pass would: its key's pin.
+    // what the whole pass would: its key's pin, or its ring's walk.
     match keys::decide(engine, records, workers, live, facts, cx) {
         // A pin its rule keeps from the profile: no holder is named for it
         // and nothing is kept of where its prompt went.
@@ -382,16 +395,16 @@ fn by_facts<const RETRY: bool>(
 /// Where the profile's stages read who holds the prompt, the lookup does
 /// behind this answer what it does behind any pick. It hands the prompt to
 /// the record of sent prefixes, or to the host's token tree by the entry
-/// and the target its maker names. It may also be the one decision a second
-/// that reads its list's table again, and a tree's match marks the path it
-/// walked as used. Where no binding of the phase reads affinity, the lookup
-/// is one test.
+/// and the target its maker names. It may read its list's table again, as
+/// any decision that finds the table expired, and a tree's match marks the
+/// path it walked as used. Where no binding of the phase reads affinity,
+/// the lookup is one test.
 ///
 /// Out of line: its code stays off the path of a request with no pin, and
 /// of a pin its rule keeps from the profile.
 #[inline(never)]
 fn handed_on(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     members: &PoolMembers,
     records: &PoolRecords,
     facts: &mut RequestFacts<'_>,
@@ -401,7 +414,7 @@ fn handed_on(
     overlap::decide(
         &own.affinity,
         members.affinity(),
-        own.spec(),
+        &own.document.spec,
         members.workers(),
         records.ids(),
         facts,
@@ -432,7 +445,7 @@ fn handed_on(
     reason = "a decision's inputs, the request's maker and the whole decision"
 )]
 fn retried(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     members: &PoolMembers,
     records: &PoolRecords,
     live: &records::Live<'_>,
@@ -453,6 +466,19 @@ fn retried(
     decision
 }
 
+/// The constraints a request that states a hard demand is decided under
+/// ([`held_in`]). The places stand in `meeting`, the calling thread's own
+/// list, taken here: its caller puts it back ([`MEETING`]). Out of line:
+/// its code stays off the path of a request that states no demand.
+#[inline(never)]
+fn held<'a>(
+    records: &PoolRecords,
+    cx: Constraints<'a>,
+    meeting: &'a mut Option<Vec<u32>>,
+) -> Result<Constraints<'a>, UnmetDemand> {
+    held_in(records, cx, meeting.insert(MEETING.take()))
+}
+
 /// The constraints a request that states a hard demand is decided under:
 /// its own, held to the places of the list whose worker meets its demands,
 /// among the places its host holds it to ([`PoolRecords::meeting`]). They
@@ -461,16 +487,14 @@ fn retried(
 /// the demands, it is held to no more than its host said. Where none does,
 /// the answer is the demand that took the last worker.
 ///
-/// The places stand in `meeting`, the calling thread's own list, taken
-/// here: its caller puts it back ([`MEETING`]). Out of line: its code
-/// stays off the path of a request that states no demand.
-#[inline(never)]
-fn held<'a>(
+/// The places are written into `kept`, a list its caller keeps: a single
+/// request's is its thread's ([`held`]), and each side of a pair has its
+/// own, judged by what that side's role is held to ([`super::pair`]).
+pub(super) fn held_in<'a>(
     records: &PoolRecords,
     cx: Constraints<'a>,
-    meeting: &'a mut Option<Vec<u32>>,
+    kept: &'a mut Vec<u32>,
 ) -> Result<Constraints<'a>, UnmetDemand> {
-    let kept = meeting.insert(MEETING.take());
     match records.meeting(cx.demands, cx.places, kept) {
         None => Ok(cx),
         Some(unmet) if kept.is_empty() => Err(unmet),
@@ -483,7 +507,7 @@ fn held<'a>(
 
 /// The answer for a request whose host handed no list: a pool of no worker,
 /// which no stage emptied.
-pub(super) fn over_none(own: &PolicyEngine, request: &Request<'_>) -> Decision {
+pub(super) fn over_none(own: Loaded<'_, '_>, request: &Request<'_>) -> Decision {
     shed(own, request, ShedReason::NoEndpoints, NO_STAGE)
 }
 
@@ -493,12 +517,16 @@ pub(super) fn over_none(own: &PolicyEngine, request: &Request<'_>) -> Decision {
 /// of the whole pass kept the pass from being inlined, 43 instructions a
 /// decision.
 #[cold]
-pub(super) fn declined(own: &PolicyEngine, request: &Request<'_>, stage: &'static str) -> Decision {
+pub(super) fn declined(
+    own: Loaded<'_, '_>,
+    request: &Request<'_>,
+    stage: &'static str,
+) -> Decision {
     shed(own, request, ShedReason::PolicyDeclined, stage)
 }
 
 fn shed(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     request: &Request<'_>,
     reason: ShedReason,
     emptied_by: &'static str,
@@ -529,13 +557,13 @@ fn shed(
 /// Under a document that takes no word a pick has no lease: no id is
 /// taken, and its guard owes the engine nothing.
 pub(super) fn issued(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     decision: Decision,
     request: &Request<'_>,
     now: Instant,
 ) -> DecideOutcome {
     let facts = &request.facts;
-    let document = &own.document;
+    let document = own.document;
     let leased = document.hears.intersects(EventSet::LEASE);
     let noted = decision.pick().filter(|_| leased);
     let lease = noted.and_then(|pick| {
@@ -551,6 +579,8 @@ pub(super) fn issued(
             session_verdict: pick.session_verdict,
             issued_micros: facts.now_micros,
             tokens: facts.prompt_tokens,
+            chars: facts.prompt_chars,
+            bytes: facts.prompt_bytes,
         })
     });
     let issue = document.hears.contains(EventKind::Issued);
@@ -585,7 +615,7 @@ pub(crate) mod tests {
         worker::WorkerStatus,
     };
 
-    use super::*;
+    use super::{super::PolicyEngine, *};
     use crate::{
         document::spec::{
             AppliedSpec, Assignment, PolicySpec, RulePlaced, ScoreStage, ShadowSpec,
@@ -600,7 +630,8 @@ pub(crate) mod tests {
             prompt_hashes::HashSeeds,
             records::worker_id,
             view::{
-                Candidate, Constraints, FixedFacts, Identity, RequestFacts, WireModes, WorkerId,
+                Candidate, Constraints, FixedFacts, Identity, RequestFacts, SessionCountedUnder,
+                WireModes, WorkerId,
             },
         },
         policies::random::Random,
@@ -722,11 +753,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// A request stated ahead, with the list its host hands for it, and how
+    /// A request stated ahead, with the lists its host hands for it, and how
     /// many times the engine made it.
     pub(crate) struct Asks<'a> {
         pub(crate) request: Request<'a>,
-        pub(crate) members: Option<&'a PublishedList>,
+        pub(crate) members: WorkerLists<'a>,
         pub(crate) loads: Option<Arc<LoadSnapshot>>,
         pub(crate) made: Cell<u32>,
         /// The token ids the host names as the request's entry in a token
@@ -737,6 +768,14 @@ pub(crate) mod tests {
 
     impl<'a> Asks<'a> {
         pub(crate) fn of(request: Request<'a>, members: Option<&'a PublishedList>) -> Self {
+            let lists = match members {
+                Some(list) => WorkerLists::Single(list.lent()),
+                None => WorkerLists::None,
+            };
+            Self::over(request, lists)
+        }
+
+        fn over(request: Request<'a>, members: WorkerLists<'a>) -> Self {
             Self {
                 request,
                 members,
@@ -762,11 +801,16 @@ pub(crate) mod tests {
             self.request.plain()
         }
 
+        fn prompt_chars(&self) -> u32 {
+            self.request.prompt_chars()
+        }
+
+        fn prompt_bytes(&self) -> u32 {
+            self.request.prompt_bytes()
+        }
+
         fn workers(&self) -> WorkerLists<'_> {
-            match self.members {
-                Some(list) => WorkerLists::Single(list.lent()),
-                None => WorkerLists::None,
-            }
+            self.members
         }
 
         fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
@@ -891,7 +935,8 @@ pub(crate) mod tests {
         let list = pool(4);
         let members = PublishedList::new(Arc::clone(&list));
         let mut sized = request();
-        sized.facts.prompt_tokens = 321;
+        (sized.facts.prompt_tokens, sized.facts.prompt_chars) = (321, 77);
+        sized.facts.prompt_bytes = 154;
         sized.facts.session_key = Identity::plain("a-key");
         let asks = Asks::of(sized, Some(&members));
         let (mut seen, mut last) = ([0_u32; 4], 0);
@@ -910,7 +955,8 @@ pub(crate) mod tests {
                 (lease.side, lease.booked, lease.target_index),
                 (Side::Single, target.id, 0)
             );
-            assert_eq!((lease.tokens, lease.session), (321, Session::NONE));
+            assert_eq!((lease.tokens, lease.chars, lease.bytes), (321, 77, 154));
+            assert_eq!(lease.session, Session::NONE);
             assert_eq!(lease.session_verdict, SessionVerdict::None);
             assert!(lease.id.0 > last, "each pick takes the next id");
             last = lease.id.0;
@@ -1046,6 +1092,102 @@ pub(crate) mod tests {
         assert_eq!(again.id, placed.id);
     }
 
+    /// The count a capped sessions rule reads stands on a worker's object
+    /// under the name the request's maker states. A maker that says
+    /// nothing is of a host whose own guard counts, and the count is read
+    /// under the key's text. A maker of a host that counts by the
+    /// decisions it holds on file says the session's number, and the count
+    /// is read under that number's text, though the request carries its
+    /// key in the clear. A count under the other name is no count of the
+    /// key: its next request stays on its worker.
+    #[test]
+    fn a_keys_count_is_read_under_the_name_its_requests_maker_states() {
+        /// The maker of a host that counts by the decisions it holds.
+        struct ByNumber<'a>(Asks<'a>);
+
+        impl RequestMaker for ByNumber<'_> {
+            fn model(&self) -> &str {
+                self.0.model()
+            }
+
+            fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+                self.0.make(spec)
+            }
+
+            fn workers(&self) -> WorkerLists<'_> {
+                self.0.workers()
+            }
+
+            fn session_counted_under(&self) -> SessionCountedUnder {
+                SessionCountedUnder::SessionNumber
+            }
+        }
+
+        /// The key's first request pins it on a worker, two requests of
+        /// the key are counted there under `name`, and the key's next
+        /// request is decided: what its rule said of the pin, and whether
+        /// the request left the pin's worker.
+        fn next(
+            engine: &PolicyEngine,
+            list: &[Arc<dyn Worker>],
+            maker: &impl RequestMaker,
+            name: &str,
+        ) -> (SessionVerdict, bool) {
+            let now = Instant::now();
+            let mut guard = DecisionGuard::decide_under(engine, GatewayId::LOCAL, maker, now)
+                .expect("a decision");
+            let owner = guard.take(0).expect("the first target");
+            guard.dispatched(now);
+            for _ in 0..2 {
+                list[owner.position as usize].increment_load();
+                list[owner.position as usize].increment_routing_key_load(name);
+            }
+            let decided = engine.decide_under(GatewayId::LOCAL, maker, now);
+            let (decided, _) = decided.expect("an answer").whole().expect("a whole one");
+            let pick = *decided.decision.pick().expect("a pick");
+            let went = pick.targets.first().expect("a target");
+            (pick.session_verdict, went.id != owner.id)
+        }
+
+        let keyed = || {
+            let mut keyed = request();
+            keyed.facts.session_key = Identity::plain("talk-1");
+            keyed
+        };
+        let mut digits = [0; Session::TEXT_LEN];
+        let number = keyed().facts.session().text(&mut digits).to_owned();
+        let decided = |by_number: bool, name: &str| {
+            // The stock rule with an in-flight cap of two, which places a
+            // key on the worker with the fewest requests.
+            let mut document = PolicySpec::preset("manual").expect("a built-in preset");
+            let rule = document.bindings[0].sessions.as_mut();
+            let rule = rule.expect("the stock rule");
+            (rule.inflight_cap, rule.assignment) = (2, Assignment::MinLoad);
+            document.generation = 1;
+            let spec = AppliedSpec::validate(&document).expect("the document validates");
+            let (engine, list) = (PolicyEngine::new(spec), pool(4));
+            let members = PublishedList::new(Arc::clone(&list));
+            let asks = Asks::of(keyed(), Some(&members));
+            if by_number {
+                next(&engine, &list, &ByNumber(asks), name)
+            } else {
+                next(&engine, &list, &asks, name)
+            }
+        };
+        let (handed_on, kept) = (
+            (SessionVerdict::Respill, true),
+            (SessionVerdict::Pinned, false),
+        );
+        assert_eq!(decided(false, "talk-1"), handed_on, "a guard's count");
+        assert_eq!(decided(false, &number), kept, "no count of a guard's");
+        assert_eq!(
+            decided(true, &number),
+            handed_on,
+            "the held decisions' count"
+        );
+        assert_eq!(decided(true, "talk-1"), kept, "no count of a held decision");
+    }
+
     /// The entry reads its host's clock where a decision is dated and
     /// nowhere else: a place reads none, and a retry's whole pass, a profile
     /// that scores and a place noted for a stage that takes a word read it
@@ -1135,11 +1277,15 @@ pub(crate) mod tests {
     /// A request stated ahead is plain where it is a first attempt that
     /// asks nothing beyond a worker of its list, and says what a pick with
     /// no request made needs: its phase, its wires and its size. Each thing
-    /// it states beyond that makes it a request the whole pass reads.
+    /// it states beyond that makes it a request the whole pass reads. Its
+    /// text's two lengths are asked apart, where such a pick's lease is
+    /// issued.
     #[test]
     fn a_request_stated_ahead_says_whether_it_is_plain() {
         let mut stated = request();
         stated.facts.prompt_tokens = 9;
+        stated.facts.prompt_chars = 31;
+        stated.facts.prompt_bytes = 62;
         stated.constraints.wire_modes = WireModes::GRPC;
         assert_eq!(
             stated.plain(),
@@ -1149,6 +1295,7 @@ pub(crate) mod tests {
                 prompt_tokens: 9,
             })
         );
+        assert_eq!((stated.prompt_chars(), stated.prompt_bytes()), (31, 62));
         let tried = [WorkerId(1)];
         let rows = [0_u32];
         let mut retried = request();
@@ -1237,16 +1384,17 @@ pub(crate) mod tests {
         }
     }
 
-    /// A draw turns the list's own word, the one a pick alone turns. Two
-    /// lists of one model and one size so turn a rotation each: asked in
-    /// turn, a request with no routing key and a new session at each, they
-    /// take each list's workers one after the other. And over one list a
-    /// pick alone and a new session's whole decision share one rotation:
-    /// the pick is asked for a model the same profile is bound for with no
-    /// rule, since a place under a rule is not one pick's.
+    /// A whole decision turns the list's own word, the one a pick alone
+    /// turns, at every size: under the draw's floor, at it and above it.
+    /// Two lists of one model and one size so turn a rotation each: asked
+    /// in turn, a request with no routing key and a new session at each,
+    /// they take each list's workers one after the other. And over one
+    /// list a pick alone and a new session's whole decision share one
+    /// rotation: the pick is asked for a model the same profile is bound
+    /// for with no rule, since a place under a rule is not one pick's.
     /// The gateway's classic policy keeps its rotation by the list it is
-    /// handed whole (`model_gateway/src/policies/round_robin.rs:95-99`,
-    /// `:151`).
+    /// handed whole, whatever its size
+    /// (`model_gateway/src/policies/round_robin.rs:95-99`, `:151`).
     #[test]
     fn each_list_turns_its_own_rotation_for_every_request() {
         let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
@@ -1258,9 +1406,9 @@ pub(crate) mod tests {
         unruled.matcher.model = "unruled-*".to_owned();
         document.bindings.insert(0, unruled);
         document.bindings[1].sessions = Some(rule);
-        let keys: Vec<String> = (0..24).map(|key| format!("key-{key}")).collect();
+        let keys: Vec<String> = (0..48).map(|key| format!("key-{key}")).collect();
         let mut keys = keys.iter();
-        for workers in [DRAW_FROM, 64] {
+        for workers in [3, DRAW_FROM - 1, DRAW_FROM, 64] {
             let spec = AppliedSpec::validate(&document).expect("the document validates");
             let engine = PolicyEngine::new(spec);
             let Place::Alone(profile) = engine.place_for("unruled-1", Phase::Single) else {
@@ -1306,6 +1454,107 @@ pub(crate) mod tests {
                 .map(|turn| (places[0][0] + turn) % workers)
                 .collect();
             assert_eq!(shared, in_turn, "{workers} workers, one list");
+        }
+    }
+
+    /// A turn that lands on a refused worker falls to the rotation of the
+    /// workers the filters kept, in every whole decision and at every size:
+    /// the ready workers take exact shares, a request with no routing key
+    /// and a new session in turn, and the list's word moves once a request.
+    /// The gateway's classic policy asks the list's turn by place and lets
+    /// a refused place fall to its set's rotation
+    /// (`model_gateway/src/policies/round_robin.rs:151-153`, `:164-167`),
+    /// and its own case holds these shares over four workers (`:430-441`).
+    #[test]
+    fn a_refused_turn_falls_to_the_kept_workers_rotation_at_every_size() {
+        let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+        let manual = PolicySpec::preset("manual").expect("a built-in preset");
+        document.view.headers.clone_from(&manual.view.headers);
+        let mut rule = manual.bindings[0].sessions.clone().expect("its rule");
+        rule.assignment = Assignment::Delegate;
+        document.bindings[0].sessions = Some(rule);
+        for workers in [4, DRAW_FROM, 64] {
+            let spec = AppliedSpec::validate(&document).expect("the document validates");
+            let engine = PolicyEngine::new(spec);
+            let list = pool(workers);
+            list[1].set_status(WorkerStatus::NotReady);
+            let members = PublishedList::new(Arc::clone(&list));
+            let word = &engine.members_of(members.lent()).rotation.0;
+            let before = word.load(Ordering::Relaxed);
+            // One request a turn of the list goes to the kept workers'
+            // rotation, which comes round once in as many turns of the list
+            // as workers are kept.
+            let requests = workers * (workers - 1);
+            let keys: Vec<String> = (0..requests).map(|key| format!("key-{key}")).collect();
+            let mut times = vec![0_usize; workers];
+            for (turn, key) in keys.iter().enumerate() {
+                let mut ask = request();
+                if turn % 2 == 1 {
+                    ask.facts.session_key = Identity::plain(key);
+                }
+                let asks = Asks::of(ask, Some(&members));
+                let decided = decided(&engine, &asks);
+                let pick = decided.decision.pick().expect("a pick");
+                times[pick.targets.first().expect("the target").position as usize] += 1;
+            }
+            let mut shares = vec![workers; workers];
+            shares[1] = 0;
+            assert_eq!(times, shares, "{workers} workers");
+            let turned = word.load(Ordering::Relaxed) - before;
+            assert_eq!(
+                turned, requests as u64,
+                "{workers} workers: a turn a request"
+            );
+        }
+    }
+
+    /// A retry takes no turn of the list: it turns the rotation of the
+    /// workers it has not tried, at every size. So the first attempts
+    /// between the retries take the list's workers one after the other,
+    /// and each worker not tried takes an exact share of the retries. The
+    /// gateway's classic placement hands its policy a retry's untried
+    /// workers as a list of their own, which nobody names
+    /// (`model_gateway/src/routers/common/placement.rs:1256-1269`,
+    /// `:1277`), and its policy takes the list's turn for a list named
+    /// whole alone (`model_gateway/src/policies/round_robin.rs:145`), a set's
+    /// rotation for any other (`:158-167`).
+    ///
+    /// A request that names a worker it tried is a retry whatever number it
+    /// states: a host that states none is answered as one that does.
+    #[test]
+    fn a_retry_turns_the_untried_workers_rotation_and_no_turn_of_the_list() {
+        let sizes = [4, DRAW_FROM, 64];
+        for (workers, attempt) in sizes.into_iter().flat_map(|n| [(n, 1), (n, 0)]) {
+            let engine = preset("round_robin");
+            let list = pool(workers);
+            let members = PublishedList::new(Arc::clone(&list));
+            let tried = [worker_id(list[0].as_ref())];
+            let mut retry = request();
+            retry.facts.tried = &tried;
+            retry.facts.attempt = attempt;
+            let (first, retry) = (
+                Asks::of(request(), Some(&members)),
+                Asks::of(retry, Some(&members)),
+            );
+            // As many first attempts as turn the list once for each worker
+            // not tried, and a retry behind each: the retries go once round
+            // the untried workers for each worker of the list.
+            let requests = workers * (workers - 1);
+            let (mut firsts, mut retries) = (Vec::new(), vec![0_usize; workers]);
+            for _ in 0..requests {
+                firsts.push(placed(&engine, &first).place as usize);
+                let decided = decided(&engine, &retry);
+                let pick = decided.decision.pick().expect("a pick");
+                retries[pick.targets.first().expect("the target").position as usize] += 1;
+            }
+            let in_turn: Vec<usize> = (0..requests)
+                .map(|turn| (firsts[0] + turn) % workers)
+                .collect();
+            let said = format!("{workers} workers, a retry that states attempt {attempt}");
+            assert_eq!(firsts, in_turn, "{said}: the first attempts");
+            let mut shares = vec![workers; workers];
+            shares[0] = 0;
+            assert_eq!(retries, shares, "{said}: the retries");
         }
     }
 
@@ -1505,7 +1754,7 @@ pub(crate) mod tests {
     /// kept: the retries behind it allocate nothing for it.
     #[test]
     fn only_a_retry_over_ranks_takes_the_threads_list_and_it_grows_once() {
-        let engine = preset("random");
+        let engine = preset("power_of_two");
         let (ranks, _) = engines(&[4, 4]);
         let ranked = PublishedList::new(Arc::clone(&ranks));
         let alone = pool(8);
@@ -1533,6 +1782,27 @@ pub(crate) mod tests {
         assert!(grown.1 >= 4, "the engine's four ranks stand in it");
         asked(&ranked, &tried);
         assert_eq!(kept(), grown, "the list is kept as it grew");
+    }
+
+    /// A whole pass's lease states the three sizes its request states: the
+    /// count of its token ids and its text's two lengths. A reader that
+    /// sizes a held decision of text reads the bytes over four off the
+    /// lease, the number its request's facts read: here a text of 400
+    /// two-byte characters.
+    #[test]
+    fn a_whole_passs_lease_states_the_requests_three_sizes() {
+        // The stock sessions rule takes a word on a lease.
+        let engine = preset("manual");
+        let list = pool(2);
+        let members = PublishedList::new(Arc::clone(&list));
+        let mut keyed = request();
+        keyed.facts.session_key = Identity::hashed(9);
+        (keyed.facts.prompt_chars, keyed.facts.prompt_bytes) = (400, 800);
+        let size = keyed.facts.prompt_size();
+        let asks = Asks::of(keyed, Some(&members));
+        let lease = decided(&engine, &asks).lease.expect("a lease").lease;
+        assert_eq!((lease.tokens, lease.chars, lease.bytes), (0, 400, 800));
+        assert_eq!((lease.prompt_size(), size), (200, 200));
     }
 
     /// A retry decided under its whole list of tried workers is leased as
@@ -1973,14 +2243,15 @@ pub(crate) mod tests {
 
     /// What `engine`'s record of sent prefixes holds of the prompt `tokens`
     /// for each worker of `list`, in blocks: what a decision of the same
-    /// lookup is named. The read's own answer picks nobody, so it writes
-    /// nothing.
+    /// lookup is named. The lookup names the deepest holders alone, so a
+    /// shorter copy at another worker reads as none. The read's own answer
+    /// picks nobody, so it writes nothing.
     fn recorded(engine: &PolicyEngine, list: &[Arc<dyn Worker>], tokens: &[u32]) -> Vec<u32> {
         let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
         let mut asked = request();
         asked.facts.now_micros = engine.clock.micros(Instant::now());
         hashes.write_to(&mut asked.facts);
-        let nobody = over_none(engine, &asked);
+        let nobody = over_none(engine.loaded(), &asked);
         let ids: Vec<WorkerId> = list
             .iter()
             .map(|worker| worker_id(worker.as_ref()))
@@ -2143,6 +2414,80 @@ pub(crate) mod tests {
         assert_ne!(kept[0], own[0], "the rule's word is on the pick");
     }
 
+    /// A retry over a list where an engine holds several workers is its
+    /// own instance of the decision ([`retried`]), and it follows its key's
+    /// pin by one worker's record as a first attempt does: the pin's worker
+    /// is no rank of the engine the request tried. What is kept of the
+    /// retry's prompt is by the rule's word there too. Under `told` the
+    /// record holds it for the pin's worker alone, and under `untold` for
+    /// nobody.
+    #[test]
+    fn a_retrys_followed_pin_is_recorded_by_the_rules_word() {
+        for kept in [RulePlaced::Untold, RulePlaced::Told] {
+            let engine = PolicyEngine::new(default_under_sessions(kept));
+            // Two engines of two ranks, then two workers alone.
+            let (list, engine_of) = engines(&[2, 2, 1, 1]);
+            let members = PublishedList::new(Arc::clone(&list));
+            let prompt = |first: u32| (first..first + 1_024).collect::<Vec<u32>>();
+            // One request of `tokens` under the session key `key` that
+            // tried `tried`, sent to its first target and served there: the
+            // place it went to and its pick.
+            let sent = |tokens: &[u32], key: u64, tried: &[WorkerId]| {
+                let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+                let mut asked = request();
+                asked.facts.seed = key;
+                asked.facts.session_key = Identity::hashed(key);
+                if !tried.is_empty() {
+                    asked.facts.attempt = 1;
+                }
+                asked.facts.tried = tried;
+                hashes.write_to(&mut asked.facts);
+                let asks = Asks::of(asked, Some(&members));
+                let now = Instant::now();
+                let mut guard = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now)
+                    .expect("a decision");
+                let pick = *guard.decision().pick().expect("a pick");
+                let target = guard.take(0).expect("the first target");
+                guard.dispatched(now);
+                guard.completed(
+                    &Outcome {
+                        side: Side::Single,
+                        served: target.id,
+                        status: 200,
+                        class: TransportClass::Ok,
+                        ttft_micros: 0,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                        duration_micros: 0,
+                    },
+                    now,
+                );
+                (target.position as usize, pick)
+            };
+            for key in 1..=6_u32 {
+                let (own, session) = (key * 100_000, u64::from(key));
+                let (pin, _) = sent(&prompt(own), session, &[]);
+                // The key's next request tried a worker of another engine
+                // than its pin's, and comes again.
+                let other = engine_of.iter().position(|&of| of != engine_of[pin]);
+                let tried = [worker_id(list[other.expect("another engine")].as_ref())];
+                let fresh = prompt(own + 50_000);
+                let (went, pick) = sent(&fresh, session, &tried);
+                let answered = (went, pick.session_verdict, pick.placed_by());
+                let pinned = (pin, SessionVerdict::Pinned, PlacedBy::Rule);
+                assert_eq!(answered, pinned, "{kept:?}: key {key}");
+                let whole = !pick.trace.drew_first();
+                assert!(!whole, "{kept:?}: key {key}: the whole decision ran");
+                let mut held = vec![0; list.len()];
+                if kept == RulePlaced::Told {
+                    held[pin] = 64;
+                }
+                let read = recorded(&engine, &list, &fresh);
+                assert_eq!(read, held, "{kept:?}: key {key}: the retry's prompt");
+            }
+        }
+    }
+
     /// A request stated ahead by a maker that states no plain request
     /// ([`RequestMaker::plain`]'s own answer), as a host that hands a
     /// decision's targets to another process states none: the leasing
@@ -2214,6 +2559,8 @@ pub(crate) mod tests {
             session_verdict: SessionVerdict::None,
             issued_micros: 0,
             tokens: 0,
+            chars: 0,
+            bytes: 0,
         };
         engine.spec().engine().on_decision_issued(&lease, &decision);
         assert_eq!(heard.lock().as_slice(), [("issued", first.id, 0)]);
@@ -2328,40 +2675,100 @@ pub(crate) mod tests {
 
     /// A request that hands no list of its kind is decided over no worker,
     /// as the one entry decides it: a single with no list, a pair's prefill
-    /// with none, and a prefill over a single's list. A decode or an encode
-    /// request sent on its own is refused.
+    /// with none, and a prefill over a single's list. A single over a pair's
+    /// two lists or an encode request's three is shed too. A decode or an
+    /// encode request sent on its own is refused.
     #[test]
     fn a_decision_without_a_lease_over_no_list_names_no_worker() {
+        use smg_worker::{test_support::worker_with_model_aliases, worker::WorkerType};
+
+        use crate::engine::{EncodeLists, EncoderFacts, PairAdmission, PairLists, PartnerClasses};
+
+        #[derive(Debug)]
+        struct Open;
+
+        impl PairAdmission for Open {
+            fn has_capacity(&self, _: usize) -> bool {
+                true
+            }
+
+            fn has_room(&self, _: usize) -> bool {
+                true
+            }
+        }
+
         let engine = preset("round_robin");
+        let document =
+            PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets");
+        let paired = PolicyEngine::new(AppliedSpec::validate(&document).expect("a valid document"));
         let list = pool(2);
         let members = PublishedList::new(Arc::clone(&list));
+        let side = |worker_type| {
+            let url = format!("http://{worker_type}:8000");
+            let worker = worker_with_model_aliases(&url, MODEL, &[], worker_type);
+            worker.set_status(WorkerStatus::Ready);
+            PublishedList::new(Arc::from([worker]))
+        };
+        let [prefill, decode, encoders] =
+            [WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode].map(side);
+        let classes = PartnerClasses::number(1, [&[0_u32][..]]);
+        let pair = PairLists {
+            prefill: prefill.lent(),
+            decode: decode.lent(),
+            classes: &classes,
+            admission: &Open,
+            prefill_places: None,
+            decode_places: None,
+            prefill_stalled: &[],
+            prefill_held: &[],
+            decode_stalled: &[],
+            decode_held: &[],
+        };
+        let encode = EncodeLists {
+            pair,
+            encoders: encoders.lent(),
+            encoders_stalled: &[],
+            encoders_held: &[],
+            facts: &[EncoderFacts {
+                class: 1,
+                ..EncoderFacts::default()
+            }],
+            prefill_classes: &[1],
+        };
         let stating = |phase, members| {
             let mut stated = request();
             stated.facts.phase = phase;
-            Asks::of(stated, members)
+            Asks::over(stated, members)
         };
         let none = (ShedReason::NoEndpoints, "none");
-        for (phase, members) in [
-            (Phase::Single, None),
-            (Phase::Prefill, None),
-            (Phase::Prefill, Some(&members)),
+        let single = WorkerLists::Single(members.lent());
+        let (both, three) = (WorkerLists::Pair(pair), WorkerLists::Encode(encode));
+        for (phase, over, members, engine) in [
+            (Phase::Single, "no list", WorkerLists::None, &engine),
+            (Phase::Prefill, "no list", WorkerLists::None, &engine),
+            (Phase::Prefill, "a single's list", single, &engine),
+            (Phase::Single, "a pair's lists", both, &paired),
+            (Phase::Single, "an encode request's lists", three, &paired),
         ] {
-            let listed = members.is_some();
             let shed = engine.decide_without_lease(&stating(phase, members), Instant::now());
             let Ok((Decision::Shed(shed), None)) = shed else {
-                panic!("{phase:?}, {listed}: a shed, not {shed:?}");
+                panic!("{phase:?} over {over}: a shed, not {shed:?}");
             };
-            assert_eq!((shed.reason, shed.emptied_by), none, "{phase:?}, {listed}");
+            assert_eq!(
+                (shed.reason, shed.emptied_by),
+                none,
+                "{phase:?} over {over}"
+            );
             let whole = Whole(stating(phase, members));
             let leased = engine.decide_under(GatewayId::LOCAL, &whole, Instant::now());
             let leased = leased.expect("an answer").whole().expect("no place").0;
             let Decision::Shed(theirs) = leased.decision else {
-                panic!("{phase:?}, {listed}: the one entry picks");
+                panic!("{phase:?} over {over}: the one entry picks");
             };
             assert_eq!((theirs.reason, theirs.emptied_by), none);
         }
         for phase in [Phase::Decode, Phase::Encode] {
-            let asks = stating(phase, None);
+            let asks = stating(phase, WorkerLists::None);
             let refused = engine.decide_without_lease(&asks, Instant::now());
             assert_eq!(refused.err(), Some(DecisionRefused::PairSide), "{phase:?}");
         }
@@ -2676,8 +3083,10 @@ pub(crate) mod tests {
                     assert_eq!(entry, (0, 0), "key {key}: a kept pin's entry");
                     assert_eq!(stored(&fresh), (0, Vec::new()), "key {key}: a kept prompt");
                 }
-                // The key's pin again, of a prompt its host does not send to
-                // the pin's worker: the tree takes none of it.
+                // The key's pin again, where the host answers that its caller
+                // sends to no target of the pick: the tree takes none of the
+                // prompt. The helper still dispatches on the pin's worker, so
+                // this holds what that answer does to the tree and no more.
                 let refused = prompt(key * 100_000 + 70_000);
                 let (went, _, entry) = sent(&refused, seed, 2, false);
                 assert_eq!(went, pin, "{kept:?}: key {key}");
@@ -3153,8 +3562,15 @@ pub(crate) mod tests {
             let targets = decided.decision.pick().expect("a pick").targets;
             let taken = targets.as_slice().get(index).copied();
             let worker = Arc::clone(&list[taken.map_or(0, |taken| taken.position as usize)]);
-            let placement =
-                crate::tracking::Placement::taken(engine, decided, later, now, index, worker, None);
+            let placement = crate::tracking::Placement::taken(
+                engine.loaded(),
+                decided,
+                later,
+                now,
+                index,
+                worker,
+                None,
+            );
             (placement, taken)
         };
         let by_hand = || {
@@ -3327,8 +3743,15 @@ pub(crate) mod tests {
             let first = first.expect("a target");
             let worker = Arc::clone(&list[first.position as usize]);
             let now = Instant::now();
-            let placement =
-                crate::tracking::Placement::taken(engine, decided, later, now, 0, worker, None);
+            let placement = crate::tracking::Placement::taken(
+                engine.loaded(),
+                decided,
+                later,
+                now,
+                0,
+                worker,
+                None,
+            );
             let mut placement = placement.expect("a placement");
             assert_eq!(words(), [("issued", first.id, 0)]);
             placement.sent(side);
@@ -3374,8 +3797,15 @@ pub(crate) mod tests {
         let first = first.expect("a target");
         let worker = Arc::clone(&list[first.position as usize]);
         let now = Instant::now();
-        let placement =
-            crate::tracking::Placement::taken(engine, decided, later, now, 0, worker, None);
+        let placement = crate::tracking::Placement::taken(
+            engine.loaded(),
+            decided,
+            later,
+            now,
+            0,
+            worker,
+            None,
+        );
         let mut placement = placement.expect("a placement");
         let ended = |side: Side| Outcome {
             side,
@@ -3445,7 +3875,7 @@ pub(crate) mod tests {
         let pick = placed(engine, &Asks::of(request(), Some(&members)));
         assert_eq!(pick.profile, 1, "the document's second profile picked");
         let worker = &list[pick.place as usize];
-        let label = engine.label_at(pick.profile);
+        let label = engine.loaded().label_at(pick.profile);
         let mut placement = crate::tracking::Placement::alone(Arc::clone(worker), label);
         assert!(!placement.owes_events());
         placement.sent(Side::Single);
@@ -3471,7 +3901,7 @@ pub(crate) mod tests {
         let worker = &list[target.position as usize];
         let now = Instant::now();
         let placement = crate::tracking::Placement::taken(
-            engine,
+            engine.loaded(),
             decided,
             later,
             now,
@@ -3553,8 +3983,15 @@ pub(crate) mod tests {
         let second = Duration::from_secs(1);
         let decided_at = Instant::now().checked_sub(second);
         let decided_at = decided_at.expect("an earlier instant");
-        let placement =
-            crate::tracking::Placement::taken(engine, decided, later, decided_at, 0, worker, None);
+        let placement = crate::tracking::Placement::taken(
+            engine.loaded(),
+            decided,
+            later,
+            decided_at,
+            0,
+            worker,
+            None,
+        );
         let mut placement = placement.expect("a placement");
         placement.sent(Side::Single);
         drop(placement);
@@ -3579,8 +4016,15 @@ pub(crate) mod tests {
         let first = *picked.targets.first().expect("a target");
         let worker = Arc::clone(&list[first.position as usize]);
         let now = Instant::now();
-        let placement =
-            crate::tracking::Placement::taken(engine, decided, later, now, 0, worker, None);
+        let placement = crate::tracking::Placement::taken(
+            engine.loaded(),
+            decided,
+            later,
+            now,
+            0,
+            worker,
+            None,
+        );
         let mut placement = placement.expect("a placement");
         let measured = Outcome {
             tokens_out: 34,

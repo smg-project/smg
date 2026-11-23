@@ -116,8 +116,7 @@ pub(crate) fn decode_as_issued(prefill: &Lease, first: &Target, session: Session
     })
 }
 
-/// Tells the stages what was `said` of a pair's lease, a side at a time, as
-/// the engine over a store tells it off its file.
+/// Tells the stages what was `said` of a pair's lease, a side at a time.
 ///
 /// - A dispatch is told on the side it names: the send counts, the session
 ///   table, then the stages. The lease told is the side's as issued, under
@@ -150,11 +149,13 @@ pub(crate) fn pair(
     let prefill = held.lease;
     let first = held.decision.pick().and_then(|pick| pick.targets.first());
     // The decode side as its host lends it with a pair's lease, under the
-    // size it was issued under.
+    // three sizes it was issued under.
     let decode = first
         .and_then(|first| decode_as_issued(prefill, first, held.decode.session))
         .map(|issued| Lease {
             tokens: held.decode.tokens,
+            chars: held.decode.chars,
+            bytes: held.decode.bytes,
             ..issued
         });
     let chosen = held.decode.chosen;

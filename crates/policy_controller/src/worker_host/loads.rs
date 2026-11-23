@@ -58,10 +58,13 @@ impl<G: Generation> LoadConsumer for SnapshotReaders<G> {
 /// It is built stopped, and a host keeps the one it built. The host starts
 /// it ([`WorkerMonitor::start_event_loop`]) where its decisions read the
 /// snapshot, and stops it where they do not ([`WorkerMonitor::stop`]). The
-/// stop ends every task of the monitor and waits for each end. Then it
-/// publishes the snapshot empty and takes every overload verdict off the
-/// objects. The channel stands through a stop: a reader handed it once
-/// reads the next start's reports on it.
+/// stop ends every task of the monitor that stands and waits for each end.
+/// Then it publishes the snapshot empty and takes every overload verdict
+/// off the objects. The loop of a group that ended just ahead of the stop
+/// is not awaited: a tick of it past its fetch can still publish a report
+/// and write a verdict, which stand until the next start clears both. The
+/// channel stands through a stop: a reader handed it once reads the next
+/// start's reports on it.
 ///
 /// A drop is no such end. It ends the monitor's tasks and its channel,
 /// whose last snapshot a reader still holds, awaits nothing and

@@ -13,7 +13,9 @@
 //!   knows of the list's workers beside their objects: how a program names
 //!   a list to the engine.
 //! - [`ModelLists`] is the program's side: for a model, each list published
-//!   so far, lent so.
+//!   so far, lent so. A program hands it once, beside the engine's start
+//!   ([`PolicyEngine::set_lists`]), and the engine's own task fills a
+//!   model's cells through it, ahead of the model's requests.
 //! - [`PolicyEngine::members_of`] is the engine's read of a lent list: the
 //!   value the cell holds under the engine's document, made first where it
 //!   holds none.
@@ -33,7 +35,7 @@ use std::{
 use smg_worker::identity::basic::Worker;
 
 use super::{
-    policy_engine::{PolicyEngine, PoolMembers},
+    policy_engine::{Loaded, PolicyEngine, PoolMembers},
     view::FixedFacts,
 };
 
@@ -58,11 +60,14 @@ use super::{
 /// its list ([`WorkerLists`](super::decision_engine::WorkerLists),
 /// [`PolicyEngine::pick`]), where it decides over the list. The first ask
 /// under a document fills the cell: it reads each worker's registration
-/// and writes the list's records, so its cost grows with the list, and
-/// the request that asks first pays it. Every later ask is one read and
-/// one compare of the document's number, and one more of both for each
-/// value made before the asker's. A program asks the engine for no value
-/// of a list.
+/// and writes the list's records, so its cost grows with the list. Where
+/// the program handed its lists ([`PolicyEngine::set_lists`]), the
+/// engine's own task asks first, off the path of a request, behind the
+/// registry's word of the membership change. Else, and for a request that
+/// comes ahead of the task, the request that asks first pays the fill.
+/// Every later ask is one read and one compare of the document's number,
+/// and one more of both for each value made before the asker's. A program
+/// asks the engine for no value of a list.
 ///
 /// The cell is two words in the program's value, filled or empty. Each
 /// value stands in an allocation of its own: it is aligned to cache lines
@@ -97,7 +102,7 @@ struct Made {
 impl Made {
     /// The value of a lent list, made by `engine` under the document whose
     /// number is `under`.
-    fn of(engine: &PolicyEngine, lent: LentList<'_>, under: u64) -> Self {
+    fn of(engine: Loaded<'_, '_>, lent: LentList<'_>, under: u64) -> Self {
         assert!(
             lent.facts
                 .is_none_or(|facts| facts.len() == lent.workers.len()),
@@ -137,15 +142,21 @@ pub struct LentList<'a> {
     /// registry makes the program's value of a generation under its own
     /// guard, the program makes them behind that, at the list's first
     /// lending or by what ordered the membership change: no member is read
-    /// under the guard. They are read where the list's cell is filled,
-    /// inside the first decision or pick that asks it, and nowhere else.
+    /// under the guard. They are read where the list's cell is filled: by
+    /// the engine's own task ahead of the list's requests
+    /// ([`ModelLists::lists_of`]), or inside the first decision or pick
+    /// that asks it, and nowhere else.
     ///
     /// Facts of another count than the list are an error of the program,
     /// refused where the list's value is made, in every build, and the cell
     /// takes no value, so every later ask of the list lent so is refused
-    /// again. A pick that asks first panics ([`PolicyEngine::pick`]). A
-    /// decision that asks first is answered `DecisionRefused::Faulted` and
-    /// counted with the engine's faults: its entry catches the panic.
+    /// again. The refusal is a panic. A pick passes it to its caller
+    /// ([`PolicyEngine::pick`]), and so does a pair's or an encode
+    /// request's own `decide`, which a host calls itself. A decision
+    /// through one of the engine's entries is answered
+    /// `DecisionRefused::Faulted` and counted with the engine's faults: the
+    /// entry catches the panic. The engine's task holds it and counts it
+    /// with its own ([`PolicyEngine::upkeep_faults`]).
     pub facts: Option<&'a [FixedFacts]>,
 }
 
@@ -166,15 +177,110 @@ pub trait ModelLists: fmt::Debug + Send + Sync + 'static {
     /// built so far. A list built later is not lost: its cell is filled at
     /// the list's first ask.
     ///
-    /// Each list is lent for the length of one call of `hand`. It is for
-    /// a fill of a model's cells ahead of the model's requests, off the
-    /// path of a request, by the engine's own task. That fill is not
-    /// built: nothing of the engine calls this yet, and a cell is filled
-    /// inside the first decision that asks it. No decision calls this.
+    /// Each list is lent for the length of one call of `hand`. The
+    /// engine's own task calls this, off the path of a request, to fill a
+    /// model's cells ahead of the model's requests
+    /// ([`PolicyEngine::set_lists`]): `hand` asks each list's value under
+    /// the engine's document, and so fills a cell that holds none. No
+    /// decision calls this.
+    ///
+    /// `hand` reads each worker of a list it fills, so an implementation
+    /// calls it under no guard of its registry. `hand` does not panic: a
+    /// list it refuses is held and counted on the engine's side. The call
+    /// runs on the task's own loop, which hears no word and keeps no newer
+    /// load snapshot meanwhile, so an implementation does not wait in it.
+    ///
+    /// What `hand` is handed, it fills with the facts lent. The task asks
+    /// behind the registry's word of a membership change, which can be
+    /// ahead of the program's own record of that change. So a program that
+    /// makes a list's facts of such a record hands the list once the record
+    /// stands, and nothing of the model until then: a cell filled with
+    /// facts that are not whole keeps them for as long as its list stands.
     fn lists_of(&self, model: &str, hand: &mut dyn FnMut(LentList<'_>));
 }
 
+/// The lists a program handed the engine ([`PolicyEngine::set_lists`]).
+#[derive(Debug, Default)]
+pub(super) struct HandedLists(OnceLock<Arc<dyn ModelLists>>);
+
+impl HandedLists {
+    /// The lists, where the program handed any: the engine's task asks
+    /// for a word's models only then.
+    pub(super) fn get(&self) -> Option<&Arc<dyn ModelLists>> {
+        self.0.get()
+    }
+}
+
 impl PolicyEngine {
+    /// Hands the engine its program's worker lists, once, at the program's
+    /// start: beside the engine's own start ([`Self::start`]), which does
+    /// not take them yet. A later call is ignored.
+    ///
+    /// The engine's own task then fills a model's cells ahead of the
+    /// model's requests ([`Self::run`]), by the registry the program handed
+    /// ([`Self::set_registry`]). Behind a word of a registration, a
+    /// replacement or a removal it asks the lists of each model the word's
+    /// worker serves ([`ModelLists::lists_of`]), and behind a whole read of
+    /// the registry the lists of each model a standing worker serves. It
+    /// asks each handed list's value under the engine's document. A cell
+    /// that holds none is filled there, off the path of a request, and the
+    /// request that asks the list first reads a filled cell. Words that
+    /// stand ready together are heard first, and their models are asked
+    /// behind the last of them, each once. The task's upkeep asks what is
+    /// owed at that minute, with words still standing: a model asked there
+    /// is asked again behind the last word, and that ask reads the cell.
+    ///
+    /// The task asks behind a word alone, and it asks the lists that stand
+    /// at its ask. So these are filled ahead only where a later ask of
+    /// their model finds them, and by their first request otherwise, as
+    /// under an engine handed no lists:
+    ///
+    /// - A list a request asks ahead of the task: the task hears the
+    ///   registry's word some time behind the registry's write.
+    /// - A list published again ahead of the task's ask: the task fills
+    ///   the newer one, and a request that still holds the older fills it.
+    /// - A list published with no word of the registry. The worker crate's
+    ///   registry publishes each model's list again where a worker's model
+    ///   cards are refreshed, and sends no event of it.
+    /// - A list of a model its word's worker does not state. A worker
+    ///   names its models by its cards of the minute, and the worker
+    ///   crate's registry keeps a worker in the list of a model its
+    ///   refreshed cards left out, until the worker is removed.
+    /// - A list the program lends under no model a worker serves, such as
+    ///   a list of every worker for a request that names no model.
+    /// - A list the program builds behind the task's ask.
+    ///
+    /// The task runs the program's `lists_of` and each fill on its own
+    /// loop: meanwhile it hears no word and keeps no newer load snapshot.
+    /// Each value made counts as a pool made, as one a request makes: a
+    /// stage that keeps what it learned of a pool by that count, as the
+    /// hash ring's does on its own walk, learns each pool again at its
+    /// next keyed request.
+    ///
+    /// A panic in a fill is held and counted ([`Self::upkeep_faults`]). A
+    /// list lent with facts of another count than its workers costs its
+    /// own fill alone, and the refusal does not unwind into the program's
+    /// code. A panic of the program's own code in `lists_of` costs the
+    /// lists of that model it had not handed. The stages are told the word
+    /// all the same, and the task goes on.
+    ///
+    /// Lists handed behind the task's first poll are taken all the same.
+    /// At its next upkeep the task asks the lists of every model a standing
+    /// worker serves, once, and each word from then on asks its own. So a
+    /// caller may rely on this: the lists that stand are filled within one
+    /// upkeep of the call, and a request that comes sooner fills its own
+    /// list, as under an engine handed no lists. A call ahead of the
+    /// task's first poll costs nothing more: the task's first whole read
+    /// of the registry asks them.
+    ///
+    /// An engine handed lists and no registry fills nothing ahead.
+    pub fn set_lists(&self, lists: Arc<dyn ModelLists>) {
+        // The first hand-over stands.
+        drop(self.lists.0.set(lists));
+    }
+}
+
+impl Loaded<'_, '_> {
     /// The engine's value of a lent list under the document it decides
     /// under: read from the list's cell, and made into the cell first where
     /// the cell holds none under that document.
@@ -196,9 +302,10 @@ impl PolicyEngine {
     ///
     /// The fill reads each worker's registration and writes the list's
     /// records, so its cost grows with the list, once for each document the
-    /// list is asked under. The request that asks first pays it: nothing
-    /// fills a cell ahead of its list's requests yet
-    /// ([`ModelLists::lists_of`]).
+    /// list is asked under. The engine's own task pays it ahead of the
+    /// list's requests where the program handed its lists
+    /// ([`PolicyEngine::set_lists`]). Else the request that asks first
+    /// pays it.
     ///
     /// # Panics
     ///
@@ -206,12 +313,14 @@ impl PolicyEngine {
     /// program, refused in every build where the value is made: the ask
     /// panics and the cell takes no value, so each later ask of the list
     /// lent so is refused again, and the list lent right is filled. A
-    /// decision's entry catches the panic and answers a fault. The
-    /// check stands in the fill and costs a read nothing: a cell that
-    /// holds the value is read with no look at the facts.
+    /// decision's entry catches the panic and answers a fault, and the
+    /// engine's task holds it and counts it
+    /// ([`PolicyEngine::upkeep_faults`]). The check stands in the fill and
+    /// costs a read nothing: a cell that holds the value is read with no
+    /// look at the facts.
     #[inline]
-    pub(crate) fn members_of<'a>(&self, lent: LentList<'a>) -> &'a PoolMembers {
-        let number = self.applied();
+    pub(crate) fn members_of<'a>(self, lent: LentList<'a>) -> &'a PoolMembers {
+        let number = self.document.applied;
         let members = match lent.cell.0.get() {
             // The value the cell took first is read here, in the caller.
             Some(made) if made.under == number => &made.members,
@@ -235,7 +344,7 @@ impl PolicyEngine {
     #[cold]
     #[inline(never)]
     fn found_or_made<'a>(
-        &self,
+        self,
         workers: &'a Arc<[Arc<dyn Worker>]>,
         mut cell: &'a ListCell,
         facts: Option<&'a [FixedFacts]>,
@@ -255,6 +364,16 @@ impl PolicyEngine {
             }
             cell = &made.next;
         }
+    }
+}
+
+impl PolicyEngine {
+    /// [`Loaded::members_of`] under the engine's document: for a caller
+    /// that asks a list's value outside a decision of the engine, as the
+    /// engine's own task does ahead of a list's requests.
+    #[inline]
+    pub(crate) fn members_of<'a>(&self, lent: LentList<'a>) -> &'a PoolMembers {
+        self.loaded().members_of(lent)
     }
 
     /// The bench's count: how many times the reports of `lent`'s list were
@@ -340,7 +459,8 @@ pub(crate) mod tests {
             &self.workers
         }
 
-        /// Whether the cell holds a value: whether any decision asked it.
+        /// Whether the cell holds a value: whether a decision or the
+        /// engine's task asked it.
         pub(crate) fn filled(&self) -> bool {
             self.cell.0.get().is_some()
         }
@@ -693,7 +813,7 @@ pub(crate) mod tests {
         };
         let mut cell = ListCell::default();
         for under in 0..20_000 {
-            let mut made = Box::new(Made::of(&engine, lent, under));
+            let mut made = Box::new(Made::of(engine.loaded(), lent, under));
             made.next = cell;
             cell = ListCell(OnceLock::from(made));
         }

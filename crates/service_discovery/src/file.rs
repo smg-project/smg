@@ -263,6 +263,9 @@ impl ManifestWorker {
             kv_connector: self.kv_connector,
             kv_role: self.kv_role,
             kv_engine_id: self.kv_engine_id,
+            // The manifest has no pairing protocol field: only the one an
+            // engine reports about itself applies.
+            pairing_protocol: None,
             compat_labels: BTreeMap::new(),
         })
     }

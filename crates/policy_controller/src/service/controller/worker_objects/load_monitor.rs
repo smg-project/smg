@@ -19,27 +19,13 @@ use crate::worker_host::{load_monitor, Members};
 /// states. It writes no row: a report is read where the monitor publishes
 /// it. A row that one gateway alone reaches is asked for no load.
 ///
-/// Nothing starts this task yet. Until a decision reads the monitor's
-/// snapshot the store's poller decides, so a monitor beside it would poll
-/// every engine a second time for no reader.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the serve starts it where its deciding threads read the monitor's snapshot"
-    )
-)]
+/// The serve runs this task, and every deciding thread holds the monitor's
+/// channel from the bind: a single request's decision is given the newest
+/// snapshot on it, where its document reads reports and keeps none.
 pub(crate) struct LoadMonitor {
     monitor: Arc<WorkerMonitor<Members>>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the serve starts it where its deciding threads read the monitor's snapshot"
-    )
-)]
 impl LoadMonitor {
     /// The monitor of `workers`, which polls each worker once an `every`
     /// while this replica leads. It is built stopped: [`Self::run`] starts
@@ -66,12 +52,20 @@ impl LoadMonitor {
     /// At the word's first term the task starts the monitor
     /// ([`WorkerMonitor::start_event_loop`]). At the word that nobody leads
     /// here it stops the monitor and waits for the stop's end
-    /// ([`WorkerMonitor::stop`]). Every task of the monitor has ended then,
-    /// a poll in flight with its task. The snapshot is published empty and
-    /// every overload verdict is off the objects. So a replica that does
-    /// not lead dials no engine for its load, and the next lead's start
-    /// comes behind the last poll. This task alone starts and stops the
-    /// monitor, each in its turn.
+    /// ([`WorkerMonitor::stop`]). Every task of the monitor that stands has
+    /// ended then, a poll in flight with its task. The snapshot is published
+    /// empty and every overload verdict is off the objects. So a replica
+    /// that does not lead dials no engine for its load, and the next lead's
+    /// start comes behind the last poll. This task alone starts and stops
+    /// the monitor, each in its turn.
+    ///
+    /// One loop is not awaited: that of a group which a registration, a
+    /// removal or a change of its interval ended just ahead of the stop. A
+    /// tick of it that is past its fetch can still publish a report and
+    /// write a verdict behind the stop. They stand until the next start,
+    /// which clears the snapshot and takes every verdict off ahead of its
+    /// first poll: a lead starts from no report, and a decision reads one of
+    /// the lead before only in the instant between a take and that start.
     ///
     /// A word that goes from one term to the next leaves the monitor
     /// running. It writes nothing under a term, so a term's end needs no
@@ -140,6 +134,7 @@ mod tests {
     use super::{super::ObjectsWake, *};
     use crate::{
         engine::view::WireModes,
+        service::controller::frame_loads::FrameLoads,
         store::{GatewayId, MemoryStore, Reachability, WorkerFacts, WorkerStatus, WorkersStore},
     };
 
@@ -470,6 +465,57 @@ mod tests {
             !comes(|| replica.polls() > polled).await,
             "a term's change started the monitor again"
         );
+        assert!(replica.stopped().await, "the task ends at the stop");
+    }
+
+    /// What a deciding thread reads across a lead, its loss, a follow and
+    /// the next take ([`FrameLoads`]): the lead's report while the replica
+    /// leads, none from the loss on, and none at the take until the take's
+    /// own first poll lands. The engine's queue moves during the follow and
+    /// the take's poll answers late: the report of the lead before is read
+    /// at no instant of the take.
+    #[tokio::test(start_paused = true)]
+    async fn a_take_behind_a_follow_reads_no_report_of_the_lead_before() {
+        let mut replica = Replica::new();
+        replica.register(facts(A));
+        let mut thread = FrameLoads::of(replica.loads.clone());
+        let read = |thread: &mut FrameLoads| {
+            let report = thread.newest().get(A);
+            report.map(WorkerLoadResponse::total_waiting_reqs)
+        };
+        replica.engine.waiting.store(3, SeqCst);
+        replica.role.send_replace(Some(1));
+        assert!(comes(|| replica.waiting(A) == Some(3)).await);
+        assert_eq!(read(&mut thread), Some(3), "the lead's own report");
+
+        replica.role.send_replace(None);
+        assert!(
+            comes(|| replica.waiting(A).is_none()).await,
+            "the snapshot is published empty at the loss"
+        );
+        assert_eq!(read(&mut thread), None, "a report was read behind the loss");
+
+        // The follow: the engine's queue moves, and nothing is read of it.
+        replica.engine.waiting.store(7, SeqCst);
+        time::sleep(EVERY * 3).await;
+        assert_eq!(read(&mut thread), None, "a follower read a report");
+
+        // The take, whose first poll answers half a second late.
+        let polled = replica.polls();
+        replica.engine.late.store(500, SeqCst);
+        replica.role.send_replace(Some(2));
+        assert!(
+            comes(|| replica.polls() == polled + 1).await,
+            "the take's poll is out"
+        );
+        assert_eq!(
+            read(&mut thread),
+            None,
+            "the take read the report of the lead before"
+        );
+        time::sleep(Duration::from_millis(500)).await;
+        assert!(comes(|| replica.waiting(A) == Some(7)).await);
+        assert_eq!(read(&mut thread), Some(7), "the take's own first report");
         assert!(replica.stopped().await, "the task ends at the stop");
     }
 

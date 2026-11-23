@@ -51,8 +51,9 @@ mod tests;
 /// find one. Where the overload veto left none open, the veto's own stage,
 /// `not-overloaded`, is named in its stead ([`saturation`]).
 const ENCODERS: &str = "encoders";
-/// The stage named when the request carries images and the registered
-/// encoders that would take it otherwise take none.
+/// The stage named when the request holds pixels, an image or a video, and
+/// none of the registered encoders that would take it otherwise takes
+/// images.
 const ENCODE_VISION: &str = "encode-vision";
 /// The stage named when no registered encoder hands to a prefill of a pair:
 /// a pushing encoder states no role, or no prefill states its end.
@@ -121,11 +122,14 @@ pub struct EncodeItems<'a> {
 
 impl EncodeItems<'_> {
     /// Whether the request's decode is held to the decodes that take
-    /// images: by its demand, or by image references beside an image.
-    /// `images` says whether the request states an image.
+    /// images: by its demand, or by references beside pixels. `pixels`
+    /// says whether the request holds an image or a video
+    /// ([`MediaCounts::holds_pixels`]).
+    ///
+    /// [`MediaCounts::holds_pixels`]: crate::engine::view::MediaCounts::holds_pixels
     #[must_use]
-    pub const fn holds_decode_to_images(&self, images: bool) -> bool {
-        self.decode_images || (self.references && images)
+    pub const fn holds_decode_to_images(&self, pixels: bool) -> bool {
+        self.decode_images || (self.references && pixels)
     }
 }
 
@@ -316,11 +320,11 @@ pub(super) struct EncodeScratch {
 /// membership: `any_member` says a registered encoder takes the request and
 /// states an end. `wires` are the wires the request's host states: an
 /// encoder dialed on none of them would not take the request with its
-/// images either.
+/// pixels either.
 fn encode_gap(
     encode: &EncodePool<'_>,
     items: &EncodeItems<'_>,
-    images: bool,
+    pixels: bool,
     wires: WireModes,
     any_member: bool,
 ) -> &'static str {
@@ -329,16 +333,16 @@ fn encode_gap(
     }
     let references = |of: &EncoderFacts| !items.references || of.references;
     let rows = || encode.encoders.iter().zip(encode.facts);
-    if images && rows().any(|(row, of)| of.class != 0 && references(of) && dialed(wires, row)) {
+    if pixels && rows().any(|(row, of)| of.class != 0 && references(of) && dialed(wires, row)) {
         return ENCODE_VISION;
     }
     // A pushing encoder that takes the media and is not counted above lacks
     // its role: one that states no end, and one that states an end and is
     // dialed on no stated wire. This test reads no wire.
-    if rows().any(|(row, of)| of.pushes && references(of) && (!images || row.vision)) {
+    if rows().any(|(row, of)| of.pushes && references(of) && (!pixels || row.vision)) {
         return EC_COMPATIBLE;
     }
-    if !encode.encoders.is_empty() && (items.references || images) {
+    if !encode.encoders.is_empty() && (items.references || pixels) {
         return ENCODE_MEDIA;
     }
     ENCODERS
@@ -352,19 +356,20 @@ fn dialed(wires: WireModes, row: &Candidate) -> bool {
 }
 
 /// Whether an encoder takes the request: its media, references when its
-/// items are references and an image when it carries one, on a wire its
-/// host states (`wires`). The one test of an encoder for a request, so an
-/// encoder it refuses is left out of every pass. Inlined by force: each
-/// pass asks it once an encoder, and its tests cost less than a call.
+/// items are references and pixels when it holds an image or a video, on a
+/// wire its host states (`wires`). The one test of an encoder for a
+/// request, so an encoder it refuses is left out of every pass. Inlined by
+/// force: each pass asks it once an encoder, and its tests cost less than a
+/// call.
 #[inline(always)]
 fn takes_request(
     items: &EncodeItems<'_>,
-    images: bool,
+    pixels: bool,
     wires: WireModes,
     row: &Candidate,
     of: &EncoderFacts,
 ) -> bool {
-    (!items.references || of.references) && (!images || row.vision) && dialed(wires, row)
+    (!items.references || of.references) && (!pixels || row.vision) && dialed(wires, row)
 }
 
 /// The stage that left no encoder open, when its reason is saturation:
@@ -383,7 +388,7 @@ fn saturation(
     cx: &Constraints<'_>,
     encode: &EncodePool<'_>,
     items: &EncodeItems<'_>,
-    images: bool,
+    pixels: bool,
 ) -> Option<&'static str> {
     let hard = || profile.filters.iter().filter(|f| !f.soft());
     // Where each of them is refused, counted over the hard filters: the
@@ -392,7 +397,7 @@ fn saturation(
         .encoders
         .iter()
         .zip(encode.facts)
-        .filter(|(row, of)| of.class != 0 && takes_request(items, images, cx.wire_modes, row, of))
+        .filter(|(row, of)| of.class != 0 && takes_request(items, pixels, cx.wire_modes, row, of))
         .filter_map(|(row, _)| hard().position(|f| !f.keep(facts, row, cx)))
         .max()?;
     let stage = hard().nth(last)?.name();
@@ -439,9 +444,9 @@ impl Engine {
     /// prefill whose class holds an open encoder that takes the request's
     /// media, and every decode, or the decodes that take images when the
     /// request asks that of its decode (and when its items are references
-    /// with images and a pair has such a decode). With every row admitted
-    /// the pools are handed on as they are. A shed of the pair is returned
-    /// as the pair gave it.
+    /// beside an image or a video and a pair has such a decode). With every
+    /// row admitted the pools are handed on as they are. A shed of the pair
+    /// is returned as the pair gave it.
     ///
     /// An encoder takes a request on a wire its host states
     /// ([`Constraints::wire_modes`] of `encode_cx`): one dialed on none of
@@ -597,11 +602,11 @@ impl Engine {
         if needs && self.marks[usize::from(index)].scoped() {
             return declined(ENCODE_SCOPE);
         }
-        let images = facts.media.images != 0;
+        let pixels = facts.media.holds_pixels();
         // A request with no item that asks no images of its decode is the
         // pair's alone: the pair entry answers it over the pools as handed,
         // and no pass of the encode side is laid for it.
-        if !needs && !items.holds_decode_to_images(images) {
+        if !needs && !items.holds_decode_to_images(pixels) {
             return self.decide_pair(facts, pool, pools, cx, decode_cx, scratch);
         }
         let encode_facts = RequestFacts {
@@ -614,16 +619,17 @@ impl Engine {
             // The encoders' own cells: the request's would be read by
             // another pool's positions.
             signal_cells: encode.signal_cells,
-            // The place stated on a lent ring is the request's routing
-            // value's: an item is placed by its own key, so it takes no
-            // lent ring and the stage's own places it.
+            // The places stated on a lent ring are the request's routing
+            // value's, or its prompt's heads': an item is placed by its
+            // own key, so it takes no lent ring and the stage's own places
+            // it.
             ring: None,
             ring_positions: &[],
             ..*facts
         };
         let wires = encode_cx.wire_modes;
         let takes =
-            |row: &Candidate, of: &EncoderFacts| takes_request(&items, images, wires, row, of);
+            |row: &Candidate, of: &EncoderFacts| takes_request(&items, pixels, wires, row, of);
         let open = |row: &Candidate| {
             let hard = profile.filters.iter().filter(|f| !f.soft());
             hard.into_iter()
@@ -662,11 +668,11 @@ impl Engine {
                 // Encoders the overload veto left none of are a saturated
                 // fleet, and the shed says so.
                 if let Some(stage) =
-                    saturation(profile, &encode_facts, encode_cx, &encode, &items, images)
+                    saturation(profile, &encode_facts, encode_cx, &encode, &items, pixels)
                 {
                     return turned_away(ShedReason::Saturated, stage, bare);
                 }
-                return gap(encode_gap(&encode, &items, images, wires, any_member));
+                return gap(encode_gap(&encode, &items, pixels, wires, any_member));
             }
             side.far_open.sort_unstable();
             side.far_member.sort_unstable();
@@ -734,7 +740,7 @@ impl Engine {
         if items.decode_images && any_served && !any_vision {
             return gap(DECODE_VISION);
         }
-        let vision = items.decode_images || (items.references && images && any_vision);
+        let vision = items.decode_images || (items.references && pixels && any_vision);
         // The rows the pair is picked among. With every row admitted the
         // pools are the host's own; else each side's admitted rows stand in
         // a pool of their own and the targets are read back by where a row

@@ -78,6 +78,14 @@ pub(crate) struct DiscoveryFlags {
     )]
     kv_engine_id_annotation: String,
 
+    /// Pod label containing the worker's prefill/decode pairing protocol
+    #[arg(
+        long,
+        default_value = "smg.ai/pairing-protocol",
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    pairing_protocol_label: String,
+
     /// Label selector for encode server pods in EPD mode
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
     encode_selector: Vec<String>,
@@ -273,6 +281,7 @@ impl DiscoveryFlags {
                     decode_selector,
                     kv_connector_annotation: self.kv_connector_annotation.clone(),
                     kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
+                    pairing_protocol_label: self.pairing_protocol_label.clone(),
                     model_id_source: self.model_id_from.clone(),
                     ..Default::default()
                 }))
@@ -515,6 +524,9 @@ pub(super) fn refuse_settings(
         }
         (DiscoveryConfig::Kubernetes(_), "discovery.kv_engine_id_annotation") => {
             "--kv-engine-id-annotation"
+        }
+        (DiscoveryConfig::Kubernetes(_), "discovery.pairing_protocol_label") => {
+            "--pairing-protocol-label"
         }
         (DiscoveryConfig::Kubernetes(_), "discovery.model_id_source") => "--model-id-from",
         (DiscoveryConfig::File(_), "discovery.path") => "--discovery-file",

@@ -1,8 +1,5 @@
 //! The cases of a frame's request maker: what the engine over worker lists
 //! is handed of a frame, and what it answers.
-//!
-//! Each case names the place the controller on main answers by today, the
-//! engine over stored records and its read of a frame.
 
 use std::{
     sync::Arc,
@@ -11,6 +8,7 @@ use std::{
 
 use smg_worker::{
     identity::{basic::Worker, builder::BasicWorkerBuilder},
+    load::state::{one_rank_load, LoadSnapshot},
     test_support::{no_health_check, ready_worker},
     worker::{WorkerSpec, WorkerStatus, WorkerType},
 };
@@ -26,7 +24,7 @@ use crate::{
         policy_engine::PolicyEngine,
         view::{
             fingerprint, Constraints, FixedFacts, HashKind, Header, Identity, MediaCounts,
-            ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
+            ModelFingerprint, Phase, RequestFacts, SessionCountedUnder, WireModes, WorkerId,
         },
         PairAdmission, PairLists,
     },
@@ -197,15 +195,15 @@ fn shed_of(decided: Decided) -> (ShedReason, &'static str) {
     }
 }
 
-/// Every field of a frame reaches the request its maker makes, as it
-/// reaches the request of the engine over stored records
-/// (`Checked::read`, and its case over the same frame in the wire's own
-/// cases). Three things are a controller's own and not the frame's: the
-/// budget is what is left, the wires are not stated, and the places and
-/// held-back positions are the ones the maker was handed. Of the subset
-/// hint a 0 alone is stated. The frame's whole budget and the wires its
-/// gateway states are read on the frame, where it was checked: no request
-/// states them. The frame gives its id whole for its answer.
+/// Every field of a frame reaches the request its maker makes.
+/// Four things are a controller's own and not the frame's: the
+/// budget is what is left, the wires are not stated, the places and
+/// held-back positions are the ones the maker was handed, and a key's
+/// requests are said counted
+/// (`a_keyed_frames_request_says_its_keys_requests_are_counted`). Of the
+/// subset hint a 0 alone is stated. The frame's whole budget and the wires
+/// its gateway states are read on the frame, where it was checked: no
+/// request states them. The frame gives its id whole for its answer.
 #[test]
 fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
     // A ring keyed by the prompt reads a text's hashes: the frame's three
@@ -293,8 +291,7 @@ fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
     let free = unheld.make(&spec).constraints;
     assert_eq!(free.places, None);
     assert!(free.stalled.is_empty() && free.held.is_empty());
-    // More left than the field holds is told as its widest, as the read for
-    // the engine over stored records tells it.
+    // More left than the field holds is told as its widest.
     let long = FrameRequest::new(
         &frame,
         &lists,
@@ -315,11 +312,35 @@ fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
     assert_eq!(answered.into_id(), [7, 8, 9]);
 }
 
+/// A controller serves no request: the decisions it holds on file count a
+/// key's requests on each worker. So the request its maker makes of a keyed
+/// frame says that the count stands, the key in either form, and the maker
+/// says under what name: the session's number. A frame with no key states
+/// no count. The frame's one reader states none of this: the maker does.
+#[test]
+fn a_keyed_frames_request_says_its_keys_requests_are_counted() {
+    let spec = applied(&preset("random"));
+    let counted = |key: Option<Form>| {
+        let frame = frame_of(1, |frame| {
+            let facts = frame.facts.as_mut().expect("the frame has facts");
+            facts.session_key = key.map(|form| proto::Identity { form: Some(form) });
+        });
+        let mut buffers = Lists::default();
+        let lists = buffers.of(&frame);
+        assert!(!frame.facts(&lists, 0, 0).session_counted);
+        let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::None);
+        let under = maker.session_counted_under();
+        assert_eq!(under, SessionCountedUnder::SessionNumber);
+        maker.make(&spec).facts.session_counted
+    };
+    assert!(counted(Some(Form::Hash(17))));
+    let clear = Form::Plain("talk-1".to_owned());
+    assert!(counted(Some(clear)));
+    assert!(!counted(None));
+}
+
 /// A decider reads frame after frame onto the same buffers: a later frame's
-/// request holds its own lists and nothing of an earlier frame's, as the
-/// read for the engine over stored records hands them
-/// (`a_decider_reads_frame_after_frame_on_the_same_buffers` in the wire's
-/// own cases).
+/// request holds its own lists and nothing of an earlier frame's.
 #[test]
 fn a_later_frames_request_holds_nothing_of_an_earlier_frames_lists() {
     let spec = applied(&preset("random"));
@@ -694,11 +715,10 @@ fn a_count_past_its_records_width_is_made_at_its_widest_and_a_header_past_256_na
 }
 
 /// A frame's decision is a whole one and names its alternates, up to four
-/// (`MAX_TARGETS`; a rotation's whole pick, `policies/round_robin.rs`), as
-/// the engine over stored records answers every frame: a gateway's
-/// dispatch names a target of the answer by its index. So the maker never
-/// says its request plain. Said plain, the same frame is answered the one
-/// place a caller in process takes.
+/// (`MAX_TARGETS`; a rotation's whole pick, `policies/round_robin.rs`): a
+/// gateway's dispatch names a target of the answer by its index. So the
+/// maker never says its request plain. Said plain, the same frame is
+/// answered the one place a caller in process takes.
 #[test]
 fn a_frames_decision_names_its_alternates() {
     let engine = engine("round_robin");
@@ -722,10 +742,46 @@ fn a_frames_decision_names_its_alternates() {
     assert_eq!(alone.len(), 1, "{alone:?}");
 }
 
+/// A request told the load snapshot its decision reads is decided by that
+/// snapshot's reports: under the least-load preset every pick names the
+/// worker that reports no queue. The same frames told no snapshot read the
+/// one their engine keeps, which holds no report here, and the worker with
+/// the queue is a pick among them.
+#[test]
+fn a_request_told_a_load_snapshot_is_decided_by_its_reports() {
+    let engine = engine("least_load");
+    let list = pool(2);
+    let members = PublishedList::new(Arc::clone(&list));
+    let loads = LoadSnapshot::from_loads_for_test(vec![
+        (
+            "http://worker-0:8000".to_owned(),
+            one_rank_load(900_000, 0.9, 10.0),
+        ),
+        (
+            "http://worker-1:8000".to_owned(),
+            one_rank_load(0, 0.1, 10.0),
+        ),
+    ]);
+    let now = Instant::now();
+    let mut buffers = Lists::default();
+    let (mut told, mut untold) = (Vec::new(), Vec::new());
+    for seed in 0..32 {
+        let frame = frame_of(seed, |_| {});
+        let lists = buffers.of(&frame);
+        let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::Single(members.lent()));
+        assert!(maker.loads().is_none());
+        untold.push(places(&decided(&engine, &maker, now))[0]);
+        let maker = maker.reading(&loads);
+        assert!(maker.loads().is_some_and(|read| Arc::ptr_eq(read, &loads)));
+        told.push(places(&decided(&engine, &maker, now))[0]);
+    }
+    assert!(told.iter().all(|place| *place == 1), "{told:?}");
+    assert!(untold.contains(&0), "{untold:?}");
+}
+
 /// The hashes past what the deciding document reads are cut where the
-/// request is made, and the first ones kept, as the read for the engine
-/// over stored records cuts them (`Viewed::max_block_hashes`): a prefix
-/// cut short is still a prefix.
+/// request is made, and the first ones kept: a prefix cut short is
+/// still a prefix.
 #[test]
 fn the_hashes_past_what_the_document_reads_are_cut_and_the_first_kept() {
     let frame = frame_of(7, |frame| {
@@ -779,12 +835,11 @@ fn the_hashes_are_cut_in_blocks_of_the_frames_own_size_and_kind() {
     assert_eq!((text(32), text(64)), (32, 16));
 }
 
-/// A hint of 0 is a decision over no candidates. Main sheds such a frame
-/// `NoEndpoints` under `subset-hint` (`emptied` in the engine over stored
-/// records). The maker keeps the 0, so the answer cannot be lost: the
-/// frame's caller gives it before it asks the engine
-/// (`GatewayPlaces::taken`), and the engine declines the single request of
-/// a caller that did not, where it would have picked a worker.
+/// A hint of 0 is a decision over no candidates. The controller sheds such
+/// a frame `NoEndpoints` under `subset-hint`. The maker keeps the 0, so the
+/// answer cannot be lost: the frame's caller gives it before it asks the
+/// engine (`GatewayPlaces::taken`), and the engine declines the single
+/// request of a caller that did not, where it would have picked a worker.
 #[test]
 fn a_hint_of_0_reaches_the_engine_which_refuses_a_single_request_not_answered_for_it() {
     let engine = engine("random");
@@ -923,10 +978,9 @@ fn a_frame_names_a_worker_by_the_stores_id_over_a_list_that_states_it() {
     );
 }
 
-/// A positive subset hint reaches no stage, as on main, where the
-/// deciding threads say so of the engine over stored records: the frame
-/// decides as one that states none. The engine over worker lists declines
-/// a request that states a hint, so the maker leaves it out.
+/// A positive subset hint reaches no stage: the frame decides as one that
+/// states none. The engine over worker lists declines a request that
+/// states a hint, so the maker leaves it out.
 #[test]
 fn a_positive_subset_hint_reaches_no_stage() {
     let engine = engine("random");

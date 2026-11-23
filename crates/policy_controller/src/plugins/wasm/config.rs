@@ -105,7 +105,11 @@ pub struct PluginSpec {
     /// The plugin's own frame budget per stage call, in microseconds; `0`
     /// takes the default frame ([`FrameBudget::DEFAULT_MICROS`]). The host
     /// clamps it to at most the decision's, and meters it as fuel through
-    /// `fuel_per_micro`.
+    /// `fuel_per_micro`. The breaker's latency rule sets the plugin's time
+    /// in a decision against the frames it was given there, at most the
+    /// decision's budget: state at least twice a call's usual time. A
+    /// decision's constructor is a call under a frame of its own, so a
+    /// plugin bound as one stage is read over two frames.
     pub budget_micros: u32,
     /// The host's calibration of fuel to wall time on the reference host.
     pub fuel_per_micro: u64,

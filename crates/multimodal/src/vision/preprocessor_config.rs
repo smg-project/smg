@@ -223,7 +223,8 @@ pub struct PreProcessorConfig {
     #[serde(default)]
     pub num_crops: Option<usize>,
 
-    /// Phi4-Vision: dynamic HD max crops
+    /// The crop budget of an upstream Phi4-Vision config. No processor of this
+    /// crate applies it; Inkling2 refuses a config that sets it.
     #[serde(default)]
     pub dynamic_hd: Option<usize>,
 
@@ -336,7 +337,7 @@ impl PreProcessorConfig {
     /// Get patch size as a simple usize.
     ///
     /// Returns the height value from PatchSize if available, falling back to provided default.
-    pub fn get_patch_size(&self, default: usize) -> usize {
+    pub(crate) fn get_patch_size(&self, default: usize) -> usize {
         self.patch_size
             .as_ref()
             .and_then(|p| p.height)
@@ -355,7 +356,7 @@ impl PreProcessorConfig {
     }
 
     /// Get image mean as fixed array, with fallback to CLIP defaults.
-    pub fn get_image_mean(&self) -> [f64; 3] {
+    pub(crate) fn get_image_mean(&self) -> [f64; 3] {
         self.image_mean
             .as_ref()
             .and_then(|v| {
@@ -369,7 +370,7 @@ impl PreProcessorConfig {
     }
 
     /// Get image std as fixed array, with fallback to CLIP defaults.
-    pub fn get_image_std(&self) -> [f64; 3] {
+    pub(crate) fn get_image_std(&self) -> [f64; 3] {
         self.image_std
             .as_ref()
             .and_then(|v| {
@@ -386,7 +387,7 @@ impl PreProcessorConfig {
     ///
     /// Handles both `{"height": H, "width": W}` and `{"shortest_edge": S}` formats.
     /// Returns (height, width).
-    pub fn get_target_size(&self) -> Option<(u32, u32)> {
+    pub(crate) fn get_target_size(&self) -> Option<(u32, u32)> {
         self.size.as_ref().map(|s| {
             // Try explicit height/width first
             let h = s
@@ -405,7 +406,7 @@ impl PreProcessorConfig {
 
     /// Get a scalar value from the `size` map, such as `shortest_edge` or
     /// `longest_edge`.
-    pub fn get_size_value(&self, key: &str) -> Option<usize> {
+    pub(crate) fn get_size_value(&self, key: &str) -> Option<usize> {
         self.size
             .as_ref()
             .and_then(|s| s.get(key))
@@ -416,14 +417,14 @@ impl PreProcessorConfig {
         self.get_size_value("shortest_edge")
     }
 
-    pub fn get_longest_edge(&self) -> Option<usize> {
+    pub(crate) fn get_longest_edge(&self) -> Option<usize> {
         self.get_size_value("longest_edge")
     }
 
     /// Get crop size.
     ///
     /// Returns (height, width).
-    pub fn get_crop_size(&self) -> Option<(u32, u32)> {
+    pub(crate) fn get_crop_size(&self) -> Option<(u32, u32)> {
         self.crop_size.as_ref().map(|s| {
             let h = s.get("height").copied().unwrap_or(224);
             let w = s.get("width").copied().unwrap_or(224);
@@ -432,7 +433,7 @@ impl PreProcessorConfig {
     }
 
     /// Get rescale factor with default.
-    pub fn get_rescale_factor(&self) -> f64 {
+    pub(crate) fn get_rescale_factor(&self) -> f64 {
         self.rescale_factor.unwrap_or(1.0 / 255.0)
     }
 
@@ -452,7 +453,7 @@ impl PreProcessorConfig {
     /// swallows a type mismatch into `None`, and a silent default would change an alignment
     /// factor or the token geometry, so the gateway's placeholder count would disagree with the
     /// serving engine's with no trace.
-    pub fn extra_usize(&self, key: &str) -> Result<Option<usize>, &serde_json::Value> {
+    pub(crate) fn extra_usize(&self, key: &str) -> Result<Option<usize>, &serde_json::Value> {
         let Some(value) = self.extra.get(key) else {
             return Ok(None);
         };
@@ -468,8 +469,8 @@ impl PreProcessorConfig {
     }
 
     // Common default values
-    pub const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
-    pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
+    pub(crate) const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
+    pub(crate) const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 }
 
 #[cfg(test)]

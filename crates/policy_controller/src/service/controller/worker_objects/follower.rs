@@ -43,8 +43,8 @@ const OVERLOAD_DEFAULTS: OverloadThresholds = OverloadThresholds {
 /// Each object states its row's overload thresholds over the program's
 /// default ([`OVERLOAD_DEFAULTS`]): what a load monitor over the registry
 /// judges the worker by ([`load_monitor`](crate::worker_host::load_monitor)).
-/// The service runs no such monitor yet, so no verdict is written on an
-/// object.
+/// The service runs that monitor while the replica leads, and it writes
+/// each verdict on the worker's object.
 ///
 /// An object's status follows its row's
 /// ([`Objects::with_status_followed`]). A decision reads a worker's status
@@ -144,8 +144,7 @@ mod tests {
             replication::Log,
         },
         store::{
-            JournalKinds, LeasesStore, Overload, Position, WorkerFacts, WorkerPatch, WorkerStatus,
-            WorkersStore,
+            LeasesStore, Overload, Position, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
         },
     };
 
@@ -249,15 +248,15 @@ mod tests {
     fn ship(leader: &Log, follower: &Follower) {
         let now = Instant::now();
         let mut place = match follower.place() {
-            nothing if nothing == Position::default() => leader
-                .first(JournalKinds::Watched)
-                .expect("every write is retained"),
+            nothing if nothing == Position::default() => {
+                leader.first().expect("every write is retained")
+            }
             place => place,
         };
         let mut entries = Vec::new();
         loop {
             leader
-                .read(JournalKinds::Watched, place, 64, &mut entries)
+                .read(place, 64, &mut entries)
                 .expect("the place is held");
             let Some(last) = entries.last() else {
                 return;
@@ -267,7 +266,7 @@ mod tests {
                 let batch = proto::ReplicationBatch {
                     first_seq: entry.at.seq,
                     term: entry.at.term,
-                    events: vec![worker_wire::replication(entry, now)],
+                    events: vec![worker_wire::replication(entry)],
                     resync_required: false,
                     snapshot: None,
                     head_seq: entry.at.seq,
@@ -386,7 +385,7 @@ mod tests {
         standby.caught_up("the standby's start").await;
         assert!(standby.held().is_empty());
         let follower = Follower::new(Arc::clone(&standby.store), Arc::clone(&standby.feed.log));
-        let cut = leader.store.checkpoint(JournalKinds::All);
+        let cut = leader.store.checkpoint();
         assert_eq!(follower.restore(cut, None), Ok(true));
         standby.caught_up("the restore").await;
         assert_eq!(standby.held(), leader.held());

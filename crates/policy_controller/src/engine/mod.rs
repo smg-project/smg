@@ -32,7 +32,6 @@ pub(crate) mod prompt_hashes;
 pub(crate) mod records;
 pub(crate) mod shadow;
 pub(crate) mod sticky_sessions;
-pub(crate) mod store_backed_engine;
 pub(crate) mod view;
 pub(crate) mod warm_up;
 
@@ -42,7 +41,7 @@ pub use decision::{
 };
 pub use decision_engine::{
     AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused,
-    HeldDecision, HeldDecode, Leased, Plain, Request, RequestMaker, SweepOutcome,
+    HeldDecision, HeldDecode, Leased, Plain, Request, RequestMaker,
 };
 #[cfg(feature = "in-process")]
 pub use decision_engine::{TokenKey, WorkerLists};
@@ -85,11 +84,11 @@ pub use sticky_sessions::{
     DecodeVerdict, SessionExpiry, SessionPins, SessionRule, SessionTable, SessionVerdict,
     ABSENT_WORKER_PIN_TTL_MICROS,
 };
-pub use store_backed_engine::StoreBackedEngine;
 pub use view::{
     fingerprint, key_of_session, permille, AffinityFacts, AffinityHolder, AffinityRows, Candidate,
     Constraints, Engines, FixedFacts, HashKind, Header, Health, Identity, KeyedRow, LoadRow,
     MediaCounts, ModelFingerprint, OverloadRegime, Phase, PinSource, PoolFacts, RequestFacts, Role,
-    Session, SignalSource, WireModes, WorkerId, ZoneCapacity, TEXT_BYTES_PER_TOKEN,
+    Session, SessionCountedUnder, SignalSource, WireModes, WorkerId, ZoneCapacity,
+    TEXT_BYTES_PER_TOKEN,
 };
 pub use warm_up::{WarmUpRule, WarmUpState};

@@ -20,8 +20,8 @@
 //! - 4.2, the decision ([`engine`]): an ordered [`Pick`] of up to
 //!   [`MAX_TARGETS`] targets, a [`Shed`] with its reason and the stage that
 //!   emptied the pool, or a [`Queue`] ticket (specified in v1; no built-in
-//!   issues one yet). A decision books nothing by itself: its door files
-//!   the pick's lease at the issue, which books the first target, and the
+//!   issues one yet). A decision books nothing by itself: the pick's
+//!   lease is filed at the issue, which books the first target, and the
 //!   host reports the lifecycle back. One issue books another target: a
 //!   pair's decode asked for later and sent with no decode call is issued
 //!   at its dispatch, on the target that dispatch took.
@@ -36,7 +36,7 @@
 //!   membership hooks. The
 //!   prefixes sent to a model's workers without cache events are kept by
 //!   the sent-prefix predictor ([`tracking`]). A profile that reads sent
-//!   prefixes reads that record at the naming through the in-process door.
+//!   prefixes reads that record at the naming.
 //! - 4.5, the stages in code ([`stages`]): the [`StageRegistry`] of the stages
 //!   a build knows by name, the stock build's and the ones a host registers. A
 //!   document names either kind the same way, and the validator resolves every
@@ -55,10 +55,7 @@
 //!   KV events feed the index the store holds for each model
 //!   ([`store`]), which no decision reads yet. A
 //!   gateway in the embedded mode implements the same traits over its own
-//!   structures. The store publishes what a decision reads
-//!   ([`store::StoreSnapshot`]: every pool as whole candidate rows) and builds
-//!   one decision's view from it through no lock; the service that calls the
-//!   build is a later step.
+//!   structures.
 //! - 10, the election ([`service::elector`]): one [`service::elector::Elector`] over a
 //!   [`service::elector::LeaseBackend`] (the lease file and the in-process record
 //!   here, the Kubernetes `Lease` next), terms that only grow, and the
@@ -87,14 +84,9 @@
 //! - Behind the `operator` feature, `document::operator::DocumentManager`
 //!   applies a host's start document and serves its status, document and dry
 //!   run. The feature also serves worker snapshots over the host's store.
-//! - The door ([`engine`]): the order of one decision's calls, written once
-//!   for every host. A host that embeds the engine asks
-//!   [`engine::StoreBackedEngine`], which runs the order on the caller's thread
-//!   over a [`store::MemoryStore`]: the lease is filed at the issue, the host
-//!   says what became of it ([`engine::StoreBackedEngine::report`]), itself or
-//!   through a handle, and its timer calls the door's clock
-//!   ([`engine::StoreBackedEngine::sweep`]). The standalone controller runs the
-//!   same order on its deciders' threads.
+//! - The engine ([`engine`]): an embedded host lends its worker lists to
+//!   `engine::PolicyEngine` and asks it on the caller's thread. The
+//!   standalone controller asks the same engine on its deciders' threads.
 //! - The handle ([`tracking`]): one decision held until its request ends.
 //!   A host that holds a [`tracking::DecisionGuard`] says the target it took,
 //!   the dispatch, and the completion or the release. The handle reports to the
@@ -174,11 +166,16 @@
 //! [`Needs`]: document::Needs
 //!
 
+use std::{cell::Cell, collections::hash_map::RandomState, hash::BuildHasher, thread};
+
 #[cfg(any(feature = "ingest", feature = "operator"))]
 mod address;
 pub mod document;
 pub mod engine;
 pub mod load;
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+pub mod mirrored;
 #[cfg(any(feature = "wasm", feature = "controller", feature = "in-process"))]
 mod names;
 pub mod plugins;
@@ -279,6 +276,26 @@ impl Draw {
     pub(crate) const fn state(self) -> u64 {
         self.0
     }
+}
+
+/// A seed no other request of this thread was given: the one randomness a
+/// stage gets ([`engine::RequestFacts::seed`]), and what a picker
+/// that places by itself draws from. Under a constant seed a policy that
+/// draws picks the same worker of an unchanged pool every time.
+///
+/// Each thread walks a draw sequence of its own ([`Draw`]). Its start is
+/// the standard library's process-random hash of the thread's id, so two
+/// threads and two runs of a process start apart.
+pub(crate) fn fresh_seed() -> u64 {
+    thread_local! {
+        static NEXT: Cell<u64> = Cell::new(RandomState::new().hash_one(thread::current().id()));
+    }
+    NEXT.with(|next| {
+        let mut draw = Draw::new(next.get());
+        let seed = draw.next_u64();
+        next.set(draw.state());
+        seed
+    })
 }
 
 #[cfg(test)]

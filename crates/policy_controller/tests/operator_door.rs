@@ -94,9 +94,7 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
     let asked = WorkerRowsQuery { limit: 2, ..asked };
     let page = worker_rows_page(
         &asked,
-        Rows::Shared(Arc::new(
-            store.checkpoint(smg_policy_controller::store::JournalKinds::Watched),
-        )),
+        Rows::Shared(Arc::new(store.checkpoint())),
         Instant::now(),
     );
     assert!(!page.truncated);

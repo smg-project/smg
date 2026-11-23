@@ -618,6 +618,24 @@ const WAITING_GAP: usize = 32;
 /// faster by its median text on one of 262k).
 const NEAR_SEED_SLOTS: usize = 131_072;
 
+/// Pieces a unit cut by blocks holds and answers together
+/// (`Native::answer_asked`).
+const ASK_AHEAD: usize = 32;
+/// Slots of a thread's packed table past which a unit cut by blocks holds
+/// its pieces. A choice by workload: holding costs 25 to 30 instructions a
+/// token, and under a bound of 16,384 slots a text of 32 thousand tokens
+/// read 3 % slower, new and read again (measured).
+const ASK_AHEAD_SLOTS: usize = 8 * THREAD_BACKING_SLOTS;
+
+/// A piece held for `Native::answer_asked`.
+#[derive(Clone, Copy)]
+struct Asked {
+    start: usize,
+    end: usize,
+    key: Option<ShortPieceKey>,
+    hash: u64,
+}
+
 /// A short piece the thread's packed table missed, waiting for its answer
 /// (see `Native::waits`): where the probe ended, with the piece's key, and
 /// where its hole of one id stands in the output.
@@ -3973,13 +3991,9 @@ impl NativeEncoder {
                 let encoded = if cache.unit_ascii {
                     self.encode_single_stage::<true>(model, stage, text, words, mapped, ids, cache)
                 } else if let Some(blocks) = stage.pattern.by_blocks(text) {
-                    self.encode_single_stage_by_blocks(
-                        model, blocks, text, words, mapped, ids, cache,
-                    )
+                    self.encode_unit_by_blocks(model, blocks, text, words, mapped, ids, cache)
                 } else if let Some(blocks) = stage.pattern.by_cased_blocks(text) {
-                    self.encode_single_stage_by_blocks(
-                        model, blocks, text, words, mapped, ids, cache,
-                    )
+                    self.encode_unit_by_blocks(model, blocks, text, words, mapped, ids, cache)
                 } else {
                     self.encode_single_stage::<false>(model, stage, text, words, mapped, ids, cache)
                 };
@@ -4361,8 +4375,7 @@ impl NativeEncoder {
             // No lean scan: the block pass where the pattern gives that
             // reader (the cased-letter template), else the walk as it was.
             if let Some(blocks) = stage.pattern.by_cased_blocks(text) {
-                return self
-                    .encode_single_stage_by_blocks(model, blocks, text, words, mapped, ids, cache);
+                return self.encode_unit_by_blocks(model, blocks, text, words, mapped, ids, cache);
             }
             return self
                 .encode_single_stage::<false>(model, stage, text, words, mapped, ids, cache);
@@ -4405,8 +4418,9 @@ impl NativeEncoder {
             }
             let rest = &text[stopped..];
             return match stage.pattern.by_blocks(rest) {
-                Some(blocks) => self
-                    .encode_single_stage_by_blocks(model, blocks, rest, words, mapped, ids, cache),
+                Some(blocks) => {
+                    self.encode_unit_by_blocks(model, blocks, rest, words, mapped, ids, cache)
+                }
                 None => {
                     self.encode_single_stage::<false>(model, stage, rest, words, mapped, ids, cache)
                 }
@@ -4456,6 +4470,121 @@ impl NativeEncoder {
                 }
             },
         );
+        fallback.map_or(Ok(()), Err)
+    }
+
+    /// The table's size is asked here, at the call: asked inside the routine
+    /// by blocks, its loop ran one instruction a token more (counted).
+    #[inline(always)]
+    #[expect(clippy::too_many_arguments)]
+    fn encode_unit_by_blocks<const CASED: bool>(
+        &self,
+        model: Option<&ModelWrapper>,
+        blocks: pattern::ByBlocks<'_, CASED>,
+        text: &str,
+        words: bool,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        if cache.packed.slots() > ASK_AHEAD_SLOTS {
+            self.encode_single_stage_asked_ahead(model, blocks, text, words, mapped, ids, cache)
+        } else {
+            self.encode_single_stage_by_blocks(model, blocks, text, words, mapped, ids, cache)
+        }
+    }
+
+    /// [`Self::encode_single_stage_by_blocks`] for a table past
+    /// [`ASK_AHEAD_SLOTS`].
+    #[inline(never)]
+    #[expect(clippy::too_many_arguments)]
+    fn encode_single_stage_asked_ahead<const CASED: bool>(
+        &self,
+        model: Option<&ModelWrapper>,
+        blocks: pattern::ByBlocks<'_, CASED>,
+        text: &str,
+        words: bool,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        let mut fallback = None;
+        let bytes = text.as_bytes();
+        let mut held = [Asked {
+            start: 0,
+            end: 0,
+            key: None,
+            hash: 0,
+        }; ASK_AHEAD];
+        let mut count = 0usize;
+        blocks.for_each_match(
+            text,
+            words,
+            #[inline(always)]
+            |start, end| {
+                let key = ShortPieceKey::at(bytes, start, end);
+                // A piece without a key holds hash 0: its touch reads the
+                // table's first lines again, cheaper than a test a piece.
+                let hash = key.map_or(0, ShortPieceTable::hash_of);
+                held[count] = Asked {
+                    start,
+                    end,
+                    key,
+                    hash,
+                };
+                count += 1;
+                if count == ASK_AHEAD {
+                    count = 0;
+                    if let Err(declined) = self.answer_asked(model, text, &held, mapped, ids, cache)
+                    {
+                        fallback = Some(declined);
+                    }
+                }
+            },
+        );
+        if count != 0 {
+            let tail = self.answer_asked(model, text, &held[..count], mapped, ids, cache);
+            fallback = tail.err().or(fallback);
+        }
+        fallback.map_or(Ok(()), Err)
+    }
+
+    /// Answers `pieces` of `text`, in order. The touches go before the
+    /// probes, with nothing between them, so that the far lines of all the
+    /// pieces are in flight together.
+    #[inline(never)]
+    fn answer_asked(
+        &self,
+        model: Option<&ModelWrapper>,
+        text: &str,
+        pieces: &[Asked],
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        let bytes = text.as_bytes();
+        let mut touched = 0u8;
+        for piece in pieces {
+            touched ^= cache.packed.touch_hashed(piece.hash);
+        }
+        std::hint::black_box(touched);
+        let mut fallback = None;
+        for piece in pieces {
+            let vacancy = match piece.key {
+                Some(key) => match cache.packed.lookup_hashed(key, piece.hash, ids) {
+                    None => continue,
+                    Some(vacancy) if self.seeded(vacancy, ids, cache) => continue,
+                    vacancy => vacancy,
+                },
+                None => None,
+            };
+            let piece = &bytes[piece.start..piece.end];
+            if let Err(declined) =
+                self.tokenize_piece_slow(model, piece, vacancy, mapped, ids, cache)
+            {
+                fallback = Some(declined);
+            }
+        }
         fallback.map_or(Ok(()), Err)
     }
 

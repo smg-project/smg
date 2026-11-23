@@ -369,16 +369,24 @@ behavior did, and the drawn rows are a new sample.
 
 ## Reading
 
-The crate's replay reads this directory, every run of its suite with the `ingest` and `in-process` features:
+The crate's replay reads this directory, every run of its suite with the `ingest`, `in-process` and `worker-host`
+features:
 
 ```bash
-cargo test -p smg-policy-controller --features ingest,in-process --test classic_rows
+cargo test -p smg-policy-controller --features ingest,in-process,worker-host --test classic_rows
 ```
 
-A few rows of each sheet are also copied into the crate's test source, and the replay holds each copy to its sheet.
+A few rows of each sheet a module replays are also copied into the crate's test source, and the replay holds each
+copy to its sheet.
 
-`retry_wire.json`, `media_refs.json`, `context_window.json`, `rank_pin.json` and `sticky_rank.json` replay over
-worker objects, which the `in-process` feature brings.
+`retry_wire.json`, `media_refs.json`, `context_window.json`, `rank_pin.json`, `sticky_rank.json` and
+`encode_pair.json` replay over worker objects, which the `in-process` feature brings. The encode sheet's fleets are
+decided by the engine's entry for an encode request over three lists of worker objects.
+
+`overload.json` replays through the worker crate's load monitor, built as a host of the engine over worker lists
+builds it, which the `worker-host` feature brings.
+
+`minimum_tokens.json` replays through the rank cache of that load monitor, behind the same feature.
 
 ## Limits left
 
@@ -388,20 +396,31 @@ fails once the reason no longer holds.
 - `power_of_two.json`: none. All 44 rows replay.
 - `all_vetoed.json`: none. All 104 rows replay.
 - `pair_index.json`: none. All 23 rows replay.
-- `encode_pair.json`: none is recorded yet. The module that replays it arrives with the crate's encoder lists
-  and its rule for encode items; until then the replay owes this sheet.
-- `pair_select.json`: five rows are decided apart, each named by the replay with the answer the pair's decision
-  gives. Four run a prefill policy that weighs load against cache affinity itself (`cache_aware`): the gateway
-  lifts the overload veto for such a policy and lets it place, and no profile of the crate places over a lifted
-  veto yet. A prefill of such a profile that is only over its thresholds keeps its refusal. One is a refusal's
-  reason: where the only ready prefill's partners are all over their thresholds beside a free decode of another
-  transport, the gateway answers unavailable and the pair's decision names the overload veto. The other 35 rows
-  replay.
-- `overload.json`: owed whole, 25 rows. A row records the overload verdict of the gateway's load monitor. A host of
-  the engine over worker lists writes that verdict on the worker object and the engine reads it there: the engine
-  judges no load. The crate's store judged these rows by rules of its own, 19 as recorded and six apart, until its
-  decision views left. No module replays the sheet now: the replay names it as owed and holds it to its 25 rows,
-  until the change that asks the load monitor of a controller's host for these verdicts.
+- `encode_pair.json`: all 52 rows replay. In the nine that place items by consistent hashing a key's encoder is
+  not held to the recorded one: two rings place no key alike. The replay holds each key to the encoders it was
+  offered and equal keys to one encoder.
+- `pair_select.json`: one row is decided apart, named by the replay with the answer the pair's decision gives. It
+  is a refusal's reason: where the only ready prefill's partners are all over their thresholds beside a free decode
+  of another transport, the gateway answers unavailable and the pair's decision names the overload veto. The other
+  39 rows replay, the four of a prefill policy that weighs load against cache affinity itself (`cache_aware`)
+  among them: the gateway lifts the overload veto for such a policy and lets it place, and a prefill profile that
+  reads affinity runs with that veto lifted under a binding that steers.
+- `overload.json`: none where the worker is one object for all its ranks, as the recording gateway held it. All 25
+  rows replay there, verdict for verdict, through the worker crate's load monitor. The replay builds the holder of
+  worker objects with the calls a controller builds its own with, and writes the row's worker into the store the
+  holder follows. It hands the monitor each step: a poll through the monitor's poll of the worker's group, a pushed
+  record through the record's own entry, and an eviction as the worker's row leaving the ready set. It reads the
+  verdict off the worker object, where the engine reads it: the engine judges no load.
+  Eleven of the 14 rows of several ranks answer apart where each rank is a worker object of its own, as a
+  registration of several ranks lays them. The replay runs those 14 rows a second time in that layout and names
+  the eleven, each with the verdict on each rank's object. One rule holds all eleven: there the monitor judges a
+  rank's object by its own rank's figures, not by the queue summed and the usage averaged over the engine's ranks.
+  Two ranks that queue 4 requests each under a threshold of 8 are vetoed as one worker and not as two
+  (`the-queue-vetoes-at-its-count-and-above-summed-over-two-ranks`). Under a usage threshold of 0.5 a rank at 0.5
+  is vetoed alone where the mean over both ranks is 0.375 and the one worker is not vetoed
+  (`the-usage-vetoes-at-its-mean-and-above-over-two-ranks`). A rank's object states the address, the engine's
+  address, the rank and the width that the worker crate's builder gives a rank worker, which a gateway that
+  registers each data-parallel rank as a worker builds its workers with.
 - `manual.json`: one row is owed, `manual-one-key-pins-apart-under-the-prefill-and-the-decode-role`. The gateway
   keeps a key's pins apart under each role of a prefill and decode pair. The crate refuses a sessions rule under a
   pair plan today, so it cannot build the row; the other 13 rows replay.
@@ -414,12 +433,19 @@ fails once the reason no longer holds.
 - `bucket.json`: none. All 19 rows replay.
 - `cache_aware.json`: none. All 28 rows replay.
 - `sticky_override.json`: none. All 18 rows replay.
-- `minimum_tokens.json`: owed whole, 18 rows. A row records the rank the load monitor's rank cache gives a request
+- `minimum_tokens.json`: none through the load monitor's rank cache. All 18 rows replay there, rank for rank.
+  A row records the rank the load monitor's rank cache gives a request
   on a worker that stands for several ranks: an answer of the host's own code, asked after the pick. The crate's
-  store listed a row a rank and decided these rows by rules of its own, eight as recorded and ten apart, until its
-  decision views left. No module replays the sheet now: the replay names it as owed and holds it to its 18 rows,
-  until the change that asks the load monitor of a controller's host. Three of the ten rows were held apart by
-  rules of the engine's scorer and picker, which stand whatever feeds a rank's loads. A rank is scored by the
+  store listed a row a rank and decided these rows by rules of its own, eight as recorded and ten apart, until the
+  replay stopped reading that store.
+  The replay builds the monitor as the overload sheet's replay does and hands it each poll, failed poll and
+  eviction. It asks the monitor's rank cache for each request's rank, with the worker as one object for all its
+  ranks, or as the object of its one rank in the three rows that say so.
+  It does not replay the engine's pick among rank objects, and these rows are not that pick's answers. The engine
+  serves no rank option: `refuse_unsupported` in `src/document/routing_settings.rs` refuses the gateway's, and
+  where each rank is a worker object the engine picks among them by its profile.
+  Three of the ten rows answer apart under the engine's pick among rank objects,
+  by rules of its scorer and picker. There a rank is scored by the
   context tokens of its requests, not by the tokens its cache uses
   (`the-used-tokens-decide-where-a-rank-holds-fewer-context-tokens`,
   `a-rank-that-reports-no-context-tokens-is-a-rank-by-its-used-tokens`), and equal ranks are drawn, where the

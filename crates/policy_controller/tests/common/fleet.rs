@@ -74,13 +74,14 @@ use smg_policy_controller::{
     },
     stages::StageRegistry,
     store::{
-        BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, JournalKinds, KvCursor,
-        KvEvent, KvEventSink, LaneCounts, LeaseState, LoadSink, MembershipChange, MembershipTail,
+        BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, KvCursor, KvEvent,
+        KvEventSink, LaneCounts, LeaseState, LoadSink, MembershipChange, MembershipTail,
         MemoryStore, ResyncReason, SequenceHash, Signals, StoredBlock, WorkerFacts, WorkerStatus,
         WorkersStore,
     },
     tracking::LeaseId,
 };
+use smg_worker::load::state::LoadReceiver;
 use tokio::{
     io::{copy, sink},
     net::{TcpListener, TcpStream},
@@ -405,6 +406,9 @@ pub struct Replica {
     control: SocketAddr,
     replication: SocketAddr,
     store: Arc<MemoryStore>,
+    /// The channel of the controller's load monitor: what a decision is
+    /// given of its workers' load.
+    loads: LoadReceiver,
     readiness: Readiness,
     stop: Option<oneshot::Sender<()>>,
     serve: JoinSet<Result<(), Error>>,
@@ -1136,6 +1140,7 @@ impl Replica {
             .of(Scope::Replication)
             .ok_or("the controller has no replication listener")?;
         let store = controller.store();
+        let loads = controller.loads();
         let readiness = controller.readiness();
         let (stop, stopped) = oneshot::channel::<()>();
         let mut serve = JoinSet::new();
@@ -1151,6 +1156,7 @@ impl Replica {
             control,
             replication,
             store,
+            loads,
             readiness,
             stop: Some(stop),
             serve,
@@ -1297,14 +1303,12 @@ impl Harness {
     /// registration made is an error, and so is a load row: a leader sends
     /// a standby none, and a standby polls nobody.
     pub fn followed(&self, standby: &Replica) -> Result<usize, String> {
-        let cut = standby.store.checkpoint(JournalKinds::All);
-        if let Some((id, rank, _)) = cut.loads.first() {
-            return Err(format!(
-                "the standby holds a load row: {id:?} at rank {rank}"
-            ));
-        }
+        let cut = standby.store.checkpoint();
         let mut held = 0;
         for row in &cut.rows {
+            if standby.store.ranks(row.id) > 0 {
+                return Err(format!("the standby holds a load row: {:?}", row.id));
+            }
             if !self.members.contains_key(&row.id) {
                 return Err(format!(
                     "the standby holds a row no registration made: {:?}",
@@ -1658,6 +1662,25 @@ impl Harness {
         Ok(())
     }
 
+    /// Whether the controller's load monitor has published, for every row
+    /// of each of `engines`, a report sampled at or after `since`. A
+    /// decision is given the monitor's snapshot, where [`Self::pool`] reads
+    /// the store's load table: the monitor polls on its own clock.
+    pub fn monitored(&self, engines: &[usize], since: Instant) -> bool {
+        let snapshot = self.replica.loads.borrow();
+        let mut rows = self.members.iter();
+        rows.all(|(id, (engine, _))| {
+            if !engines.contains(engine) {
+                return true;
+            }
+            let row = WorkersStore::get(self.store.as_ref(), *id);
+            row.is_some_and(|row| {
+                let report = snapshot.report(&row.facts.key);
+                report.is_some_and(|(_, sampled)| sampled >= since)
+            })
+        })
+    }
+
     /// The pool serving `model` in `role` as the store holds it at this
     /// instant, each row named by its engine: the rows of the workers'
     /// table that serve the model in that role. A row is healthy where its
@@ -1886,16 +1909,6 @@ impl Harness {
         // By the trait's path, as `leases` reads the file.
         smg_policy_controller::store::LeasesStore::get(store, gateway, LeaseId(lease))
             .is_some_and(|record| matches!(record.state, LeaseState::Dispatched { .. }))
-    }
-
-    /// The row the store's pin of record names for `session`, the value a
-    /// lease states of its request's session; `None` where the store pins
-    /// the session nowhere.
-    pub fn pinned(&self, session: u64) -> Option<(usize, u16)> {
-        // By the trait's path, as `leases` reads the file.
-        let pin =
-            smg_policy_controller::store::SessionsStore::lookup(self.store.as_ref(), session)?;
-        self.named(pin.worker.0)
     }
 
     /// Whether the store holds a completion of class ok by the gateway named

@@ -2,9 +2,10 @@
 //! key names.
 //!
 //! The engine decides a keyed request of the single plan over rows read one
-//! at a time ([`Engine::decide_keyed`]): its key's pin is one row. Here
-//! those rows are the records of a gateway's own list, each written when
-//! the decision asks about its worker ([`PoolRecords::read`]).
+//! at a time ([`Engine::decide_keyed`]): its key's pin is one row, and a
+//! ring's walk is the few its key reaches. Here those rows are the records
+//! of a gateway's own list, each written when the decision asks about its
+//! worker ([`PoolRecords::read`]).
 
 use std::sync::Arc;
 
@@ -45,9 +46,10 @@ impl PoolRows for ListRows<'_> {
 
 /// A keyed request's decision over `workers`, the list `records` were made
 /// from, by the rows its key names: its key's pin under the binding's
-/// sessions rule. `None` where the key decides nothing by those rows: the
-/// caller then asks the whole decision ([`records::decide`]) with the same
-/// `facts`.
+/// sessions rule, or the workers it reaches on the ring its caller lent
+/// ([`RequestFacts::ring`]). `None` where the key decides nothing by those
+/// rows: the caller then asks the whole decision ([`records::decide`]) with
+/// the same `facts`.
 ///
 /// The decision's instant is written into `facts` here
 /// ([`RequestFacts::now_micros`]), the one `live` was made at.

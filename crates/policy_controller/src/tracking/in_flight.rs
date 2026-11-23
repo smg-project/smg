@@ -13,13 +13,14 @@
 //! the worker's cell: the engine over worker lists reads the object's count.
 
 use std::sync::{
-    atomic::{AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     OnceLock,
 };
 
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use rustc_hash::FxHashMap;
 
-use crate::engine::view::Candidate;
+use crate::engine::view::{Candidate, Session};
 
 /// The place of one worker's count in the store's counts. A member is
 /// given its slot at the membership write that first files it and keeps
@@ -157,6 +158,13 @@ pub(crate) struct InFlightCounts {
 /// leaving wait for the steps under way, and a step waits for them: each
 /// of the two makes one call a lease that stands.
 ///
+/// A lease that counts for its session key steps the session's count on
+/// the worker too, beside its plain step: a capped sessions rule reads how
+/// many requests of a key stand on each worker. The store keeps the
+/// sessions that stand on a row, so a count handed takes each of them and
+/// the count before it gives each up, as the two do for the leases'
+/// number.
+///
 /// The calls and the count's drop run under the store's locks: none of
 /// them calls the store. A store that is dropped tells its counts
 /// nothing.
@@ -166,6 +174,17 @@ pub trait HostCount: Send + Sync {
 
     /// One lease that booked the worker books it no longer.
     fn freed(&self);
+
+    /// One lease more of `session` books the worker, never
+    /// [`Session::NONE`]. A count that keeps a session's requests on its
+    /// worker keeps them under the text [`Session::text`] writes: the
+    /// engine over worker lists reads a record's count under that text.
+    /// The default keeps no count of a session.
+    fn session_booked(&self, _session: Session) {}
+
+    /// One lease of `session` that booked the worker books it no longer:
+    /// the twin of [`Self::session_booked`].
+    fn session_freed(&self, _session: Session) {}
 }
 
 /// One member's place for the count its host keeps.
@@ -177,6 +196,20 @@ pub trait HostCount: Send + Sync {
 #[derive(Default)]
 struct HostPlace {
     count: RwLock<Option<Box<dyn HostCount>>>,
+    /// The sessions whose leases book the member, each with how many of
+    /// its leases do. A hand-over and the member's leaving replay them:
+    /// the cell's number names no session. A step writes it with the
+    /// place held shared, under this lock of its own. Empty for a member
+    /// that no keyed lease books. A member that stands keeps the table's
+    /// room when its last session leaves: its next keyed lease allocates
+    /// nothing.
+    sessions: Mutex<FxHashMap<Session, u32>>,
+    /// The member left the store. No count is handed for it again, so
+    /// nothing would replay a session: its place gave its table back and
+    /// keeps none from then on. A place is never another member's, so a
+    /// table kept here would stand for the store's life. Written with the
+    /// place held alone and read with it held shared.
+    left: AtomicBool,
 }
 
 impl std::fmt::Debug for HostPlace {
@@ -229,7 +262,14 @@ impl InFlightCounts {
     /// turn of a leases' file orders that file's writers alone, and two
     /// files book one worker where it serves two models: neither write is
     /// lost under the other. No reader waits on the line.
-    pub(crate) fn book(&self, slot: WorkerSlot) {
+    ///
+    /// `session` is the lease's, where the lease counts for its key:
+    /// under the same hold of the member's place, the place keeps the
+    /// session and the host's count takes the session's step
+    /// ([`HostCount::session_booked`]). A lease that counts for no key
+    /// names [`Session::NONE`]: it reads no session and takes no lock for
+    /// one.
+    pub(crate) fn book(&self, slot: WorkerSlot, session: Session) {
         if let Some(cell) = self.cell(slot) {
             let host = self.stepping(slot);
             let one_more = |held: u32| held.saturating_add(1);
@@ -239,12 +279,17 @@ impl InFlightCounts {
             if let Some(count) = count.filter(|_| held != u32::MAX) {
                 count.booked();
             }
+            if !session.is_none() {
+                self.session_kept(slot, session, count);
+            }
         }
     }
 
     /// One lease that booked the worker of `slot` left the file, in one
-    /// atomic step as well: a count at zero stays there.
-    pub(crate) fn free(&self, slot: WorkerSlot) {
+    /// atomic step as well: a count at zero stays there. `session` is the
+    /// one its booking named ([`Self::book`]): its count leaves under the
+    /// same hold of the member's place.
+    pub(crate) fn free(&self, slot: WorkerSlot, session: Session) {
         if let Some(cell) = self.cell(slot) {
             let host = self.stepping(slot);
             let one_less = |held: u32| held.saturating_sub(1);
@@ -253,12 +298,75 @@ impl InFlightCounts {
             if let Some(count) = count.filter(|_| held != 0) {
                 count.freed();
             }
+            if !session.is_none() {
+                self.session_let_go(slot, session, count);
+            }
         }
+    }
+
+    /// The place of `slot` keeps one lease more of `session`, and `count`,
+    /// the host's count that stands, takes the session's step. Its caller
+    /// holds the place shared. The place of a member that left keeps
+    /// nothing: no count stands there, and none is handed again.
+    #[inline(never)]
+    fn session_kept(&self, slot: WorkerSlot, session: Session, count: Option<&dyn HostCount>) {
+        let Some(place) = self.hosts.cell(slot) else {
+            return;
+        };
+        if place.left.load(Ordering::Relaxed) {
+            return;
+        }
+        *place.sessions.lock().entry(session).or_default() += 1;
+        if let Some(count) = count {
+            count.session_booked(session);
+        }
+    }
+
+    /// The place of `slot` keeps one lease less of `session`, and its
+    /// entry leaves with its last lease. `count` takes the step where the
+    /// place held the session: a session it does not hold steps nothing.
+    /// Its caller holds the place shared.
+    #[inline(never)]
+    fn session_let_go(&self, slot: WorkerSlot, session: Session, count: Option<&dyn HostCount>) {
+        let Some(place) = self.hosts.cell(slot) else {
+            return;
+        };
+        let stood = {
+            let mut sessions = place.sessions.lock();
+            let left = sessions.get_mut(&session).map(|leases| {
+                *leases = leases.saturating_sub(1);
+                *leases
+            });
+            if left == Some(0) {
+                sessions.remove(&session);
+            }
+            left.is_some()
+        };
+        if let Some(count) = count.filter(|_| stood) {
+            count.session_freed(session);
+        }
+    }
+
+    /// How many sessions the place of `slot` keeps: zero once the last
+    /// keyed lease that booked its member left.
+    #[cfg(test)]
+    pub(crate) fn sessions_kept(&self, slot: WorkerSlot) -> usize {
+        let place = self.hosts.cell(slot);
+        place.map_or(0, |place| place.sessions.lock().len())
+    }
+
+    /// How many sessions the table of `slot`'s place has room for: zero
+    /// for a table that holds no memory.
+    #[cfg(test)]
+    pub(crate) fn sessions_room(&self, slot: WorkerSlot) -> usize {
+        let place = self.hosts.cell(slot);
+        place.map_or(0, |place| place.sessions.lock().capacity())
     }
 
     /// Takes `count`, the count the store's host keeps for the member of
     /// `slot`, in the place of the one handed before ([`HostCount`]). It
-    /// takes a step for each lease that books the member, and the one
+    /// takes a step for each lease that books the member and for each
+    /// session those leases count for, and the one
     /// before it gives each of them up. `false` for a slot that names no
     /// cell: nothing is kept. A membership write's call, under the
     /// workers lock as the member's leaving is: no count is handed for a
@@ -271,9 +379,16 @@ impl InFlightCounts {
         // Added before they are taken: a number the two counts share
         // reads high between the two, never low.
         let standing = cell.load(Ordering::Relaxed);
+        let sessions = place.sessions.lock();
         (0..standing).for_each(|_| count.booked());
+        for (&session, &leases) in sessions.iter() {
+            (0..leases).for_each(|_| count.session_booked(session));
+        }
         if let Some(before) = stood.as_deref() {
             (0..standing).for_each(|_| before.freed());
+            for (&session, &leases) in sessions.iter() {
+                (0..leases).for_each(|_| before.session_freed(session));
+            }
         }
         *stood = Some(count);
         true
@@ -282,15 +397,24 @@ impl InFlightCounts {
     /// The member of `slot` left the store: the count its host handed
     /// gives up the leases that still book the member, and is let go. A
     /// lease that outlives its worker's row steps the cell alone from
-    /// here on. A membership write's call, under the workers lock.
+    /// here on. The place gives its table of sessions back with what the
+    /// table held, and keeps no session behind the leaving: nothing is
+    /// handed for the member again that would take one. A membership
+    /// write's call, under the workers lock.
     pub(crate) fn left(&self, slot: WorkerSlot) {
         let (Some(cell), Some(place)) = (self.cell(slot), self.hosts.cell(slot)) else {
             return;
         };
         let mut stood = place.count.write();
+        let mut sessions = place.sessions.lock();
         if let Some(count) = stood.take() {
             (0..cell.load(Ordering::Relaxed)).for_each(|_| count.freed());
+            for (&session, &leases) in sessions.iter() {
+                (0..leases).for_each(|_| count.session_freed(session));
+            }
         }
+        *sessions = FxHashMap::default();
+        place.left.store(true, Ordering::Relaxed);
     }
 
     /// The place of the host's count for the member of `slot`, held shared
@@ -308,13 +432,15 @@ impl InFlightCounts {
     /// request on one of the two or on both. A reader that meets the two
     /// in the other order may count it on neither, as before the order.
     /// The writes and the reads are relaxed: a machine that orders them
-    /// more loosely may show any reader the taking first.
-    pub(crate) fn moved(&self, from: Option<WorkerSlot>, to: Option<WorkerSlot>) {
+    /// more loosely may show any reader the taking first. The count of
+    /// `session`, the lease's where it counts for its key, moves with
+    /// the lease's own: each worker's two under one hold of its place.
+    pub(crate) fn moved(&self, from: Option<WorkerSlot>, to: Option<WorkerSlot>, session: Session) {
         if let Some(to) = to {
-            self.book(to);
+            self.book(to, session);
         }
         if let Some(from) = from {
-            self.free(from);
+            self.free(from, session);
         }
     }
 
@@ -546,7 +672,7 @@ pub(crate) mod tests {
     };
 
     use super::{InFlightBuffers, InFlightCounts, PoolInFlightCounts, WorkerSlot};
-    use crate::engine::view::{Candidate, RequestFacts};
+    use crate::engine::view::{Candidate, RequestFacts, Session};
 
     thread_local! {
         pub(crate) static RUN_READERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -577,7 +703,7 @@ pub(crate) mod tests {
                 if *place == WorkerSlot::NONE {
                     *place = counts.claim();
                     for _ in 0..held {
-                        counts.book(*place);
+                        counts.book(*place, Session::NONE);
                     }
                 }
                 assert_eq!(counts.in_flight(*place), held, "one count a position");
@@ -618,12 +744,12 @@ pub(crate) mod tests {
     fn a_rows_first_read_stands_for_its_decision_alone() {
         let counts = InFlightCounts::default();
         let slots = [counts.claim(), counts.claim()];
-        counts.book(slots[0]);
+        counts.book(slots[0], Session::NONE);
         let mut kept = InFlightBuffers::default();
         let first = counts.lend(&slots, &mut kept);
         assert_eq!(first.at(0), 1);
-        counts.book(slots[0]);
-        counts.book(slots[1]);
+        counts.book(slots[0], Session::NONE);
+        counts.book(slots[1], Session::NONE);
         assert_eq!(
             (first.at(0), first.at(1)),
             (1, 1),
@@ -642,7 +768,7 @@ pub(crate) mod tests {
         let slots = [counts.claim()];
         let mut kept = InFlightBuffers::default();
         assert_eq!(counts.lend(&slots, &mut kept).at(0), 0);
-        counts.book(slots[0]);
+        counts.book(slots[0], Session::NONE);
         // The last stamp before the round.
         kept.stamp = u32::MAX;
         assert_eq!(counts.lend(&slots, &mut kept).at(0), 1);
@@ -679,7 +805,7 @@ pub(crate) mod tests {
     fn a_runs_reader_and_a_single_read_share_a_decisions_one_number() {
         let counts = InFlightCounts::default();
         let slots = [counts.claim(), counts.claim()];
-        counts.book(slots[0]);
+        counts.book(slots[0], Session::NONE);
         let mut kept = InFlightBuffers::default();
         let lent = counts.lend(&slots, &mut kept);
         let run = lent.run();
@@ -690,11 +816,11 @@ pub(crate) mod tests {
             ..Candidate::default()
         };
         assert_eq!(run.of(&row(0)), 1, "the run reads the row first");
-        counts.book(slots[0]);
-        counts.book(slots[1]);
+        counts.book(slots[0], Session::NONE);
+        counts.book(slots[1], Session::NONE);
         assert_eq!(lent.at(0), 1, "a single read after the run's");
         assert_eq!(lent.at(1), 1, "a single read first");
-        counts.book(slots[1]);
+        counts.book(slots[1], Session::NONE);
         assert_eq!((run.of(&row(0)), run.of(&row(1))), (1, 1));
         let later = lent.run();
         let read = [0, 1, 2].map(|position| later.of(&row(position)));
@@ -720,7 +846,7 @@ pub(crate) mod tests {
         ];
         for (&slot, held) in rows.iter().zip([4, 1, 9, 2, 3]) {
             for _ in 0..held {
-                counts.book(slot);
+                counts.book(slot, Session::NONE);
             }
         }
         let mut kept = InFlightBuffers::default();
@@ -738,13 +864,13 @@ pub(crate) mod tests {
         let counts = InFlightCounts::default();
         let slot = counts.claim();
         let start = Barrier::new(2);
-        let both = |write: fn(&InFlightCounts, WorkerSlot)| {
+        let both = |write: fn(&InFlightCounts, WorkerSlot, Session)| {
             thread::scope(|scope| {
                 for _ in 0..2 {
                     scope.spawn(|| {
                         start.wait();
                         for _ in 0..EACH {
-                            write(&counts, slot);
+                            write(&counts, slot, Session::NONE);
                         }
                     });
                 }
@@ -797,15 +923,15 @@ pub(crate) mod tests {
             let bookings = told.bookings.load(Ordering::Relaxed);
             (bookings, told.ends.load(Ordering::Relaxed))
         };
-        counts.free(slot);
+        counts.free(slot, Session::NONE);
         assert_eq!((counts.in_flight(slot), read()), (0, (0, 0)), "at zero");
         let cell = counts.cell(slot).expect("the slot's cell");
         cell.store(u32::MAX, Ordering::Relaxed);
-        counts.book(slot);
+        counts.book(slot, Session::NONE);
         assert_eq!(read(), (0, 0), "a cell that holds every lease it can");
-        counts.free(slot);
+        counts.free(slot, Session::NONE);
         assert_eq!((counts.in_flight(slot), read()), (u32::MAX - 1, (0, 1)));
-        counts.book(slot);
+        counts.book(slot, Session::NONE);
         assert_eq!(read(), (1, 1), "the last booking the cell takes");
     }
 
@@ -856,9 +982,9 @@ pub(crate) mod tests {
                     scope.spawn(|| {
                         let _ended = Ended(&ended);
                         for _ in 0..EACH {
-                            counts.book(slot);
-                            counts.book(slot);
-                            counts.free(slot);
+                            counts.book(slot, Session::NONE);
+                            counts.book(slot, Session::NONE);
+                            counts.free(slot, Session::NONE);
                             wrote.fetch_add(1, Ordering::SeqCst);
                         }
                     });
@@ -884,6 +1010,144 @@ pub(crate) mod tests {
         assert_eq!(held.load(Ordering::SeqCst), 0, "every lease given up");
     }
 
+    /// A member that leaves gives its place's table back, with the
+    /// sessions of the leases that outlive it, and its place keeps no
+    /// session of a lease that books it behind the leaving. No count is
+    /// handed for such a member again, so nothing would take them, and a
+    /// place is never another member's: what it kept would stand for the
+    /// store's life. A member that stands keeps its table's room when its
+    /// last session leaves.
+    #[test]
+    fn a_member_that_left_keeps_no_session_and_no_table() {
+        let counts = InFlightCounts::default();
+        let slot = counts.claim();
+        let kept = || (counts.sessions_kept(slot), counts.sessions_room(slot));
+        for session in 1..=64 {
+            counts.book(slot, Session::from_raw(session));
+        }
+        let (sessions, room) = kept();
+        assert_eq!(sessions, 64);
+        assert!(room >= 64, "room for the sessions that stand: {room}");
+        for session in 1..=64 {
+            counts.free(slot, Session::from_raw(session));
+        }
+        assert_eq!(kept(), (0, room), "a standing member keeps the room");
+        for session in 1..=64 {
+            counts.book(slot, Session::from_raw(session));
+        }
+        counts.left(slot);
+        assert_eq!(kept(), (0, 0), "the table is given back at the leaving");
+        // A lease that outlives the member ends, and a late one books it.
+        counts.free(slot, Session::from_raw(1));
+        counts.book(slot, Session::from_raw(65));
+        assert_eq!(kept(), (0, 0), "no session is kept behind the leaving");
+        assert_eq!(counts.in_flight(slot), 64, "the cell steps as it did");
+    }
+
+    /// A member's place keeps a session while a lease of it books the
+    /// member, and the session's entry leaves with its last lease. A lease
+    /// that counts for no key is kept under no session, and an end of a
+    /// session the place does not keep takes nothing from it.
+    #[test]
+    fn a_place_keeps_a_session_until_its_last_lease_ends() {
+        let counts = InFlightCounts::default();
+        let slot = counts.claim();
+        let kept = || (counts.in_flight(slot), counts.sessions_kept(slot));
+        let (one, two) = (Session::from_raw(7), Session::from_raw(9));
+        counts.book(slot, Session::NONE);
+        assert_eq!(kept(), (1, 0), "a lease that counts for no key");
+        counts.book(slot, one);
+        counts.book(slot, one);
+        counts.book(slot, two);
+        assert_eq!(kept(), (4, 2));
+        counts.free(slot, one);
+        assert_eq!(kept(), (3, 2), "a lease of the first still books it");
+        counts.free(slot, two);
+        counts.free(slot, Session::NONE);
+        assert_eq!(kept(), (1, 1));
+        counts.free(slot, one);
+        assert_eq!(kept(), (0, 0), "the last keyed lease ended");
+        // A move takes the session with the lease.
+        let next = counts.claim();
+        counts.book(slot, two);
+        counts.moved(Some(slot), Some(next), two);
+        assert_eq!((kept(), counts.sessions_kept(next)), ((0, 0), 1));
+        counts.free(next, one);
+        assert_eq!(counts.sessions_kept(next), 1, "a session it does not keep");
+        counts.free(next, two);
+        assert_eq!(counts.sessions_kept(next), 0);
+    }
+
+    /// A count handed in the place of another takes every step before the
+    /// one before it gives any up, the leases' and each session's alike: a
+    /// number the two counts share reads high between the two and never
+    /// low. A member that leaves gives up the same steps, and a session's
+    /// end after it reaches no count.
+    #[test]
+    fn a_count_handed_takes_its_steps_before_the_one_before_gives_them_up() {
+        use std::sync::Arc;
+
+        use parking_lot::Mutex;
+
+        use super::HostCount;
+
+        /// What the counts of one member were told, in order, each line
+        /// under its count's name.
+        struct Says(&'static str, Arc<Mutex<Vec<String>>>);
+
+        impl Says {
+            fn say(&self, step: &str) {
+                self.1.lock().push(format!("{} {step}", self.0));
+            }
+        }
+
+        impl HostCount for Says {
+            fn booked(&self) {
+                self.say("booked");
+            }
+
+            fn freed(&self) {
+                self.say("freed");
+            }
+
+            fn session_booked(&self, session: Session) {
+                self.say(&format!("booked {}", session.get()));
+            }
+
+            fn session_freed(&self, session: Session) {
+                self.say(&format!("freed {}", session.get()));
+            }
+        }
+
+        let counts = InFlightCounts::default();
+        let slot = counts.claim();
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let count = |name| Box::new(Says(name, Arc::clone(&said)));
+        let told = || std::mem::take(&mut *said.lock());
+        // A lease filed ahead of the member's count, then the count.
+        counts.book(slot, Session::from_raw(7));
+        assert!(counts.beside(slot, count("first")));
+        assert_eq!(told(), ["first booked", "first booked 7"]);
+        assert!(counts.beside(slot, count("second")));
+        let handed = [
+            "second booked",
+            "second booked 7",
+            "first freed",
+            "first freed 7",
+        ];
+        assert_eq!(told(), handed);
+        // An end of a session the place does not keep reaches no count:
+        // its lease's own step alone does.
+        counts.book(slot, Session::NONE);
+        counts.free(slot, Session::from_raw(9));
+        assert_eq!(told(), ["second booked", "second freed"]);
+        counts.left(slot);
+        assert_eq!(told(), ["second freed", "second freed 7"]);
+        // The lease outlives its member: its end steps the place alone.
+        counts.free(slot, Session::from_raw(7));
+        assert_eq!((told().len(), counts.sessions_kept(slot)), (0, 0));
+    }
+
     /// A booking that moves is added before it is taken: a reader beside the
     /// mover that reads the worker it leaves and then the worker it goes to
     /// counts the request on one of the two or on both, never on neither.
@@ -901,7 +1165,7 @@ pub(crate) mod tests {
             .map(|_| [counts.claim(), counts.claim()])
             .collect();
         for [from, _] in &pairs {
-            counts.book(*from);
+            counts.book(*from, Session::NONE);
         }
         let read = |[from, to]: &[WorkerSlot; 2]| (counts.in_flight(*from), counts.in_flight(*to));
         let at = AtomicUsize::new(0);
@@ -909,7 +1173,7 @@ pub(crate) mod tests {
             scope.spawn(|| {
                 for (pair, [from, to]) in pairs.iter().enumerate() {
                     at.store(pair, Ordering::Relaxed);
-                    counts.moved(Some(*from), Some(*to));
+                    counts.moved(Some(*from), Some(*to), Session::NONE);
                 }
                 at.store(MOVES, Ordering::Relaxed);
             });

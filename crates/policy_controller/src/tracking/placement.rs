@@ -52,7 +52,7 @@ use super::{
 use crate::{
     engine::{
         decision_engine::{DecideOutcome, DecisionRefused, DecodeRefused},
-        policy_engine::PolicyEngine,
+        policy_engine::{Loaded, PolicyEngine},
         records::worker_id,
         view::WorkerId,
         PlaceRequest, Unplaced,
@@ -166,7 +166,7 @@ impl Placement<'_> {
     /// ([`AlonePick`](crate::engine::decision_engine::AlonePick)): `worker`
     /// is the worker at the pick's place in the list its host handed, and
     /// `profile` the label of the pick's profile, which the call that
-    /// decided read ([`PolicyEngine::label_at`]). Nothing is owed of it, so
+    /// decided read ([`Loaded::label_at`]). Nothing is owed of it, so
     /// it holds no lease, takes no id and reads no clock. The one call for
     /// a request makes it ([`PolicyEngine::place`]).
     #[must_use]
@@ -201,7 +201,7 @@ impl Placement<'_> {
     /// under its reason ([`DecisionGuard::released`]).
     #[must_use]
     pub(crate) fn taken(
-        engine: &'static PolicyEngine,
+        engine: Loaded<'static, '_>,
         decided: DecideOutcome,
         later: bool,
         now: Instant,
@@ -217,8 +217,8 @@ impl Placement<'_> {
         // Held ahead of every refusal below: a lease ends at this guard's
         // drop where the placement is not made.
         let leased = decided.lease.is_some();
-        let mut held =
-            leased.then(|| DecisionGuard::holding(engine, GatewayId::LOCAL, decided, later, now));
+        let mut held = leased
+            .then(|| DecisionGuard::holding(engine.object, GatewayId::LOCAL, decided, later, now));
         let (profile, target) = (profile?, target?);
         if let Some(held) = &mut held {
             held.take(index)?;
@@ -414,6 +414,31 @@ impl Placement<'_> {
     /// their order, and one that times a request from its dispatch reads a
     /// span of zero for it.
     pub fn ended(&mut self, side: Side, outcome: Outcome) {
+        self.end(side, outcome, Instant::now);
+    }
+
+    /// One side of the request ended with the `outcome` a handle on that
+    /// side's end reported at `at` ([`SideEnd`](super::SideEnd)):
+    /// [`Self::ended`], said under that instant. The placement writes one
+    /// thing more into the outcome, whatever the handle's holder wrote
+    /// there: the span from the side's dispatch to the report, as an end
+    /// with no outcome states the span to its side's drop. Zero for a side
+    /// whose send was never said.
+    pub(super) fn reported(&mut self, side: Side, outcome: Outcome, at: Instant) {
+        let Some(held) = &self.held else {
+            return;
+        };
+        let outcome = Outcome {
+            duration_micros: held.since_sent(side, at),
+            ..outcome
+        };
+        self.end(side, outcome, || at);
+    }
+
+    /// The one way an outcome reaches the lease: [`Self::ended`] and
+    /// [`Self::reported`] by it. The clock is asked for `at` where the end
+    /// is said, and not for an end that says nothing.
+    fn end(&mut self, side: Side, outcome: Outcome, at: impl FnOnce() -> Instant) {
         let Some(held) = &mut self.held else {
             return;
         };
@@ -428,7 +453,7 @@ impl Placement<'_> {
             served,
             ..outcome
         };
-        held.completed(&outcome, Instant::now());
+        held.completed(&outcome, at());
     }
 }
 

@@ -62,7 +62,7 @@ pub(super) fn later(seed: u64) -> Request<'static> {
 }
 
 /// A ready worker of `worker_type` at `url`, with no health checker behind it.
-fn typed(url: String, worker_type: WorkerType) -> Arc<dyn Worker> {
+pub(super) fn typed(url: String, worker_type: WorkerType) -> Arc<dyn Worker> {
     let spec = WorkerSpec {
         worker_type,
         ..WorkerSpec::new(url)
@@ -77,7 +77,7 @@ fn typed(url: String, worker_type: WorkerType) -> Arc<dyn Worker> {
 /// A pair's host with no limit of its own: every prefill has capacity and
 /// every decode a room.
 #[derive(Debug)]
-struct Open;
+pub(super) struct Open;
 
 impl PairAdmission for Open {
     fn has_capacity(&self, _: usize) -> bool {
@@ -188,15 +188,10 @@ impl Decodes {
                 decode
             };
             held.dispatched_decode(now);
-            let end = |side, served| Outcome {
-                side,
-                served,
-                status: 200,
-                class: TransportClass::Ok,
-                ttft_micros: 0,
-                tokens_in: 1_024,
-                tokens_out: 0,
-                duration_micros: 0,
+            let end = |side, served| {
+                let mut end = Outcome::reported(200, TransportClass::Ok).with_served(side, served);
+                end.tokens_in = 1_024;
+                end
             };
             held.completed(&end(Side::Prefill, target.id), now);
             held.completed(&end(Side::Decode, decode), now);

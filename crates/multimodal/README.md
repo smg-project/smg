@@ -74,9 +74,8 @@ the name its `name()` returns, with the processors it builds:
 
 Which of a family's modalities one model serves is read from its config: most families
 take video or audio only where the config declares the modality's tokens or its tower.
-`Phi4VisionProcessor` is a public processor no family builds, and `QwenVLProcessorBase` is
-the base that `Qwen2VLProcessor`, `Qwen3VLProcessor`, `Qwen3OmniVisionProcessor` and
-`MiniMaxM3VisionProcessor` wrap.
+`QwenVLProcessorBase` is the base that `Qwen2VLProcessor`, `Qwen3VLProcessor`,
+`Qwen3OmniVisionProcessor` and `MiniMaxM3VisionProcessor` wrap.
 
 `ModelRegistry::for_format` keeps the families whose processors emit one
 `EncoderInputFormat`. For `Reference` it also registers `nemotron_vl_tiled` and
@@ -224,7 +223,7 @@ PCM, float and A-law, 8 to 96 kHz, one, two and six channels, 0.1 s to 600 s.
 Configurations: 20, from 16 of the families above. `llava` runs once with each of its two
 processors, `qwen3_vl` and `qwen_vl` with the configs of two checkpoints each, and
 `step3_vl` with each of its two model types. The image processors of `inkling` and
-`inkling2` and the public `Phi4VisionProcessor` are not in the tables.
+`inkling2` are not in the tables.
 
 Setup: One x86-64 core, release builds, one harness source on both releases (the gateway's allocator with its options, the decoded frame borrowed, the consuming write on another thread as the gateway does it), the bf16 wire, alpha composited over white, 10 timed repeats per class, 15 interleaved rounds per build with the order swapped (medians). 1.16.0 = `322350993`, 1.15.0 = `82c0f1fcd`. "Same bytes" compares the SHA-256 of the decoded pixels, of the float32 write and of the wire bytes. The reference column runs the processor class each checkpoint's config names (transformers 5.17.0, torch 2.13.0+cpu, Pillow 12.3.0, numpy 2.2.6), one compute thread, its decode and preprocess stages; this release's figure beside it also carries the write of the wire bytes.
 

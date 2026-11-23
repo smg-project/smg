@@ -1,4 +1,10 @@
-use std::{ops::Deref, sync::Arc, time::Instant};
+use std::{
+    ops::Deref,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use parking_lot::Mutex;
 use serde_json::json;
@@ -6,18 +12,10 @@ use serde_json::json;
 use crate::{
     document::{AppliedSpec, PolicySpec, SpecError, API_VERSION},
     engine::{
-        decision,
-        decision_engine::{DecisionEngine, Request},
-        framework,
-        store_backed_engine::StoreBackedEngine,
-        Candidate, Constraints, Engine, Filter, LoadRow, Pair, PoolFacts, RequestFacts, Scorer,
-        Scratch, Target, TieBand, WorkerId,
+        decision, decision_engine::DecisionEngine, framework, Candidate, Constraints, Engine,
+        Filter, LoadRow, Pair, PoolFacts, RequestFacts, Scorer, Scratch, Target, TieBand, WorkerId,
     },
-    stages::{pickers, Lifecycle, StageRegistry},
-    store::{
-        GatewayId, LeaseState, LeasesStore, MemoryStore, StaleGeneration, WorkerFacts,
-        WorkerStatus, WorkersStore,
-    },
+    stages::{pickers, scorers::take_lane, Lifecycle, StageRegistry},
     tracking::{
         decision_guard::DecisionGuard, CreditedDispatches, DispatchCounts, DispatchCredit, Lease,
         Membership, Side,
@@ -25,11 +23,9 @@ use crate::{
 };
 
 const POOL: &str = "work";
-const GATEWAY: GatewayId = GatewayId(37);
 const START: u64 = 91_300;
 const DELAY: u32 = 47;
 const TOKENS: u32 = 317;
-const NEXT_GENERATION: u64 = 43;
 
 fn one(tokens: u32) -> CreditedDispatches {
     CreditedDispatches {
@@ -401,6 +397,171 @@ fn a_delay_longer_than_a_u32_of_microseconds_holds_to_its_end() {
     assert_eq!(sent.read(&clock(0), &a), CreditedDispatches::default());
 }
 
+/// What [`DispatchCreditPass::sends`](super::DispatchCreditPass::sends)
+/// hands of `row` under `facts`: each send's instant and its stated tokens,
+/// in the order handed.
+fn instants(sent: &DispatchCredit, facts: &RequestFacts<'_>, row: &Candidate) -> Vec<(u64, u32)> {
+    let mut handed = Vec::new();
+    let each = |at_micros, tokens| handed.push((at_micros, tokens));
+    sent.pass(facts).sends(row, each);
+    handed
+}
+
+/// The instant the count keeps of a send whose lease was issued at
+/// `issued_micros`: [`send`] reports it [`DELAY`] microseconds later.
+fn sent_at(issued_micros: u64) -> u64 {
+    issued_micros + u64::from(DELAY)
+}
+
+/// The sends a stage reads one by one are the sends the two numbers count,
+/// to the send, across a release: each with its own instant and its stated
+/// tokens, none for a send of no stated size. A report ends the sends it
+/// reaches for both reads, and the read of the instants lets them go
+/// itself. Each rank of a worker hands its own sends, and a row the count
+/// holds nothing of hands nothing.
+#[test]
+fn the_instants_read_are_the_sends_the_two_numbers_count_across_a_release() {
+    let (engine, sent) = built(None);
+    let mut a = row(251, 3);
+    send(&engine, &a, START, TOKENS);
+    send(&engine, &a, START + 1, 0);
+    send(&engine, &a, START + 20, 293);
+    // Another rank of the worker holds a send of its own.
+    let other = row(a.id.0, 7);
+    send(&engine, &other, START + 40, 17);
+    let facts = clock(0);
+    let all = [
+        (sent_at(START), TOKENS),
+        (sent_at(START + 1), 0),
+        (sent_at(START + 20), 293),
+    ];
+    assert_eq!(instants(&sent, &facts, &a), all);
+    let others = [(sent_at(START + 40), 17)];
+    assert_eq!(instants(&sent, &facts, &other), others);
+    let counts = DispatchCounts {
+        requests: 3,
+        tokens: u64::from(TOKENS) + 293,
+    };
+    assert_eq!(sent.pass(&facts).counts(&a), counts);
+    // A sample instant on a row that holds no report ends nothing.
+    a.load_sampled_at_micros = sent_at(START + 1);
+    assert_eq!(instants(&sent, &facts, &a), all);
+    // A report that reflects the first two sends: the read of the
+    // instants lets them go, with no other read ahead of it.
+    a.load = Some(LoadRow::default());
+    assert_eq!(instants(&sent, &facts, &a), all[2..]);
+    assert_eq!(sent.credits.held_at(a.id, a.dp_rank), 1);
+    let counts = DispatchCounts {
+        requests: 1,
+        tokens: 293,
+    };
+    assert_eq!(sent.pass(&facts).counts(&a), counts);
+    assert!(instants(&sent, &facts, &row(257, 3)).is_empty());
+}
+
+/// The read of the instants follows the pass's rule, as the totals do.
+/// Under a report delay a report sampled sooner behind a send leaves the
+/// send handed, and one sampled the delay behind it ends it. The profile's
+/// time limit ends a send that no report reaches.
+#[test]
+fn the_instants_follow_the_profiles_report_delay_and_its_time_limit() {
+    let (engine, sent) = counting(delayed(None, REPORT_DELAY_MS));
+    let mut a = row(263, 3);
+    send(&engine, &a, START, TOKENS);
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = sent_at(START) + REPORT_DELAY - 1;
+    assert_eq!(instants(&sent, &clock(0), &a), [(sent_at(START), TOKENS)]);
+    a.load_sampled_at_micros += 1;
+    assert!(instants(&sent, &clock(0), &a).is_empty());
+
+    let (engine, sent) = built(Some(2));
+    let a = row(269, 3);
+    send(&engine, &a, START, TOKENS);
+    let within = clock(sent_at(START) + 1_999);
+    assert_eq!(instants(&sent, &within, &a), [(sent_at(START), TOKENS)]);
+    assert!(instants(&sent, &clock(sent_at(START) + 2_000), &a).is_empty());
+}
+
+/// The sends come lane by lane as the count keeps them, oldest first
+/// within a lane. Two threads' sends are not merged by instant, so a stage
+/// that wants one order sorts.
+#[test]
+fn the_instants_come_lane_by_lane_and_oldest_first_within_a_lane() {
+    let (engine, sent) = built(None);
+    let a = row(271, 3);
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            take_lane(0);
+            // The later send is recorded first: its lane keeps the two by
+            // instant.
+            send(&engine, &a, START + 30, 13);
+            send(&engine, &a, START, 11);
+        });
+        first.join().expect("the first lane's sends");
+        let second = scope.spawn(|| {
+            take_lane(1);
+            send(&engine, &a, START + 20, 17);
+        });
+        second.join().expect("the second lane's send");
+    });
+    let handed = [
+        (sent_at(START), 11),
+        (sent_at(START + 30), 13),
+        (sent_at(START + 20), 17),
+    ];
+    assert_eq!(instants(&sent, &clock(0), &a), handed);
+}
+
+/// A send reported while the instants are read is not lost. The read holds
+/// every lane of the row while it calls, so the send's record waits and
+/// lands behind the read: the read hands the sends that stood before it,
+/// and the next read hands the new one too. The read stays in its first
+/// call until the sender's thread runs, and a thousand turns of the
+/// scheduler more: the send is under way while the read runs and has not
+/// landed when the read goes on.
+#[test]
+fn a_send_reported_while_the_instants_are_read_lands_behind_the_read() {
+    let (engine, sent) = built(None);
+    let a = row(277, 3);
+    send(&engine, &a, START, TOKENS);
+    send(&engine, &a, START + 3, 281);
+    let entry = sent.credits.tally.load().get(&(a.id, a.dp_rank)).cloned();
+    let entry = entry.expect("the row's entry");
+    let facts = clock(0);
+    let (started, landed) = (AtomicBool::new(false), AtomicBool::new(false));
+    let (mut read, mut held, mut waited) = (Vec::new(), true, true);
+    std::thread::scope(|scope| {
+        let mut sender = None;
+        sent.pass(&facts).sends(&a, |at_micros, tokens| {
+            held &= entry.lanes_held_for_test();
+            // The first call starts a send to the row on another thread.
+            sender.get_or_insert_with(|| {
+                let sender = scope.spawn(|| {
+                    started.store(true, Ordering::Release);
+                    send(&engine, &a, START + 9, 331);
+                    landed.store(true, Ordering::Release);
+                });
+                while !started.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                (0..1_000).for_each(|_| std::thread::yield_now());
+                sender
+            });
+            waited &= !landed.load(Ordering::Acquire);
+            read.push((at_micros, tokens));
+        });
+    });
+    assert!(held, "the read holds every lane of the row while it calls");
+    assert!(waited, "the send has not landed while the read runs");
+    let before = [(sent_at(START), TOKENS), (sent_at(START + 3), 281)];
+    assert_eq!(read, before);
+    let mut all = instants(&sent, &facts, &a);
+    all.sort_unstable();
+    assert_eq!(all[..2], before);
+    assert_eq!(all[2..], [(sent_at(START + 9), 331)]);
+    assert_eq!(sent.pass(&facts).counts(&a).requests, 3);
+}
+
 #[test]
 fn the_two_number_read_says_the_requests_and_stated_tokens_of_the_whole_read() {
     let (engine, sent) = built(None);
@@ -525,69 +686,27 @@ fn removing_a_worker_clears_its_ranks_sends() {
     assert_eq!(reads.of(&b), one(TOKENS));
 }
 
+#[cfg_attr(
+    not(feature = "in-process"),
+    expect(
+        dead_code,
+        reason = "the cases that read it are built under `in-process`"
+    )
+)]
 fn validated(document: &PolicySpec, catalog: &StageRegistry) -> AppliedSpec {
     let digest = document.digest().expect("a digest");
     AppliedSpec::validate_digested(document, digest, catalog, &[]).expect("the policy validates")
 }
 
-fn apply(store: &MemoryStore, document: &PolicySpec, catalog: &StageRegistry) {
-    store
-        .apply(validated(document, catalog))
-        .expect("a newer generation");
-}
-
-fn next_document(limit: Option<u32>) -> PolicySpec {
-    let mut next = document(limit);
-    next.generation = NEXT_GENERATION;
-    next
-}
-
-fn door() -> (StoreBackedEngine, StageRegistry, Readers) {
-    let (catalog, readers) = catalog();
-    let store = Arc::new(MemoryStore::new());
-    for name in ["http://first:8000", "http://second:8000"] {
-        let id = store
-            .upsert(WorkerFacts {
-                key: name.to_owned(),
-                engine: name.to_owned(),
-                incarnation: 1,
-                models: vec![POOL.to_owned()],
-                dp_size: 1,
-                ..WorkerFacts::default()
-            })
-            .id();
-        let revision = WorkersStore::get(&*store, id).expect("the row").revision;
-        store.set_status(id, WorkerStatus::Ready, revision);
-    }
-    store.publish_now();
-    apply(&store, &document(None), &catalog);
-    (StoreBackedEngine::new(store), catalog, readers)
-}
-
-fn decide<'a>(
-    door: &'a StoreBackedEngine,
-    id: &[u8],
-    now: Instant,
-) -> DecisionGuard<&'a StoreBackedEngine> {
-    DecisionGuard::decide(
-        door,
-        GATEWAY,
-        &Request {
-            id,
-            facts: RequestFacts {
-                model: POOL,
-                prompt_tokens: TOKENS,
-                ..RequestFacts::default()
-            },
-            constraints: Constraints::default(),
-        },
-        now,
-    )
-    .expect("a decision")
-}
-
 /// The first target of a held decision, as the candidate a reader is asked
 /// of, whichever engine decided it.
+#[cfg_attr(
+    not(feature = "in-process"),
+    expect(
+        dead_code,
+        reason = "the cases that read it are built under `in-process`"
+    )
+)]
 fn chosen<D: Deref<Target: DecisionEngine>>(decision: &DecisionGuard<D>) -> Candidate {
     let target = decision
         .decision()
@@ -595,204 +714,6 @@ fn chosen<D: Deref<Target: DecisionEngine>>(decision: &DecisionGuard<D>) -> Cand
         .and_then(|pick| pick.targets.first())
         .expect("a pick");
     row(target.id.0, target.dp_rank)
-}
-
-#[test]
-fn a_dispatch_of_an_older_lease_reaches_the_standing_generation() {
-    let (door, catalog, readers) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"first", now);
-    let sent_to = chosen(&first);
-    let mut next = document(None);
-    next.generation = 7;
-    apply(door.store(), &next, &catalog);
-
-    first.dispatched(now);
-    let readers = readers.lock();
-    assert_eq!(readers[1].read(&clock(0), &sent_to), one(TOKENS));
-    assert_eq!(
-        readers[0].read(&clock(0), &sent_to),
-        CreditedDispatches::default()
-    );
-}
-
-#[test]
-fn a_decision_reads_the_sends_carried_to_its_profile() {
-    let (door, catalog, readers) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"choose", now);
-    let sent_to = chosen(&first);
-    first.dispatched(now);
-
-    apply(door.store(), &next_document(None), &catalog);
-    let next = decide(&door, b"choose", now);
-    assert_eq!(readers.lock()[1].read(&clock(0), &sent_to), one(TOKENS));
-    assert_ne!(chosen(&next).id, sent_to.id);
-}
-
-#[test]
-fn a_profile_under_a_new_name_starts_with_no_sends() {
-    let (door, catalog, readers) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"before", now);
-    let sent_to = chosen(&first);
-    first.dispatched(now);
-
-    let mut next = next_document(None);
-    let profile = next.profiles.remove(POOL).expect("the standing profile");
-    next.profiles.insert("new".into(), profile);
-    apply(door.store(), &next, &catalog);
-    let readers = readers.lock();
-    assert_eq!(
-        readers[1].read(&clock(0), &sent_to),
-        CreditedDispatches::default()
-    );
-    assert_eq!(readers[0].read(&clock(0), &sent_to), one(TOKENS));
-}
-
-#[test]
-fn the_new_profiles_limit_applies_to_carried_sends() {
-    let (door, catalog, readers) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"before", now);
-    let sent_to = chosen(&first);
-    let issued = first.lease().expect("the pick's lease").lease.issued_micros;
-    first.dispatched(now);
-
-    let limit = 29;
-    apply(door.store(), &next_document(Some(limit)), &catalog);
-    let edge = issued + u64::from(limit) * 1000;
-    let readers = readers.lock();
-    assert_eq!(readers[1].read(&clock(edge - 1), &sent_to), one(TOKENS));
-    assert_eq!(readers[0].read(&clock(edge), &sent_to), one(TOKENS));
-    assert_eq!(
-        readers[1].read(&clock(edge), &sent_to),
-        CreditedDispatches::default()
-    );
-}
-
-#[test]
-fn a_refused_generation_takes_no_sends_from_the_standing_profile() {
-    let (door, catalog, readers) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"before", now);
-    let sent_to = chosen(&first);
-    first.dispatched(now);
-
-    let stale = document(None);
-    assert_eq!(
-        door.store().apply(validated(&stale, &catalog)),
-        Err(StaleGeneration {
-            standing: stale.generation,
-            offered: stale.generation,
-        })
-    );
-    let readers = readers.lock();
-    assert_eq!(
-        readers[1].read(&clock(0), &sent_to),
-        CreditedDispatches::default()
-    );
-    assert_eq!(readers[0].read(&clock(0), &sent_to), one(TOKENS));
-}
-
-#[test]
-fn a_decision_holding_the_standing_world_reads_the_same_carried_entry() {
-    let (door, catalog, _) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"choose", now);
-    let mut second = decide(&door, b"choose", now);
-    let sent_to = chosen(&first);
-    assert_eq!(chosen(&second).id, sent_to.id);
-    first.dispatched(now);
-
-    let store = door.store();
-    store.deciding(|world| {
-        let standing = &world.spec().engine().sent_credits[0];
-        apply(store, &next_document(None), &catalog);
-        second.dispatched(now);
-
-        let both = CreditedDispatches {
-            requests: 2,
-            tokens: 2 * u64::from(TOKENS),
-            ..CreditedDispatches::default()
-        };
-        assert_eq!(standing.read(&clock(0), &sent_to), both);
-        store.deciding(|next| {
-            let carried = &next.spec().engine().sent_credits[0];
-            assert_eq!(carried.read(&clock(0), &sent_to), both);
-        });
-    });
-}
-
-#[test]
-fn a_late_dispatch_adds_no_entry_for_a_row_that_left() {
-    for resize in [false, true] {
-        let (door, _, readers) = door();
-        let now = Instant::now();
-        let mut first = decide(&door, b"before", now);
-        let sent_to = chosen(&first);
-        let lease = first.lease().expect("the pick's lease").lease;
-        let store = door.store();
-        let worker = WorkersStore::get(&**store, sent_to.id).expect("the worker");
-        if resize {
-            let facts = WorkerFacts {
-                dp_rank: 6,
-                dp_size: 9,
-                ..worker.facts
-            };
-            assert_eq!(store.upsert(facts).id(), sent_to.id);
-            store.publish_now();
-        } else {
-            store.remove(sent_to.id, worker.revision).expect("removal");
-        }
-        first.dispatched(now);
-
-        let record = LeasesStore::get(&**store, GATEWAY, lease.id).expect("the filed lease");
-        assert!(matches!(record.state, LeaseState::Dispatched { .. }));
-        let tally = readers.lock()[0].credits.tally.load();
-        assert!(!tally.contains_key(&(sent_to.id, sent_to.dp_rank)));
-    }
-}
-
-#[test]
-fn a_generation_with_no_readers_leaves_sends_behind() {
-    let (door, catalog, readers) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"before", now);
-    let sent_to = chosen(&first);
-    first.dispatched(now);
-
-    let mut next: PolicySpec = serde_json::from_value(json!({
-        "apiVersion": API_VERSION,
-        "generation": NEXT_GENERATION,
-        "profiles": { (POOL): { "pick": "random" } }
-    }))
-    .expect("a document");
-    apply(door.store(), &next, &catalog);
-    door.store().deciding(|world| {
-        let engine = world.spec().engine();
-        assert!(engine.sent_credits.is_empty());
-        engine.dispatched_sent(
-            &Lease::default(),
-            &Target::default(),
-            Side::Single,
-            0,
-            || {
-                panic!("a dispatch with no readers checked membership");
-            },
-        );
-    });
-
-    next = next_document(None);
-    next.generation += 5;
-    apply(door.store(), &next, &catalog);
-    let readers = readers.lock();
-    assert_eq!(readers.len(), 2);
-    assert_eq!(readers[0].read(&clock(0), &sent_to), one(TOKENS));
-    assert_eq!(
-        readers[1].read(&clock(0), &sent_to),
-        CreditedDispatches::default()
-    );
 }
 
 #[test]

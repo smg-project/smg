@@ -36,6 +36,9 @@ use crate::routers::{
 // ============================================================================
 
 const MAX_ITEMS_PER_REQUEST: usize = 20;
+/// The rows of an item list page when the request names no `limit`, and the
+/// fewest a further store read of one list asks for.
+const DEFAULT_LIST_LIMIT: usize = 100;
 /// The longest item id a client may supply, in bytes: the id columns of the
 /// SQL stores are 64 wide, and every backend gives the same refusal before any
 /// store is asked, where one of them used to fail the insert instead.
@@ -429,19 +432,42 @@ pub async fn list_conversation_items(
         return response;
     }
 
-    let limit = limit.unwrap_or(100);
+    let limit = limit.unwrap_or(DEFAULT_LIST_LIMIT);
     let order = match order {
         Some("asc") => SortOrder::Asc,
         _ => SortOrder::Desc,
     };
 
-    let params = ListParams {
-        limit,
-        order,
-        after: after.map(String::from),
+    // A page of the rows the caller may read: a row the item's own rule
+    // refuses is read past, a further page of the store at a time, so the
+    // paging fields below describe the rows in `data`.
+    let mut after = after.map(String::from);
+    let mut visible = Vec::new();
+    let mut read = limit;
+    let listed = loop {
+        let params = ListParams {
+            limit: read,
+            order,
+            after: after.take(),
+        };
+        let page = match item_storage.list_items(&conversation_id, params).await {
+            Ok(page) => page,
+            Err(e) => break Err(e),
+        };
+        let last_page = page.len() < read;
+        after = page.last().map(|item| item.id.0.clone());
+        visible.extend(page.into_iter().filter(|item| item.is_visible_to(tenant)));
+        if last_page || visible.len() >= limit {
+            visible.truncate(limit);
+            break Ok(visible);
+        }
+        // The refused rows may be another caller's: a further page is at
+        // least a default page, so a small `limit` does not pay a store read
+        // a row.
+        read = limit.max(DEFAULT_LIST_LIMIT);
     };
 
-    match item_storage.list_items(&conversation_id, params).await {
+    match listed {
         Ok(items) => {
             let has_more = items.len() == limit;
             let first_id = items.first().map(|item| item.id.0.clone());
@@ -930,8 +956,10 @@ pub async fn get_conversation_item(
     }
 
     match item_storage.get_item(&item_id).await {
-        Ok(Some(item)) => (StatusCode::OK, Json(item_to_json(item))).into_response(),
-        Ok(None) => not_found("Item not found"),
+        Ok(Some(item)) if item.is_visible_to(tenant) => {
+            (StatusCode::OK, Json(item_to_json(item))).into_response()
+        }
+        Ok(_) => not_found("Item not found in this conversation"),
         Err(e) => store_error("Failed to get item", &e),
     }
 }
@@ -2647,5 +2675,96 @@ mod tests {
             assert_eq!(other.tenant.as_deref(), B, "{case}");
             assert_eq!(other.content[0]["text"], "msg_o", "{case}");
         }
+    }
+
+    /// A conversation serves a row only to an owner the row's own rule
+    /// allows: a link to another tenant's row is not listed, and its read
+    /// answers what the read of an id the conversation does not hold answers.
+    #[tokio::test]
+    async fn a_linked_row_of_another_tenant_is_neither_listed_nor_read() {
+        use crate::middleware::test_support::text_of;
+
+        let (conversations, items, _, item_of_a) = conversation_of_a().await;
+        let created =
+            json_of(create_conversation(&conversations, &items, B, json!({})).await).await;
+        let conv_of_b = created["id"].as_str().unwrap();
+        items
+            .link_items(
+                &ConversationId::from(conv_of_b),
+                &[(
+                    ConversationItemId::from(item_of_a.as_str()),
+                    chrono::Utc::now(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        let listed = json_of(
+            list_conversation_items(&conversations, &items, B, conv_of_b, None, None, None).await,
+        )
+        .await;
+        let mut reads = Vec::new();
+        for id in [item_of_a.as_str(), "msg_unlinked"] {
+            let response =
+                get_conversation_item(&conversations, &items, B, conv_of_b, id, None).await;
+            reads.push((
+                response.status(),
+                response.headers().clone(),
+                text_of(response).await,
+            ));
+        }
+        assert_eq!(
+            (&listed["data"], reads[0].0, &reads[0]),
+            (&json!([]), StatusCode::NOT_FOUND, &reads[1]),
+            "{listed}"
+        );
+    }
+
+    /// A page is filled from the rows the caller may read: the list reads
+    /// past a row the item's rule refuses, and its paging fields name rows
+    /// in `data`.
+    #[tokio::test]
+    async fn a_page_reads_past_a_row_the_caller_may_not_read() {
+        let (conversations, items, _, item_of_a) = conversation_of_a().await;
+        let created =
+            json_of(create_conversation(&conversations, &items, B, json!({})).await).await;
+        let conv_of_b = created["id"].as_str().unwrap();
+        let added = json_of(
+            create_conversation_items(
+                &conversations,
+                &items,
+                B,
+                conv_of_b,
+                json!({"items": [
+                    {"type": "message", "role": "user", "content": "older"},
+                    {"type": "message", "role": "user", "content": "own"}
+                ]}),
+            )
+            .await,
+        )
+        .await;
+        // the newest row of the conversation is one its caller may not read
+        items
+            .link_items(
+                &ConversationId::from(conv_of_b),
+                &[(
+                    ConversationItemId::from(item_of_a.as_str()),
+                    chrono::Utc::now(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        let page = json_of(
+            list_conversation_items(&conversations, &items, B, conv_of_b, Some(1), None, None)
+                .await,
+        )
+        .await;
+        // the further store page holds both of the caller's rows: the page
+        // keeps the newer one
+        let own = &added["data"][1]["id"];
+        let rows = page["data"].as_array().map(Vec::len);
+        let ids = (&page["data"][0]["id"], &page["first_id"], &page["last_id"]);
+        assert_eq!((rows, ids), (Some(1), (own, own, own)), "{page}");
     }
 }

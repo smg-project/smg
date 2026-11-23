@@ -751,6 +751,233 @@ pub fn replay_on_a_lent_ring(text: &str) -> (usize, Vec<String>) {
     (replayed.len(), defects.collect())
 }
 
+/// The rows that say where their requests stand on a ring, played through
+/// the one call a gateway asks, over worker objects
+/// ([`PolicyEngine::place`](smg_policy_controller::engine::PolicyEngine::place)).
+/// The caller lends the row's ring and states no place: the engine cuts
+/// each request into its heads and asks the lender where each stands.
+#[cfg(feature = "in-process")]
+pub mod through_the_one_call {
+    use std::sync::Arc;
+
+    use openai_protocol::worker::WorkerStatus;
+    use smg_policy_controller::{
+        document::AppliedSpec,
+        engine::{
+            HeaderRead, LentList, ListCell, PlaceRequest, PolicyEngine, Prompt, WorkerId,
+            WorkerLists,
+        },
+        policies::consistent_hashing::{Head, LentRing},
+    };
+    use smg_worker::{identity::basic::Worker, test_support::ready_worker};
+
+    use super::{ids, in_order, same_outcome, Outcome, Request, Row, Sheet, Step};
+
+    const MODEL: &str = "m";
+
+    /// The address of the worker a row lists at `i`.
+    fn url(i: usize) -> String {
+        format!("http://worker-{i}:8000")
+    }
+
+    /// A prompt carried as text: each id spelled as four hex digits.
+    fn spelled(ids: &[u32]) -> String {
+        ids.iter().map(|id| format!("{id:04x}")).collect()
+    }
+
+    /// A head as a row's lender keeps it.
+    #[derive(Debug)]
+    enum Kept {
+        Tokens(Vec<u32>),
+        Text(String),
+    }
+
+    /// A row's ring as its caller lends it. The head `heads[n]` stands at
+    /// the place `n`, and the walk from there reaches the row's workers in
+    /// the order `orders[n]`, as the recorder found them on the gateway's
+    /// ring. A head the row says nothing of is no head of its requests.
+    #[derive(Debug)]
+    struct Lender {
+        heads: Vec<Kept>,
+        orders: Vec<Vec<usize>>,
+    }
+
+    impl LentRing for Lender {
+        // The prefix form reads no place of a key's own text: a request
+        // stated this one stands where the row's walk reaches no worker.
+        fn position(&self, _: &str) -> u64 {
+            u64::MAX
+        }
+
+        fn head_position(&self, head: Head<'_>) -> Option<u64> {
+            let stands = |kept: &Kept| match (kept, head) {
+                (Kept::Tokens(kept), Head::Tokens(ids)) => kept == ids,
+                (Kept::Text(kept), Head::Text(text)) => kept == text,
+                _ => false,
+            };
+            let at = self.heads.iter().position(stands);
+            Some(at.expect("a head the row places") as u64)
+        }
+
+        fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
+            let order = self.orders.get(position as usize);
+            let _ = order.is_some_and(|order| order.iter().any(|&i| take(&url(i))));
+        }
+    }
+
+    impl Row {
+        /// The first `tokens` tokens of `request` as its lender keeps a
+        /// head: its routing key whole, else its ids, else its text at
+        /// four characters a token.
+        fn kept(request: &Request, tokens: usize) -> Option<Kept> {
+            if let Some(key) = &request.key {
+                return Some(Kept::Text(key.clone()));
+            }
+            let cut = |runs: &[[u32; 2]]| {
+                let mut ids = ids(runs);
+                ids.truncate(tokens);
+                ids
+            };
+            // Token ids lead a text, and an empty list of them leaves it.
+            let ids_stated = |runs: &&Vec<[u32; 2]>| !runs.is_empty();
+            match (request.tokens.as_ref().filter(ids_stated), &request.text) {
+                (Some(runs), _) => Some(Kept::Tokens(cut(runs))),
+                (None, Some(runs)) => Some(Kept::Text(spelled(&cut(runs)))),
+                (None, None) => None,
+            }
+        }
+
+        /// The ring the row's caller lends: the ring request's deepest
+        /// head at the place `0`, where the walk reaches the workers in
+        /// the row's own order, and its head at each level's boundary
+        /// behind it. The deepest head is cut at the deepest boundary the
+        /// request reaches, and at the configuration's depth where it
+        /// reaches none.
+        fn lender(&self) -> Lender {
+            let mut heads = Vec::new();
+            if let Some(ring) = &self.ring {
+                // Token ids lead a text, and an empty list of them leaves
+                // it, as in `kept`.
+                let stated = ring.tokens.as_ref().filter(|runs| !runs.is_empty());
+                let runs = stated.or(ring.text.as_ref());
+                let length = runs.map_or(0, |runs| ids(runs).len());
+                let reached = |&&at: &&u32| at as usize <= length;
+                let boundaries = self.config.cache_boundaries.iter();
+                let deepest = boundaries.filter(reached).max();
+                let depth = deepest.unwrap_or(&self.config.prefix_token_count);
+                heads.extend(Self::kept(ring, *depth as usize));
+                for level in &self.levels {
+                    heads.extend(Self::kept(ring, level.boundary as usize));
+                }
+            }
+            let levels = self.levels.iter().map(|level| level.order.clone());
+            let orders = std::iter::once(in_order(self.workers.len())).chain(levels);
+            Lender {
+                heads,
+                orders: orders.collect(),
+            }
+        }
+
+        /// The row's steps through the one call, once, from a fresh
+        /// engine: the worker each request went to.
+        fn through(&self) -> Result<Vec<usize>, String> {
+            let spec = AppliedSpec::validate(&self.config.spec()).map_err(|err| err.to_string())?;
+            // An engine as its host holds it: for the life of the process.
+            let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(spec)));
+            let list: Arc<[Arc<dyn Worker>]> = (0..self.workers.len())
+                .map(|i| ready_worker(&url(i), MODEL))
+                .collect();
+            // The list as its host lends it: with the cell it keeps beside it.
+            let cell = ListCell::default();
+            let members = LentList {
+                workers: &list,
+                cell: &cell,
+                facts: None,
+            };
+            let hold = |loads: &[u32]| {
+                for (worker, &load) in list.iter().zip(loads) {
+                    while worker.load() < load as usize {
+                        worker.increment_load();
+                    }
+                    while worker.load() > load as usize {
+                        worker.decrement_load();
+                    }
+                }
+            };
+            hold(&self.workers);
+            let lender = self.lender();
+            let mut answers = Vec::new();
+            for step in &self.steps {
+                let request = match step {
+                    Step::Pick(request) => request,
+                    Step::Loads(loads) => {
+                        hold(loads);
+                        continue;
+                    }
+                    Step::Ready(ready) => {
+                        for (worker, &ready) in list.iter().zip(ready) {
+                            worker.set_status(if ready {
+                                WorkerStatus::Ready
+                            } else {
+                                WorkerStatus::NotReady
+                            });
+                        }
+                        continue;
+                    }
+                };
+                let tokens = request.tokens.as_deref().map(ids);
+                let text = request.text.as_deref().map(|runs| spelled(&ids(runs)));
+                let keyed = request
+                    .key
+                    .as_deref()
+                    .map(|key| [("x-smg-routing-key", key)]);
+                let headers: &dyn HeaderRead = keyed.as_ref().map_or(&(), |keyed| keyed);
+                let tried = request
+                    .tried
+                    .iter()
+                    .map(|&i| WorkerId::from_address(&url(i)));
+                let tried: Vec<WorkerId> = tried.collect();
+                let asked = PlaceRequest {
+                    prompt: Prompt {
+                        tokens: tokens.as_deref(),
+                        text: text.as_deref(),
+                        ..Prompt::NONE
+                    },
+                    headers,
+                    tried: &tried,
+                    ring: Some(&lender),
+                    ..PlaceRequest::of(MODEL, WorkerLists::Single(members))
+                };
+                let placement = engine.place(&asked).map_err(|why| format!("{why:?}"))?;
+                let went = |held: &Arc<dyn Worker>| Arc::ptr_eq(held, &placement.worker);
+                answers.push(list.iter().position(went).expect("a worker of the row"));
+            }
+            Ok(answers)
+        }
+    }
+
+    /// The rows of a sheet that say where their requests stand on a ring
+    /// ([`Row::stands`]), each played four times through the one call: how
+    /// many they are, and each one whose answer is not the recorded one
+    /// every time.
+    pub fn replay(text: &str) -> (usize, Vec<String>) {
+        let sheet: Sheet = serde_json::from_str(text).expect("a sheet of these rows");
+        let stated = |row: &&Row| row.on_a_lent_ring().is_some();
+        let rows: Vec<&Row> = sheet.rows.iter().filter(stated).collect();
+        let defect = |row: &&Row| {
+            (0..4).find_map(|_| match row.through() {
+                Ok(picks) if same_outcome(&row.outcome, &Outcome::Sequence(picks.clone())) => None,
+                Ok(picks) => Some(format!(
+                    "{}: recorded {:?}, through the one call {picks:?}",
+                    row.name, row.outcome
+                )),
+                Err(why) => Some(format!("{}: refused here: {why}", row.name)),
+            })
+        };
+        (rows.len(), rows.iter().filter_map(defect).collect())
+    }
+}
+
 /// Rows copied from the recorded sheet: one or more of each kind, and every
 /// row of the sheet on the replay's list.
 pub const INLINE: &str = r#"{

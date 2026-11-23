@@ -478,6 +478,8 @@ const HEADINGS: [&str; 2] = ["Routing Policy", "PD Disaggregation"];
 
 const POOLS: &str = "the pools and their addresses are the gateway's";
 const ADMISSION: &str = "the prefill queue and its limits are the gateway's admission";
+const THRESHOLDS: &str =
+    "the gateway builds its worker objects with the two overload thresholds, and no document carries one";
 
 const EPD: &[&str] = &[
     "--epd-disaggregation",
@@ -512,8 +514,8 @@ const ROUTING_FLAGS: &[Row] = &[
         "it says the default, and is kept so that an old command line still parses",
     ),
     lands("disable-worker-overload-protection", &[], &[]),
-    lands("worker-overload-waiting-requests", &[], &["32"]),
-    lands("worker-overload-token-usage", &[], &["0.9"]),
+    kept("worker-overload-waiting-requests", &[], &["32"], THRESHOLDS),
+    kept("worker-overload-token-usage", &[], &["0.9"], THRESHOLDS),
     lands("worker-overload-shed", &[], &[]),
     deferred("overlap-decay", &["0.5"], "the prefix-affinity decay"),
     deferred(
@@ -553,7 +555,7 @@ const ROUTING_FLAGS: &[Row] = &[
         &[],
         "whether a rank is a worker of its own is its registration's, not the document's",
     ),
-    refused("routing-key-override", &[], "routing_key_override.enabled"),
+    lands("routing-key-override", &[], &[]),
     lands("pd-pairing-mode", PAIR, &["strict"]),
     lands("routing-key-headers", MANUAL, &["x-session-id"]),
     kept(
@@ -749,8 +751,15 @@ fn is_one_sentence_headed(sentence: &str, head: &str) -> bool {
 fn the_print_option_says_a_refusal_in_one_sentence() {
     // A setting no document says: no document, and one sentence with the
     // setting by its name at the head. The words behind the head are the
-    // policy crate's, and no case of the gateway holds them.
-    let sticky = printed(&["smg", "--routing-key-override", "--print-policy-spec"]);
+    // policy crate's, and no case of the gateway holds them. The sticky
+    // override has no document beside the prefix hash ring.
+    let sticky = printed(&[
+        "smg",
+        "--policy",
+        "prefix_hash",
+        "--routing-key-override",
+        "--print-policy-spec",
+    ]);
     assert_eq!(sticky.document(), None);
     assert!(
         sticky
@@ -763,13 +772,16 @@ fn the_print_option_says_a_refusal_in_one_sentence() {
     );
 
     // A line the binary itself refuses: the configuration's own sentence.
-    let alone = printed(&["smg", "--policy", "power_of_two", "--print-policy-spec"]);
-    assert_eq!(alone.document(), None);
+    let mut line = vec!["smg"];
+    line.extend_from_slice(PAIR);
+    line.extend_from_slice(&["--decode-policy", "bucket", "--print-policy-spec"]);
+    let bucket = printed(&line);
+    assert_eq!(bucket.document(), None);
     assert!(
-        alone
+        bucket
             .refusal()
-            .is_some_and(|sentence| sentence.contains("at least 2 workers")),
-        "{alone:?}"
+            .is_some_and(|sentence| sentence.contains("Decode policy should not be allowed")),
+        "{bucket:?}"
     );
 
     // A document this build's controller does not run yet: it prints, with
@@ -787,6 +799,20 @@ fn the_print_option_says_a_refusal_in_one_sentence() {
                 "profiles.cache_aware.score[1].prefix-affinity: "
             )),
         "{decayed:?}"
+    );
+}
+
+/// A policy that compares two workers prints its document with one worker
+/// URL or none: no rule counts the worker URLs a line gives, since a URL
+/// registers one worker per data-parallel rank of its engine.
+#[test]
+fn the_print_counts_no_worker_urls_under_power_of_two() {
+    let alone = printed(&["smg", "--policy", "power_of_two", "--print-policy-spec"]);
+    assert!(
+        alone
+            .document()
+            .is_some_and(|yaml| yaml.contains("pick: power-of-two")),
+        "{alone:?}"
     );
 }
 

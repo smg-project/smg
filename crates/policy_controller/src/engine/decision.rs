@@ -24,6 +24,9 @@ pub const TRACE_TOP: usize = 3;
 
 /// One target: a candidate by position and id, with the decode side when the
 /// decision is a pair.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..Target::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Target {
     /// Position in the host's candidate slice (the prefill's for a pair).
@@ -36,6 +39,9 @@ pub struct Target {
 
 /// The decode side of a pair target, by position in the host's decode slice.
 /// The rendezvous the two sides meet at is the host's at dispatch.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..Pair::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Pair {
     pub decode_position: u32,
@@ -99,7 +105,8 @@ pub struct Targets {
     /// the byte the count and the overlap left spare between them.
     placing: Placing,
     /// What the profile's prefix stage says of the first target
-    /// ([`Pick::overlap`]), in the bytes the count left spare.
+    /// ([`Pick::overlap`]), in the bytes the count left spare. Nothing
+    /// states it: it reads [`Overlap::NONE`].
     overlap: Overlap,
 }
 
@@ -141,12 +148,6 @@ impl Targets {
             placing: Placing::Stages,
             overlap: Overlap::NONE,
         }
-    }
-
-    /// States what the first target holds of the request. A list led anew
-    /// ([`Self::lead`]) says nothing of its new first target.
-    pub(crate) fn state(&mut self, overlap: Overlap) {
-        self.overlap = overlap;
     }
 
     /// States that the binding's sessions rule placed the pick, with no
@@ -401,7 +402,10 @@ impl Trace {
     /// alone ([`Picker::draw_first`](crate::engine::Picker::draw_first)). No pass
     /// over the pool ran, so the trace counts nothing of the pool:
     /// `survivors` holds no count, which is the mark read here, and `top`
-    /// is of the rows drawn.
+    /// is of the rows drawn. A decision by the rows its key names carries
+    /// the mark with no draw, a pin followed or a ring walked
+    /// ([`Engine::decide_keyed`](crate::engine::Engine::decide_keyed)): no
+    /// pass ran for it either, and `top` is of the rows it hands out.
     pub const fn drew_first(&self) -> bool {
         self.survivors.get().is_none()
     }
@@ -450,13 +454,17 @@ pub enum OverlapSource {
 /// leading blocks of the request the worker holds, of how many, and where
 /// they were read. A host observes its cache series from it: the share
 /// held is `blocks` over `of`, and a miss reads zero of `of`. `of` is zero
-/// only where no stage said: the profile holds no such stage, or the
-/// decision was made at an entry that asks none
-/// ([`Engine::decide_stated`](crate::engine::Engine::decide_stated) asks). A
-/// stage counts a request as one block at the least.
+/// only where no stage said. A stage counts a request as one block at the
+/// least.
+///
+/// No entry of the engine asks a stage for it: every pick's overlap is
+/// [`Overlap::NONE`].
 ///
 /// Six bytes, in bytes a pick's targets had spare behind their count: a
 /// pick is no larger for it ([`Pick::overlap`]).
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..Overlap::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Overlap {
     /// The leading blocks the worker holds, by the stage's source: the
@@ -537,6 +545,9 @@ enum Placing {
 /// onto the lease it commits, and fills the lease's session from the
 /// request ([`crate::engine::RequestFacts::session`]) for every keyed request, rule
 /// or no rule: the verdict alone says whether the commit moves a pin.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..Pick::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Pick {
     pub targets: Targets,
@@ -546,7 +557,8 @@ pub struct Pick {
 
 impl Pick {
     /// What the profile's prefix stage says of the first target
-    /// ([`Overlap`]); nothing where no stage said.
+    /// ([`Overlap`]); nothing where no stage said. No entry of the engine
+    /// asks a stage for it, so it is [`Overlap::NONE`].
     pub const fn overlap(&self) -> Overlap {
         self.targets.overlap
     }
@@ -698,10 +710,24 @@ pub(crate) const WIRES: &str = "wires";
 
 /// The stage a decision is shed under when its gateway hints a subset of 0
 /// of a pool that has rows: a decision over no candidates, as it asked.
+#[cfg_attr(
+    not(feature = "in-process"),
+    expect(
+        dead_code,
+        reason = "the deciders that shed under it are built under `in-process`"
+    )
+)]
 pub(crate) const SUBSET_HINT: &str = "subset-hint";
 
 /// A shed the deciders say in the engine's place, in the shape of the
 /// engine's own.
+#[cfg_attr(
+    not(feature = "in-process"),
+    expect(
+        dead_code,
+        reason = "the deciders that say it are built under `in-process`"
+    )
+)]
 pub(crate) fn shed(
     reason: ShedReason,
     emptied_by: &'static str,
@@ -884,8 +910,7 @@ mod tests {
     }
 
     /// The overlap costs the pick no byte: it shares the eight bytes the
-    /// targets' count stood alone in, a pick no stage spoke of reads none,
-    /// and a list led anew or cleared says nothing of a first target.
+    /// targets' count stood alone in, and a pick reads none.
     #[test]
     fn the_overlap_costs_the_pick_no_byte() {
         assert_eq!(size_of::<Overlap>(), 6);
@@ -896,33 +921,6 @@ mod tests {
         );
         assert_eq!(Pick::default().overlap(), Overlap::NONE);
         assert_eq!(Overlap::default(), Overlap::NONE);
-        let held = Overlap {
-            blocks: 3,
-            of: 4,
-            source: OverlapSource::Index,
-            margin_held: false,
-        };
-        let mut targets = Targets::new();
-        for position in 0..2u32 {
-            targets.push(Target {
-                position,
-                id: WorkerId(u64::from(position) + 1),
-                dp_rank: 0,
-                pair: None,
-            });
-        }
-        targets.state(held);
-        let mut pick = Pick {
-            targets,
-            ..Pick::default()
-        };
-        assert_eq!(pick.overlap(), held);
-        let second = *pick.targets.as_slice().last().expect("two targets");
-        pick.targets.lead(second);
-        assert_eq!(pick.overlap(), Overlap::NONE);
-        pick.targets.state(held);
-        pick.targets.clear();
-        assert_eq!(pick.overlap(), Overlap::NONE);
     }
 
     /// The word of who placed a pick costs the pick no byte: it sits in the
@@ -1043,19 +1041,10 @@ mod tests {
         let mut new = Targets::new();
         new.push(target(2));
         assert_eq!(used, new);
-        // A count and what a list states of its first target are parts
-        // of it still.
+        // A count is a part of it still.
         let mut longer = new;
         longer.push(target(1));
         assert_ne!(used, longer);
-        let mut stated = new;
-        stated.state(Overlap {
-            blocks: 1,
-            of: 2,
-            source: OverlapSource::Index,
-            margin_held: false,
-        });
-        assert_ne!(used, stated);
         // A list prints what its equality reads.
         assert_eq!(format!("{used:?}"), format!("{new:?}"));
         assert_ne!(format!("{used:?}"), format!("{longer:?}"));
@@ -1121,8 +1110,7 @@ mod tests {
 
     /// A decode side's targets turn into a pair's where they stand. Each
     /// names the prefill with the decode it held, in the order they had.
-    /// The list equals the one a new list takes push by push, and nothing
-    /// is stated of its first target.
+    /// The list equals the one a new list takes push by push.
     #[test]
     fn a_decodes_targets_turn_into_a_pairs_where_they_stand() {
         let prefill = Target {
@@ -1151,19 +1139,8 @@ mod tests {
                 ..prefill
             });
         }
-        turned.state(Overlap {
-            blocks: 3,
-            of: 4,
-            source: OverlapSource::Index,
-            margin_held: false,
-        });
         turned.pair_under(&prefill);
         assert_eq!(turned, pushed);
-        let pick = Pick {
-            targets: turned,
-            ..Pick::default()
-        };
-        assert_eq!(pick.overlap(), Overlap::NONE);
         // An empty list stays empty.
         let mut none = Targets::new();
         none.pair_under(&prefill);

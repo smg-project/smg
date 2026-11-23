@@ -475,19 +475,10 @@ impl Bed {
             return;
         };
         self.pool[place].in_flight -= 1;
-        self.engine.on_completed(
-            &lease,
-            &smg_policy_controller::tracking::Outcome {
-                side: Side::Single,
-                served: target.id,
-                status: 200,
-                class: TransportClass::Ok,
-                ttft_micros: 0,
-                tokens_in: lease.tokens,
-                tokens_out: 0,
-                duration_micros: 0,
-            },
-        );
+        let mut ended = smg_policy_controller::tracking::Outcome::reported(200, TransportClass::Ok)
+            .with_served(Side::Single, target.id);
+        ended.tokens_in = lease.tokens;
+        self.engine.on_completed(&lease, &ended);
     }
 
     /// One step of the row; a request answers where it was placed.

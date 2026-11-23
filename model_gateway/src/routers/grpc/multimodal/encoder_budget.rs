@@ -23,7 +23,8 @@
 use std::{fmt, sync::Arc};
 
 use llm_multimodal::{
-    EncoderDtype, ImageFrame, MediaConnectorError, MediaItemInfo, Modality, VisionPreProcessor,
+    EncoderDtype, ImageFrame, MediaConnectorError, MediaItemInfo, Modality, TransformError,
+    VisionPreProcessor,
 };
 use smg_worker::identity::basic::Worker;
 
@@ -154,33 +155,39 @@ pub(crate) fn check_item_feature_budget(
 /// (`calculate_num_tokens`, the rule its preprocessing applies to the same
 /// size); the first image above the budget is the refusal, with the numbers
 /// and words of [`check_item_feature_budget`]. `None` is no budget. A size
-/// the processor's rule refuses is left to the preprocessing to report, so
-/// its own message stands.
+/// the processor's rule refuses is not counted: the first one, in request
+/// order, is handed back, so the caller refuses it in the preprocessing's
+/// own words and the rule is asked once for an image. A header with a side
+/// of zero is not handed back: no image has one, and it is left to the
+/// decode and the preprocessing.
 pub(crate) fn check_image_size_feature_budget(
     processor: &dyn VisionPreProcessor,
     images: &[Arc<ImageFrame>],
     budget: Option<usize>,
-) -> Result<(), ItemOverEncoderBudget> {
-    let Some(budget) = budget else {
-        return Ok(());
-    };
+) -> Result<Option<TransformError>, ItemOverEncoderBudget> {
+    let mut refused = None;
     for (index, image) in images.iter().enumerate() {
         let size = image.size();
-        let Ok(feature_tokens) = processor.calculate_num_tokens(size.width, size.height) else {
-            continue;
-        };
-        if feature_tokens > budget {
-            return Err(ItemOverEncoderBudget {
-                modality: Modality::Image,
-                position: index + 1,
-                count: images.len(),
-                feature_tokens,
-                sampled_frames: None,
-                budget,
-            });
+        match processor.calculate_num_tokens(size.width, size.height) {
+            Ok(feature_tokens) => {
+                if let Some(budget) = budget.filter(|budget| feature_tokens > *budget) {
+                    return Err(ItemOverEncoderBudget {
+                        modality: Modality::Image,
+                        position: index + 1,
+                        count: images.len(),
+                        feature_tokens,
+                        sampled_frames: None,
+                        budget,
+                    });
+                }
+            }
+            Err(error) if refused.is_none() && size.width != 0 && size.height != 0 => {
+                refused = Some(error);
+            }
+            Err(_) => {}
         }
     }
-    Ok(())
+    Ok(refused)
 }
 
 /// The longest message the gRPC framing carries: its length prefix is four
@@ -387,7 +394,7 @@ mod tests {
     /// the numbers and words of the check on the produced counts, before
     /// anything is decoded; at the budget, and under it, the image is
     /// admitted; no budget admits everything; a size the processor's own
-    /// rule refuses is left to the preprocessing to report.
+    /// rule refuses is not counted here.
     #[test]
     fn an_image_over_the_budget_on_its_header_size_is_refused_before_preprocessing() {
         let images = [header_only(4, 4), header_only(64, 2)];

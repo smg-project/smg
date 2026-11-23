@@ -1,7 +1,8 @@
 //! The holder of a replica's worker objects: it follows the store's
-//! membership and writes the registry. A host can also ask it to follow
-//! the rows' status, or to build each object with the thresholds its own
-//! load monitor judges overload by.
+//! membership and writes the registry. A leader's door writes a row through
+//! it, and the store follows that write ([`mod@write`]). A host can also ask it
+//! to follow the rows' status, or to build each object with the thresholds
+//! its own load monitor judges overload by.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -44,6 +45,7 @@ use crate::{
 };
 
 mod host_count;
+mod write;
 
 /// The row an object stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,8 +161,9 @@ impl Held {
 /// A replica's worker objects: for every row of the membership store that
 /// stands one object in the registry, and none beside.
 ///
-/// [`Self::follow`] is the one path, on a leader and on a standby: it reads
-/// what the store's membership did since its last read. It builds the
+/// [`Self::follow`] reads what the store's membership did since its last
+/// read: every change on a standby, and on a leader each change no door
+/// wrote through the holder, a status change among them. It builds the
 /// object of a row that arrived, drops the object of a row that went, and
 /// replaces the object of a row whose facts changed under the same id in
 /// the registry. A new incarnation of a key gets a new object and id,
@@ -253,8 +256,13 @@ pub struct Objects<G> {
     handing: Mutex<()>,
     /// How many lays found no object handed in where the host hands them.
     unhanded: AtomicU64,
-    /// Where the last read ended. Held through a read: one follows at a
-    /// time.
+    /// Where the last read ended. Held through a read and through a write
+    /// of the holder's own ([`mod@write`]): one follows or writes at a time.
+    ///
+    /// The order of the locks, said here once: a door's turn, then this
+    /// one, then the store's membership lock. Nothing that holds this one
+    /// takes a door's turn, and no lock of the store is held over a write
+    /// of the registry.
     read_to: Mutex<Place>,
     held: RwLock<Held>,
     /// How many times a kept object's entry moved in place in what a
@@ -642,13 +650,6 @@ impl<G: Generation> Objects<G> {
     /// ([`Self::unhanded`]) states its key, role, models, labels, cache
     /// block size and bootstrap port as it was handed in, and as the
     /// engine the address it dials, where the moved row names one.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the controller's service reads it once its worker objects lead"
-        )
-    )]
     pub(crate) fn row_of(&self, object: &ObjectId) -> Option<WorkerRow> {
         let held = self.held.read();
         held.rows
@@ -693,6 +694,23 @@ impl<G: Generation> Objects<G> {
             .iter()
             .find(|&&(ranked, _)| ranked == rank)
             .map(|&(_, row)| row)
+    }
+
+    /// Whether the row `row` stands at rank `rank`, by the facts its
+    /// object was laid from. `false` for a row the holder holds no object
+    /// for. Asked of the worker a dispatch report names, which may have
+    /// left or changed its rank since its decision. One read of the
+    /// entry under its read lock, a leaf: the caller may hold a turn of
+    /// the leases' files.
+    #[cfg_attr(
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "a controller's word to its engine asks it")
+    )]
+    pub(crate) fn lists_rank(&self, row: WorkerId, rank: u16) -> bool {
+        let held = self.held.read();
+        held.facts
+            .get(&row)
+            .is_some_and(|facts| facts.dp_rank == rank)
     }
 
     /// How many objects stand.
@@ -1418,8 +1436,8 @@ mod tests {
     use super::*;
     use crate::{
         store::{
-            GatewayId, HealthSink, JournalKinds, MemoryStore, Overload, Registrant, WorkerFacts,
-            WorkerPatch, WorkerStatus,
+            GatewayId, HealthSink, MemoryStore, Overload, Registrant, WorkerFacts, WorkerPatch,
+            WorkerStatus,
         },
         worker_host::{
             facts as stated, object, HealthAdapter, KeptCredential, Members, MembershipWriter,
@@ -1805,23 +1823,21 @@ mod tests {
         }
     }
 
-    /// The holder lends what each stored worker states for a request's hard
-    /// demands, and a decision over its list reads it. A retry that demands
-    /// a runtime lands on the worker that states that runtime, whichever
-    /// request it is, and one that demands a runtime no worker states is
-    /// shed under the stage `wires`. The classic router holds a retry to
-    /// its first plan's runtime and transport by one test of each worker
-    /// (`model_gateway/src/routers/common/placement.rs:84-93`).
+    /// The decision of a retry that demands `runtime`, made by `engine`
+    /// over the list a holder lends.
     #[cfg(feature = "in-process")]
-    #[test]
-    fn a_stored_workers_demand_facts_are_lent_and_hold_a_retry_to_its_runtime() {
+    fn retry_demanding(
+        engine: &crate::engine::PolicyEngine,
+        lent: LentList<'_>,
+        id: &'static [u8],
+        runtime: u32,
+    ) -> crate::engine::Decision {
         use std::time::Instant;
 
         use crate::{
-            document::spec::{AppliedSpec, PolicySpec},
+            document::spec::AppliedSpec,
             engine::{
-                Constraints, Decided, Decision, DemandFacts, Demands, PolicyEngine, Request,
-                RequestFacts, RequestMaker, Role, ShedReason, WorkerLists,
+                Constraints, Decided, Demands, Request, RequestFacts, RequestMaker, WorkerLists,
             },
         };
 
@@ -1841,6 +1857,43 @@ mod tests {
                 self.1
             }
         }
+
+        let asked = Request {
+            id,
+            facts: RequestFacts {
+                model: "m",
+                seed: 7,
+                ..RequestFacts::default()
+            },
+            constraints: Constraints {
+                demands: Demands {
+                    runtime,
+                    ..Demands::default()
+                },
+                ..Constraints::default()
+            },
+        };
+        let asks = Asks(asked, WorkerLists::Single(lent));
+        match engine.decide_at(&asks, Instant::now).expect("an answer") {
+            Decided::Whole(decided, _) => decided.decision,
+            Decided::Alone(_) => panic!("a place for a request that states a demand"),
+        }
+    }
+
+    /// The holder lends what each stored worker states for a request's hard
+    /// demands, and a decision over its list reads it. A retry that demands
+    /// a runtime lands on the worker that states that runtime, whichever
+    /// request it is, and one that demands a runtime no worker states is
+    /// shed under the stage `wires`. The classic router holds a retry to
+    /// its first plan's runtime and transport by one test of each worker
+    /// (`model_gateway/src/routers/common/placement.rs:84-93`).
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_stored_workers_demand_facts_are_lent_and_hold_a_retry_to_its_runtime() {
+        use crate::{
+            document::spec::{AppliedSpec, PolicySpec},
+            engine::{Decision, DemandFacts, PolicyEngine, Role, ShedReason},
+        };
 
         let mut replica = Replica::new();
         replica.objects = replica.objects.with_status_followed();
@@ -1891,28 +1944,7 @@ mod tests {
         let applied = AppliedSpec::validate(&document).expect("the document validates");
         let engine = PolicyEngine::new(applied);
         // A retry that demands `runtime`, decided over the list lent.
-        let decide = |id: &'static [u8], runtime: u32| {
-            let asked = Request {
-                id,
-                facts: RequestFacts {
-                    model: "m",
-                    seed: 7,
-                    ..RequestFacts::default()
-                },
-                constraints: Constraints {
-                    demands: Demands {
-                        runtime,
-                        ..Demands::default()
-                    },
-                    ..Constraints::default()
-                },
-            };
-            let asks = Asks(asked, WorkerLists::Single(lent));
-            match engine.decide_at(&asks, Instant::now).expect("an answer") {
-                Decided::Whole(decided, _) => decided.decision,
-                Decided::Alone(_) => panic!("a place for a request that states a demand"),
-            }
-        };
+        let decide = |id: &'static [u8], runtime: u32| retry_demanding(&engine, lent, id, runtime);
         let landed = |id: &'static [u8], runtime: u32| match decide(id, runtime) {
             Decision::Pick(pick) => pick.targets.first().map(|target| target.id),
             other => panic!("a worker states runtime {runtime}: {other:?}"),
@@ -1930,6 +1962,95 @@ mod tests {
             }
             other => panic!("no worker states runtime 5: {other:?}"),
         }
+    }
+
+    /// A registration that changes the runtime a stored worker states is
+    /// read by the decisions behind it. The door starts another life for
+    /// the worker, and one follow later the holder lends the new life's
+    /// statement under its id: a retry that demands the new runtime lands
+    /// on the new life, and one that demands the old runtime is shed under
+    /// the stage `wires`, as no worker states it any more.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_registration_that_changes_a_runtime_moves_the_retries_that_demand_it() {
+        use crate::{
+            document::spec::{AppliedSpec, PolicySpec},
+            engine::{Decision, DemandFacts, PolicyEngine, Role, ShedReason},
+        };
+
+        let mut replica = Replica::new();
+        replica.objects = replica.objects.with_status_followed();
+        let door = StoreMembershipWriter::new(Arc::clone(&replica.store));
+        // The registration of the worker at `A` as one that states `runtime`.
+        let registers = |runtime: u32| {
+            let stating = |_: Option<&WorkerFacts>| WorkerFacts {
+                demand_facts: DemandFacts {
+                    runtime,
+                    ..DemandFacts::default()
+                },
+                ..facts(A, 1)
+            };
+            door.found(&Registrant::Control, Precondition::Any, A, &stating)
+        };
+        // What the holder lends of the model's workers as they stand: each
+        // worker's id and the runtime it states.
+        let lends = |replica: &Replica| {
+            let registry = replica.objects.registry();
+            let generation = registry
+                .model_generation("m")
+                .expect("the model's generation");
+            let lent = replica.objects.lent(&generation, Role::Single);
+            let stated: Vec<(Option<WorkerId>, u32)> = lent
+                .facts
+                .expect("the holder lends facts")
+                .iter()
+                .map(|facts| (facts.id, facts.demands.runtime))
+                .collect();
+            (generation, stated)
+        };
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        document.generation = 1;
+        let applied = AppliedSpec::validate(&document).expect("the document validates");
+        let engine = PolicyEngine::new(applied);
+        // Where a retry that demands `runtime` lands over the list the
+        // holder lends now, or the stage it is shed under.
+        let retry = |replica: &Replica, runtime: u32| {
+            let (generation, _) = lends(replica);
+            let lent = replica.objects.lent(&generation, Role::Single);
+            match retry_demanding(&engine, lent, b"again", runtime) {
+                Decision::Pick(pick) => Ok(pick.targets.first().map(|target| target.id)),
+                Decision::Shed(shed) => Err((shed.reason, shed.emptied_by)),
+                other @ Decision::Queue(_) => panic!("neither a pick nor a shed: {other:?}"),
+            }
+        };
+        let unstated = Err((ShedReason::NoEndpoints, "wires"));
+
+        let wrote = registers(7);
+        let Ok(MembershipWriteOutcome::Registered(first)) = wrote else {
+            panic!("the first registration is a join: {wrote:?}");
+        };
+        // Its checks are on: a check's word makes the first life ready.
+        let row = replica.store.get(first).expect("the registered row");
+        let ready = replica
+            .store
+            .set_status(first, WorkerStatus::Ready, row.revision);
+        ready.expect("ready");
+        replica.follow();
+        assert_eq!(lends(&replica).1, [(Some(first), 7)]);
+        assert_eq!(retry(&replica, 7), Ok(Some(first)));
+        assert_eq!(retry(&replica, 9), unstated);
+
+        // The same worker registers again and states another runtime: the
+        // store hands the first life's status on to the next.
+        let wrote = registers(9);
+        let Ok(MembershipWriteOutcome::Another { old, new }) = wrote else {
+            panic!("a changed runtime is another life: {wrote:?}");
+        };
+        assert_eq!(old, first);
+        replica.follow();
+        assert_eq!(lends(&replica).1, [(Some(new), 9)], "under the new id");
+        assert_eq!(retry(&replica, 9), Ok(Some(new)));
+        assert_eq!(retry(&replica, 7), unstated);
     }
 
     /// What the pairing rule reads of a kept object's row moves in place
@@ -3376,9 +3497,7 @@ mod tests {
                 .set_status(row.id, WorkerStatus::Ready, row.revision)
                 .is_some());
         }
-        assert!(replica
-            .store
-            .restore_from(other.checkpoint(JournalKinds::Watched)));
+        assert!(replica.store.restore_from(other.checkpoint()));
         replica.follow();
 
         assert!(Arc::ptr_eq(&a, &replica.at(A)));
@@ -3395,9 +3514,7 @@ mod tests {
         assert!(other
             .set_status(row.id, WorkerStatus::NotReady, row.revision)
             .is_some());
-        assert!(replica
-            .store
-            .restore_from(other.checkpoint(JournalKinds::Watched)));
+        assert!(replica.store.restore_from(other.checkpoint()));
         replica.follow();
         assert!(Arc::ptr_eq(&a, &replica.at(A)));
         assert!(!a.is_available());
@@ -3666,9 +3783,7 @@ mod tests {
                 before_tail(&self.store);
             }
             if let Some((other, row)) = self.turn.lock().take() {
-                assert!(self
-                    .store
-                    .restore_from(other.checkpoint(JournalKinds::Watched)));
+                assert!(self.store.restore_from(other.checkpoint()));
                 let revision = self.store.get(row).expect("the row").revision;
                 assert!(self.store.patch(row, labels("gold"), revision).is_some());
             }
@@ -3833,7 +3948,7 @@ mod tests {
         });
         other.upsert(facts(C, 1));
         other.upsert(facts(D, 1));
-        let cut = other.checkpoint(JournalKinds::Watched);
+        let cut = other.checkpoint();
         let (epoch, theirs) = (cut.epoch, other.by_key(A).expect("a row"));
         assert_eq!(epoch, replica.store.epoch());
         assert_eq!((theirs.id, theirs.revision), (row, replica.row(A).revision));
@@ -4015,6 +4130,26 @@ mod tests {
         assert_eq!(replica.objects.rank_row(lower, 1), None);
         assert_eq!(replica.objects.rank_row(upper, 1), None);
         assert_eq!(replica.objects.rank_row(lower, 0), Some(lower));
+    }
+
+    /// A row stands at the rank its facts state and at no other, and at
+    /// none once it left: what a late dispatch report is held against.
+    #[test]
+    fn a_row_stands_at_its_own_rank_until_it_leaves() {
+        let replica = Replica::new();
+        let lower = replica.store.upsert(rank_facts(A, C, 0)).id();
+        let upper = replica.store.upsert(rank_facts(B, C, 1)).id();
+        replica.follow();
+        let objects = &replica.objects;
+        assert!(objects.lists_rank(lower, 0));
+        assert!(objects.lists_rank(upper, 1));
+        assert!(!objects.lists_rank(lower, 1), "another row's rank");
+        assert!(!objects.lists_rank(upper, 0), "another row's rank");
+
+        replica.remove(B);
+        replica.follow();
+        assert!(!objects.lists_rank(upper, 1), "a row that left");
+        assert!(objects.lists_rank(lower, 0));
     }
 
     /// A rank's key that comes back as a new incarnation is another row, and

@@ -60,7 +60,7 @@ use crate::{
             TOOL_CALL_LIMIT_REASON,
         },
     },
-    persistence_utils::persist_conversation_items,
+    persistence_utils::persist_conversation_items_owned,
     sse::{sse_channel, SseEncoder, SseSender},
     upstream_body::{
         error_body_text, read_response_body_limited, ReadBodyResult, ERROR_BODY_TOO_LARGE,
@@ -772,11 +772,11 @@ pub(super) async fn handle_simple_streaming_passthrough(
                 );
 
                 // Always persist conversation items and response (even without conversation)
-                if let Err(err) = persist_conversation_items(
+                if let Err(err) = persist_conversation_items_owned(
                     storage.conversation.clone(),
                     storage.conversation_item.clone(),
                     storage.response.clone(),
-                    &response_json,
+                    response_json,
                     &original_request,
                     storage.tenant.as_deref(),
                     storage.request_context.clone(),
@@ -1246,11 +1246,11 @@ pub(super) fn handle_streaming_with_tool_interception(
 
         if should_store {
             // Always persist conversation items and response (even without conversation)
-            if let Err(err) = persist_conversation_items(
+            if let Err(err) = persist_conversation_items_owned(
                 storage.conversation.clone(),
                 storage.conversation_item.clone(),
                 storage.response.clone(),
-                &final_response,
+                final_response,
                 &original_request,
                 storage.tenant.as_deref(),
                 storage.request_context.clone(),

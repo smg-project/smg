@@ -33,7 +33,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use prost::{encoding::message, Message as _};
+use prost::Message as _;
 use tokio::{
     sync::{watch, Notify},
     time::{interval, Interval, MissedTickBehavior},
@@ -46,13 +46,12 @@ use super::{
     worker_objects::ObjectsWake, worker_wire,
 };
 use crate::{
-    engine::view::WorkerId,
     service::{
         elector::Fence,
         proto::{self, replica_frame::Frame, replication_event::Event as Sent},
         replication::{Entry, Event as Written, Log, NotLeading},
     },
-    store::{Journal, JournalKinds, LoadSample, MemoryStore, Position, StoreCheckpoint},
+    store::{Journal, MemoryStore, Position, StoreCheckpoint},
 };
 
 /// The watched kinds' ring: the membership and status events a watcher or a
@@ -150,7 +149,7 @@ pub(super) fn journaled_at(
     let landed = Arc::new(Notify::new());
     let log = {
         let landed = Arc::clone(&landed);
-        Log::new(WATCHED_EVENTS, 0)
+        Log::new(WATCHED_EVENTS)
             .starting_after(first)
             .on_watched(move || {
                 landed.notify_one();
@@ -491,28 +490,26 @@ impl Kept {
 
     fn at_head(&self, store: &MemoryStore, log: &Log) -> Arc<StoreCheckpoint> {
         let mut kept = self.head.lock();
-        let head = log.head(JournalKinds::Watched);
+        let head = log.head();
         if let Some(cut) = kept.upgrade().filter(|cut| cut.at == head) {
             return cut;
         }
-        let cut = Arc::new(store.checkpoint(JournalKinds::Watched));
+        let cut = Arc::new(store.checkpoint());
         *kept = Arc::downgrade(&cut);
         cut
     }
 }
 
 /// A snapshot on its way to one standby: the cut it is restored from, and
-/// how much of it the parts sent so far hold. The rows' parts come first,
-/// paged as a watch's snapshot is ([`watch_workers::fill`]), then the load
-/// rows' within the same bytes. The part that ends both is marked the last,
-/// and an empty store is one empty part. The stream holds the cut while it
-/// sends ([`Hold`]), and no lock.
+/// how much of it the parts sent so far hold. The rows' parts are paged as
+/// a watch's snapshot is ([`watch_workers::fill`]). The part that ends them
+/// is marked the last, and an empty store is one empty part. The stream
+/// holds the cut while it sends ([`Hold`]), and no lock.
 #[derive(Debug)]
 struct Parts {
     hold: Arc<Hold>,
-    /// The rows and the load rows sent.
+    /// The rows sent.
     rows: usize,
-    loads: usize,
     /// The next part's number.
     part: u32,
 }
@@ -534,7 +531,6 @@ impl Parts {
         Self {
             hold,
             rows: 0,
-            loads: 0,
             part: 0,
         }
     }
@@ -542,8 +538,8 @@ impl Parts {
     /// The next part as sent at `now`, and the snapshot's place where the
     /// part is the last. Every part says that place as a heartbeat says
     /// the head: the position after it, under its term. A row's admission
-    /// crosses as its age at `now`, as a load row's sample does. `None`
-    /// where the leader let the cut go ([`Hold`]).
+    /// crosses as its age at `now`. `None` where the leader let the cut go
+    /// ([`Hold`]).
     fn next(&mut self, now: Instant) -> Option<(proto::ReplicationBatch, Option<Position>)> {
         let cut = self.hold.take(now)?;
         let mut part = proto::ReplicationSnapshot {
@@ -557,11 +553,8 @@ impl Parts {
                 ..worker_wire::row(row)
             });
             self.rows += part.workers.len();
-        } else {
-            part.loads = load_rows(&cut.loads[self.loads..], now);
-            self.loads += part.loads.len();
         }
-        let last = self.rows == cut.rows.len() && self.loads == cut.loads.len();
+        let last = self.rows == cut.rows.len();
         part.last = last;
         self.part += 1;
         let batch = proto::ReplicationBatch {
@@ -575,26 +568,6 @@ impl Parts {
         }
         Some((batch, last.then_some(cut.at)))
     }
-}
-
-/// The load rows one part holds of `loads`, as sent at `now`: each in order
-/// while they stay within a page's bytes on the wire, the first whatever it
-/// weighs.
-fn load_rows(loads: &[(WorkerId, u16, LoadSample)], now: Instant) -> Vec<proto::LoadSample> {
-    let mut part = Vec::new();
-    let mut bytes = 0;
-    for (id, rank, sample) in loads {
-        let told = worker_wire::load(*id, *rank, sample, now);
-        // A load row in a part: its bytes under the part's tag and a length
-        // (`ReplicationSnapshot.loads`).
-        let framed = message::encoded_len(5, &told);
-        if !part.is_empty() && bytes + framed > watch_workers::PAGE_BYTES {
-            break;
-        }
-        bytes += framed;
-        part.push(told);
-    }
-    part
 }
 
 /// Every part of the snapshot of `cut`, as sent at `now`: the cases'
@@ -736,9 +709,9 @@ impl Feed {
             most => u64::from(most).min(ring),
         };
         let log = &source.log;
-        let (place, held) = match log.first(JournalKinds::Watched) {
+        let (place, held) = match log.first() {
             Some(first) if place == Position::default() => (first, true),
-            _ => (place, log.holds(JournalKinds::Watched, place)),
+            _ => (place, log.holds(place)),
         };
         let restore = if held {
             Restore::No
@@ -781,7 +754,7 @@ impl Feed {
     /// The log's head as a frame states it: one read of the log, after
     /// whatever events the frame carries were read.
     fn head(&self) -> u64 {
-        self.source.log.head(JournalKinds::Watched).seq
+        self.source.log.head().seq
     }
 
     /// The snapshot's cut and its first part at `now`, or the stream's end
@@ -805,7 +778,6 @@ impl Feed {
                     seq = cut.at.seq,
                     term = cut.at.term,
                     rows = cut.rows.len(),
-                    loads = cut.loads.len(),
                     why = %why,
                     "restoring a standby from a snapshot"
                 );
@@ -895,7 +867,7 @@ impl Feed {
         if self
             .source
             .log
-            .read(JournalKinds::Watched, self.place, most, &mut self.entries)
+            .read(self.place, most, &mut self.entries)
             .is_err()
         {
             return self.resync(Why::Place(self.place), now);
@@ -933,7 +905,7 @@ impl Feed {
         // only leaves this frame short of the head it states.
         let head = self.head();
         let documents = self.source.documents.as_deref();
-        let (events, last) = fitting(first, head, &self.entries, now, MESSAGE_BYTES, documents);
+        let (events, last) = fitting(first, head, &self.entries, MESSAGE_BYTES, documents);
         self.place = last;
         self.beat = now;
         Step::Batch(proto::ReplicationBatch {
@@ -966,7 +938,6 @@ fn fitting(
     first: Position,
     head: u64,
     entries: &[Entry],
-    now: Instant,
     bound: usize,
     documents: Option<&Generations>,
 ) -> (Vec<proto::ReplicationEvent>, Position) {
@@ -982,7 +953,7 @@ fn fitting(
     let mut events = Vec::with_capacity(entries.len());
     let mut last = first;
     for entry in entries {
-        let mut event = worker_wire::replication(entry, now);
+        let mut event = worker_wire::replication(entry);
         // A generation's entry is its number: the document is its door's.
         if let (Written::Generation { generation }, Some(documents)) = (&entry.event, documents) {
             event.event = Some(Sent::Generation(documents.sent(*generation)));
@@ -1096,8 +1067,8 @@ mod tests {
         },
         stages::registry,
         store::{
-            LeasesStore, LoadSample, LoadSink, LoadSource, MembershipChange, WorkerFacts,
-            WorkerRow, WorkersStore,
+            LeasesStore, LoadSink, LoadSource, MembershipChange, WorkerFacts, WorkerRow,
+            WorkersStore,
         },
     };
 
@@ -1225,7 +1196,7 @@ mod tests {
     fn resync(feed: &mut Feed, at: Instant) -> Why {
         let word = proto::ReplicationBatch {
             resync_required: true,
-            head_seq: feed.source.log.head(JournalKinds::Watched).seq,
+            head_seq: feed.source.log.head().seq,
             ..proto::ReplicationBatch::default()
         };
         match (feed.look(at), &feed.restore) {
@@ -1273,7 +1244,7 @@ mod tests {
     #[test]
     fn a_burst_above_one_batch_arrives_in_consecutive_batches_with_no_idle_look_between() {
         let leader = Leader::leading();
-        // The take, the registration and a thousand load rows.
+        // The take, the registration and a thousand generations.
         leader.writes(1_000);
         let mut feed = leader.feed(START, RING);
         let mut sizes = Vec::new();
@@ -1293,7 +1264,7 @@ mod tests {
             }
         }
         assert_eq!(sizes, [256, 256, 256, 234]);
-        assert_eq!(feed.place, leader.log.head(JournalKinds::Watched));
+        assert_eq!(feed.place, leader.log.head());
     }
 
     #[test]
@@ -1343,7 +1314,7 @@ mod tests {
         let mut entries = Vec::new();
         leader
             .log
-            .read(JournalKinds::Watched, START, Log::BATCH, &mut entries)
+            .read(START, Log::BATCH, &mut entries)
             .expect("the log holds its start");
         assert!(entries.len() > 2, "{}", entries.len());
         assert!(follows(START, &entries));
@@ -1365,7 +1336,7 @@ mod tests {
         let leader = Leader::leading();
         leader.writes(4);
         let replication = leader.replication();
-        let held = leader.log.head(JournalKinds::Watched);
+        let held = leader.log.head();
         let lost = Position {
             seq: held.seq + 1,
             ..held
@@ -1475,7 +1446,7 @@ mod tests {
     #[test]
     fn a_bound_under_one_batch_is_fed_in_its_own_steps_to_the_head() {
         let leader = Leader::leading();
-        // The take, the registration and a thousand load rows against a
+        // The take, the registration and a thousand generations against a
         // bound of 64, each batch acknowledged.
         leader.writes(1_000);
         let mut feed = leader.feed(START, 64);
@@ -1543,16 +1514,14 @@ mod tests {
     #[test]
     fn a_batch_stops_at_its_bound_to_the_byte_and_holds_its_first_event_whatever_it_weighs() {
         let leader = Leader::leading();
-        // The take, the registration and three load rows: five events.
+        // The take, the registration and three generations: five events.
         leader.writes(3);
         let mut entries = Vec::new();
-        let read = leader
-            .log
-            .read(JournalKinds::Watched, START, Log::BATCH, &mut entries);
+        let read = leader.log.read(START, Log::BATCH, &mut entries);
         assert!(read.is_ok());
         let first = entries.first().expect("the take's event").at;
-        let head = leader.log.head(JournalKinds::Watched);
-        let (all, last) = fitting(first, head.seq, &entries, leader.at, usize::MAX, None);
+        let head = leader.log.head();
+        let (all, last) = fitting(first, head.seq, &entries, usize::MAX, None);
         assert_eq!((all.len(), last), (5, head));
         // What a batch of the first `count` events weighs on the wire.
         let weighs = |count: usize| {
@@ -1567,21 +1536,14 @@ mod tests {
             .encoded_len()
         };
         for count in 2..=5 {
-            let (fits, last) = fitting(first, head.seq, &entries, leader.at, weighs(count), None);
+            let (fits, last) = fitting(first, head.seq, &entries, weighs(count), None);
             assert_eq!(fits.len(), count);
             assert_eq!(last.seq, first.seq + count as u64 - 1);
-            let (short, _) = fitting(
-                first,
-                head.seq,
-                &entries,
-                leader.at,
-                weighs(count) - 1,
-                None,
-            );
+            let (short, _) = fitting(first, head.seq, &entries, weighs(count) - 1, None);
             assert_eq!(short.len(), count - 1, "one byte under {count} events");
         }
         // No bound is under the first event: a batch always moves the place.
-        let (alone, last) = fitting(first, head.seq, &entries, leader.at, 0, None);
+        let (alone, last) = fitting(first, head.seq, &entries, 0, None);
         assert_eq!((alone.len(), last), (1, first));
     }
 
@@ -1617,7 +1579,7 @@ mod tests {
         let leader = Leader::elected();
         leader.writes(1);
         leader.store.set_term(leader.term);
-        let head = leader.log.head(JournalKinds::Watched);
+        let head = leader.log.head();
         let join = |place| {
             Feed::join(
                 &leader.replication(),
@@ -1665,8 +1627,8 @@ mod tests {
             leader
         };
         let (before, after) = (run(), run());
-        let held = before.log.head(JournalKinds::Watched);
-        let head = after.log.head(JournalKinds::Watched);
+        let held = before.log.head();
+        let head = after.log.head();
         assert_eq!(held.term, head.term, "one term, two runs");
         let join = |place| {
             Feed::join(
@@ -1683,17 +1645,14 @@ mod tests {
             _ => panic!("{held:?} is a place of the run before, this run's head is {head:?}"),
         }
         assert!(matches!(join(head).restore, Restore::No));
-        // The log is a watcher's judge as well, and a load row's place is
+        // The log is a watcher's judge as well, and a generation's place is
         // one it holds: this run's head, and no place of the run before.
-        assert!(after.log.holds(JournalKinds::Watched, head), "{head:?}");
-        assert!(!after.log.holds(JournalKinds::Watched, held), "{held:?}");
+        assert!(after.log.holds(head), "{head:?}");
+        assert!(!after.log.holds(held), "{held:?}");
 
         // A standby that applied nothing names no place of either run: it
         // stands at this run's first place and reads its writes from there.
-        let first = after
-            .log
-            .first(JournalKinds::Watched)
-            .expect("every write is retained");
+        let first = after.log.first().expect("every write is retained");
         assert_eq!(first.term, 0, "{first:?}");
         let mut feed = join(START);
         assert!(matches!(feed.restore, Restore::No));
@@ -1768,9 +1727,9 @@ mod tests {
     #[test]
     fn every_frame_states_the_logs_head_as_its_look_found_it() {
         let leader = Leader::leading();
-        // The take, the registration and 300 load rows: more than a batch.
+        // The take, the registration and 300 generations: more than a batch.
         leader.writes(300);
-        let head = leader.log.head(JournalKinds::Watched);
+        let head = leader.log.head();
         let ends =
             |batch: &proto::ReplicationBatch| batch.first_seq + batch.events.len() as u64 - 1;
         let mut feed = leader.feed(START, RING);
@@ -1846,9 +1805,16 @@ mod tests {
         // half of what the transport reads.
         let page = watch_workers::PAGE_BYTES + 64;
         assert!(sizes.iter().all(|size| *size <= page), "{sizes:?}");
+        // Every part says the cut's place and its epoch, in order, and the
+        // one that ends the rows is the last.
+        let at = (cut.at.seq + 1, cut.at.term);
         for (number, batch) in sent.iter().enumerate() {
             let part = batch.snapshot.as_ref().expect("a part");
-            assert_eq!(part.part as usize, number);
+            assert_eq!((batch.first_seq, batch.term), at, "part {number}");
+            assert_eq!(
+                (part.part as usize, part.membership_epoch),
+                (number, cut.epoch)
+            );
             assert_eq!(part.last, number + 1 == sent.len(), "part {number}");
         }
         // The parts are the cut whole, in its order: the rows, and no load
@@ -1868,58 +1834,8 @@ mod tests {
         assert_eq!(sent.len(), 1);
         let part = sent[0].snapshot.as_ref().expect("a part");
         assert!(part.last && part.workers.is_empty() && part.loads.is_empty());
-        let head = leader.log.head(JournalKinds::Watched);
+        let head = leader.log.head();
         assert_eq!((sent[0].first_seq, sent[0].term), (head.seq + 1, head.term));
-    }
-
-    #[test]
-    fn load_rows_past_a_page_are_sent_in_parts_each_full_to_the_row() {
-        let now = Instant::now();
-        let sample = LoadSample {
-            row: LoadRow {
-                running: u32::MAX,
-                queued: u32::MAX,
-                ..LoadRow::default()
-            },
-            received_at: now,
-            sampled_at: now,
-            source: LoadSource::Stream,
-        };
-        // A cut of load rows alone, a worker each: above two pages of them.
-        let cut = Arc::new(StoreCheckpoint {
-            at: Position { seq: 7, term: 3 },
-            epoch: 2,
-            rows: Vec::new(),
-            loads: (0..250_000).map(|n| (WorkerId(n), 0, sample)).collect(),
-        });
-        let sent = parts(Arc::clone(&cut), now);
-        assert!(sent.len() > 2, "{} parts", sent.len());
-        let framed = |told: &[proto::LoadSample]| -> usize {
-            told.iter().map(|told| message::encoded_len(5, told)).sum()
-        };
-        let told: Vec<&[proto::LoadSample]> = sent
-            .iter()
-            .map(|batch| batch.snapshot.as_ref().expect("a part").loads.as_slice())
-            .collect();
-        // Each part is within a page and full to the row: the first row of
-        // the next would pass it.
-        for pair in told.windows(2) {
-            let bytes = framed(pair[0]);
-            let next = framed(&pair[1][..1]);
-            assert!(bytes <= watch_workers::PAGE_BYTES, "{bytes}");
-            assert!(bytes + next > watch_workers::PAGE_BYTES, "{bytes}");
-        }
-        // Every part says the cut's place and its epoch, in order, and the
-        // one that ends the load rows is the last.
-        for (number, batch) in sent.iter().enumerate() {
-            let part = batch.snapshot.as_ref().expect("a part");
-            assert_eq!((batch.first_seq, batch.term), (8, 3));
-            assert_eq!((part.part as usize, part.membership_epoch), (number, 2));
-            assert_eq!(part.last, number + 1 == sent.len(), "part {number}");
-        }
-        // The parts are the cut's load rows, each once, in its order.
-        let ids = told.concat().into_iter().map(|told| told.worker_id);
-        assert!(ids.eq(0..250_000));
     }
 
     #[test]
@@ -1937,21 +1853,21 @@ mod tests {
         leader.writes(1);
         let later = replication.cut(leader.term).expect("a cut");
         assert!(!Arc::ptr_eq(&first, &later));
-        assert_eq!(later.at, leader.log.head(JournalKinds::Watched));
+        assert_eq!(later.at, leader.log.head());
         // Nothing is kept past the last stream that holds a cut: the next
         // at the same place copies the rows again.
         let held = Arc::downgrade(&later);
         drop(later);
         assert!(held.upgrade().is_none(), "the rows are let go");
         let again = replication.cut(leader.term).expect("a cut");
-        assert_eq!(again.at, leader.log.head(JournalKinds::Watched));
+        assert_eq!(again.at, leader.log.head());
     }
 
     #[test]
     fn a_place_the_log_does_not_hold_is_told_to_resync() {
         let leader = Leader::leading();
         leader.writes(4);
-        let held = leader.log.head(JournalKinds::Watched);
+        let held = leader.log.head();
         for place in [
             Position {
                 term: held.term + 1,
@@ -1973,7 +1889,7 @@ mod tests {
 
     /// A place past the head of `leader`'s log: one its log does not hold.
     fn past_the_head(leader: &Leader) -> Position {
-        let head = leader.log.head(JournalKinds::Watched);
+        let head = leader.log.head();
         Position {
             seq: head.seq + 9,
             ..head
@@ -1984,7 +1900,7 @@ mod tests {
     fn a_standby_the_log_does_not_continue_is_restored_by_the_looks_after_the_word() {
         let leader = Leader::leading();
         leader.writes(3);
-        let head = leader.log.head(JournalKinds::Watched);
+        let head = leader.log.head();
         let lost = past_the_head(&leader);
         let mut feed = leader.feed(lost, RING);
         assert_eq!(resync(&mut feed, leader.at), Why::Place(lost));
@@ -2242,7 +2158,7 @@ mod tests {
             parts += 1;
         }
         assert_eq!(parts, 0, "one part, the rows', and it is the last");
-        let head = leader.log.head(JournalKinds::Watched);
+        let head = leader.log.head();
         assert_eq!((feed.place, feed.acked), (head, head.seq));
         assert!(matches!(feed.look(later), Step::Idle));
     }
@@ -2285,7 +2201,7 @@ mod tests {
     fn a_snapshots_parts_are_the_stores_cut_at_its_place() {
         let leader = Leader::leading();
         let id = leader.writes(3);
-        let head = leader.log.head(JournalKinds::Watched);
+        let head = leader.log.head();
         // A load row on the leader's own table: it is journaled nowhere,
         // so the log stands where it stood, and no part holds it.
         let row = LoadRow {
@@ -2296,7 +2212,7 @@ mod tests {
             .store
             .record(id, 0, row, leader.at, LoadSource::Stream);
         assert!(leader.store.load(id, 0).is_some(), "the leader's own row");
-        assert_eq!(leader.log.head(JournalKinds::Watched), head);
+        assert_eq!(leader.log.head(), head);
         let cut = leader.replication().cut(leader.term).expect("a cut");
         assert_eq!((cut.at, cut.epoch), (head, leader.store.epoch()));
         // One part, the row's, and the last. It says the place as a
@@ -2339,10 +2255,6 @@ mod tests {
             self.log.member(at, epoch, change, row, left);
         }
 
-        fn load(&self, at: Option<Position>, id: WorkerId, rank: u16, sample: &LoadSample) {
-            self.log.load(at, id, rank, sample);
-        }
-
         fn term_rose(&self, term: u64) {
             self.log.term_rose(term);
         }
@@ -2355,17 +2267,13 @@ mod tests {
             self.log.term_followed(at);
         }
 
-        fn carries_loads(&self) -> bool {
-            self.log.carries_loads()
-        }
-
-        fn head(&self, kinds: JournalKinds) -> Position {
+        fn head(&self) -> Position {
             // Taken out before it runs: the write reads no head itself.
             let lands = self.lands.lock().take();
             if let Some(lands) = lands {
                 lands();
             }
-            self.log.head(kinds)
+            self.log.head()
         }
 
         fn followed(&self) -> Option<u64> {
@@ -2387,7 +2295,7 @@ mod tests {
         let told = Arc::new(AtomicUsize::new(0));
         let log = {
             let told = Arc::clone(&told);
-            Arc::new(Log::new(WATCHED_EVENTS, 0).on_watched(move || {
+            Arc::new(Log::new(WATCHED_EVENTS).on_watched(move || {
                 told.fetch_add(1, Ordering::Relaxed);
             }))
         };
@@ -2433,7 +2341,7 @@ mod tests {
         leader.writes(1);
         let mut feed = leader.feed(START, RING);
         let sent = batch(feed.look(leader.at));
-        let head = leader.log.head(JournalKinds::Watched);
+        let head = leader.log.head();
         assert_eq!(sent.first_seq + sent.events.len() as u64 - 1, head.seq);
         // Silent under a second: nothing. At the second: the heartbeat.
         let second = leader.at + BEAT;
@@ -2575,10 +2483,10 @@ mod tests {
         let leader = Leader::elected();
         let (store, feed) = journaled_from(&LeasePlace::File("shared".into()), 0);
         store.set_term(leader.term);
-        // The log carries no load row under a shared lease either: the
-        // lease's place alone says whether a standby may follow it.
-        assert!(!feed.log.alone() && !feed.log.carries_loads());
-        let head = feed.log.head(JournalKinds::Watched);
+        // The lease's place alone says whether a standby may follow the
+        // log.
+        assert!(!feed.log.alone());
+        let head = feed.log.head();
         let cut = Replication::new(store, feed.log, leader.elector.fence())
             .cut(leader.term)
             .expect("a standby may follow it");

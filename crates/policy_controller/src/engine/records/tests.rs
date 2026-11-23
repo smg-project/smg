@@ -1234,6 +1234,14 @@ fn a_tried_worker_names_every_rank_of_its_engine_once() {
     assert_eq!(whole, [id(1), id(4), id(6)], "the second engine's own");
     pool.tried_engines(&[id(2)], &mut whole);
     assert_eq!(whole, [id(2)], "a worker alone names itself");
+    // A further list of the same decision adds its own engines' ranks to
+    // what the list holds, and takes nothing out of it.
+    let mut whole = vec![WorkerId(9), id(5)];
+    pool.more_tried_engines(&[id(5), id(1)], &mut whole);
+    assert_eq!(
+        whole,
+        [WorkerId(9), id(5), id(3), id(0), id(1), id(4), id(6)]
+    );
 
     let stranger = WorkerId(77);
     pool.tried_engines(&[id(0), id(2), stranger, id(3), id(4)], &mut whole);

@@ -217,13 +217,13 @@ fn worker(port: u16, worker_type: WorkerType) -> Arc<dyn Worker> {
     Arc::new(grpc_worker(port, worker_type, RuntimeType::Vllm, card).build())
 }
 
-/// One chat through `router`, answered in full.
+/// One chat through `router`, answered in full: the answer's JSON.
 #[expect(
     clippy::expect_used,
     clippy::unwrap_used,
     reason = "test helper: failures should panic"
 )]
-async fn chat(router: &dyn RouterTrait, heard: &Heard) {
+async fn chat(router: &dyn RouterTrait, heard: &Heard) -> serde_json::Value {
     let request = serde_json::from_value(serde_json::json!({
         "model": MODEL,
         "messages": [{"role": "user", "content": "Hello world"}],
@@ -245,6 +245,7 @@ async fn chat(router: &dyn RouterTrait, heard: &Heard) {
         "{said:?}: {}",
         String::from_utf8_lossy(&body)
     );
+    serde_json::from_slice(&body).expect("a JSON answer")
 }
 
 /// One chat through the sequential pair route of a gateway the policy
@@ -383,4 +384,60 @@ async fn a_sequential_pair_whose_decode_moves_is_served_by_the_decode_it_moved_t
     let said = heard.lock().expect("the record").clone();
     assert_eq!(said, [served_by_b, served_by_b].concat());
     assert_eq!((decode_a.load(), decode_b.load()), (0, 0));
+}
+
+/// A pair whose decode moved states the weight version of the decode that
+/// answered. Decode A and decode B carry a version each, and a chat
+/// answer's `system_fingerprint` is its worker's. The first request is
+/// decode B's from its first decision on. The second names A first and
+/// takes B behind the prefill, as in the case above: B's engine answers
+/// it, and its answer states B's version, not the version of the decode
+/// that was named first.
+#[tokio::test]
+async fn a_pair_whose_decode_moved_states_the_weight_version_of_its_decode() {
+    let (heard, preferred) = (Heard::default(), Preferred::default());
+    let decode_a = serve_engine(Decode(Arc::clone(&heard), "decode A").into_server()).await;
+    let decode_b = serve_engine(Decode(Arc::clone(&heard), "decode B").into_server()).await;
+    let of_version = |port, version: &str| -> Arc<dyn Worker> {
+        let card = ModelCard::new(MODEL);
+        let decode = grpc_worker(port, WorkerType::Decode, RuntimeType::Vllm, card);
+        Arc::new(decode.label("weight_version", version).build())
+    };
+    let decode_a = of_version(decode_a, "version-a");
+    let decode_b = of_version(decode_b, "version-b");
+    let (a, b) = (worker_id(decode_a.as_ref()), worker_id(decode_b.as_ref()));
+    // The prefill's answer turns the test's stage to decode B.
+    let prefill = Prefill {
+        heard: Arc::clone(&heard),
+        preferred: Arc::clone(&preferred),
+        then: Some(b),
+    };
+    let prefill = serve_engine(prefill.into_server()).await;
+    let workers = vec![worker(prefill, WorkerType::Prefill), decode_a, decode_b];
+
+    let (stayed, moved) = common::with_policy_stages(stages_hearing(&heard, &preferred), async {
+        let config = pair_config(DecodePick::AfterPrefill);
+        let router = build_grpc_router(config, MODEL, workers).await;
+        // Decode B's from its first decision on.
+        prefer(&preferred, Some(b));
+        let stayed = chat(router.as_ref(), &heard).await;
+        // Decode A's by its first decision, and B's by the one behind the
+        // prefill.
+        prefer(&preferred, Some(a));
+        let moved = chat(router.as_ref(), &heard).await;
+        (stayed, moved)
+    })
+    .await;
+
+    let asked: Vec<String> = {
+        let said = heard.lock().expect("the record");
+        let asked = said.iter().filter(|word| word.ends_with("was asked"));
+        asked.cloned().collect()
+    };
+    assert_eq!(asked, ["decode B was asked", "decode B was asked"]);
+    assert_eq!(stayed["system_fingerprint"], "version-b");
+    assert_eq!(
+        moved["system_fingerprint"], "version-b",
+        "the answer of a decode that moved states its own version"
+    );
 }

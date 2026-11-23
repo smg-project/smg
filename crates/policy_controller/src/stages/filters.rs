@@ -250,7 +250,7 @@ impl HasRoomRule {
     #[inline(always)]
     fn asked(&self, facts: &RequestFacts<'_>) -> f64 {
         f64::from(facts.max_output_tokens) * self.output_tokens
-            + f64::from(facts.prompt_tokens) * self.request_tokens
+            + f64::from(facts.prompt_size()) * self.request_tokens
     }
 
     /// Whether a row has room, by its report as `load` hands it and its

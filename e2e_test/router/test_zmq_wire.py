@@ -199,16 +199,20 @@ class _LockstepGroupTurns:
     # add reaches its rank after the group parked.
     rewake: bool
 
-    def test_the_group_registered_as_one_worker_of_two_ranks(self, setup_backend):
+    def test_the_group_registered_as_one_worker_per_rank(self, setup_backend):
         _, _, _, gateway = setup_backend
         resp = httpx.get(f"{gateway.base_url}/workers", timeout=5.0)
         assert resp.status_code == 200, f"GET /workers returned {resp.status_code}: {resp.text}"
         workers = resp.json().get("workers")
-        assert workers and len(workers) == 1, f"one ZMQ worker expected: {resp.text}"
-        worker = workers[0]
-        assert worker["url"].startswith("ipc://"), worker
-        assert worker.get("connection_mode") == "zmq", worker
-        assert worker.get("dp_size") == _LOCKSTEP_RANKS, worker
+        assert workers and len(workers) == _LOCKSTEP_RANKS, (
+            f"one ZMQ worker per rank expected: {resp.text}"
+        )
+        for worker in workers:
+            assert worker["url"].startswith("ipc://"), worker
+            assert worker.get("connection_mode") == "zmq", worker
+            assert worker.get("dp_size") == _LOCKSTEP_RANKS, worker
+        ranks = sorted(worker.get("dp_rank") for worker in workers)
+        assert ranks == list(range(_LOCKSTEP_RANKS)), workers
 
     def test_a_turn_wakes_the_parked_group_and_it_parks_again(self, setup_backend, mock_answers):
         _, model_path, client, _ = setup_backend

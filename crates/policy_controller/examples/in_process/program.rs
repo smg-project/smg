@@ -7,7 +7,10 @@
 //! published and the empty cell the program keeps beside it. The engine
 //! takes the registry and the load monitor's channel once, at its start
 //! ([`PolicyEngine::start`]), and reads both in place: the program tells it
-//! nothing of a worker that joins or leaves. Its sends are a function its
+//! nothing of a worker that joins or leaves. The program hands its lists
+//! by model beside the start ([`PublishedLists`]), and the engine's task
+//! fills the cell of a model's newest list behind each membership change.
+//! Its sends are a function its
 //! builder gives ([`Program::start`]): handed the worker a request goes to,
 //! it answers the status that worker answered.
 //!
@@ -25,8 +28,8 @@ use http::HeaderMap;
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySettings, RoutingSettings},
     engine::{
-        HeaderRead, LentList, ListCell, PlaceRequest, PolicyEngine, Unplaced, WorkerData, WorkerId,
-        WorkerLists,
+        HeaderRead, LentList, ListCell, ModelLists, PlaceRequest, PolicyEngine, Unplaced,
+        WorkerData, WorkerId, WorkerLists,
     },
     tracking::{Outcome, Placement, Side, TransportClass},
 };
@@ -88,6 +91,26 @@ impl Lists {
             cell: &self.cell,
             facts: None,
         }
+    }
+}
+
+/// The program's lists by model, as it hands them to the engine beside its
+/// start: the generation the registry holds of a model now, lent as a
+/// request lends it. The engine's task asks them behind each membership
+/// word of the registry and fills a cell it finds empty, so a list's first
+/// request reads a filled cell where the task came first.
+#[derive(Debug)]
+struct PublishedLists(Arc<WorkerRegistry<Lists>>);
+
+impl ModelLists for PublishedLists {
+    fn lists_of(&self, model: &str, hand: &mut dyn FnMut(LentList<'_>)) {
+        // The generation is taken out of the registry first: the engine
+        // reads each worker of a list it fills, and no guard of the
+        // registry stands meanwhile.
+        let Some(lists) = self.0.model_generation(model) else {
+            return;
+        };
+        hand(lists.lent());
     }
 }
 
@@ -172,12 +195,15 @@ impl Program {
     /// engine is built from `spec` for the life of the process and takes
     /// the program's registry, and its load monitor's channel where the
     /// program has a monitor. This program keeps no index of cache events.
+    /// Beside the start it hands the engine its lists by model
+    /// ([`PublishedLists`]).
     ///
     /// It answers the program with the engine's own task, which a program
     /// spawns on its runtime ahead of its first request. The task keeps the
     /// newest load snapshot at hand, runs the engine's upkeep, and follows
     /// the registry: it tells the document's stages a worker that joined or
-    /// left. `sends` are the program's sends.
+    /// left, and fills the cell of the model's list that stands then.
+    /// `sends` are the program's sends.
     pub fn start(
         spec: AppliedSpec,
         loads: Option<LoadReceiver>,
@@ -191,6 +217,7 @@ impl Program {
             cache_indexes: None,
         };
         let (engine, task) = PolicyEngine::start(spec, data);
+        engine.set_lists(Arc::new(PublishedLists(Arc::clone(&registry))));
         let program = Self {
             registry,
             engine: Engine(engine),
@@ -202,7 +229,7 @@ impl Program {
     /// A worker joins: the registry publishes the next generation of its
     /// model, with an empty cell. `false` where the registry holds a worker
     /// at its address already. The engine's task hears the join from the
-    /// registry.
+    /// registry, and fills the cell of the model's list that stands then.
     pub fn join(&self, worker: Arc<dyn Worker>) -> bool {
         self.registry.register(worker).is_some()
     }
