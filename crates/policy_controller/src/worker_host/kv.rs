@@ -470,8 +470,8 @@ where
     /// A feed's own row begins. An error, with nothing done, says why it
     /// does not. [`SkipReason::NoRow`]: `stands` says the feed's object stands
     /// for the row no longer. [`SkipReason::UpperRank`]: the holder stands the
-    /// row above rank 0. An object kept through such a move still stands
-    /// for the row, which is its engine's stream's now. Both are asked in
+    /// row above rank 0. An object can stand for such a row and state no
+    /// rank: it states one where its row's width is above one. Both are asked in
     /// the hold that writes the row's entry: a row laid again behind the
     /// answers is taken from this feed by the stream the holder then
     /// routes to it, and never by this feed from that stream.
@@ -868,9 +868,9 @@ where
         // The ticket was written at the enrollment, and the feed opens
         // later, on the subscription's task. A row laid again since is
         // another object's, and may be another stream's by now: its ticket
-        // opens nothing. Nor does the ticket of a kept object whose row
-        // stands above rank 0 by now. The holder is asked both as the row
-        // begins, and the answer names the reason.
+        // opens nothing. Nor does a ticket for a row the holder stands
+        // above rank 0. The holder is asked both as the row begins, and
+        // the answer names the reason.
         let ticket = ticket.and_then(|row| {
             self.sink
                 .begin(row, || self.row_of(worker) == Some(row))
@@ -2246,8 +2246,7 @@ mod tests {
 
     /// The store keeps a row's lane at the row's own rank. A row the holder
     /// stands above rank 0 is its engine's rank 0 stream's. A ticket for
-    /// it opens no feed, and what the store keeps of the row stands: such
-    /// a ticket was written before a kept object's row moved there. It is
+    /// it opens no feed, and what the store keeps of the row stands. It is
     /// counted as an upper rank's: the holder keeps the row.
     #[test]
     fn a_ticket_for_a_row_above_rank_0_opens_no_feed() {

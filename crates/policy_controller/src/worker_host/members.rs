@@ -30,8 +30,8 @@ use crate::engine::{FixedFacts, LentList, ListCell, Role};
 #[derive(Debug)]
 pub struct Members {
     members: Arc<[Arc<dyn Worker>]>,
-    /// The pair classes of the prefill and decode lists, each set under the
-    /// pairing mode and the holder's count of in-place moves its ask read.
+    /// The pair classes of the prefill and decode lists, one set a pairing
+    /// mode.
     #[cfg(feature = "in-process")]
     pairs: pairs::PairSets,
     #[cfg(feature = "in-process")]

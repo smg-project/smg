@@ -18,13 +18,9 @@
 //! not move within its life: a registration that states others starts
 //! another life (`WorkerFacts::compare_to_standing`), and a holder lays
 //! another life's object, which the registry publishes. Who dials a worker
-//! moves within its life. A holder that builds its objects from the rows
-//! lays a new object at each move of a row, so the registry publishes a
-//! generation and the list's reach is made again. A holder that keeps the
-//! objects its registrations hand in moves its entry alone and publishes
-//! nothing ([`Objects::with_built_kept`](super::Objects::with_built_kept)):
-//! there a list's reach stands as it was made until the model's next
-//! membership change. No served controller is such a holder.
+//! moves within its life. The holder lays a new object at each move of a
+//! row, so the registry publishes a generation and the list's reach is
+//! made again.
 
 use super::remainder::RowRemainder;
 use crate::{engine::view::WireModes, store::Reachability};

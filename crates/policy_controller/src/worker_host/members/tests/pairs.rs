@@ -187,6 +187,38 @@ fn a_lent_worker_whose_object_was_replaced_pairs_with_nobody() {
     );
 }
 
+/// A row whose pairing facts move gets a new object, and the registry
+/// publishes another generation for it: the holder keeps no object over a
+/// row that moved. So the generation that stood keeps the one set it
+/// derived under the mode, and the new generation's classes say what the
+/// row states now.
+#[test]
+fn a_row_whose_pairing_facts_move_gets_a_new_object_and_a_new_generation() {
+    let replica = Replica::new();
+    state(&replica, pair_side(PREFILL, Role::Prefill, "a"));
+    let decode = state(&replica, pair_side(DECODE, Role::Decode, "a"));
+    let object = || {
+        let id = replica.objects.object(decode).expect("the row's object");
+        replica.objects.registry().get(&id).expect("it stands")
+    };
+    let (before, stood) = (replica.generation(), object());
+    let paired = replica.objects.pair_classes(&before, Pairing::Lenient);
+    assert_eq!((paired.prefills(), paired.decodes()), (&[1][..], &[1][..]));
+
+    // The decode offers another transport, in place: its row keeps its id.
+    let moved = state(&replica, pair_side(DECODE, Role::Decode, "b"));
+    assert_eq!(moved, decode, "the row's id stands");
+    let after = replica.generation();
+    assert!(!Arc::ptr_eq(&before, &after), "another generation");
+    assert!(!Arc::ptr_eq(&stood, &object()), "another object");
+
+    // An ask of the generation that stood derives nothing: its set stands.
+    let again = replica.objects.pair_classes(&before, Pairing::Lenient);
+    assert!(ptr::eq(again, paired), "one set a mode");
+    let apart = replica.objects.pair_classes(&after, Pairing::Lenient);
+    assert_eq!((apart.prefills(), apart.decodes()), (&[0][..], &[0][..]));
+}
+
 /// One fleet under the stock pair document, decided over the lists the
 /// holder lends, with the holder's pair classes and a controller's open
 /// admission. One prefill and one decode share a transport, so the fleet

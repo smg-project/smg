@@ -36,9 +36,7 @@ mod tests {
             KvEventSink as _, MemoryStore, Registrant, Signals, WorkerFacts, WorkerStatus,
             WorkersStore,
         },
-        worker_host::{
-            KvFeed, Members, MembershipWriter as _, Objects, Precondition, StoreMembershipWriter,
-        },
+        worker_host::{KvFeed, Members, MembershipWriter as _, Objects, Precondition, StoreDoor},
     };
 
     const MODEL: &str = "m";
@@ -235,7 +233,7 @@ mod tests {
         f.store
             .apply(AppliedSpec::validate(&spec).expect("the preset validates"))
             .expect("the first generation");
-        let door = StoreMembershipWriter::new(Arc::clone(&f.store));
+        let door = StoreDoor::new(Arc::clone(&f.store));
         f.check(async {
             door.found(&Registrant::Control, Precondition::Absent, FIRST, &|_| {
                 facts(FIRST, WireModes::GRPC, false)

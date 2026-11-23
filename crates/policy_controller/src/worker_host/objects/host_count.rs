@@ -59,18 +59,16 @@ impl<G: Generation> Objects<G> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use smg_worker::{
-        identity::builder::BasicWorkerBuilder, model_card::ModelCard, registry::WorkerRegistry,
-    };
+    use smg_worker::registry::WorkerRegistry;
 
     use super::*;
     use crate::{
         store::{
-            GatewayId, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord, Registrant,
-            WorkerFacts, WorkerPatch,
+            GatewayId, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord, WorkerFacts,
+            WorkerPatch,
         },
         tracking::lease::{Lease, LeaseId, Outcome, TransportClass},
-        worker_host::{Members, MembershipWriter, Precondition, StoreMembershipWriter},
+        worker_host::Members,
     };
 
     const A: &str = "http://a:8000";
@@ -89,16 +87,6 @@ mod tests {
             store.set_term(1);
             let objects = Objects::new(Arc::new(WorkerRegistry::new()));
             Self { store, objects }
-        }
-
-        /// A replica whose registrations hand in the workers they built,
-        /// and the door they write at.
-        fn handing() -> (Self, StoreMembershipWriter) {
-            let mut replica = Self::new();
-            let registry = Arc::clone(replica.objects.registry());
-            replica.objects = Objects::new(registry).with_built_kept();
-            let door = StoreMembershipWriter::new(Arc::clone(&replica.store));
-            (replica, door)
         }
 
         /// Have the holder read the store.
@@ -166,8 +154,7 @@ mod tests {
             assert!(self.store.completed(GATEWAY, LeaseId(id), &outcome));
         }
 
-        /// Move the facts of the row at `url` with no object handed in:
-        /// one label more.
+        /// Move the facts of the row at `url`: one label more.
         fn relabel(&self, url: &str) {
             let row = self.store.by_key(url).expect("a row");
             let labels = [("tier".to_string(), "gold".to_string())];
@@ -177,22 +164,6 @@ mod tests {
             };
             assert!(self.store.patch(row.id, patch, row.revision).is_some());
         }
-    }
-
-    /// A worker a registration built at `url`.
-    fn built(url: &str) -> Arc<dyn Worker> {
-        let worker = <BasicWorkerBuilder>::new(url).model(ModelCard::new("m"));
-        Arc::new(worker.build())
-    }
-
-    /// One registration of `built`, handed to the holder through its write
-    /// at `door`.
-    fn registered(replica: &Replica, door: &StoreMembershipWriter, built: &Arc<dyn Worker>) {
-        let store = replica.store.as_ref();
-        let wrote = replica.objects.handing_one(store, built, None, || {
-            door.found_built(&Registrant::Control, Precondition::Any, built, None)
-        });
-        wrote.expect("the registration");
     }
 
     /// A lease on file counts on its worker's object from its filing to
@@ -389,56 +360,6 @@ mod tests {
         follower.end(1);
         follower.end(2);
         assert_eq!(object.load(), 0);
-    }
-
-    /// A whole read keeps the handed object of a row that moved with no
-    /// hand-in, and hands it as the row's count all the same: the store
-    /// that took rows again gave the row a new place.
-    #[test]
-    fn a_whole_read_hands_the_object_it_keeps_for_a_moved_row() {
-        let (replica, door) = Replica::handing();
-        let built = built(A);
-        registered(&replica, &door, &built);
-        let row = replica.store.by_key(A).expect("a row");
-        replica.file(1, row.id);
-        assert_eq!(built.load(), 1);
-
-        // The row moves with no hand-in, and the store takes its rows
-        // again: every row a new place.
-        replica.relabel(A);
-        let cut = replica.store.checkpoint();
-        assert!(replica.store.restore_from(cut));
-        replica.store.set_term(1);
-        assert_eq!(built.load(), 0, "the old place's lease");
-        replica.follow();
-        assert!(Arc::ptr_eq(&built, &replica.at(A)), "the object is kept");
-        replica.file(2, row.id);
-        assert_eq!(built.load(), 1, "a lease at the new place");
-    }
-
-    /// A registration's second attempt hands in the object that stands.
-    /// The holder puts no object, and hands the one that stands as the
-    /// row's count all the same: the store that took rows again gave the
-    /// row a new place.
-    #[test]
-    fn an_object_handed_in_again_is_handed_as_its_rows_count() {
-        let (replica, door) = Replica::handing();
-        let built = built(A);
-        registered(&replica, &door, &built);
-        let row = replica.store.by_key(A).expect("a row");
-        replica.file(1, row.id);
-        assert_eq!(built.load(), 1);
-
-        // Another writer moves the row, the store takes its rows again,
-        // and the second attempt states the row as its object was built.
-        replica.relabel(A);
-        let cut = replica.store.checkpoint();
-        assert!(replica.store.restore_from(cut));
-        replica.store.set_term(1);
-        registered(&replica, &door, &built);
-        assert!(Arc::ptr_eq(&built, &replica.at(A)), "the object stands");
-        replica.file(2, row.id);
-        assert_eq!(built.load(), 1, "a lease at the new place");
     }
 
     /// The engine over worker lists reads the count the leases on file
