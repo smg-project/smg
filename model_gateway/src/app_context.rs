@@ -330,6 +330,13 @@ fn has_https_worker(config: &RouterConfig) -> bool {
     }
 }
 
+/// The whole seconds the overload shed advertises as Retry-After under a
+/// load monitor that polls every `interval`. The header carries no
+/// fraction, so an interval with one is raised to the next second.
+fn shed_retry_after_secs(interval: Duration) -> u64 {
+    interval.as_secs() + u64::from(interval.subsec_nanos() != 0)
+}
+
 impl AppContextBuilder {
     pub fn new() -> Self {
         Self::new_with_connector(None)
@@ -965,17 +972,22 @@ impl AppContextBuilder {
         // The monitor's snapshot feeds every policy that consumes it; the
         // monitor polls every group by default, conditionally under
         // `--disable-load-monitoring`.
-        let monitor = Arc::new(WorkerMonitor::new(
+        let monitor = WorkerMonitor::new(
             registry,
             Arc::clone(&policy_registry),
             interval,
             engine_metrics,
             conditional,
-        ));
+        );
+        // An interval stated in milliseconds takes the place of the seconds.
+        let monitor = Arc::new(match config.load_monitor_interval_ms {
+            Some(millis) => monitor.with_interval(Duration::from_millis(millis)),
+            None => monitor,
+        });
         policy_registry.set_load_receiver(Some(monitor.subscribe()));
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
-        overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
+        overload::set_shed_retry_after_secs(shed_retry_after_secs(config.load_monitor_interval()));
         if let Some(registry) = self.worker_registry.as_ref() {
             registry.set_overload_shed(config.worker_overload_shed);
         }
@@ -1354,6 +1366,46 @@ mod tests {
             .get_default_policy();
         let cache_aware = as_cache_aware(policy.as_ref()).expect("default policy is cache-aware");
         assert!(cache_aware.has_load_receiver_for_test());
+    }
+
+    /// The load monitor is built with the interval the configuration states
+    /// in milliseconds, over its seconds, and with the seconds where it
+    /// states no milliseconds.
+    #[test]
+    fn the_worker_monitor_takes_its_interval_in_milliseconds_over_the_seconds() {
+        let built_with = |millis: Option<u64>| {
+            let config = RouterConfig {
+                load_monitor_interval_secs: 5,
+                load_monitor_interval_ms: millis,
+                ..config_with_policy(PolicyConfig::RoundRobin)
+            };
+            AppContextBuilder::new()
+                .with_client(&config, 5)
+                .expect("client builds")
+                .with_worker_registry()
+                .with_policy_registry(&config)
+                .with_worker_monitor(&config)
+                .expect("worker monitor builds")
+                .worker_monitor
+                .expect("the worker monitor")
+                .interval()
+        };
+        assert_eq!(built_with(Some(250)), Duration::from_millis(250));
+        assert_eq!(built_with(None), Duration::from_secs(5));
+    }
+
+    /// The shed's Retry-After is the poll interval in whole seconds: an
+    /// interval with a fraction is raised to the next second, and whole
+    /// seconds read as they are.
+    #[test]
+    fn the_sheds_retry_after_raises_a_fraction_to_the_next_second() {
+        for (millis, seconds) in [(100, 1), (250, 1), (1_000, 1), (1_500, 2), (10_000, 10)] {
+            assert_eq!(
+                shed_retry_after_secs(Duration::from_millis(millis)),
+                seconds,
+                "{millis} ms"
+            );
+        }
     }
 
     /// Every policy gets the monitor: a cache-aware one for its indexes, any

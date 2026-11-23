@@ -726,6 +726,12 @@ struct WorkerArgs {
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
 
+    /// Interval in milliseconds between load monitor checks, 100 at the
+    /// least. When set it is the interval, and --load-monitor-interval is
+    /// not read for it.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(100..), help_heading = "Load Monitoring")]
+    load_monitor_interval_ms: Option<u64>,
+
     /// Seconds without any contact from a worker (a load poll, a health probe,
     /// a KV event, a response) after which a transport failure excludes it
     /// from routing; the first successful contact re-admits it.
@@ -4252,6 +4258,55 @@ mod tests {
         let server_config = cli.to_server_config(router_config).unwrap();
         assert!(server_config.router_config.worker_overload_protection);
         assert!(!server_config.router_config.disable_load_monitoring);
+    }
+
+    /// `--load-monitor-interval-ms` reaches both configurations beside the
+    /// seconds option, which keeps its own value, and is the monitor's
+    /// interval over it. With no word of it the seconds are the interval,
+    /// ten by default. A value under the monitor's least is refused when
+    /// the line is read.
+    #[test]
+    fn the_load_monitor_interval_in_milliseconds_flows_into_both_configs() {
+        use std::time::Duration;
+
+        use smg_worker::load::monitor::LEAST_POLL_INTERVAL;
+
+        let cli = cli_args_from(&[
+            "--load-monitor-interval",
+            "5",
+            "--load-monitor-interval-ms",
+            "250",
+        ]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.load_monitor_interval_secs, 5);
+        assert_eq!(router_config.load_monitor_interval_ms, Some(250));
+        assert_eq!(
+            router_config.load_monitor_interval(),
+            Duration::from_millis(250)
+        );
+        let server_config = cli.to_server_config(router_config).unwrap();
+        let nested = &server_config.router_config;
+        assert_eq!(nested.load_monitor_interval_secs, 5);
+        assert_eq!(nested.load_monitor_interval_ms, Some(250));
+
+        let seconds = |flags: &[&str]| {
+            let config = cli_args_from(flags).to_router_config(vec![], vec![]);
+            let config = config.unwrap();
+            assert_eq!(config.load_monitor_interval_ms, None);
+            config.load_monitor_interval()
+        };
+        assert_eq!(
+            seconds(&["--load-monitor-interval", "5"]),
+            Duration::from_secs(5)
+        );
+        assert_eq!(seconds(&[]), Duration::from_secs(10));
+
+        let least = LEAST_POLL_INTERVAL.as_millis();
+        for (millis, taken) in [(least - 1, false), (least, true)] {
+            let millis = millis.to_string();
+            let line = ["smg", "--load-monitor-interval-ms", millis.as_str()];
+            assert_eq!(Cli::try_parse_from(line).is_ok(), taken, "{millis} ms");
+        }
     }
 
     /// Cache-index flags must reach the cache_aware policy variant and the

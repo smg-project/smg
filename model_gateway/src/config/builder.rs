@@ -273,6 +273,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn load_monitor_interval_ms(mut self, interval: Option<u64>) -> Self {
+        self.config.load_monitor_interval_ms = interval;
+        self
+    }
+
     pub fn worker_stall_secs(mut self, secs: u64) -> Self {
         self.config.worker_stall_secs = secs;
         self

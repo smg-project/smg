@@ -1183,6 +1183,7 @@ impl CliArgs {
             .job_queue_capacity(self.routing.job_queue_capacity)
             .job_queue_concurrency(self.routing.job_queue_concurrency)
             .load_monitor_interval_secs(self.workers.load_monitor_interval)
+            .load_monitor_interval_ms(self.workers.load_monitor_interval_ms)
             .worker_stall_secs(self.workers.worker_stall_secs)
             .worker_wedge_secs(self.workers.worker_wedge_secs)
             .worker_stale_secs(self.workers.worker_stale_secs)

@@ -612,6 +612,7 @@ struct Router {
     least_load_kv_pressure_weight: f64,
     least_load_mean_prefill_tokens: u32,
     load_monitor_interval: u64,
+    load_monitor_interval_ms: Option<u64>,
     log_dir: Option<String>,
     log_json: bool,
     log_level: Option<String>,
@@ -1434,6 +1435,7 @@ impl Router {
             )
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .load_monitor_interval_ms(self.load_monitor_interval_ms)
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
@@ -1678,6 +1680,7 @@ impl Router {
         least_load_kv_pressure_weight = 0.15,
         least_load_mean_prefill_tokens = 1024,
         load_monitor_interval = 10,
+        load_monitor_interval_ms = None,
         log_dir = None,
         log_json = false,
         log_level = None,
@@ -1905,6 +1908,7 @@ impl Router {
         least_load_kv_pressure_weight: f64,
         least_load_mean_prefill_tokens: u32,
         load_monitor_interval: u64,
+        load_monitor_interval_ms: Option<u64>,
         log_dir: Option<String>,
         log_json: bool,
         log_level: Option<String>,
@@ -2183,6 +2187,7 @@ impl Router {
             least_load_kv_pressure_weight,
             least_load_mean_prefill_tokens,
             load_monitor_interval,
+            load_monitor_interval_ms,
             log_dir,
             log_json,
             log_level,

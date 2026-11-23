@@ -454,6 +454,9 @@ class RouterArgs:
     least_load_kv_pressure_weight: float = 0.15
     least_load_mean_prefill_tokens: int = 1024
     load_monitor_interval: int = 10
+    # The interval in milliseconds, 100 at the least; set, it is the interval
+    # and load_monitor_interval is not read for it
+    load_monitor_interval_ms: int | None = None
     log_dir: str | None = None
     log_json: bool = False
     log_level: str | None = None
@@ -1665,6 +1668,16 @@ class RouterArgs:
             type=int,
             default=RouterArgs.load_monitor_interval,
             help="Interval in seconds between load monitor checks for PowerOfTwo routing (default: 10)",
+        )
+        parser.add_argument(
+            f"--{prefix}load-monitor-interval-ms",
+            type=int,
+            default=RouterArgs.load_monitor_interval_ms,
+            help=(
+                "Interval in milliseconds between load monitor checks, 100 at the least."
+                " When set it is the interval, and --load-monitor-interval is not read for it"
+                " (default: unset)"
+            ),
         )
         parser.add_argument(
             f"--{prefix}disable-load-monitoring",
