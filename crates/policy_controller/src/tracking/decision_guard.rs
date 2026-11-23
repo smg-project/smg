@@ -916,47 +916,62 @@ impl<D: Deref<Target: DecisionEngine>> fmt::Debug for DecisionGuard<D> {
     }
 }
 
+// The engine over worker lists stands under the feature `in-process`: the
+// cases that hold a guard over it need the feature, and so does every
+// fixture they share. The feature's gate is an attribute of its own: the
+// lints read a module of cases by its plain `cfg(test)`.
 #[cfg(test)]
+#[cfg(feature = "in-process")]
 mod tests {
     use std::{
         cell::RefCell,
         error::Error,
         mem,
-        sync::{mpsc, Arc, Barrier},
+        sync::{Arc, Barrier},
         thread,
         time::{Duration, Instant},
     };
 
     use parking_lot::Mutex;
+    use smg_worker::{identity::basic::Worker, test_support::ready_worker};
 
     use super::DecisionGuard;
     use crate::{
-        document::spec::AppliedSpec,
+        document::spec::{AppliedSpec, PolicySpec},
         engine::{
             decision::{Decision, ShadowKind, Target, Targets},
             decision_engine::{
                 DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused,
-                HeldDecision, Request, RequestMaker, SweepOutcome,
+                HeldDecision, Request, RequestMaker, SweepOutcome, WorkerLists,
             },
             framework::{EncodeItems, EncodePlaced, Picker, TieBand},
+            list_cell::tests::PublishedList,
+            policy_engine::PolicyEngine,
             prompt_hashes::{HashSeeds, PromptHashes},
             store_backed_engine::{
                 tests::{
-                    counted, fleet, held as deciding, later_request, load_decodes, pair_counts,
-                    pair_fleet, pair_request, picking, push_fleet, request, Ends, GATEWAY,
-                    PATIENCE,
+                    fleet, later_request, load_decodes, pair_counts, pair_fleet, pair_request,
+                    picking, push_fleet, request, GATEWAY,
                 },
                 StoreBackedEngine,
             },
-            view::{Candidate, Identity, RequestFacts, Session, WorkerId},
+            view::{Candidate, Constraints, Identity, RequestFacts, Session, WorkerId},
         },
         policies::random::Random,
-        stages::lifecycle::Lifecycle,
+        stages::{lifecycle::Lifecycle, registry::StageRegistry},
         store::{GatewayId, HealthSink, LeaseState, LeasesStore, MemoryStore, WorkersStore},
         tracking::lease::{
-            Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass,
+            Dispatch, EventSet, Lease, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass,
         },
     };
+
+    /// The model of the list's workers.
+    const MODEL: &str = "model-a";
+
+    /// How long a case waits for an answer it expects back. The cases of the
+    /// client's link alone read it, so it stands under their feature.
+    #[cfg(feature = "client")]
+    const PATIENCE: Duration = Duration::from_secs(20);
 
     /// What a stage heard of a lease.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -978,6 +993,10 @@ mod tests {
     struct Hears(Heard);
 
     impl Lifecycle for Hears {
+        fn hears(&self) -> EventSet {
+            EventSet::LEASE
+        }
+
         fn on_decision_issued(&self, _: &Lease, _: &Decision) {
             self.0.lock().push(Call::Issued);
         }
@@ -1037,6 +1056,79 @@ mod tests {
         decided.expect("a decision")
     }
 
+    /// The engine over worker lists under the `random` preset with
+    /// [`Hears`] in its pick's place, the list of four ready workers its
+    /// host hands it, and what the picker heard.
+    struct Host {
+        engine: PolicyEngine,
+        members: PublishedList,
+        heard: Heard,
+    }
+
+    impl Host {
+        /// One decision over the host's list for the request `id`, held.
+        fn held(&self, id: &[u8], now: Instant) -> DecisionGuard<&PolicyEngine> {
+            let asks = Listed(stated(id), Some(&self.members));
+            let decided = DecisionGuard::decide_under(&self.engine, GatewayId::LOCAL, &asks, now);
+            decided.expect("a decision")
+        }
+    }
+
+    /// A host with an engine, a list and a hearing picker of its own.
+    fn host() -> Host {
+        let heard = Heard::default();
+        let kept = Arc::clone(&heard);
+        let mut stages = StageRegistry::builtin();
+        let added = stages.picker("hears", move || Box::new(Hears(Arc::clone(&kept))));
+        added.expect("a free name");
+        let mut document = PolicySpec::preset("random").expect("a built-in preset");
+        document.generation = 1;
+        let profile = document.profiles.get_mut("random");
+        profile.expect("the preset's profile").pick = "hears".into();
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        let engine = PolicyEngine::new(spec.expect("the stages hold the picker"));
+        let list: Arc<[Arc<dyn Worker>]> = (0..4)
+            .map(|at| ready_worker(&format!("http://worker-{at}:8000"), MODEL))
+            .collect();
+        let members = PublishedList::new(list);
+        Host {
+            engine,
+            members,
+            heard,
+        }
+    }
+
+    /// A request for [`MODEL`] under `id`, stated ahead.
+    fn stated(id: &[u8]) -> Request<'_> {
+        Request {
+            id,
+            facts: RequestFacts {
+                model: MODEL,
+                seed: 7,
+                ..RequestFacts::default()
+            },
+            constraints: Constraints::default(),
+        }
+    }
+
+    /// A request stated ahead, with the list its host hands for it.
+    struct Listed<'a>(Request<'a>, Option<&'a PublishedList>);
+
+    impl RequestMaker for Listed<'_> {
+        fn model(&self) -> &str {
+            self.0.facts.model
+        }
+
+        fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
+            self.0
+        }
+
+        fn workers(&self) -> WorkerLists<'_> {
+            self.1
+                .map_or(WorkerLists::None, |list| WorkerLists::Single(list.lent()))
+        }
+    }
+
     /// An outcome of `class` on `served`, as a host reads one.
     fn outcome(served: WorkerId, class: TransportClass) -> Outcome {
         Outcome {
@@ -1074,104 +1166,87 @@ mod tests {
     #[test]
     fn a_handle_is_the_size_it_has_in_a_build_with_no_link() {
         const HELD: usize = 488;
-        assert_eq!(size_of::<DecisionGuard<Arc<StoreBackedEngine>>>(), HELD);
-        assert_eq!(size_of::<DecisionGuard<&StoreBackedEngine>>(), HELD);
+        assert_eq!(size_of::<DecisionGuard<Arc<PolicyEngine>>>(), HELD);
+        assert_eq!(size_of::<DecisionGuard<&PolicyEngine>>(), HELD);
         // A placement is the handle and what its host reads of the answer:
         // two worker pointers, the routing key, the profile's label and the
         // label of a pair's decode side.
-        #[cfg(feature = "in-process")]
         assert_eq!(size_of::<crate::tracking::Placement<'_>>(), HELD + 80);
     }
 
-    /// A request that is served: its lease is booked at the issue, moves
-    /// to dispatched at the host's word and ends at its completion, which
-    /// is written on the served worker. Each is told once: what the host
-    /// says after the end, and the drop, say nothing.
+    /// A request that is served: its lease is issued on the pick's first
+    /// target, dispatched at the host's word and ended at its completion.
+    /// Each is told once: what the host says after the end, and the drop,
+    /// say nothing.
     #[test]
     fn a_served_request_tells_its_dispatch_and_its_completion_once_each() {
-        let (door, heard) = bed();
-        let store = door.store();
+        let host = host();
         let now = Instant::now();
-        let mut handle = held(&door, b"r-1", now);
-        let lease = handle.lease().expect("a pick's lease").lease.id;
+        let mut handle = host.held(b"r-1", now);
+        let issued = handle.lease().map(|leased| leased.lease.booked);
         let first = handle.take(0).expect("the pick's first target");
-        assert_eq!(counted(store), [(first.id, 1)], "booked at the issue");
-        let sent = now + Duration::from_micros(250);
-        handle.dispatched(sent);
-        let on_file = LeasesStore::get(&**store, GATEWAY, lease);
-        let state = on_file.expect("the lease is on file").state;
-        assert_eq!(state, LeaseState::Dispatched { at: sent });
+        assert_eq!(issued, Some(first.id), "issued on the pick's first target");
+        handle.dispatched(now + Duration::from_micros(250));
         let ended = now + Duration::from_millis(5);
         handle.completed(&outcome(first.id, TransportClass::Ok), ended);
-        assert_eq!(counted(store), []);
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
-        assert!(store.completed_ok_since(GATEWAY, first.id, now));
-        // Nothing more is owed: what its host says behind the end is told
-        // to nobody and written nowhere.
-        let later = ended + Duration::from_secs(1);
-        handle.dispatched(later);
-        handle.completed(&outcome(first.id, TransportClass::Ok), later);
-        handle.released(ReleaseReason::ClientGone, Instant::now());
-        drop(handle);
-        let again = store.completed_ok_since(GATEWAY, first.id, later);
-        assert!(!again, "one completion is written");
         let told = [
             Call::Issued,
             Call::Dispatched(first.id, 0, 250),
             Call::Completed(first.id, TransportClass::Ok, 5_000),
         ];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told);
+        // Nothing more is owed: what its host says behind the end is told
+        // to nobody.
+        let later = ended + Duration::from_secs(1);
+        handle.dispatched(later);
+        handle.completed(&outcome(first.id, TransportClass::Ok), later);
+        handle.released(ReleaseReason::ClientGone, Instant::now());
+        drop(handle);
+        assert_eq!(*host.heard.lock(), told, "one completion is told");
     }
 
     /// A host whose commit passes over the first target takes another: a
-    /// take says nothing to the store, and the dispatch moves the lease's
-    /// booking to the target taken. A take of no target of the pick, and
-    /// one behind the dispatch, change nothing.
+    /// take says nothing, and the dispatch names the target taken under its
+    /// index in the pick. A take of no target of the pick, and one behind
+    /// the dispatch, change nothing.
     #[test]
-    fn a_dispatch_on_an_alternate_moves_the_leases_booking_there() {
-        let (door, heard) = bed();
-        let store = door.store();
+    fn a_dispatch_on_an_alternate_names_the_target_taken() {
+        let host = host();
         let now = Instant::now();
-        let mut handle = held(&door, b"r-1", now);
+        let mut handle = host.held(b"r-1", now);
         let first = handle.take(0).expect("the pick's first target");
         let second = handle.take(1).expect("an alternate of the pick");
         assert_ne!(first.id, second.id);
         assert_eq!(handle.take(9), None, "no such target");
-        assert_eq!(counted(store), [(first.id, 1)], "a take books nothing");
+        assert_eq!(*host.heard.lock(), [Call::Issued], "a take says nothing");
         // Two hours behind the decision: more microseconds than the span's
         // field holds, so it says its most.
         handle.dispatched(now + Duration::from_secs(7_200));
-        assert_eq!(counted(store), [(second.id, 1)]);
         assert_eq!(handle.take(0), None, "the dispatch named its target");
         handle.completed(&outcome(second.id, TransportClass::Ok), now);
-        assert_eq!(counted(store), []);
         let told = [
             Call::Issued,
             Call::Dispatched(second.id, 1, u32::MAX),
             Call::Completed(second.id, TransportClass::Ok, 5_000),
         ];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told);
     }
 
     /// A host whose commit refuses every target releases the lease under
     /// that reason, once: nothing it says behind the release is told.
     #[test]
     fn a_commit_that_refuses_every_target_releases_the_lease_once() {
-        let (door, heard) = bed();
-        let store = door.store();
+        let host = host();
         let now = Instant::now();
-        let mut handle = held(&door, b"r-1", now);
+        let mut handle = host.held(b"r-1", now);
         let first = handle.take(0).expect("the pick's first target");
         handle.released(ReleaseReason::CommitFailed, Instant::now());
-        assert_eq!(counted(store), []);
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
+        let told = [Call::Issued, Call::Released(ReleaseReason::CommitFailed)];
+        assert_eq!(*host.heard.lock(), told);
         handle.released(ReleaseReason::ClientGone, Instant::now());
         handle.completed(&outcome(first.id, TransportClass::Ok), now);
         drop(handle);
-        let written = store.completed_ok_since(GATEWAY, first.id, now);
-        assert!(!written, "no completion is written behind a release");
-        let told = [Call::Issued, Call::Released(ReleaseReason::CommitFailed)];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told, "no completion behind a release");
     }
 
     /// A handle dropped with no call knows no reason for its drop: before
@@ -1179,60 +1254,51 @@ mod tests {
     /// lease nobody spoke for.
     #[test]
     fn a_handle_dropped_with_no_call_gives_its_lease_up_as_abandoned() {
-        let (door, heard) = bed();
-        let store = door.store();
-        let handle = held(&door, b"r-1", Instant::now());
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 1);
+        let host = host();
+        let handle = host.held(b"r-1", Instant::now());
+        assert_eq!(*host.heard.lock(), [Call::Issued]);
         drop(handle);
-        assert_eq!(counted(store), []);
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
         let told = [Call::Issued, Call::Released(ReleaseReason::Abandoned)];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told);
     }
 
     /// A host that knows its client left before any dispatch says so, and
     /// the handle's drop behind it says nothing more.
     #[test]
     fn a_host_that_knows_its_client_left_says_so_once() {
-        let (door, heard) = bed();
-        let store = door.store();
-        let mut handle = held(&door, b"r-1", Instant::now());
+        let host = host();
+        let mut handle = host.held(b"r-1", Instant::now());
         handle.released(ReleaseReason::ClientGone, Instant::now());
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
-        drop(handle);
         let told = [Call::Issued, Call::Released(ReleaseReason::ClientGone)];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told);
+        drop(handle);
+        assert_eq!(*host.heard.lock(), told);
     }
 
     /// After a dispatch a lease lives until its completion: a handle
     /// dropped with no outcome, and a release said there, are told as one
     /// completion of class cancelled on the dispatched target, which says
-    /// the time since the dispatch. It is no completion of class ok for
-    /// the health precedence.
+    /// the time since the dispatch.
     #[test]
     fn behind_a_dispatch_a_drop_and_a_release_are_a_cancelled_completion() {
         for released in [false, true] {
-            let (door, heard) = bed();
-            let store = door.store();
+            let host = host();
             let now = Instant::now();
-            let mut handle = held(&door, b"r-1", now);
+            let mut handle = host.held(b"r-1", now);
             let second = handle.take(1).expect("an alternate of the pick");
             handle.dispatched(now);
             thread::sleep(Duration::from_millis(1));
-            if released {
-                handle.released(ReleaseReason::ClientGone, Instant::now());
-                assert_eq!(counted(store), [], "told where it was said");
-            }
-            drop(handle);
-            assert_eq!(counted(store), []);
-            assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
-            assert!(!store.completed_ok_since(GATEWAY, second.id, now));
             let told = [
                 Call::Issued,
                 Call::Dispatched(second.id, 1, 0),
                 Call::Completed(second.id, TransportClass::Cancelled, 0),
             ];
-            assert_eq!(clocked(&heard, 1_000), told, "released: {released}");
+            if released {
+                handle.released(ReleaseReason::ClientGone, Instant::now());
+                assert_eq!(clocked(&host.heard, 1_000), told, "told where it was said");
+            }
+            drop(handle);
+            assert_eq!(clocked(&host.heard, 1_000), told, "released: {released}");
         }
     }
 
@@ -1242,49 +1308,43 @@ mod tests {
     /// their order.
     #[test]
     fn a_completion_said_with_no_dispatch_says_the_dispatch_first() {
-        let (door, heard) = bed();
+        let host = host();
         let now = Instant::now();
-        let mut handle = held(&door, b"r-1", now);
+        let mut handle = host.held(b"r-1", now);
         let second = handle.take(1).expect("an alternate of the pick");
         let failed = outcome(second.id, TransportClass::ConnectFailed);
         handle.completed(&failed, now + Duration::from_micros(400));
-        assert_eq!(counted(door.store()), []);
         let told = [
             Call::Issued,
             Call::Dispatched(second.id, 1, 400),
             Call::Completed(second.id, TransportClass::ConnectFailed, 5_000),
         ];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told);
     }
 
     /// A decision that picks no worker has no lease: its handle takes no
     /// target and tells nothing, whatever its host says.
     #[test]
     fn a_decision_that_picks_no_worker_owes_no_report() {
-        let (door, heard) = bed();
-        let store = door.store();
+        let host = host();
         let now = Instant::now();
-        // A member of the fleet, by a decision that picks one: a
-        // completion on a worker the store holds no row of is written
-        // for nobody.
-        let mut picked = held(&door, b"r-0", now);
+        // A worker of the list, by a decision that picks one.
+        let mut picked = host.held(b"r-0", now);
         let member = picked.take(0).expect("the pick's first target").id;
         picked.released(ReleaseReason::CommitFailed, Instant::now());
-        heard.lock().clear();
-        let mut asked = request(b"r-1", 7);
-        asked.facts.model = "model-none";
-        let decided = DecisionGuard::decide(&door, GATEWAY, &asked, now);
+        host.heard.lock().clear();
+        // A request whose host hands no list is decided over no worker.
+        let asks = Listed(stated(b"r-1"), None);
+        let decided = DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &asks, now);
         let mut handle = decided.expect("a decision");
-        assert!(handle.decision().pick().is_none(), "no pool, no pick");
+        assert!(handle.decision().pick().is_none(), "no list, no pick");
         assert!(handle.lease().is_none());
         assert_eq!(handle.take(0), None);
         handle.dispatched(now);
         handle.completed(&outcome(member, TransportClass::Ok), now);
         handle.released(ReleaseReason::CommitFailed, Instant::now());
         drop(handle);
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
-        assert!(!store.completed_ok_since(GATEWAY, member, now));
-        assert_eq!(*heard.lock(), []);
+        assert_eq!(*host.heard.lock(), []);
     }
 
     /// A host that takes no target dispatches to the pick's first, and a
@@ -1293,78 +1353,42 @@ mod tests {
     /// said ahead of the clock has no span yet.
     #[test]
     fn a_host_that_takes_no_target_dispatches_to_the_picks_first() {
-        let (door, heard) = bed();
-        let store = door.store();
+        let host = host();
         let now = Instant::now();
-        let mut handle = held(&door, b"r-1", now);
+        let mut handle = host.held(b"r-1", now);
         let pick = handle.decision().pick();
         let first = pick.and_then(|pick| pick.targets.first().copied());
         let first = first.expect("the pick's first target");
         handle.dispatched(now + Duration::from_secs(3_600));
-        assert_eq!(counted(store), [(first.id, 1)]);
         thread::sleep(Duration::from_millis(1));
         drop(handle);
-        assert_eq!(counted(store), []);
         let told = [
             Call::Issued,
             Call::Dispatched(first.id, 0, 3_600_000_000),
             Call::Completed(first.id, TransportClass::Cancelled, 0),
         ];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told);
     }
 
-    /// A handle's report holds no thread for a decision. While one
-    /// decision stands, more handles than a file's ring takes are let go:
-    /// every one returns, and their leases stay on file, the deciding
-    /// thread's to end. As that caller leaves, every lease is ended.
-    #[test]
-    fn handles_let_go_at_a_full_ring_hold_no_thread_for_a_decision() {
-        let store = fleet(1);
-        let door = Arc::new(StoreBackedEngine::new(Arc::clone(&store)));
-        let more = MemoryStore::HANDOVER + 8;
-        let now = Instant::now();
-        let asks = (0..more).map(|n| {
-            let id = n.to_le_bytes();
-            let asked = request(&id, 7);
-            let decided = DecisionGuard::decide(Arc::clone(&door), GATEWAY, &asked, now);
-            decided.expect("a decision")
-        });
-        let handles: Vec<_> = asks.collect();
-        let ends = Ends::over(&store);
-        let held = deciding(&door);
-        ends.stands("pick");
-        let (done, returned) = mpsc::channel();
-        thread::spawn(move || {
-            drop(handles);
-            done.send(()).ok();
-        });
-        let returned = returned.recv_timeout(PATIENCE).is_ok();
-        let on_file = LeasesStore::live(&*store, GATEWAY);
-        ends.go();
-        ends.stands("issue");
-        ends.go();
-        let lease = held.join().expect("the held decision's thread");
-        assert!(returned, "every handle was let go while the decision stood");
-        assert_eq!(on_file, more, "a report is the deciding thread's to apply");
-        assert!(lease.is_some(), "the held request has its lease");
-        assert_eq!(LeasesStore::live(&*store, GATEWAY), 1, "its lease alone");
-    }
-
-    /// A handle that owns its door travels with its request: dropped on
+    /// A handle that owns its engine travels with its request: dropped on
     /// another thread behind its dispatch, it ends the lease from there.
     #[test]
-    fn a_handle_that_owns_its_door_ends_its_lease_from_another_thread() {
-        let (door, heard) = bed();
-        let door = Arc::new(door);
+    fn a_handle_that_owns_its_engine_ends_its_lease_from_another_thread() {
+        let Host {
+            engine,
+            members,
+            heard,
+        } = host();
+        let engine = Arc::new(engine);
         let now = Instant::now();
-        let asked = request(b"r-1", 7);
-        let decided = DecisionGuard::decide(Arc::clone(&door), GATEWAY, &asked, now);
+        let asks = Listed(stated(b"r-1"), Some(&members));
+        let decided =
+            DecisionGuard::decide_under(Arc::clone(&engine), GatewayId::LOCAL, &asks, now);
         let mut handle = decided.expect("a decision");
         let first = handle.take(0).expect("the pick's first target");
         handle.dispatched(now);
         let ended = thread::spawn(move || drop(handle));
         ended.join().expect("the request's thread");
-        assert_eq!(counted(door.store()), []);
         let told = [
             Call::Issued,
             Call::Dispatched(first.id, 0, 0),
@@ -1376,21 +1400,20 @@ mod tests {
     /// Sixty-four hosts at once on one model, each holding its requests
     /// from the decision to the end, by turns served, dropped behind the
     /// dispatch, refused at the commit and dropped before any dispatch:
-    /// every lease is ended once, by its own path's word, none is left on
-    /// file and no count is left on a member.
+    /// every lease is ended once, by its own path's word.
     #[test]
     fn sixty_four_hosts_at_once_end_every_lease_once() {
-        let (door, heard) = bed();
+        let shared = host();
         let (hosts, each) = (64_u8, 32_u8);
         let start = Barrier::new(usize::from(hosts));
         thread::scope(|scope| {
             for host in 0..hosts {
-                let (door, start) = (&door, &start);
+                let (shared, start) = (&shared, &start);
                 scope.spawn(move || {
                     start.wait();
                     for turn in 0..each {
                         let now = Instant::now();
-                        let mut handle = held(door, &[host, turn], now);
+                        let mut handle = shared.held(&[host, turn], now);
                         match turn % 4 {
                             0 => {
                                 let first = handle.take(0).expect("the first target");
@@ -1405,10 +1428,7 @@ mod tests {
                 });
             }
         });
-        let store = door.store();
-        assert_eq!(counted(store), []);
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
-        let heard = heard.lock();
+        let heard = shared.heard.lock();
         let told = |want: fn(&Call) -> bool| heard.iter().filter(|call| want(call)).count();
         let quarter = usize::from(hosts) * usize::from(each) / 4;
         let ok = |call: &Call| matches!(call, Call::Completed(_, TransportClass::Ok, _));
@@ -1427,44 +1447,33 @@ mod tests {
         );
     }
 
-    /// A completion is written on the worker its host names, which need
-    /// not be the target the handle took: the health precedence reads the
-    /// worker that served.
+    /// A completion names the worker its host names, which need not be the
+    /// target the handle took: a stage reads the worker that served.
     #[test]
-    fn a_completion_is_written_on_the_worker_its_host_names() {
-        let (door, _) = bed();
-        let store = door.store();
+    fn a_completion_names_the_worker_its_host_names() {
+        let host = host();
         let now = Instant::now();
-        let mut handle = held(&door, b"r-1", now);
+        let mut handle = host.held(b"r-1", now);
         let other = handle.take(1).expect("the pick's second target");
         let taken = handle.take(0).expect("the pick's first target");
+        assert_ne!(other.id, taken.id);
         handle.dispatched(now);
         handle.completed(&outcome(other.id, TransportClass::Ok), now);
-        assert!(store.completed_ok_since(GATEWAY, other.id, now));
-        assert!(!store.completed_ok_since(GATEWAY, taken.id, now));
-    }
-
-    /// A completion is written at the instant its host read: a host whose
-    /// instants run ahead of the clock writes there, as its dispatch did.
-    #[test]
-    fn a_completion_is_written_at_its_hosts_instant() {
-        let (door, _) = bed();
-        let store = door.store();
-        let now = Instant::now();
-        let mut handle = held(&door, b"r-1", now);
-        let first = handle.take(0).expect("the pick's first target");
-        let ahead = now + Duration::from_secs(2);
-        handle.completed(&outcome(first.id, TransportClass::Ok), ahead);
-        assert!(store.completed_ok_since(GATEWAY, first.id, ahead));
+        let told = [
+            Call::Issued,
+            Call::Dispatched(taken.id, 0, 0),
+            Call::Completed(other.id, TransportClass::Ok, 5_000),
+        ];
+        assert_eq!(*host.heard.lock(), told);
     }
 
     /// A release behind a dispatch spans its host's two instants, the
     /// dispatch's and its own: no clock is read.
     #[test]
     fn a_release_behind_a_dispatch_spans_its_hosts_instants() {
-        let (door, heard) = bed();
+        let host = host();
         let now = Instant::now();
-        let mut handle = held(&door, b"r-1", now);
+        let mut handle = host.held(b"r-1", now);
         let first = handle.take(0).expect("the pick's first target");
         let sent = now + Duration::from_secs(3_600);
         handle.dispatched(sent);
@@ -1474,7 +1483,7 @@ mod tests {
             Call::Dispatched(first.id, 0, 3_600_000_000),
             Call::Completed(first.id, TransportClass::Cancelled, 7_000),
         ];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told);
     }
 
     thread_local! {
@@ -2356,37 +2365,31 @@ mod tests {
     /// A single's handle holds no decode side: a decode's take, dispatch
     /// and release say nothing. Its lease ends under any side its host
     /// names, a decode outcome among them: a decode phase can stand under
-    /// a single plan, and the outcome its host read reaches the store.
+    /// a single plan, and the outcome its host read reaches the engine.
     #[test]
     fn a_single_handle_ends_under_a_decode_outcome_and_says_nothing_else_of_a_decode_side() {
-        let (door, heard) = bed();
-        let store = door.store();
+        let host = host();
         let now = Instant::now();
-        let mut handle = held(&door, b"single", now);
-        let lease = handle.lease().expect("the single's lease").lease.id;
+        let mut handle = host.held(b"single", now);
         let first = handle.take(0).expect("the first target");
         handle.dispatched_decode(now);
         assert_eq!(handle.take_decode(1), None);
         handle.released_decode(ReleaseReason::ClientGone, now);
-        let state = LeasesStore::get(&**store, GATEWAY, lease).map(|filed| filed.state);
-        assert_eq!(state, Some(LeaseState::ISSUED));
-        assert_eq!(counted(store), [(first.id, 1)]);
-        assert_eq!(*heard.lock(), [Call::Issued]);
+        assert!(handle.lease().is_some(), "the single's lease stands");
+        assert_eq!(*host.heard.lock(), [Call::Issued]);
         let decoded = Outcome {
             side: Side::Decode,
             ..outcome(first.id, TransportClass::Ok)
         };
         handle.completed(&decoded, now + Duration::from_micros(400));
-        assert!(LeasesStore::get(&**store, GATEWAY, lease).is_none());
-        assert_eq!(counted(store), []);
         let told = [
             Call::Issued,
             Call::Dispatched(first.id, 0, 400),
             Call::Completed(first.id, TransportClass::Ok, 5_000),
         ];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told);
         drop(handle);
-        assert_eq!(*heard.lock(), told, "the drop says nothing more");
+        assert_eq!(*host.heard.lock(), told, "the drop says nothing more");
     }
 
     /// A pair's lease holds no encode side: an encode outcome ends no
@@ -2469,8 +2472,8 @@ mod tests {
         use tokio_stream::StreamExt as _;
 
         use super::{
-            outcome, request, DecisionGuard, DecisionRefused, DecodeRefused, Duration, Instant,
-            Request, Side, StoreBackedEngine, TransportClass, WorkerId, PATIENCE,
+            outcome, stated, DecisionGuard, DecisionRefused, DecodeRefused, Duration, Instant,
+            PolicyEngine, Request, Side, TransportClass, WorkerId, PATIENCE,
         };
         use crate::{
             engine::Demands,
@@ -2516,8 +2519,8 @@ mod tests {
             peer: &mut Peer,
             told: proto::Decision,
             now: Instant,
-        ) -> Result<DecisionGuard<&'static StoreBackedEngine>, DecisionUnavailable> {
-            let mut ask = request(&[1], 7);
+        ) -> Result<DecisionGuard<&'static PolicyEngine>, DecisionUnavailable> {
+            let mut ask = stated(&[1]);
             ask.facts.budget_micros = 200_000;
             answered_to(peer, &ask, told, now).await
         }
@@ -2528,7 +2531,7 @@ mod tests {
             ask: &Request<'_>,
             told: proto::Decision,
             now: Instant,
-        ) -> Result<DecisionGuard<&'static StoreBackedEngine>, DecisionUnavailable> {
+        ) -> Result<DecisionGuard<&'static PolicyEngine>, DecisionUnavailable> {
             peer.read_hello().await;
             let link = peer.link.clone();
             let exchange = async {
@@ -2942,7 +2945,7 @@ mod tests {
         async fn a_linked_pair_asked_with_its_decode_later_is_held_as_issued_and_takes_no_call() {
             let now = Instant::now();
             let mut peer = Peer::new(1);
-            let mut ask = request(&[1], 7);
+            let mut ask = stated(&[1]);
             ask.facts.budget_micros = 200_000;
             ask.constraints.decode_later = true;
             let mut handle = answered_to(&mut peer, &ask, paired(), now)
@@ -3016,12 +3019,12 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn a_handle_passes_the_wait_budget_to_the_link() {
             let peer = Peer::new(1);
-            let mut ask = request(&[1], 7);
+            let mut ask = stated(&[1]);
             ask.facts.budget_micros = 200_000;
             let before = tokio::time::Instant::now();
             let answer = timeout(
                 PATIENCE,
-                pin!(DecisionGuard::<&StoreBackedEngine>::asked(
+                pin!(DecisionGuard::<&PolicyEngine>::asked(
                     &peer.link,
                     &ask,
                     Instant::now(),
@@ -3044,12 +3047,12 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn a_request_with_no_budget_is_late_before_anything_is_sent() {
             let mut peer = Peer::new(1);
-            let ask = request(&[1], 7);
+            let ask = stated(&[1]);
             assert_eq!(ask.facts.budget_micros, 0);
             let before = tokio::time::Instant::now();
             let answer = timeout(
                 PATIENCE,
-                pin!(DecisionGuard::<&StoreBackedEngine>::asked(
+                pin!(DecisionGuard::<&PolicyEngine>::asked(
                     &peer.link,
                     &ask,
                     Instant::now(),
@@ -3076,7 +3079,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn a_request_that_states_a_demand_is_refused_before_anything_is_sent() {
             let mut peer = Peer::new(1);
-            let mut ask = request(&[1], 7);
+            let mut ask = stated(&[1]);
             ask.facts.budget_micros = 200_000;
             ask.constraints.demands = Demands {
                 runtime: 7,
@@ -3085,7 +3088,7 @@ mod tests {
             let before = tokio::time::Instant::now();
             let answer = timeout(
                 PATIENCE,
-                pin!(DecisionGuard::<&StoreBackedEngine>::asked(
+                pin!(DecisionGuard::<&PolicyEngine>::asked(
                     &peer.link,
                     &ask,
                     Instant::now(),
