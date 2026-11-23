@@ -37,16 +37,16 @@ use crate::{
 };
 
 /// CLIP normalization mean values.
-pub const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
+pub(crate) const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 
 /// CLIP normalization std values.
-pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
+pub(crate) const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 
 /// Default number of crops for HD transform.
-pub const DEFAULT_NUM_CROPS: usize = 16;
+pub(crate) const DEFAULT_NUM_CROPS: usize = 16;
 
 /// Tile size used in Phi3-Vision (336x336).
-pub const TILE_SIZE: u32 = 336;
+pub(crate) const TILE_SIZE: u32 = 336;
 
 /// Phi3-Vision image processor.
 ///
@@ -69,7 +69,7 @@ impl Default for Phi3VisionProcessor {
 
 impl Phi3VisionProcessor {
     /// Create a new Phi3-Vision processor with default settings.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             num_crops: DEFAULT_NUM_CROPS,
             mean: CLIP_MEAN,
@@ -185,7 +185,7 @@ impl Phi3VisionProcessor {
     /// 3. Resize to new_w = scale * 336, new_h = new_w / ratio
     /// 4. Pad height to multiple of 336 (centered, white padding)
     /// 5. If transposed, transpose back
-    pub fn hd_transform(&self, image: &DynamicImage) -> DynamicImage {
+    pub(crate) fn hd_transform(&self, image: &DynamicImage) -> DynamicImage {
         let (width, height) = image.dimensions();
 
         let transposed = width < height;

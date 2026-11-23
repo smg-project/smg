@@ -577,7 +577,7 @@ impl Glm53FlashProcessor {
         clippy::expect_used,
         reason = "the default config sets the checkpoint geometry and CLIP normalization"
     )]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::from_config_for(&PreProcessorConfig::default(), Modality::Image)
             .expect("the default preprocessor config is valid")
     }

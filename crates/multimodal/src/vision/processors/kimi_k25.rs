@@ -20,15 +20,15 @@ use crate::{
     },
 };
 
-pub const KIMI_K25_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
-pub const KIMI_K25_STD: [f64; 3] = [0.5, 0.5, 0.5];
+pub(crate) const KIMI_K25_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
+pub(crate) const KIMI_K25_STD: [f64; 3] = [0.5, 0.5, 0.5];
 
-pub const DEFAULT_PATCH_SIZE: usize = 14;
-pub const DEFAULT_MERGE_SIZE: usize = 2;
+pub(crate) const DEFAULT_PATCH_SIZE: usize = 14;
+pub(crate) const DEFAULT_MERGE_SIZE: usize = 2;
 /// Maximum total patches before merge (from preprocessor_config.json in_patch_limit)
-pub const DEFAULT_IN_PATCH_LIMIT: usize = 16384;
+pub(crate) const DEFAULT_IN_PATCH_LIMIT: usize = 16384;
 /// Maximum patches along one spatial dimension
-pub const DEFAULT_PATCH_LIMIT_ON_ONE_SIDE: usize = 512;
+pub(crate) const DEFAULT_PATCH_LIMIT_ON_ONE_SIDE: usize = 512;
 
 #[derive(Debug, Clone)]
 pub struct KimiK25Processor {
@@ -42,7 +42,7 @@ impl Default for KimiK25Processor {
 }
 
 impl KimiK25Processor {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             params: MoonVitParams {
                 patch_size: DEFAULT_PATCH_SIZE,
@@ -55,7 +55,7 @@ impl KimiK25Processor {
         }
     }
 
-    pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
+    pub(crate) fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
         Self {
             params: Self::new().params.resolved(config),
         }
