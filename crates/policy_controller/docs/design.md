@@ -980,11 +980,17 @@ The types the two engines shared stay where they were moved ahead of the deletio
 named signal, the kept engine fills the field itself, from the reports of the load snapshot the
 decision holds. Such a decision converts its list's reports where no decision under its snapshot
 has, ahead of a routing key's short answer too. A row that is one rank of a data-parallel worker
-reads its own rank's values. One limit stands: a worker object that stands for several ranks
-reads no named value, because its report holds one sample instant for all its ranks. So a
-signal's `across_ranks` has no effect under the kept engine until the worker crate's report
-states each rank's own sample instant. An encode request decided over its three lists is not
-lent cells yet: neither its encoders nor the two sides of its pair.
+reads its own rank's values. A worker object that stands for several ranks reads one value a
+name: its ranks' values made one as the signal's `across_ranks` says, under the oldest sample
+among them. The worker crate's report states each rank's own sample instant, so a rank that
+stopped reporting ends the worker's value at the signal's `max_age_ms`. The report is read where
+it lists as many ranks as the object's registration states it stands for, its width with no rank
+of its own: a pushed report counts the rows it holds, so the object's word is what says a rank is
+still to report. A report of several ranks is read of no other object, and a report that lists
+fewer ranks than it counts gives no value. A report of one rank is read as the worker's whole, so
+the first record of an object of several ranks stands for it until a second rank's record. An
+encode request decided over its three lists is not lent cells yet: neither its encoders nor the
+two sides of its pair.
 
 A pair is lent them a side. Where the prefill profile reads a named signal, the prefill side
 reads its prefill list's cells, and the decode side reads its decode list's where the decode
@@ -1296,8 +1302,8 @@ of its worker. The channel keeps one snapshot, so of two reports of one worker t
 snapshot between, the earlier is told to no policy. A told report states its named values too, one
 cell a signal the document declares and in the document's order, under a document a stage of which
 keeps a signal's column: a stage reads its column's cell (`SignalColumn::told`) for the time of the
-call and copies out what it keeps. A report of several ranks states none, and neither plugin view
-carries the values yet.
+call and copies out what it keeps. A report that is not the whole of its worker object states
+none, as a list's cells hold none of it, and neither plugin view carries the values yet.
 
 The fifth job fills a model's cells ahead of its requests, for a host that handed its lists
 (`PolicyEngine::set_lists`). The task asks the host for lists (`ModelLists::lists_of`):

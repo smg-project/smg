@@ -364,6 +364,17 @@ pub(super) fn stated_rank(spec: &WorkerSpec) -> u16 {
     u16::try_from(spec.dp_rank.unwrap_or(0)).unwrap_or(u16::MAX)
 }
 
+/// How many ranks a worker object stands for, by its registration: the
+/// width it states where it registers no rank, and one where it registers
+/// a rank or states no width. One reading for a list's cells and for the
+/// report a stage is told ([`whole`]).
+pub(super) fn stated_ranks(spec: &WorkerSpec) -> usize {
+    match (spec.dp_rank, spec.dp_size) {
+        (None, Some(width)) => width.max(1),
+        _ => 1,
+    }
+}
+
 /// A worker's report as a record states it: the row of a worker of `role`,
 /// converted at the report's own sample ([`load_row`]), and the sample's
 /// instant on `clock`. One conversion for a list's record and for the
@@ -385,19 +396,21 @@ pub(super) fn stated_report(
 /// report at all. They are made by the crate's one conversion
 /// ([`signal_values`]) under `columns`, the document's, and written where
 /// a decision may read them ([`SignalCells::write`]): under the signal's
-/// own unit and in range, each sample instant on `clock`. A report of
-/// several ranks states none ([`several_ranks`]), and nothing is written
-/// of it. One reading for a list's cells and for the report a stage is
-/// told.
+/// own unit and in range, each sample instant on `clock`. A report that
+/// is not the whole of its worker object states none ([`whole`]), and
+/// nothing is written of it: `ranks` says how many ranks the object stands
+/// for ([`stated_ranks`]), and is asked of a report of several rows alone.
+/// One reading for a list's cells and for the report a stage is told.
 fn write_signals(
     report: &WorkerLoadResponse,
     sampled_at: Instant,
+    ranks: impl FnOnce() -> usize,
     columns: &[SignalColumn],
     clock: &DecisionClock,
     position: u32,
     cells: &mut SignalCells,
 ) -> bool {
-    if several_ranks(report) {
+    if !whole(report, ranks) {
         return false;
     }
     signal_values(report, columns, sampled_at, |column, unit, value, at| {
@@ -409,18 +422,21 @@ fn write_signals(
 /// A report's named values as a stage is told them
 /// ([`Signal::Load`](crate::tracking::lease::Signal)): one cell a column
 /// of `columns`, as a list's cells state the report ([`write_signals`]),
-/// and none for a report of several ranks. They stand in `cells`, which
-/// the caller keeps from one report to the next: behind the call it holds
-/// this report's values and no other's, and its room is kept.
+/// and none for a report that is not the whole of its worker object,
+/// which stands for `ranks` ranks ([`stated_ranks`]). They stand in
+/// `cells`, which the caller keeps from one report to the next: behind the
+/// call it holds this report's values and no other's, and its room is
+/// kept.
 pub(super) fn stated_signals<'c>(
     report: &WorkerLoadResponse,
     sampled_at: Instant,
+    ranks: usize,
     columns: &[SignalColumn],
     clock: &DecisionClock,
     cells: &'c mut SignalCells,
 ) -> ReportSignals<'c> {
     cells.blank(1, columns.len());
-    if !write_signals(report, sampled_at, columns, clock, 0, cells) {
+    if !write_signals(report, sampled_at, || ranks, columns, clock, 0, cells) {
         return ReportSignals::NONE;
     }
     ReportSignals::new(cells.row(0).unwrap_or_default())
@@ -1072,8 +1088,9 @@ impl PoolRecords {
     /// ([`write_signals`]): made by the crate's one conversion, under the
     /// signal's own unit, and in range. A worker the snapshot holds no
     /// report of, and a name its report does not state, keep a cell with
-    /// no value. So does a worker whose report is of several ranks
-    /// ([`several_ranks`]).
+    /// no value. So does a worker whose report is not its whole
+    /// ([`whole`]): the worker object says how many ranks it stands for
+    /// ([`stated_ranks`]).
     ///
     /// The cells are what this snapshot's reports state and nothing more:
     /// no value of an earlier snapshot is kept.
@@ -1089,8 +1106,9 @@ impl PoolRecords {
             let Some((report, sampled_at)) = loads.report(worker.url()) else {
                 continue;
             };
-            let columns = &self.signals;
-            write_signals(report, sampled_at, columns, clock, fixed.position, cells);
+            let ranks = || stated_ranks(&worker.metadata().spec);
+            let (columns, position) = (&self.signals, fixed.position);
+            write_signals(report, sampled_at, ranks, columns, clock, position, cells);
         }
     }
 
@@ -1132,22 +1150,37 @@ impl PoolRecords {
     }
 }
 
-/// Whether `report` is of several ranks: it lists more than one, or it
-/// counts more than the one it lists. A reader of a snapshot cannot take
-/// such a report for one sample: it states one sample instant, and its
-/// ranks' entries may be of several. A pushed record replaces its own
-/// rank's entry and dates the whole report, so a rank that stopped
-/// reporting keeps its last values under the newest record's instant, and
-/// a maximum age would never end them. A polled answer carries the
-/// entries of the ranks that pushed while it was asked, under one instant
-/// too. A snapshot states no instant a rank.
+/// Whether `report` states the whole of its worker object, which stands
+/// for `ranks()` ranks ([`stated_ranks`]): what a named value of the
+/// worker is made of. A list's cells take no named value of any other
+/// report ([`PoolRecords::write_cells`]), and a stage is told none
+/// ([`stated_signals`]).
 ///
-/// The list's cells take no named value of such a report, and a stage is
-/// told none of it ([`write_signals`]). A value is read where its report
-/// is one rank's, as the report of a worker object that is one rank is,
-/// however it arrived.
-fn several_ranks(report: &WorkerLoadResponse) -> bool {
-    report.loads.len() > 1 || report.dp_rank_count > 1
+/// A report that counts more ranks than it lists is not the whole, as a
+/// partial answer: the ranks it leaves out state nothing. A report of
+/// several rows is the whole where it lists as many ranks as the object
+/// stands for, and under no other count. A worker's pushed report counts
+/// the rows it holds, so its own count does not say that a rank is still
+/// to report: the object's registration does. An object that registers a
+/// rank or states no width stands for one rank, so no report of several
+/// rows is read of it.
+///
+/// A report of one row is read as the worker's whole, whatever the object
+/// stands for, and `ranks` is not asked. So the first record of an object
+/// of several ranks is read as the worker's own until a second rank's
+/// record stands beside it.
+///
+/// Each rank's entry states its own sample instant where the load monitor
+/// wrote it, and the conversion dates each rank's values by it
+/// ([`signal_values`]). A pushed record replaces its own rank's entry and
+/// dates that entry alone, so a rank that stopped reporting keeps its last
+/// values under its own last sample, and a maximum age ends the worker's
+/// value there. The worker's value is made of its ranks' as the signal
+/// declares, under the oldest sample among them.
+fn whole(report: &WorkerLoadResponse, ranks: impl FnOnce() -> usize) -> bool {
+    let listed = report.loads.len();
+    let counted = usize::try_from(report.dp_rank_count).unwrap_or(0);
+    listed >= counted && (listed <= 1 || listed == ranks())
 }
 
 /// A list's signal cells as one decision holds them
