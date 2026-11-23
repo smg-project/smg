@@ -5327,9 +5327,9 @@ fn strict_function_schema_passes_through_for_self_hosted_models() {
 
 /// A strict function that is a namespace's member is held to the pin a
 /// top-level strict function is held to, for OpenAI's own models: the refusal
-/// names the member whose schema lacks it. A pinned member and a member that
-/// is not strict pass, and a self-hosted model's strict member is passed
-/// through as its top-level function is.
+/// names the member whose schema lacks it, by its name and its place. A
+/// pinned member and a member that is not strict pass, and a self-hosted
+/// model's strict member is passed through as its top-level function is.
 #[test]
 fn strict_namespace_member_schema_needs_additional_properties_false_for_openai_models() {
     let loose = json!({"type": "object", "properties": {"x": {"type": "string"}}});
@@ -5352,7 +5352,7 @@ fn strict_namespace_member_schema_needs_additional_properties_false_for_openai_m
     assert!(
         code.contains("invalid_function_parameters")
             && code.contains(
-                "Invalid schema for function 'g': In context=(), 'additionalProperties' is required to be supplied and to be false."
+                "Invalid schema for function 'g' (tools[0].tools[2].parameters): In context=(), 'additionalProperties' is required to be supplied and to be false."
             ),
         "{code}"
     );
@@ -5384,6 +5384,73 @@ fn strict_namespace_member_schema_needs_additional_properties_false_for_openai_m
         request.validate().is_ok(),
         "the engine's grammar compiler decides a self-hosted model's strict schema"
     );
+}
+
+/// Two namespaces may each declare a member of one name, so a strict
+/// member's refusal says which one: its place stands beside its name, the
+/// namespace's index and the member's own. A top-level function is refused
+/// in the public API's sentence, by its name alone.
+#[test]
+fn a_strict_namespace_members_refusal_names_its_place() {
+    let loose = json!({"type": "object", "properties": {"x": {"type": "string"}}});
+    let nested = json!({
+        "type": "object", "additionalProperties": false,
+        "properties": {"inner": {"type": "object", "properties": {}}}
+    });
+    let pinned = json!({
+        "type": "object", "properties": {"x": {"type": "string"}}, "additionalProperties": false
+    });
+    let namespace = |name: &str, tools: serde_json::Value| json!({"type": "namespace", "name": name, "description": "d", "tools": tools});
+    let strict = |name: &str, parameters: &serde_json::Value| json!({"type": "function", "name": name, "strict": true, "parameters": parameters});
+    let refusal = |tools: serde_json::Value| {
+        let body = json!({"model": OPENAI_MODEL, "input": "hi", "tools": tools});
+        validation_code(&plain_request(body).unwrap())
+    };
+    let sentence = |named: &str, context: &str| {
+        format!(
+            "Invalid schema for function {named}: In context={context}, 'additionalProperties' is required to be supplied and to be false."
+        )
+    };
+
+    // One name at the top and under two namespaces: the loose one is the
+    // second namespace's second member.
+    let code = refusal(json!([
+        strict("search", &pinned),
+        namespace(
+            "crm",
+            json!([{"type": "custom", "name": "c"}, strict("search", &pinned)])
+        ),
+        namespace(
+            "web",
+            json!([strict("lookup", &pinned), strict("search", &loose)])
+        ),
+    ]));
+    assert!(
+        code.contains(&sentence("'search' (tools[2].tools[1].parameters)", "()")),
+        "{code}"
+    );
+
+    // A member's index counts every member before it, a custom tool too,
+    // and the context of the miss follows the place.
+    let code = refusal(json!([namespace(
+        "crm",
+        json!([{"type": "custom", "name": "c"}, strict("search", &nested)])
+    )]));
+    assert!(
+        code.contains(&sentence(
+            "'search' (tools[0].tools[1].parameters)",
+            "/properties/inner"
+        )),
+        "{code}"
+    );
+
+    // A top-level function after a namespace: the public API's sentence.
+    let code = refusal(json!([
+        namespace("crm", json!([strict("search", &pinned)])),
+        strict("search", &loose),
+    ]));
+    assert!(code.contains(&sentence("'search'", "()")), "{code}");
+    assert!(!code.contains("tools["), "{code}");
 }
 
 #[test]
