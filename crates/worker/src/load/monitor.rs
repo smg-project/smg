@@ -1309,9 +1309,11 @@ impl<G: Generation> WorkerMonitor<G> {
     /// the snapshot.
     ///
     /// A start ends what it replaces. Where a slot still holds the handle
-    /// of an earlier start's event task, eviction flusher or liveness
-    /// sweep, that task is told to end and the new task's handle takes
-    /// the slot. The groups' loops end at the rebuild from the registry.
+    /// of an earlier start's event task or liveness sweep, that task is
+    /// told to end and the new task's handle takes the slot. The groups'
+    /// loops end at the rebuild from the registry. An eviction flusher
+    /// that still stands is kept: it may have taken the wakeup of an
+    /// eviction it has not applied yet.
     pub fn start_event_loop(self: &Arc<Self>) {
         // Capture the receiver before reconciling so events that fire
         // during reconcile are buffered, not lost.
@@ -1341,18 +1343,24 @@ impl<G: Generation> WorkerMonitor<G> {
 
         // The debounced eviction flusher: holds the load state strongly (it
         // is cheap and monitor-independent) and the monitor weakly, for the
-        // same cycle-breaking reason as the event loop.
-        let load_state = Arc::clone(&self.load_state);
-        let monitor = Arc::downgrade(self);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "eviction flusher runs for the monitor's lifetime; the JoinHandle is stored on the monitor and aborted at its stop or in Drop"
-        )]
-        let flush_handle = tokio::spawn(async move {
-            eviction_flush_loop(load_state, monitor).await;
-        });
-
-        replace(&self.eviction_flush_task, flush_handle);
+        // same cycle-breaking reason as the event loop. One that still
+        // stands is kept, by the rule of the pushed flusher's start: it
+        // holds nothing a start changes, and ended in its debounce it
+        // would leave the eviction that woke it queued.
+        let mut flusher = self.eviction_flush_task.lock();
+        if flusher.as_ref().is_none_or(JoinHandle::is_finished) {
+            let load_state = Arc::clone(&self.load_state);
+            let monitor = Arc::downgrade(self);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "eviction flusher runs for the monitor's lifetime; the JoinHandle is stored on the monitor and aborted at its stop or in Drop"
+            )]
+            let flush_handle = tokio::spawn(async move {
+                eviction_flush_loop(load_state, monitor).await;
+            });
+            *flusher = Some(flush_handle);
+        }
+        drop(flusher);
 
         // The liveness sweep: vetoes a worker that stayed silent for the stall
         // threshold after a transport failure (see `health::liveness::sweep`).
@@ -1374,7 +1382,8 @@ impl<G: Generation> WorkerMonitor<G> {
     /// publisher of pushed reports end. Each task's end is awaited, so no
     /// tick of a loop that stands publishes behind the reset, and none
     /// writes a verdict there. One kind of loop is not awaited: that of a
-    /// group that ended or changed its interval ahead of the call. It was
+    /// group that ended, changed its interval or had another loop spawned
+    /// over it ahead of the call. It was
     /// told to end there, and a tick of it that is past its fetch can
     /// still publish. Last the
     /// monitor resets as its rebuild from the registry does: the shared
@@ -1408,8 +1417,9 @@ impl<G: Generation> WorkerMonitor<G> {
     /// task to end. It has reset nothing: a later stop does.
     ///
     /// A host makes its stops and starts in turn. A start behind a stop
-    /// that was dropped ends what that stop left standing
-    /// ([`Self::start_event_loop`]), so no task is left with no handle. A
+    /// that was dropped ends the event task and the liveness sweep that
+    /// stop left standing, and keeps its eviction flusher
+    /// ([`Self::start_event_loop`]): no task is left with no handle. A
     /// start beside a stop that still waits is no turn: that stop ends the
     /// start's other tasks and leaves its event task, with its handle in
     /// the slot.
@@ -1761,7 +1771,8 @@ impl<G: Generation> WorkerMonitor<G> {
         });
     }
 
-    /// Spawn the polling loop for a single group.
+    /// Spawn the polling loop for a single group. A loop of the group
+    /// that still stands is told to end: its handle is written over.
     fn spawn_group_loop(self: &Arc<Self>, key: WorkerGroupKey, interval: Duration) {
         info!("Starting load monitor for group {key} with interval {interval:?}");
 
@@ -1780,7 +1791,12 @@ impl<G: Generation> WorkerMonitor<G> {
         });
 
         let mut handles = self.group_handles.lock();
-        handles.insert(key, GroupState { handle, interval });
+        // Two reconciles of one group can each find no loop and each spawn
+        // one: the loop written over is told to end, so none polls on
+        // with no handle.
+        if let Some(replaced) = handles.insert(key, GroupState { handle, interval }) {
+            replaced.handle.abort();
+        }
     }
 
     /// Fetch load over HTTP, preferring a native load endpoint over the
@@ -2241,8 +2257,8 @@ impl Drop for Awaited<'_> {
 }
 
 /// Write a task's handle into its slot, and tell the task the slot still
-/// held to end: a start ends what it replaces
-/// ([`WorkerMonitor::start_event_loop`]).
+/// held to end: a start ends the event task and the liveness sweep it
+/// replaces ([`WorkerMonitor::start_event_loop`]).
 fn replace(slot: &Mutex<Option<JoinHandle<()>>>, handle: JoinHandle<()>) {
     if let Some(replaced) = slot.lock().replace(handle) {
         replaced.abort();

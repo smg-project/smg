@@ -720,11 +720,68 @@ async fn polled_once(stop: std::pin::Pin<&mut impl std::future::Future<Output = 
     }
 }
 
-/// A start behind a stop that was dropped at its first wait ends what that
-/// stop left standing: the first start's eviction flusher and liveness
-/// sweep, whose handles it writes over, and the event task whose handle
-/// the stop put back. The next stop ends every task of the second start,
-/// and no task of either start holds the monitor.
+/// A start keeps the eviction flusher that stands. The flusher may have
+/// taken the one wakeup of an eviction and not applied it yet: a start
+/// that ended it there would leave that eviction queued until the next
+/// one. Behind a stop dropped at its first wait and a second start, the
+/// slot's task is the one the first start spawned.
+#[tokio::test]
+async fn a_start_keeps_the_eviction_flusher_that_stands() {
+    let (registry, monitor) = build_monitor();
+    registry
+        .register(ready_worker("http://w1:8080", "llama-3"))
+        .unwrap();
+    let flusher = || {
+        let slot = monitor.eviction_flush_task.lock();
+        slot.as_ref().map(JoinHandle::id)
+    };
+    monitor.start_event_loop();
+    let stood = flusher().expect("the first start's flusher");
+    {
+        let stop = monitor.stop();
+        tokio::pin!(stop);
+        assert!(!polled_once(stop.as_mut()).await, "the stop ended");
+    }
+
+    monitor.start_event_loop();
+    assert_eq!(
+        flusher(),
+        Some(stood),
+        "the start replaced a flusher that stood"
+    );
+    monitor.stop().await;
+}
+
+/// A group's loop that another is spawned over is told to end. Two
+/// reconciles of one group can each find no loop and each spawn one, and
+/// the second handle goes over the first: a loop with no handle would
+/// poll on behind every stop. Here the stop ends the loop that holds the
+/// handle, and no loop holds the monitor.
+#[tokio::test]
+async fn a_group_loop_another_is_spawned_over_is_told_to_end() {
+    let (_registry, monitor) = build_monitor();
+    let key = WorkerGroupKey {
+        model_id: "llama-3".to_string(),
+        worker_type: WorkerType::Regular,
+        connection_mode: ConnectionMode::Http,
+    };
+    monitor.spawn_group_loop(key.clone(), Duration::from_secs(10));
+    monitor.spawn_group_loop(key, Duration::from_secs(10));
+
+    monitor.stop().await;
+    assert_eq!(
+        Arc::weak_count(&monitor),
+        0,
+        "the loop written over outlived the stop"
+    );
+}
+
+/// A start behind a stop that was dropped at its first wait ends what it
+/// replaces of the tasks that stop left standing: the first start's
+/// liveness sweep, whose handle it writes over, and the event task whose
+/// handle the stop put back. The next stop ends every task that stands,
+/// the first start's eviction flusher among them, and no task of either
+/// start holds the monitor.
 #[tokio::test]
 async fn a_start_behind_a_dropped_stop_ends_the_tasks_it_replaces() {
     let (registry, monitor) = build_monitor();
