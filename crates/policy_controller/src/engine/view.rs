@@ -851,6 +851,40 @@ pub struct Candidate {
     pub engine: u32,
 }
 
+impl Candidate {
+    /// A record of a worker that can be sent to, for a caller that makes
+    /// records by hand: its status is ready and no other health bit is set,
+    /// both admission bits are open, and it is an engine of its own
+    /// ([`Self::engine`] is its position). Every other field is the
+    /// default's, and a caller writes what its stage reads over it:
+    /// `Candidate { in_flight: 3, ..Candidate::ready(0, id, Role::Single) }`.
+    ///
+    /// An engine states its place among the engines of its list, so the
+    /// position is that place only while every record before it is an
+    /// engine of its own. A caller that makes several records the ranks of
+    /// one engine writes the engine of each record behind them too.
+    ///
+    /// A default record is no such record. It is not ready and both of its
+    /// admission bits are closed, so the health and admission filters drop
+    /// it, and every default record states engine `0`.
+    #[must_use]
+    pub fn ready(position: u32, id: WorkerId, role: Role) -> Self {
+        Self {
+            position,
+            id,
+            role,
+            health: Health {
+                healthy: true,
+                ..Health::default()
+            },
+            has_capacity: true,
+            has_room: true,
+            engine: position,
+            ..Self::default()
+        }
+    }
+}
+
 /// What a program says of a worker for the half of its record that no
 /// request changes, where the worker object holds no such fact: whether
 /// the worker takes images, the id the program knows the worker by where
@@ -1673,6 +1707,46 @@ mod tests {
         println!("Candidate size {size} bytes, alignment {alignment} bytes");
         assert_eq!((size, alignment), (128, 64));
         assert_eq!(size_of::<AffinityFacts>(), 20);
+    }
+
+    /// A record made ready is one the health and admission filters keep
+    /// and an engine of its own, and every field it does not write is the
+    /// default's. A default record is dropped by three of those filters.
+    #[test]
+    fn a_ready_record_can_be_sent_to_and_is_an_engine_of_its_own() {
+        use crate::{
+            engine::framework::Filter,
+            stages::{HasCapacity, HasRoom, Healthy, NotOverloaded},
+        };
+
+        let made = Candidate::ready(3, WorkerId(9), Role::Decode);
+        assert_eq!(
+            (made.position, made.id, made.role, made.engine),
+            (3, WorkerId(9), Role::Decode, 3)
+        );
+        let (facts, cx) = (RequestFacts::default(), Constraints::default());
+        let stock: [&dyn Filter; 4] = [&Healthy, &NotOverloaded, &HasCapacity, &HasRoom];
+        let dropped = |record: &Candidate| {
+            let refuses = stock
+                .iter()
+                .filter(|stage| !stage.keep(&facts, record, &cx));
+            refuses.map(|stage| stage.name()).collect::<Vec<_>>()
+        };
+        assert!(dropped(&made).is_empty(), "{:?}", dropped(&made));
+        let unset = Candidate::default();
+        assert_eq!(dropped(&unset), ["healthy", "has-capacity", "has-room"]);
+
+        let rest = Candidate {
+            position: 0,
+            id: WorkerId::default(),
+            role: Role::default(),
+            health: Health::default(),
+            has_capacity: false,
+            has_room: false,
+            engine: 0,
+            ..made
+        };
+        assert_eq!(format!("{rest:?}"), format!("{unset:?}"));
     }
 
     /// A request's facts are copied where a decision narrows or resumes

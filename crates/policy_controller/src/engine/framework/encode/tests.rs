@@ -49,20 +49,11 @@ fn row(at: u32, role: Role, pair_class: u32, in_flight: u32) -> Candidate {
         _ => 3_000,
     } + u64::from(at);
     Candidate {
-        position: at,
-        id: WorkerId(id),
-        role,
-        health: Health {
-            healthy: true,
-            ..Health::default()
-        },
         in_flight,
         pair_class,
-        has_capacity: true,
-        has_room: true,
         vision: true,
         key: id as u32,
-        ..Candidate::default()
+        ..Candidate::ready(at, WorkerId(id), role)
     }
 }
 
@@ -147,10 +138,8 @@ impl Bed {
 
     fn pools(&self) -> PairPools<'_> {
         PairPools {
-            prefills: &self.prefills,
-            decodes: &self.decodes,
             prefill_affinity: &self.prefill_affinity,
-            ..PairPools::default()
+            ..PairPools::of(&self.prefills, &self.decodes)
         }
     }
 

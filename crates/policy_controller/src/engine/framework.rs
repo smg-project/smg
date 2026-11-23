@@ -4265,6 +4265,19 @@ impl PairSide {
 }
 
 impl<'a> PairPools<'a> {
+    /// The two pools with nothing beside them: no affinity column, no
+    /// signal cells and no pair table, so classes pair by their number.
+    /// A caller writes what it holds beside its pools over it:
+    /// `PairPools { table, ..PairPools::of(prefills, decodes) }`.
+    #[must_use]
+    pub fn of(prefills: &'a [Candidate], decodes: &'a [Candidate]) -> Self {
+        Self {
+            prefills,
+            decodes,
+            ..Self::default()
+        }
+    }
+
     /// One side of the pair as its stages read it: the side's pool, and the
     /// request's facts with the side's phase, its draw sequence and its own
     /// pool's affinity column and signal cells, and with no rows named:

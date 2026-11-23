@@ -16,7 +16,9 @@
 //! still owes a program, and leaves that list with the change that pays it.
 //!
 //! One module a plan holds the plan's cases. A single request is served so
-//! far (`caller/single.rs`).
+//! far (`caller/single.rs`). The example's own stage
+//! (`examples/in_process/engine_load.rs`) is taken in beside the program,
+//! and its cases decide over records made by hand (`caller/stage.rs`).
 //!
 //! [`PolicyEngine::place`]: smg_policy_controller::engine::PolicyEngine::place
 
@@ -28,10 +30,14 @@ use program::{settings, Program};
 use smg_policy_controller::document::{AppliedSpec, PolicySettings};
 use smg_worker::{identity::basic::Worker, load::state::TestFeed, test_support::ready_worker};
 
+#[path = "../examples/in_process/engine_load.rs"]
+mod engine_load;
 #[path = "../examples/in_process/program.rs"]
 mod program;
 #[path = "caller/single.rs"]
 mod single;
+#[path = "caller/stage.rs"]
+mod stage;
 
 /// The model every case serves.
 const MODEL: &str = "model-a";

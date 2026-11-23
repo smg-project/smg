@@ -761,7 +761,7 @@ mod tests {
                 tests::{later_request, pair_fleet, pair_request, GATEWAY},
                 StoreBackedEngine,
             },
-            view::{Health, Identity, Role, WireModes, WorkerId},
+            view::{Identity, Role, WireModes, WorkerId},
         },
         policies::consistent_hashing::InOrder,
         stages::{Best, HasCapacity, StageRegistry},
@@ -905,18 +905,7 @@ mod tests {
 
     /// A ready record of `role` at `position` of its list.
     fn row(position: u32, id: u64, role: Role) -> Candidate {
-        Candidate {
-            position,
-            id: WorkerId(id),
-            role,
-            health: Health {
-                healthy: true,
-                ..Health::default()
-            },
-            has_capacity: true,
-            has_room: true,
-            ..Candidate::default()
-        }
+        Candidate::ready(position, WorkerId(id), role)
     }
 
     /// Prefills 1.., and decodes 101.., each in its list's order.
@@ -962,10 +951,8 @@ mod tests {
         classes: &'a PartnerClasses,
     ) -> PairPools<'a> {
         PairPools {
-            prefills,
-            decodes,
             table: classes.table(),
-            ..PairPools::default()
+            ..PairPools::of(prefills, decodes)
         }
     }
 

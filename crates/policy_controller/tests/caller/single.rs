@@ -20,9 +20,11 @@ use std::{
 use http::{HeaderMap, HeaderValue};
 use smg_policy_controller::{
     document::{AppliedSpec, Assignment, PolicySettings, ScoreSpec},
-    engine::{Candidate, Decision, RequestFacts, Scorer, ShedReason, Target, TieBand, Unplaced},
+    engine::{
+        Candidate, Decision, RequestFacts, Scorer, ShedReason, Target, TieBand, Unplaced, WorkerId,
+    },
     stages::{Lifecycle, StageRegistry},
-    tracking::{EventSet, Lease, Outcome, ReleaseReason, Side},
+    tracking::{EventSet, Lease, Membership, Outcome, ReleaseReason, Side},
 };
 use smg_worker::{
     identity::basic::Worker,
@@ -106,9 +108,10 @@ fn callers_that_ask_at_once_take_each_idle_worker_once() {
 
 /// A send that a worker answers with a server error is asked again, and the
 /// next attempt names that worker as tried: it goes to the other worker,
-/// every time. A list of one worker keeps its worker for the retry, up to
-/// the program's bound of sends. A send answered with a client error is the
-/// client's answer and is not asked again.
+/// every time, and the rotation of first attempts goes on behind it. A list
+/// of one worker keeps its worker for the retry, up to the program's bound
+/// of sends. A send answered with a client error is the client's answer and
+/// is not asked again.
 ///
 /// The classic router lets the workers a request tried step aside while
 /// another is left, and uses the list whole otherwise
@@ -121,20 +124,12 @@ fn a_retry_names_the_worker_it_tried_and_goes_to_another() {
     let sends = move |worker: &dyn Worker| if worker.url() == failing { 502 } else { 200 };
     let (program, _loads, _task) = under(PolicySettings::RoundRobin, &fleet, sends);
     let answers: Vec<Answer> = (0..4).map(|_| program.serve(&PLAIN)).collect();
-    for answer in &answers {
-        assert_eq!(answer.status, 200);
-        assert_eq!(answer.sent.last(), Some(&url(1)), "the other worker serves");
-        assert!(
-            answer.sent.len() <= 2,
-            "one retry at most: {:?}",
-            answer.sent
-        );
-    }
-    let retried = answers.iter().filter(|answer| answer.sent.len() == 2);
-    assert!(
-        retried.count() > 0,
-        "a first attempt met the failing worker"
-    );
+    assert!(answers.iter().all(|answer| answer.status == 200));
+    let sent: Vec<&[String]> = answers.iter().map(|answer| &answer.sent[..]).collect();
+    // Every other first attempt meets the failing worker, and its retry
+    // goes to the other one.
+    let (served, retried) = ([url(1)], [url(0), url(1)]);
+    assert_eq!(sent, [&served[..], &retried[..], &served[..], &retried[..]]);
 
     let lone = workers(1);
     let (program, _loads, _task) = under(PolicySettings::RoundRobin, &lone, |_| 502);
@@ -152,6 +147,28 @@ fn a_retry_names_the_worker_it_tried_and_goes_to_another() {
     let (program, _loads, _task) = under(PolicySettings::RoundRobin, &workers(2), |_| 404);
     let answer = program.serve(&PLAIN);
     assert_eq!((answer.status, answer.sent.len()), (404, 1));
+}
+
+/// A send is asked again for the statuses a gateway's retry layer asks
+/// again for, a 408 and a 429 among them, and for no other: a 501 or a 505
+/// is the client's answer after one send.
+///
+/// The gateway's set is `is_retryable_status`
+/// (`crates/external_router/src/retry.rs:10-19`).
+#[test]
+fn a_send_is_asked_again_for_the_statuses_a_gateway_asks_again_for() {
+    let again = [408, 429, 500, 502, 503, 504].map(|status| (status, ATTEMPTS));
+    let once = [400, 404, 501, 505].map(|status| (status, 1));
+    for (status, sends) in again.into_iter().chain(once) {
+        let fleet = workers(2);
+        let (program, _loads, _task) = under(PolicySettings::RoundRobin, &fleet, move |_| status);
+        let answer = program.serve(&PLAIN);
+        assert_eq!(
+            (answer.status, answer.sent.len()),
+            (status, sends),
+            "a send answered {status}"
+        );
+    }
 }
 
 /// A worker that cannot be sent to takes no request: one that is not ready,
@@ -298,6 +315,24 @@ impl Lifecycle for Hears {
     fn on_released(&self, _: &Lease, reason: ReleaseReason) {
         self.heard(format!("released {reason:?}"));
     }
+
+    fn on_membership(&self, change: &Membership<'_>) {
+        match change {
+            Membership::Added(worker) => self.heard(joined(*worker)),
+            Membership::Removed(worker) => self.heard(left(*worker)),
+            _ => {}
+        }
+    }
+}
+
+/// The word [`Hears`] keeps of a worker that joined.
+fn joined(worker: WorkerId) -> String {
+    format!("joined {}", worker.0)
+}
+
+/// The word [`Hears`] keeps of a worker that left.
+fn left(worker: WorkerId) -> String {
+    format!("left {}", worker.0)
 }
 
 impl Scorer for Hears {
@@ -314,7 +349,11 @@ impl Scorer for Hears {
 /// A program under `round_robin` with [`Hears`] among its scorers, over two
 /// workers: the program, what that stage heard, and the word that makes the
 /// next send fail. A send is answered a 200, and a 502 once where the word
-/// is set.
+/// is set, and says `went out` among the stage's words as it goes.
+///
+/// The stage heard each of the two workers join, under the id every
+/// decision names that worker by: the fingerprint of the address the worker
+/// states.
 fn hearing() -> (Program, Heard, Arc<AtomicBool>) {
     let heard = Heard::default();
     let kept = Arc::clone(&heard);
@@ -329,8 +368,10 @@ fn hearing() -> (Program, Heard, Arc<AtomicBool>) {
     let spec = AppliedSpec::validate_in(&document, &stages, &[]);
     let spec = spec.expect("the stages hold the scorer");
     let fails = Arc::new(AtomicBool::new(false));
-    let next = Arc::clone(&fails);
+    let (next, went) = (Arc::clone(&fails), Arc::clone(&heard));
     let sends = move |_: &dyn Worker| {
+        let mut words = went.lock().expect("no case panicked");
+        words.push("went out".to_owned());
         if next.swap(false, Ordering::Relaxed) {
             502
         } else {
@@ -338,6 +379,8 @@ fn hearing() -> (Program, Heard, Arc<AtomicBool>) {
         }
     };
     let (program, _loads, _task) = started(spec, &workers(2), sends);
+    let fleet = [0, 1].map(|at| WorkerId::from_address(&url(at)));
+    assert_eq!(taken(&heard), fleet.map(joined), "each worker's join");
     (program, heard, fails)
 }
 
@@ -348,23 +391,30 @@ fn taken(heard: &Heard) -> Vec<String> {
 
 /// The engine hears each request's end from the placement its program
 /// keeps: a served request is issued, dispatched and completed, once each
-/// and in that order; a send answered a server error completes so, and its
-/// retry is a request of its own to the stages. A send answered a client
-/// error completes as one. A placement dropped before its send is a
-/// release, one dropped behind it an end of class cancelled, and a
-/// placement kept ends on another thread than the one that placed it.
+/// and in that order, and the program says the dispatch before the send
+/// goes out; a send answered a server error completes so, and its retry is
+/// a request of its own to the stages. A send answered a client error
+/// completes as one, and a 408 or a 504 as a timeout. A placement dropped
+/// before its send is a release, one dropped behind it an end of class
+/// cancelled, and a placement kept ends on another thread than the one
+/// that placed it.
 #[test]
 fn the_engine_hears_each_requests_end() {
     let (program, heard, fails) = hearing();
     assert_eq!(program.serve(&PLAIN).status, 200);
-    let served = ["issued", "dispatched", "completed 200 Ok"];
+    let served = ["issued", "dispatched", "went out", "completed 200 Ok"];
     assert_eq!(taken(&heard), served);
 
     fails.store(true, Ordering::Relaxed);
     let answer = program.serve(&PLAIN);
     assert_eq!((answer.status, answer.sent.len()), (200, 2));
     assert_ne!(answer.sent[0], answer.sent[1], "the retry left the worker");
-    let failed = ["issued", "dispatched", "completed 502 ServerError"];
+    let failed = [
+        "issued",
+        "dispatched",
+        "went out",
+        "completed 502 ServerError",
+    ];
     assert_eq!(taken(&heard), [failed, served].concat());
 
     let unsent = program.place(&PLAIN, &[]).expect("a placement");
@@ -383,13 +433,34 @@ fn the_engine_hears_each_requests_end() {
     streamed.sent();
     let ended = thread::spawn(move || streamed.ended(200));
     ended.join().expect("the stream's thread ends");
-    assert_eq!(taken(&heard), served);
+    assert_eq!(taken(&heard), ["issued", "dispatched", "completed 200 Ok"]);
 
-    let mut refused = program.place(&PLAIN, &[]).expect("a placement");
-    refused.sent();
-    refused.ended(404);
-    let client_error = ["issued", "dispatched", "completed 404 ClientError"];
-    assert_eq!(taken(&heard), client_error);
+    for (status, class) in [(404, "ClientError"), (408, "Timeout"), (504, "Timeout")] {
+        let mut ended = program.place(&PLAIN, &[]).expect("a placement");
+        ended.sent();
+        ended.ended(status);
+        let completed = format!("completed {status} {class}");
+        assert_eq!(taken(&heard), ["issued", "dispatched", completed.as_str()]);
+    }
+}
+
+/// A worker that leaves is forgotten under the address it states. The
+/// registry finds a worker by an address written without its scheme, and
+/// the engine knows the worker by the whole address, so the program tells
+/// the engine the address of the worker the registry gave back. A leave
+/// that finds no worker tells the engine nothing.
+///
+/// The classic router's registry resolves such an address the same way
+/// (`crates/worker/src/registry.rs:2032-2035`).
+#[test]
+fn a_worker_that_leaves_is_forgotten_under_the_address_it_states() {
+    let (program, heard, _fails) = hearing();
+    let bare = url(1);
+    let bare = bare.strip_prefix("http://").expect("an http address");
+    assert!(program.leave(bare), "the registry finds the worker");
+    assert_eq!(taken(&heard), [left(WorkerId::from_address(&url(1)))]);
+    assert!(!program.leave(&url(1)), "it left already");
+    assert!(taken(&heard).is_empty(), "nothing left, nothing told");
 }
 
 /// One report a worker: the worker at `short` has no queue, every other a

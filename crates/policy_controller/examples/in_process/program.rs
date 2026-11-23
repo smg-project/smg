@@ -17,14 +17,14 @@
 //! It keeps no circuit breaker's count and chooses no rank inside a worker:
 //! both are a route's own, behind the engine's answer.
 
-use std::{future::Future, sync::Arc};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+};
 
 use http::HeaderMap;
 use smg_policy_controller::{
-    document::{
-        AppliedSpec, Assignment, ModeSettings, Pairing, PolicySettings, RoutingKeyOverrideSettings,
-        RoutingSettings,
-    },
+    document::{AppliedSpec, PolicySettings, RoutingSettings},
     engine::{
         HeaderRead, LentList, ListCell, PlaceRequest, PolicyEngine, Unplaced, WorkerId, WorkerLists,
     },
@@ -43,33 +43,17 @@ pub const ATTEMPTS: usize = 3;
 /// for, whatever the reason.
 pub const NO_WORKER: u16 = 503;
 
-/// The routing settings of a gateway that sets `policy` and nothing else,
-/// each other setting at the value a configuration that leaves it out gets.
+/// The statuses a send is asked again for: the set a gateway's retry layer
+/// asks again for.
+pub const ASKED_AGAIN: [u16; 6] = [408, 429, 500, 502, 503, 504];
+
+/// The routing settings of a gateway that sets `policy` and nothing else:
+/// each other setting at the value a configuration that leaves it out gets
+/// ([`RoutingSettings::default`]).
 pub fn settings(policy: PolicySettings) -> RoutingSettings {
     RoutingSettings {
-        mode: ModeSettings::Regular,
         policy,
-        enable_igw: false,
-        policy_spec: None,
-        grouped_dp_sticky: None,
-        dp_minimum_tokens_scheduler: false,
-        pd_pairing_mode: Pairing::Lenient,
-        worker_warmup_secs: 60,
-        worker_warmup_share: 0.25,
-        worker_warmup_blocks: 1024,
-        worker_warmup_thin_ratio: 0.5,
-        worker_warmup_divert_every: 8,
-        routing_key_override: RoutingKeyOverrideSettings {
-            enabled: false,
-            headers: vec!["x-smg-routing-key".to_owned()],
-            eviction_interval_secs: 60,
-            max_idle_secs: 14_400,
-            assignment_mode: Assignment::Delegate,
-        },
-        worker_overload_protection: true,
-        worker_overload_waiting_requests: Some(8),
-        worker_overload_token_usage: Some(0.8),
-        worker_overload_shed: false,
+        ..RoutingSettings::default()
     }
 }
 
@@ -157,10 +141,12 @@ impl InFlight {
         self.placement.sent(Side::Single);
     }
 
-    /// The attempt ended with `status`.
+    /// The attempt ended with `status`. A 408 and a 504 say the worker
+    /// ran out of time, whichever side of 500 they stand on.
     pub fn ended(&mut self, status: u16) {
         let class = match status {
             ..400 => TransportClass::Ok,
+            408 | 504 => TransportClass::Timeout,
             400..500 => TransportClass::ClientError,
             _ => TransportClass::ServerError,
         };
@@ -190,6 +176,9 @@ pub struct Program {
     registry: WorkerRegistry<Lists>,
     engine: Engine,
     sends: Sends,
+    /// Held over a change of the registry and the engine's word of it, so
+    /// two changes at one address reach the engine in the registry's order.
+    membership: Mutex<()>,
 }
 
 impl Program {
@@ -212,6 +201,7 @@ impl Program {
             registry: WorkerRegistry::new(),
             engine: Engine(engine),
             sends: Box::new(sends),
+            membership: Mutex::new(()),
         };
         (program, engine.run())
     }
@@ -221,6 +211,7 @@ impl Program {
     /// at its address already.
     pub fn join(&self, worker: Arc<dyn Worker>) -> bool {
         let address = worker.url().to_owned();
+        let _changing = self.changing();
         let joined = self.registry.register(worker).is_some();
         if joined {
             self.engine.joined(&address);
@@ -229,13 +220,23 @@ impl Program {
     }
 
     /// The worker at `address` leaves. `false` where the registry holds
-    /// none there.
+    /// none there. The engine is told the address the worker itself
+    /// states: the registry finds a worker by an address written without
+    /// its scheme too, and the engine knows the worker by the whole one.
     pub fn leave(&self, address: &str) -> bool {
-        let left = self.registry.remove_by_url(address).is_some();
-        if left {
-            self.engine.forget(address);
-        }
-        left
+        let _changing = self.changing();
+        let Some(left) = self.registry.remove_by_url(address) else {
+            return false;
+        };
+        self.engine.forget(left.url());
+        true
+    }
+
+    /// The membership lock, taken. Nothing is kept under it, so a change
+    /// that panicked leaves nothing half written.
+    fn changing(&self) -> MutexGuard<'_, ()> {
+        let held = self.membership.lock();
+        held.unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The model's generation as the registry holds it now.
@@ -275,10 +276,12 @@ impl Program {
         })
     }
 
-    /// Serves one client request as a route does: places an attempt, says
-    /// it sent, sends it, says its end, and where the send was answered a
-    /// server error places the next attempt past the workers tried, up to
-    /// [`ATTEMPTS`] sends.
+    /// Serves one client request: places an attempt, says it sent, sends
+    /// it, says its end, and where the send was answered a status a gateway
+    /// asks again for ([`ASKED_AGAIN`]) places the next attempt past the
+    /// workers tried, up to [`ATTEMPTS`] sends. A route does more than
+    /// this: it waits between two sends, and a response can say that it is
+    /// not to be asked again.
     pub fn serve(&self, asked: &Asked<'_>) -> Answer {
         let (mut tried, mut sent) = (Vec::new(), Vec::new());
         loop {
@@ -296,7 +299,7 @@ impl Program {
             let status = (self.sends)(attempt.placement.worker.as_ref());
             attempt.ended(status);
             sent.push(attempt.placement.worker.url().to_owned());
-            if status < 500 || sent.len() == ATTEMPTS {
+            if !ASKED_AGAIN.contains(&status) || sent.len() == ATTEMPTS {
                 return Answer {
                     sent,
                     status,
