@@ -1734,12 +1734,7 @@ impl Replica {
     /// How many load rows the replica's own table holds.
     fn load_rows(&self) -> usize {
         let rows = self.store.checkpoint().rows;
-        let ranks = rows
-            .iter()
-            .flat_map(|row| (0..row.facts.dp_size.max(1)).map(move |rank| (row.id, rank)));
-        ranks
-            .filter(|(id, rank)| self.store.load(*id, *rank).is_some())
-            .count()
+        rows.iter().map(|row| self.store.ranks(row.id)).sum()
     }
 
     /// Waits, within 20 s, until the replica stands at `place`.

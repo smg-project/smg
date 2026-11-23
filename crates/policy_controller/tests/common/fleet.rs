@@ -1306,12 +1306,8 @@ impl Harness {
         let cut = standby.store.checkpoint();
         let mut held = 0;
         for row in &cut.rows {
-            let mut ranks = 0..row.facts.dp_size.max(1);
-            if let Some(rank) = ranks.find(|rank| standby.store.load(row.id, *rank).is_some()) {
-                return Err(format!(
-                    "the standby holds a load row: {:?} at rank {rank}",
-                    row.id
-                ));
+            if standby.store.ranks(row.id) > 0 {
+                return Err(format!("the standby holds a load row: {:?}", row.id));
             }
             if !self.members.contains_key(&row.id) {
                 return Err(format!(

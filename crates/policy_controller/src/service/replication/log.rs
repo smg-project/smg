@@ -1576,7 +1576,6 @@ mod tests {
         follower.restart(at(2, 4)).expect("a place the log takes");
         applies(&follower, &led[2..]);
         assert_eq!(follower.head(), leader.head());
-        assert_eq!(follower.head(), leader.head());
         assert_eq!(follower.floor(), at(2, 4));
         assert_eq!(all_after(&follower, at(2, 4)), led[2..]);
         for held in [at(3, 4), at(5, 6), at(6, 6)] {
@@ -2172,7 +2171,6 @@ mod tests {
             assert_eq!(follower.join(led[0].at), Ok(()), "{own}");
             assert_eq!((follower.term(), follower.followed()), (4, Some(4)));
             applies(&follower, &led[1..]);
-            assert_eq!(follower.head(), leader.head());
             assert_eq!(follower.head(), leader.head());
             // Its log is its leader's from the first place on: a reader
             // that holds nothing joins it there.
