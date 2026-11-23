@@ -2321,6 +2321,18 @@ async fn build_app_context(
     ))
 }
 
+/// What the start line says places this process's requests: the policy
+/// document the policy controller runs in place of the one the routing
+/// settings mean, by its path where it was read from one, and the routing
+/// settings' policy everywhere else.
+fn start_line_policy(config: &RouterConfig) -> String {
+    match (&config.policy_spec, &config.policy_spec_path) {
+        (None, _) => format!("{:?}", config.policy),
+        (Some(_), Some(path)) => format!("document {path}"),
+        (Some(_), None) => "a supplied document".to_owned(),
+    }
+}
+
 /// Start the gateway listeners and drain them within the configured shutdown budget.
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     Box::pin(startup_with(config, Extensions::default())).await
@@ -2522,11 +2534,11 @@ pub async fn startup_with(
     };
 
     info!(
-        "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
+        "Starting router on {}:{} | mode: {:?} | policy: {} | max_payload: {}MB",
         config.router_config.host,
         config.router_config.port,
         config.router_config.mode,
-        config.router_config.policy,
+        start_line_policy(&config.router_config),
         config.router_config.max_payload_size / (1024 * 1024)
     );
 
@@ -5432,6 +5444,47 @@ mod tests {
             error.to_string().contains("must have a non-empty key"),
             "startup refused for another reason: {error}"
         );
+    }
+
+    /// The start line names what places requests. Under the classic
+    /// policies, and where the policy controller runs the document the
+    /// settings mean, it is the settings' policy in its debug form. A
+    /// supplied document is named in its place: by its path where it was
+    /// read from one, and without one where the caller set it.
+    #[test]
+    fn the_start_line_names_a_supplied_document() {
+        let classic = RouterConfig::default();
+        assert_eq!(start_line_policy(&classic), format!("{:?}", classic.policy));
+
+        let the_settings_own = RouterConfig {
+            policy_controller: true,
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            start_line_policy(&the_settings_own),
+            format!("{:?}", the_settings_own.policy)
+        );
+
+        let document = classic
+            .policy_document()
+            .expect("the default settings mean a document");
+        let read_from_a_path = RouterConfig {
+            policy_controller: true,
+            policy_spec_path: Some("routing.yaml".to_owned()),
+            policy_spec: Some(document.clone()),
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            start_line_policy(&read_from_a_path),
+            "document routing.yaml"
+        );
+
+        let set_by_the_caller = RouterConfig {
+            policy_controller: true,
+            policy_spec: Some(document),
+            ..RouterConfig::default()
+        };
+        assert_eq!(start_line_policy(&set_by_the_caller), "a supplied document");
     }
 
     /// `minimal` leaves a library caller on the CLI's shutdown grace, not a
