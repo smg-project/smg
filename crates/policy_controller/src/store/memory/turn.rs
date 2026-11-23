@@ -136,11 +136,10 @@
 //! the files' order (`set_term`, `follow_term`), and so does a standby's
 //! restore, from its start until it has read the ids on file
 //! ([`MemoryStore::restore_from`]). Under a turn come the world's load
-//! (no lock), a stage's own lock, the engine's sessions table, the store's
-//! session counts, the journal's word of a term, the table of the
-//! members no world lists yet, a leaf lock, and the entry of the worker
-//! objects a host's word to the engine asks, a leaf lock too. A standby's
-//! restore takes the
+//! (no lock), a stage's own lock, the engine's sessions table, the
+//! journal's word of a term, the table of the members no world lists yet,
+//! a leaf lock, and the entry of the worker objects a host's word to the
+//! engine asks, a leaf lock too. A standby's restore takes the
 //! store's tables under its turns too: the workers', the health's and the
 //! loads', in that order. No path takes one of those and then a turn. A
 //! lifecycle call of a served controller therefore runs under a turn, or

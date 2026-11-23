@@ -76,7 +76,6 @@ pub mod membership;
 pub(crate) mod memory;
 pub mod pairing;
 pub(crate) mod reservations;
-pub(crate) mod sessions;
 pub(crate) mod signals;
 pub(crate) mod snapshot;
 pub(crate) mod workers;
