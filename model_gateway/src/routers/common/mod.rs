@@ -18,6 +18,8 @@
 //!   session registry) shared by the OpenAI and HTTP routers
 //! - [`overload`] — shed responses for the absolute worker-overload
 //!   guard, shared by the HTTP and gRPC selection paths
+//! - `pair_classes` — a pair index's partner lists as the policy engine
+//!   reads them: a class on each worker and the table of classes that pair
 //! - `pair_index` — the prefill and decode workers that may pair, decided
 //!   once for a membership generation and read by every placement
 //! - [`pd_admission`] — the disaggregated dispatch's admission gate: never
@@ -63,6 +65,7 @@ pub use smg_external_router::header_utils;
 pub(crate) mod kv_transfer;
 pub use smg_external_router::{mcp_utils, openai_bridge};
 pub mod overload;
+pub(crate) mod pair_classes;
 pub(crate) mod pair_index;
 pub mod pd_admission;
 pub(crate) mod pd_failure;
@@ -227,10 +230,7 @@ pub mod bench_support {
     use std::sync::Arc;
 
     use axum::http::HeaderMap;
-    use smg_worker::{
-        identity::basic::{Worker, WorkerLoadGuard},
-        load::state::LoadReceiver,
-    };
+    use smg_worker::{identity::basic::Worker, load::state::LoadReceiver};
 
     use super::{
         attempt_ledger::AttemptLedger,
@@ -366,9 +366,13 @@ pub mod bench_support {
             ..Default::default()
         };
         let pair = select_pair(registry, policies, model, &pairs, None, None, inputs).ok()?;
-        let went = placed_on(&pair.prefill);
-        let prefill = WorkerLoadGuard::with_key(pair.prefill, policies.sticky_key(None, None));
-        let decode = WorkerLoadGuard::with_key(pair.decode, policies.sticky_key(None, None));
+        let went = placed_on(pair.prefill.worker());
+        let key = policies.sticky_key(None, None);
+        let prefill = pair.prefill.into_guard(key);
+        // The decode's guard as a pair route makes it: ahead of the decode's
+        // send, and sent behind the prefill.
+        let decode = pair.decode.ahead(key);
+        let decode = pair.decode.sent(decode);
         drop((prefill, decode));
         Some(went)
     }
@@ -502,7 +506,7 @@ pub mod bench_support {
                     inputs,
                 )
                 .ok()
-                .map(|pair| (pair.prefill, pair.decode))
+                .map(|pair| (pair.prefill.into_worker(), pair.decode.into_worker()))
             })
             .await
         }

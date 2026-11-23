@@ -60,6 +60,10 @@ use crate::{
 /// Result type for PD worker pair selection: (prefill, decode, runtime_type)
 type PdWorkerPair = (Arc<dyn Worker>, Arc<dyn Worker>, RuntimeType);
 
+/// A PD pair as the placement answers it: each worker as a [`Placed`],
+/// which that side's load guard is made from.
+type PlacedPdPair = (Placed, Placed, RuntimeType);
+
 /// The candidate predicate of a request carrying media references with no
 /// pipeline pin: only workers that process them themselves. The stage
 /// derives its own predicate from the request's media demands
@@ -114,6 +118,10 @@ type EncodePrefillDecodeWorkerSelection = (
     Arc<dyn Worker>,
     RuntimeType,
 );
+
+/// An EPD selection as the placement answers its pair: the prefill and the
+/// decode each as a [`Placed`], which that side's load guard is made from.
+type PlacedEpdSelection = (Vec<EncodeWorkerAssignment>, Placed, Placed, RuntimeType);
 
 /// Client-visible, gateway-owned code for a request refused ahead of worker
 /// selection because it had already waited longer than the queue timeout
@@ -899,10 +907,20 @@ impl WorkerSelectionStage {
         acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
-            |(prefill, _, _): &PdWorkerPair| prefill,
-            |capacity| self.select_pd_pair(model_id, inputs, wire, capacity, demand),
+            |(prefill, _, _): &PlacedPdPair| prefill,
+            |capacity| self.placed_pd_pair(model_id, inputs, wire, capacity, demand),
         )
         .await
+        // The prefill's side went into its guard. The decode's guard is not
+        // made from its answer yet.
+        .map(|((prefill, decode, runtime), guard)| {
+            let pair = (
+                prefill.into_worker(),
+                decode.worker_alone_for_now(),
+                runtime,
+            );
+            (pair, guard)
+        })
         .map_err(|error| {
             Self::acquire_failure(model_id, error, |failure| {
                 self.pd_selection_failure(model_id, failure, media)
@@ -922,9 +940,9 @@ impl WorkerSelectionStage {
         acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
-            |(_, prefill, _, _): &EncodePrefillDecodeWorkerSelection| prefill,
+            |(_, prefill, _, _): &PlacedEpdSelection| prefill,
             |capacity| {
-                self.select_encode_prefill_decode_workers(
+                self.placed_encode_prefill_decode_workers(
                     model_id,
                     inputs,
                     encode_item_hashes,
@@ -934,6 +952,17 @@ impl WorkerSelectionStage {
             },
         )
         .await
+        // As for a PD pair: the prefill's side went into its guard, and the
+        // decode's guard is not made from its answer yet.
+        .map(|((assignments, prefill, decode, runtime), guard)| {
+            let selection = (
+                assignments,
+                prefill.into_worker(),
+                decode.worker_alone_for_now(),
+                runtime,
+            );
+            (selection, guard)
+        })
         .map_err(|error| {
             Self::acquire_failure(model_id, error, |failure| {
                 match failure {
@@ -1997,14 +2026,17 @@ impl WorkerSelectionStage {
 
     /// Apply media and context constraints within the existing compatible-pair
     /// index, then let the configured policies and admission choose the roles.
-    fn select_pd_pair(
+    ///
+    /// Each worker is answered as the placement answers it ([`Placed`]):
+    /// the route makes that side's load guard from it.
+    fn placed_pd_pair(
         &self,
         model_id: &str,
         inputs: PlacementInputs<'_>,
         wire: Option<WireConstraint>,
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
         demand: PairDemands,
-    ) -> Result<PdWorkerPair, PdSelectionFailure> {
+    ) -> Result<PlacedPdPair, PdSelectionFailure> {
         // One snapshot answers both: the pair index, and what the windows
         // of its two pools leave of the context demand. Both pools derive
         // from ONE membership snapshot: separate pool lookups could straddle
@@ -2034,6 +2066,24 @@ impl WorkerSelectionStage {
             )
         })?;
         Ok((pair.prefill, pair.decode, pair.runtime))
+    }
+
+    /// [`Self::placed_pd_pair`] with the two workers alone, for a caller
+    /// that sends the pair no request: a bench's placement, a case. An
+    /// engine's side of the request is let go here, which the engine hears
+    /// as a release.
+    fn select_pd_pair(
+        &self,
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        wire: Option<WireConstraint>,
+        prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+        demand: PairDemands,
+    ) -> Result<PdWorkerPair, PdSelectionFailure> {
+        self.placed_pd_pair(model_id, inputs, wire, prefill_capacity, demand)
+            .map(|(prefill, decode, runtime)| {
+                (prefill.into_worker(), decode.into_worker(), runtime)
+            })
     }
 
     /// The per-request narrowing of a pair placement over `pairs`, then
@@ -2131,14 +2181,18 @@ impl WorkerSelectionStage {
     ///
     /// Full Prefill pools wait for admission; unsupported references are
     /// refused explicitly, while other failures are judged per role.
-    fn select_encode_prefill_decode_workers(
+    ///
+    /// The prefill and the decode are each answered as the placement
+    /// answers a worker ([`Placed`]): the route makes that side's load
+    /// guard from it.
+    fn placed_encode_prefill_decode_workers(
         &self,
         model_id: &str,
         inputs: PlacementInputs<'_>,
         encode_item_hashes: &[Vec<u8>],
         demand: EpdDemands,
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
-    ) -> Result<EncodePrefillDecodeWorkerSelection, EpdSelectionFailure> {
+    ) -> Result<PlacedEpdSelection, EpdSelectionFailure> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let needs_encode = !encode_item_hashes.is_empty();
         let mut available_encode = Self::available_workers(&snapshot, RoutingPool::GrpcEncode);
@@ -2245,7 +2299,7 @@ impl WorkerSelectionStage {
         let pairs_with_prefill = |worker: &Arc<dyn Worker>| {
             worker.metadata().spec.runtime_type == pair.runtime
                 && (handoff != Some(EncodeHandoff::Push)
-                    || ec_pair(worker.as_ref(), pair.prefill.as_ref()))
+                    || ec_pair(worker.as_ref(), &*pair.prefill))
         };
         // Only image-only reference requests can merge a push encoder's prompt updates.
         let prompt_hash;
@@ -2276,6 +2330,34 @@ impl WorkerSelectionStage {
         )
         .ok_or(EpdSelectionFailure::Unavailable)?;
         Ok((assignments, pair.prefill, pair.decode, pair.runtime))
+    }
+
+    /// [`Self::placed_encode_prefill_decode_workers`] with the pair's two
+    /// workers alone, for a case, which sends them no request.
+    #[cfg(test)]
+    fn select_encode_prefill_decode_workers(
+        &self,
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        encode_item_hashes: &[Vec<u8>],
+        demand: EpdDemands,
+        prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+    ) -> Result<EncodePrefillDecodeWorkerSelection, EpdSelectionFailure> {
+        self.placed_encode_prefill_decode_workers(
+            model_id,
+            inputs,
+            encode_item_hashes,
+            demand,
+            prefill_capacity,
+        )
+        .map(|(assignments, prefill, decode, runtime)| {
+            (
+                assignments,
+                prefill.into_worker(),
+                decode.into_worker(),
+                runtime,
+            )
+        })
     }
 }
 

@@ -215,6 +215,12 @@ impl WorkerLoadGuard {
         self.kept = Some(kept);
         self
     }
+
+    /// Whether this guard counts `worker`'s load: the same worker object.
+    #[must_use]
+    pub fn counts(&self, worker: &Arc<dyn Worker>) -> bool {
+        Arc::ptr_eq(&self.worker, worker)
+    }
 }
 
 impl Drop for WorkerLoadGuard {

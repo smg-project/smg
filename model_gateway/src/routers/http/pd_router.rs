@@ -81,7 +81,8 @@ use crate::{
             pair_index::{PdPairIndex, PdWire},
             pd_failure::{PdSide, SidePhase},
             placement::{
-                self, CandidateFilter, PairFailure, PlacementFailure, PlacementInputs, RefusalSite,
+                self, CandidateFilter, PairFailure, Placed, PlacementFailure, PlacementInputs,
+                RefusalSite,
             },
             prefill_admission::{
                 acquire_prefill, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
@@ -2496,11 +2497,14 @@ impl PDRouter {
         let ((prefill, decode), prefill_guard) = acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
-            |(prefill, _): &PdPair| prefill,
+            |(prefill, _): &(Placed, Placed)| prefill,
             |capacity| self.select_pd_pair(model_id, inputs, capacity),
         )
         .await
         .map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
+        // The prefill's side went into its guard. The decode's guard is not
+        // made from its answer yet.
+        let (prefill, decode) = (prefill.into_worker(), decode.worker_alone_for_now());
         let guards = PdLoadGuards {
             prefill: prefill_guard,
             decode: WorkerLoadGuard::with_key(Arc::clone(&decode), sticky_key),
@@ -2541,7 +2545,7 @@ impl PDRouter {
         model_id: &str,
         inputs: PlacementInputs<'_>,
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
-    ) -> Result<PdPair, Box<PairFailure>> {
+    ) -> Result<(Placed, Placed), Box<PairFailure>> {
         debug!("Selecting PD pair: model_id={:?}", model_id);
         let pairs = self.pd_pairs(model_id);
         let pair = placement::select_pair(
