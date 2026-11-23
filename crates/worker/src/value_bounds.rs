@@ -1,19 +1,69 @@
-//! The bounds a load report keeps an engine's named values under, and the
-//! read of a `values` key off the wire. Every path a list arrives by is
-//! held to the one test here: a pushed record's entries where the record
-//! is read, a polled answer's list where the load monitor takes it.
+//! The bounds a load report keeps an engine's ranks and named values
+//! under, and the read of a `values` key off the wire. Every path a list
+//! arrives by is held to the one test here: a pushed record's entries where
+//! the record is read, a polled answer's list where the load monitor takes
+//! it.
 
 use std::sync::Arc;
 
 use serde::{de::IgnoredAny, Deserialize, Deserializer};
 
 use crate::worker::NamedValue;
+#[cfg(feature = "runtime")]
+use crate::worker::SchedulerLoadSnapshot;
 
+/// How many ranks of a worker a report considers: the ranks below it, and
+/// the one rank of its engine a worker is registered for. A record or a
+/// row of any other rank is dropped unread.
+#[cfg(feature = "runtime")]
+pub(crate) const MAX_RANKS: usize = 64;
 /// How many entries of a list a report considers. Those past them are
 /// dropped unread.
 pub(crate) const MAX_VALUES: usize = 64;
 const MAX_NAME_BYTES: usize = 63;
 const MAX_UNIT_BYTES: usize = 31;
+
+/// Whether a report of a worker considers `dp_rank`: a rank below
+/// [`MAX_RANKS`], or the one rank of its engine the worker is registered
+/// for (`pinned`), whatever its number.
+#[cfg(feature = "runtime")]
+pub(crate) fn considers(pinned: Option<usize>, dp_rank: i32) -> bool {
+    usize::try_from(dp_rank).is_ok_and(|rank| rank < MAX_RANKS || pinned == Some(rank))
+}
+
+/// Puts the rows of a polled answer under the bound of its ranks, in
+/// place, and answers how many rows left it for their rank: the rows of a
+/// rank the report does not consider. Where the rows are one engine's
+/// ranks (`one_engine`), a row of a rank an earlier row stated leaves as
+/// well, uncounted: it stated no rank of its own, and the first of a rank
+/// stands as the first of a name does. The kept rows keep their order. A
+/// list that holds room for [`MAX_RANKS`] rows or fewer is bound where it
+/// lies; one that holds more gives back the room past its rows.
+#[cfg(feature = "runtime")]
+pub(crate) fn bound_ranks(
+    loads: &mut Vec<SchedulerLoadSnapshot>,
+    pinned: Option<usize>,
+    one_engine: bool,
+) -> usize {
+    let mut left = 0;
+    // Whether a kept row stated a rank: each rank below the bound, and the
+    // registered one past it.
+    let mut below = [false; MAX_RANKS];
+    let mut past = false;
+    loads.retain(|row| {
+        if !considers(pinned, row.dp_rank) {
+            left += 1;
+            return false;
+        }
+        let seen = match usize::try_from(row.dp_rank) {
+            Ok(rank) if rank < MAX_RANKS => &mut below[rank],
+            _ => &mut past,
+        };
+        !(std::mem::replace(seen, true) && one_engine)
+    });
+    loads.shrink_to(MAX_RANKS);
+    left
+}
 
 /// Whether an entry among a list's first [`MAX_VALUES`] stands beside the
 /// entries kept ahead of it: its name is not empty, its name and its unit
