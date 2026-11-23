@@ -80,6 +80,9 @@ impl EncodeLists<'_> {
     /// `request` is the pair's, as its host made it for the prefill phase.
     /// This call's instant is written into its facts: `now` on `clock`.
     ///
+    /// A request that states no budget is decided with the widest one
+    /// written into its facts too, as a pair's is ([`PairLists::decide`]).
+    ///
     /// A pair's lists are narrowed by no demand, no subset hint and no
     /// places, and a request's own mask names places of no one list: a
     /// request that states one of these is shed or declined as its pair's
@@ -132,6 +135,7 @@ impl EncodeLists<'_> {
         // takes one for its two.
         let live = Live::at(spec.engine(), clock, now, loads, None);
         request.facts.now_micros = live.now_micros();
+        request.facts.budget_micros = super::budget::shown(request.facts.budget_micros);
         // The engine's pass decides the pair over the prefills and the
         // decodes it admits for the items: a place of the lists as their
         // host holds them names no row there. The call's instant is

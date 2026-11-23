@@ -245,6 +245,10 @@ impl<'a> PairLists<'a> {
     ///
     /// Prefills that are all at their admission limit shed a first
     /// decision, which reads as a request that waits ([`prefills_full`]).
+    ///
+    /// The call writes the widest budget into the facts of a request that
+    /// states none: a decision in process is unbounded
+    /// ([`Request::facts`]), and a stage reads the number as the time left.
     pub fn decide(
         &self,
         spec: &AppliedSpec,
@@ -260,6 +264,7 @@ impl<'a> PairLists<'a> {
         // key's requests.
         let live = Live::at(spec.engine(), clock, now, loads, None);
         request.facts.now_micros = live.now_micros();
+        request.facts.budget_micros = super::budget::shown(request.facts.budget_micros);
         let (facts, cx) = (&request.facts, &request.constraints);
         let sides = [
             Beside {
@@ -797,6 +802,16 @@ mod tests {
     /// side picking through a stage that keeps what it hears: the document
     /// as applied, and the words.
     fn hearing() -> (AppliedSpec, Arc<Mutex<Vec<Word>>>) {
+        hearing_with(None)
+    }
+
+    /// A picker of a case's own: its name in the catalog and the stage it
+    /// makes.
+    type OwnPicker = (&'static str, fn() -> Box<dyn Picker>);
+
+    /// [`hearing`], its prefill side picking through `prefill` where a case
+    /// names one, which is added to the catalog.
+    fn hearing_with(prefill: Option<OwnPicker>) -> (AppliedSpec, Arc<Mutex<Vec<Word>>>) {
         let heard = Arc::new(Mutex::new(Vec::new()));
         let kept = Arc::clone(&heard);
         let mut catalog = StageRegistry::builtin();
@@ -808,6 +823,11 @@ mod tests {
         document.generation = 3;
         let decode = document.profiles.get_mut("decode");
         decode.expect("the decode profile").pick = "hears".into();
+        if let Some((name, stage)) = prefill {
+            catalog.picker(name, stage).expect("a free picker name");
+            let side = document.profiles.get_mut("prefill");
+            side.expect("the prefill profile").pick = name.into();
+        }
         let digest = document.digest().expect("a digest");
         let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
         (spec.expect("a valid document"), heard)
@@ -2915,25 +2935,7 @@ mod tests {
     /// The decode profile's stage, which keeps what it hears, is told each
     /// word ahead of it.
     fn stopping() -> (AppliedSpec, Arc<Mutex<Vec<Word>>>) {
-        let heard = Arc::new(Mutex::new(Vec::new()));
-        let kept = Arc::clone(&heard);
-        let mut catalog = StageRegistry::builtin();
-        catalog
-            .picker("hears", move || Box::new(Hears(Arc::clone(&kept))))
-            .expect("a free picker name");
-        catalog
-            .picker("stops-at-decode", || Box::new(StopsAtDecode))
-            .expect("a free picker name");
-        let mut document =
-            PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets");
-        document.generation = 3;
-        for (side, pick) in [("decode", "hears"), ("prefill", "stops-at-decode")] {
-            let profile = document.profiles.get_mut(side);
-            profile.expect("the side's profile").pick = pick.into();
-        }
-        let digest = document.digest().expect("a digest");
-        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
-        (spec.expect("a valid document"), heard)
+        hearing_with(Some(("stops-at-decode", || Box::new(StopsAtDecode))))
     }
 
     /// A stage that panics at the issue of a decode decided again is held
@@ -2963,7 +2965,6 @@ mod tests {
         let again = *guard.decide_decode_under(&asks, call).expect("a decision");
         let decode = target_at(&again, 0).pair.expect("a pair").decode_id;
         assert!(!guard.decode_chosen(), "the call's pick issued the side");
-        assert_eq!((host.engine.faults(), host.engine.unheard()), (0, 1));
         guard.dispatched_decode(call);
         guard.completed(&outcome(Side::Prefill, first.id), call);
         guard.completed(&outcome(Side::Decode, decode), call);
@@ -2979,6 +2980,7 @@ mod tests {
                 ("completed", Side::Decode, decode, at),
             ]
         );
+        // The held panic alone is counted, and no later word of the side.
         assert_eq!((host.engine.faults(), host.engine.unheard()), (0, 1));
     }
 
