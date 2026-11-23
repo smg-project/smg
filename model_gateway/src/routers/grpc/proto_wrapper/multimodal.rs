@@ -587,7 +587,10 @@ pub(crate) fn stage_tokenspeed_tensor_rdma(
         };
     };
     match export_rdma_tensor(exporter, slot_key, &data) {
-        Some(handle) => TokenSpeedTensor::remote(handle, shape, dtype),
+        Some(handle) => {
+            data.recycle();
+            TokenSpeedTensor::remote(handle, shape, dtype)
+        }
         None => TokenSpeedTensor::inline(data, shape, dtype),
     }
 }
@@ -607,6 +610,7 @@ fn resolve_mm_tensor_payload(
         rdma.and_then(|rdma| export_rdma_tensor(rdma.exporter, rdma.slot_key, &data))
     {
         Metrics::record_mm_tensor(engine, "remote", nbytes);
+        data.recycle();
         return MmTensorPayload::Remote(handle);
     }
     if !shm_enabled || nbytes < min_bytes {
