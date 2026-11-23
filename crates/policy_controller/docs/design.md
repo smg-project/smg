@@ -247,7 +247,7 @@ bindings:
 ### 3.3 From routing flags to a document
 
 A user who never writes a document still gets one. The crate turns the routing settings into the
-document they mean. The settings are the policy name and its options, the mode, the overload
+document they mean. The settings include the policy name and its options, the mode, the overload
 switch and shed word, and the sticky-session options.
 
 ```text
@@ -266,8 +266,9 @@ The mode and the gateway decide what the document binds:
 | one router | single workers | one profile, bound to every model |
 | one router | prefill-decode, over HTTP | two profiles under one pair binding, over the prefill and decode phases; behind it, the main policy's profile, bound to every other request |
 | one router | prefill-decode, over gRPC or ZMQ | the pair binding alone |
+| one router | encode-prefill-decode | three profiles under one binding of the `epd` plan, and no single request |
 | many routers | single workers, or prefill-decode | the pair binding and, behind it, the main policy's profile for every other request; under `manual` with single workers, its one profile alone |
-| either | encode-prefill-decode | three profiles under one binding of the `epd` plan, and no single request |
+| many routers | encode-prefill-decode | three profiles under one binding of the `epd` plan, over the encode, prefill and decode phases; behind it, the main policy's profile, bound to every other request |
 
 A gateway of many routers serves pairs and single workers, however it reaches them, so its
 document binds both. In a gateway of one router the second binding of a prefill-decode mode is
@@ -276,7 +277,7 @@ on one prefill worker, and classic places it by the main policy. Over gRPC or ZM
 with no worker, as the encode mode does, so the document binds no single request. The settings
 state how the gateway reaches its workers.
 
-In two more cases the document plans the pair alone:
+The document plans the pair alone in other cases too, among them:
 
 - The main policy states a setting that no document says.
 - In a gateway of one router, one of the two policies (the pairs', the single requests') names a
@@ -300,7 +301,7 @@ Validation turns a `PolicySpec` into an `AppliedSpec`. An `AppliedSpec` holds th
 and bindings with their stage objects. It also holds what is resolved once from the document: the
 block size, the hash depth, each binding's routing-key sources and the signals.
 
-What a policy remembers lives in four places:
+What a policy remembers lives in several places, among them:
 
 | What | Where |
 |---|---|
@@ -445,7 +446,7 @@ request: the leases its store holds on file write the in-flight counter there (`
 These are the main writers, not all of them. The status is also written at a drain, at a
 registration's activation, by the registry itself where a worker leaves or comes from a peer's
 record, and on a controller by its worker host, which follows the store's row. The liveness flag
-is also written on the word of the stream each worker pushes on (section 4.3), of a passed probe
+is also written on the word of the stream a worker pushes on (section 4.3), of a passed probe
 and of a request's own token stream.
 
 A decision reads a worker in one read: `Worker::routing_state()` gives ready, circuit breaker,
@@ -584,7 +585,9 @@ account of the prompts it sent, written by its policy at each decision. No worke
 no worker's stream carries them. In classic the gateway's policy keeps them. With the engine in
 the gateway the gateway keeps them and lends them to the engine. On main it lends none yet
 (section 9.2). Until it does, a request under the engine reads the hash table, and the index
-beside it where its model has one. A pair reads no record of sent prefixes. A controller is to
+beside it where its model has one. A prefill-decode pair is lent no tree: each of its sides
+reads the hash table, and the index where its model has one, by the side's own list. An encode
+request's first decision reads neither yet. A controller is to
 keep trees of its own **[planned]**, and section 11 says what its contract must hold for that. On
 main a controller's engine reads its hash table alone (section 10.1).
 
@@ -875,7 +878,8 @@ scorer and no filter beyond the health tests, and its binding has no sessions ru
 shadow. On main three pickers say so: round robin, `random` and `passthrough`.
 
 1. The engine asks `maker.plain()`. If the request is plain and a single one, the host handed one
-   list, every worker of the list serves the protocols the request states, and the list's model
+   list, every worker of the list is dialed over a protocol the request states (where it states
+   any), and the list's model
    is bound to a profile that one pick decides, the picker names a worker by its own rule and the
    engine answers with its position. Round robin adds one to the list's counter and takes the
    worker it lands on if that worker is eligible. Where it is not, the engine reads the list once
@@ -1098,15 +1102,16 @@ This is the contract between the engine and the program that embeds it. The gate
 controller keep it differently on main.
 
 - **At start.** The gateway takes steps 1 to 3 of section 8.1's start. It hands no lists yet
-  (step 4). A controller takes none of the steps: its store builds an engine object for each
-  document it applies, with no hand-over (section 10.2).
+  (step 4). A controller takes step 3 alone: its holder lends each role's list with its cell
+  (section 4.1). Its store builds an engine object for each document it applies, with no
+  hand-over (section 10.2).
 - **For each request.** The gateway makes the one call of section 8.2 and keeps the placement. A
   controller states worker ids of its own and keeps no placement: it calls the entry that issues
   nothing and files its own record.
 
 ### 8.1 On main today **[built]**
 
-At start the host does five things.
+A host's start has these steps.
 
 1. **It starts the engine with its own data, once.** The call is
    `PolicyEngine::start(spec, WorkerData { registry, loads, cache_indexes })`. It builds the
@@ -1211,7 +1216,7 @@ pub enum Decided {
 }
 ```
 
-A host that calls the engine through this trait alone has four more things to do itself:
+A host that calls the engine through this trait alone has more to do itself. Among its duties:
 
 - derive the routing key by the document's rule and hash the prompt into blocks, inside `make`;
 - try the targets in order, checking each worker's health again;
@@ -1320,7 +1325,7 @@ asked once behind the last of them. The upkeep asks what is owed at that minute 
 still standing. Lists handed behind the task's first poll are owed at its next upkeep, every
 list that stands once.
 
-The task asks behind a word alone, and it fills the lists that stand at its ask. So six kinds
+The task asks at those moments alone, and it fills the lists that stand at its ask. So six kinds
 of list are filled ahead only where a later ask of their model finds them, and by their first
 request otherwise:
 
