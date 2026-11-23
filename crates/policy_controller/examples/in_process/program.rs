@@ -4,10 +4,12 @@
 //! It holds what a program that routes requests holds already, in the
 //! worker crate's own types: the worker registry, with the program's value
 //! of each membership generation ([`Lists`]), which is the list the registry
-//! published and the empty cell the program keeps beside it. Its load
-//! monitor's channel goes to the engine once, at the start. Its sends are a
-//! function its builder gives ([`Program::start`]): handed the worker a
-//! request goes to, it answers the status that worker answered.
+//! published and the empty cell the program keeps beside it. The engine
+//! takes the registry and the load monitor's channel once, at its start
+//! ([`PolicyEngine::start`]), and reads both in place: the program tells it
+//! nothing of a worker that joins or leaves. Its sends are a function its
+//! builder gives ([`Program::start`]): handed the worker a request goes to,
+//! it answers the status that worker answered.
 //!
 //! The document is the one its routing settings mean
 //! ([`RoutingSettings::policy_document`]): the program writes settings as a
@@ -17,16 +19,14 @@
 //! It keeps no circuit breaker's count and chooses no rank inside a worker:
 //! both are a route's own, behind the engine's answer.
 
-use std::{
-    future::Future,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
-};
+use std::{future::Future, sync::Arc};
 
 use http::HeaderMap;
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySettings, RoutingSettings},
     engine::{
-        HeaderRead, LentList, ListCell, PlaceRequest, PolicyEngine, Unplaced, WorkerId, WorkerLists,
+        HeaderRead, LentList, ListCell, PlaceRequest, PolicyEngine, Unplaced, WorkerData, WorkerId,
+        WorkerLists,
     },
     tracking::{Outcome, Placement, Side, TransportClass},
 };
@@ -91,29 +91,16 @@ impl Lists {
     }
 }
 
-/// Every call the program makes of the engine once it is started.
+/// Every call the program makes of the engine once it is started: one.
 ///
-/// [`Engine::place`] is the host contract's one call for a request. Each
-/// other method is a call the contract still owes a program, and leaves
-/// this list with the change that pays it. The start ([`Program::start`])
-/// is the one other place that names the engine.
+/// [`Engine::place`] is the host contract's one call for a request. The
+/// start ([`Program::start`]) is the one other place that names the engine.
 struct Engine(&'static PolicyEngine);
 
 impl Engine {
     /// The one call for a request.
     fn place<'a>(&self, request: &PlaceRequest<'a>) -> Result<Placement<'a>, Unplaced> {
         self.0.place(request)
-    }
-
-    /// A worker left. Owed: the engine's own task follows the registry's
-    /// events.
-    fn forget(&self, address: &str) {
-        self.0.forget(address);
-    }
-
-    /// A worker joined. Owed with [`Engine::forget`].
-    fn joined(&self, address: &str) {
-        self.0.joined(address);
     }
 }
 
@@ -173,70 +160,60 @@ type Sends = Box<dyn Fn(&dyn Worker) -> u16 + Send + Sync>;
 
 /// The program.
 pub struct Program {
-    registry: WorkerRegistry<Lists>,
+    /// The program's registry. The engine holds it too, since its start.
+    registry: Arc<WorkerRegistry<Lists>>,
     engine: Engine,
     sends: Sends,
-    /// Held over a change of the registry and the engine's word of it, so
-    /// two changes at one address reach the engine in the registry's order.
-    membership: Mutex<()>,
 }
 
 impl Program {
-    /// The program's start: the engine built from `spec` for the life of
-    /// the process, and the load monitor's channel handed once, where the
-    /// program has a monitor. It answers the program with the engine's own
-    /// task, which a program spawns on its runtime: the task keeps the
-    /// newest load snapshot at hand and runs the engine's upkeep. `sends`
-    /// are the program's sends.
+    /// The program's start: the engine's one call
+    /// ([`PolicyEngine::start`]), made over the program's own data. The
+    /// engine is built from `spec` for the life of the process and takes
+    /// the program's registry, and its load monitor's channel where the
+    /// program has a monitor. This program keeps no index of cache events.
+    ///
+    /// It answers the program with the engine's own task, which a program
+    /// spawns on its runtime ahead of its first request. The task keeps the
+    /// newest load snapshot at hand, runs the engine's upkeep, and follows
+    /// the registry: it tells the document's stages a worker that joined or
+    /// left. `sends` are the program's sends.
     pub fn start(
         spec: AppliedSpec,
         loads: Option<LoadReceiver>,
         sends: impl Fn(&dyn Worker) -> u16 + Send + Sync + 'static,
     ) -> (Self, impl Future<Output = ()> + Send + 'static) {
-        let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(spec)));
-        if let Some(loads) = loads {
-            engine.set_loads(loads);
-        }
+        let registry = Arc::new(WorkerRegistry::new());
+        let handed: Arc<WorkerRegistry<Lists>> = Arc::clone(&registry);
+        let data = WorkerData {
+            registry: handed,
+            loads,
+            cache_indexes: None,
+        };
+        let (engine, task) = PolicyEngine::start(spec, data);
         let program = Self {
-            registry: WorkerRegistry::new(),
+            registry,
             engine: Engine(engine),
             sends: Box::new(sends),
-            membership: Mutex::new(()),
         };
-        (program, engine.run())
+        (program, task)
     }
 
     /// A worker joins: the registry publishes the next generation of its
     /// model, with an empty cell. `false` where the registry holds a worker
-    /// at its address already.
+    /// at its address already. The engine's task hears the join from the
+    /// registry.
     pub fn join(&self, worker: Arc<dyn Worker>) -> bool {
-        let address = worker.url().to_owned();
-        let _changing = self.changing();
-        let joined = self.registry.register(worker).is_some();
-        if joined {
-            self.engine.joined(&address);
-        }
-        joined
+        self.registry.register(worker).is_some()
     }
 
     /// The worker at `address` leaves. `false` where the registry holds
-    /// none there. The engine is told the address the worker itself
-    /// states: the registry finds a worker by an address written without
-    /// its scheme too, and the engine knows the worker by the whole one.
+    /// none there. The registry finds a worker by an address written
+    /// without its scheme too. The engine's task hears the removal with
+    /// the worker's own object, so the stages are told the worker under
+    /// the address it states.
     pub fn leave(&self, address: &str) -> bool {
-        let _changing = self.changing();
-        let Some(left) = self.registry.remove_by_url(address) else {
-            return false;
-        };
-        self.engine.forget(left.url());
-        true
-    }
-
-    /// The membership lock, taken. Nothing is kept under it, so a change
-    /// that panicked leaves nothing half written.
-    fn changing(&self) -> MutexGuard<'_, ()> {
-        let held = self.membership.lock();
-        held.unwrap_or_else(PoisonError::into_inner)
+        self.registry.remove_by_url(address).is_some()
     }
 
     /// The model's generation as the registry holds it now.

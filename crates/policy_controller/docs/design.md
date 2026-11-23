@@ -1067,8 +1067,10 @@ The engine lives as long as the process, so a placement holds a plain reference 
 
 The start answers the task and the host spawns it on a runtime of its choice: the start spawns
 nothing. The call is marked `#[must_use]`, with the reason that the task does nothing until it is
-spawned. The start takes no worker lists: each request gives its own, and the engine's task reads
-none.
+spawned: the compiler warns a caller that drops the whole answer. It does not warn a caller that
+keeps the engine and drops the task, whose engine keeps no load snapshot, runs no upkeep and tells
+the policies no worker. The start takes no worker lists: each request gives its own, and the
+engine's task reads none.
 
 The engine's background task does what a host did by hand. Four of its jobs are built
 (`PolicyEngine::run`): the upkeep once a second, and the newest load snapshot kept at hand,
