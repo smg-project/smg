@@ -241,7 +241,7 @@ struct InProgressResponse<'a> {
 
 /// The event that ends the stream, `response.completed`,
 /// `response.incomplete` or `response.failed` by `kind`: the final response
-/// object, the fields in the event's order, the request's borrowed.
+/// object, the fields in the event's order, the request's fields borrowed.
 #[derive(Serialize)]
 struct ResponseTerminal<'a> {
     #[serde(rename = "type")]
@@ -758,6 +758,10 @@ impl ResponseStreamEventEmitter {
         usage: Option<serde_json::Value>,
         error: Option<&'a serde_json::Value>,
     ) -> (ResponseTerminal<'a>, &'a mut SseEncoder) {
+        debug_assert!(
+            error.is_none() || self.finish_reason.as_deref() == Some("failed"),
+            "a terminal with an error must be read under the failed finish reason"
+        );
         // Build output array from tracked items
         let output: Vec<serde_json::Value> = self
             .output_items
