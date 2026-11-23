@@ -2,15 +2,20 @@
 //! part of a request's budget that must be left for it to run, and its
 //! counts.
 
+#![cfg_attr(
+    not(feature = "in-process"),
+    expect(dead_code, reason = "Only the engine over worker lists asks a shadow.")
+)]
+
 use std::{sync::atomic::AtomicU64, time::Duration};
 
 use super::{decision::ShadowKind, framework::PairSide, view::WorkerId};
 
 /// How many of a generation's bindings count their shadows in a row of
-/// their own ([`StoreBackedEngine::shadowed`]). The bindings behind them count
+/// their own ([`DecisionEngine::shadowed`]). The bindings behind them count
 /// in the last row. A host that shows the counts walks this many rows.
 ///
-/// [`StoreBackedEngine::shadowed`]: super::store_backed_engine::StoreBackedEngine::shadowed
+/// [`DecisionEngine::shadowed`]: super::decision_engine::DecisionEngine::shadowed
 pub const SHADOW_ROWS: usize = 16;
 
 /// One decider's counts of its shadows, on lines of their own: a row a
@@ -38,10 +43,18 @@ pub(crate) enum Counted {
     /// Beside a single's decision.
     Single,
     /// Beside this side of a pair, at the pair's decision.
+    #[expect(
+        dead_code,
+        reason = "no host asks a pair's shadows until the engine over worker lists does"
+    )]
     Side(PairSide),
     /// Beside a decode decided after its prefill, at that second
     /// decision. The pair's first decision counted its decode side
     /// beside the decode it named first: the two are never one count.
+    #[expect(
+        dead_code,
+        reason = "no host asks a later decode's shadow until the engine over worker lists does"
+    )]
     Later,
 }
 

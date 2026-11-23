@@ -48,7 +48,7 @@ pub use decision_engine::{
 };
 pub use decision_slot::{DecisionSlot, DecisionSlotGuard};
 pub use demands::{DemandFacts, Demands, References, UnmetDemand};
-pub use explain::{DecisionExplanation, DecisionNames, DecisionRecord};
+pub use explain::{DecisionNames, DecisionRecord};
 pub use framework::{
     AloneProfile, Binding, DecisionScope, DrawUnit, EncodeItems, EncodePlaced, EncodePool,
     EncoderFacts, Engine, Filter, InTheWay, NotAlone, OverloadThresholds, PairPools, PairSide,

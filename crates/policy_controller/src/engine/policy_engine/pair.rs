@@ -1530,6 +1530,177 @@ mod tests {
         }
     }
 
+    /// A decode among the decode places is handed only with the prefill it
+    /// partners. Two prefills, each with its own decode, both decode places
+    /// stated and the prefill list held to the second: the pair is the
+    /// second prefill with the second decode at every turn. So it is where
+    /// a place of either side stands past its list's end, which names no
+    /// row. With the prefill list free and the first decode not ready, the
+    /// second decode place alone opens a prefill: the same pair. The
+    /// gateway's classic router picks a pair's decode among the picked
+    /// prefill's own partners that are open for the request
+    /// (`model_gateway/src/routers/common/placement.rs:1301-1306`,
+    /// `:1389-1394`, `:1548-1553`, at main `b8c15d40a`).
+    #[test]
+    fn a_decode_among_the_places_is_handed_only_with_the_prefill_it_partners() {
+        let (spec, _) = hearing();
+        let own: Vec<[u32; 1]> = (0..2).map(|at| [at]).collect();
+        let classes = PartnerClasses::number(2, own.iter().map(|one| one.as_slice()));
+        let free = Constraints::default();
+        let decide = |seed: u64, first_ready: bool, places: [Option<&[u32]>; 2]| {
+            let (mut prefills, mut decodes) = lists(2, 2);
+            stamp(&mut prefills, &mut decodes, &classes, &OPEN);
+            decodes[0].health.healthy = first_ready;
+            let facts = RequestFacts { seed, ..facts() };
+            decide_records(
+                spec.engine(),
+                &facts,
+                (&free, places),
+                &pool(&prefills),
+                pools(&prefills, &decodes, &classes),
+                &mut Scratch::default(),
+            )
+        };
+        for seed in 0..24 {
+            let held = [Some(&[1][..]), Some(&[0, 1][..])];
+            assert_eq!(picked(&decide(seed, true, held)), (2, 102), "seed {seed}");
+            let past = [Some(&[1, 7][..]), Some(&[0, 1, 9][..])];
+            assert_eq!(picked(&decide(seed, true, past)), (2, 102), "seed {seed}");
+            let second = [None, Some(&[0, 1][..])];
+            assert_eq!(
+                picked(&decide(seed, false, second)),
+                (2, 102),
+                "seed {seed}"
+            );
+        }
+    }
+
+    /// The decode asked again is held to the decode places that partner its
+    /// held prefill. Two prefills, each with its own decode, and the second
+    /// prefill held, which is not the first of its list: among both decode
+    /// places, and at the second alone, its decode is the second at every
+    /// turn. At the first place alone the places and the prefill's partners
+    /// meet in no decode, and the call is shed under the partners' name. So
+    /// it is over no place at all. The gateway's classic router asks no
+    /// decode again: it selects a request's pair whole, once, the decode
+    /// among the picked prefill's own partners
+    /// (`model_gateway/src/routers/common/placement.rs:1227-1275`,
+    /// `:1548-1553`, at main `b8c15d40a`).
+    #[test]
+    fn the_decode_asked_again_is_held_to_the_places_that_partner_its_prefill() {
+        let pair = decided(2);
+        let (mut prefills, mut decodes) = lists(2, 2);
+        let own: Vec<[u32; 1]> = (0..2).map(|at| [at]).collect();
+        let classes = PartnerClasses::number(2, own.iter().map(|one| one.as_slice()));
+        stamp(&mut prefills, &mut decodes, &classes, &OPEN);
+        let free = Constraints::default();
+        let again = |seed: u64, places: &[u32]| {
+            let facts = RequestFacts { seed, ..facts() };
+            decide_decode_records(
+                pair.spec.engine(),
+                &facts,
+                (&free, Some(places)),
+                &pool(&decodes),
+                pools(&prefills, &decodes, &classes),
+                &prefill_alone(WorkerId(2)),
+                &mut Scratch::default(),
+            )
+        };
+        for seed in 0..24 {
+            assert_eq!(picked(&again(seed, &[0, 1])), (2, 102), "seed {seed}");
+            assert_eq!(picked(&again(seed, &[1])), (2, 102), "seed {seed}");
+        }
+        let nobody = (ShedReason::NoEndpoints, "partners");
+        assert_eq!(shed_for(&again(1, &[0])), nobody);
+        assert_eq!(shed_for(&again(1, &[])), nobody);
+    }
+
+    /// A side's places stand beside what the request states, and hold the
+    /// other side to nothing. Three prefills and four decodes, every pair
+    /// open. With the prefill list held to its second place the turns reach
+    /// every decode, and with the decode list held to its fourth they reach
+    /// every prefill. A decode its host just failed to reach steps aside
+    /// among the decode places while another of them is left. A prefill
+    /// list held to no place picks no pair, as a pair with no prefill picks
+    /// none. Behind the third prefill the
+    /// decode asked again reads the decodes' places alone: the prefills'
+    /// places, which leave that prefill out, are not read, and decode
+    /// places that keep none pick none. The gateway's classic router steps
+    /// aside from the engines a request tried on each side of a pair, among
+    /// the workers its request's rule admits
+    /// (`model_gateway/src/routers/common/placement.rs:1301-1306`,
+    /// `:1492-1494`, `:1568-1570`, at main `b8c15d40a`).
+    #[test]
+    fn a_sides_places_stand_beside_the_requests_word_and_hold_the_other_side_to_nothing() {
+        let host = Host::of(3, 4);
+        let free = Constraints::default;
+        let mut decodes = [false; 4];
+        for seed in 0..64 {
+            let prefill = [Some(&[1][..]), None];
+            let picked = host.picked(&host.decide_among(&OPEN, seed, None, free(), prefill));
+            assert_eq!(picked.0, 1, "seed {seed}");
+            decodes[picked.1] = true;
+        }
+        assert_eq!(decodes, [true; 4]);
+        let mut prefills = [false; 3];
+        for seed in 0..64 {
+            let decode = [None, Some(&[3][..])];
+            let picked = host.picked(&host.decide_among(&OPEN, seed, None, free(), decode));
+            assert_eq!(picked.1, 3, "seed {seed}");
+            prefills[picked.0] = true;
+        }
+        assert_eq!(prefills, [true; 3]);
+        let tried = [worker_id(host.decodes[0].as_ref())];
+        for seed in 0..16 {
+            let excluding = Constraints {
+                excluded: &tried,
+                ..Constraints::default()
+            };
+            let among = [None, Some(&[0, 3][..])];
+            let picked = host.picked(&host.decide_among(&OPEN, seed, None, excluding, among));
+            assert_eq!(picked.1, 3, "seed {seed}");
+        }
+        let none = [Some(&[][..]), None];
+        let unheld = host.decide_among(&OPEN, 1, None, free(), none);
+        assert_eq!(shed_for(&unheld), (ShedReason::NoEndpoints, "none"));
+        let held = prefill_alone(worker_id(host.prefills[2].as_ref()));
+        for seed in 0..16 {
+            let other = [Some(&[0][..]), Some(&[1][..])];
+            let again = host.decide_among(&OPEN, seed, Some(&held), free(), other);
+            assert_eq!(host.picked(&again), (2, 1), "seed {seed}");
+        }
+        let none = [None, Some(&[][..])];
+        let again = host.decide_among(&OPEN, 1, Some(&held), free(), none);
+        assert_eq!(shed_for(&again), (ShedReason::NoEndpoints, "partners"));
+    }
+
+    /// The decode asked again keeps the decode its first decision named
+    /// while that decode stands among the decodes' places of the call, and
+    /// picks among the places where it does not: no decode outside them is
+    /// handed, kept or not. One prefill and three decodes under round
+    /// robin, which keeps its pick. The gateway's classic router asks no
+    /// decode again: it selects a request's pair whole, once
+    /// (`model_gateway/src/routers/common/placement.rs:1227-1275`, at main
+    /// `b8c15d40a`).
+    #[test]
+    fn the_decode_asked_again_keeps_its_first_decode_among_the_places() {
+        let host = Host::under(presets("round_robin"), 1, 3);
+        for seed in 0..12 {
+            let held = first_target(&host.decide(&OPEN, seed, None));
+            let named = held.pair.expect("a decode").decode_position;
+            let other = (named + 1) % 3;
+            // A host states its places ascending.
+            let (with, without) = ([named.min(other), named.max(other)], [other]);
+            let among = [None, Some(&with[..])];
+            let again = host.decide_among(&OPEN, seed, Some(&held), Constraints::default(), among);
+            assert_eq!(host.picked(&again).1, named as usize, "seed {seed}");
+            let outside = [None, Some(&without[..])];
+            let again =
+                host.decide_among(&OPEN, seed, Some(&held), Constraints::default(), outside);
+            assert_eq!(host.picked(&again).1, other as usize, "seed {seed}");
+        }
+    }
+
     /// The decode asked again reads both lists at its own call, and keeps
     /// the prefill that was sent.
     #[test]
