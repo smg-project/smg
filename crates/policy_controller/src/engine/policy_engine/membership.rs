@@ -507,7 +507,7 @@ impl PolicyEngine {
         id: WorkerId,
         replaced: bool,
     ) {
-        let record = Held::of(id, worker, self.spec.engine().keeps_loads());
+        let record = Held::of(id, worker, self.document.spec.engine().keeps_loads());
         if let Some(was) = follow.told.insert(object, record) {
             if was.id == id && (replaced || was.is(worker)) {
                 return;

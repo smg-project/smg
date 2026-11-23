@@ -1082,7 +1082,7 @@ impl Call {
 fn named(engine: &PolicyEngine, list: Option<LentList<'_>>, place: u32) -> Option<WorkerId> {
     let records = engine
         .members_of(list?)
-        .records(&engine.spec, &engine.clock);
+        .records(&engine.document.spec, &engine.clock);
     records.ids().get(place as usize).copied()
 }
 

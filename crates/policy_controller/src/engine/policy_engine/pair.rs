@@ -293,7 +293,7 @@ impl<'a> PairLists<'a> {
         request: &mut Request<'_>,
         held: Option<&Target>,
     ) -> Decision {
-        let (spec, clock) = (&engine.spec, &engine.clock);
+        let (spec, clock) = (&engine.document.spec, &engine.clock);
         // One value for both lists' records: this call's instant on the
         // clock and the host's snapshot, as the host holds it. No session
         // key's text is handed to it: a pair's records carry no count of a
@@ -632,7 +632,7 @@ fn issue_decode_caught(
     decision: &Decision,
     prefill: &Lease,
 ) -> Option<Lease> {
-    let engine = own.spec.engine();
+    let engine = own.document.spec.engine();
     let told = || issue_decode(engine, facts, decision, prefill, facts.now_micros);
     match catch_unwind(AssertUnwindSafe(told)) {
         Ok(decode) => decode,
@@ -713,7 +713,7 @@ pub(super) fn issued(
     held: Option<&HeldDecision<'_>>,
     now: Instant,
 ) -> DecideOutcome {
-    let (spec, later) = (&own.spec, request.constraints.decode_later);
+    let (spec, later) = (&own.document.spec, request.constraints.decode_later);
     let (engine, facts) = (spec.engine(), &request.facts);
     let issued = match held {
         // A shed writes no word that every pick shares.

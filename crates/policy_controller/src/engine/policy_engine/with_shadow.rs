@@ -163,7 +163,8 @@ pub(super) fn decide(
 /// Counts what the shadow of a single request said, for its binding. The
 /// table is allocated at the first count.
 fn count(own: &PolicyEngine, said: Shadowed) {
-    let counts = own.shadow_counts.get_or_init(Box::<ShadowCounts>::default);
+    let counts = &own.document.shadow_counts;
+    let counts = counts.get_or_init(Box::<ShadowCounts>::default);
     let count = counts.of(said.binding, Counted::Single, said.kind);
     count.fetch_add(1, Ordering::Relaxed);
 }

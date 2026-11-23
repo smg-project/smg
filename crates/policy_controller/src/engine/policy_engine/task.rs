@@ -148,9 +148,9 @@ impl PolicyEngine {
     /// the newest the task keeps at hand otherwise: a single request's, a
     /// pair's first, and a pair's decode decided again.
     pub fn set_loads(&self, loads: LoadReceiver) {
-        let needs = self.spec.needs();
+        let needs = self.document.spec.needs();
         let read = needs.loads || needs.signal_cells;
-        if read || self.spec.engine().keeps_loads() {
+        if read || self.document.spec.engine().keeps_loads() {
             let mut feed = self.loads.feed.lock();
             *feed = (feed.0 + 1, Some(loads));
             // A channel kept for the telling alone is read by no decision.

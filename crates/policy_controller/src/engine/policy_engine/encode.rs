@@ -186,7 +186,7 @@ impl EncodeLists<'_> {
         items: EncodeItems<'_>,
         placed: &mut EncodePlaced,
     ) -> Decision {
-        let (spec, clock) = (&engine.spec, &engine.clock);
+        let (spec, clock) = (&engine.document.spec, &engine.clock);
         let pair = &self.pair;
         if not_decided(&request.constraints).is_some() {
             placed.clear();

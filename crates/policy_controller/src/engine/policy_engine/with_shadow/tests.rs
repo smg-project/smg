@@ -443,7 +443,10 @@ fn a_shadow_beside_a_decision_without_a_lease_is_counted_by_its_caller() {
     let answer = engine.decide_without_lease(&asks, Instant::now());
     let (_, said) = answer.expect("a decision");
     assert!(said.is_some(), "the shadow's word");
-    assert!(engine.shadow_counts.get().is_none(), "nothing counted yet");
+    assert!(
+        engine.document.shadow_counts.get().is_none(),
+        "nothing counted yet"
+    );
     assert_eq!(kinds(&engine), [0; 4]);
     engine.count_shadow(said);
     assert_eq!(kinds(&engine), [0, 1, 0, 0]);
@@ -463,7 +466,7 @@ fn a_shadow_beside_a_decision_without_a_lease_is_counted_by_its_caller() {
     assert_eq!(none, None);
     unshadowed.count_shadow(none);
     assert_eq!(seen.shadows(), 0);
-    assert!(unshadowed.shadow_counts.get().is_none());
+    assert!(unshadowed.document.shadow_counts.get().is_none());
 }
 
 /// A live decision that sheds files no lease, and the entry still answers
@@ -877,7 +880,10 @@ fn a_shadow_under_a_sessions_rule_moves_no_session_pin() {
 fn the_shadow_counts_of_every_thread_are_read_as_one() {
     let list = pool(3);
     let (engine, seen) = bed(Rule::Place(0), Rule::Place(1));
-    assert!(engine.shadow_counts.get().is_none(), "no count yet");
+    assert!(
+        engine.document.shadow_counts.get().is_none(),
+        "no count yet"
+    );
     thread::scope(|scope| {
         for _ in 0..4 {
             scope.spawn(|| {
@@ -894,5 +900,5 @@ fn the_shadow_counts_of_every_thread_are_read_as_one() {
 
     let (unshadowed, _) = bed_of("random", Rule::Place(0), None, |_| {});
     let _ = placed(&unshadowed, &list, request(7));
-    assert!(unshadowed.shadow_counts.get().is_none());
+    assert!(unshadowed.document.shadow_counts.get().is_none());
 }
