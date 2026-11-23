@@ -95,6 +95,7 @@ use crate::{
         endpoint::Endpoint,
     },
     load::{
+        counts::{FetchFailure, PollCounts, PollTotals},
         port::{GroupTick, LoadSink, PollMode, PolledMember, PolledRanks, PolledReport},
         state::{LoadReceiver, LoadSnapshot, LoadState},
     },
@@ -596,6 +597,9 @@ pub struct WorkerMonitor<G> {
     pending_pushed: Mutex<Vec<Arc<dyn Worker>>>,
     pushed_notify: Arc<Notify>,
     pushed_flush_task: Mutex<Option<JoinHandle<()>>>,
+    /// What the polls did, for a host's read ([`Self::poll_totals`]). A
+    /// group's tick adds to it, and nothing else does.
+    poll_counts: Arc<PollCounts>,
     /// The sink [`Self::new`] built, for the cases that read its receipts.
     #[cfg(test)]
     classic: Option<Arc<ClassicLoadSink<G>>>,
@@ -747,6 +751,7 @@ impl<G: Generation> WorkerMonitor<G> {
             pending_pushed: Mutex::new(Vec::new()),
             pushed_notify: Arc::new(Notify::new()),
             pushed_flush_task: Mutex::new(None),
+            poll_counts: Arc::new(PollCounts::default()),
             #[cfg(test)]
             classic: None,
         }
@@ -768,6 +773,14 @@ impl<G: Generation> WorkerMonitor<G> {
     /// workers states one for itself.
     pub fn interval(&self) -> Duration {
         self.default_interval
+    }
+
+    /// What the monitor's polls did since it was built, as plain numbers:
+    /// for a host that renders series of its own and cannot read the
+    /// process recorder's. The monitor's own series are written as before,
+    /// and each number here moves in a group's tick alone.
+    pub fn poll_totals(&self) -> PollTotals {
+        self.poll_counts.totals()
     }
 
     /// A load record pushed on a worker's KV-event stream (`KvEventBatch.load`,
@@ -1931,17 +1944,18 @@ impl<G: Generation> WorkerMonitor<G> {
     ///
     /// Engine responses are scoped to the virtual worker's DP rank, if any.
     /// Gateway fleet rollups retain their worker annotations. An empty response
-    /// means a successful poll omitted this rank; `None` means a failed poll.
+    /// means a successful poll omitted this rank; an error means a failed
+    /// poll, with the reason the gauges' read ended on.
     ///
     /// `native_loads_memo` is the shared probe memo, or `None` for callers
     /// with no monitor to borrow it from (they simply always discover).
     pub(crate) async fn fetch_http_load(
         worker: &Arc<dyn Worker>,
         native_loads_memo: Option<&DashMap<String, NativeLoadsMemo>>,
-    ) -> Option<WorkerLoadResponse> {
+    ) -> Result<WorkerLoadResponse, FetchFailure> {
         if let Some((path, load)) = Self::fetch_native_loads(worker, native_loads_memo).await {
             liveness::on_contact(worker);
-            return Some(Self::scoped_native_load(path, load, worker.dp_rank()));
+            return Ok(Self::scoped_native_load(path, load, worker.dp_rank()));
         }
         Self::fetch_http_gauges(worker).await
     }
@@ -2003,10 +2017,12 @@ impl<G: Generation> WorkerMonitor<G> {
     }
 
     /// The backend-wide gauges of a worker with no native load route.
-    async fn fetch_http_gauges(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
+    async fn fetch_http_gauges(
+        worker: &Arc<dyn Worker>,
+    ) -> Result<WorkerLoadResponse, FetchFailure> {
         // Backend-wide gauges cannot be attributed to a virtual DP worker.
         if worker.dp_rank().is_some() {
-            return None;
+            return Err(FetchFailure::Unsupported);
         }
 
         match worker.metadata().spec.runtime_type {
@@ -2014,7 +2030,7 @@ impl<G: Generation> WorkerMonitor<G> {
             RuntimeType::Sglang => Self::fetch_http_load_sglang(worker).await,
             // Custom engines expose no gauge schema we can parse; the native
             // routes above were their only path.
-            _ => None,
+            _ => Err(FetchFailure::Unsupported),
         }
     }
 
@@ -2072,19 +2088,27 @@ impl<G: Generation> WorkerMonitor<G> {
 
     /// The first family over HTTP: the load from the Prometheus `/metrics`
     /// endpoint, read by its gauge table in [`scrape`].
-    async fn fetch_http_load_vllm(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
+    async fn fetch_http_load_vllm(
+        worker: &Arc<dyn Worker>,
+    ) -> Result<WorkerLoadResponse, FetchFailure> {
         let url = format!("{}/metrics", worker.base_url());
-        let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
-        scrape::vllm(&body).map(Self::single_rank)
+        let body = Self::authed_text(worker, &url).await?;
+        scrape::vllm(&body)
+            .map(Self::single_rank)
+            .ok_or(FetchFailure::NoLoad)
     }
 
     /// The second family over HTTP: the load from the Prometheus `/metrics`
     /// gauges, read by its gauge table in [`scrape`] (either metric
     /// prefix).
-    async fn fetch_http_load_sglang(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
+    async fn fetch_http_load_sglang(
+        worker: &Arc<dyn Worker>,
+    ) -> Result<WorkerLoadResponse, FetchFailure> {
         let url = format!("{}/metrics", worker.base_url());
-        let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
-        scrape::sglang(&body).map(Self::single_rank)
+        let body = Self::authed_text(worker, &url).await?;
+        scrape::sglang(&body)
+            .map(Self::single_rank)
+            .ok_or(FetchFailure::NoLoad)
     }
 
     /// Shared authenticated GET builder with the standard timeout.
@@ -2096,13 +2120,26 @@ impl<G: Generation> WorkerMonitor<G> {
         }
     }
 
-    /// Shared authenticated GET with the standard timeout. Returns `None` on
-    /// transport error or non-success status.
-    async fn authed_get(worker: &Arc<dyn Worker>, url: &str) -> Option<reqwest::Response> {
-        match Self::authed_request(worker, url).send().await {
-            Ok(r) if r.status().is_success() => Some(r),
-            _ => None,
+    /// The body of a shared authenticated GET with the standard timeout. A
+    /// status that is no success is the engine's answer. A request the
+    /// timeout ended is a deadline, at the send or in the body. Any other
+    /// failure is the transport's.
+    async fn authed_text(worker: &Arc<dyn Worker>, url: &str) -> Result<String, FetchFailure> {
+        let failed = |error: reqwest::Error| {
+            if error.is_timeout() {
+                FetchFailure::Deadline
+            } else {
+                FetchFailure::Transport
+            }
+        };
+        let response = Self::authed_request(worker, url)
+            .send()
+            .await
+            .map_err(failed)?;
+        if !response.status().is_success() {
+            return Err(FetchFailure::Answer);
         }
+        response.text().await.map_err(failed)
     }
 
     /// A single scheduler snapshot as a one-rank report: the wrapper of
@@ -2118,12 +2155,15 @@ impl<G: Generation> WorkerMonitor<G> {
     /// member asks; the outcome is every member's, as each one's own poll
     /// would have had it: the whole answer (the caller scopes it to each
     /// member's rank), the contact that ends an unreachable veto, a
-    /// transport failure. Returns `None` on no members, a missing client, a
-    /// connect or a call the poll's deadline ended, or an error.
+    /// transport failure. A failure names its reason: the host's own where
+    /// there is no member or no client, the transport's for a connect that
+    /// failed and for a status that is a connection's, the deadline's for a
+    /// connect or a call the poll's deadline ended, and the engine's answer
+    /// for any other status, but for a call the engine does not implement.
     pub(crate) async fn fetch_backend_load(
         members: &[Arc<dyn Worker>],
-    ) -> Option<WorkerLoadResponse> {
-        let worker = members.first()?;
+    ) -> Result<WorkerLoadResponse, FetchFailure> {
+        let worker = members.first().ok_or(FetchFailure::Client)?;
         // A first use connects through the host's connector. The connect
         // stands under the deadline as the call below does, and for its
         // reason: a connector that never returns must not stall the group's
@@ -2136,21 +2176,21 @@ impl<G: Generation> WorkerMonitor<G> {
             Ok(Ok(Some(client))) => client,
             Ok(Ok(None)) => {
                 debug!("No backend client for worker {}", worker.redacted_url());
-                return None;
+                return Err(FetchFailure::Client);
             }
             Ok(Err(e)) => {
                 debug!(
                     "Failed to get backend client for {}: {e}",
                     worker.redacted_url()
                 );
-                return None;
+                return Err(FetchFailure::Transport);
             }
             Err(_) => {
                 debug!(
                     "the connect of {} did not end within {LOAD_POLL_DEADLINE:?}",
                     worker.redacted_url()
                 );
-                return None;
+                return Err(FetchFailure::Deadline);
             }
         };
 
@@ -2163,7 +2203,7 @@ impl<G: Generation> WorkerMonitor<G> {
                 for member in members {
                     liveness::on_contact(member);
                 }
-                Some(load)
+                Ok(load)
             }
             Ok(Err(e)) => {
                 debug!("backend GetLoads failed for {}: {e}", worker.redacted_url());
@@ -2171,42 +2211,47 @@ impl<G: Generation> WorkerMonitor<G> {
                     for member in members {
                         liveness::on_contact_failed(member, "load poll");
                     }
+                    return Err(FetchFailure::Transport);
                 }
-                None
+                Err(match e.code() {
+                    tonic::Code::Unimplemented => FetchFailure::Unsupported,
+                    _ => FetchFailure::Answer,
+                })
             }
             Err(_) => {
                 debug!(
                     "backend GetLoads for {} did not answer within {LOAD_POLL_DEADLINE:?}",
                     worker.redacted_url()
                 );
-                None
+                Err(FetchFailure::Deadline)
             }
         }
     }
 
     /// One call of a host's load source for the HTTP workers of one engine,
     /// under the poll's deadline. A failure or a late answer is a missing
-    /// report. Nothing here speaks to the worker, so no contact is noted
-    /// and none is failed: an HTTP worker's health stays its health check's.
+    /// report: the source's answer, or the deadline's. Nothing here speaks
+    /// to the worker, so no contact is noted and none is failed: an HTTP
+    /// worker's health stays its health check's.
     async fn fetch_source_load(
         worker: &Arc<dyn Worker>,
         source: &dyn LoadSource,
-    ) -> Option<WorkerLoadResponse> {
+    ) -> Result<WorkerLoadResponse, FetchFailure> {
         match tokio::time::timeout(LOAD_POLL_DEADLINE, source.get_loads()).await {
-            Ok(Ok(load)) => Some(load),
+            Ok(Ok(load)) => Ok(load),
             Ok(Err(e)) => {
                 debug!(
                     "the host's load source failed for {}: {e}",
                     worker.redacted_url()
                 );
-                None
+                Err(FetchFailure::Answer)
             }
             Err(_) => {
                 debug!(
                     "the host's load source for {} did not answer within {LOAD_POLL_DEADLINE:?}",
                     worker.redacted_url()
                 );
-                None
+                Err(FetchFailure::Deadline)
             }
         }
     }
@@ -2224,11 +2269,17 @@ impl<G: Generation> WorkerMonitor<G> {
     /// worker's place: no load request goes to the worker, and its entry in
     /// the native loads memo is never written. The connector's word on the
     /// source and the source's call each stand under the poll's deadline.
+    ///
+    /// Each fetch made here is counted once in `counts` by how it ended
+    /// ([`PollCounts::fetched`]): one for the engine, or one a member where
+    /// each member reads its own gauges.
     async fn fetch_engine_loads(
         members: Vec<Arc<dyn Worker>>,
         connection_mode: ConnectionMode,
         native_loads_memo: &DashMap<String, NativeLoadsMemo>,
+        counts: &PollCounts,
     ) -> Vec<(Arc<dyn Worker>, Option<WorkerLoadResponse>)> {
+        let over_http = connection_mode == ConnectionMode::Http;
         let mut reports = Vec::with_capacity(members.len());
         // The first member asks for the engine, as it does on every wire.
         // The connector's answer stands under the poll's deadline, as its
@@ -2245,6 +2296,7 @@ impl<G: Generation> WorkerMonitor<G> {
                          whether it keeps a load source for {}",
                         first.redacted_url()
                     );
+                    counts.fetched::<()>(over_http, &Err(FetchFailure::Client));
                     return members.into_iter().map(|member| (member, None)).collect();
                 };
                 source
@@ -2254,6 +2306,8 @@ impl<G: Generation> WorkerMonitor<G> {
         match (source, connection_mode) {
             (Some(source), _) => {
                 let answer = Self::fetch_source_load(&members[0], source.as_ref()).await;
+                counts.fetched(over_http, &answer);
+                let answer = answer.ok();
                 for member in &members {
                     reports.push(
                         answer
@@ -2264,10 +2318,13 @@ impl<G: Generation> WorkerMonitor<G> {
             }
             (None, ConnectionMode::Http) => {
                 if let [worker] = members.as_slice() {
-                    reports.push(Self::fetch_http_load(worker, Some(native_loads_memo)).await);
+                    let answer = Self::fetch_http_load(worker, Some(native_loads_memo)).await;
+                    counts.fetched(over_http, &answer);
+                    reports.push(answer.ok());
                 } else {
                     match Self::fetch_native_loads(&members[0], Some(native_loads_memo)).await {
                         Some((path, load)) => {
+                            counts.fetched(over_http, &Ok(()));
                             for member in &members {
                                 liveness::on_contact(member);
                                 reports.push(Some(Self::scoped_native_load(
@@ -2279,7 +2336,9 @@ impl<G: Generation> WorkerMonitor<G> {
                         }
                         None => {
                             for member in &members {
-                                reports.push(Self::fetch_http_gauges(member).await);
+                                let answer = Self::fetch_http_gauges(member).await;
+                                counts.fetched(over_http, &answer);
+                                reports.push(answer.ok());
                             }
                         }
                     }
@@ -2287,6 +2346,8 @@ impl<G: Generation> WorkerMonitor<G> {
             }
             (None, ConnectionMode::Grpc | ConnectionMode::Zmq) => {
                 let answer = Self::fetch_backend_load(&members).await;
+                counts.fetched(over_http, &answer);
+                let answer = answer.ok();
                 for member in &members {
                     reports.push(
                         answer
@@ -2323,7 +2384,7 @@ impl<G: Generation> WorkerMonitor<G> {
                 .map(SchedulerLoadSnapshot::bound_values)
                 .sum();
             if dropped != 0 {
-                Metrics::record_engine_load_values_dropped(member.url(), dropped);
+                counts.dropped(member.url(), dropped);
             }
         }
         answers
@@ -2689,9 +2750,12 @@ async fn poll_group_once<G: Generation>(
     // here touches its entry. The others are polled: no record ever
     // (`poll`) or records gone quiet (`fallback`).
     let mut polled: Vec<Arc<dyn Worker>> = Vec::with_capacity(workers.len());
+    let on_connection = group_key.connection_mode != ConnectionMode::Http;
     for worker in &workers {
         let mode = monitor.sink.poll_mode(worker, now, interval);
-        Metrics::record_engine_load_poll(worker.url(), mode.as_str());
+        monitor
+            .poll_counts
+            .decided(worker.url(), mode, on_connection);
         if mode != PollMode::Suppressed {
             polled.push(Arc::clone(worker));
         }
@@ -2707,12 +2771,14 @@ async fn poll_group_once<G: Generation>(
             .into_iter()
             .map(|members| {
                 let native_loads_memo = Arc::clone(&monitor.native_loads_memo);
+                let counts = Arc::clone(&monitor.poll_counts);
                 let connection_mode = group_key.connection_mode;
                 async move {
                     WorkerMonitor::<G>::fetch_engine_loads(
                         members,
                         connection_mode,
                         &native_loads_memo,
+                        &counts,
                     )
                     .await
                 }
@@ -2767,6 +2833,8 @@ async fn poll_group_once<G: Generation>(
         polled.len()
     );
 
+    let rows = group_loads.iter().map(|(_, load, _)| load.loads.len());
+    monitor.poll_counts.published(rows.sum());
     monitor.publish_polled(&group_key.model_id, &polled_urls, group_loads);
 }
 
@@ -2790,6 +2858,9 @@ mod native_loads_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{tests::PushedRecord, *};
+
+    #[path = "tests/poll_counts.rs"]
+    mod poll_counts;
     use crate::{
         connection::engine::{EngineConnection, EngineConnector, ZmqLink},
         identity::basic::{ConnectionMode, WorkerLoadGuard, WorkerType},
@@ -3351,6 +3422,7 @@ mod native_loads_tests {
                 members,
                 ConnectionMode::Http,
                 &memo,
+                &PollCounts::default(),
             ));
         });
         (answers, rendered)
@@ -3498,11 +3570,16 @@ mod native_loads_tests {
         members: Vec<Arc<dyn Worker>>,
         memo: &DashMap<String, NativeLoadsMemo>,
     ) -> Vec<Option<WorkerLoadResponse>> {
-        WorkerMonitor::fetch_engine_loads(members, ConnectionMode::Http, memo)
-            .await
-            .into_iter()
-            .map(|(_, report)| report)
-            .collect()
+        WorkerMonitor::fetch_engine_loads(
+            members,
+            ConnectionMode::Http,
+            memo,
+            &PollCounts::default(),
+        )
+        .await
+        .into_iter()
+        .map(|(_, report)| report)
+        .collect()
     }
 
     /// An HTTP worker whose host keeps a load source reports the source's
@@ -3995,12 +4072,14 @@ mod native_loads_tests {
         let prompt = SourceConnector::keeping(Some(host_answer(1)));
         let beside = hosted_worker("http://engine-b.invalid:8000", &prompt, None);
         let memo = DashMap::new();
+        let counts = PollCounts::default();
 
         let (stalled, answered) = tokio::join!(
             WorkerMonitor::fetch_engine_loads(
                 vec![Arc::clone(&silent)],
                 ConnectionMode::Grpc,
-                &memo
+                &memo,
+                &counts,
             ),
             engine_fetch(vec![beside], &memo),
         );
@@ -4268,7 +4347,9 @@ mod native_loads_tests {
         let memo = DashMap::new();
         let route = NativeLoadsPath::Engine;
 
-        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo)).await;
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+            .await
+            .ok();
         assert_eq!(
             resp.as_ref()
                 .map(WorkerLoadResponse::total_waiting_uncached_tokens),
@@ -4281,7 +4362,9 @@ mod native_loads_tests {
             "first tick records the answering route"
         );
 
-        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo)).await;
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+            .await
+            .ok();
         assert_eq!(
             resp.as_ref().map(WorkerLoadResponse::total_running_reqs),
             Some(7),
@@ -4295,7 +4378,9 @@ mod native_loads_tests {
         );
         assert!(!hit.is_absent(route), "route stays eligible");
 
-        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo)).await;
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+            .await
+            .ok();
         assert_eq!(
             resp.as_ref()
                 .map(WorkerLoadResponse::total_waiting_uncached_tokens),
