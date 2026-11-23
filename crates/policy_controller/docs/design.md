@@ -379,7 +379,8 @@ pub struct WorkerRuntime {
 ```
 
 Who writes it: the health checker (status), the load monitor (overload, liveness), the request's
-load guard (the in-flight counters), request outcomes (the circuit breaker).
+load guard (the in-flight counters), request outcomes (the circuit breaker). A controller serves no
+request: the leases its store holds on file write the in-flight counter there (`HostCount`).
 
 What a decision reads of a worker: `Worker::routing_state()` gives ready, circuit breaker,
 stalled, overloaded and the in-flight count in one read.
@@ -472,7 +473,7 @@ functions.
 | Structure | Written by | Read by classic | Read by the engine |
 |---|---|---|---|
 | a model's worker list | the registry, at each membership change | yes | yes, the same list |
-| the worker object's state | health checker, load monitor, load guard, outcomes | yes | yes, once for each decision |
+| the worker object's state | health checker, load monitor, load guard (on a controller, the leases on file), outcomes | yes | yes, once for each decision |
 | `LoadSnapshot` | the load monitor | `least_load`, `cache_aware`, `power_of_two` | yes, the latest snapshot |
 | the index of cache events | the workers' event streams | `cache_aware` | yes, through `CacheIndex` |
 | the two trees | the deciding policy | `cache_aware` | **[planned]** trees of its own, same types |

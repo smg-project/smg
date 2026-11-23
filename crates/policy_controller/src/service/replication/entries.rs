@@ -41,6 +41,12 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ("WorkersStore", "changes_since", EntryReplication::Read),
     // Each replica counts the snapshots it takes.
     ("WorkersStore", "history", EntryReplication::Read),
+    // A count is of the replica's own worker object: no journal names it.
+    (
+        "WorkersStore",
+        "host_count",
+        EntryReplication::Rebuilt("each replica's holder hands its own worker objects"),
+    ),
     // The status a verdict moves is journaled as the status write it makes.
     // The streak between two moves is the prober's own count: a promoted
     // standby's prober starts it again.

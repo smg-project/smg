@@ -35,6 +35,8 @@ use crate::{
     },
 };
 
+mod host_count;
+
 fn facts(key: &str, incarnation: u64) -> WorkerFacts {
     WorkerFacts {
         key: key.to_string(),

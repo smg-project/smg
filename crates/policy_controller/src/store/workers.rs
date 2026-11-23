@@ -10,7 +10,7 @@ use crate::{
         view::{fingerprint, Role, WireModes, WorkerId},
     },
     store::{encoding::EncodeOffer, pairing::PairingDescriptor, GatewayId},
-    tracking::lease::Membership,
+    tracking::{in_flight::HostCount, lease::Membership},
 };
 
 /// The stable identity of a registration: the key (the URL today) and the
@@ -506,5 +506,15 @@ pub trait WorkersStore: Send + Sync {
     /// that never takes another's rows stays at `0`.
     fn history(&self) -> u64 {
         0
+    }
+
+    /// Takes the count the store's host keeps for the row `id`
+    /// ([`HostCount`]): the store keeps it equal to the count its leases
+    /// on file book on that worker. Whether the store keeps it: `false`
+    /// for a row that is gone. The holder of a host's worker objects hands
+    /// one as it lays a row's object. A store that books no count keeps
+    /// none, which is the default.
+    fn host_count(&self, _id: WorkerId, _count: Box<dyn HostCount>) -> bool {
+        false
     }
 }
