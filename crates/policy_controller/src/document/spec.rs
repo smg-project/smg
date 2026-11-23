@@ -234,15 +234,18 @@ pub struct Needs {
     pub text_hashes: bool,
     /// The request's size
     /// ([`RequestFacts::prompt_tokens`](crate::engine::RequestFacts::prompt_tokens)).
-    /// A stage that places by it declares this. A host that reads every
-    /// request's prompt counts it and states it always. A host that can
-    /// send a request on without reading its prompt reads the prompt where
-    /// this is declared, and may state zero where it is not: a stage that
-    /// read the size undeclared there would place every request as an
-    /// empty one, with no error. Where a request states its prompt's token
-    /// ids ahead of its body, their count stands for the size, up to the
-    /// host's cap on such a list. A plugin is shown the size where its own
-    /// row declares this, and zero otherwise, whatever the host read.
+    /// A stage that places by it declares this, and so does a stage that
+    /// prices what was sent to a worker by its size, as a `sent.tokens`
+    /// term does: a send of text alone is counted by its text's bytes. A
+    /// host that reads every request's prompt counts it and states it
+    /// always. A host that can send a request on without reading its
+    /// prompt reads the prompt where this is declared, and may state zero
+    /// where it is not: a stage that read the size undeclared there would
+    /// place every request as an empty one, with no error. Where a request
+    /// states its prompt's token ids ahead of its body, their count stands
+    /// for the size, up to the host's cap on such a list. A plugin is
+    /// shown the size where its own row declares this, and zero otherwise,
+    /// whatever the host read.
     #[serde(default)]
     pub prompt_size: bool,
     /// Load reports per worker.

@@ -8,7 +8,10 @@ pub(crate) enum CostTerm {
     InFlight,
     /// The sends to the row that no report of it shows yet.
     SentRequests,
-    /// The prompt tokens those sends stated.
+    /// The prompt tokens of those sends: the count each one stated, and
+    /// for a send that stated none the bytes of its text over four. A
+    /// stage that names it asks for each request's size
+    /// ([`Coefficients::sizes_sends`]).
     SentTokens,
 }
 
@@ -142,10 +145,20 @@ impl Coefficients {
         self.active_kv != 0.0 || self.kv_usage != 0.0 || self.running != 0.0
     }
 
+    /// Whether a term prices the sends by their tokens (`sent.tokens`). A
+    /// send of text alone is counted there by its text's bytes, which a
+    /// host that can send a request on without reading its prompt states
+    /// only where a stage asks for a request's size
+    /// ([`Needs::prompt_size`](crate::document::Needs::prompt_size)). So a
+    /// stage that holds such a term asks for it.
+    pub(crate) fn sizes_sends(&self) -> bool {
+        self.sent_tokens != 0.0
+    }
+
     /// Adds the sends' two terms to `sum` in name order: the requests,
-    /// then the tokens they stated. The one routine a pass that prices a
-    /// profile's count of sends closes a row's sum by. A pass reads the
-    /// count first, so it holds no sum across that read.
+    /// then their tokens, stated or estimated. The one routine a pass
+    /// that prices a profile's count of sends closes a row's sum by. A
+    /// pass reads the count first, so it holds no sum across that read.
     #[inline(always)]
     pub(crate) fn add_sent(&self, sum: &mut f64, sent: DispatchCounts) {
         *sum += f64::from(sent.requests) * self.sent_requests;
