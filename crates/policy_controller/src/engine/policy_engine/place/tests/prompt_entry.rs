@@ -4,14 +4,17 @@
 //! request's decisions read, and what the tree then holds to the worker the
 //! call sent to.
 
-use std::{borrow::Cow, cell::Cell};
+use std::{
+    borrow::Cow,
+    cell::{Cell, RefCell},
+};
 
 use kv_index::TokenTree;
 
 use super::*;
 use crate::engine::{
     decision_engine::TokenKey,
-    policy_engine::single::tests::{lent, Also},
+    policy_engine::single::tests::{lending, lent, Also},
 };
 
 /// A caller's entry for its prompt: the prompt's token ids under no cache
@@ -56,6 +59,35 @@ fn stating<'a>(
         admits,
         ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     }
+}
+
+/// The `cache_aware` preset under a host that lends its token tree, with
+/// [`InOrder`] in its pick's place and without its `healthy` filter: a
+/// decision names the list's workers in their order, ready or not. And the
+/// host's tree, and what the picker heard of each lease.
+fn lent_in_order() -> (&'static PolicyEngine, Arc<TokenTree>, Heard) {
+    let heard = Heard::default();
+    let kept = Arc::clone(&heard);
+    let mut stages = StageRegistry::builtin();
+    let added = stages.picker("in-order", move || {
+        Box::new(InOrder {
+            heard: Arc::clone(&kept),
+            budgets: Budgets::default(),
+            panics: false,
+        })
+    });
+    added.expect("a free name");
+    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
+    document.generation = 1;
+    let profile = document.profiles.get_mut("cache_aware");
+    let profile = profile.expect("the preset's profile");
+    profile.pick = "in-order".into();
+    profile
+        .filter
+        .retain(|filter| *filter != FilterSpec::Name("healthy".to_owned()));
+    let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+    let (engine, tree) = lending(spec.expect("the stages hold the picker"));
+    (hosted(engine), tree, heard)
 }
 
 /// The workers `tree` holds `tokens` whole for, by their ids. A page is
@@ -283,4 +315,92 @@ fn a_rule_that_panics_inside_the_lookup_passes_its_panic_to_the_caller() {
 
     let placement = engine.place(&request).expect("a placement");
     assert_eq!(holders(&tree, &tokens), [placement.id()]);
+}
+
+/// A request decided inside a lent tree asks its route's rule of a target
+/// once: the answer the lookup was given is the pick's. The first turn asks
+/// it of the worker it is placed on, and of no other. The next turn's first
+/// target is that worker, which the rule now refuses: the rule is asked of
+/// it and of the target behind it, once each, and the tree names the
+/// second alone.
+///
+/// The classic policy asks the rule of each candidate once, ahead of its
+/// policy (`model_gateway/src/routers/common/placement.rs:504-509`).
+#[test]
+fn a_rule_is_asked_of_a_target_once_a_decision() {
+    let (engine, tree) = lent("cache_aware", Also::Nothing);
+    let engine = hosted(engine);
+    let list = pool(8);
+    let members = PublishedList::new(Arc::clone(&list));
+    let asked = RefCell::new(Vec::new());
+    let refused = Cell::new(None);
+    let admits = |worker: &dyn Worker| {
+        let id = worker_id(worker);
+        asked.borrow_mut().push(id);
+        refused.get() != Some(id)
+    };
+    let first: Vec<u32> = (0..256).collect();
+    let entry = Entry::of(&first);
+    let request = stating(&members, &entry, Some(&admits));
+    let placed = engine.place(&request).expect("a placement").id();
+    assert_eq!(*asked.borrow(), [placed]);
+
+    refused.set(Some(placed));
+    asked.borrow_mut().clear();
+    let next: Vec<u32> = (0..512).collect();
+    let entry = Entry::of(&next);
+    let request = stating(&members, &entry, Some(&admits));
+    let moved = engine.place(&request).expect("a placement").id();
+    assert_eq!(entry.asked.get(), 1, "one decision");
+    assert_ne!(moved, placed);
+    assert_eq!(*asked.borrow(), [placed, moved]);
+    assert_eq!(holders(&tree, &next), [moved]);
+}
+
+/// A target that cannot be sent to is passed over inside the lookup: the
+/// tree stores the prompt for the target behind it, and the call sends
+/// there. The document here holds no `healthy` filter and names the list's
+/// workers in their order, so the decision's first target is the worker
+/// whose breaker is open.
+///
+/// The classic policy picks among the workers that can be sent to, and
+/// stores the one it selects
+/// (`model_gateway/src/policies/cache_aware.rs:1497-1499`, `:3470-3491`).
+#[test]
+fn a_target_that_cannot_be_sent_to_is_passed_over_inside_the_lookup() {
+    let (engine, tree, _) = lent_in_order();
+    let list = pool(4);
+    trip(&list[0]);
+    let members = PublishedList::new(Arc::clone(&list));
+    let tokens: Vec<u32> = (0..256).collect();
+    let entry = Entry::of(&tokens);
+    let request = stating(&members, &entry, None);
+    let placement = engine.place(&request).expect("a placement");
+    assert_eq!(entry.asked.get(), 1, "one decision, made inside the tree");
+    assert_eq!(placement.id(), worker_id(list[1].as_ref()));
+    assert_eq!(holders(&tree, &tokens), [placement.id()]);
+}
+
+/// The decision whose lookup the rule panicked in is given up by name
+/// before the panic goes on: the stage that heard its lease issued hears
+/// it released, and no lease is left behind.
+#[test]
+fn a_rule_that_panics_inside_the_lookup_leaves_no_lease_behind() {
+    let (engine, tree, heard) = lent_in_order();
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    let tokens: Vec<u32> = (0..256).collect();
+    let entry = Entry::of(&tokens);
+    let admits = |_: &dyn Worker| {
+        assert!(tokens.is_empty(), "this rule panics");
+        true
+    };
+    let request = stating(&members, &entry, Some(&admits));
+    let placed = catch_unwind(AssertUnwindSafe(|| engine.place(&request).is_ok()));
+    assert!(placed.is_err(), "the rule's panic reaches the caller");
+    assert_eq!(entry.asked.get(), 1, "one decision, made inside the tree");
+    let first = worker_id(list[0].as_ref());
+    assert_eq!(heard.lock().as_slice(), given_up(first));
+    assert!(tree.get_tenant_token_counts().is_empty());
+    assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }

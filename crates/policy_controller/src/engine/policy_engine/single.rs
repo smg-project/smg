@@ -643,6 +643,13 @@ pub(crate) mod tests {
             }
         }
         let spec = AppliedSpec::validate(&document).expect("the document validates");
+        lending(spec)
+    }
+
+    /// The engine of `spec` under a host that lends its token tree, a page
+    /// of sixteen tokens, and the host's tree: for a case that makes its
+    /// own document.
+    pub(crate) fn lending(spec: AppliedSpec) -> (PolicyEngine, Arc<TokenTree>) {
         let engine = PolicyEngine::new(spec);
         let tree = Arc::new(TokenTree::with_config(16, Default::default()));
         engine

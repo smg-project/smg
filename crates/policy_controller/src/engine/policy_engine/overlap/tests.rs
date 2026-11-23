@@ -402,6 +402,31 @@ fn the_cap_cuts_the_holders_of_one_depth_by_a_draw() {
     assert!((2..40).any(|seed| rows(seed) != first));
 }
 
+/// The lookup is kept within the list's own workers. A worker outside the
+/// list holds the request deeper than any worker of it, under a sample of
+/// one: the one place goes to the list's deepest holder. A lookup over
+/// every worker of the index would spend it on the worker outside, which
+/// is no row of the list, and name nobody.
+#[test]
+fn a_holder_outside_the_list_takes_no_place_of_the_cap() {
+    use crate::document::spec::{BestParams, PickStage};
+
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 4);
+    let hashes = hashes_of(&asked);
+    store(&index, 2, &hashes[..2]);
+    store(&index, 9, &hashes);
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    document.generation = 1;
+    let profile = document.profiles.get_mut("cache_aware");
+    let profile = profile.expect("the preset's profile");
+    profile.pick = PickStage::Best(BestParams { sample: 1 }).into();
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let bed = Bed::new(affinity, spec, 4);
+    assert_eq!(bed.holders(&asked, NOW), [(2, 2, 0)]);
+}
+
 /// With no index the record of sent prefixes speaks for every worker: a
 /// pick writes the request's prefix for its worker, a later request that
 /// begins alike names that worker by the blocks it was sent, and a worker

@@ -293,15 +293,13 @@ pub struct PlaceRequest<'a> {
     /// engine picked: a request whose first pick it admits pays one call
     /// of it, and a pair's request one for each of its two workers. A
     /// request decided inside a token tree its caller lends
-    /// ([`Prompt::entry`]) pays one more for each target up to the one it
-    /// is placed on: the rule is asked inside that decision too, ahead of
-    /// the tree's write, so the tree stores the prompt for a worker the
-    /// rule takes. A rule asked there runs inside a decision: it asks the
-    /// engine nothing, and where it panics the tree stores nothing and
-    /// the panic reaches the caller behind the decision. A rule that
-    /// answers one worker two ways within a call can leave the tree
-    /// naming another worker than the request's: that ask and the pick's
-    /// are two asks. Behind
+    /// ([`Prompt::entry`]) has the rule asked inside that decision, ahead
+    /// of the tree's write, so the tree stores the prompt for a worker the
+    /// rule takes. The pick takes that answer and asks the rule of that
+    /// worker no second time. A rule asked there runs inside a decision:
+    /// it asks the engine nothing, and where it panics the tree stores
+    /// nothing and the panic reaches the caller behind the decision.
+    /// Behind
     /// a single request's decision none of whose picks can be sent to,
     /// where it refused one that was ready, it is asked of every worker of
     /// the list, once a call, and the call decides again among the workers
@@ -415,6 +413,55 @@ pub(super) struct Made<'r, 'a> {
     /// of a lent token tree ([`RequestMaker::sends_to`]): kept for the
     /// call, which raises it again outside the decision ([`raise`]).
     panicked: OnceCell<Box<dyn Any + Send>>,
+    /// What the lookup of a lent token tree was answered on the targets it
+    /// asked ([`RequestMaker::sends_to`]): the call's pick takes these
+    /// answers, and reads none of those targets again.
+    sent: Cell<Sent>,
+}
+
+/// What a call's maker answered on a decision's targets inside the lookup
+/// of a lent token tree: each place asked, and whether the call sends to
+/// it. The lookup asks a pick's targets best first and stops at the first
+/// one the call sends to, so a pick's targets fit.
+#[derive(Clone, Copy)]
+struct Sent {
+    /// The places asked, in the order asked.
+    places: [u32; MAX_TARGETS],
+    /// How many were asked and kept.
+    asked: u8,
+    /// A bit a place kept, in that order: set where the call sends to it.
+    sendable: u8,
+    /// Whether the route's rule refused a target that was ready.
+    refused: bool,
+}
+
+impl Sent {
+    /// No target asked.
+    const NONE: Self = Self {
+        places: [0; MAX_TARGETS],
+        asked: 0,
+        sendable: 0,
+        refused: false,
+    };
+
+    /// The answer on the target at `place`: whether the call sends to it.
+    /// `None` where the lookup did not ask it.
+    fn answer(&self, place: u32) -> Option<bool> {
+        let asked = &self.places[..usize::from(self.asked)];
+        let at = asked.iter().position(|&asked| asked == place)?;
+        Some(self.sendable & (1 << at) != 0)
+    }
+
+    /// Keeps the answer on the target at `place`. A target past the room
+    /// is not kept, and the pick reads it itself.
+    fn keep(&mut self, place: u32, sendable: bool) {
+        let at = usize::from(self.asked);
+        if let Some(slot) = self.places.get_mut(at) {
+            *slot = place;
+            self.sendable |= u8::from(sendable) << at;
+            self.asked += 1;
+        }
+    }
 }
 
 impl<'r, 'a> Made<'r, 'a> {
@@ -436,6 +483,7 @@ impl<'r, 'a> Made<'r, 'a> {
             key: Cell::new(None),
             place: OnceCell::new(),
             panicked: OnceCell::new(),
+            sent: Cell::new(Sent::NONE),
         }
     }
 
@@ -620,6 +668,9 @@ impl RequestMaker for Made<'_, '_> {
     // later target is asked or stored, and the call raises it again behind
     // the decision ([`raise`]). The walk catches the rule's panic the same
     // way where it asks ([`walk`]).
+    //
+    // Each answer is kept ([`Sent`]): the call's pick takes it, so a
+    // target is read and its rule asked once a decision.
     fn sends_to(&self, target: &Target) -> bool {
         let WorkerLists::Single(list) = self.request.lists else {
             return true;
@@ -628,19 +679,26 @@ impl RequestMaker for Made<'_, '_> {
             return false;
         };
         let worker = worker.as_ref();
-        if self.panicked.get().is_some() || !ready(worker) {
+        if self.panicked.get().is_some() {
             return false;
         }
-        let Some(admits) = self.request.admits else {
-            return true;
-        };
-        match catch_unwind(AssertUnwindSafe(|| admits(worker))) {
-            Ok(admitted) => admitted,
-            Err(panic) => {
-                drop(self.panicked.set(panic));
-                false
-            }
-        }
+        let mut sent = self.sent.get();
+        let sendable = ready(worker)
+            && self.request.admits.is_none_or(|admits| {
+                match catch_unwind(AssertUnwindSafe(|| admits(worker))) {
+                    Ok(admitted) => {
+                        sent.refused |= !admitted;
+                        admitted
+                    }
+                    Err(panic) => {
+                        drop(self.panicked.set(panic));
+                        false
+                    }
+                }
+            });
+        sent.keep(target.position, sendable);
+        self.sent.set(sent);
+        sendable
     }
 }
 
@@ -1042,7 +1100,10 @@ fn raise(
 /// One ask for a single request over `list`, the list its caller lent:
 /// one decision, and the first of its targets that can be sent to
 /// ([`walk`]): ready ([`ready`]) and admitted by its route's rule. At a
-/// pick the rule is asked of a worker that is ready, and of no other.
+/// pick the rule is asked of a worker that is ready, and of no other. A
+/// target the lookup of a lent token tree asked is taken by the answer
+/// it was given there ([`Sent`]): it is read once a decision, and its
+/// rule asked once.
 /// Where none can be sent to, the decision is given up by name, its
 /// targets join the ones the call's next ask leaves out
 /// ([`Call::missed`]), and the call's next ask answers ([`Call::again`]).
@@ -1063,7 +1124,7 @@ fn single<'a>(
         raise(engine, panic, decided);
     }
     let (decided, dated) = decided.map_err(Unplaced::Refused)?;
-    let key = made.key();
+    let (key, sent) = (made.key(), made.sent.get());
     let at = |place: u32| list?.workers.get(place as usize);
     // Each arm answers its own placement: a place's holds no decision, and
     // is written without the room of one.
@@ -1096,26 +1157,26 @@ fn single<'a>(
         }
         Decided::Whole(decided, later) => {
             let now = dated.unwrap_or_else(Instant::now);
-            // Whether the rule refused a target that was ready.
-            let refused = Cell::new(false);
-            let taken = walk(
-                engine,
-                decided,
-                later,
-                now,
-                &mut call.missed,
-                |target| match at(target.position) {
-                    Some(worker) if ready(worker.as_ref()) => {
-                        if admitted(request, worker.as_ref()) {
-                            Ok((Arc::clone(worker), None))
-                        } else {
-                            refused.set(true);
-                            Err([Some(target.id), None])
+            // Whether the rule refused a target that was ready: inside
+            // the lookup of a lent tree, or here.
+            let refused = Cell::new(sent.refused);
+            let taken = walk(engine, decided, later, now, &mut call.missed, |target| {
+                let worker = at(target.position);
+                // The lookup's answer stands for a target it asked.
+                let sendable = sent.answer(target.position).unwrap_or_else(|| {
+                    worker.is_some_and(|worker| {
+                        ready(worker.as_ref()) && {
+                            let admitted = admitted(request, worker.as_ref());
+                            refused.set(refused.get() || !admitted);
+                            admitted
                         }
-                    }
+                    })
+                });
+                match worker {
+                    Some(worker) if sendable => Ok((Arc::clone(worker), None)),
                     _ => Err([Some(target.id), None]),
-                },
-            )?;
+                }
+            })?;
             let Some(mut placement) = taken else {
                 // The walk gave the decision up: the rule is asked of the
                 // list while the call holds none.
@@ -1157,8 +1218,8 @@ impl PolicyEngine {
     ///
     /// A worker the rule refuses is left out like one that is not ready.
     /// The rule is asked of a decision's picks first: a request whose
-    /// first pick it admits pays one call of it, and two where its
-    /// decision is made inside a lent token tree. Behind the first decision
+    /// first pick it admits pays one call of it, inside the decision where
+    /// that is made in a lent token tree. Behind the first decision
     /// none of whose picks can be sent to, where the rule refused one that
     /// was ready, the decision is given up and the rule is asked of every
     /// worker of the list, ready or not, once a call. The call's later
@@ -1190,9 +1251,11 @@ impl PolicyEngine {
     /// inside its lookup ([`Prompt::entry`]) asks, ahead of the write,
     /// which of its targets this call can send to
     /// ([`RequestMaker::sends_to`]): ready, and admitted by the route's
-    /// rule. The tree stores the prompt for the first such target, the one
-    /// the call then takes, and for no worker where there is none: a
-    /// decision that is given up leaves no holder in it.
+    /// rule. The tree stores the prompt for the first such target, and the
+    /// call takes that target by the same answer: a worker is read, and
+    /// its rule asked, once a decision. Where there is none the tree
+    /// stores the prompt for no worker: a decision that is given up
+    /// leaves no holder in it.
     ///
     /// A request with a pair's two lists is placed over both, a target at
     /// a time. The first target both of whose workers can be sent to is
