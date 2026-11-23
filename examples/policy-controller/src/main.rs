@@ -268,10 +268,9 @@ mod tests {
                 cell: &self.cell,
                 facts: None,
             };
-            let members = self.engine.members_of(lent);
             let request = PlaceRequest {
                 admits,
-                ..PlaceRequest::of(MODEL, WorkerLists::Single(members))
+                ..PlaceRequest::of(MODEL, WorkerLists::Single(lent))
             };
             let placement = self.engine.place(&request).ok()?;
             Some(placement.worker.url().to_owned())
