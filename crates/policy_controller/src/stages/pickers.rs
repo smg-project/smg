@@ -375,14 +375,9 @@ pub(crate) fn draw_best(mut draw: Draw, scores: &[f32], band: TieBand, out: &mut
     filled
 }
 
-/// The target that names `c`, on no pair.
+/// The target that names `c`, on no pair ([`Target::of`]).
 pub(crate) fn target_of(c: &Candidate) -> Target {
-    Target {
-        position: c.position,
-        id: c.id,
-        dp_rank: c.dp_rank,
-        pair: None,
-    }
+    Target::of(c)
 }
 
 /// The rows a draw left, handed out as it drew them.

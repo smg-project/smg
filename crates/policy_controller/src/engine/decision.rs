@@ -12,7 +12,7 @@ use crate::{
     document::spec::RulePlaced,
     engine::{
         sticky_sessions::{DecodeVerdict, SessionVerdict},
-        view::WorkerId,
+        view::{Candidate, WorkerId},
     },
 };
 
@@ -46,6 +46,45 @@ pub struct Pair {
     /// decode. The pick's own verdict ([`Pick::session_verdict`]) is the
     /// prefill side's. It is one byte the pair had spare.
     pub decode_verdict: DecodeVerdict,
+}
+
+impl Target {
+    /// The target that names `record`, on no pair: its position, its id and
+    /// its rank.
+    #[inline]
+    #[must_use]
+    pub fn of(record: &Candidate) -> Self {
+        Self {
+            position: record.position,
+            id: record.id,
+            dp_rank: record.dp_rank,
+            pair: None,
+        }
+    }
+
+    /// The pair target of `prefill` with `decode` as its decode side
+    /// ([`Pair::of`]).
+    #[must_use]
+    pub fn paired(prefill: &Candidate, decode: &Candidate) -> Self {
+        Self {
+            pair: Some(Pair::of(decode)),
+            ..Self::of(prefill)
+        }
+    }
+}
+
+impl Pair {
+    /// The decode side that names `decode`: its position in the decodes,
+    /// its id and its rank, with no verdict on a session key.
+    #[must_use]
+    pub fn of(decode: &Candidate) -> Self {
+        Self {
+            decode_position: decode.position,
+            decode_id: decode.id,
+            decode_dp_rank: decode.dp_rank,
+            decode_verdict: DecodeVerdict::NONE,
+        }
+    }
 }
 
 /// The ordered targets of a pick: the best first. For a pair the list reads
@@ -687,6 +726,47 @@ pub(crate) fn shed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::view::Role;
+
+    /// A target made of a record names the record's position, id and rank
+    /// and no pair. A pair's target names its prefill so and its decode in
+    /// the pair, with no verdict on the decode's key: the value the engine
+    /// makes where it puts a decode's target under its prefill's.
+    #[test]
+    fn a_target_names_the_records_it_is_made_of() {
+        let prefill = Candidate {
+            dp_rank: 2,
+            ..Candidate::ready(4, WorkerId(7), Role::Prefill)
+        };
+        let decode = Candidate {
+            dp_rank: 1,
+            ..Candidate::ready(6, WorkerId(9), Role::Decode)
+        };
+        let alone = Target {
+            position: 4,
+            id: WorkerId(7),
+            dp_rank: 2,
+            pair: None,
+        };
+        assert_eq!(Target::of(&prefill), alone);
+        let side = Pair {
+            decode_position: 6,
+            decode_id: WorkerId(9),
+            decode_dp_rank: 1,
+            decode_verdict: DecodeVerdict::NONE,
+        };
+        assert_eq!(Pair::of(&decode), side);
+        let pair = Target {
+            pair: Some(side),
+            ..alone
+        };
+        assert_eq!(Target::paired(&prefill, &decode), pair);
+
+        let mut targets = Targets::new();
+        targets.push(Target::of(&decode));
+        targets.pair_under(&Target::of(&prefill));
+        assert_eq!(targets.first(), Some(&pair));
+    }
 
     #[test]
     fn every_shadow_kind_takes_a_place_of_its_own_under_the_count() {
