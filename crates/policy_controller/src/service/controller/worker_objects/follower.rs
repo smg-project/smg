@@ -19,12 +19,15 @@ use crate::{
 
 /// The overload thresholds an object states for each signal its row names
 /// none for: the worker crate's two default numbers, which a gateway hands
-/// its workers too. They are this crate's own two defaults, by which the
-/// store judges under a binding whose block is on
+/// each worker of an engine too. An external row's object takes none, as a
+/// gateway's external worker takes none at its registration. They are this
+/// crate's own two defaults, by which the store judges under a binding
+/// whose block is on
 /// ([`OVERLOAD_WAITING_REQUESTS`](crate::document::spec::OVERLOAD_WAITING_REQUESTS),
 /// [`OVERLOAD_TOKEN_USAGE`](crate::document::spec::OVERLOAD_TOKEN_USAGE)):
 /// no document names a threshold.
-/// One set a worker: a registration's own values, each over these.
+/// One set a worker: a registration's own values, each over these for an
+/// engine's worker.
 ///
 /// The usage is the worker crate's 64-bit number, as an engine reports it.
 /// This crate's constant is 32 bits wide: widened, it reads just above
@@ -42,9 +45,10 @@ const OVERLOAD_DEFAULTS: OverloadThresholds = OverloadThresholds {
 /// here. The replica cannot dial a row that one gateway alone reaches: such
 /// a row's object is built with its checks off, and no probe is sent to it.
 ///
-/// Each object states its row's overload thresholds over the program's
-/// default ([`OVERLOAD_DEFAULTS`]): what a load monitor over the registry
-/// judges the worker by ([`load_monitor`](crate::worker_host::load_monitor)).
+/// The object of an engine's row states its row's overload thresholds over
+/// the program's default ([`OVERLOAD_DEFAULTS`]), and an external row's
+/// object its row's alone: what a load monitor over the registry judges
+/// the worker by ([`load_monitor`](crate::worker_host::load_monitor)).
 /// The service runs that monitor while the replica leads, and it writes
 /// each verdict on the worker's object.
 ///

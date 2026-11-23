@@ -30,7 +30,7 @@ use super::reach::{ListReach, Reach};
 use super::{
     credentials::Credentials,
     membership_writer::MembershipWriteRefused,
-    object::{builder, dial_address, status, thresholds, unchecked},
+    object::{builder, dial_address, external, status, thresholds, unchecked},
     remainder::RowRemainder,
 };
 #[cfg(feature = "in-process")]
@@ -209,9 +209,10 @@ pub struct Objects<G> {
     forgotten_at: AtomicU64,
     /// Whether the object of a host-local row is built with its checks off.
     host_local_unchecked: bool,
-    /// The overload thresholds an object built from a row states for each
-    /// signal its row names none for, where the host asked for objects with
-    /// thresholds ([`Self::with_overload_thresholds`]).
+    /// The overload thresholds an object built from an engine's row states
+    /// for each signal its row names none for, where the host asked for
+    /// objects with thresholds ([`Self::with_overload_thresholds`]). An
+    /// external row's object states its row's own alone.
     overload_defaults: Option<OverloadThresholds>,
     /// One registration that keeps its credential at a time, from its keep
     /// to the lay-again its keeper's answer asks for ([`Self::keeping`]).
@@ -262,6 +263,14 @@ impl<G> Objects<G> {
     /// own, and `defaults` for each signal the row names none for. A row
     /// whose thresholds change is laid again, so its object states the new
     /// ones.
+    ///
+    /// A row that states the external runtime takes its own alone, at its
+    /// first build and at every later one. A gateway registers an engine's
+    /// worker with its default thresholds and an external worker with none,
+    /// so its monitor judges an external worker by nothing where its
+    /// registration names nothing. A gateway's update of a worker's
+    /// properties builds the worker again with the defaults, an external
+    /// worker too: this holder does not.
     ///
     /// For a host whose own load monitor judges overload: the worker
     /// crate's monitor writes its verdict on an object by the thresholds
@@ -814,11 +823,14 @@ impl<G: Generation> Objects<G> {
             unchecked(row)
         };
         // The thresholds the host's own monitor judges the object by: the
-        // row's own, each over the host's default for its signal.
+        // row's own, each over the host's default for its signal. An
+        // external row takes no default, as a gateway's external worker
+        // takes none.
         if let Some(defaults) = self.overload_defaults {
-            worker = worker
-                .overload(thresholds(&row.facts.overload))
-                .overload_defaults(defaults);
+            worker = worker.overload(thresholds(&row.facts.overload));
+            if !external(&row.facts) {
+                worker = worker.overload_defaults(defaults);
+            }
         }
         // The registry's signal sender: the object says its connect signal
         // and each move of its liveness veto to the collector's loop.
@@ -1543,6 +1555,65 @@ mod tests {
             };
             assert_eq!(stated(&replica, B), if asked { own } else { none });
         }
+    }
+
+    /// A row that states the external runtime takes no default: its object
+    /// states the thresholds its row names and no other, a queue alone or a
+    /// usage alone, and in any spelling of the runtime's name. An engine's
+    /// row takes the default, one that names its runtime too. A gateway
+    /// registers an engine's worker with its default thresholds (its
+    /// registration workflow's `overload_defaults`) and an external worker
+    /// with none (`build_external_worker`), so until that worker's first
+    /// update its monitor judges it by nothing.
+    #[test]
+    fn an_external_rows_object_states_no_default_threshold() {
+        let defaults = OverloadThresholds {
+            waiting_requests: Some(8),
+            token_usage: Some(0.8),
+        };
+        let mut replica = Replica::new();
+        let registry = Arc::clone(replica.objects.registry());
+        replica.objects = Objects::new(registry).with_overload_thresholds(defaults);
+        let of_kind = |url, kind: &str| WorkerFacts {
+            engine_kind: kind.to_string(),
+            ..facts(url, 1)
+        };
+        replica.store.upsert(of_kind(A, "external"));
+        replica.store.upsert(WorkerFacts {
+            overload: Overload {
+                kv_usage_permille: None,
+                waiting_requests: Some(3),
+            },
+            ..of_kind(B, "external")
+        });
+        replica.store.upsert(facts(C, 1));
+        replica.store.upsert(WorkerFacts {
+            overload: Overload {
+                kv_usage_permille: Some(500),
+                waiting_requests: None,
+            },
+            ..of_kind(D, "external")
+        });
+        replica.store.upsert(of_kind(E, "vllm"));
+        replica.store.upsert(of_kind(F, "EXTERNAL"));
+        replica.follow();
+
+        let stated = |url| replica.at(url).metadata().overload;
+        let queue = OverloadThresholds {
+            waiting_requests: Some(3),
+            token_usage: None,
+        };
+        let usage = OverloadThresholds {
+            waiting_requests: None,
+            token_usage: Some(0.5),
+        };
+        let none = OverloadThresholds::default();
+        assert_eq!(stated(A), none);
+        assert_eq!(stated(B), queue, "an external row states its own alone");
+        assert_eq!(stated(D), usage, "and no default queue beside its usage");
+        assert_eq!(stated(F), none, "in any spelling of the name");
+        assert_eq!(stated(C), defaults, "an engine's row takes the default");
+        assert_eq!(stated(E), defaults, "one that names its runtime too");
     }
 
     /// The first act: by the snapshot for a row that stood before the first
