@@ -71,7 +71,7 @@ def complete(args, role):
             max_active=max_active,
             control_listen=host_port(args.host or "0.0.0.0", args.port + 10),
             receive_endpoint=f"http://{host_port(advertise_host, args.port)}",
-            max_artifact_bytes=64 * 1024**2,
+            max_artifact_bytes=388 * 1024**2,
             max_staging_bytes_per_request=256 * 1024**2,
             max_receivers=max_receivers,
             max_control_bytes=64 * 1024**2,
@@ -83,6 +83,61 @@ def complete(args, role):
     else:
         config.update(max_records=16384, max_duration_ms=122000)
     return config
+
+
+def _cfg_get(obj, key):
+    """Read `key` from either a dict-like config object or an attribute namespace."""
+    if obj is None:
+        return None
+    return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+
+def encoder_artifact_bytes(hf_config, dtype):
+    """Compute per-request preprocessed pixel-artifact budget from vision geometry and dtype."""
+    element_bytes = {"float16": 2, "bfloat16": 2, "float32": 4}.get(dtype)
+    if element_bytes is None:
+        raise ValueError("unsupported managed visual dtype")
+    vision = getattr(hf_config, "vision_config", None)
+    raw_patch = _cfg_get(vision, "patch_size")
+    if raw_patch is None:
+        patch = 16
+    elif isinstance(raw_patch, dict):
+        vals = list(raw_patch.values())
+        if not vals or any(type(v) is not int or v <= 0 for v in vals):
+            raise ValueError("unsupported managed vision geometry")
+        patch = max(vals)
+    elif isinstance(raw_patch, (list, tuple)):
+        if not raw_patch or any(type(v) is not int or v <= 0 for v in raw_patch):
+            raise ValueError("unsupported managed vision geometry")
+        patch = max(raw_patch)
+    else:
+        patch = raw_patch
+    temporal = _cfg_get(vision, "temporal_patch_size")
+    if temporal is None:
+        temporal = 2
+    merge = next(
+        (
+            v
+            for v in (_cfg_get(vision, "spatial_merge_size"), _cfg_get(vision, "merge_size"))
+            if v is not None
+        ),
+        2,
+    )
+    channels = next(
+        (
+            v
+            for v in (_cfg_get(vision, "in_chans"), _cfg_get(vision, "num_channels"))
+            if v is not None
+        ),
+        3,
+    )
+    for value in (patch, temporal, merge, channels):
+        if type(value) is not int or value <= 0:
+            raise ValueError("unsupported managed vision geometry")
+    return (
+        MAX_IMAGE_TOKENS_PER_REQUEST * channels * temporal * (patch * merge) ** 2 * element_bytes
+        + 4 * 1024**2
+    )
 
 
 def encoder_staging_bytes(hidden_size, dtype):
@@ -210,15 +265,22 @@ async def serve(config, args):
 
     model_dir, tokenizer_dir = encoder_artifact_dirs(args)
     backend = launch_runtime(args, config["max_active"])
-    server = native_task = None
+    server = native_task = shutdown_deadline = None
     stopped = asyncio.Event()
     previous = {}
     try:
         if not hasattr(backend.encoder.preprocessor, "max_artifact_bytes"):
             raise RuntimeError("native rank zero did not install the managed Rust bridge")
+        visual = getattr(backend.encoder.model, "visual", None)
+        vision_dtype = str(getattr(visual, "dtype", config["embedding_dtype"])).removeprefix(
+            "torch."
+        )
+        vision_dtype = {"half": "float16", "float": "float32"}.get(vision_dtype, vision_dtype)
+        hf_config = backend.encoder.model_config.hf_config
         config["max_staging_bytes_per_request"] = encoder_staging_bytes(
             backend.encoder.model_config.hidden_size, config["embedding_dtype"]
         )
+        config["max_artifact_bytes"] = encoder_artifact_bytes(hf_config, vision_dtype)
         config["execution_capacity"], _ = encoder_window(config)
         config["max_cpu"] = min(
             available_cpus(),
@@ -227,10 +289,7 @@ async def serve(config, args):
         )
         config["processor_options"]["model_dir"] = model_dir
         config["processor_options"]["max_inflight"] = config["max_cpu"]
-        visual = getattr(backend.encoder.model, "visual", None)
-        vision_dtype = getattr(visual, "dtype", config["embedding_dtype"])
-        config["processor_options"]["encoder_dtype"] = str(vision_dtype).removeprefix("torch.")
-        hf_config = backend.encoder.model_config.hf_config
+        config["processor_options"]["encoder_dtype"] = vision_dtype
         image_token_id = getattr(hf_config, "image_token_id", None)
         if image_token_id is None:
             image_token_id = getattr(hf_config, "image_token_index", None)
@@ -274,21 +333,40 @@ async def serve(config, args):
                     stop_task.cancel()
                     await asyncio.gather(stop_task, return_exceptions=True)
                 server.drain()
-                deadline = asyncio.get_running_loop().time() + config["shutdown_timeout_seconds"]
+                shutdown_deadline = (
+                    asyncio.get_running_loop().time() + config["shutdown_timeout_seconds"]
+                )
                 while server.active():
-                    if asyncio.get_running_loop().time() >= deadline:
+                    if asyncio.get_running_loop().time() >= shutdown_deadline:
                         await stop_followers(backend)
                         os._exit(1)
                     await asyncio.sleep(0.05)
-                await asyncio.to_thread(server.stop, 5)
+                stop_wait = max(
+                    0.5, min(5.0, shutdown_deadline - asyncio.get_running_loop().time())
+                )
+                await asyncio.to_thread(server.stop, stop_wait)
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
-        if native_task is not None:
-            native_task.cancel()
-            await asyncio.gather(native_task, return_exceptions=True)
+        if shutdown_deadline is None:
+            shutdown_deadline = (
+                asyncio.get_running_loop().time() + config["shutdown_timeout_seconds"]
+            )
+
+        def remaining():
+            return max(0.1, shutdown_deadline - asyncio.get_running_loop().time())
+
         try:
-            await backend.stop()
+            if native_task is not None:
+                native_task.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(native_task, return_exceptions=True),
+                    timeout=remaining(),
+                )
+            await asyncio.wait_for(backend.stop(), timeout=remaining())
+        except asyncio.TimeoutError:  # noqa: UP041 - Python 3.10
+            await stop_followers(backend)
+            os._exit(1)
         finally:
             await stop_followers(backend)
 

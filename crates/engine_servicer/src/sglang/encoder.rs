@@ -249,6 +249,25 @@ impl NativeEncoderLink {
     pub fn ready(&self) -> bool {
         !self.state.failed.load(Ordering::Acquire) && self.state.connected.load(Ordering::Acquire)
     }
+
+    /// Best-effort notification to wake early HTTP facade waiters when an encode fails before `execute`.
+    pub fn notify_forget(&self, rid: &str) {
+        if rid.is_empty()
+            || rid.len() > 256
+            || self.state.failed.load(Ordering::Acquire)
+            || !self.state.connected.load(Ordering::Acquire)
+        {
+            return;
+        }
+        if let Ok(header) = serde_json::to_vec(&serde_json::json!({
+            "operation": "forget",
+            "rid": rid,
+        })) {
+            let _ = self
+                .commands
+                .try_send((0, ZmqMessage::from(Bytes::from(header))));
+        }
+    }
 }
 
 impl NativeState {
@@ -435,7 +454,15 @@ impl EncoderRuntime {
         if !self.ready() {
             return Err(Status::unavailable("encoder is not ready"));
         }
-        let owner = self.admit(&request, remaining)?;
+        let owner = match self.admit(&request, remaining) {
+            Ok(owner) => owner,
+            Err(status) => {
+                if status.code() != tonic::Code::AlreadyExists {
+                    self.native.notify_forget(&request.req_id);
+                }
+                return Err(status);
+            }
+        };
         let runtime = self.clone();
         let execution_owner = owner.clone();
         #[expect(
@@ -547,6 +574,7 @@ impl EncoderRuntime {
             Err(error) => {
                 self.release_owner(&rid);
                 drop(permit);
+                self.native.notify_forget(&rid);
                 owner.result.send_replace(Some(Err(error)));
                 return;
             }
@@ -1010,6 +1038,14 @@ mod tests {
         }
     }
 
+    async fn recv_cmd(pull: &mut PullSocket) -> Value {
+        let message = tokio::time::timeout(Duration::from_secs(2), pull.recv())
+            .await
+            .expect("timed out waiting for encoder IPC command")
+            .unwrap();
+        serde_json::from_slice(&message.into_vec()[0]).unwrap()
+    }
+
     #[tokio::test]
     async fn cancel_releases_queued_immediately_and_inflight_only_after_receipt() {
         let dir = tempfile::tempdir().unwrap();
@@ -1058,11 +1094,10 @@ mod tests {
                     .await
             }
         });
-        let exec1: Value =
-            serde_json::from_slice(&pull.recv().await.unwrap().into_vec()[0]).unwrap();
+        let exec1 = recv_cmd(&mut pull).await;
         assert_eq!(exec1["operation"], "execute");
 
-        // Queued request cancelled before execution releases immediately with no IPC.
+        // Queued request cancelled before execution releases immediately and notifies Python.
         let h2 = tokio::spawn({
             let rt = runtime.clone();
             async move {
@@ -1075,11 +1110,13 @@ mod tests {
         h2.abort();
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(runtime.loads(), (1, 0));
+        let forget2 = recv_cmd(&mut pull).await;
+        assert_eq!(forget2["operation"], "forget");
+        assert_eq!(forget2["rid"], "req-2");
 
         // Cancelling in-flight req-1 sends cancel wakeup but retains slot until released=true.
         h1.abort();
-        let cancel1: Value =
-            serde_json::from_slice(&pull.recv().await.unwrap().into_vec()[0]).unwrap();
+        let cancel1 = recv_cmd(&mut pull).await;
         assert_eq!(cancel1["operation"], "cancel");
         assert_eq!(cancel1["rid"], "req-1");
         let reply_c =
@@ -1195,15 +1232,13 @@ mod tests {
                     .await
             }
         });
-        let exec: Value =
-            serde_json::from_slice(&pull.recv().await.unwrap().into_vec()[0]).unwrap();
+        let exec = recv_cmd(&mut pull).await;
         assert_eq!(exec["operation"], "execute");
 
         // Cancel the RPC; leave BOTH cancel and execute unacknowledged to verify the
         // timeout covers a wedged cancel handler as well as a wedged execute batch.
         handle.abort();
-        let cancel: Value =
-            serde_json::from_slice(&pull.recv().await.unwrap().into_vec()[0]).unwrap();
+        let cancel = recv_cmd(&mut pull).await;
         assert_eq!(cancel["operation"], "cancel");
 
         for _ in 0..50 {

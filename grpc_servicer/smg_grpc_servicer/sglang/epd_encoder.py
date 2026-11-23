@@ -13,6 +13,9 @@ from urllib.parse import urlsplit
 import grpc
 
 ARTIFACT_KEY = "__smg_rust_encoder_artifact_v1"
+MAX_RECEIVER_HTTP_BODY_BYTES = 256 * 1024
+MAX_ABANDONED_RIDS = 4096
+ABANDONED_TTL_SECONDS = 125.0
 _ROUTES = {
     "scheduler_receive_meta_data": "metadata",
     "scheduler_receive_url": "register",
@@ -255,8 +258,34 @@ class NativeEncoder:
         self.config, self.backend = config, backend
         self.entries = {}
         self.waiters = {}
+        self.abandoned = {}
         self.closed = False
         self.submitter = OwnedBatchSubmitter(backend.scheduler)
+
+    def _mark_abandoned(self, rid):
+        if not isinstance(rid, str) or not 0 < len(rid) <= 512:
+            return
+        now = time.monotonic()
+        for key in list(self.abandoned):
+            if self.abandoned[key] <= now:
+                del self.abandoned[key]
+            else:
+                break
+        self.abandoned.pop(rid, None)
+        while len(self.abandoned) >= MAX_ABANDONED_RIDS:
+            self.abandoned.pop(next(iter(self.abandoned)))
+        self.abandoned[rid] = now + ABANDONED_TTL_SECONDS
+        for waiter in self.waiters.pop(rid, ()):
+            waiter.set()
+
+    def _is_abandoned(self, rid):
+        expiry = self.abandoned.get(rid)
+        if expiry is None:
+            return False
+        if expiry <= time.monotonic():
+            self.abandoned.pop(rid, None)
+            return False
+        return True
 
     async def _receiver_control(self, entry, operation):
         """Race a receiver control future against entry cancellation and clean up on exit."""
@@ -279,6 +308,11 @@ class NativeEncoder:
         entry = self.entries.get(rid)
         if entry is None:
             require(not self.closed, "encoder shutting down", grpc.StatusCode.CANCELLED)
+            require(
+                not self._is_abandoned(rid),
+                "native operation aborted before execution",
+                grpc.StatusCode.CANCELLED,
+            )
             event = asyncio.Event()
             self.waiters.setdefault(rid, []).append(event)
             try:
@@ -293,6 +327,12 @@ class NativeEncoder:
                     if not pending:
                         del self.waiters[rid]
             entry = self.entries.get(rid)
+            if entry is None:
+                require(
+                    not self._is_abandoned(rid),
+                    "native operation aborted before execution",
+                    grpc.StatusCode.CANCELLED,
+                )
         require(entry is not None, "native operation is not registered")
         require(not entry.abort_requested, "native part closed", grpc.StatusCode.CANCELLED)
         require(
@@ -404,6 +444,11 @@ class NativeEncoder:
         entry.sends[key] = (dict(request), task)
         return await asyncio.shield(task)
 
+    def forget(self, rid):
+        """Wake early receiver waiters when Rust fails a request before dispatching execute."""
+        if rid not in self.entries:
+            self._mark_abandoned(rid)
+
     async def cancel(self, rid):
         """Wake and abandon an active native encode entry without releasing its slot prematurely."""
         entry = self.entries.get(rid)
@@ -413,6 +458,8 @@ class NativeEncoder:
             if entry.cleanup is None:
                 with entry.retain(cancelling=True):
                     await self.backend.encoder.abandon_request(rid)
+        else:
+            self._mark_abandoned(rid)
 
     async def execute(self, command, artifact):
         """Run one Rust-preprocessed artifact through native GPU encoding, transfer, and release."""
@@ -424,6 +471,7 @@ class NativeEncoder:
         remaining = command["remaining_ms"] / 1000
         require(0 < remaining <= 122, "invalid native deadline")
         entry = NativeEntry(time.monotonic() + remaining, rid, prefill_host=command["prefill_host"])
+        self.abandoned.pop(rid, None)
         self.entries[rid] = entry
         for waiter in self.waiters.pop(rid, ()):
             waiter.set()
@@ -499,12 +547,15 @@ class NativeEncoder:
         self.waiters.clear()
 
     async def dispatch(self, command, artifact):
-        """Route one sequenced IPC command from Rust (`execute` or `cancel`)."""
+        """Route one sequenced IPC command from Rust (`execute`, `cancel`, or `forget`)."""
         operation = command["operation"]
         if operation == "execute":
             return await self.execute(command, artifact)
         if operation == "cancel":
             await self.cancel(command["rid"])
+            return None
+        if operation == "forget":
+            self.forget(command["rid"])
             return None
         raise ValueError("unknown native encoder operation")
 
@@ -515,7 +566,10 @@ async def _start_http_facade(owner, config):
 
     host, port_str = config["http_listen"].rsplit(":", 1)
     host = host.strip("[]")
-    max_body = config["max_control_bytes"]
+    max_body = min(
+        config.get("max_http_body_bytes", MAX_RECEIVER_HTTP_BODY_BYTES),
+        MAX_RECEIVER_HTTP_BODY_BYTES,
+    )
     slots = asyncio.Semaphore(config.get("max_http_connections", 528))
 
     async def handle_route(request):
@@ -590,19 +644,24 @@ async def serve_native(config, backend):
             frames.clear()
             return
         command = json.loads(frames[0])
-        reply = {"sequence": command["sequence"]}
+        sequence = command.get("sequence")
+        reply = {"sequence": sequence} if sequence is not None else None
         try:
-            reply["result"] = await owner.dispatch(command, frames[1] if len(frames) == 2 else b"")
+            result = await owner.dispatch(command, frames[1] if len(frames) == 2 else b"")
+            if reply is not None:
+                reply["result"] = result
         except (Exception, asyncio.CancelledError) as error:
-            reply["error"] = _err(error)
-            if isinstance(error, Rejected):
-                reply["error_code"] = error.code.value[0]
-            elif isinstance(error, asyncio.CancelledError):
-                reply["error_code"] = 1
-            elif isinstance(error, (TimeoutError, asyncio.TimeoutError)):
-                reply["error_code"] = 4
+            if reply is not None:
+                reply["error"] = _err(error)
+                if isinstance(error, Rejected):
+                    reply["error_code"] = error.code.value[0]
+                elif isinstance(error, asyncio.CancelledError):
+                    reply["error_code"] = 1
+                elif isinstance(error, (TimeoutError, asyncio.TimeoutError)):
+                    reply["error_code"] = 4
         frames.clear()
-        await publish(reply)
+        if reply is not None:
+            await publish(reply)
 
     try:
         # Signal Rust readiness only after HTTP facade is listening and both IPC sockets are connected.
@@ -619,12 +678,32 @@ async def serve_native(config, backend):
     finally:
         stopping.set_result(None)
         owner.close()
-        await asyncio.gather(
-            *(owner.cancel(rid) for rid in list(owner.entries)), return_exceptions=True
-        )
-        await asyncio.gather(*tasks, return_exceptions=True)
-        if runner is not None:
-            await runner.cleanup()
-        commands.close()
-        events.close()
-        context.term()
+        deadline = asyncio.get_running_loop().time() + config.get("shutdown_timeout_seconds", 30)
+
+        def remaining():
+            return max(0.0, deadline - asyncio.get_running_loop().time())
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *(owner.cancel(rid) for rid in list(owner.entries)),
+                    return_exceptions=True,
+                ),
+                timeout=remaining(),
+            )
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=remaining(),
+            )
+        except asyncio.TimeoutError:  # noqa: UP041 - Python 3.10
+            for task in list(tasks):
+                task.cancel()
+        finally:
+            if runner is not None:
+                try:
+                    await asyncio.wait_for(runner.cleanup(), timeout=max(0.05, remaining()))
+                except asyncio.TimeoutError:  # noqa: UP041 - Python 3.10
+                    pass
+            commands.close()
+            events.close()
+            context.term()

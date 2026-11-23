@@ -1517,26 +1517,50 @@ async fn managed_harness(role: &str) -> Harness {
 
 #[test]
 fn prepared_native_labels_follow_the_engine_capability() {
-    use smg_grpc_client::sglang_managed::{proto, Limits};
+    use smg_grpc_client::sglang_managed::{proto, Limits, VERSION};
 
     let mut config = managed_test_config("decode");
     let binding = prepared_binding("p", "d");
-    let mut manifest = proto::PreparedDecodeInput::default();
     for supported in [true, false] {
         config.disable_routing_labels = !supported;
         let runtime =
             ManagedNativeRuntime::new(Arc::new(|| None), &config, Limits::default()).unwrap();
-        manifest.images = vec![proto::ImageMetadata {
-            routing_label: Some("label".into()),
+        let manifest = proto::PreparedDecodeInput {
+            version: VERSION,
+            binding: Some(binding.clone()),
+            unpadded_ids: vec![1, 151_655, 2],
+            padded_ids: vec![1, 1_000_001, 2],
+            images: vec![proto::ImageMetadata {
+                occurrence: 0,
+                full_identity: vec![7; 32],
+                pad_values: vec![1_000_001],
+                offsets: vec![proto::Offset { start: 1, end: 1 }],
+                native_format: 1,
+                grid_thw: vec![1, 1, 1],
+                routing_label: Some("label".into()),
+                native_hash: 1,
+                ..Default::default()
+            }],
+            mrope_positions: Some(proto::IntegerArray {
+                shape: vec![3, 3],
+                values: vec![0; 9],
+            }),
+            mrope_delta: Some(proto::IntegerArray {
+                shape: vec![1],
+                values: vec![0],
+            }),
+            image_token_id: 151_655,
             ..Default::default()
-        }];
-        let error = runtime.validate_layout(&manifest, &binding).unwrap_err();
-        assert_eq!(
-            error
+        };
+        if supported {
+            runtime.validate_layout(&manifest, &binding).unwrap();
+        } else {
+            let error = runtime.validate_layout(&manifest, &binding).unwrap_err();
+            assert_eq!(error.code(), Code::FailedPrecondition);
+            assert!(error
                 .message()
-                .contains("does not support media routing labels"),
-            !supported
-        );
+                .contains("does not support media routing labels"));
+        }
     }
 }
 
@@ -1544,8 +1568,6 @@ fn prepared_native_labels_follow_the_engine_capability() {
 /// admission, and only sends native Abort after first output proves handoff progressed.
 #[tokio::test]
 async fn prepared_decode_cancel_grace_quarantines_and_defers_abort_until_first_output() {
-    use smg_grpc_client::sglang_managed::Limits;
-    let config = managed_test_config("decode");
     let Harness {
         server,
         mut engine_in,
@@ -1554,16 +1576,8 @@ async fn prepared_decode_cancel_grace_quarantines_and_defers_abort_until_first_o
         _dir,
         ..
     } = managed_harness("decode").await;
-    let client_engine = server.state.shared.engine().unwrap().clone();
-    let runtime = Arc::new(
-        ManagedNativeRuntime::new(
-            Arc::new(move || Some(client_engine.clone())),
-            &config,
-            Limits::default(),
-        )
-        .unwrap()
-        .with_abort_grace(Duration::from_millis(80)),
-    );
+    let runtime = Arc::clone(server.state.prepared.get().unwrap());
+    runtime.set_abort_grace(Duration::from_millis(80));
     let rid = "silent-prepared-decode";
     let binding = prepared_binding("p-rid", rid);
     let (registration, cancellation) = server.state.shared.registry.register(rid).unwrap();
@@ -1594,6 +1608,18 @@ async fn prepared_decode_cancel_grace_quarantines_and_defers_abort_until_first_o
     assert!(verdict.message().contains("worker quarantined"));
     assert!(!runtime.ready());
     assert_eq!(server.state.shared.registry.active(), 1);
+    assert_scheduler_idle(&mut engine_in).await;
+    // Ordinary text admission must also be refused during quarantine without reaching the scheduler.
+    let blocked = client
+        .generate(generate_request(
+            "blocked-during-quarantine",
+            false,
+            Vec::new(),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(blocked.code(), Code::Unavailable);
+    assert!(blocked.message().contains("unhealthy"));
     assert_scheduler_idle(&mut engine_in).await;
     // First native output proves handoff progressed; only now may D send Abort.
     send(&mut engine_out, &batch(rid, vec![7], 1, None, None)).await;
@@ -1920,7 +1946,7 @@ async fn prepared_full_queue_delivers_quarantine_error_after_buffered_chunks() {
     for i in 1..=8 {
         send(&mut engine_out, &batch(rid, vec![200 + i], i, None, None)).await;
     }
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    wait_until(|| runtime.output_queued(rid) == 8).await;
     // Trigger server-side cancellation while the 8-slot queue is still full, and do NOT
     // send a native terminal receipt so abort_grace expires and quarantines the worker.
     server.state.shared.registry.cancel_all().unwrap();
@@ -5284,4 +5310,107 @@ async fn prepared_prefill_abort_before_layout_and_decode_generate_roundtrip() {
     );
     wait_until(|| server.state.shared.registry.active() == 0).await;
     server.stop(Duration::from_secs(5)).unwrap();
+}
+
+#[tokio::test]
+async fn prepared_publish_layout_ignores_mismatched_binding_and_cancels_matching_invalid() {
+    use prost::Message;
+    use smg_grpc_client::sglang_managed::{proto, VERSION};
+
+    let Harness {
+        server,
+        mut engine_in,
+        mut engine_out,
+        _dir,
+        ..
+    } = managed_harness("prefill").await;
+    let runtime = server.state.prepared.get().unwrap();
+    let rid = "layout-binding-isolation";
+    let active_binding = prepared_binding(rid, "attempt-2");
+    let (registration, cancellation) = server.state.shared.registry.register(rid).unwrap();
+    let mut request = generate_request(rid, true, Vec::new());
+    request.tokenized.as_mut().unwrap().original_text = "image prompt".into();
+    let mut output = runtime
+        .submit(
+            PreparedRequest {
+                binding: active_binding.clone(),
+                request,
+                external: Some(("http://127.0.0.1:5000".into(), 1)),
+                manifest: None,
+                deadline: Instant::now() + Duration::from_secs(60),
+            },
+            registration,
+            cancellation,
+        )
+        .unwrap();
+    assert_eq!(recv_add(&mut engine_in).bounded().await.rid, rid);
+
+    let make_manifest = |binding: InputBinding, pad_values: Vec<i64>| proto::PreparedDecodeInput {
+        version: VERSION,
+        binding: Some(binding),
+        unpadded_ids: vec![1, 151_655, 2],
+        padded_ids: vec![1, 1_000_001, 2],
+        images: vec![proto::ImageMetadata {
+            occurrence: 0,
+            full_identity: vec![7; 32],
+            pad_values,
+            offsets: vec![proto::Offset { start: 1, end: 1 }],
+            native_format: 1,
+            grid_thw: vec![1, 1, 1],
+            native_hash: 1,
+            ..Default::default()
+        }],
+        image_token_id: 151_655,
+        ..Default::default()
+    };
+
+    // Retired/foreign binding or malformed layout must NOT cancel the active owner.
+    let stale_err = runtime
+        .publish_layout(
+            rid,
+            &make_manifest(prepared_binding(rid, "attempt-1"), vec![1_000_001]).encode_to_vec(),
+        )
+        .unwrap_err();
+    assert_eq!(stale_err.code(), Code::InvalidArgument);
+    let malformed_err = runtime.publish_layout(rid, b"\xff\xff\xff").unwrap_err();
+    assert_eq!(malformed_err.code(), Code::DataLoss);
+    assert_scheduler_idle(&mut engine_in).await;
+
+    // Matching-binding invalid layout DOES cancel the active attempt so P aborts promptly.
+    let invalid_err = runtime
+        .publish_layout(
+            rid,
+            &make_manifest(active_binding, Vec::new()).encode_to_vec(),
+        )
+        .unwrap_err();
+    assert_eq!(invalid_err.code(), Code::InvalidArgument);
+    assert_eq!(recv_abort(&mut engine_in).bounded().await, vec![rid]);
+    send(&mut engine_out, &batch(rid, vec![], 0, Some("abort"), None)).await;
+    let err = tokio::time::timeout(Duration::from_secs(1), output.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(err.message().contains("aborted"));
+    wait_until(|| server.state.shared.registry.active() == 0).await;
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn prepared_push_terminal_error_keeps_first_error_after_partial_drain() {
+    use tokio::sync::mpsc::{self, error::TryRecvError};
+
+    let (tx, mut rx) = mpsc::channel(2);
+    let slot = Mutex::new(None);
+    tx.try_send(Ok(sg::GenerateResponse::default())).unwrap();
+    tx.try_send(Ok(sg::GenerateResponse::default())).unwrap();
+    native::push_terminal_error(&tx, &slot, tonic::Status::internal("first cause"));
+    assert!(rx.try_recv().is_ok());
+    native::push_terminal_error(&tx, &slot, tonic::Status::unavailable("later abort"));
+    drop(tx);
+    assert!(rx.try_recv().unwrap().is_ok());
+    assert!(matches!(rx.try_recv(), Err(TryRecvError::Disconnected)));
+    let stored = slot.into_inner().unwrap().expect("first error retained");
+    assert_eq!(stored.code(), Code::Internal);
+    assert_eq!(stored.message(), "first cause");
 }

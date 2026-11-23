@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     task::{Context, Poll},
@@ -125,6 +125,8 @@ struct Entry {
     cancel: watch::Sender<bool>,
     layout: mpsc::Sender<Vec<u8>>,
     binding: proto::InputBinding,
+    #[cfg(test)]
+    output_observer: mpsc::WeakSender<Result<sglang_proto::GenerateResponse, Status>>,
     _registration: Registration,
 }
 
@@ -135,7 +137,7 @@ pub struct ManagedNativeRuntime {
     max_entries: usize,
     limits: Limits,
     disable_routing_labels: bool,
-    abort_grace: Duration,
+    abort_grace_ms: AtomicU64,
     metadata_failed: AtomicBool,
     quarantined: AtomicUsize,
 }
@@ -154,7 +156,8 @@ impl ManagedNativeRuntime {
         Ok(socket)
     }
 
-    /// One reader per P instance; malformed events cancel their owner instead of hanging D.
+    /// One reader per P instance; malformed/oversized events cannot be attributed safely and are dropped
+    /// (bounded by each owner's prepared deadline), while binding-matched invalid layouts cancel their owner.
     pub async fn read_metadata(&self, mut socket: PullSocket) -> Result<(), Status> {
         let result = self.read_metadata_inner(&mut socket).await;
         self.metadata_failed.store(true, Ordering::Release);
@@ -180,11 +183,6 @@ impl ManagedNativeRuntime {
                 .map_err(|_| Status::data_loss("invalid native metadata rid"))?;
             if let Err(error) = self.publish_layout(rid, &frames[1]) {
                 tracing::warn!(rid, %error, "native managed metadata refused");
-                if let Ok(entries) = self.entries.lock() {
-                    if let Some(entry) = entries.get(rid) {
-                        let _ = entry.cancel.send(true);
-                    }
-                }
             }
         }
     }
@@ -204,16 +202,32 @@ impl ManagedNativeRuntime {
             max_entries: config.max_records,
             limits,
             disable_routing_labels: config.disable_routing_labels,
-            abort_grace: DEFAULT_ABORT_GRACE,
+            abort_grace_ms: AtomicU64::new(DEFAULT_ABORT_GRACE.as_millis() as u64),
             metadata_failed: AtomicBool::new(false),
             quarantined: AtomicUsize::new(0),
         })
     }
 
     #[cfg(test)]
-    pub(crate) fn with_abort_grace(mut self, grace: Duration) -> Self {
-        self.abort_grace = grace;
+    pub(crate) fn with_abort_grace(self, grace: Duration) -> Self {
+        self.abort_grace_ms
+            .store(grace.as_millis() as u64, Ordering::Release);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_abort_grace(&self, grace: Duration) {
+        self.abort_grace_ms
+            .store(grace.as_millis() as u64, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn output_queued(&self, rid: &str) -> usize {
+        self.entries
+            .lock()
+            .ok()
+            .and_then(|entries| entries.get(rid).and_then(|e| e.output_observer.upgrade()))
+            .map_or(0, |tx| tx.max_capacity() - tx.capacity())
     }
 
     pub(crate) fn validate_layout(
@@ -234,7 +248,9 @@ impl ManagedNativeRuntime {
         validate_manifest(manifest, binding, self.limits)
     }
 
-    /// Registry lookup precedes protobuf decoding; no early unregistered event is retained.
+    /// Registry lookup and binding verification precede cancellation: oversized, malformed, or
+    /// mismatched-binding frames never cancel an unrelated attempt (its prepared deadline bounds D).
+    /// Only validation or delivery failures whose binding matches the registered attempt cancel it.
     pub fn publish_layout(&self, rid: &str, bytes: &[u8]) -> Result<(), Status> {
         if bytes.len() > self.limits.manifest_bytes {
             return Err(Status::resource_exhausted(
@@ -255,7 +271,15 @@ impl ManagedNativeRuntime {
         }
         let manifest = proto::PreparedDecodeInput::decode(bytes)
             .map_err(|_| Status::data_loss("malformed native layout"))?;
-        self.validate_layout(&manifest, &entry.binding)?;
+        if manifest.binding.as_ref() != Some(&entry.binding) {
+            return Err(Status::invalid_argument(
+                "managed manifest binding mismatch",
+            ));
+        }
+        if let Err(error) = self.validate_layout(&manifest, &entry.binding) {
+            let _ = entry.cancel.send(true);
+            return Err(error);
+        }
         entry.layout.try_send(bytes.to_vec()).map_err(|_| {
             let _ = entry.cancel.send(true);
             Status::resource_exhausted("native layout channel full or closed")
@@ -299,12 +323,15 @@ impl ManagedNativeRuntime {
                 cancel: cancel.clone(),
                 layout,
                 binding: input.binding.clone(),
+                #[cfg(test)]
+                output_observer: output.downgrade(),
                 _registration: registration,
             },
         );
         drop(entries);
         let runtime = Arc::clone(self);
         let task_terminal_error = Arc::clone(&terminal_error);
+        let abort_grace = Duration::from_millis(runtime.abort_grace_ms.load(Ordering::Acquire));
         #[expect(
             clippy::disallowed_methods,
             reason = "native task retains submission through acknowledged termination"
@@ -318,7 +345,7 @@ impl ManagedNativeRuntime {
                 output,
                 task_terminal_error,
                 &runtime.quarantined,
-                runtime.abort_grace,
+                abort_grace,
             );
             tokio::pin!(work);
             let (safe, was_quarantined) = tokio::select! {
@@ -395,15 +422,20 @@ impl Stream for PreparedOutputStream {
     }
 }
 
-fn push_terminal_error(
+pub(crate) fn push_terminal_error(
     output: &mpsc::Sender<Result<sglang_proto::GenerateResponse, Status>>,
     terminal_error: &Mutex<Option<Status>>,
     status: Status,
 ) {
+    let Ok(mut slot) = terminal_error.lock() else {
+        let _ = output.try_send(Err(status));
+        return;
+    };
+    if slot.is_some() {
+        return;
+    }
     if let Err(mpsc::error::TrySendError::Full(Err(status))) = output.try_send(Err(status)) {
-        if let Ok(mut slot) = terminal_error.lock() {
-            slot.get_or_insert(status);
-        }
+        *slot = Some(status);
     }
 }
 
