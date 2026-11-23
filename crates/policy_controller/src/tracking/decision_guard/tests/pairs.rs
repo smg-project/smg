@@ -25,7 +25,7 @@ use crate::{
         decision::{Decision, ShadowKind, Target},
         decision_engine::{
             DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused, HeldDecision,
-            Plain, Request, RequestMaker, SweepOutcome, TokenKey, WorkerLists,
+            Plain, Request, RequestMaker, TokenKey, WorkerLists,
         },
         framework::{EncodeItems, EncodePlaced, EncoderFacts},
         list_cell::tests::PublishedList,
@@ -181,8 +181,8 @@ impl DecisionEngine for Door<'_> {
         DecisionEngine::say(self.engine, gateway, held, said, now);
     }
 
-    fn sweep(&self, now: Instant) -> SweepOutcome {
-        DecisionEngine::sweep(self.engine, now)
+    fn sweep(&self, now: Instant) {
+        DecisionEngine::sweep(self.engine, now);
     }
 
     fn with_spec<R>(&self, read: impl FnOnce(&AppliedSpec) -> R) -> R {

@@ -869,7 +869,7 @@ deleted in the steps behind it (sections 10.2 and 10.3). A controller answers a 
 `Busy` until they are decided over worker lists (decision 5).
 
 The types the two engines shared stay where they were moved ahead of the deletion: `Request`,
-`DecideOutcome`, `DecisionRefused`, `DecodeRefused` and `SweepOutcome` in the trait's file, and
+`DecideOutcome`, `DecisionRefused` and `DecodeRefused` in the trait's file, and
 `Said` (section 6) beside `Lease`. `GatewayId` is still defined in the store.
 
 ### 5.8 What changes in the kept engine **[planned]**

@@ -33,7 +33,7 @@ use super::{
 };
 use crate::{
     engine::{
-        decision_engine::{DecisionEngine, RequestMaker, SweepOutcome},
+        decision_engine::{DecisionEngine, RequestMaker},
         framework::release,
     },
     load::SignalCells,
@@ -265,7 +265,7 @@ impl PolicyEngine {
 
     /// The task's loop. `upkeep` is the step it runs once a second under
     /// a catch of its own: [`Self::run`] hands the engine's own.
-    async fn run_with(&self, upkeep: impl Fn(Instant) -> SweepOutcome) {
+    async fn run_with(&self, upkeep: impl Fn(Instant)) {
         // The first upkeep runs at this poll, below, and the first tick is
         // due a second behind it. A tick due at once still waits on the
         // runtime's timer: a host that spawned the task and yielded once
@@ -307,7 +307,7 @@ impl PolicyEngine {
     /// the named values of the report a telling tells.
     fn step(
         &self,
-        upkeep: &impl Fn(Instant) -> SweepOutcome,
+        upkeep: &impl Fn(Instant),
         members: &mut Option<Follow>,
         told: &mut SignalCells,
         taken: &mut u64,
