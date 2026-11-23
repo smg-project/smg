@@ -52,6 +52,29 @@ impl RouterConfig {
         self.routing_settings().policy_document_in_force(&defaults)
     }
 
+    /// Whether the policy engine places this process's requests. It does
+    /// where the policy controller is on, with one exception: a gateway
+    /// whose every router is one provider's
+    /// ([`RoutingSettings::provider_alone`]) places its requests by no
+    /// routing policy. There the option moves nothing: no engine runs, the
+    /// classic policies stay, and the start says so in one log line.
+    ///
+    /// Every reader of the option asks here: the start, the policy
+    /// registry, the pairing mode in force and the validator's refusal of
+    /// a document.
+    ///
+    /// A supplied document is never dropped in silence. Beside one the
+    /// answer is yes under a provider's mode alone too, and the start then
+    /// refuses the document by the mode's name
+    /// ([`Self::policy_document_in_force`]). So a yes may still end in a
+    /// refused start.
+    pub(crate) fn policy_engine_decides(&self) -> bool {
+        self.policy_controller
+            && (self.policy_spec.is_some()
+                || self.policy_spec_path.is_some()
+                || self.routing_settings().provider_alone().is_none())
+    }
+
     /// How strictly this gateway pairs a prefill with a decode. Where the
     /// policy controller runs a supplied document, it is that document's
     /// `plans.pd-pair.pairing`: the engine pairs within the classes the
@@ -61,11 +84,13 @@ impl RouterConfig {
     /// mean states too.
     pub(crate) fn pd_pairing_in_force(&self) -> PdPairingMode {
         match &self.policy_spec {
-            Some(document) if self.policy_controller => match document.plans.pd_pair.pairing {
-                Pairing::Off => PdPairingMode::Off,
-                Pairing::Lenient => PdPairingMode::Lenient,
-                Pairing::Strict => PdPairingMode::Strict,
-            },
+            Some(document) if self.policy_engine_decides() => {
+                match document.plans.pd_pair.pairing {
+                    Pairing::Off => PdPairingMode::Off,
+                    Pairing::Lenient => PdPairingMode::Lenient,
+                    Pairing::Strict => PdPairingMode::Strict,
+                }
+            }
             _ => self.pd_pairing_mode,
         }
     }
@@ -756,6 +781,96 @@ mod tests {
             mode,
             ..RouterConfig::default()
         }
+    }
+
+    /// The one test every reader of the option asks. The policy engine
+    /// places the requests of every configuration that turns the policy
+    /// controller on, a provider's mode alone apart: under the multi-router
+    /// setting that mode has the regular document. With the option off the
+    /// engine decides nowhere.
+    #[test]
+    fn the_policy_engine_decides_under_the_option_save_in_a_providers_mode_alone() {
+        let modes = [
+            RoutingMode::Regular {
+                worker_urls: Vec::new(),
+            },
+            RoutingMode::PrefillDecode {
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: Vec::new(),
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            RoutingMode::OpenAI {
+                worker_urls: Vec::new(),
+            },
+            RoutingMode::Anthropic {
+                worker_urls: Vec::new(),
+            },
+            RoutingMode::Gemini {
+                worker_urls: Vec::new(),
+            },
+        ];
+        for mode in modes {
+            let provider = matches!(
+                mode,
+                RoutingMode::OpenAI { .. }
+                    | RoutingMode::Anthropic { .. }
+                    | RoutingMode::Gemini { .. }
+            );
+            for enable_igw in [false, true] {
+                let on = RouterConfig {
+                    policy_controller: true,
+                    enable_igw,
+                    ..config_of(mode.clone())
+                };
+                let row = format!("{} with enable_igw = {enable_igw}", on.mode_type());
+                assert_eq!(on.policy_engine_decides(), !provider || enable_igw, "{row}");
+                let off = RouterConfig {
+                    policy_controller: false,
+                    ..on
+                };
+                assert!(!off.policy_engine_decides(), "{row}, the option off");
+            }
+        }
+    }
+
+    /// A supplied document is never dropped in silence. Beside one the
+    /// answer is yes under a provider's mode alone too, and the document in
+    /// force is refused there by the mode's name. The path of a document
+    /// that was never loaded stands for a document.
+    #[test]
+    fn a_supplied_document_keeps_the_option_in_force_in_a_providers_mode_alone() {
+        let alone = RouterConfig {
+            policy_controller: true,
+            ..config_of(RoutingMode::OpenAI {
+                worker_urls: Vec::new(),
+            })
+        };
+        assert!(!alone.policy_engine_decides());
+
+        let supplied = RouterConfig {
+            policy_spec: Some(preset("round_robin")),
+            ..alone.clone()
+        };
+        assert!(supplied.policy_engine_decides());
+        assert!(matches!(
+            supplied.policy_document_in_force(),
+            Err(RoutingSettingsError::UnsupportedSetting { setting: "mode", value, .. }) if value == "openai"
+        ));
+
+        let named = RouterConfig {
+            policy_spec_path: Some("routing.yaml".to_owned()),
+            ..alone
+        };
+        assert!(named.policy_engine_decides());
     }
 
     /// A pair gateway counts tokens on a prefill worker over HTTP alone: its

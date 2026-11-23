@@ -63,9 +63,9 @@ thread_local! {
 ///
 /// # Errors
 ///
-/// The decision's shed, its queue or its refusal. Prefills that are all at
-/// the caller's admission limit answer [`Unplaced::PrefillsFull`], as a
-/// pair's do.
+/// The decision's shed, its queue or its refusal. Prefills with an open
+/// partner that are all at the caller's admission limit answer
+/// [`Unplaced::PrefillsFull`], as a pair's do.
 pub(super) fn ask<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,

@@ -2958,6 +2958,50 @@ fn clear_all_overload_flags_resets_every_model() {
     assert_eq!(registry.overloaded_worker_count("m2"), 0);
 }
 
+/// The registry counts its overload edges for a host's read: one a veto
+/// that changed, either way, a clear of every flag among them. A verdict
+/// said again counts nothing, and a worker the registry does not hold
+/// counts nothing. The replacement and the removal of an overloaded worker
+/// lower its flag, an edge each, and those of a worker with no flag count
+/// nothing.
+#[test]
+fn an_overload_edge_is_counted_once_and_a_verdict_said_again_is_not() {
+    let registry = WorkerRegistry::new();
+    let a = overload_worker("http://127.0.0.1:9711", "m");
+    let b = overload_worker("http://127.0.0.1:9712", "m");
+    let a_id = registry.register(Arc::clone(&a)).unwrap();
+    let b_id = registry.register(Arc::clone(&b)).unwrap();
+    assert_eq!(registry.overload_edges(), 0);
+
+    assert!(registry.set_worker_overloaded(&a, true));
+    assert!(!registry.set_worker_overloaded(&a, true));
+    assert_eq!(registry.overload_edges(), 1, "said again: no edge");
+    assert!(registry.set_worker_overloaded(&b, true));
+    assert!(registry.set_worker_overloaded(&a, false));
+    assert_eq!(registry.overload_edges(), 3, "either way is an edge");
+
+    assert_eq!(registry.clear_all_overload_flags(), 1);
+    assert_eq!(registry.overload_edges(), 4, "a clear is an edge a flag");
+
+    let stranger = overload_worker("http://127.0.0.1:9713", "m");
+    assert!(!registry.set_worker_overloaded(&stranger, true));
+    assert_eq!(registry.overload_edges(), 4, "no worker of the registry's");
+
+    assert!(registry.set_worker_overloaded(&a, true));
+    assert!(registry.set_worker_overloaded(&b, true));
+    let again = overload_worker("http://127.0.0.1:9711", "m");
+    assert!(registry.replace(&a_id, again));
+    assert_eq!(
+        registry.overload_edges(),
+        7,
+        "a replacement lowers the flag"
+    );
+    assert!(registry.remove(&b_id).is_some());
+    assert_eq!(registry.overload_edges(), 8, "a removal lowers the flag");
+    assert!(registry.remove(&a_id).is_some());
+    assert_eq!(registry.overload_edges(), 8, "no flag to lower: no edge");
+}
+
 /// A removed worker's address stays retired in the series store while a
 /// handle to the worker lives (a late write of that handle lands nowhere),
 /// and the store's upkeep forgets it once the last handle is gone: the

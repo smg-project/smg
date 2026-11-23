@@ -328,7 +328,11 @@ mod tests {
         let leader = Replica::new();
         leader.store.set_term(1);
         let standby = Replica::new();
-        let follower = Follower::new(Arc::clone(&standby.store), Arc::clone(&standby.feed.log));
+        let follower = Follower::new(
+            Arc::clone(&standby.store),
+            Arc::clone(&standby.feed.log),
+            standby.workers.holder(),
+        );
         let row = |store: &MemoryStore| store.by_key(URL).expect("a row");
         let writes: [Write<'_>; 6] = [
             ("a registration", &|store| {
@@ -384,7 +388,11 @@ mod tests {
         let standby = Replica::new();
         standby.caught_up("the standby's start").await;
         assert!(standby.held().is_empty());
-        let follower = Follower::new(Arc::clone(&standby.store), Arc::clone(&standby.feed.log));
+        let follower = Follower::new(
+            Arc::clone(&standby.store),
+            Arc::clone(&standby.feed.log),
+            standby.workers.holder(),
+        );
         let cut = leader.store.checkpoint();
         assert_eq!(follower.restore(cut, None), Ok(true));
         standby.caught_up("the restore").await;

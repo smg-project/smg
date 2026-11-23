@@ -1,8 +1,9 @@
 //! The holder of a replica's worker objects: it follows the store's
 //! membership and writes the registry. A leader's door writes a row through
-//! it, and the store follows that write ([`mod@write`]). A host can also ask it
-//! to follow the rows' status, or to build each object with the thresholds
-//! its own load monitor judges overload by.
+//! it, and the store follows that write ([`mod@write`]). A standby's applier
+//! hands it each event of its leader's stream ([`mod@standby`]). A host can
+//! also ask it to follow the rows' status, or to build each object with the
+//! thresholds its own load monitor judges overload by.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -43,6 +44,7 @@ use crate::{
 };
 
 mod host_count;
+mod standby;
 mod write;
 
 /// The row an object stands for.
@@ -139,8 +141,8 @@ impl Held {
 /// stands one object in the registry, and none beside.
 ///
 /// [`Self::follow`] reads what the store's membership did since its last
-/// read: every change on a standby, and on a leader each change no door
-/// wrote through the holder, a status change among them. It builds the
+/// read: each change that neither a door nor a standby's applier wrote
+/// through the holder, a status change among them. It builds the
 /// object of a row that arrived, drops the object of a row that went, and
 /// replaces the object of a row whose facts changed under the same id in
 /// the registry. A new incarnation of a key gets a new object and id.
@@ -445,10 +447,10 @@ impl<G: Generation> Objects<G> {
     /// alone among them. `None` as [`Self::standing`] answers it. The
     /// remainder is shared with the entry: a row laid again gets another.
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "controller")),
         expect(
             dead_code,
-            reason = "the controller's service reads it once its worker objects lead"
+            reason = "a controller's standby reads the instant a row was admitted at"
         )
     )]
     pub(crate) fn remainder(&self, object: &ObjectId) -> Option<Arc<RowRemainder>> {
@@ -1065,10 +1067,7 @@ mod tests {
             GatewayId, HealthSink, MemoryStore, Overload, Registrant, WorkerFacts, WorkerPatch,
             WorkerStatus,
         },
-        worker_host::{
-            membership_writer::tests::StoreDoor, object, HealthAdapter, KeptCredential, Members,
-            MembershipWriteOutcome, MembershipWriter, Precondition, SoleLead,
-        },
+        worker_host::{object, HealthAdapter, KeptCredential, Members, SoleLead},
     };
 
     const A: &str = "http://a:8000";
@@ -1374,6 +1373,10 @@ mod tests {
         use crate::{
             document::spec::{AppliedSpec, PolicySpec},
             engine::{Decision, DemandFacts, PolicyEngine, Role, ShedReason},
+            worker_host::{
+                membership_writer::tests::StoreDoor, MembershipWriteOutcome, MembershipWriter,
+                Precondition,
+            },
         };
 
         let mut replica = Replica::new();
@@ -1895,6 +1898,18 @@ mod tests {
             replica.lay_again(&facts(A, 1));
         }
         assert!(replica.holds_credential(A, Some(KEY_B)));
+    }
+
+    /// One registration that keeps its credential at a time: its write
+    /// runs inside the holder's keeping turn, and the turn is let go
+    /// behind it.
+    #[test]
+    fn a_keeping_write_runs_in_a_turn_of_its_own() {
+        let replica = Replica::new();
+        let objects = &replica.objects;
+        let held = objects.keeping(A, None, || objects.keeping.is_locked());
+        assert_eq!(held, Ok(true), "the write runs inside the turn");
+        assert!(!objects.keeping.is_locked(), "let go behind the write");
     }
 
     #[test]

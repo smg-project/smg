@@ -27,8 +27,11 @@
 //! publishes once. `--overloaded 1` puts every worker over its
 //! overload threshold, so the list admits no worker, and gives each worker
 //! requests in flight: its place plus one, the middle worker none, so the
-//! rule for such a list has loads to steer by. `--shadow twin` names a copy
-//! of the cell's profile as its binding's shadow, so each decision is
+//! rule for such a list has loads to steer by. `--refused limit` puts every
+//! prefill of a pair's cell at its host's admission limit, and `--refused
+//! partners` takes its every decode out of service: each decision is then
+//! refused, and a turn refused that way counts. `--shadow twin` names a
+//! copy of the cell's profile as its binding's shadow, so each decision is
 //! followed by its shadow profile's. `--shadow other` names that shadow at
 //! a binding of another model: the cell's decisions then have no shadow,
 //! under a document that names one. `--callers` threads each
@@ -471,6 +474,9 @@ struct Run {
     entry: String,
     overloaded: bool,
     publish_ms: u64,
+    /// What refuses every pair of a pair's cell: the bench's `pair` file
+    /// reads it.
+    refused: pair::Refused,
     shadow: Shadowed,
     /// Whether a thread of its own turns the engine's task behind its first
     /// step.
@@ -486,6 +492,7 @@ fn run() -> Run {
         entry: "decide_at".to_owned(),
         overloaded: false,
         publish_ms: 0,
+        refused: pair::Refused::No,
         shadow: Shadowed::No,
         upkeep_thread: true,
         workers: 64,
@@ -505,6 +512,7 @@ fn run() -> Run {
             "--entry" => run.entry = place::named(&value),
             "--overloaded" => run.overloaded = number() != 0,
             "--publish-ms" => run.publish_ms = number(),
+            "--refused" => run.refused = pair::Refused::named(&value),
             "--shadow" => {
                 run.shadow = match value.as_str() {
                     "twin" => Shadowed::Twin,
@@ -688,6 +696,8 @@ fn main() {
     if pair::runs(&run) || encode::runs(&run) {
         return;
     }
+    let open = run.refused == pair::Refused::No;
+    assert!(open, "a pair's cell alone runs refused");
     let Cell {
         behind,
         document,

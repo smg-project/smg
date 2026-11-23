@@ -14,16 +14,19 @@
 //! decode's report states a value of it (`pair_signal_cost`).
 //! `--overloaded 1` puts a pair's decodes alone over their thresholds: the
 //! rule for such a list steers a pair's decode side. A pair whose prefills
-//! are all over theirs goes to the pair's default, which no cell runs. The
-//! result's `conversions=` counts the two lists together.
+//! are all over theirs goes to the pair's default, which no cell runs.
+//! `--refused` states what refuses every pair ([`Refused`]): the engine
+//! then names the refusal of each request, and a turn counts where it was
+//! refused the way the run states. A cell that leaves that path counts no
+//! turn. The result's `conversions=` counts the two lists together.
 
 use std::{cell::OnceCell, ops::Deref, sync::Arc, time::Instant};
 
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
     engine::{
-        Decided, PairAdmission, PairLists, PartnerClasses, Phase, Plain, PolicyEngine, Request,
-        RequestMaker, WorkerLists,
+        prefills_full, Decided, PairAdmission, PairLists, PartnerClasses, Phase, Plain,
+        PolicyEngine, Request, RequestMaker, WorkerLists,
     },
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Side, TransportClass},
@@ -89,11 +92,52 @@ impl PairAdmission for Open {
     }
 }
 
+/// A pair's host every prefill of which holds its limit: none has capacity.
+#[derive(Debug)]
+struct Full;
+
+impl PairAdmission for Full {
+    fn has_capacity(&self, _: usize) -> bool {
+        false
+    }
+
+    fn has_room(&self, _: usize) -> bool {
+        true
+    }
+}
+
+/// What a run states refuses every pair of its cell (`--refused`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Refused {
+    /// Nothing: every pair is open.
+    No,
+    /// The host's admission limit: every prefill holds it, beside open
+    /// partners.
+    Limit,
+    /// The decode side: no decode is ready, and no prefill has a partner
+    /// to go to.
+    Partners,
+}
+
+impl Refused {
+    /// What `--refused` names.
+    pub(super) fn named(name: &str) -> Self {
+        match name {
+            "limit" => Self::Limit,
+            "partners" => Self::Partners,
+            other => panic!("nothing refuses a pair by {other}"),
+        }
+    }
+}
+
 /// A pair's decodes as its host keeps them beside its prefills (the host's
-/// own list), with every worker's pair class.
+/// own list), with every worker's pair class, the host's admission and
+/// what the run states refuses every pair.
 struct Decodes {
     list: Published,
     classes: PartnerClasses,
+    admission: &'static (dyn PairAdmission + Sync),
+    refused: Refused,
 }
 
 /// One turn's pair request as its host states it: the request of
@@ -121,7 +165,7 @@ impl RequestMaker for StatedPair<'_> {
             prefill: self.stated.host.list.lent(),
             decode: self.decodes.list.lent(),
             classes: &self.decodes.classes,
-            admission: &Open,
+            admission: self.decodes.admission,
             prefill_places: None,
             decode_places: None,
             prefill_stalled: &[],
@@ -164,6 +208,14 @@ impl Decodes {
         let Decided::Whole(decided, later) = host.engine.decide_at(&stated, clock).ok()? else {
             return None;
         };
+        // A run that refuses every pair counts the turns refused the way it
+        // states: by full prefills under the limit, by any other shed where
+        // the decode side refuses.
+        if self.refused != Refused::No {
+            let full = prefills_full(&decided.decision);
+            let stated = full == (self.refused == Refused::Limit);
+            return (decided.decision.pick().is_none() && stated).then_some(0);
+        }
         let target = *decided.decision.pick()?.targets.first()?;
         let decode = target.pair?.decode_id;
         if decided.lease.is_some() {
@@ -236,6 +288,11 @@ pub(super) fn runs(run: &Run) -> bool {
             }
         }
     }
+    if run.refused == Refused::Partners {
+        for worker in decodes.iter() {
+            worker.set_status(WorkerStatus::NotReady);
+        }
+    }
     let document = document();
     let spec = AppliedSpec::validate(&document).expect("a valid document");
     let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(spec)));
@@ -246,6 +303,12 @@ pub(super) fn runs(run: &Run) -> bool {
     let decode_side = Decodes {
         classes: PartnerClasses::number(decodes.len(), every),
         list: Published::of(&decodes),
+        admission: if run.refused == Refused::Limit {
+            &Full
+        } else {
+            &Open
+        },
+        refused: run.refused,
     };
     let mut receiver = None;
     let feed = TestFeed::attached_to(|loads| receiver = loads);

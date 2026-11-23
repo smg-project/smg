@@ -11,7 +11,7 @@ use std::sync::mpsc as test_mpsc;
 use std::{
     collections::{BTreeSet, HashSet},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -257,6 +257,10 @@ pub struct WorkerRegistry<G> {
     /// never taken on a request path.
     overload_transitions: Arc<parking_lot::Mutex<()>>,
 
+    /// How many overload edges the registry applied ([`Self::overload_edges`]):
+    /// one add an edge, made under the lock above.
+    overload_edges: Arc<AtomicU64>,
+
     /// Per-model retry config (last write wins).
     /// Updated when a worker with non-empty retry overrides registers.
     /// Cleaned up when the last worker for a model is removed.
@@ -344,6 +348,7 @@ impl<G: Generation> WorkerRegistry<G> {
             pool_sizes: pool::PoolSizes::default(),
             overload_shed: Arc::new(AtomicBool::new(false)),
             overload_transitions: Arc::new(parking_lot::Mutex::new(())),
+            overload_edges: Arc::new(AtomicU64::new(0)),
             model_retry_configs: Arc::new(DashMap::with_hasher_and_shard_amount(
                 FxBuildHasher,
                 MODEL_MAP_SHARDS,
@@ -674,6 +679,7 @@ impl<G: Generation> WorkerRegistry<G> {
             if !worker.set_overloaded(overloaded) {
                 return false;
             }
+            self.overload_edges.fetch_add(1, Ordering::Relaxed);
             for model_id in model_ids {
                 let updated = self.adjust_model_overloaded(&model_id, overloaded);
                 Metrics::set_workers_overloaded(&model_id, updated);
@@ -687,6 +693,17 @@ impl<G: Generation> WorkerRegistry<G> {
             }
         }
         true
+    }
+
+    /// How many times the overload veto of a worker changed since the
+    /// registry was built, either way: one an edge
+    /// ([`Self::set_worker_overloaded`]). A clear of every flag
+    /// ([`Self::clear_all_overload_flags`]) counts each flag it lowers, and
+    /// the removal or the replacement of an overloaded worker lowers its
+    /// flag and counts that edge. A verdict that is said again counts
+    /// nothing. For a host that renders series of its own.
+    pub fn overload_edges(&self) -> u64 {
+        self.overload_edges.load(Ordering::Relaxed)
     }
 
     /// Whether `worker` is the `Arc` the registry currently holds for its URL.

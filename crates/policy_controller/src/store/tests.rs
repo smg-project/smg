@@ -4669,6 +4669,150 @@ fn a_decode_take_back_looks_up_the_lease_once() {
     assert_eq!(LEASE_HASHES.get(), 1);
 }
 
+/// The pair a decode call reads ahead of its decision is the lease's own:
+/// its prefill's worker, then the worker and the rank of the decode its
+/// first decision chose for the target the prefill's dispatch took, the
+/// pick's first or the one that dispatch named. A side a call issued and a
+/// take-back put back names the first decision's decode again. The read is
+/// refused under the name its issue is refused under, it gives the file's
+/// turn back with its answer, and it moves nothing.
+#[cfg(feature = "controller")]
+#[test]
+fn the_held_pair_names_the_prefill_and_the_decode_of_the_target_its_dispatch_took() {
+    use DecodeRefused::{DecodeStands, NoLease, NotChosen, PrefillNotHeld};
+
+    let store = MemoryStore::new();
+    let keys = ["http://p:1", "http://d0:1", "http://d1:1", "http://d2:1"];
+    let [p, d0, d1, d2] = keys.map(|key| ready(&store, key));
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    store.set_term(1);
+    // A pick of three targets on the one prefill, each decode at a rank of
+    // its own: the pair filed with its decode side chosen where `later`.
+    let filed = |id: u64, later: bool| {
+        let (mut record, mut decode) = pair(id, p, &[d0, d1, d2], now);
+        let mut targets = Targets::new();
+        for (decode_id, decode_dp_rank) in [(d0, 2), (d1, 3), (d2, 5)] {
+            let pair = decision::Pair {
+                decode_id,
+                decode_dp_rank,
+                ..Default::default()
+            };
+            targets.push(Target {
+                id: p,
+                pair: Some(pair),
+                ..Target::default()
+            });
+        }
+        (record.picked, decode.picked) =
+            (PickRecord::of(&targets), PickRecord::of_decodes(&targets));
+        if later {
+            decode.state = LeaseState::Chosen;
+        }
+        issue_pair(&store, (record, decode)).expect("the key is free");
+    };
+    for id in 1..=3 {
+        filed(id, true);
+    }
+    filed(4, false);
+    store
+        .issue(booking(gateway, 5, p, now))
+        .expect("the key is free");
+    let file = || {
+        let sides = [1, 2, 3, 4, 5].map(|id| LeasesStore::sides(&store, gateway, LeaseId(id)));
+        (sides, booked(&store, &[p, d0, d1, d2]), store.queued())
+    };
+    let held = |owner: GatewayId, id: u64| {
+        let before = file();
+        let held = store.held_pair(owner, LeaseId(id));
+        assert!(store.unlocked(), "the turn is given back");
+        assert_eq!(file(), before, "the read moves nothing");
+        held
+    };
+    // No prefill was sent yet.
+    assert_eq!(held(gateway, 1), Err(PrefillNotHeld));
+    // The prefill's dispatch names the pick's first target, then another.
+    assert!(store.dispatched(gateway, LeaseId(1), on(Side::Prefill, 0), now));
+    assert!(store.dispatched(gateway, LeaseId(2), on(Side::Prefill, 2), now));
+    assert!(store.dispatched(gateway, LeaseId(4), on(Side::Prefill, 0), now));
+    assert_eq!(held(gateway, 1), Ok((p, Some((d0, 2)))));
+    assert_eq!(held(gateway, 2), Ok((p, Some((d2, 5)))));
+    // Each refusal by its name: another gateway's id, a prefill not sent,
+    // a pair filed whole and a single's lease.
+    assert_eq!(held(GatewayId(2), 1), Err(NoLease));
+    assert_eq!(held(gateway, 3), Err(PrefillNotHeld));
+    assert_eq!(held(gateway, 4), Err(NotChosen));
+    assert_eq!(held(gateway, 5), Err(NotChosen));
+    // A call issues the side on another decode: the side stands, and the
+    // read is refused as the next issue is.
+    let moved = DecodeSide {
+        picked: PickRecord::default(),
+        ..decode_side(d1)
+    };
+    assert_eq!(store.issue_decode(gateway, LeaseId(2), moved, now), Ok(()));
+    assert_eq!(held(gateway, 2), Err(DecodeStands));
+    assert_eq!(
+        store.issue_decode(gateway, LeaseId(2), moved, now),
+        Err(DecodeStands)
+    );
+    // Taken back, the side names the first decision's decode again, at the
+    // target the prefill's dispatch took.
+    assert!(store.take_back_decode(gateway, LeaseId(2), ReleaseReason::Abandoned));
+    assert_eq!(held(gateway, 2), Ok((p, Some((d2, 5)))));
+}
+
+/// An undo takes back its own issue of a decode side and no other. Where a
+/// take-back ended that issue, and where a later call issued the side
+/// since, the first issue's undo moves nothing and frees nothing: the place
+/// counts the side's issues, and an undo names its own. The undo of the
+/// issue that stands puts the side back as that issue found it and frees
+/// its booking. Behind the prefill's end it takes the lease off the file:
+/// the side would stand chosen beside a prefill that ended, and no later
+/// event ends a side that is not live.
+#[cfg(feature = "controller")]
+#[test]
+fn an_undo_takes_back_its_own_issue_of_a_decode_side_and_no_other() {
+    let store = MemoryStore::new();
+    let [p, d0, d1] = ["http://p:1", "http://d0:1", "http://d1:1"].map(|key| ready(&store, key));
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    store.set_term(1);
+    issue_pair(&store, chosen_pair(id.0, p, &[d0, d1], now)).expect("the key is free");
+    assert!(store.dispatched(gateway, id, on(Side::Prefill, 0), now));
+    let file = || {
+        let sides = LeasesStore::sides(&store, gateway, id);
+        (sides, booked(&store, &[p, d0, d1]))
+    };
+    let chosen = file();
+    assert_eq!(chosen.1, [1, 0, 0]);
+    // One call's issue of the side on the second decode, with the slot of
+    // the count it books.
+    let call = || {
+        let slot = store.snapshot().booked_of(d1);
+        let issued = store.issue_decided_decode(gateway, id, (decode_side(d1), slot), now, |_| ());
+        issued.expect("the prefill holds the chosen side").1
+    };
+    let first = call();
+    assert_eq!(file().1, [1, 0, 1]);
+    assert!(store.take_back_decode(gateway, id, ReleaseReason::Abandoned));
+    assert_eq!(file(), chosen);
+    assert!(!store.unissue_decode(gateway, id, first), "its issue ended");
+    assert_eq!(file(), chosen);
+    let second = call();
+    let issued = file();
+    assert_eq!(issued.1, [1, 0, 1]);
+    assert!(!store.unissue_decode(gateway, id, first), "another's issue");
+    assert_eq!(file(), issued);
+    assert!(store.unissue_decode(gateway, id, second));
+    assert_eq!(file(), chosen);
+    assert!(!store.unissue_decode(gateway, id, second), "undone once");
+    // Behind the prefill's end.
+    let third = call();
+    let gone = ReleaseReason::ClientGone;
+    assert!(store.released(gateway, id, Some(Side::Prefill), gone));
+    assert!(file().0.is_some(), "the issued decode stands");
+    assert!(store.unissue_decode(gateway, id, third));
+    assert_eq!(file(), (None, vec![0, 0, 0]));
+}
+
 #[test]
 fn a_frame_handed_where_nobody_is_at_work_is_applied_by_its_hand() {
     let now = Instant::now();

@@ -519,12 +519,13 @@ pub struct PoolRecords {
     /// Each worker's record with its fixed fields written and every live
     /// field at rest, by position.
     fixed: Box<[Candidate]>,
+    /// Whether every worker of the list is a regular one.
+    regular: bool,
     /// Each worker's id, by position.
     ids: Box<[WorkerId]>,
     /// What each worker states for a request's hard demands, by position
-    /// ([`FixedFacts::demands`], and the rank its object registered), and
-    /// none where no worker of the list states one: such a list allocates
-    /// no column.
+    /// ([`FixedFacts::demands`]), and none where no worker of the list
+    /// states one: such a list allocates no column.
     demand_facts: Option<Box<[DemandFacts]>>,
     /// The ids in their own order, each with its worker's position
     /// ([`Self::place_of`]). Empty where two rows of the list carry one
@@ -585,10 +586,7 @@ impl PoolRecords {
     /// fingerprint of its address ([`worker_id`]). What it states for a
     /// request's hard demands goes into a column beside the records
     /// ([`Self::meeting`]), which the first worker that states one makes:
-    /// a list where none does allocates nothing for it. Whether a worker
-    /// registered a data-parallel rank ([`DemandFacts::ranked`]) is read
-    /// off its object and goes into the same column, whatever the program
-    /// says of it: [`Self::new`] reads it too.
+    /// a list where none does allocates nothing for it.
     #[must_use]
     pub fn with_fixed_facts(
         workers: &[Arc<dyn Worker>],
@@ -623,12 +621,7 @@ impl PoolRecords {
                     Some(lists.positions(kind, None, &labels))
                 };
                 let facts = facts_of(worker);
-                // Whether the worker registered a rank is its object's to
-                // say, whatever the program said of it.
-                let demands = DemandFacts {
-                    ranked: worker.is_dp_aware(),
-                    ..facts.demands
-                };
+                let demands = facts.demands;
                 if demands != DemandFacts::default() {
                     let column = demand_facts
                         .get_or_insert_with(|| vec![DemandFacts::default(); workers.len()].into());
@@ -675,6 +668,7 @@ impl PoolRecords {
         // membership.
         let number = clock.pools.fetch_add(1, Ordering::Relaxed) + 1;
         Self {
+            regular: fixed.iter().all(|row| row.role == Role::Single),
             fixed,
             ids,
             demand_facts,
@@ -704,6 +698,12 @@ impl PoolRecords {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.fixed.is_empty()
+    }
+
+    /// Whether every worker of the list is a regular one, read once when
+    /// the records were made: a keyed decision is told it with no row read.
+    pub(crate) fn regular(&self) -> bool {
+        self.regular
     }
 
     /// Each worker's id, by its place in the list: the one its program
@@ -804,9 +804,8 @@ impl PoolRecords {
     /// The places of the list whose worker meets `demands`, written into
     /// `kept`: of every place, in the list's order, or of `among` alone, in
     /// its order, the places the request is already held to. A worker is
-    /// judged by its record's vision bit, by what the program said it
-    /// states and by the rank its object registered
-    /// ([`Self::with_fixed_facts`]). A list no worker of which states
+    /// judged by its record's vision bit and by what the program said it
+    /// states ([`Self::with_fixed_facts`]). A list no worker of which states
     /// anything keeps no column, and each of its workers states nothing.
     /// The demands are judged as they are handed: a caller that judges a
     /// prefill side's list hands them through [`Demands::held_by`].
