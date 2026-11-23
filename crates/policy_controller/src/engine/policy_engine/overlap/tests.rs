@@ -2306,7 +2306,8 @@ fn a_fresh_target_outside_the_holder_cap_writes_nothing() {
 }
 
 /// A bound that came down forgets nothing by itself. The write that ends
-/// behind it sweeps one step: of a hundred placements at most 36 stay.
+/// behind it sweeps one step (`PrefixRecord::SWEEP` placements): of a
+/// hundred placements at most the others stay.
 #[test]
 fn the_last_slice_sweeps_placements_owed_by_a_lower_bound() {
     let (affinity, _, _) = hosted(false);
@@ -2337,7 +2338,10 @@ fn the_last_slice_sweeps_placements_owed_by_a_lower_bound() {
     bed.decide(&request(&cold, 7, now), Some(0))
         .expect("rows for the cold pick");
     let left = record.predictor.read().len();
-    assert!(left <= 36, "the cold write leaves {left} placements");
+    assert!(
+        left <= 100 - PrefixRecord::SWEEP,
+        "the cold write leaves {left} placements"
+    );
 }
 
 /// The record's bound is the index's size in blocks of the size the
@@ -2431,5 +2435,8 @@ fn a_lower_bound_keeps_its_sweep_past_a_decider_that_holds_the_record() {
     );
     bed.affinity.sweep();
     let left = record.predictor.read().len();
-    assert!(left <= 36, "one step of the sweep leaves {left} placements");
+    assert!(
+        left <= 100 - PrefixRecord::SWEEP,
+        "one step of the sweep leaves {left} placements"
+    );
 }

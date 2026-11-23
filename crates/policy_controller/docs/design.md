@@ -1592,12 +1592,12 @@ On main: 18 sheets, 482 lines.
 
 | | Sheets | Lines |
 |---|---|---|
-| replayed and passing | 17 | 477 |
-| recorded, replayed by nothing (`constraint_decider`) | 1 | 5 |
-| replayed through the engine that stays (`PolicyEngine`) | **4** | **37** |
-| replayed lines held to an answer of the crate's own, not classic's | | 28 |
+| replayed and passing | 15 | 434 |
+| recorded, replayed by nothing (`constraint_decider`, `overload`, `minimum_tokens`) | 3 | 48 |
+| replayed through the engine that stays (`PolicyEngine`) | **5** | **45** |
+| replayed lines held to an answer of the crate's own, not classic's | | 12 |
 
-A replay of all fourteen decision sheets through `PolicyEngine` over worker objects is in work and not on main yet: on main the four hard-demand sheets (`retry_wire`, `media_refs`, `context_window`, `rank_pin`; 37 lines) replay through it. Measured
+A replay of all fourteen decision sheets through `PolicyEngine` over worker objects is in work and not on main yet: on main the four hard-demand sheets (`retry_wire`, `media_refs`, `context_window`, `rank_pin`; 37 lines) and `sticky_rank` (8 lines) replay through it. Measured
 with it locally on 2026-11-22, on main (`096c0f5ea`): of the 408 lines that record a decision
 (point 1 below), the engine answers 286 as classic recorded and 28 differently, and 94 cannot
 be asked yet. Of the 94, 25 are declined because the request states a hard demand, 16 need a
@@ -1607,8 +1607,8 @@ the ring) lose lines, so the replay can fail.
 
 Five things follow, and they are the first work of section 16.
 
-1. **Only the four hard-demand sheets (37 lines) go through the engine that stays** in main's own tests. The other replays
-   call the decision function over hand-built candidates, or over candidates of the old engine's store. Fourteen sheets
+1. **Only the four hard-demand sheets and `sticky_rank` (45 lines) go through the engine that stays** in main's own tests. The other replays
+   call the decision function over hand-built candidates. Fourteen sheets
    (408 lines) record a decision, and each has to replay through `PolicyEngine` over worker
    objects. The other four (74 lines: `overload` 25, `pair_index` 23, `minimum_tokens` 18,
    `sticky_rank` 8) record an answer of the host, which the kept engine is never asked for. It
@@ -1617,11 +1617,10 @@ Five things follow, and they are the first work of section 16.
    registered, never one of the ranks behind a worker that stands for all of them. In a host's
    own process those answers are classic's own code, which stays, so the 74 lines hold there
    with no replay. For the two rank sheets that rests on a rule of the gateway's change
-   (section 9.2). On main the four replay through the old engine's side, and they stay there
+   (section 9.2). On main `pair_index` replays through the old engine's side, `sticky_rank` replays over rank objects through `PolicyEngine`, and `overload` and `minimum_tokens` (43 lines) are replayed by nothing: the store that judged them is no longer read, and they wait for the host's code
    until stage 4.
-2. **23 lines are held to the crate's own answer** (`minimum_tokens` 10, `overload` 6,
-   `sticky_rank` 4, `prefix_hash` 2, `manual` 1). The first 20 are in the four host sheets: the
-   rules that hold them apart are the old engine's, and the kept engine has none of them. The
+2. **23 lines were held to the crate's own answer** (`minimum_tokens` 10, `overload` 6,
+   `sticky_rank` 4, `prefix_hash` 2, `manual` 1). The 16 of `minimum_tokens` and `overload` were held by the old engine's store and are not replayed now (point 1); three of them are rules of the scorer and the picker, which the kept engine shares. The 4 of `sticky_rank` are held the same through `PolicyEngine`, by the ring and the picker. The
    other three are the kept engine's. The 2 of `prefix_hash` differ from classic there too (a
    key folds whole blocks). One of them turns in the crate on a ring its caller lends
    (decision 3). The other measures which tokens are in a prompt's head, which is then the
@@ -1719,7 +1718,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; a pair's shadows run in no engine, and `explain.sample` is kept by the served controller alone (decision 7) |
 | The ten presets and the conversion from routing settings | **[built]** | |
 | The stage interfaces and a builder's own stages | **[built]** | |
-| The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, a pair's demand, mixed protocols; of the recorded lines only the four hard-demand sheets (37) replay through it |
+| The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, a pair's demand, mixed protocols; of the recorded lines only the four hard-demand sheets and `sticky_rank` (45) replay through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |
 | `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. Every other request the engine names the holders of reads the engine's own record, with its three faults: a request whose caller names no entry is one. The string tree is planned |
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | placed on the ring the host lends (decision 3): through `place` the plain ring alone, at the place the engine reads with the request's keys; `prefix_hash` at the places a host that writes the request's facts itself states; that both are classic's is proven at stage 3; a host that lends none is placed on the crate's ring, which may be another worker than classic's |
