@@ -331,7 +331,9 @@ pub(crate) async fn execute_plan(
     // The selection that names the decode the dispatch sent, where a second
     // ask moved it.
     let mut moved = None;
-    let behind = behind_prefill.then_some(DecodeBehindPrefill {
+    // The dispatch below borrows this slot and a pair arm takes the hold out
+    // of it: moved in, the hold would sit in every request's dispatch future.
+    let mut behind = behind_prefill.then(|| DecodeBehindPrefill {
         stage: selection,
         model_id: ctx.model_id.as_str(),
         routing: &ctx.routing,
@@ -434,7 +436,7 @@ pub(crate) async fn execute_plan(
                     ledger,
                     room_residue,
                     None,
-                    behind,
+                    behind.take(),
                 ))
                 .await
             }
@@ -453,7 +455,7 @@ pub(crate) async fn execute_plan(
                     encode_watch,
                     prefill_guard,
                     ledger,
-                    behind,
+                    behind.take(),
                 ))
                 .await
                 .map_err(|mut response| {
