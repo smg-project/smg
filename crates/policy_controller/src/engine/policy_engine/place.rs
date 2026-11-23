@@ -318,7 +318,9 @@ pub struct PlaceRequest<'a> {
     /// ([`PlacementSide::decode_again`](crate::tracking::PlacementSide::decode_again)),
     /// the rule is asked under the lock the pair's two sides share. It
     /// must leave both sides alone: the send or the drop of one, from
-    /// inside the rule, waits on that lock and never returns.
+    /// inside the rule, waits on that lock and never returns. That
+    /// decision asks the request's headers, its ring and its lists'
+    /// admission under the same lock, and each is held to the same.
     ///
     /// For an encode request the rule is its pair's: it is asked of the
     /// pair's two workers and of no encoder.
