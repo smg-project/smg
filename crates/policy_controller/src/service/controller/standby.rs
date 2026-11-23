@@ -1297,7 +1297,7 @@ mod tests {
         let mut unread = told_load(a, at);
         if let Some(Sent::Load(load)) = &mut unread.event {
             load.dp_rank = 65_536;
-            last.loads.push(load.clone());
+            last.loads.push(*load);
         }
         assert_eq!(last.loads.len(), 1);
         let cut = staged(&parts, at);
