@@ -45,6 +45,7 @@
 //! that read who holds a prompt, the record of the prefixes it sent
 //! ([`overlap`]).
 
+mod budget;
 pub(super) mod encode;
 mod keys;
 mod labels;
@@ -597,10 +598,14 @@ impl PolicyEngine {
     /// The request `maker` makes, as this engine decides it: with no pins of
     /// record lent ([`Constraints::pins`](super::view::Constraints::pins)).
     /// Its session table is the only one it reads, whatever the entry.
+    ///
+    /// A request that states no budget is made with the widest one: a stage
+    /// reads the number as the time left ([`budget::shown`]).
     #[inline(always)]
     fn made<'w>(&'w self, maker: &'w impl RequestMaker) -> Request<'w> {
         let mut request = maker.make(&self.spec);
         request.constraints.pins = None;
+        request.facts.budget_micros = budget::shown(request.facts.budget_micros);
         request
     }
 
