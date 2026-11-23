@@ -67,6 +67,9 @@ struct ExposedToolBinding {
     /// bindings: the label is its label, a call takes its pool key.
     binding_index: Option<usize>,
     resolved_tool_name: String,
+    /// The alias target the session listed the tool with; `None` for a
+    /// server's own tool. A call runs an entry that still holds it.
+    alias_target: Option<QualifiedToolName>,
     is_builtin_routed: bool,
     approval_mode: ApprovalMode,
 }
@@ -286,22 +289,20 @@ impl<'a> McpToolSession<'a> {
     /// Execute a single tool while preserving pending approval state.
     pub async fn execute_tool_result(&self, input: ToolExecutionInput) -> ToolExecutionResult {
         let invoked_name = input.tool_name.clone();
-        // A session calls what it admitted: an alias the inventory now holds
-        // with another target than the one this session listed is not this
-        // session's tool.
-        let admitted = self.exposed_name_map.get(&invoked_name).filter(|binding| {
-            binding.server_key == binding.associated_server_key
-                || self
-                    .orchestrator
-                    .tool_inventory()
-                    .get_entry(&binding.server_key, &binding.resolved_tool_name)
-                    .is_none_or(|now| {
-                        self.mcp_tools.iter().any(|listed| {
-                            listed.qualified_name == now.qualified_name
-                                && listed.alias_target.as_ref().map(|alias| &alias.target)
-                                    == now.alias_target.as_ref().map(|alias| &alias.target)
-                        })
-                    })
+        let exposed = self.exposed_name_map.get(&invoked_name);
+        // A session calls what it listed: the entry read here is the one the
+        // call runs, and an entry whose alias target is not the listed one is
+        // not this session's tool.
+        let entry = exposed.and_then(|binding| {
+            self.orchestrator
+                .tool_inventory()
+                .get_entry(&binding.server_key, &binding.resolved_tool_name)
+        });
+        let admitted = exposed.filter(|binding| {
+            entry.as_ref().is_none_or(|now| {
+                now.alias_target.as_ref().map(|alias| &alias.target)
+                    == binding.alias_target.as_ref()
+            })
         });
 
         if let Some(binding) = admitted {
@@ -315,7 +316,8 @@ impl<'a> McpToolSession<'a> {
                 .and_then(|b| b.pool_key.clone());
             let mut result = self
                 .orchestrator
-                .execute_tool_resolved_result(
+                .execute_resolved_entry_result(
+                    entry,
                     ToolExecutionInput {
                         call_id: input.call_id,
                         tool_name: resolved_tool_name.clone(),
@@ -338,18 +340,22 @@ impl<'a> McpToolSession<'a> {
 
             result
         } else {
-            let fallback_label = self
-                .all_mcp_servers
-                .first()
-                .map(|b| b.label.as_str())
-                .unwrap_or(DEFAULT_SERVER_LABEL)
-                .to_string();
+            // A tool the session listed is refused under its own binding.
+            let (server_key, server_label) = match exposed {
+                Some(binding) => (binding.server_key.as_str(), binding.server_label.as_str()),
+                None => (
+                    UNKNOWN_SERVER_KEY,
+                    self.all_mcp_servers
+                        .first()
+                        .map_or(DEFAULT_SERVER_LABEL, |b| b.label.as_str()),
+                ),
+            };
             let err = format!("Tool '{invoked_name}' is not in this session's exposed tool map");
             ToolExecutionResult::Executed(ToolExecutionOutput {
                 call_id: input.call_id,
                 tool_name: invoked_name.clone(),
-                server_key: UNKNOWN_SERVER_KEY.to_string(),
-                server_label: fallback_label,
+                server_key: server_key.to_string(),
+                server_label: server_label.to_string(),
                 arguments_str: input.arguments.to_string(),
                 output: serde_json::json!({ "error": &err }),
                 is_error: true,
@@ -633,6 +639,7 @@ impl<'a> McpToolSession<'a> {
                     server_label,
                     binding_index,
                     resolved_tool_name,
+                    alias_target: entry.alias_target.as_ref().map(|a| a.target.clone()),
                     is_builtin_routed,
                     approval_mode: ApprovalMode::PolicyOnly,
                 },
@@ -1026,7 +1033,7 @@ mod tests {
         }
     }
 
-    /// A session calls what it admitted: an alias registered again with
+    /// A session calls what it listed: an alias registered again with
     /// another target is not this session's tool.
     #[tokio::test]
     async fn an_alias_registered_again_with_another_target_is_not_called() {
@@ -1036,33 +1043,46 @@ mod tests {
         orchestrator
             .register_alias("find", "server1", "search", None)
             .unwrap();
+        let binding = |label: &str, server_key: &str| McpServerBinding {
+            label: label.to_string(),
+            server_key: server_key.to_string(),
+            allowed_tools: None,
+            list_error: None,
+            pool_key: None,
+        };
         let session = McpToolSession::new(
             &orchestrator,
-            vec![McpServerBinding {
-                label: "one".to_string(),
-                server_key: "server1".to_string(),
-                allowed_tools: None,
-                list_error: None,
-                pool_key: None,
-            }],
+            vec![binding("zero", "server0"), binding("one", "server1")],
             "test-request",
         );
         assert!(session.has_exposed_tool("find"));
-
-        orchestrator
-            .register_alias("find", "server2", "search", None)
-            .unwrap();
-        let output = session
-            .execute_tool(ToolExecutionInput {
+        let call = || {
+            session.execute_tool(ToolExecutionInput {
                 call_id: "call".to_string(),
                 tool_name: "find".to_string(),
                 arguments: json!({}),
             })
-            .await;
+        };
+
+        // Registered again with the target it had, the alias is still called.
+        orchestrator
+            .register_alias("find", "server1", "search", None)
+            .unwrap();
         assert_eq!(
-            output.error_message.as_deref(),
+            call().await.error_message.as_deref(),
+            Some("Tool call failed: Server not found: server1")
+        );
+
+        orchestrator
+            .register_alias("find", "server2", "search", None)
+            .unwrap();
+        let refused = call().await;
+        assert_eq!(
+            refused.error_message.as_deref(),
             Some("Tool 'find' is not in this session's exposed tool map")
         );
+        // The refusal reads under the label the alias was listed with.
+        assert_eq!(refused.server_label, "one");
     }
 
     #[test]

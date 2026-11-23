@@ -1082,11 +1082,25 @@ impl McpOrchestrator {
         server_label: &str,
         request_ctx: &McpRequestContext<'_>,
     ) -> ToolExecutionResult {
+        let entry = self.tool_inventory.get_entry(server_key, &input.tool_name);
+        self.execute_resolved_entry_result(entry, input, server_key, server_label, request_ctx)
+            .await
+    }
+
+    /// The same for the entry a caller read under `server_key` and the
+    /// tool's name: the entry it checked is the entry that runs.
+    pub(crate) async fn execute_resolved_entry_result(
+        &self,
+        entry: Option<ToolEntry>,
+        input: ToolExecutionInput,
+        server_key: &str,
+        server_label: &str,
+        request_ctx: &McpRequestContext<'_>,
+    ) -> ToolExecutionResult {
         let start = Instant::now();
         let arguments_str = input.arguments.to_string();
 
         let qualified = QualifiedToolName::new(server_key, &input.tool_name);
-        let entry = self.tool_inventory.get_entry(server_key, &input.tool_name);
 
         match entry {
             Some(entry) => match self
