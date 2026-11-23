@@ -9,10 +9,10 @@
 //! store's pins stand beside them: a build from the store allocates nothing
 //! after the first, and two membership writes are held to each other, a
 //! write that moves an offer to one that moves none and a registration into
-//! 512 workers to one into 8. A host in process is pinned too: a request
-//! held from its decision to its completion allocates nothing after the
-//! first ones. A separate executable, so it can declare the counting
-//! allocator the pins need.
+//! 512 workers to one into 8. A host in process is pinned too, in a build
+//! with the `in-process` feature: a request held from its decision to its
+//! completion allocates nothing after the first ones. A separate
+//! executable, so it can declare the counting allocator the pins need.
 
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
 
@@ -25,11 +25,11 @@ use std::{
 
 use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
-    document::{AppliedSpec, PolicySpec, PRESETS},
+    document::{PolicySpec, PRESETS},
     engine::{
         AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Engine, Health,
-        LoadRow, PairPools, PoolFacts, Request, RequestFacts, Role, Scratch, SignalSource,
-        StoreBackedEngine, Target, WireModes, WorkerId,
+        LoadRow, PairPools, PoolFacts, RequestFacts, Role, Scratch, SignalSource, Target,
+        WireModes, WorkerId,
     },
     stages::Lifecycle,
     store::{
@@ -37,7 +37,7 @@ use smg_policy_controller::{
         PairBuffers, ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore,
         PUBLISH_WINDOW,
     },
-    tracking::{DecisionGuard, Lease, Outcome, Side, TransportClass},
+    tracking::{Lease, Side},
 };
 
 #[global_allocator]
@@ -877,49 +877,161 @@ fn a_lent_view_from_the_store_after_the_first_allocates_nothing() {
     }
 }
 
-/// A request a host in process holds from its decision to its completion
-/// allocates nothing once the first requests have sized the door's
-/// buffers and the leases' file: the decision with its lease, the take,
-/// the dispatch and the completion, each report applied where it is
-/// handed.
-#[test]
-fn a_request_held_from_its_decision_to_its_completion_allocates_nothing() {
-    for n in [8usize, 64] {
-        let (store, _, opened) = store_of(n);
+/// The pin of a host in process: the engine over the host's own worker
+/// list, asked through the one call a host makes for a request.
+#[cfg(feature = "in-process")]
+mod in_process {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use smg_policy_controller::{
+        document::{AppliedSpec, PolicySpec, ScoreSpec},
+        engine::{
+            Candidate, Decision, LentList, ListCell, PlaceRequest, PolicyEngine, RequestFacts,
+            Scorer, Target, TieBand, WorkerLists,
+        },
+        stages::{Lifecycle, StageRegistry},
+        tracking::{EventSet, Lease, Outcome, ReleaseReason, Side, TransportClass},
+    };
+    use smg_worker::{identity::basic::Worker, test_support::ready_worker};
+
+    use super::allocations_during;
+
+    /// The model every worker of the list serves.
+    const MODEL: &str = "m";
+
+    /// How often a stage was told each word of a lease.
+    #[derive(Debug, Default)]
+    struct Told {
+        issued: AtomicUsize,
+        dispatched: AtomicUsize,
+        completed: AtomicUsize,
+        released: AtomicUsize,
+    }
+
+    impl Told {
+        /// The four counts, in a lease's order: its issue, its dispatch, its
+        /// completion and its release.
+        fn read(&self) -> [usize; 4] {
+            [
+                &self.issued,
+                &self.dispatched,
+                &self.completed,
+                &self.released,
+            ]
+            .map(|count| count.load(Ordering::Relaxed))
+        }
+    }
+
+    /// A scorer that scores every worker alike and takes every word of a
+    /// lease. It counts each word and allocates nothing.
+    #[derive(Debug)]
+    struct Hears(Arc<Told>);
+
+    impl Lifecycle for Hears {
+        fn hears(&self) -> EventSet {
+            EventSet::LEASE
+        }
+
+        fn on_decision_issued(&self, _: &Lease, _: &Decision) {
+            self.0.issued.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_dispatched(&self, _: &Lease, _: &Target, _: Side, _: u32) {
+            self.0.dispatched.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_completed(&self, _: &Lease, _: &Outcome) {
+            self.0.completed.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_released(&self, _: &Lease, _: ReleaseReason) {
+            self.0.released.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl Scorer for Hears {
+        fn name(&self) -> &'static str {
+            "hears"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(1.0);
+            TieBand::NORMALIZED
+        }
+    }
+
+    /// The engine of the `round_robin` preset, for the life of the process:
+    /// the preset as it stands, or with [`Hears`] among its scorers where
+    /// `told` is handed.
+    fn engine_of(told: Option<&Arc<Told>>) -> &'static PolicyEngine {
         let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
-        document.generation = 1;
-        let spec = AppliedSpec::validate(&document).expect("the preset validates");
-        store.apply(spec).expect("the first generation");
-        let door = StoreBackedEngine::new(Arc::new(store));
-        let now = opened + Duration::from_secs(1);
-        let request = Request {
-            id: b"held",
-            facts: RequestFacts {
-                model: "m",
-                ..RequestFacts::default()
-            },
-            constraints: Constraints::default(),
-        };
-        let serve = || {
-            let decided = DecisionGuard::decide(&door, GatewayId(1), &request, now);
-            let mut handle = decided.expect("a decision");
-            let target = handle.take(0).expect("a pick over the pool");
-            handle.dispatched(now);
-            let outcome = Outcome {
-                side: Side::Single,
-                served: target.id,
-                status: 200,
-                class: TransportClass::Ok,
-                ttft_micros: 0,
-                tokens_in: 8,
-                tokens_out: 8,
-                duration_micros: 1_000,
-            };
-            handle.completed(&outcome, now);
-        };
-        // A rotation's first round names every member once.
-        (0..2 * n).for_each(|_| serve());
-        let ((), allocations) = allocations_during(|| (0..256).for_each(|_| serve()));
-        assert_eq!(allocations, 0, "{n} members: a held request allocated");
+        let mut stages = StageRegistry::builtin();
+        if let Some(told) = told {
+            let kept = Arc::clone(told);
+            let added = stages.scorer("hears", move || Box::new(Hears(Arc::clone(&kept))));
+            added.expect("a free name");
+            let profile = document.profiles.get_mut("round_robin");
+            let scorers = &mut profile.expect("the preset's profile").score;
+            scorers.push(ScoreSpec::from("hears"));
+        }
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        let spec = spec.expect("the stages hold the scorer");
+        Box::leak(Box::new(PolicyEngine::new(spec)))
+    }
+
+    /// A request a host in process holds from its decision to its completion
+    /// allocates nothing once the list's first requests have sized the
+    /// thread's scratch and the list's records: the one call that places
+    /// it, the word that it went out and the word of its end. Under the
+    /// preset alone a place answers the request, and nothing is owed of it.
+    /// Under a stage that takes every word of a lease the pick is leased:
+    /// the decision with its lease, the take, the dispatch and the
+    /// completion, each word told where it is said.
+    #[test]
+    fn a_request_held_from_its_decision_to_its_completion_allocates_nothing() {
+        for leased in [false, true] {
+            for n in [8usize, 64] {
+                let told = Arc::new(Told::default());
+                let engine = engine_of(leased.then_some(&told));
+                let list: Arc<[Arc<dyn Worker>]> = (0..n)
+                    .map(|at| ready_worker(&format!("http://w{at}:8000"), MODEL))
+                    .collect();
+                let cell = ListCell::default();
+                let lent = LentList {
+                    workers: &list,
+                    cell: &cell,
+                    facts: None,
+                };
+                let request = PlaceRequest::of(MODEL, WorkerLists::Single(lent));
+                let serve = || {
+                    let mut placement = engine.place(&request).expect("a worker of the list");
+                    assert_eq!(placement.owes_events(), leased);
+                    placement.sent(Side::Single);
+                    placement.ended(Side::Single, Outcome::reported(200, TransportClass::Ok));
+                };
+                // A rotation's first round names every worker once.
+                (0..2 * n).for_each(|_| serve());
+                let before = told.read();
+                let ((), allocations) = allocations_during(|| (0..256).for_each(|_| serve()));
+                assert_eq!(
+                    allocations, 0,
+                    "{n} workers, leased {leased}: a held request allocated"
+                );
+                // What the stage was told of the 256 requests: each one's
+                // issue, dispatch and completion, and no release.
+                let (after, each) = (told.read(), if leased { 256 } else { 0 });
+                let since = [0, 1, 2, 3].map(|word| after[word] - before[word]);
+                assert_eq!(since, [each, each, each, 0], "{n} workers");
+            }
+        }
     }
 }
