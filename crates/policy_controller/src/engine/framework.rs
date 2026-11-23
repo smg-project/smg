@@ -3238,10 +3238,10 @@ pub(crate) enum ShadowRows {
     /// no column, and would be named none.
     Unnamed,
     /// By rows the host names again for it, under the shadow profile's
-    /// own cap ([`Engine::shadow_cap_at`]) and its own test of a row
-    /// ([`Engine::shadow_keeps_at`]): that profile names by another cap
-    /// than the live one, a cap the two share can fill and they hold it
-    /// to different tests, or the live one is named no row.
+    /// own cap ([`Engine::shadow_cap_at`]) and its own test of a row: that
+    /// profile names by another cap than the live one, a cap the two
+    /// share can fill and they hold it to different tests, or the live
+    /// one is named no row.
     /// A pool keeps one ruling of its warming rows and one record of
     /// sent prefixes, and both are the shadow profile's own there
     /// ([`Engine::pool_rule_for`], [`Engine::pool_record_for`]). The
@@ -5323,23 +5323,6 @@ impl Engine {
         self.bindings.get(at as usize).map(|entry| &entry.binding)
     }
 
-    /// Whether the live profile of the binding at `at` reads the affinity
-    /// column for `phase` by its own stages. [`Self::reads_for`] joins
-    /// the shadow profile's needs to the live one's: a host that skips a
-    /// shadow, or names it rows of its own ([`ShadowRows`]), fills the
-    /// live decision's column by this word.
-    #[expect(
-        dead_code,
-        reason = "no host names a shadow rows of its own until the engine over worker lists does"
-    )]
-    pub(crate) fn live_column_at(&self, at: u32, phase: Phase) -> bool {
-        self.bindings
-            .get(at as usize)
-            .and_then(|entry| profile_index(&entry.binding, phase))
-            .and_then(|index| self.profile_needs.get(usize::from(index)))
-            .is_some_and(|needs| needs.affinity)
-    }
-
     /// The cap of each list of rows a host names again for the shadow of
     /// the binding at `at` ([`ShadowRows::Own`]): the shadow profile's
     /// own, as [`Self::affinity_rows_cap`] says a live profile's. `0` where the
@@ -5580,25 +5563,6 @@ impl Engine {
     ) -> Option<RowTest<'a>> {
         let (_, index, _) = self.resolve(model, phase)?;
         self.keeps_at(index, facts, cx)
-    }
-
-    /// [`Self::keeps_for`] for the shadow profile of the binding at `at`:
-    /// the test that profile's own standing pass asks of a row. A host
-    /// that names the shadow rows of its own ([`ShadowRows::Own`]) holds
-    /// a naming that fills its cap to it. `None` too where the binding
-    /// names no shadow.
-    #[expect(
-        dead_code,
-        reason = "no host names a shadow rows of its own until the engine over worker lists does"
-    )]
-    pub(crate) fn shadow_keeps_at<'a>(
-        &'a self,
-        at: u32,
-        facts: &'a RequestFacts<'a>,
-        cx: &'a Constraints<'a>,
-    ) -> Option<RowTest<'a>> {
-        let shadow = self.bindings.get(at as usize)?.binding.shadow?;
-        self.keeps_at(shadow, facts, cx)
     }
 
     /// The test the standing pass of the profile at `index` asks of a
