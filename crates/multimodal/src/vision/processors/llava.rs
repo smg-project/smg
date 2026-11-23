@@ -187,16 +187,6 @@ impl LlavaProcessor {
         }
     }
 
-    /// Create a processor with custom settings.
-    pub fn with_config(patch_size: u32, image_size: u32, aspect_ratio: ImageAspectRatio) -> Self {
-        Self {
-            transforms: LlavaTransforms::new(&PreProcessorConfig::default()),
-            patch_size,
-            image_size,
-            aspect_ratio,
-        }
-    }
-
     /// Create a processor from model config JSON.
     ///
     /// Extracts patch_size, image_size, and image_aspect_ratio from config.
@@ -493,14 +483,6 @@ impl LlavaNextProcessor {
         }
     }
 
-    /// Create a processor with custom grid pinpoints.
-    pub fn with_grid_pinpoints(grid_pinpoints: Vec<(u32, u32)>) -> Self {
-        Self {
-            base: LlavaProcessor::new(),
-            image_grid_pinpoints: grid_pinpoints,
-        }
-    }
-
     /// Create a processor from model config.
     pub fn from_config(config: &Value) -> Self {
         let base = LlavaProcessor::from_config(config);
@@ -541,15 +523,6 @@ impl LlavaNextProcessor {
     pub fn get_anyres_grid_shape(&self, image_size: (u32, u32)) -> (u32, u32) {
         let (width, height) = self.select_best_resolution(image_size);
         (width / self.base.image_size, height / self.base.image_size)
-    }
-
-    /// Calculate unpad dimensions based on original aspect ratio.
-    #[expect(
-        clippy::unused_self,
-        reason = "method logically belongs to the processor; keeps API consistent"
-    )]
-    pub fn calculate_unpad(&self, grid_shape: (u32, u32), original_size: (u32, u32)) -> (u32, u32) {
-        calculate_unpad(grid_shape, original_size)
     }
 
     /// Resize and pad image to target resolution, maintaining aspect ratio.
@@ -772,26 +745,6 @@ fn select_best_resolution(
 /// as that integer and anything else rounds down.
 fn unpadded_side(value: f64) -> f64 {
     ((value * 1e7).round() / 1e7).floor()
-}
-
-/// Calculate unpad dimensions based on aspect ratio.
-fn calculate_unpad(size: (u32, u32), original_size: (u32, u32)) -> (u32, u32) {
-    let (original_width, original_height) = original_size;
-    let (current_width, current_height) = size;
-    let original_aspect_ratio = original_width as f32 / original_height as f32;
-    let current_aspect_ratio = current_width as f32 / current_height as f32;
-
-    if original_aspect_ratio > current_aspect_ratio {
-        let scale_factor = current_width as f32 / original_width as f32;
-        let new_height = (original_height as f32 * scale_factor).floor() as u32;
-        let padding = (current_height - new_height) / 2;
-        (current_width, current_height - 2 * padding)
-    } else {
-        let scale_factor = current_height as f32 / original_height as f32;
-        let new_width = (original_width as f32 * scale_factor).floor() as u32;
-        let padding = (current_width - new_width) / 2;
-        (current_width - 2 * padding, current_height)
-    }
 }
 
 /// Resize and pad image to target resolution, centering the image.
@@ -1078,17 +1031,6 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_unpad() {
-        // Square grid, wide original -> should reduce width padding
-        let unpad = calculate_unpad((24, 24), (800, 400));
-        assert!(unpad.0 >= unpad.1); // Width should be >= height
-
-        // Square grid, tall original -> should reduce height padding
-        let unpad = calculate_unpad((24, 24), (400, 800));
-        assert!(unpad.1 >= unpad.0); // Height should be >= width
-    }
-
-    #[test]
     fn test_llava_next_processor_default() {
         let processor = LlavaNextProcessor::new();
         assert!(!processor.image_grid_pinpoints.is_empty());
@@ -1352,7 +1294,7 @@ mod tests {
 
     /// The reference's processors default to bicubic when a config omits
     /// `resample`, and the crate-wide fallback is bilinear: a processor built
-    /// without a config (`new()`, `with_grid_pinpoints`) resized, padded and
+    /// without a config (`new()`) resized, padded and
     /// patched through the other kernel.
     #[test]
     fn a_config_without_resample_resizes_bicubic_like_the_reference() {
