@@ -87,7 +87,7 @@ use super::{
     decision::ShadowKind,
     decision_engine::{
         AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Request,
-        RequestMaker, SweepOutcome, WorkerLists,
+        RequestMaker, WorkerLists,
     },
     framework::{release, AloneProfile, NotAlone, Picker, Place, PoolWord, ShadowRows},
     lease_events,
@@ -1070,10 +1070,9 @@ impl DecisionEngine for PolicyEngine {
     // table here, off the path of a request: from this pass's first run no
     // read of a key sweeps the table. The records of sent prefixes take a
     // bounded step of the work they left waiting.
-    fn sweep(&self, now: Instant) -> SweepOutcome {
+    fn sweep(&self, now: Instant) {
         self.sessions.sweep_due(self.clock.micros(now));
         self.affinity.sweep();
-        SweepOutcome::default()
     }
 
     fn with_spec<R>(&self, read: impl FnOnce(&AppliedSpec) -> R) -> R {

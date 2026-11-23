@@ -41,7 +41,7 @@ pub use decision::{
 };
 pub use decision_engine::{
     AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused,
-    HeldDecision, HeldDecode, Leased, Plain, Request, RequestMaker, SweepOutcome,
+    HeldDecision, HeldDecode, Leased, Plain, Request, RequestMaker,
 };
 #[cfg(feature = "in-process")]
 pub use decision_engine::{TokenKey, WorkerLists};

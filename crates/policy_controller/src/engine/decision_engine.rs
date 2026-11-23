@@ -513,7 +513,7 @@ pub trait DecisionEngine {
 
     /// One pass of the engine's clock at `now`, about once a second: what
     /// lives past its end is ended, and what was told of it is said.
-    fn sweep(&self, now: Instant) -> SweepOutcome;
+    fn sweep(&self, now: Instant);
 
     /// Reads the document in force. A host names a profile, reads a
     /// binding's key sources and a document's own rules here, under the
@@ -593,15 +593,6 @@ pub struct Leased {
     /// leases whose dispatch span has passed and whose dispatch is still
     /// owed.
     pub due: Instant,
-}
-
-/// What one pass of an engine's clock ended ([`DecisionEngine::sweep`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SweepOutcome {
-    /// The leases past their dispatch span, ended as abandoned.
-    pub leases: usize,
-    /// The pins of record past their end, gone from their table.
-    pub pins: usize,
 }
 
 /// Why a door has no decision for a request.
