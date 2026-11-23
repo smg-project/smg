@@ -282,8 +282,14 @@ mod tests {
     /// `case` beside the engine's own task, as a program runs it: the task
     /// keeps the newest load snapshot at hand. It runs for as long as its
     /// engine stands, so the case's end ends both.
+    ///
+    /// The task is polled ahead of the case at every turn. Its first tick
+    /// is due before the case's first wait ends, and a report wakes it at
+    /// once, so a report the feed published is at hand before the case
+    /// reads on, on a paused clock and on a real one.
     async fn beside_its_task(engine: &'static PolicyEngine, case: impl Future<Output = ()>) {
         tokio::select! {
+            biased;
             () = engine.run() => {}
             () = case => {}
         }
