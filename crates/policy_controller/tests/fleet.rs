@@ -4,9 +4,9 @@
 //! the controller's own load driver polls it; each engine is asked its
 //! health and what it answered is written, by the controller's own prober
 //! where its build has one and by a probe turn of the case elsewhere; and
-//! the pool is read back as a decision's view reads it: every rank a row,
-//! healthy by its probe, its load from a poll, an engine that holds
-//! requests reading them.
+//! the pool is read back as the store holds it: every rank a row, healthy
+//! by its probe, its load from a poll, an engine that holds requests
+//! reading them.
 //! That engine's KV events follow: a subscriber of the case hands each batch
 //! of its stream to the sink, and its row's index holds every block the
 //! events left the engine holding, where the cache-aware preset then asks a
@@ -311,33 +311,51 @@ fn nth(run: &str, n: u64) -> DecideRequest {
     ask
 }
 
-/// Whether the fleet's pool of `rows` rows reads overloaded on the rows of
-/// `engine` and on no other; with no engine, on no row. A view of another
-/// size is no answer, and neither is one that holds no row of `engine`: an
-/// empty or a partial pool reads false.
-fn reads_overloaded(harness: &mut Harness, rows: usize, engine: Option<usize>) -> bool {
-    harness.view(MODEL, Role::Single).is_ok_and(|pool| {
-        pool.len() == rows
-            && engine.is_none_or(|engine| pool.iter().any(|row| row.engine == engine))
-            && pool
-                .iter()
-                .all(|row| row.overloaded == (Some(row.engine) == engine))
-    })
+/// Waits until a rotation leaves `engine` out for a whole turn: as many
+/// asks of the run named `run` as the fleet's pool has `rows`, one after
+/// another, none answered with a row of `engine`. An overload verdict
+/// stands nowhere a case reads, so a veto is read in what the service
+/// answers.
+async fn left_out(
+    harness: &mut Harness,
+    run: &str,
+    rows: usize,
+    engine: usize,
+) -> Result<(), String> {
+    let bound = POLL_INTERVAL + ROOM;
+    let asked = Instant::now();
+    let mut spared = 0;
+    for n in 0u64.. {
+        if spared == rows {
+            return Ok(());
+        }
+        if asked.elapsed() > bound {
+            break;
+        }
+        let pick = picked(harness, nth(run, n)).await?;
+        spared = if pick.engine == engine { 0 } else { spared + 1 };
+    }
+    Err(format!(
+        "a rotation leaves a vetoed engine out for a turn: not within {bound:?}"
+    ))
 }
 
-/// Waits until the rows of `engine` read overloaded and no other row of the
-/// fleet's pool of `rows` rows does; with no engine, until no row does.
-async fn overloaded(
-    harness: &mut Harness,
-    rows: usize,
-    engine: Option<usize>,
-) -> Result<Duration, String> {
-    within(
-        "the pool reads overloaded where a patch stands, and there alone",
-        POLL_INTERVAL + ROOM,
-        || reads_overloaded(harness, rows, engine),
-    )
-    .await
+/// Waits until an ask of the run named `run` is answered with a row of
+/// `engine`: a rotation names the engine again once no veto stands on it.
+async fn named_again(harness: &mut Harness, run: &str, engine: usize) -> Result<(), String> {
+    let bound = POLL_INTERVAL + ROOM;
+    let asked = Instant::now();
+    for n in 0u64.. {
+        if picked(harness, nth(run, n)).await?.engine == engine {
+            return Ok(());
+        }
+        if asked.elapsed() > bound {
+            break;
+        }
+    }
+    Err(format!(
+        "a rotation names an engine whose veto ended: not within {bound:?}"
+    ))
 }
 
 /// `ask` under the routing key `key`.
@@ -701,7 +719,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .filter(|shape| shape.model == MODEL)
             .map(|shape| usize::from(shape.ranks))
             .sum();
-        let pool = harness.view(MODEL, Role::Single).expect("the view");
+        let pool = harness.pool(MODEL, Role::Single).expect("the pool");
         assert_eq!(pool.len(), ranks, "every rank is a row: {pool:?}");
         // A controller that probes by itself asks an engine as its row
         // arrives: nothing is asked yet only where the stand-in probes.
@@ -717,7 +735,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             "every rank is healthy and holds a polled load row",
             PROBE_INTERVAL + POLL_INTERVAL + ROOM,
             || {
-                harness.view(MODEL, Role::Single).is_ok_and(|pool| {
+                harness.pool(MODEL, Role::Single).is_ok_and(|pool| {
                     pool.iter().all(|row| {
                         row.healthy
                             && row
@@ -729,7 +747,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         )
         .await
         .expect("the fleet turns ready");
-        let pool = harness.view(MODEL, Role::Single).expect("the view");
+        let pool = harness.pool(MODEL, Role::Single).expect("the pool");
         assert_eq!(pool.len(), ranks, "{pool:?}");
         for row in &pool {
             let load = row.load.expect("a polled row");
@@ -812,7 +830,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             "the busy engine's row reads its held requests",
             POLL_INTERVAL + POLL_INTERVAL + ROOM,
             || {
-                harness.view(MODEL, Role::Single).is_ok_and(|pool| {
+                harness.pool(MODEL, Role::Single).is_ok_and(|pool| {
                     pool.iter().any(|row| {
                         row.engine == busy && row.load.is_some_and(|load| load.running == HELD)
                     })
@@ -821,7 +839,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         )
         .await
         .expect("the loads follow");
-        let pool = harness.view(MODEL, Role::Single).expect("the view");
+        let pool = harness.pool(MODEL, Role::Single).expect("the pool");
         for row in pool.iter().filter(|row| row.engine != busy) {
             assert_eq!(
                 row.load.map(|load| load.running),
@@ -839,7 +857,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             "the counted pool's rows read their engines' resident tokens",
             POLL_INTERVAL + POLL_INTERVAL + ROOM,
             || {
-                harness.view(COUNTED, Role::Single).is_ok_and(|pool| {
+                harness.pool(COUNTED, Role::Single).is_ok_and(|pool| {
                     pool.len() == 2
                         && pool.iter().all(|row| {
                             row.healthy
@@ -935,6 +953,8 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         // prompts there reads it overloaded: a rotation names every row
         // but its own, and an ask that lifts the veto is turned over every
         // row again. The patch taken back, the engine is a pick as before.
+        // The verdict is read in the picks: the case waits for a turn that
+        // leaves the engine out, and for a pick that names it again.
         harness
             .apply("round_robin")
             .expect("a preset of this build applies");
@@ -946,9 +966,11 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .patch_overload(busy, least)
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, ranks, Some(busy))
-            .await
-            .expect("an engine at its patched limit reads overloaded");
+        if READS_OVERLOAD {
+            left_out(&mut harness, "spared", ranks, busy)
+                .await
+                .expect("an engine at its patched limit leaves the rotation");
+        }
         let mut vetoed = HashSet::new();
         for n in (0u64..).take(2 * ranks) {
             let pick = picked(&mut harness, nth("veto", n))
@@ -980,17 +1002,26 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             ranks,
             "the gateway's lift of the veto keeps the overloaded row: {lifted:?}"
         );
-        assert!(
-            reads_overloaded(&mut harness, ranks, Some(busy)),
-            "the engine read overloaded through both rotations"
-        );
+        if READS_OVERLOAD {
+            for n in (0u64..).take(ranks) {
+                let pick = picked(&mut harness, nth("stood", n))
+                    .await
+                    .expect("a pick answers an ask over a ready fleet");
+                assert_ne!(
+                    pick.engine, busy,
+                    "the veto stood through both rotations: {pick:?}"
+                );
+            }
+        }
         harness
             .patch_overload(busy, OverloadThresholds::default())
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, ranks, None)
-            .await
-            .expect("the patch taken back, no row reads overloaded");
+        if READS_OVERLOAD {
+            named_again(&mut harness, "regained", busy)
+                .await
+                .expect("the patch taken back, the engine is a pick again");
+        }
 
         // A rotation names every row before it names one again: under the
         // round-robin preset two turns of asks name each row twice.
@@ -1466,7 +1497,11 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         // A session key keeps its ring worker over the overload veto. A
         // key of the engine that holds requests is found among 256, an
         // operator patches that engine as before, and with the engine
-        // read overloaded the key's asks still name its row.
+        // vetoed the key's asks still name its row. A key keeps its worker
+        // over a veto, so the ring gives no witness that one stands: the
+        // rotation preset is applied on either side of the key's asks to
+        // show it, and the ring preset between them for the asks. The
+        // patch is the row's own and stands under every preset.
         harness
             .apply("consistent_hashing")
             .expect("a preset of this build applies");
@@ -1485,9 +1520,17 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .patch_overload(busy, least)
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, ranks, Some(busy))
-            .await
-            .expect("an engine at its patched limit reads overloaded");
+        if READS_OVERLOAD {
+            harness
+                .apply("round_robin")
+                .expect("a preset of this build applies");
+            left_out(&mut harness, "ring-spared", ranks, busy)
+                .await
+                .expect("an engine at its patched limit leaves the rotation");
+            harness
+                .apply("consistent_hashing")
+                .expect("a preset of this build applies");
+        }
         for n in 0..8 {
             let again = picked(&mut harness, keyed(nth("kept", n), key))
                 .await
@@ -1497,17 +1540,29 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
                 "a session key keeps its ring worker over the veto"
             );
         }
-        assert!(
-            reads_overloaded(&mut harness, ranks, Some(busy)),
-            "the engine read overloaded through the key's asks"
-        );
+        if READS_OVERLOAD {
+            harness
+                .apply("round_robin")
+                .expect("a preset of this build applies");
+            for n in (0u64..).take(ranks) {
+                let pick = picked(&mut harness, nth("ring-stood", n))
+                    .await
+                    .expect("a pick answers an ask over a ready fleet");
+                assert_ne!(
+                    pick.engine, busy,
+                    "the veto stood through the key's asks: {pick:?}"
+                );
+            }
+        }
         harness
             .patch_overload(busy, OverloadThresholds::default())
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, ranks, None)
-            .await
-            .expect("the patch taken back, no row reads overloaded");
+        if READS_OVERLOAD {
+            named_again(&mut harness, "ring-regained", busy)
+                .await
+                .expect("the patch taken back, the engine is a pick again");
+        }
 
         // A keyed ask returns to its worker: under the ring preset one
         // routing key names one row at each ask, and 64 keys do not all
@@ -1843,7 +1898,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         if DECIDES_PHASES {
             within("the prefill pool's rows read healthy", ROOM, || {
                 harness
-                    .view(SIZED, Role::Prefill)
+                    .pool(SIZED, Role::Prefill)
                     .is_ok_and(|pool| pool.len() == 3 && pool.iter().all(|row| row.healthy))
             })
             .await
@@ -1901,12 +1956,12 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             );
         }
 
-        // The death. The kill waits for a view that reads its engine
+        // The death. The kill waits for a pool that reads its engine
         // healthy, so the death alone moves its rows. Its promise is held
         // by order below, whatever the host's clock does: the time from the
-        // kill to the view that reads the death is a number of the case.
+        // kill to the pool that reads the death is a number of the case.
         within("the engine to kill reads healthy", ROOM, || {
-            harness.view(MODEL, Role::Single).is_ok_and(|pool| {
+            harness.pool(MODEL, Role::Single).is_ok_and(|pool| {
                 pool.iter()
                     .filter(|row| row.engine == dead)
                     .all(|row| row.healthy)
@@ -1946,14 +2001,14 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             PROBE_INTERVAL + DIAL_TIMEOUT + ROOM,
             || {
                 harness
-                    .view(MODEL, Role::Single)
+                    .pool(MODEL, Role::Single)
                     .is_ok_and(|pool| pool.iter().all(|row| row.healthy == (row.engine != dead)))
             },
         )
         .await
         .expect("the death is seen");
         let seen = death.at.elapsed();
-        let pool = harness.view(MODEL, Role::Single).expect("the view");
+        let pool = harness.pool(MODEL, Role::Single).expect("the pool");
         assert_eq!(
             pool.len(),
             ranks,
@@ -2032,7 +2087,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             "a hung engine's rows read unhealthy and every live row healthy",
             PROBE_INTERVAL + DIAL_TIMEOUT + ROOM,
             || {
-                harness.view(MODEL, Role::Single).is_ok_and(|pool| {
+                harness.pool(MODEL, Role::Single).is_ok_and(|pool| {
                     pool.iter()
                         .all(|row| row.healthy == (row.engine != dead && row.engine != hung))
                 })
@@ -2421,7 +2476,7 @@ async fn a_pair_plan_answers_its_prefill_for_both_sides_by_the_loads_their_engin
             PROBE_INTERVAL + POLL_INTERVAL + ROOM,
             || {
                 sides.iter().all(|&(side, _)| {
-                    harness.view(PAIRED, side).is_ok_and(|pool| {
+                    harness.pool(PAIRED, side).is_ok_and(|pool| {
                         pool.len() == 2 && pool.iter().all(|row| row.healthy && row.load.is_some())
                     })
                 })
@@ -2443,7 +2498,7 @@ async fn a_pair_plan_answers_its_prefill_for_both_sides_by_the_loads_their_engin
             POLL_INTERVAL + POLL_INTERVAL + ROOM,
             || {
                 sides.iter().all(|&(side, held)| {
-                    harness.view(PAIRED, side).is_ok_and(|pool| {
+                    harness.pool(PAIRED, side).is_ok_and(|pool| {
                         pool.iter().all(|row| {
                             row.load
                                 .is_some_and(|load| (load.running == HELD) == (row.engine == held))
@@ -2569,7 +2624,7 @@ async fn linked_fleet(gateway: &str, workers: usize) -> Result<(Harness, Link), 
     harness.feed();
     within("the workers are ready", ROOM, || {
         harness
-            .view(MODEL, Role::Single)
+            .pool(MODEL, Role::Single)
             .is_ok_and(|pool| pool.len() == workers && pool.iter().all(|row| row.healthy))
     })
     .await?;
@@ -3470,7 +3525,7 @@ mod hosted {
                 PROBE_INTERVAL + POLL_INTERVAL + ROOM,
                 || {
                     [MODEL, COUNTED, SERVED].into_iter().all(|model| {
-                        harness.view(model, Role::Single).is_ok_and(|pool| {
+                        harness.pool(model, Role::Single).is_ok_and(|pool| {
                             pool.len() == ranks(&shapes, model)
                                 && pool.iter().all(|row| row.healthy)
                         })
@@ -3562,7 +3617,7 @@ async fn a_standby_takes_the_fleet_when_its_leader_stops() {
             "every rank is healthy and holds a polled load row",
             PROBE_INTERVAL + POLL_INTERVAL + ROOM,
             || {
-                harness.view(MODEL, Role::Single).is_ok_and(|pool| {
+                harness.pool(MODEL, Role::Single).is_ok_and(|pool| {
                     pool.len() == ranks
                         && pool.iter().all(|row| {
                             row.healthy
@@ -3612,7 +3667,7 @@ async fn a_standby_takes_the_fleet_when_its_leader_stops() {
             harness.term_floor() > led,
             "a promoted standby answers under a term above its leader's"
         );
-        let pool = harness.view(MODEL, Role::Single).expect("the view");
+        let pool = harness.pool(MODEL, Role::Single).expect("the pool");
         assert!(
             pool.len() == ranks && pool.iter().all(|row| row.healthy),
             "a promoted standby holds its leader's rows, each ready: {pool:?}"
@@ -3681,7 +3736,7 @@ async fn a_standby_takes_the_fleet_when_its_leader_stops() {
             "the busy engine's row reads its held requests",
             POLL_INTERVAL + POLL_INTERVAL + ROOM,
             || {
-                harness.view(MODEL, Role::Single).is_ok_and(|pool| {
+                harness.pool(MODEL, Role::Single).is_ok_and(|pool| {
                     pool.iter().any(|row| {
                         row.engine == busy && row.load.is_some_and(|load| load.running == HELD)
                     })

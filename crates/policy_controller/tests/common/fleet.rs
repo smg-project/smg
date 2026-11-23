@@ -28,10 +28,10 @@
 //! A fleet registers as an operator's does ([`Harness::register`]): an
 //! engine of one rank is an add on the control listener, under the name the
 //! harness states there. The call makes one rank, so a rank of a wider
-//! engine is still the store's membership write. The view a case reads
-//! ([`Harness::view`]) is the store's handle too, and gives way to the
-//! decisions the service answers. A case calls the handle alone, so neither
-//! move rewrites a case.
+//! engine is still the store's membership write. The rows a case reads
+//! ([`Harness::pool`]) are the store's too: its workers' table and its load
+//! table, as the controller's own writers left them. A case calls the
+//! handle alone, so a move of either rewrites no case.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -75,9 +75,9 @@ use smg_policy_controller::{
     stages::StageRegistry,
     store::{
         BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, JournalKinds, KvCursor,
-        KvEvent, KvEventSink, LaneCounts, LeaseState, MembershipChange, MembershipTail,
-        MemoryStore, ResyncReason, SequenceHash, Signals, StoredBlock, ViewBuffers, ViewQuery,
-        WorkerFacts, WorkerStatus, WorkersStore,
+        KvEvent, KvEventSink, LaneCounts, LeaseState, LoadSink, MembershipChange, MembershipTail,
+        MemoryStore, ResyncReason, SequenceHash, Signals, StoredBlock, WorkerFacts, WorkerStatus,
+        WorkersStore,
     },
     tracking::LeaseId,
 };
@@ -197,7 +197,7 @@ pub struct Shape {
     pub runtime: RuntimeType,
 }
 
-/// One row of a pool as a view reads it, named by the engine that
+/// One row of a pool as the store holds it, named by the engine that
 /// registered it.
 #[derive(Clone, Copy, Debug)]
 pub struct Seen {
@@ -205,9 +205,6 @@ pub struct Seen {
     pub engine: usize,
     pub rank: u16,
     pub healthy: bool,
-    /// Whether the row reads overloaded: its engine's reports against the
-    /// thresholds that stand for it.
-    pub overloaded: bool,
     pub load: Option<LoadRow>,
 }
 
@@ -432,7 +429,6 @@ pub struct Harness {
     sent: u64,
     /// The spec generations applied so far.
     generation: u64,
-    buffers: ViewBuffers,
     stop_feeds: watch::Sender<bool>,
     feeds: JoinSet<()>,
     /// Whether the controller the harness asks elects over a lease file: a
@@ -1252,7 +1248,6 @@ impl Harness {
             held: Vec::new(),
             sent: 0,
             generation: 0,
-            buffers: ViewBuffers::default(),
             stop_feeds,
             feeds: JoinSet::new(),
             elects: false,
@@ -1423,8 +1418,8 @@ impl Harness {
             let mut ids = Vec::with_capacity(usize::from(shape.ranks));
             for rank in 0..shape.ranks {
                 let id = self.member(&endpoint, shape, rank).await?;
-                // The build this registration owes, asked: the cases read
-                // the row at once.
+                // The build this registration owes, asked: a decision asked
+                // right behind it reads the row.
                 self.store.publish_now();
                 self.members.insert(id, (engine, rank));
                 ids.push(id);
@@ -1658,37 +1653,30 @@ impl Harness {
         Ok(())
     }
 
-    /// The pool serving `model` in `role` as a decision's view reads it at
-    /// this instant, each row named by its engine. Until the service
-    /// answers decisions this is what a case reads back.
-    pub fn view(&mut self, model: &str, role: Role) -> Result<Vec<Seen>, String> {
-        let ask = ViewQuery {
-            gateway: GatewayId::LOCAL,
-            now: Instant::now(),
-            pinned: None,
-            affinity: false,
-            signal_cells: false,
-        };
-        if self
-            .store
-            .build_view(model, role, &ask, &mut self.buffers)
-            .is_none()
-        {
-            return Ok(Vec::new());
-        }
-        self.buffers
-            .candidates
-            .iter()
+    /// The pool serving `model` in `role` as the store holds it at this
+    /// instant, each row named by its engine: the rows of the workers'
+    /// table that serve the model in that role. A row is healthy where its
+    /// status is ready, and its load is the row its engine's reports left
+    /// in the load table. The rows come in the table's order, by
+    /// registration key: no case reads their order. The overload verdict
+    /// is no part of a row here: a case reads a veto in the picks the
+    /// service answers.
+    pub fn pool(&self, model: &str, role: Role) -> Result<Vec<Seen>, String> {
+        let (_, mut rows) = self.store.all_rows();
+        rows.retain(|row| {
+            row.facts.role == role && row.facts.models.iter().any(|served| served == model)
+        });
+        rows.iter()
             .map(|row| {
                 let (engine, rank) = *self.members.get(&row.id).ok_or_else(|| {
-                    format!("the view holds a row no registration made: {:?}", row.id)
+                    format!("the store holds a row no registration made: {:?}", row.id)
                 })?;
+                let load = self.store.load(row.id, row.facts.dp_rank);
                 Ok(Seen {
                     engine,
                     rank,
-                    healthy: row.health.healthy,
-                    overloaded: row.health.overloaded,
-                    load: row.load,
+                    healthy: row.status == WorkerStatus::Ready,
+                    load: load.map(|sample| sample.row),
                 })
             })
             .collect()
