@@ -7085,6 +7085,8 @@ impl Engine {
     /// to the rule is placed by the assignment. The pick states the prefill
     /// side's verdict, and its first target's pair the decode side's
     /// ([`Pair::decode_verdict`](super::decision::Pair::decode_verdict)).
+    /// A claim of the prefill side names the prefill the pair formed on,
+    /// before any dispatch, and a decision that forms no pair leaves none.
     ///
     /// The decode side is put to its binding's all-vetoed rule for the
     /// overload veto, as the pool of a single request is ([`Self::decide`]).
@@ -7539,11 +7541,31 @@ impl Engine {
                         lifted => lifted,
                     };
                     *session_verdict = prefill_pick.session_verdict;
+                    // The prefill side's run claimed the prefill it placed
+                    // first. Where the pair formed on another, the claim
+                    // moves to that one here, ahead of any dispatch: the
+                    // key's next decision follows a prefill that pairs.
+                    // Where the table moves none, the claim stands
+                    // unconfirmed no longer or that prefill is a pin
+                    // already: the pick states a pin's verdict, and its
+                    // dispatch moves the pins as a pin's alternate does.
+                    if let SessionVerdict::Claimed(claimed) = prefill_pick.session_verdict {
+                        if claimed != prefill_target.id {
+                            let (key, paired) = (prefill_facts.session(), prefill_target.id);
+                            *session_verdict = self.sessions.move_claim(key, claimed, paired);
+                        }
+                    }
                     return decision;
                 }
                 Decision::Shed(shed) => last_shed = Some(*shed),
                 Decision::Queue(_) => return decision,
             }
+        }
+        // No prefill paired: the claim the prefill side's run made is
+        // withdrawn, and the key's next request is placed again.
+        if let SessionVerdict::Claimed(claimed) = prefill_pick.session_verdict {
+            let key = prefill_facts.session();
+            self.sessions.move_claim(key, claimed, WorkerId(0));
         }
         match last_shed {
             Some(last) => Decision::Shed(last),
@@ -15919,48 +15941,100 @@ mod tests {
         assert_eq!(places, in_turn);
     }
 
-    /// A prefill the decode side declines is passed over under a rule too.
-    /// The pick states the claim of the prefill its side placed first, the
-    /// pair names the prefill that paired, and the dispatch there withdraws
-    /// the claim: the key's prefill pin is the worker the request went to.
+    /// A decode profile whose picker declines the partners of a prefill
+    /// where the first of them is of pair class 7.
+    fn declining_decode_profile() -> Profile {
+        Profile {
+            name: "decode".into(),
+            filters: vec![Box::new(Healthy)],
+            scorers: vec![],
+            picker: Box::new(RefusesClass(7)),
+        }
+    }
+
+    /// A prefill the decode side declines is passed over under a rule too,
+    /// and the claim its side's run made moves with the pair. The pick
+    /// states the claim of the prefill that paired, and the key's pin names
+    /// that prefill before any dispatch. So a second decision of the key,
+    /// made before the first is dispatched, follows the prefill that pairs.
+    /// The first decision's dispatch there settles the claim.
     #[test]
-    fn a_claimed_prefill_that_is_passed_over_leaves_its_pin_to_the_one_that_pairs() {
+    fn a_claim_on_a_prefill_that_is_passed_over_moves_to_the_one_that_pairs() {
         // The idle prefill's decode is refused; the busy prefill's is not.
         let mut sides = two_sides(&[0, 5], &[0, 0]);
         for side in &mut sides {
             (side[0].pair_class, side[1].pair_class) = (7, 8);
         }
-        let rule = SessionRule {
-            inflight_cap: 0,
-            ..SESSIONS
-        };
-        let engine = Engine::new(
-            vec![
-                least_requests_profile(),
-                Profile {
-                    name: "decode".into(),
-                    filters: vec![Box::new(Healthy)],
-                    scorers: vec![],
-                    picker: Box::new(RefusesClass(7)),
-                },
-            ],
-            vec![Binding {
-                decode_profile: Some(1),
-                sessions: Some(rule),
-                ..pair_binding()
-            }],
-            1,
-            Needs::default(),
-        );
+        let profiles = vec![least_requests_profile(), declining_decode_profile()];
+        let engine = pair_session_engine(profiles, Assignment::Delegate);
         let keyed = pair_request(Some(7));
-        let (places, verdicts) = pair_placed(&engine, &keyed, &sides, &mut Scratch::new());
-        assert_eq!(places, (1, 1));
-        assert_eq!(verdicts.0, SessionVerdict::Claimed(sides[0][0].id));
         let [prefill_session, _] = side_sessions(&keyed);
-        assert_eq!(
-            engine.sessions.pins(prefill_session),
-            Some([sides[0][1].id, WorkerId(0)])
-        );
+        let pools = PairPools {
+            prefills: &sides[0],
+            decodes: &sides[1],
+            ..PairPools::default()
+        };
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let paired = sides[0][1].id;
+        // Two decisions of the key, neither dispatched: the first claims
+        // the prefill that pairs, and the second follows that claim.
+        let first = engine.decide_pair(&keyed, &pool, pools, &cx, &cx, &mut scratch);
+        let first = first.pick().expect("a pair");
+        let went = *first.targets.first().expect("a target");
+        assert_eq!(went.id, paired);
+        assert_eq!(first.session_verdict, SessionVerdict::Claimed(paired));
+        let pinned = Some([paired, WorkerId(0)]);
+        assert_eq!(engine.sessions.pins(prefill_session), pinned);
+        let second = engine.decide_pair(&keyed, &pool, pools, &cx, &cx, &mut scratch);
+        let second = second.pick().expect("the key's second pair");
+        assert_eq!(second.targets.first().map(|target| target.id), Some(paired));
+        assert_eq!(second.session_verdict, SessionVerdict::Pinned);
+        // The first decision's dispatch on the prefill settles its claim.
+        let lease = Lease {
+            session: prefill_session,
+            session_verdict: first.session_verdict,
+            ..Lease::default()
+        };
+        let went = Target { pair: None, ..went };
+        engine.on_dispatched(&lease, &went, Side::Prefill, 0);
+        assert_eq!(engine.sessions.pins(prefill_session), pinned);
+    }
+
+    /// A pair's decision that forms no pair leaves no claim. Where the
+    /// decode side declines the partners of every prefill placed, the claim
+    /// the prefill side's run made is withdrawn, and the key holds no pin.
+    /// Its next request is placed again, and pairs with a prefill whose
+    /// decode is usable by then.
+    #[test]
+    fn a_pair_that_sheds_withdraws_the_claim_its_prefill_side_made() {
+        // Every decode is of the refused class: no prefill pairs.
+        let mut sides = two_sides(&[0, 5], &[0, 0]);
+        for row in sides.iter_mut().flatten() {
+            row.pair_class = 7;
+        }
+        let profiles = vec![least_requests_profile(), declining_decode_profile()];
+        let engine = pair_session_engine(profiles, Assignment::Delegate);
+        let keyed = pair_request(Some(7));
+        let [prefill_session, _] = side_sessions(&keyed);
+        let pools = PairPools {
+            prefills: &sides[0],
+            decodes: &sides[1],
+            ..PairPools::default()
+        };
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let declined = engine.decide_pair(&keyed, &pool, pools, &cx, &cx, &mut scratch);
+        assert!(declined.pick().is_none(), "{declined:?}");
+        let none = Some([WorkerId(0); 2]);
+        assert_eq!(engine.sessions.pins(prefill_session), none);
+        // The busy prefill's decode is usable by the key's next request.
+        for side in &mut sides {
+            side[1].pair_class = 8;
+        }
+        let (places, verdicts) = pair_placed(&engine, &keyed, &sides, &mut scratch);
+        assert_eq!(places, (1, 1));
+        assert_eq!(verdicts.0, SessionVerdict::Claimed(sides[0][1].id));
     }
 
     /// A decode side its rule places writes the decode side's buffers, as
