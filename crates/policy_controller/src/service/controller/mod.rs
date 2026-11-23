@@ -173,7 +173,6 @@ pub struct Controller {
     /// The load reports of the replica's workers: one task of the serve,
     /// which polls while this replica leads. The deciding threads hold its
     /// channel from the bind.
-    #[cfg(feature = "worker-host")]
     monitor: worker_objects::LoadMonitor,
     /// Worker discovery, where the configuration names a provider: one task
     /// of the serve, which runs the provider while this replica leads.
@@ -520,7 +519,6 @@ impl Controller {
             workers,
             kv_feed,
             prober,
-            #[cfg(feature = "worker-host")]
             monitor,
             #[cfg(feature = "discovery")]
             discovery,
@@ -850,7 +848,6 @@ impl Controller {
             workers,
             kv_feed,
             prober,
-            #[cfg(feature = "worker-host")]
             monitor,
             #[cfg(feature = "discovery")]
             discovery,

@@ -148,10 +148,10 @@
 //! A served decision reads no report of the bench's yet (`READS_LOADS`): a
 //! controller's decision is given its load monitor's snapshot, and the bench
 //! writes its members' reports into the store's table, which no decision
-//! reads. Until its members answer the monitor, the bands hold no row's pool: it moves with
-//! the leases on file, and a row whose pool moves stops the bench. So no
-//! wire row is run, and each kind's line says so. The count cells run:
-//! they read a decision's calls of the allocator, not its pool.
+//! reads. Until its members answer the monitor, the bands hold no row's
+//! pool: it moves with the leases on file, and a row whose pool moves stops
+//! the bench. So no wire row is run, and each kind's line says so. The count
+//! cells run: they read a decision's calls of the allocator, not its pool.
 //!
 //! Every row runs on the allocator the binary registers, under a copy of
 //! its settings (`MALLOC_CONF`). A served decision's frame holds lists
