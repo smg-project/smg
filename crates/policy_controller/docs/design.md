@@ -934,7 +934,8 @@ are a broadcast that drops its oldest for a reader that falls behind: the task t
 registry whole, tells what changed, and last tells the ids that stand, so a stage keeps
 nothing of a worker whose whole life the channel dropped. It does the same behind a channel
 that closed, and at its next upkeep behind every registration, replacement and removal of a
-host that states ids: such a host may have stated an id of a worker and taken it back ahead of
+host known to state ids, from the first ask it answers with one: such a host may have stated an
+id of a worker and taken it back ahead of
 the event. The session table is told nothing: a pin on a worker that is gone stands until the
 session's idle time or two other workers end it.
 
