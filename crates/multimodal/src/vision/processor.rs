@@ -31,17 +31,6 @@ fn dim_for_ndim(
 }
 
 impl PreprocessedEncoderInputs {
-    /// Get the number of channels.
-    ///
-    /// For 4D tensors `[B, C, H, W]`, returns `shape[1]`.
-    /// For 5D tensors `[B, N, C, H, W]` (Phi3-Vision), returns `shape[2]`.
-    ///
-    /// # Errors
-    /// Returns `TransformError::InvalidShape` if encoder_input is not 4D or 5D.
-    pub fn channels(&self) -> Result<usize, TransformError> {
-        dim_for_ndim(self.encoder_input.ndim(), 1, 2, self.encoder_input.shape())
-    }
-
     /// Get the height of processed images.
     ///
     /// For 4D tensors `[B, C, H, W]`, returns `shape[2]`.
@@ -284,7 +273,6 @@ mod tests {
             vec![(640, 480), (800, 600)],
         );
 
-        assert_eq!(inputs.channels().unwrap(), 3);
         assert_eq!(inputs.height().unwrap(), 336);
         assert_eq!(inputs.width().unwrap(), 336);
     }
