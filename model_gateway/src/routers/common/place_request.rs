@@ -84,6 +84,9 @@ pub(crate) fn place_request<'a>(
             tokens: inputs.tokens,
             text: inputs.text,
             seeds: seeds(inputs.cache_namespace),
+            // The gateway lends the engine no token tree yet, so a prompt
+            // has no entry in one.
+            entry: None,
         },
         headers,
         request_id: inputs.rid,
