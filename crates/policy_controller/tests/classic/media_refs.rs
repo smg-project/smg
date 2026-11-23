@@ -118,6 +118,7 @@ impl Replayed for Row {
                     host_pipeline: worker.gateway_pipeline,
                     ..DemandFacts::default()
                 },
+                rank: None,
             });
         }
         let mut bed = Bed::new(self.shed, &pooled)?;

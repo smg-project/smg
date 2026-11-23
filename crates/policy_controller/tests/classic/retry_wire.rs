@@ -65,6 +65,7 @@ impl Replayed for Row {
                     runtime: runtimes.number(&worker.runtime),
                     ..DemandFacts::default()
                 },
+                rank: None,
             });
         }
         let mut bed = Bed::new(self.shed, &pooled)?;

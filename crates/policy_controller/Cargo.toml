@@ -343,10 +343,11 @@ required-features = ["controller", "worker-host"]
 name = "caller"
 required-features = ["in-process"]
 
-# Replays recorded rows through the load report conversion under `ingest`.
+# Replays recorded rows through the load report conversion under `ingest`,
+# and the hard-demand rows over worker objects under `in-process`.
 [[test]]
 name = "classic_rows"
-required-features = ["ingest"]
+required-features = ["ingest", "in-process"]
 
 [[test]]
 name = "controller"

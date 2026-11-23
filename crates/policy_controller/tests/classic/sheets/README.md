@@ -371,13 +371,16 @@ behavior did, and the drawn rows are a new sample.
 
 ## Reading
 
-The crate's replay reads this directory, every run of its suite with the `ingest` feature:
+The crate's replay reads this directory, every run of its suite with the `ingest` and `in-process` features:
 
 ```bash
-cargo test -p smg-policy-controller --features ingest --test classic_rows
+cargo test -p smg-policy-controller --features ingest,in-process --test classic_rows
 ```
 
 A few rows of each sheet are also copied into the crate's test source, and the replay holds each copy to its sheet.
+
+`retry_wire.json`, `media_refs.json`, `context_window.json` and `rank_pin.json` replay over worker objects, which the
+`in-process` feature brings.
 
 ## Limits left
 
@@ -452,7 +455,9 @@ fails once the reason no longer holds.
   row share for share.
 - `retry_wire.json`: every row replays. A worker states its runtime as a number of its registering host's, and
   a retry demands the number of its plan's runtime, so the replay numbers a row's runtimes itself, one a
-  spelling. A refusal replays by its `status` and its `code`. The crate sheds under a reason and a stage's
+  spelling on each transport: a retry stays on its wire by that number alone, and its pool is one list
+  whatever transports its workers dial.
+  A refusal replays by its `status` and its `code`. The crate sheds under a reason and a stage's
   name, and the replay keeps the gateway's words for each: a model no worker serves and a wire no worker is on
   are no model, a pool over its thresholds on every worker of the wire is overloaded where shedding is on, and
   any other pool left nobody is unavailable. The `message` and `retry_after` are no part of a decision.
@@ -460,4 +465,5 @@ fails once the reason no longer holds.
 - `constraint_decider.json`: owed whole. No module replays this sheet yet, and the replay names it as owed
   until the change that brings its module.
 - `rank_pin.json`: every row replays, each worker stating whether it registered a rank (`rank_registered`) and
-  each request that no rank can be pinned for it.
+  each request that no rank can be pinned for it. A worker's object registers the `dp_rank` and `dp_size` its row
+  records.

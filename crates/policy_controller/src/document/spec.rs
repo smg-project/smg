@@ -5839,7 +5839,6 @@ mod tests {
     fn an_applied_generation_reads_block_hashes_as_deep_as_its_stages_do() {
         use HashKind::{Text, Token};
 
-        use crate::engine::store_backed_engine::tests::sent_prefixes::use_sent_prefixes;
         let preset = |name: &str| {
             let mut document = PolicySpec::preset(name).expect("a preset of this build");
             document.generation = 1;
@@ -5847,6 +5846,16 @@ mod tests {
         };
         let applied = |document: &PolicySpec| {
             AppliedSpec::validate(document).expect("the document validates")
+        };
+        // The source each prefix stage a document states with parameters
+        // reads, as the presets state theirs.
+        let read_from = |document: &mut PolicySpec, source: AffinitySource| {
+            let stages = document.profiles.values_mut();
+            for stage in stages.flat_map(|profile| &mut profile.score) {
+                if let ScoreSpec::Params(ScoreStage::PrefixAffinity(params)) = stage {
+                    params.source = Some(source);
+                }
+            }
         };
         // No stage of the random preset reads the hashes, and the unbound
         // start has no stage.
@@ -5892,10 +5901,10 @@ mod tests {
         // A kind no stage declares is read by none. The prefix stage
         // declares text hashes where its source reads the record of sent
         // prefixes, and none where it reads cache events alone.
-        use_sent_prefixes(&mut held, AffinitySource::Index);
+        read_from(&mut held, AffinitySource::Index);
         assert_eq!(applied(&held).block_hashes_read(Token, 0), 128);
         assert_eq!(applied(&held).block_hashes_read(Text, 4), 0);
-        use_sent_prefixes(&mut held, AffinitySource::Merged);
+        read_from(&mut held, AffinitySource::Merged);
         assert_eq!(applied(&held).block_hashes_read(Text, 4), 128);
         // A generation reads as deep as the deepest of its profiles.
         let two = doc(

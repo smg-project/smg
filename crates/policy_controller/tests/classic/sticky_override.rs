@@ -692,7 +692,6 @@ pub const INLINE: &str = r#"{
 /// the override's rule placed: the rule keeps it from the profile. The
 /// beds above run the engine's rows, where a host says every dispatch
 /// whole.
-#[cfg(feature = "in-process")]
 mod sends {
     use std::{
         collections::VecDeque,
