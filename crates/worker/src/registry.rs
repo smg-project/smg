@@ -697,9 +697,11 @@ impl<G: Generation> WorkerRegistry<G> {
 
     /// How many times the overload veto of a worker changed since the
     /// registry was built, either way: one an edge
-    /// ([`Self::set_worker_overloaded`]), a clear of every flag among them
-    /// ([`Self::clear_all_overload_flags`]). A verdict that is said again
-    /// counts nothing. For a host that renders series of its own.
+    /// ([`Self::set_worker_overloaded`]). A clear of every flag
+    /// ([`Self::clear_all_overload_flags`]) counts each flag it lowers, and
+    /// the removal or the replacement of an overloaded worker lowers its
+    /// flag and counts that edge. A verdict that is said again counts
+    /// nothing. For a host that renders series of its own.
     pub fn overload_edges(&self) -> u64 {
         self.overload_edges.load(Ordering::Relaxed)
     }

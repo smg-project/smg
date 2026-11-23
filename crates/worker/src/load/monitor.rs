@@ -251,8 +251,9 @@ enum NativeLoads {
     /// The backend answered success with a body that is no load response.
     /// What that says of the route depends on whether it ever answered.
     Unreadable,
-    /// Nothing was learned about the endpoint — retry on the next tick.
-    Inconclusive,
+    /// Nothing was learned about the endpoint — retry on the next tick. With
+    /// why: the read's own failure.
+    Inconclusive(FetchFailure),
 }
 
 /// A route that answers with the native load schema.
@@ -1945,7 +1946,8 @@ impl<G: Generation> WorkerMonitor<G> {
     /// Engine responses are scoped to the virtual worker's DP rank, if any.
     /// Gateway fleet rollups retain their worker annotations. An empty response
     /// means a successful poll omitted this rank; an error means a failed
-    /// poll, with the reason the gauges' read ended on.
+    /// poll, with the reason the gauges' read ended on, or the native read's
+    /// for a worker with no gauges to read.
     ///
     /// `native_loads_memo` is the shared probe memo, or `None` for callers
     /// with no monitor to borrow it from (they simply always discover).
@@ -1953,20 +1955,24 @@ impl<G: Generation> WorkerMonitor<G> {
         worker: &Arc<dyn Worker>,
         native_loads_memo: Option<&DashMap<String, NativeLoadsMemo>>,
     ) -> Result<WorkerLoadResponse, FetchFailure> {
-        if let Some((path, load)) = Self::fetch_native_loads(worker, native_loads_memo).await {
-            liveness::on_contact(worker);
-            return Ok(Self::scoped_native_load(path, load, worker.dp_rank()));
+        match Self::fetch_native_loads(worker, native_loads_memo).await {
+            Ok((path, load)) => {
+                liveness::on_contact(worker);
+                Ok(Self::scoped_native_load(path, load, worker.dp_rank()))
+            }
+            Err(native) => Self::fetch_http_gauges(worker, native).await,
         }
-        Self::fetch_http_gauges(worker).await
     }
 
     /// The whole answer of the first native load route that has one (an
     /// engine's every rank, or a gateway's fleet rollup) with the route it
-    /// came from, before it is scoped to a worker. `None` is a failed poll.
+    /// came from, before it is scoped to a worker. An error is a failed poll:
+    /// with the reason the last read that failed ended on, or with none
+    /// where no route is there.
     async fn fetch_native_loads(
         worker: &Arc<dyn Worker>,
         native_loads_memo: Option<&DashMap<String, NativeLoadsMemo>>,
-    ) -> Option<(NativeLoadsPath, WorkerLoadResponse)> {
+    ) -> Result<(NativeLoadsPath, WorkerLoadResponse), Option<FetchFailure>> {
         // Only workers already `Ready` are polled, so a definitive "no such
         // endpoint" cannot be a warm-up artifact and is safe to memoize.
         let known = native_loads_memo
@@ -1974,21 +1980,23 @@ impl<G: Generation> WorkerMonitor<G> {
             .unwrap_or_default();
         let mut memo = known;
 
-        let mut response = None;
+        let mut response = Err(None);
         for path in known.candidates() {
             match Self::probe_native_loads(worker, path).await {
                 NativeLoads::Available(load) => {
                     memo.record_answered(path);
-                    response = Some((path, load));
+                    response = Ok((path, load));
                     break;
                 }
                 // On a route that had answered, a body that does not read is
                 // one bad answer: the memo keeps the route and the next tick
                 // asks it again. On a route that never answered it means
                 // something else is mounted here, as definitive as a 404.
-                NativeLoads::Unreadable if known.answered == Some(path) => {}
+                NativeLoads::Unreadable if known.answered == Some(path) => {
+                    response = Err(Some(FetchFailure::Answer));
+                }
                 NativeLoads::Absent | NativeLoads::Unreadable => memo.record_absent(path),
-                NativeLoads::Inconclusive => {}
+                NativeLoads::Inconclusive(reason) => response = Err(Some(reason)),
             }
         }
         // Write back only what a probe actually settled, so a tick that
@@ -2016,13 +2024,18 @@ impl<G: Generation> WorkerMonitor<G> {
         }
     }
 
-    /// The backend-wide gauges of a worker with no native load route.
+    /// The backend-wide gauges of a worker whose native load routes brought
+    /// no answer (`native`: why, or none where no route is there). A worker
+    /// with no gauges to read fails as its native read did, and has no load
+    /// read where no route is there.
     async fn fetch_http_gauges(
         worker: &Arc<dyn Worker>,
+        native: Option<FetchFailure>,
     ) -> Result<WorkerLoadResponse, FetchFailure> {
+        let no_gauges = native.unwrap_or(FetchFailure::Unsupported);
         // Backend-wide gauges cannot be attributed to a virtual DP worker.
         if worker.dp_rank().is_some() {
-            return Err(FetchFailure::Unsupported);
+            return Err(no_gauges);
         }
 
         match worker.metadata().spec.runtime_type {
@@ -2030,7 +2043,7 @@ impl<G: Generation> WorkerMonitor<G> {
             RuntimeType::Sglang => Self::fetch_http_load_sglang(worker).await,
             // Custom engines expose no gauge schema we can parse; the native
             // routes above were their only path.
-            _ => Err(FetchFailure::Unsupported),
+            _ => Err(no_gauges),
         }
     }
 
@@ -2045,7 +2058,7 @@ impl<G: Generation> WorkerMonitor<G> {
         let resp = match Self::authed_request(worker, &url).send().await {
             Ok(resp) => resp,
             // Transport error or timeout: says nothing about the route.
-            Err(_) => return NativeLoads::Inconclusive,
+            Err(error) => return NativeLoads::Inconclusive(Self::request_failure(&error)),
         };
 
         let status = resp.status();
@@ -2057,7 +2070,7 @@ impl<G: Generation> WorkerMonitor<G> {
         }
         if !status.is_success() {
             // 5xx and auth failures are conditions, not routing facts.
-            return NativeLoads::Inconclusive;
+            return NativeLoads::Inconclusive(FetchFailure::Answer);
         }
 
         // WorkerLoadResponse defaults missing fields for compatibility. Native
@@ -2125,13 +2138,7 @@ impl<G: Generation> WorkerMonitor<G> {
     /// timeout ended is a deadline, at the send or in the body. Any other
     /// failure is the transport's.
     async fn authed_text(worker: &Arc<dyn Worker>, url: &str) -> Result<String, FetchFailure> {
-        let failed = |error: reqwest::Error| {
-            if error.is_timeout() {
-                FetchFailure::Deadline
-            } else {
-                FetchFailure::Transport
-            }
-        };
+        let failed = |error: reqwest::Error| Self::request_failure(&error);
         let response = Self::authed_request(worker, url)
             .send()
             .await
@@ -2140,6 +2147,16 @@ impl<G: Generation> WorkerMonitor<G> {
             return Err(FetchFailure::Answer);
         }
         response.text().await.map_err(failed)
+    }
+
+    /// Why a request brought no answer: the deadline's where its timeout
+    /// ended it, the transport's otherwise.
+    fn request_failure(error: &reqwest::Error) -> FetchFailure {
+        if error.is_timeout() {
+            FetchFailure::Deadline
+        } else {
+            FetchFailure::Transport
+        }
     }
 
     /// A single scheduler snapshot as a one-rank report: the wrapper of
@@ -2271,8 +2288,8 @@ impl<G: Generation> WorkerMonitor<G> {
     /// source and the source's call each stand under the poll's deadline.
     ///
     /// Each fetch made here is counted once in `counts` by how it ended
-    /// ([`PollCounts::fetched`]): one for the engine, or one a member where
-    /// each member reads its own gauges.
+    /// ([`PollCounts::fetched`]): one for the engine, its ranks' shared read
+    /// among them.
     async fn fetch_engine_loads(
         members: Vec<Arc<dyn Worker>>,
         connection_mode: ConnectionMode,
@@ -2323,7 +2340,7 @@ impl<G: Generation> WorkerMonitor<G> {
                     reports.push(answer.ok());
                 } else {
                     match Self::fetch_native_loads(&members[0], Some(native_loads_memo)).await {
-                        Some((path, load)) => {
+                        Ok((path, load)) => {
                             counts.fetched(over_http, &Ok(()));
                             for member in &members {
                                 liveness::on_contact(member);
@@ -2334,12 +2351,14 @@ impl<G: Generation> WorkerMonitor<G> {
                                 )));
                             }
                         }
-                        None => {
-                            for member in &members {
-                                let answer = Self::fetch_http_gauges(member).await;
-                                counts.fetched(over_http, &answer);
-                                reports.push(answer.ok());
-                            }
+                        // The members are one engine's ranks, and a rank
+                        // has no gauges of its own: the engine's one read is
+                        // the one count, by the reason it ended on, or as
+                        // no load read where no route is there.
+                        Err(native) => {
+                            let ended = native.unwrap_or(FetchFailure::Unsupported);
+                            counts.fetched::<()>(over_http, &Err(ended));
+                            reports.resize(members.len(), None);
                         }
                     }
                 }

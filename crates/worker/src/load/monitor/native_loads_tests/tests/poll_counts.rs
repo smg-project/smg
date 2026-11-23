@@ -182,6 +182,25 @@ async fn spawn_page(status: StatusCode, body: &'static str) -> String {
     format!("http://{addr}")
 }
 
+/// A loopback address nothing listens at: a connect there is refused.
+async fn closed_address() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    format!("http://{}", listener.local_addr().expect("an address"))
+}
+
+/// A worker over HTTP at `url` of a runtime with no gauge table, whose host
+/// keeps no load source.
+fn no_table_worker(url: &str) -> Arc<dyn Worker> {
+    worker_on(
+        url,
+        ConnectionMode::Http,
+        RuntimeType::Unspecified,
+        Arc::new(SourceConnector::default()),
+    )
+}
+
 /// One fetch of the engine that `worker` is, on its own wire.
 async fn fetch(counts: &PollCounts, worker: &Arc<dyn Worker>) {
     fetch_engine(counts, vec![Arc::clone(worker)]).await;
@@ -260,9 +279,9 @@ async fn a_fetch_over_a_connection_counts_its_failure_by_its_reason() {
 /// one engine count the one read they share. One that brings none is
 /// counted by its reason: a status that is no success, a page of either
 /// family with no load gauge, an address nothing answers at, a runtime with
-/// no gauge table, a rank worker whose engine has no native route, each
-/// rank of two for its own gauges, and a host's source that fails. No
-/// fetch over a connection is counted.
+/// no gauge table and no native route, a rank worker whose engine has no
+/// native route, two ranks of such an engine once, and a host's source that
+/// fails. No fetch over a connection is counted.
 #[tokio::test]
 async fn a_read_over_http_counts_a_report_or_its_failure_by_its_reason() {
     let counts = PollCounts::default();
@@ -292,30 +311,18 @@ async fn a_read_over_http_counts_a_report_or_its_failure_by_its_reason() {
     fetch(&counts, &gauge_worker(&refusing)).await;
     let bare = spawn_page(StatusCode::OK, "up 1\n").await;
     fetch(&counts, &gauge_worker(&bare)).await;
-    let closed = {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        format!("http://{}", listener.local_addr().expect("an address"))
-    };
-    fetch(&counts, &gauge_worker(&closed)).await;
-    // Two workers whose host keeps no source: the second family at the page
-    // with no gauge, and a runtime with no gauge table.
-    let keeps_none = || Arc::new(SourceConnector::default()) as Arc<dyn EngineConnector>;
+    fetch(&counts, &gauge_worker(&closed_address().await)).await;
+    // The second family at the page with no gauge: its host keeps no source.
     let second = worker_on(
         &bare,
         ConnectionMode::Http,
         RuntimeType::Sglang,
-        keeps_none(),
+        Arc::new(SourceConnector::default()),
     );
     fetch(&counts, &second).await;
-    let no_table = worker_on(
-        &gauges.url,
-        ConnectionMode::Http,
-        RuntimeType::Unspecified,
-        keeps_none(),
-    );
-    fetch(&counts, &no_table).await;
+    // No native route and no gauges to read: no load read, and the two
+    // ranks of one engine count the one read they share.
+    fetch(&counts, &no_table_worker(&gauges.url)).await;
     fetch(&counts, &gauge_dp_worker(&gauges.url, 1, 2)).await;
     fetch_engine(&counts, two_ranks(&gauges.url)).await;
     let unread = SourceConnector::keeping(None);
@@ -330,16 +337,81 @@ async fn a_read_over_http_counts_a_report_or_its_failure_by_its_reason() {
             transport: 1,
             answer: 2,
             no_load: 2,
-            unsupported: 4,
+            unsupported: 3,
             ..FailureTotals::default()
         }
     );
     assert_eq!(counts.totals().poll_failures, FailureTotals::default());
 }
 
-/// A read over HTTP the request's timeout ends is a deadline, as a host's
-/// source that never answers is under the poll's own. A connector that is
-/// late to say whether it keeps a source is the host's failure.
+/// A worker with no gauges to read fails as its native read did, and has
+/// no load read only where no native route is there: a rank worker and a
+/// worker of a runtime with no gauge table, at an address nothing answers
+/// at and at an engine whose native route refuses. The rank workers of one
+/// engine count the one read they share, once. A native route that
+/// answered, and then answers a body that does not read, is the engine's
+/// answer.
+#[tokio::test]
+async fn a_native_read_that_fails_counts_its_reason_once_an_engine() {
+    let counts = PollCounts::default();
+    let closed = closed_address().await;
+    fetch(&counts, &gauge_dp_worker(&closed, 1, 2)).await;
+    fetch(&counts, &no_table_worker(&closed)).await;
+    let ranks = two_ranks(&closed);
+    let answers =
+        WorkerMonitor::fetch_engine_loads(ranks, ConnectionMode::Http, &DashMap::new(), &counts)
+            .await;
+    assert!(
+        matches!(answers.as_slice(), [(_, None), (_, None)]),
+        "each rank's report is missing"
+    );
+    let unreached = FailureTotals {
+        transport: 3,
+        ..FailureTotals::default()
+    };
+    assert_eq!(counts.totals().scrape_failures, unreached);
+
+    let refusing = spawn_engine(StatusCode::INTERNAL_SERVER_ERROR, "").await;
+    fetch(&counts, &gauge_dp_worker(&refusing.url, 1, 2)).await;
+    fetch(&counts, &no_table_worker(&refusing.url)).await;
+    fetch_engine(&counts, two_ranks(&refusing.url)).await;
+    let refused = FailureTotals {
+        answer: 3,
+        ..unreached
+    };
+    assert_eq!(counts.totals().scrape_failures, refused);
+
+    let turning = spawn_backend(
+        &[(StatusCode::NOT_FOUND, "")],
+        &[
+            (StatusCode::OK, NATIVE_DP_BODY),
+            (StatusCode::OK, UNREADABLE_NATIVE_BODY),
+        ],
+    )
+    .await;
+    let memo = DashMap::new();
+    for _ in 0..2 {
+        let ranks = two_ranks(&turning.url);
+        WorkerMonitor::fetch_engine_loads(ranks, ConnectionMode::Http, &memo, &counts).await;
+    }
+    assert_eq!(
+        counts.totals(),
+        PollTotals {
+            scrapes: 1,
+            scrape_failures: FailureTotals {
+                answer: 4,
+                ..unreached
+            },
+            ..PollTotals::default()
+        },
+        "the route answered once: its unread body is one bad answer"
+    );
+}
+
+/// A read over HTTP the request's timeout ends is a deadline, the gauges'
+/// read and the native read of a rank worker alike, as a host's source
+/// that never answers is under the poll's own. A connector that is late to
+/// say whether it keeps a source is the host's failure.
 #[tokio::test(start_paused = true)]
 async fn a_read_over_http_that_a_timeout_ends_counts_a_deadline() {
     let counts = PollCounts::default();
@@ -350,6 +422,7 @@ async fn a_read_over_http_that_a_timeout_ends_counts_a_deadline() {
         .expect("bind");
     let mute = format!("http://{}", listener.local_addr().expect("an address"));
     fetch(&counts, &gauge_worker(&mute)).await;
+    fetch(&counts, &gauge_dp_worker(&mute, 1, 2)).await;
     let never = worker_on(
         "http://engine-a.invalid:8000",
         ConnectionMode::Http,
@@ -368,7 +441,7 @@ async fn a_read_over_http_that_a_timeout_ends_counts_a_deadline() {
         counts.totals(),
         PollTotals {
             scrape_failures: FailureTotals {
-                deadline: 2,
+                deadline: 3,
                 client: 1,
                 ..FailureTotals::default()
             },

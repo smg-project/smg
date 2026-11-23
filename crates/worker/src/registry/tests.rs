@@ -2961,14 +2961,16 @@ fn clear_all_overload_flags_resets_every_model() {
 /// The registry counts its overload edges for a host's read: one a veto
 /// that changed, either way, a clear of every flag among them. A verdict
 /// said again counts nothing, and a worker the registry does not hold
-/// counts nothing.
+/// counts nothing. The replacement and the removal of an overloaded worker
+/// lower its flag, an edge each, and those of a worker with no flag count
+/// nothing.
 #[test]
 fn an_overload_edge_is_counted_once_and_a_verdict_said_again_is_not() {
     let registry = WorkerRegistry::new();
     let a = overload_worker("http://127.0.0.1:9711", "m");
     let b = overload_worker("http://127.0.0.1:9712", "m");
-    registry.register(Arc::clone(&a)).unwrap();
-    registry.register(Arc::clone(&b)).unwrap();
+    let a_id = registry.register(Arc::clone(&a)).unwrap();
+    let b_id = registry.register(Arc::clone(&b)).unwrap();
     assert_eq!(registry.overload_edges(), 0);
 
     assert!(registry.set_worker_overloaded(&a, true));
@@ -2984,6 +2986,20 @@ fn an_overload_edge_is_counted_once_and_a_verdict_said_again_is_not() {
     let stranger = overload_worker("http://127.0.0.1:9713", "m");
     assert!(!registry.set_worker_overloaded(&stranger, true));
     assert_eq!(registry.overload_edges(), 4, "no worker of the registry's");
+
+    assert!(registry.set_worker_overloaded(&a, true));
+    assert!(registry.set_worker_overloaded(&b, true));
+    let again = overload_worker("http://127.0.0.1:9711", "m");
+    assert!(registry.replace(&a_id, again));
+    assert_eq!(
+        registry.overload_edges(),
+        7,
+        "a replacement lowers the flag"
+    );
+    assert!(registry.remove(&b_id).is_some());
+    assert_eq!(registry.overload_edges(), 8, "a removal lowers the flag");
+    assert!(registry.remove(&a_id).is_some());
+    assert_eq!(registry.overload_edges(), 8, "no flag to lower: no edge");
 }
 
 /// A removed worker's address stays retired in the series store while a

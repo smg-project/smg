@@ -20,7 +20,8 @@ pub(crate) enum FetchFailure {
     /// The connect, the request or the read of the answer failed on the
     /// way: no answer of the engine's.
     Transport,
-    /// The engine answered with an error of its own.
+    /// The engine, or the host's load source in its place, answered with an
+    /// error.
     Answer,
     /// The poll's deadline, or the request's own, ended the fetch.
     Deadline,
@@ -41,7 +42,8 @@ pub struct FailureTotals {
     /// The connect, the request or the read of the answer failed on the
     /// way.
     pub transport: u64,
-    /// The engine answered with an error of its own.
+    /// The engine, or the host's load source in its place, answered with an
+    /// error.
     pub answer: u64,
     /// The poll's deadline, or the request's own, ended the fetch.
     pub deadline: u64,
