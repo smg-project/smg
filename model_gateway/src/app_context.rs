@@ -14,7 +14,11 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
-use smg_policy_controller::{document::AppliedSpec, engine::PolicyEngine, stages::StageRegistry};
+use smg_policy_controller::{
+    document::AppliedSpec,
+    engine::{CacheIndexes, Members, PolicyEngine, WorkerData},
+    stages::StageRegistry,
+};
 use smg_worker::{
     connection::{
         engine::EngineConnector,
@@ -24,7 +28,6 @@ use smg_worker::{
         },
     },
     health::liveness,
-    load::state::LoadReceiver,
     settings::RegistrationSettings,
     workflow::WorkflowHost,
 };
@@ -724,8 +727,8 @@ impl AppContextBuilder {
         // The policy document comes first, checked against the stages the
         // host registered: ahead of the stores, the storage hooks and every
         // listener, so a document that is refused ends the start in its own
-        // words. The engine is built further down from the document that
-        // was checked here.
+        // words. The engine is started last, from the document that was
+        // checked here.
         let policy = Self::policy_in_force(&router_config, policy_stages.as_ref())?;
         // A served model aliased under a vendor name keeps that vendor's
         // contract profile after the alias is resolved into the served name.
@@ -750,13 +753,14 @@ impl AppContextBuilder {
             .with_policy_registry(&router_config)
             .with_storage(&router_config)
             .await?
-            .with_worker_monitor(&router_config, policy)?
+            .with_worker_monitor(&router_config)?
             .with_worker_job_queue()
             .with_workflow_engines()
             .with_mcp_orchestrator(&router_config)
             .await?
             .with_wasm_manager(&router_config)
             .with_kv_event_monitor()
+            .with_policy_engine(policy)?
             .webrtc_bind_addr(
                 webrtc_bind_addr.or_else(|| Some(default_bind_addr(&router_config.host))),
             )
@@ -971,14 +975,8 @@ impl AppContextBuilder {
         Ok(self)
     }
 
-    /// Create load monitor, and start the policy engine over `policy` where
-    /// the configuration runs the policy controller: the checked document
-    /// [`Self::policy_in_force`] answered.
-    fn with_worker_monitor(
-        mut self,
-        config: &RouterConfig,
-        policy: Option<AppliedSpec>,
-    ) -> Result<Self, String> {
+    /// Create load monitor
+    fn with_worker_monitor(mut self, config: &RouterConfig) -> Result<Self, String> {
         let policy_registry = self
             .policy_registry
             .as_ref()
@@ -1007,9 +1005,6 @@ impl AppContextBuilder {
             None => monitor,
         });
         policy_registry.set_load_receiver(Some(monitor.subscribe()));
-        if let Some(spec) = policy {
-            Self::start_policy_engine(spec, &policy_registry, monitor.subscribe())?;
-        }
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(shed_retry_after_secs(config.load_monitor_interval()));
@@ -1052,45 +1047,91 @@ impl AppContextBuilder {
             .map_err(|refused| format!("policy controller: {refused}"))
     }
 
+    /// Starts the policy engine over `policy`, where the configuration runs
+    /// the policy controller: the checked document [`Self::policy_in_force`]
+    /// answered. It is the last step of the start, so the engine is handed
+    /// where this process keeps its workers' data, each once: the worker
+    /// registry, the load monitor's channel and the cache-event monitor.
+    fn with_policy_engine(self, policy: Option<AppliedSpec>) -> Result<Self, String> {
+        let Some(spec) = policy else {
+            return Ok(self);
+        };
+        let unset = |field: &str| format!("{field} must be set before the policy engine");
+        let policies = self
+            .policy_registry
+            .as_ref()
+            .ok_or_else(|| unset("policy_registry"))?;
+        let registry = self
+            .worker_registry
+            .as_ref()
+            .ok_or_else(|| unset("worker_registry"))?;
+        let monitor = self
+            .worker_monitor
+            .as_ref()
+            .ok_or_else(|| unset("worker_monitor"))?;
+        let cache_events = self
+            .kv_event_monitor
+            .as_ref()
+            .ok_or_else(|| unset("kv_event_monitor"))?;
+        let data = WorkerData {
+            registry: Arc::clone(registry) as Arc<dyn Members>,
+            loads: Some(monitor.subscribe()),
+            cache_indexes: Some(Arc::clone(cache_events) as Arc<dyn CacheIndexes>),
+        };
+        Self::start_policy_engine(spec, data, policies)?;
+        Ok(self)
+    }
+
     /// Starts the policy engine that places every request of this process:
-    /// one engine, built from the checked document
-    /// ([`Self::policy_in_force`]). The engine is handed the load monitor's
-    /// channel, its own task is spawned on the runtime this context is built
-    /// on, and the placement functions find the engine through `policies`.
+    /// one engine, by the policy crate's one start call, over the checked
+    /// document ([`Self::policy_in_force`]) and `data`, where this process
+    /// keeps its workers' data. The engine's task follows the registry's
+    /// events and tells the document's stages a worker that joined or was
+    /// removed, and it keeps the newest load snapshot at hand. It is
+    /// spawned on the runtime this context is built on, and the placement
+    /// functions find the engine through `policies`.
     fn start_policy_engine(
         spec: AppliedSpec,
+        data: WorkerData,
         policies: &PolicyRegistry,
-        loads: LoadReceiver,
     ) -> Result<(), String> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
             format!("policy controller: the engine's task needs a Tokio runtime: {error}")
         })?;
         // One engine for the life of the process: its placements borrow it.
-        let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(spec)));
-        engine.set_loads(loads);
-        // The engine's task keeps nothing a shutdown waits for: its upkeep
-        // and its load snapshot end with the runtime.
-        runtime.spawn(engine.run());
+        let (engine, task) = PolicyEngine::start(spec, data);
+        // The engine's task keeps nothing a shutdown waits for: its upkeep,
+        // its load snapshot and its follow of the registry end with the
+        // runtime.
+        runtime.spawn(task);
         policies.set_engine(engine);
         Ok(())
     }
 
     /// The policy engine's start for a context a test builds by hand, field
-    /// by field, where no builder step of this file runs: the two steps
-    /// `with_worker_monitor` takes behind the load monitor, in their order
-    /// and with nothing added (`policy_in_force`, then
-    /// `start_policy_engine`). It is not a second start. `stages` is the
-    /// table a host would bring, where the test brings one, and a
+    /// by field, where no builder step of this file runs: the start's own
+    /// two steps, in their order and with nothing added (`policy_in_force`,
+    /// then `start_policy_engine`). It is not a second start. `stages` is
+    /// the table a host would bring, where the test brings one, and a
     /// configuration that leaves the policy controller off starts nothing.
+    /// The engine is handed the test's worker registry and its load
+    /// monitor's channel. Such a context keeps no cache-event monitor, so
+    /// the engine is handed none.
     #[cfg(any(test, feature = "test-util"))]
     pub fn start_policy_engine_by_hand(
         config: &RouterConfig,
         stages: Option<&StageRegistry>,
         policies: &PolicyRegistry,
+        registry: &Arc<WorkerRegistry>,
         monitor: &WorkerMonitor,
     ) -> Result<(), String> {
         if let Some(spec) = Self::policy_in_force(config, stages)? {
-            Self::start_policy_engine(spec, policies, monitor.subscribe())?;
+            let data = WorkerData {
+                registry: Arc::clone(registry) as Arc<dyn Members>,
+                loads: Some(monitor.subscribe()),
+                cache_indexes: None,
+            };
+            Self::start_policy_engine(spec, data, policies)?;
         }
         Ok(())
     }
@@ -1453,7 +1494,7 @@ mod tests {
             .expect("client builds")
             .with_worker_registry()
             .with_policy_registry(&config)
-            .with_worker_monitor(&config, None)
+            .with_worker_monitor(&config)
             .expect("worker monitor builds");
 
         let policy = builder

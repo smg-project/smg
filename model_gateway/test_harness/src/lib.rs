@@ -495,9 +495,14 @@ pub fn policy_controller_forced() -> bool {
     clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
-fn start_policy_engine(config: &RouterConfig, policies: &PolicyRegistry, monitor: &WorkerMonitor) {
+fn start_policy_engine(
+    config: &RouterConfig,
+    policies: &PolicyRegistry,
+    registry: &Arc<WorkerRegistry>,
+    monitor: &WorkerMonitor,
+) {
     let start = |stages: Option<&StageRegistry>| {
-        AppContextBuilder::start_policy_engine_by_hand(config, stages, policies, monitor)
+        AppContextBuilder::start_policy_engine_by_hand(config, stages, policies, registry, monitor)
     };
     POLICY_STAGES
         .try_with(|stages| start(Some(stages)))
@@ -591,7 +596,7 @@ async fn build_test_app_context(
     // The policy engine behind the load monitor, as the server's builder
     // starts it: nothing where the configuration leaves the controller off.
     if let Some(monitor) = &worker_monitor {
-        start_policy_engine(&config, &policy_registry, monitor);
+        start_policy_engine(&config, &policy_registry, &worker_registry, monitor);
     }
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator

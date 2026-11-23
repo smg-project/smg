@@ -3752,6 +3752,7 @@ mod tests {
     mod connector;
     mod load_source;
     mod policy_stages;
+    mod worker_data;
 
     use std::convert::Infallible;
 
