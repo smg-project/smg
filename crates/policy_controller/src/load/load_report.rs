@@ -21,6 +21,7 @@ use crate::{
 /// partial report or a rank without a rate leaves it unknown (zero), and
 /// the scorer prices the worker at the fleet's nominal rate. Any other
 /// role's drain is the generation rate of the ranks with a request running.
+/// A known rate under one token a second reads as one, zero being unknown.
 /// `source` is where the report came from; `report_age_ms` is `now` less
 /// `sampled_at`.
 pub fn load_row(
