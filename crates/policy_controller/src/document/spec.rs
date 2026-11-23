@@ -5458,8 +5458,8 @@ fn index_matching<'a>(
 /// document, with the generation's number, its needs and its view's cap on
 /// a request's block hashes.
 ///
-/// One invariant: **a decision reads its rows, its engine and its number
-/// in one load.** A store publishes every world under one of these
+/// One invariant: **a decision reads its gateway's vetoes, its engine and
+/// its number in one load.** A store publishes every world under one of these
 /// ([`StoreSnapshot::spec`](crate::store::StoreSnapshot::spec)), so no reader
 /// pairs one generation's engine with rows published under another. The number
 /// is the engine's own, the document's `generation` line: there is no second
