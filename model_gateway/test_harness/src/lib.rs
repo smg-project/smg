@@ -41,7 +41,7 @@ use openai_protocol::{
 };
 use serde_json::json;
 use smg::{
-    app_context::AppContext,
+    app_context::{AppContext, AppContextBuilder},
     config::{RouterConfig, RoutingMode},
     middleware::TokenBucket,
     policies::PolicyRegistry,
@@ -56,6 +56,7 @@ use smg::{
 use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage, StorageBundle,
 };
+use smg_policy_controller::stages::StageRegistry;
 use smg_worker::{
     health::liveness,
     identity::basic::{RuntimeType, Worker, WorkerType},
@@ -451,6 +452,59 @@ impl AppTestContext {
     }
 }
 
+tokio::task_local! {
+    /// The table of stages a test lent the policy engine of the contexts it
+    /// builds ([`with_policy_stages`]).
+    static POLICY_STAGES: StageRegistry;
+}
+
+/// Runs `test` with `stages` lent to the policy engine of every context it
+/// builds. Where a context's configuration runs the policy controller
+/// (`policy_controller: true`), this harness starts the engine by the
+/// gateway's own start, over the document in force (a supplied one,
+/// `policy_spec`, too) validated against `stages`. It is the table a host
+/// brings a served gateway (`smg::server::Extensions::policy_stages`): the
+/// stock stages and the test's own, so the document may name both. Outside
+/// this call a context's engine is started over the stock table.
+///
+/// The table is lent to the task that awaits this call: a context built on a
+/// task the test spawned does not see it.
+pub async fn with_policy_stages<T>(stages: StageRegistry, test: impl Future<Output = T>) -> T {
+    POLICY_STAGES.scope(stages, test).await
+}
+
+/// The environment value that runs every context of a test run under the
+/// policy controller, whatever its configuration says:
+/// `SMG_TEST_POLICY_CONTROLLER=on`. A whole test binary runs on the policy
+/// engine by it, with no change to its tests.
+pub const POLICY_CONTROLLER_ENV: &str = "SMG_TEST_POLICY_CONTROLLER";
+
+/// Whether this run turns the policy controller on for every context
+/// ([`POLICY_CONTROLLER_ENV`]).
+pub fn policy_controller_forced() -> bool {
+    std::env::var(POLICY_CONTROLLER_ENV).is_ok_and(|value| value == "on")
+}
+
+/// Starts the policy engine of a context this harness builds, where its
+/// configuration runs the policy controller: by the gateway's own start
+/// ([`AppContextBuilder::start_policy_engine_by_hand`]), over the table the
+/// test lent ([`with_policy_stages`]) or else the stock one. A refused
+/// document fails the test with the refusal's words. With the policy
+/// controller off nothing is started.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn start_policy_engine(config: &RouterConfig, policies: &PolicyRegistry, monitor: &WorkerMonitor) {
+    let start = |stages: Option<&StageRegistry>| {
+        AppContextBuilder::start_policy_engine_by_hand(config, stages, policies, monitor)
+    };
+    POLICY_STAGES
+        .try_with(|stages| start(Some(stages)))
+        .unwrap_or_else(|_| start(None))
+        .expect("the policy engine starts");
+}
+
 /// Shared `AppContext` construction tail for the `create_test_context_*`
 /// family below: registries, storage backends, worker monitor, job queue,
 /// workflow engines, OpenAI-mode external worker registration, and MCP
@@ -464,7 +518,7 @@ impl AppTestContext {
     reason = "test helper - panicking on failure is intentional"
 )]
 async fn build_test_app_context(
-    config: RouterConfig,
+    mut config: RouterConfig,
     tokenizer_registry: Arc<TokenizerRegistry>,
     legacy_parsers: bool,
     rate_limit_manager: Option<Arc<smg::rate_limit::RateLimitManager>>,
@@ -472,6 +526,10 @@ async fn build_test_app_context(
     storages: Option<StorageBundle>,
 ) -> Arc<AppContext> {
     use smg_mcp::McpOrchestrator;
+
+    if policy_controller_forced() {
+        config.policy_controller = true;
+    }
 
     // See `test_app::create_test_app_context`: no environment proxy in a test's path.
     let client = smg::server::http_client_builder()
@@ -529,6 +587,12 @@ async fn build_test_app_context(
         config.engine_metrics,
         config.disable_load_monitoring,
     )));
+
+    // The policy engine behind the load monitor, as the server's builder
+    // starts it: nothing where the configuration leaves the controller off.
+    if let Some(monitor) = &worker_monitor {
+        start_policy_engine(&config, &policy_registry, monitor);
+    }
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
     let worker_job_queue = Arc::new(OnceLock::new());

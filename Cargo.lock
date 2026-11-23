@@ -8306,6 +8306,7 @@ dependencies = [
  "smg-auth",
  "smg-grpc-client",
  "smg-mcp",
+ "smg-policy-controller",
  "smg-worker",
  "tempfile",
  "tokio",

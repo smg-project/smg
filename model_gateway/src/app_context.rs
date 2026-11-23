@@ -1075,6 +1075,26 @@ impl AppContextBuilder {
         Ok(())
     }
 
+    /// The policy engine's start for a context a test builds by hand, field
+    /// by field, where no builder step of this file runs: the two steps
+    /// `with_worker_monitor` takes behind the load monitor, in their order
+    /// and with nothing added (`policy_in_force`, then
+    /// `start_policy_engine`). It is not a second start. `stages` is the
+    /// table a host would bring, where the test brings one, and a
+    /// configuration that leaves the policy controller off starts nothing.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn start_policy_engine_by_hand(
+        config: &RouterConfig,
+        stages: Option<&StageRegistry>,
+        policies: &PolicyRegistry,
+        monitor: &WorkerMonitor,
+    ) -> Result<(), String> {
+        if let Some(spec) = Self::policy_in_force(config, stages)? {
+            Self::start_policy_engine(spec, policies, monitor.subscribe())?;
+        }
+        Ok(())
+    }
+
     /// Create worker job queue OnceLock container
     fn with_worker_job_queue(mut self) -> Self {
         self.worker_job_queue = Some(Arc::new(OnceLock::new()));
