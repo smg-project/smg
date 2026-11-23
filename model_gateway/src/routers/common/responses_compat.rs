@@ -115,6 +115,7 @@ pub(crate) fn lower_responses_request_for_local_backend(
     let mut lowered_items = Vec::with_capacity(original_items.len());
     let mut lifted_tools: Vec<ResponseTool> = Vec::new();
     let mut unwrapped_default_namespace = false;
+    let mut unwrapped_custom_names: Vec<String> = Vec::new();
 
     for item in original_items {
         match item {
@@ -129,7 +130,10 @@ pub(crate) fn lower_responses_request_for_local_backend(
                             for member in namespace.tools {
                                 let lifted = match member {
                                     NamespaceTool::Function(ft) => ResponseTool::Function(ft),
-                                    NamespaceTool::Custom(ct) => ResponseTool::Custom(ct),
+                                    NamespaceTool::Custom(ct) => {
+                                        unwrapped_custom_names.push(ct.name.clone());
+                                        ResponseTool::Custom(ct)
+                                    }
                                 };
                                 push_or_replace_tool(&mut lifted_tools, lifted);
                             }
@@ -243,7 +247,18 @@ pub(crate) fn lower_responses_request_for_local_backend(
                     .strip_prefix(DEFAULT_FUNCTION_NAMESPACE)
                     .and_then(|rest| rest.strip_prefix('.'))
                 {
-                    *name = bare.to_owned();
+                    let has_literal_tool = request.tools.as_deref().is_some_and(|tools| {
+                        tools
+                            .iter()
+                            .any(|tool| callable_tool_name(tool) == Some(name.as_str()))
+                    });
+                    if !has_literal_tool
+                        && unwrapped_custom_names
+                            .iter()
+                            .any(|unwrapped| unwrapped == bare)
+                    {
+                        *name = bare.to_owned();
+                    }
                 }
             }
             _ => {}
@@ -427,6 +442,32 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&custom_choice_req.tool_choice).unwrap(),
             json!({"type": "custom", "name": "apply_patch"})
+        );
+
+        // Literal top-level custom names with a `functions.` prefix must stay
+        // intact when an unrelated inline `functions` namespace is unwrapped.
+        let mut literal_custom_req = parse_request(json!({
+            "model": "test-model",
+            "tools": [{"type": "custom", "name": "functions.apply_patch"}],
+            "tool_choice": {"type": "custom", "name": "functions.apply_patch"},
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "functions",
+                        "description": "",
+                        "tools": [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}]
+                    }]
+                },
+                {"role": "user", "content": "patch it"}
+            ]
+        }));
+        lower_responses_request_for_local_backend(&mut literal_custom_req)
+            .expect("lowering preserves literal dotted custom tool");
+        assert_eq!(
+            serde_json::to_value(&literal_custom_req.tool_choice).unwrap(),
+            json!({"type": "custom", "name": "functions.apply_patch"})
         );
 
         lower_responses_request_for_local_backend(&mut req).expect("lowering succeeds");
