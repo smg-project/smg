@@ -1058,8 +1058,8 @@ impl McpOrchestrator {
                 .any(|server| server.builtin_type.is_some() && server.name == name)
     }
 
-    /// Whether the pool holds a connection under `key`: the one a request's
-    /// own server was connected with is still there.
+    /// Whether the pool holds a connection under `key`: the request's own, or
+    /// one pooled since under the same key.
     pub(crate) fn is_pooled(&self, key: &PoolKey) -> bool {
         self.connection_pool.contains(key)
     }
@@ -2985,22 +2985,28 @@ mod tests {
             }
         };
         let url = "http://tools.example/mcp";
-        let binding = McpServerBinding {
+        let mut binding = McpServerBinding {
             label: "tools".to_string(),
             server_key: url.to_string(),
             allowed_tools: None,
             list_error: None,
             pool_key: Some(pool(url).await),
         };
-        let list_error = || {
+        let list_error = |binding: &McpServerBinding| {
             McpToolSession::new(orchestrator, vec![binding.clone()], "request")
                 .list_error_for_binding("tools", url)
         };
-        assert_eq!(list_error(), None);
+        assert_eq!(list_error(&binding), None);
 
         // Another server's connection takes the pool's one place.
         pool("http://other.example/mcp").await;
-        assert_eq!(list_error(), Some(format!("Server not found: {url}")));
+        assert_eq!(
+            list_error(&binding).as_deref(),
+            Some("Server not found: tools")
+        );
+        // A listing that failed keeps its own error.
+        binding.list_error = Some("boom".to_string());
+        assert_eq!(list_error(&binding).as_deref(), Some("boom"));
     }
 
     #[test]
