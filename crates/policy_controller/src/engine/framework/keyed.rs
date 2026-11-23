@@ -224,7 +224,7 @@ impl Engine {
             .find(|row| test.keeps(row))?;
         // At its cap a pin puts the request to the stages again, over every
         // row the filters keep.
-        if Self::at_cap(rule, facts, &pinned) {
+        if Self::at_cap(rule, &pinned) {
             return None;
         }
         if self.sessions.lookup(key, facts.now_micros, rule) != pins {

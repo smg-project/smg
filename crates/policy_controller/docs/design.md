@@ -964,9 +964,9 @@ The types the two engines shared stay where they were moved ahead of the deletio
   lists (`PairLists::decide` keeps a pair to the positions its host states, and a single
   request states the positions of its list in `Constraints::places` and is decided, which is
   built); an encode request's demands (a single request's and a pair's are kept, which is built).
-- Four request fields that only the old engine's host fills leave with it (`pinned_at`,
-  `lent_in_flight`, `lent_session_in_flight`, `model_fingerprint`).
-  A fifth, `session_counted`, stays, which is built: by it a host says that somebody counts a
+- The request fields that only the old engine's host fills leave with it. `pinned_at`,
+  `lent_in_flight` and `model_fingerprint` have yet to go.
+  Another, `session_counted`, stays, which is built: by it a host says that somebody counts a
   key's requests on each worker, and a sessions rule with a cap asks nothing more of it. Where
   that count stands on a worker object is the request's maker's to say
   (`RequestMaker::session_counted_under`, a provided method): under the key's text for a host
