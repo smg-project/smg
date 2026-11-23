@@ -775,14 +775,8 @@ impl ClientGone {
         }
     }
 
-    /// One poll of a read that ends when the client leaves: `None` is the
-    /// client's leaving, `Some` what `source` gave. The order is kept here
-    /// and not by each reader: the channel's flag first, so a busy source
-    /// cannot outrun the leaving; then the source; and only while the source
-    /// has nothing the wait, which is not polled again under the waker it is
-    /// registered for. The channel raises its flag before it wakes the wait,
-    /// so the poll that wake brings meets the flag, and a connection pulls a
-    /// pending body more than once a frame.
+    /// The closed flag is read first, so a busy `source` cannot outrun it.
+    /// Repeated polls under one waker skip the wait: its wake follows the flag.
     pub(crate) fn poll_read<T>(
         &mut self,
         cx: &mut Context<'_>,

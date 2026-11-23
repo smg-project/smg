@@ -448,8 +448,8 @@ enum BodyRead {
 /// body: parked on a body that stalled mid-stream, it would learn that its
 /// client left only when the body next yields, and the engine request behind
 /// the body would run on as long. Here every read races the body against the
-/// client's leaving, looked at first so a busy body cannot outrun it; on
-/// [`BodyRead::ClientLeft`] the caller ends its read and drops the body,
+/// client's leaving; on [`BodyRead::ClientLeft`] the caller ends its read
+/// and drops the body,
 /// and the chat layer ends the engine request the way it does for its own
 /// clients. A background response's wait is on the sender of its relay, which
 /// closes with the work and not with the client: its reads are the body's
@@ -2492,10 +2492,15 @@ mod tests {
         assert!(read.as_mut().poll(&mut cx).is_pending());
         let call = json!({"tool_calls":[{"index":0,"id":"call_server","type":"function",
             "function":{"name":"server_tool","arguments":""}}]});
+        // A keep-alive ends the parked read. The next read finds the call's
+        // frame ready and registers no wait; the call is named between reads.
+        body_tx
+            .try_send(Ok(Bytes::from_static(b": keep-alive\n\n")))
+            .unwrap();
         body_tx
             .try_send(Ok(Bytes::from(chat_event(call, None))))
             .unwrap();
-        assert_eq!(wakes.0.load(Ordering::SeqCst), 1, "the frame's wake");
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1, "the frames' one wake");
         let Poll::Ready(Err(error)) = read.as_mut().poll(&mut cx) else {
             panic!("the read ends at the first read after the client left");
         };
