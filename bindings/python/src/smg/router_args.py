@@ -884,6 +884,10 @@ class RouterArgs:
                 "Idle timeout in seconds for pooled upstream connections. Must"
                 " stay below the backend HTTP server's keep-alive timeout (vLLM"
                 " and SGLang default to 5). 0 keeps idle connections forever."
+                " While a nonzero value is below the load monitor interval, an"
+                " idle HTTP worker is connected anew for every load poll; where"
+                " the server's keep-alive can be raised above that interval, a"
+                " value between the two keeps the connection."
                 " Defaults to 3."
             ),
         )

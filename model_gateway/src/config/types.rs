@@ -232,6 +232,10 @@ pub struct RouterConfig {
     /// backend HTTP server's keep-alive timeout (the engines default to
     /// 5s), or the pool hands out connections the server has already closed
     /// and non-idempotent sends fail. `0` keeps idle connections forever.
+    /// While a nonzero value is below `load_monitor_interval_secs`, an idle
+    /// HTTP worker is connected anew for every load poll; where the server's
+    /// keep-alive can be raised above that interval, a value between the two
+    /// keeps the connection.
     #[serde(default = "default_upstream_pool_idle_timeout_secs")]
     pub upstream_pool_idle_timeout_secs: u64,
     pub worker_startup_timeout_secs: u64,
