@@ -74,8 +74,8 @@ use smg_policy_controller::{
     },
     stages::StageRegistry,
     store::{
-        BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, JournalKinds, KvCursor,
-        KvEvent, KvEventSink, LaneCounts, LeaseState, LoadSink, MembershipChange, MembershipTail,
+        BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, KvCursor, KvEvent,
+        KvEventSink, LaneCounts, LeaseState, LoadSink, MembershipChange, MembershipTail,
         MemoryStore, ResyncReason, SequenceHash, Signals, StoredBlock, WorkerFacts, WorkerStatus,
         WorkersStore,
     },
@@ -1303,14 +1303,12 @@ impl Harness {
     /// registration made is an error, and so is a load row: a leader sends
     /// a standby none, and a standby polls nobody.
     pub fn followed(&self, standby: &Replica) -> Result<usize, String> {
-        let cut = standby.store.checkpoint(JournalKinds::All);
-        if let Some((id, rank, _)) = cut.loads.first() {
-            return Err(format!(
-                "the standby holds a load row: {id:?} at rank {rank}"
-            ));
-        }
+        let cut = standby.store.checkpoint();
         let mut held = 0;
         for row in &cut.rows {
+            if standby.store.ranks(row.id) > 0 {
+                return Err(format!("the standby holds a load row: {:?}", row.id));
+            }
             if !self.members.contains_key(&row.id) {
                 return Err(format!(
                     "the standby holds a row no registration made: {:?}",

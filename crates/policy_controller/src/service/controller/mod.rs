@@ -1410,7 +1410,7 @@ mod tests {
             ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, LeaseBackend,
             LeaseRecord, MemoryLease, TickOutcome,
         },
-        store::{HealthPolicy, JournalKinds, WorkerFacts, WorkerStatus, WorkersStore},
+        store::{HealthPolicy, WorkerFacts, WorkerStatus, WorkersStore},
     };
 
     /// A lease that stores `writes` writes: the thread that steps it panics
@@ -1535,7 +1535,7 @@ mod tests {
         let mut starts = Vec::new();
         for _ in 0..2 {
             let controller = Controller::bind(valid()).await.expect("the listeners bind");
-            starts.push(controller.shared.feed.log.head(JournalKinds::Watched));
+            starts.push(controller.shared.feed.log.head());
         }
         assert_ne!(starts[0].seq, starts[1].seq, "two runs start apart");
         assert!(starts.iter().all(|start| start.seq != 0 && start.term == 0));

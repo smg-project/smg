@@ -90,7 +90,7 @@ pub use index::{
     AffinityRowsBuffers, ApplyError, ChainBlockMap, ContentHash, KvEvent, LaneCounts, LaneWriter,
     SequenceHash, StoredBlock, WorkerGroups, INDEX_WORKERS,
 };
-pub use journal::{Journal, JournalKinds, Position};
+pub use journal::{Journal, Position};
 pub use kv_events::{
     BatchAdmission, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
     SnapshotChunk, GAP_CLEAR_THRESHOLD, RESTART_WINDOW,

@@ -66,8 +66,8 @@ mod tests {
     use super::*;
     use crate::{
         store::{
-            GatewayId, JournalKinds, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord,
-            Registrant, WorkerFacts, WorkerPatch,
+            GatewayId, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord, Registrant,
+            WorkerFacts, WorkerPatch,
         },
         tracking::lease::{Lease, LeaseId, Outcome, TransportClass},
         worker_host::{Members, MembershipWriter, Precondition, StoreMembershipWriter},
@@ -321,7 +321,7 @@ mod tests {
         let leader = Replica::new();
         let a = leader.write(A);
         let follower = Replica::new();
-        let cut = || leader.store.checkpoint(JournalKinds::All);
+        let cut = || leader.store.checkpoint();
         assert!(follower.store.restore_from(cut()));
         follower.follow();
         let before = follower.at(A);
@@ -368,7 +368,7 @@ mod tests {
         let leader = Replica::new();
         let a = leader.write(A);
         let follower = Replica::new();
-        let cut = || leader.store.checkpoint(JournalKinds::All);
+        let cut = || leader.store.checkpoint();
         assert!(follower.store.restore_from(cut()));
         follower.follow();
         let object = follower.at(A);
@@ -406,7 +406,7 @@ mod tests {
         // The row moves with no hand-in, and the store takes its rows
         // again: every row a new place.
         replica.relabel(A);
-        let cut = replica.store.checkpoint(JournalKinds::All);
+        let cut = replica.store.checkpoint();
         assert!(replica.store.restore_from(cut));
         replica.store.set_term(1);
         assert_eq!(built.load(), 0, "the old place's lease");
@@ -432,7 +432,7 @@ mod tests {
         // Another writer moves the row, the store takes its rows again,
         // and the second attempt states the row as its object was built.
         replica.relabel(A);
-        let cut = replica.store.checkpoint(JournalKinds::All);
+        let cut = replica.store.checkpoint();
         assert!(replica.store.restore_from(cut));
         replica.store.set_term(1);
         registered(&replica, &door, &built);

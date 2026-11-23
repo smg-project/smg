@@ -69,9 +69,8 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         EntryReplication::Rebuilt("the gateways' reports of the last probe interval"),
     ),
     ("HealthSink", "completed_ok_since", EntryReplication::Read),
-    // No log the controller builds carries a load row: a standby holds none
-    // of its leader's and no overload verdict. Its first poll goes out at
-    // its take.
+    // A log carries no load row: a standby holds none of its leader's and
+    // no overload verdict. Its first poll goes out at its take.
     ("LoadSink", "record", EntryReplication::Rebuilt(REPORTED)),
     ("LoadSink", "report", EntryReplication::Rebuilt(REPORTED)),
     (
@@ -204,10 +203,9 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         "watch_from",
         EntryReplication::Rebuilt("a follower takes the worker rows from a watch snapshot"),
     ),
-    // The three doors for a followed write, one a kind of the leader's
+    // The two doors for a followed write, one a kind of the leader's
     // events: each is the standby's side of a journaled write.
     ("MemoryStore", "follow", EntryReplication::Journaled),
-    ("MemoryStore", "follow_load", EntryReplication::Journaled),
     ("MemoryStore", "follow_term", EntryReplication::Journaled),
     // The generation's number is journaled, one of the watched kinds. The
     // document it runs from is its door's to hold: whoever sends the event

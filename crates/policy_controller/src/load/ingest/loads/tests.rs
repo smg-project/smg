@@ -26,8 +26,8 @@ use crate::{
     },
     engine::view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
     store::{
-        GatewayId, JournalKinds, LoadSink, LoadSource, MembershipChange, MemoryStore, Position,
-        Reachability, Signals, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        GatewayId, LoadSink, LoadSource, MembershipChange, MemoryStore, Position, Reachability,
+        Signals, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
 };
 
@@ -1425,7 +1425,7 @@ fn vetoing_at(waiting: u32) -> AppliedSpec {
 /// overload verdict. Every worker of these cases serves the one pool.
 fn vetoed(store: &MemoryStore) -> Vec<bool> {
     let world = store.snapshot();
-    let on_file = store.checkpoint(JournalKinds::All).rows;
+    let on_file = store.checkpoint().rows;
     let mut ids: Vec<WorkerId> = on_file.iter().map(|row| row.id).collect();
     ids.sort_unstable();
     ids.into_iter()
@@ -1880,7 +1880,7 @@ async fn the_polls_group_the_membership_anew_at_a_take_after_a_restore_to_the_sa
         0,
     );
     assert_eq!(leader.epoch(), store.epoch());
-    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(store.restore_from(leader.checkpoint()));
     let before = probe.polls().len();
     tokio::time::sleep(TEN + TEN).await;
     assert_eq!(probe.polls().len(), before, "a follower polled");
@@ -1937,7 +1937,7 @@ async fn a_take_whose_word_folded_over_a_loss_starts_the_polls_anew() {
         0,
     );
     assert_eq!(leader.epoch(), store.epoch());
-    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(store.restore_from(leader.checkpoint()));
     leads.send_replace(Some(2));
     let before = probe.polls().len();
     tokio::time::sleep(TEN + TEN).await;

@@ -17,9 +17,7 @@ use crate::{
         decision::{Target, Targets},
         view::WorkerId,
     },
-    store::{
-        GatewayId, JournalKinds, LeasesStore, MemoryStore, PickRecord, WorkerFacts, WorkersStore,
-    },
+    store::{GatewayId, LeasesStore, MemoryStore, PickRecord, WorkerFacts, WorkersStore},
     tracking::{
         lease::{LeaseId, ReleaseReason, Side},
         HostCount,
@@ -281,11 +279,11 @@ fn a_snapshot_takes_the_leases_off_the_count_of_a_row_it_moves() {
 
     let source = MemoryStore::new();
     assert_eq!(ready(&source, "http://b:1"), stays);
-    assert!(store.watch_from(source.checkpoint(JournalKinds::Watched)));
+    assert!(store.watch_from(source.checkpoint()));
     assert_eq!((kept_left.held(), kept_left.dropped()), (0, 1), "dropped");
     assert_eq!((kept_stays.held(), kept_stays.dropped()), (1, 0), "kept");
 
-    assert!(store.restore_from(source.checkpoint(JournalKinds::All)));
+    assert!(store.restore_from(source.checkpoint()));
     assert_eq!((kept_stays.held(), kept_stays.dropped()), (0, 1));
 }
 

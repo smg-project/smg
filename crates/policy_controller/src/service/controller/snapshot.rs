@@ -317,7 +317,7 @@ mod tests {
             proto::{self, snapshot_request::Slice},
         },
         stages::registry::StageRegistry,
-        store::{JournalKinds, MemoryStore, StoreCheckpoint, WorkerFacts, WorkerRow, WorkersStore},
+        store::{MemoryStore, StoreCheckpoint, WorkerFacts, WorkerRow, WorkersStore},
     };
 
     /// The rows slice alone: every model, no limit.
@@ -339,7 +339,6 @@ mod tests {
             rows: cut.to_vec(),
             at: Default::default(),
             epoch: 0,
-            loads: Vec::new(),
         });
         super::rows(&asked.rows, Rows::Shared(cut), now)
     }
@@ -556,7 +555,7 @@ mod tests {
         let store = MemoryStore::new();
         let key = "grpc://operator-name:s3cret-word@10.0.0.5:8000";
         let id = register(&store, key, "model-a");
-        let cut = store.checkpoint(JournalKinds::Watched);
+        let cut = store.checkpoint();
         let later = cut.rows[0].admitted_at + Duration::from_millis(1_500);
         let (told, truncated) = rows(&cut.rows, &ROWS, later);
         let [row] = told.as_slice() else {
@@ -599,7 +598,7 @@ mod tests {
 
         let store = MemoryStore::new();
         register(&store, &url(1), "model-a");
-        let mut row = store.checkpoint(JournalKinds::Watched).rows[0].clone();
+        let mut row = store.checkpoint().rows[0].clone();
         let page = |row: &WorkerRow| {
             let (mut told, _) = rows(std::slice::from_ref(row), &ROWS, Instant::now());
             told.pop().expect("one row")
@@ -649,7 +648,7 @@ mod tests {
         for n in 0..5 {
             register(&store, &url(n), "model-a");
         }
-        let cut = store.checkpoint(JournalKinds::Watched);
+        let cut = store.checkpoint();
         let now = Instant::now();
         let told = |limit| {
             let (page, truncated) = rows(
@@ -681,7 +680,7 @@ mod tests {
             let wide = format!("grpc://{n}.{}:8000", "u".repeat(PAGE_BYTES / 2));
             register(&store, &wide, "model-a");
         }
-        let cut = store.checkpoint(JournalKinds::Watched);
+        let cut = store.checkpoint();
         let (page, truncated) = rows(&cut.rows, &ROWS, Instant::now());
         assert_eq!((page.len(), truncated), (1, true));
         assert!(page[0].url.starts_with("grpc://0."));
@@ -705,7 +704,7 @@ mod tests {
             let key = format!("grpc://10.0.{}.{}:8000", n / 100, n % 100);
             register(&store, &key, "model-a");
         }
-        let cut = store.checkpoint(JournalKinds::Watched);
+        let cut = store.checkpoint();
         let (page, truncated) = rows(&cut.rows, &ROWS, Instant::now());
         assert_eq!((page.len(), truncated), (200, false));
     }
@@ -719,7 +718,7 @@ mod tests {
         for (n, model) in models.into_iter().enumerate() {
             register(&store, &url(n), model);
         }
-        let cut = store.checkpoint(JournalKinds::Watched);
+        let cut = store.checkpoint();
         let told = |limit| {
             let asked = SnapshotQuery {
                 rows: WorkerRowsQuery {
@@ -750,7 +749,7 @@ mod tests {
         for (n, model) in models.into_iter().enumerate() {
             register(&store, &url(n), model);
         }
-        let cut = store.checkpoint(JournalKinds::Watched);
+        let cut = store.checkpoint();
         let filters = [
             Vec::new(),
             vec!["model-b".to_owned()],
@@ -795,7 +794,7 @@ mod tests {
                 asked,
                 3,
                 "controller-0",
-                || Rows::Shared(Arc::new(store.checkpoint(JournalKinds::Watched))),
+                || Rows::Shared(Arc::new(store.checkpoint())),
                 &generations,
                 Instant::now(),
             )
@@ -1103,7 +1102,7 @@ mod tests {
         ] {
             register(&store, key, model);
         }
-        let cut = Arc::new(store.checkpoint(JournalKinds::Watched));
+        let cut = Arc::new(store.checkpoint());
         let now = Instant::now() + Duration::from_secs(1);
         for models in [Vec::new(), vec!["a".to_owned()], vec!["none".to_owned()]] {
             for limit in [0, 1, 2, 3, usize::MAX] {
