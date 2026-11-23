@@ -6433,7 +6433,7 @@ impl Engine {
                 // At the cap: the stages place the request again, over every
                 // candidate the filters kept.
                 if let Some(respilled) = self.respill(
-                    profile, index, rule, placing, facts, pool, candidates, cx, buf, c.id,
+                    profile, index, rule, placing, facts, pool, set, cx, buf, c.id,
                 ) {
                     return self.moved::<WRITE_SESSIONS>(key, respilled);
                 }
@@ -6470,7 +6470,7 @@ impl Engine {
                 return shed;
             }
         }
-        let mut decision = self.place(profile, index, placing, facts, pool, candidates, cx, buf);
+        let mut decision = self.place(profile, index, placing, facts, pool, set, cx, buf);
         if let Decision::Pick(pick) = &mut decision {
             // Under any assignment but `delegate` the rule's own stage
             // placed the key: no stage of the profile was asked.
@@ -6637,12 +6637,11 @@ impl Engine {
         cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Decision {
-        let candidates = set.candidates;
         let buf = &mut scratch.single;
         if let Some(answer) = single_survivors(profile, index, facts, pool, set, cx, buf) {
             return answer;
         }
-        self.place(profile, index, assignment, facts, pool, candidates, cx, buf)
+        self.place(profile, index, assignment, facts, pool, set, cx, buf)
     }
 
     /// Whether a pin carries its rule's in-flight cap of the key's requests,
@@ -6705,7 +6704,7 @@ impl Engine {
         placing: Assignment,
         facts: &RequestFacts<'_>,
         pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
+        set: Set<'_>,
         cx: &Constraints<'_>,
         buf: &mut Buffers,
         pin: WorkerId,
@@ -6713,7 +6712,8 @@ impl Engine {
         if buf.kept.is_empty() {
             return None;
         }
-        let mut decision = self.place(profile, index, placing, facts, pool, candidates, cx, buf);
+        let candidates = set.candidates;
+        let mut decision = self.place(profile, index, placing, facts, pool, set, cx, buf);
         if let Decision::Pick(pick) = &mut decision {
             // As a key with no pin: the rule's own stage placed it.
             if placing != Assignment::Delegate {
@@ -6781,17 +6781,16 @@ impl Engine {
         all_vetoed: bool,
         pin: WorkerId,
     ) -> Option<Decision> {
-        let candidates = set.candidates;
         if !KEPT {
             return self.respill(
-                profile, index, rule, placing, facts, pool, candidates, cx, buf, pin,
+                profile, index, rule, placing, facts, pool, set, cx, buf, pin,
             );
         }
         // The veto as it stands: that pass's survivors decide. The pass is
         // put to no rule.
         if !all_vetoed && filter(profile, facts, cx, buf, set.shedding()).is_none() {
             if let Some(respilled) = self.respill(
-                profile, index, rule, placing, facts, pool, candidates, cx, buf, pin,
+                profile, index, rule, placing, facts, pool, set, cx, buf, pin,
             ) {
                 return Some(respilled);
             }
@@ -6800,7 +6799,7 @@ impl Engine {
         // says the lift.
         if vetoed::lifted(profile, index, facts, pool, set, cx, buf).is_none() {
             if let Some(mut respilled) = self.respill(
-                profile, index, rule, placing, facts, pool, candidates, cx, buf, pin,
+                profile, index, rule, placing, facts, pool, set, cx, buf, pin,
             ) {
                 if let Decision::Pick(pick) = &mut respilled {
                     pick.trace.lifted = LiftedVeto::Overload;
@@ -6826,9 +6825,9 @@ impl Engine {
     /// the stages decide ([`score_and_pick`]), as the whole pass does behind
     /// that draw. So where a soft filter refuses every row, both kinds of
     /// request are refused at the draw and fall to the survivors' one
-    /// rotation. `None` too for a side of a pair, whose request with no
-    /// session value never draws: its sessions rotate through the
-    /// survivors, as that request does.
+    /// rotation. `None` too over a set narrowed to a side of a pair
+    /// ([`Set::plain`]), whose request with no session value never draws:
+    /// its sessions rotate through the survivors, as that request does.
     ///
     /// The rows drawn stand in `buf.before_soft`, which nothing reads behind
     /// the filters: `buf.kept` stays the survivors, which the callers read.
@@ -6840,20 +6839,21 @@ impl Engine {
         index: u16,
         facts: &RequestFacts<'_>,
         pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
+        set: Set<'_>,
         cx: &Constraints<'_>,
         buf: &mut Buffers,
     ) -> Option<Decision> {
-        // The plain path's own test of a turn: a single request, of a
-        // profile that draws for every request and takes turns, over
-        // `DRAW_FROM` rows or more or over a pool that lends its own word,
-        // and a request its host holds to no places. A side of a pair
-        // takes no turn of a list: its request with no session value never
-        // draws, so its new session rotates through the survivors too.
-        let at = usize::from(index);
+        // The plain path's own test of a turn: the single plan's whole
+        // pool, of a profile that draws for every request and takes turns,
+        // over `DRAW_FROM` rows or more or over a pool that lends its own
+        // word, and a request its host holds to no places. A side of a
+        // pair takes no turn of a list: its request with no session value
+        // never draws, so its new session rotates through the survivors
+        // too. The set says which it is. A request's phase does not: a
+        // binding of the single plan decides a request of any phase.
+        let (at, candidates) = (usize::from(index), set.candidates);
         let sized = candidates.len() >= DRAW_FROM || pool.word.is_some();
-        let single = facts.phase == Phase::Single;
-        if !(single && sized && self.marks[at].turns() && !places::stated(cx)) {
+        if !(set.plain() && sized && self.marks[at].turns() && !places::stated(cx)) {
             return None;
         }
         let (profile, tests) = (&self.profiles[at], self.row_tests[at]);
@@ -6935,15 +6935,16 @@ impl Engine {
         assignment: Assignment,
         facts: &RequestFacts<'_>,
         pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
+        set: Set<'_>,
         cx: &Constraints<'_>,
         buf: &mut Buffers,
     ) -> Decision {
+        let candidates = set.candidates;
         let mut targets = Targets::new();
         let picker: &dyn Picker = match assignment {
             // The profile's own stages, through the profile run's one home.
             Assignment::Delegate => {
-                if let Some(turned) = self.pool_turn(index, facts, pool, candidates, cx, buf) {
+                if let Some(turned) = self.pool_turn(index, facts, pool, set, cx, buf) {
                     return turned;
                 }
                 score_and_pick(profile, facts, candidates, buf, &mut targets);
@@ -17122,6 +17123,36 @@ mod tests {
             Random.pick(&facts, &ailing, &survivors, &[], TieBand(0.0), &mut alone);
             let alone: Vec<u32> = alone.iter().map(|target| target.position).collect();
             assert_eq!(positions(&placed), alone, "seed {seed}");
+        }
+    }
+
+    /// A binding of the single plan decides a request of any phase, and
+    /// its round robin turns one rotation for both kinds of request at
+    /// each: a request with no session value draws the pool's turn whatever
+    /// its phase says, so a new session takes that turn too. A set narrowed
+    /// to a side of a pair alone takes none.
+    #[test]
+    fn round_robin_under_delegate_turns_one_rotation_at_every_phase_of_the_single_plan() {
+        let rows = DRAW_FROM + 4;
+        let pool = pool_of(rows as u32, |_| false);
+        for phase in PHASES {
+            let engine = session_engine_of(round_robin_profile(), SESSIONS);
+            let mut scratch = Scratch::new();
+            let mut turn = |key: Option<u64>| {
+                let facts = RequestFacts {
+                    phase,
+                    session_key: key.map_or(Identity::NONE, Identity::hashed),
+                    ..request(0)
+                };
+                let (shared, cx) = (PoolFacts::default(), Constraints::default());
+                let decision = engine.decide(&facts, &shared, &pool, &cx, &mut scratch);
+                positions(&decision)[0] as usize
+            };
+            let first = turn(None);
+            let keys = [Some(1), None, Some(2), Some(3), None];
+            let places: Vec<usize> = keys.into_iter().map(&mut turn).collect();
+            let in_turn: Vec<usize> = (1..6).map(|step| (first + step) % rows).collect();
+            assert_eq!(places, in_turn, "{phase:?}");
         }
     }
 
