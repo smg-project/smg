@@ -235,7 +235,9 @@ impl WholeDecision for WithoutShadow {
 /// request's place one ([`overlap::decide`]). It is asked of the maker's
 /// own type and no argument carries the entry: a maker that names none
 /// costs a decision nothing. The decision is compiled once for each maker
-/// type, as the engine's entry that calls it is.
+/// type, as the engine's entry that calls it is, and once more for the
+/// trait object through which a copy that carries signal cells asks
+/// ([`super::signals::decide`]).
 ///
 /// A request that states a hard demand is decided under its constraints
 /// held to the workers that meet it ([`held`]). A list the demands leave
@@ -318,7 +320,8 @@ pub(super) fn decide(
 /// decision more.
 ///
 /// `maker` is the request's own, a retry's too: the lookup that names a
-/// request's holders asks it for the request's entry in a lent token tree.
+/// request's holders asks it for the request's entry in a lent token tree,
+/// and which target of its pick the request's caller sends to.
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
@@ -352,6 +355,7 @@ fn by_facts<const RETRY: bool>(
             records.ids(),
             facts,
             |page| maker.token_key(page),
+            |target| maker.sends_to(target),
             |facts| whole.decide(engine, records, workers, live, facts, cx),
         ),
     }
@@ -601,7 +605,7 @@ pub(crate) mod tests {
 
     /// What a lending host's document holds beyond its preset.
     #[derive(Clone, Copy, Debug)]
-    enum Also {
+    pub(crate) enum Also {
         /// Nothing.
         Nothing,
         /// The binding names a copy of its profile as its shadow.
@@ -614,7 +618,7 @@ pub(crate) mod tests {
     /// The engine of a preset under a host that lends its token tree, a
     /// page of sixteen tokens, and the host's tree. `also` is what the
     /// document holds beyond the preset.
-    fn lent(name: &str, also: Also) -> (PolicyEngine, Arc<TokenTree>) {
+    pub(crate) fn lent(name: &str, also: Also) -> (PolicyEngine, Arc<TokenTree>) {
         let mut document = PolicySpec::preset(name).expect("a built-in preset");
         document.generation = 1;
         let live = document.bindings[0].profile.clone();

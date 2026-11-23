@@ -1,5 +1,6 @@
 mod encode;
 mod pair;
+mod prompt_entry;
 
 use std::{
     cell::{Cell, RefCell},
@@ -355,7 +356,7 @@ fn a_request_is_made_of_what_its_caller_states() {
     let prompt = Prompt {
         tokens: Some(&[7, 8, 9]),
         text: Some("secret words"),
-        seeds: HashSeeds::PLAIN,
+        ..Prompt::NONE
     };
     let shown = format!("{prompt:?}");
     assert!(shown.contains("tokens: Some(3)"), "{shown}");
@@ -404,6 +405,7 @@ fn the_prompts_blocks_are_hashed_under_its_partition_once() {
             tokens,
             text,
             seeds,
+            ..Prompt::NONE
         },
         ..PlaceRequest::of(MODEL, WorkerLists::None)
     };

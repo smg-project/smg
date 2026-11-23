@@ -66,7 +66,6 @@ mod signals;
 #[cfg(any(target_env = "msvc", target_env = "musl"))]
 use std::alloc::System as Allocator;
 use std::{
-    borrow::Cow,
     cell::OnceCell,
     collections::HashMap,
     env,
@@ -86,7 +85,7 @@ use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec, ShadowSpec},
     engine::{
         Constraints, Decided, Identity, LentList, ListCell, Phase, Plain, PolicyEngine, Request,
-        RequestFacts, RequestMaker, TokenKey, WorkerId, WorkerLists,
+        RequestFacts, RequestMaker, TokenEntry, TokenKey, WorkerId, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
     store::GatewayId,
@@ -523,9 +522,8 @@ impl RequestMaker for Stated<'_> {
         WorkerLists::Single(self.host.list.lent())
     }
 
-    fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
-        let tokens = Cow::Borrowed(self.prompt?.tokens);
-        Some(TokenKey { tokens, marker: 0 })
+    fn token_key(&self, page: usize) -> Option<TokenKey<'_>> {
+        self.prompt?.token_key(page)
     }
 }
 

@@ -463,7 +463,7 @@ cluster run did not.
 record. For B and C the engine keeps no tree of its own. The host lends its own trees, through
 the trait it already answers for cache events (`CacheIndexes`). The engine decides inside the
 lent tree's one walk, as classic does, and the walk stores the request once, for the worker the
-decision names.
+request goes to.
 
 - **[built]** A single request that hands token ids, for a model with no index of cache events,
   under a profile that reads sent prefixes and names the holders' rows, as the `cache_aware`
@@ -473,9 +473,19 @@ decision names.
   bound and a worker that left stay the host's to keep.
 - **[built]** A host that lends no tree, or names no entry, is decided by the hash table as
   before.
-- **[planned]** A request placed by the one call (`PolicyEngine::place`) hands its entry too.
-  Until then that call's own maker names none, so such a request is decided by the hash table,
-  whatever its host lends.
+- **[built]** A request placed by the one call (`PolicyEngine::place`) hands its entry too. Its
+  caller states the entry with the prompt (`Prompt::entry`), and the call's own maker asks it
+  where a decision reads the tree.
+- **[built]** The tree is written for the worker the request goes to. The tree's walk asks the
+  request's maker which target of the pick its caller sends to (`RequestMaker::sends_to`), best
+  first, and stores the prompt for the first one: for no worker where the caller sends to none.
+  The one call answers by the read it makes of a target itself: ready, and admitted by the
+  route's rule. So a call that decides again stores the prompt once, for the worker it sends
+  to, and a call shed under the rule's name stores nothing. A maker that does not answer is
+  stored for the pick's first target.
+- Where a worker's state changes, or its route's rule answers it two ways, between the tree's
+  walk and the call's own read of it, the tree names another worker than the one the prompt went
+  to: the two reads are not one. The hash table is written for a pick's first target, as before.
 - **[planned]** A request given as text is decided the same way in the host's string tree.
 - **[planned]** The hash table leaves the single decision. Until then a model with an index of
   cache events reads the index and the hash table together, as today.
@@ -995,6 +1005,7 @@ pub trait RequestMaker {
     fn workers(&self) -> WorkerLists<'_>;             // the worker list, a pair's two lists, or an encode request's three
     fn loads(&self) -> Option<&Arc<LoadSnapshot>>;    // a request's snapshot of the host's own; without one the engine reads its own
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>>; // the prompt's entry in the host's token tree, where the host lends one
+    fn sends_to(&self, target: &Target) -> bool;      // whether its caller sends to this target of a pick: the tree stores the first such
 }
 
 pub enum WorkerLists<'a> {
@@ -1178,6 +1189,9 @@ Two things keep the short path of section 5.6 as cheap as it is today. The route
 of the one picked worker, and of a single request's whole list only behind a decision all of whose ready picks it refuses; a rule that is the same for every request of a
 route belongs to the list itself. And a plain request touches neither the load snapshot nor the
 other fields of the request.
+
+A request decided inside a lent token tree has the rule asked once more: inside the tree's walk,
+of the pick's targets best first, so the tree stores the prompt for a worker the rule takes.
 
 **3. Keep the placement with the request.**
 
@@ -1701,7 +1715,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The stage interfaces and a builder's own stages | **[built]** | |
 | The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, a pair's demand, mixed protocols; no recorded line replays through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |
-| `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. Every other request the engine names the holders of reads the engine's own record, with its three faults: a request placed by `PolicyEngine::place` is one, until that call hands the entry. The string tree is planned |
+| `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. Every other request the engine names the holders of reads the engine's own record, with its three faults: a request whose caller names no entry is one. The string tree is planned |
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | placed on the ring the host lends (decision 3): through `place` the plain ring alone, at the place the engine reads with the request's keys; `prefix_hash` at the places a host that writes the request's facts itself states; that both are classic's is proven at stage 3; a host that lends none is placed on the crate's ring, which may be another worker than classic's |
 | `manual` and sticky sessions on that engine | **[partly]** | their sheets replay through the decision function, not through the engine |
 | `bucket` on that engine | **[partly]** | the same |

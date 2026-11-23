@@ -70,7 +70,9 @@ pub use policy_engine::overlap::{
 #[cfg(feature = "in-process")]
 pub use policy_engine::pair::{prefills_full, PairAdmission, PairLists};
 #[cfg(feature = "in-process")]
-pub use policy_engine::place::{HeaderRead, PlaceRequest, Prompt, Unplaced, WorkerRule};
+pub use policy_engine::place::{
+    HeaderRead, PlaceRequest, Prompt, TokenEntry, Unplaced, WorkerRule,
+};
 #[cfg(feature = "in-process")]
 pub use policy_engine::start::WorkerData;
 #[cfg(feature = "in-process")]
