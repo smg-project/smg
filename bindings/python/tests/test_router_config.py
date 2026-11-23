@@ -7,6 +7,9 @@ including validation of configuration parameters and their interactions.
 
 import inspect
 import re
+import subprocess
+import sys
+from textwrap import dedent
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -622,9 +625,9 @@ class TestControlPlaneAuthHalfJwt:
 
 @pytest.fixture
 def policy_document(tmp_path):
-    def write(policy):
+    def write(policy, *, kind=None):
         path = tmp_path / "routing.yaml"
-        path.write_text(
+        yaml = (
             "apiVersion: smg.policy/v1\n"
             "generation: 1\n"
             "profiles:\n"
@@ -635,13 +638,63 @@ def policy_document(tmp_path):
             "  - match: {model: '*'}\n"
             f"    profile: {policy}\n"
         )
+        if kind is not None:
+            yaml += f"kind: {kind}\n"
+        path.write_text(yaml)
         return path
 
     return write
 
 
 class TestPolicyDocument:
-    """A routing option beside a policy document is refused by its name."""
+    """The plain start runs the policy document it was given, and a routing option
+    beside a document is refused by its name."""
+
+    @staticmethod
+    def assert_start_refusal(path, named, *flags):
+        # Each start installs a process-wide metrics recorder, so each runs in a
+        # process of its own. A storage hook that is not there stops a start that
+        # accepted its document before anything binds.
+        code = dedent("""
+            import sys
+            from pathlib import Path
+
+            from smg.launch_router import parse_router_args
+            from smg.router import Router
+
+            path = Path(sys.argv[1])
+            args = parse_router_args(
+                ["--policy-controller", "on", "--policy-spec", str(path), *sys.argv[2:]]
+            )
+            args.storage_hook_wasm_path = str(path.with_name("missing.wasm"))
+            Router.from_args(args).start()
+            """)
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(path), *flags],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 1, result.stderr
+        # The start ends in the policy controller's refusal of the document, which
+        # names what the document wrote. The words between are the policy crate's,
+        # and no case here holds them.
+        refusals = [
+            line for line in result.stderr.splitlines() if line.startswith("RuntimeError: ")
+        ]
+        assert len(refusals) == 1, result.stderr
+        assert refusals[0].startswith("RuntimeError: policy controller: "), result.stderr
+        assert named in refusals[0], result.stderr
+
+    @pytest.mark.parametrize(
+        "mode",
+        [(), ("--pd-disaggregation",), ("--epd-disaggregation",)],
+        ids=["regular", "pd", "epd"],
+    )
+    def test_the_plain_start_takes_the_document(self, policy_document, mode):
+        path = policy_document("round_robin", kind="PolicySpec")
+        self.assert_start_refusal(path, '"PolicySpec"', *mode)
 
     @pytest.mark.parametrize(
         ("flags", "named"),

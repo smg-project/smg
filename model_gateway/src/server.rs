@@ -48,6 +48,7 @@ use smg_mesh::{
     ClusterState, MeshServer, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
     PreparedMeshServer,
 };
+use smg_policy_controller::stages::StageRegistry;
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
@@ -1139,12 +1140,16 @@ impl ServerConfig {
 #[non_exhaustive]
 pub struct Extensions {
     connector: Option<Arc<dyn EngineConnector>>,
+    policy_stages: Option<StageRegistry>,
 }
 
 impl Extensions {
-    /// Use the stock connector.
+    /// Use the stock connector and the stock policy stages.
     pub fn new() -> Self {
-        Self { connector: None }
+        Self {
+            connector: None,
+            policy_stages: None,
+        }
     }
 
     /// Set the connector workers of this gateway use to probe and connect
@@ -1180,6 +1185,27 @@ impl Extensions {
     #[must_use]
     pub fn connector(mut self, connector: Arc<dyn EngineConnector>) -> Self {
         self.connector = Some(connector);
+        self
+    }
+
+    /// Set the table of stages a policy document of this gateway may name,
+    /// where the gateway runs the policy controller (`policy_controller`
+    /// on). Start from the stock table ([`StageRegistry::builtin`]) and add
+    /// each stage of your own under a new name, with
+    /// [`StageRegistry::filter`], [`StageRegistry::scorer`] or
+    /// [`StageRegistry::picker`]. A supplied document (`policy_spec`) then
+    /// names your stage as it names a stock one, and the engine that places
+    /// this gateway's requests runs it.
+    ///
+    /// The gateway validates its document against this table first, before
+    /// it opens a store or listens. A document that names a stage the table
+    /// does not hold ends the start by the stage's name. Without this call
+    /// the document is validated against the stock table.
+    ///
+    /// With the policy controller off the table is not read.
+    #[must_use]
+    pub fn policy_stages(mut self, stages: StageRegistry) -> Self {
+        self.policy_stages = Some(stages);
         self
     }
 }
@@ -2277,7 +2303,7 @@ fn serve_listeners(
 }
 
 /// The context of this process, built over what the host added: its
-/// worker connector.
+/// worker connector and its table of policy stages.
 async fn build_app_context(
     config: &ServerConfig,
     extensions: Extensions,
@@ -2289,6 +2315,7 @@ async fn build_app_context(
             config.webrtc_bind_addr,
             config.webrtc_stun_server.clone(),
             extensions.connector,
+            extensions.policy_stages,
         )
         .await?,
     ))
@@ -3724,6 +3751,7 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
 mod tests {
     mod connector;
     mod load_source;
+    mod policy_stages;
 
     use std::convert::Infallible;
 

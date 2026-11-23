@@ -14,7 +14,7 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
-use smg_policy_controller::{engine::PolicyEngine, stages::StageRegistry};
+use smg_policy_controller::{document::AppliedSpec, engine::PolicyEngine, stages::StageRegistry};
 use smg_worker::{
     connection::{
         engine::EngineConnector,
@@ -273,15 +273,20 @@ impl AppContext {
             webrtc_bind_addr,
             webrtc_stun_server,
             None,
+            None,
         )
     }
 
+    /// [`Self::from_config`] over what a host added: its worker connector,
+    /// and the table of policy stages its policy document may name. With no
+    /// table the document is checked against the stock one.
     pub(crate) fn from_config_with_extensions(
         router_config: RouterConfig,
         request_timeout_secs: u64,
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
         connector: Option<Arc<dyn EngineConnector>>,
+        policy_stages: Option<StageRegistry>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
         Box::pin(async move {
             Box::pin(AppContextBuilder::from_config_with_extensions(
@@ -290,6 +295,7 @@ impl AppContext {
                 webrtc_bind_addr,
                 webrtc_stun_server,
                 connector,
+                policy_stages,
             ))
             .await?
             .build()
@@ -702,6 +708,7 @@ impl AppContextBuilder {
             webrtc_bind_addr,
             webrtc_stun_server,
             None,
+            None,
         ))
         .await
     }
@@ -712,7 +719,14 @@ impl AppContextBuilder {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
         connector: Option<Arc<dyn EngineConnector>>,
+        policy_stages: Option<StageRegistry>,
     ) -> Result<Self, String> {
+        // The policy document comes first, checked against the stages the
+        // host registered: ahead of the stores, the storage hooks and every
+        // listener, so a document that is refused ends the start in its own
+        // words. The engine is built further down from the document that
+        // was checked here.
+        let policy = Self::policy_in_force(&router_config, policy_stages.as_ref())?;
         // A served model aliased under a vendor name keeps that vendor's
         // contract profile after the alias is resolved into the served name.
         ProviderProfile::register_model_aliases(
@@ -736,7 +750,7 @@ impl AppContextBuilder {
             .with_policy_registry(&router_config)
             .with_storage(&router_config)
             .await?
-            .with_worker_monitor(&router_config)?
+            .with_worker_monitor(&router_config, policy)?
             .with_worker_job_queue()
             .with_workflow_engines()
             .with_mcp_orchestrator(&router_config)
@@ -957,8 +971,14 @@ impl AppContextBuilder {
         Ok(self)
     }
 
-    /// Create load monitor
-    fn with_worker_monitor(mut self, config: &RouterConfig) -> Result<Self, String> {
+    /// Create load monitor, and start the policy engine over `policy` where
+    /// the configuration runs the policy controller: the checked document
+    /// [`Self::policy_in_force`] answered.
+    fn with_worker_monitor(
+        mut self,
+        config: &RouterConfig,
+        policy: Option<AppliedSpec>,
+    ) -> Result<Self, String> {
         let policy_registry = self
             .policy_registry
             .as_ref()
@@ -987,8 +1007,8 @@ impl AppContextBuilder {
             None => monitor,
         });
         policy_registry.set_load_receiver(Some(monitor.subscribe()));
-        if config.policy_controller {
-            Self::start_policy_engine(config, &policy_registry, monitor.subscribe())?;
+        if let Some(spec) = policy {
+            Self::start_policy_engine(spec, &policy_registry, monitor.subscribe())?;
         }
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
@@ -1003,26 +1023,45 @@ impl AppContextBuilder {
         Ok(self)
     }
 
-    /// Starts the policy engine that places every request of this process
-    /// (`policy_controller: on`): one engine, built from the document in
-    /// force, which is the one the routing settings mean or a supplied one.
-    /// The engine is handed the load monitor's channel, its own task is
-    /// spawned on the runtime this context is built on, and the placement
-    /// functions find the engine through `policies`.
+    /// The policy document this process runs under the policy controller
+    /// (`policy_controller: on`), checked: the document in force, which is
+    /// the one the routing settings mean or a supplied one, validated
+    /// against `stages`. A host's table holds the stock stages and the
+    /// host's own, so a supplied document may name both. With no table the
+    /// document is validated against the stock one. `None` where the
+    /// configuration leaves the classic policies in place.
     ///
     /// A document that is refused ends the start with the refusal's own
-    /// words, before the gateway listens.
-    fn start_policy_engine(
+    /// words, before a store is opened and before the gateway listens.
+    fn policy_in_force(
         config: &RouterConfig,
-        policies: &PolicyRegistry,
-        loads: LoadReceiver,
-    ) -> Result<(), String> {
+        stages: Option<&StageRegistry>,
+    ) -> Result<Option<AppliedSpec>, String> {
+        if !config.policy_controller {
+            return Ok(None);
+        }
         let document = config
             .policy_document_in_force()
             .map_err(|refused| format!("policy controller: {refused}"))?;
-        let spec = config
-            .hosted_policy(&document, &StageRegistry::builtin())
-            .map_err(|refused| format!("policy controller: {refused}"))?;
+        let checked = match stages {
+            Some(stages) => config.hosted_policy(&document, stages),
+            None => config.hosted_policy(&document, &StageRegistry::builtin()),
+        };
+        checked
+            .map(Some)
+            .map_err(|refused| format!("policy controller: {refused}"))
+    }
+
+    /// Starts the policy engine that places every request of this process:
+    /// one engine, built from the checked document
+    /// ([`Self::policy_in_force`]). The engine is handed the load monitor's
+    /// channel, its own task is spawned on the runtime this context is built
+    /// on, and the placement functions find the engine through `policies`.
+    fn start_policy_engine(
+        spec: AppliedSpec,
+        policies: &PolicyRegistry,
+        loads: LoadReceiver,
+    ) -> Result<(), String> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
             format!("policy controller: the engine's task needs a Tokio runtime: {error}")
         })?;
@@ -1394,7 +1433,7 @@ mod tests {
             .expect("client builds")
             .with_worker_registry()
             .with_policy_registry(&config)
-            .with_worker_monitor(&config)
+            .with_worker_monitor(&config, None)
             .expect("worker monitor builds");
 
         let policy = builder
