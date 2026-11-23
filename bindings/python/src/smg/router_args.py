@@ -61,8 +61,6 @@ DOCUMENT_REPLACES = (
     "balance_token_usage_threshold",
     "overload_token_usage_threshold",
     "worker_overload_protection",
-    "worker_overload_waiting_requests",
-    "worker_overload_token_usage",
     "worker_overload_shed",
     "overlap_decay",
     "selection_temperature",
@@ -1040,7 +1038,8 @@ class RouterArgs:
             help=(
                 "Run a policy document with the policy controller."
                 " The document replaces the routing options: one that is not at its"
-                " default is refused beside it by name."
+                " default is refused beside it by name. The two overload thresholds"
+                " stand beside it: the gateway builds its workers with them."
             ),
         )
         routing_group.add_argument(

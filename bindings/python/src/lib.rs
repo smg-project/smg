@@ -2400,8 +2400,6 @@ impl Router {
                 balance_token_usage_threshold,
                 overload_token_usage_threshold,
                 worker_overload_protection,
-                worker_overload_waiting_requests,
-                worker_overload_token_usage,
                 worker_overload_shed,
                 overlap_decay,
                 selection_temperature,

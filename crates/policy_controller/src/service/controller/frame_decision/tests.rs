@@ -19,7 +19,7 @@ use smg_worker::load::state::{one_rank_load, LoadSnapshot};
 
 use super::{decide, decide_pair, hands_reports, issue_pair, FrameBuffers};
 use crate::{
-    document::spec::{self, AppliedSpec, Assignment, PolicySpec},
+    document::spec::{AppliedSpec, Assignment, PolicySpec},
     engine::{
         decision::{Decision, ShedReason, Targets, SUBSET_HINT, WIRES},
         decision_engine::{Request, RequestMaker, WorkerLists},
@@ -226,10 +226,6 @@ fn a_served_key_under_a_capped_rule_keeps_an_owner_over_its_thresholds_below_its
     // binding names them once.
     binding.routing_key = None;
     binding.sessions = Some(rule);
-    binding.overload = Some(spec::OverloadSpec {
-        waiting_requests: Some(1),
-        ..spec::OverloadSpec::default()
-    });
     let store = Arc::new(MemoryStore::with_publish_window(Duration::ZERO));
     let (singles, _) = fleet(&store);
     let spec = AppliedSpec::validate(&document).expect("the document validates");

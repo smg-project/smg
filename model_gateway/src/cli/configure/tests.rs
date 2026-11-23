@@ -478,6 +478,8 @@ const HEADINGS: [&str; 2] = ["Routing Policy", "PD Disaggregation"];
 
 const POOLS: &str = "the pools and their addresses are the gateway's";
 const ADMISSION: &str = "the prefill queue and its limits are the gateway's admission";
+const THRESHOLDS: &str =
+    "the gateway builds its worker objects with the two overload thresholds, and no document carries one";
 
 const EPD: &[&str] = &[
     "--epd-disaggregation",
@@ -512,8 +514,8 @@ const ROUTING_FLAGS: &[Row] = &[
         "it says the default, and is kept so that an old command line still parses",
     ),
     lands("disable-worker-overload-protection", &[], &[]),
-    lands("worker-overload-waiting-requests", &[], &["32"]),
-    lands("worker-overload-token-usage", &[], &["0.9"]),
+    kept("worker-overload-waiting-requests", &[], &["32"], THRESHOLDS),
+    kept("worker-overload-token-usage", &[], &["0.9"], THRESHOLDS),
     lands("worker-overload-shed", &[], &[]),
     deferred("overlap-decay", &["0.5"], "the prefix-affinity decay"),
     deferred(

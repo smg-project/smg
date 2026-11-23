@@ -12,7 +12,7 @@ use crate::{
         LeastLoadParams, OverloadSpec, Pairing, PickStage, PolicySpec, PrefixAffinityParams,
         ProfileSpec, Recovery, RoutingKeySpec, RulePlaced, ScoreSpec, ScoreStage, SessionsSpec,
         SpecError, SpillParams, WarmupSliceParams, MANUAL_SESSION_HEADER, MAX_KEY_SOURCES,
-        OVERLOAD_TOKEN_USAGE, OVERLOAD_WAITING_REQUESTS,
+        OVERLOAD_WAITING_REQUESTS,
     },
     engine::view::Phase,
     policies::{
@@ -64,9 +64,9 @@ use crate::{
 ///   and only where it differs from the number that stage runs at when its
 ///   document names none. The controller names those numbers and this
 ///   module reads them, so a configuration at them is the preset itself.
-/// - The overload thresholds land on every binding, the pairing mode on
-///   the pair plan, the index settings under every model, and the block
-///   size and the cache boundaries in the view.
+/// - The overload veto's switch and its shed word land on every binding,
+///   the pairing mode on the pair plan, the index settings under every
+///   model, and the block size and the cache boundaries in the view.
 /// - The manual policy's settings land in the binding's session rule.
 /// - A keyed policy's key sources land on the binding. The two rings name
 ///   them under `routing_key`. The manual policy names them in its session
@@ -89,7 +89,7 @@ use crate::{
 ///
 /// A setting that decides a placement and has no place in the document is
 /// refused by its name ([`RoutingSettingsError::UnsupportedSetting`]). It is never left
-/// out in silence.
+/// out in silence, but for what the gateway keeps for itself (below).
 ///
 /// # What is left out
 ///
@@ -110,8 +110,11 @@ use crate::{
 /// What the gateway keeps for itself under the controller is no part of the
 /// document: the pools and their addresses, discovery, the probes and the
 /// load poll, retries and the breaker, the prefill queue and the decode
-/// rooms. The pin of a sticky key to one engine of a grouped worker is the
-/// dispatch's as well: it runs behind the decision, on the worker the
+/// rooms. The two overload thresholds are the gateway's too: the default it
+/// builds its worker objects with, under each worker's own registration. No
+/// document carries a threshold, so one off its default means the same
+/// document. The pin of a sticky key to one engine of a grouped worker is
+/// the dispatch's as well: it runs behind the decision, on the worker the
 /// decision names. Its key is the gateway's own, read from the routing-key
 /// headers. A supplied document names its own key sources, which need not
 /// be that key, so the pin is refused beside one. The copy of the cache
@@ -159,10 +162,10 @@ pub struct RoutingSettings {
     /// The overload veto is on.
     pub worker_overload_protection: bool,
     /// The waiting requests at which a worker counts as overloaded. None
-    /// switches the signal off.
+    /// switches the signal off. The gateway's own: no document carries it.
     pub worker_overload_waiting_requests: Option<usize>,
     /// The KV-cache token usage at which a worker counts as overloaded. None
-    /// switches the signal off.
+    /// switches the signal off. The gateway's own: no document carries it.
     pub worker_overload_token_usage: Option<f64>,
     /// A request is refused where every worker it could use is overloaded.
     pub worker_overload_shed: bool,
@@ -173,9 +176,10 @@ impl Default for RoutingSettings {
     /// has where a configuration leaves it out. The document they mean is the
     /// `random` preset.
     ///
-    /// The warm-up numbers and the overload thresholds are the ones the
-    /// controller's stages run at when a document names none, so settings at
-    /// them write neither into a document.
+    /// The warm-up numbers are the ones the controller's stages run at when
+    /// a document names none, so settings at them write none into a
+    /// document. The overload thresholds are the crate's two defaults, and
+    /// no document carries one at any value.
     fn default() -> Self {
         Self {
             mode: ModeSettings::Regular,
@@ -824,8 +828,8 @@ fn both_families(config: &RoutingSettings) -> Result<Option<Planned<'_>>, Routin
 /// Writes the configuration's settings over a planned document: each side's
 /// policy into its profile, what the sides of a binding share into that
 /// binding, and what every side shares into the places the document holds
-/// once. The overload block lands on every binding, so one set of thresholds
-/// judges the pools of each family.
+/// once. The overload block lands on every binding, so one switch and one
+/// shed word stand for the pools of each family.
 fn written<'a>(
     config: &'a RoutingSettings,
     (mut document, bindings): Planned<'a>,
@@ -875,7 +879,7 @@ fn written<'a>(
     for (binding, (sides, bound)) in document.bindings.iter_mut().zip(bound) {
         bound.write(config, sides, binding, &mut document.view.headers)?;
     }
-    let overload = overload(config)?;
+    let overload = overload(config);
     for binding in &mut document.bindings {
         binding.overload.clone_from(&overload);
     }
@@ -1749,37 +1753,22 @@ fn override_rule(config: &RoutingSettings) -> Result<SessionsSpec, RoutingSettin
 }
 
 /// The binding's overload block, or none where the configuration stands at
-/// the block's own defaults.
-fn overload(config: &RoutingSettings) -> Result<Option<OverloadSpec>, RoutingSettingsError> {
-    // A threshold at none switches its signal off in the gateway. The
-    // document reads an absent threshold as the controller's own number, so
-    // it cannot say one signal off alone. Both off is the block off.
+/// the block's own defaults: its switch and its shed word. The two
+/// thresholds travel in no document: they are the default a gateway builds
+/// its worker objects with, and a worker's registration states its own over
+/// them.
+fn overload(config: &RoutingSettings) -> Option<OverloadSpec> {
+    // A threshold at none switches its signal off in the gateway, on its
+    // worker objects. With the veto on, one signal off leaves the block on,
+    // and both off is the block off.
     let waiting = config.worker_overload_waiting_requests;
     let usage = config.worker_overload_token_usage;
-    let enabled = config.worker_overload_protection && (waiting.is_some() || usage.is_some());
-    if enabled {
-        let one_off = "the document's overload block cannot switch one signal off alone";
-        if waiting.is_none() {
-            return Err(unsupported(
-                "worker_overload_waiting_requests",
-                "null",
-                one_off,
-            ));
-        }
-        if usage.is_none() {
-            return Err(unsupported("worker_overload_token_usage", "null", one_off));
-        }
-    }
     let written = OverloadSpec {
-        enabled,
-        waiting_requests: waiting
-            .map(|waiting| narrow("worker_overload_waiting_requests", waiting))
-            .transpose()?
-            .and_then(|waiting| unless(waiting, OVERLOAD_WAITING_REQUESTS)),
-        token_usage: usage.and_then(|usage| unless(usage as f32, OVERLOAD_TOKEN_USAGE)),
+        enabled: config.worker_overload_protection && (waiting.is_some() || usage.is_some()),
         shed_when_all_vetoed: config.worker_overload_shed,
+        ..OverloadSpec::default()
     };
-    Ok(unless(written, OverloadSpec::default()))
+    unless(written, OverloadSpec::default())
 }
 
 #[cfg(test)]
@@ -2079,44 +2068,54 @@ mod tests {
         }
     }
 
-    /// A threshold at none switches its signal off in the gateway, and an
-    /// absent threshold of the document is the controller's own number. One
-    /// signal off alone is refused by its field's name, whatever the other
-    /// is. Both off is the block switched off.
+    /// A threshold at none switches its signal off in the gateway, on its
+    /// worker objects, and no document carries a threshold. With the veto
+    /// on, one signal off leaves the block switched on, whatever the other
+    /// is: the settings mean the preset, with nothing written over it. Both
+    /// off is the block switched off, and the shed word stays where it is
+    /// written.
     #[test]
-    fn an_overload_signal_switched_off_alone_is_refused_and_both_are_the_block_off() {
+    fn one_overload_signal_off_leaves_the_block_on_and_both_off_switch_it_off() {
         let thresholds = |waiting: Option<usize>, usage: Option<f64>| {
             let mut config = config(at_flag_defaults("round_robin"));
             config.worker_overload_waiting_requests = waiting;
             config.worker_overload_token_usage = usage;
             config
         };
-        let null = "null".to_string();
-        for (waiting, usage, named) in [
-            (None, Some(0.8), "worker_overload_waiting_requests"),
-            (None, Some(0.5), "worker_overload_waiting_requests"),
-            (Some(8), None, "worker_overload_token_usage"),
-            (Some(32), None, "worker_overload_token_usage"),
+        for (waiting, usage) in [
+            (None, Some(0.8)),
+            (None, Some(0.5)),
+            (Some(8), None),
+            (Some(32), None),
         ] {
             assert_eq!(
-                refusal(&thresholds(waiting, usage)),
-                (named, null.clone()),
+                thresholds(waiting, usage).policy_document(),
+                Ok(preset("round_robin")),
                 "waiting {waiting:?}, usage {usage:?}"
             );
         }
-        let document = thresholds(None, None)
-            .policy_document()
-            .expect("both signals off have a document");
-        assert!(!document.bindings.is_empty());
-        for binding in &document.bindings {
-            let block = binding.overload.as_ref().expect("the block is written");
-            assert!(!block.enabled, "both signals off is the block off");
-            assert_eq!((block.waiting_requests, block.token_usage), (None, None));
-        }
-        // With the protection off the thresholds decide nothing: none is refused.
+        let switched_off = edited(preset("round_robin"), |document| {
+            document["bindings"][0]["overload"] = json!({ "enabled": false });
+        });
+        assert_eq!(
+            thresholds(None, None).policy_document(),
+            Ok(switched_off.clone())
+        );
+        // With the protection off the thresholds decide nothing: the block
+        // is off whatever they are.
         let mut unprotected = thresholds(None, Some(0.8));
         unprotected.worker_overload_protection = false;
-        assert!(unprotected.policy_document().is_ok());
+        assert_eq!(unprotected.policy_document(), Ok(switched_off));
+        // The shed word does not switch the block on.
+        let mut shedding = thresholds(None, None);
+        shedding.worker_overload_shed = true;
+        assert_eq!(
+            shedding.policy_document(),
+            Ok(edited(preset("round_robin"), |document| {
+                document["bindings"][0]["overload"] =
+                    json!({ "enabled": false, "shed_when_all_vetoed": true });
+            }))
+        );
     }
 
     /// The converter puts a written stage in the place of a preset's stage
@@ -2841,20 +2840,25 @@ mod tests {
         );
     }
 
+    /// No document carries an overload threshold: one off its default writes
+    /// nothing, alone and beside the shed word. The switch and the shed word
+    /// land on the binding, each only off its default.
     #[test]
-    fn the_overload_thresholds_land_on_the_binding_only_off_their_defaults() {
-        let tightened = RoutingSettings {
+    fn an_overload_threshold_lands_on_no_binding_and_the_switch_and_the_shed_word_do() {
+        let raised = RoutingSettings {
             worker_overload_waiting_requests: Some(32),
             worker_overload_token_usage: Some(0.9),
-            worker_overload_shed: true,
             ..config(PolicySettings::RoundRobin)
         };
+        assert_eq!(raised.policy_document(), Ok(preset("round_robin")));
+        let shedding = RoutingSettings {
+            worker_overload_shed: true,
+            ..raised
+        };
         assert_eq!(
-            tightened.policy_document(),
+            shedding.policy_document(),
             Ok(edited(preset("round_robin"), |document| {
-                document["bindings"][0]["overload"] = json!({
-                    "waiting_requests": 32, "token_usage": 0.9, "shed_when_all_vetoed": true
-                });
+                document["bindings"][0]["overload"] = json!({ "shed_when_all_vetoed": true });
             })),
         );
         let off = RoutingSettings {
@@ -2867,6 +2871,27 @@ mod tests {
                 document["bindings"][0]["overload"] = json!({ "enabled": false });
             })),
         );
+    }
+
+    /// A threshold is the gateway's own beside a supplied document too: one
+    /// off its default says no other document than the settings without it,
+    /// so the supplied document is in force wherever it is without that
+    /// threshold.
+    #[test]
+    fn an_overload_threshold_beside_a_given_document_is_no_disagreement() {
+        let given = preset("least_load");
+        for settings in [defaults(), config(at_flag_defaults("least_load"))] {
+            let raised = RoutingSettings {
+                policy_spec: Some(given.clone()),
+                worker_overload_waiting_requests: Some(32),
+                worker_overload_token_usage: Some(0.9),
+                ..settings
+            };
+            assert_eq!(
+                raised.policy_document_in_force(&defaults()),
+                Ok(given.clone())
+            );
+        }
     }
 
     #[test]
@@ -3385,15 +3410,23 @@ mod tests {
             .first()
             .map(|binding| (binding.overload.clone(), binding.routing_key.clone()))
             .expect("the regular binding");
-        assert!(overload.is_some() && key.is_some());
+        // The block states its shed word and no number: a threshold off its
+        // default lands on no binding.
+        let sheds = OverloadSpec {
+            shed_when_all_vetoed: true,
+            ..OverloadSpec::default()
+        };
+        assert_eq!(overload, Some(sheds));
+        assert!(key.is_some());
 
         let both = many_routers(keyed)
             .policy_document()
             .expect("the document of many routers");
         assert_eq!(both.bindings.len(), 2);
         for binding in &both.bindings {
-            // One set of thresholds judges the pools of each family, and
-            // each family reads a request's key from the same sources.
+            // One switch and one shed word stand for the pools of each
+            // family, and each family reads a request's key from the same
+            // sources.
             assert_eq!(binding.overload, overload);
             assert_eq!(binding.routing_key, key);
         }

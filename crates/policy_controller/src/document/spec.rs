@@ -2048,33 +2048,47 @@ impl Default for Match {
 }
 
 /// The queued requests, summed over an engine's ranks, at or above which
-/// its rows are vetoed where a binding's overload block names no count.
+/// a binding whose overload block is on vetoes the engine's rows, where
+/// the worker's registration states no count: the crate's default. No
+/// binding states one.
 pub const OVERLOAD_WAITING_REQUESTS: u32 = 8;
 
-/// The mean active KV usage over an engine's ranks at or above which its
-/// rows are vetoed where a binding's overload block names no usage.
+/// The mean active KV usage over an engine's ranks at or above which a
+/// binding whose overload block is on vetoes the engine's rows, where the
+/// worker's registration states no usage: the crate's default. No binding
+/// states one.
 pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 
-/// The overload veto's defaults for the workers of the pools decided under
-/// the binding, as the binding's `overload` field says: evaluated per load
-/// report by the host and latched, never per request; a worker's own
-/// registration thresholds resolve over these.
+/// What a binding says of the overload veto on the workers of the pools
+/// decided under it, as its `overload` field: whether the default
+/// thresholds veto at all, and what a decision does where every worker is
+/// vetoed. The veto is evaluated per load report by the host and latched,
+/// never per request. The block names no threshold: a worker's
+/// registration states its own two, over its program's default where the
+/// program has one. The store's judge reads the switch; a host that judges
+/// on its worker objects does not read it yet.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct OverloadSpec {
     /// Whether the host's thresholds veto at all (a worker's own block still
     /// does).
     pub enabled: bool,
-    /// Queued requests, summed over an engine's ranks, at or above which a
-    /// worker is vetoed; at least 1 (default 8).
+    /// A number here is refused: a binding names no count of queued
+    /// requests. A worker's registration states the count at or above which
+    /// it is vetoed, or its program's default does. The field stands so
+    /// that a document which names a number is refused by its path. Its
+    /// schema is `null` alone, as a writer that spells an absent field
+    /// writes it: an editor refuses the number on shape.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1))]
+    #[schemars(with = "()")]
     pub waiting_requests: Option<u32>,
-    /// Mean active KV usage over an engine's ranks at or above which a
-    /// worker is vetoed; above 0 and at most 1 (default 0.8). A rank that
-    /// reports no active share counts its whole usage.
+    /// A number here is refused: a binding names no KV usage. A worker's
+    /// registration states the usage at or above which it is vetoed, or its
+    /// program's default does. The field stands so that a document which
+    /// names a number is refused by its path, and its schema is `null`
+    /// alone.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("exclusiveMinimum" = 0), range(max = 1.0))]
+    #[schemars(with = "()")]
     pub token_usage: Option<f32>,
     /// Shed with a 503 when every usable worker is vetoed, instead of
     /// falling back to the least-vetoed one. The same word decides what a
@@ -2437,8 +2451,8 @@ pub struct BindingSpec {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub profiles: BTreeMap<String, String>,
-    /// The overload veto's defaults for the workers of the pools decided
-    /// under the binding: the pools whose model and phase it is the first
+    /// What the binding says of the overload veto for the workers of the
+    /// pools decided under it: the pools whose model and phase it is the first
     /// to match. A decode pool of a model whose prefill lookup resolves to
     /// a pair binding (`pd-pair` or `epd`) is decided under that binding,
     /// so its block judges the pool: a decode-phase binding's block is not
@@ -2830,10 +2844,6 @@ fn unit_interval(v: f32) -> bool {
 fn at_least_one<T: Into<f64>>(v: T) -> bool {
     let v: f64 = v.into();
     v.is_finite() && v >= 1.0
-}
-
-fn unit_fraction(v: f32) -> bool {
-    v.is_finite() && v > 0.0 && v <= 1.0
 }
 
 /// The matcher understands an id, `prefix*`, `*suffix` and `*`; any other
@@ -3758,9 +3768,11 @@ fn has_room_of(
     max_age_ms: Option<u64>,
     at: &At,
 ) -> Result<Box<dyn Filter>, SpecError> {
-    if p.used.is_empty() {
+    // The first name, in name order, which is the map's own: a rule that
+    // comes to read nothing of a worker is refused by it.
+    let Some(first) = p.used.keys().next().map(String::as_str) else {
         return Err(at.bad("used", "{}", "at least one field with its coefficient"));
-    }
+    };
     let mut terms = Vec::new();
     let mut signal_terms = Vec::new();
     let mut request_tokens = 0.0;
@@ -3814,14 +3826,8 @@ fn has_room_of(
     // it keeps every row or steps aside. A signal in the sum reads a worker,
     // and so does a capacity read of each worker, so both are settled
     // first. Every name of such a rule is the request's, since any other
-    // became a term or was refused: the refusal names the first of them in
-    // name order, which is the map's own.
+    // became a term or was refused: the refusal names the first of them.
     if terms.is_empty() && signal_terms.is_empty() && capacity_signal.is_none() {
-        let first = p
-            .used
-            .keys()
-            .next()
-            .map_or(HasRoomRule::REQUEST_TOKENS, String::as_str);
         return Err(at.bad(
             "used",
             first,
@@ -4307,30 +4313,35 @@ fn check_matcher(
     Ok(())
 }
 
-/// The thresholds a binding hands its pools: its block's values, each else
-/// the default, and none when the block is switched off. A binding with no
-/// block has the default block. The usage goes to permille by the one
-/// conversion of a threshold ([`threshold_permille`]): the rounding a
-/// report's usage takes, so one rank's usage at or above the threshold in
-/// the document's unit is never read as under it, and a floor of one.
+/// The thresholds a binding hands its pools: the crate's two defaults, and
+/// none when the block is switched off. A binding with no block has the
+/// default block. A block names no number of its own ([`check_overload`]):
+/// a worker's registration states its two over these. The usage goes to
+/// permille by the one conversion of a threshold ([`threshold_permille`]):
+/// the rounding a report's usage takes, so one rank's usage at or above the
+/// threshold as a ratio is never read as under it.
 fn overload_thresholds(block: Option<&OverloadSpec>) -> Option<OverloadThresholds> {
-    let (enabled, waiting, usage) = block.map_or((true, None, None), |block| {
-        (block.enabled, block.waiting_requests, block.token_usage)
-    });
+    let enabled = block.is_none_or(|block| block.enabled);
     enabled.then(|| OverloadThresholds {
-        waiting_requests: waiting.unwrap_or(OVERLOAD_WAITING_REQUESTS),
-        kv_usage_permille: threshold_permille(f64::from(usage.unwrap_or(OVERLOAD_TOKEN_USAGE))),
+        waiting_requests: OVERLOAD_WAITING_REQUESTS,
+        kv_usage_permille: threshold_permille(f64::from(OVERLOAD_TOKEN_USAGE)),
     })
 }
 
+/// A binding's overload block names no number, with its switch on or off:
+/// a block that names one is refused by the number's path. One set of
+/// thresholds stands for each worker, its registration's own over its
+/// program's default, and a worker is judged by that set alone.
 fn check_overload(overload: &OverloadSpec, at: &At) -> Result<(), SpecError> {
-    at.nonzero("waiting_requests", overload.waiting_requests)?;
-    at.number(
-        "token_usage",
-        overload.token_usage,
-        unit_fraction,
-        "a fraction above zero and at most 1",
-    )
+    const STATED: &str =
+        "left out: a worker's registration states this threshold, or its program's default does";
+    if let Some(waiting) = overload.waiting_requests {
+        return Err(at.bad("waiting_requests", waiting, STATED));
+    }
+    match overload.token_usage {
+        Some(usage) => Err(at.bad("token_usage", usage, STATED)),
+        None => Ok(()),
+    }
 }
 
 fn check_sessions(
@@ -8018,102 +8029,37 @@ mod tests {
 
     #[test]
     fn the_binding_rules_are_checked_in_shape_then_by_the_build() {
-        let overload = spec_with_binding(
-            r#"{"profile":"p","overload":{"waiting_requests":32,"token_usage":0.9,"shed_when_all_vetoed":true}}"#,
-        );
         let thresholds = |spec: &PolicySpec| {
             spec.validate()
                 .expect("the binding validates")
                 .binding("m", Phase::Single)
                 .and_then(|binding| binding.overload)
         };
-        assert_eq!(
-            thresholds(&overload),
-            Some(OverloadThresholds {
-                waiting_requests: 32,
-                kv_usage_permille: 900,
-            }),
-            "the block's two values, the usage in permille"
-        );
-        // A value the block does not name is the default, and so is a
-        // binding with no block and the binding of a document that
-        // writes none.
+        // A block names no number. Switched on, a binding hands its pools
+        // the crate's two, the usage in permille, whatever its shed word
+        // says. So does a binding with no block, and the binding of a
+        // document that writes none.
         let defaults = OverloadThresholds {
             waiting_requests: OVERLOAD_WAITING_REQUESTS,
             kv_usage_permille: 800,
         };
-        assert_eq!(
-            thresholds(&spec_with_binding(
-                r#"{"profile":"p","overload":{"waiting_requests":3}}"#
-            )),
-            Some(OverloadThresholds {
-                waiting_requests: 3,
-                ..defaults
-            })
-        );
-        assert_eq!(
-            thresholds(&spec_with_binding(
-                r#"{"profile":"p","overload":{"token_usage":0.25}}"#
-            )),
-            Some(OverloadThresholds {
-                kv_usage_permille: 250,
-                ..defaults
-            })
-        );
-        // A usage that would round to no permille is held as one: at none,
-        // every engine with a row on file would read over it.
-        assert_eq!(
-            thresholds(&spec_with_binding(
-                r#"{"profile":"p","overload":{"token_usage":0.0004}}"#
-            )),
-            Some(OverloadThresholds {
-                kv_usage_permille: 1,
-                ..defaults
-            })
-        );
-        // The usage is rounded to its permille, not cut.
-        assert_eq!(
-            thresholds(&spec_with_binding(
-                r#"{"profile":"p","overload":{"token_usage":0.2496}}"#
-            )),
-            Some(OverloadThresholds {
-                kv_usage_permille: 250,
-                ..defaults
-            })
-        );
-        assert_eq!(
-            thresholds(&spec_with_binding(r#"{"profile":"p"}"#)),
-            Some(defaults)
-        );
+        for on in [
+            r#"{"profile":"p"}"#,
+            r#"{"profile":"p","overload":{}}"#,
+            r#"{"profile":"p","overload":{"enabled":true,"shed_when_all_vetoed":true}}"#,
+            r#"{"profile":"p","overload":{"waiting_requests":null,"token_usage":null}}"#,
+        ] {
+            assert_eq!(thresholds(&spec_with_binding(on)), Some(defaults), "{on}");
+        }
         assert_eq!(
             thresholds(&doc(
                 r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["kv-pressure"],"pick":"best"}}}"#
             )),
             Some(defaults)
         );
-        assert_eq!(
-            bad_field(&spec_with_binding(
-                r#"{"profile":"p","overload":{"waiting_requests":0}}"#
-            )),
-            "bindings[0].overload.waiting_requests"
-        );
-        for token_usage in ["1.5", "0"] {
-            assert_eq!(
-                bad_field(&spec_with_binding(&format!(
-                    r#"{{"profile":"p","overload":{{"token_usage":{token_usage}}}}}"#
-                ))),
-                "bindings[0].overload.token_usage",
-                "{token_usage}"
-            );
-        }
-        // Off is the block's switch alone: the binding hands no threshold,
-        // whatever values the block still names.
-        for off in [
-            r#"{"profile":"p","overload":{"enabled":false}}"#,
-            r#"{"profile":"p","overload":{"enabled":false,"waiting_requests":3,"token_usage":0.5}}"#,
-        ] {
-            assert_eq!(thresholds(&spec_with_binding(off)), None, "{off}");
-        }
+        // Off is the block's switch alone: the binding hands no threshold.
+        let off = r#"{"profile":"p","overload":{"enabled":false,"shed_when_all_vetoed":true}}"#;
+        assert_eq!(thresholds(&spec_with_binding(off)), None);
 
         let sessions = spec_with_binding(
             r#"{"profile":"p","sessions":{"sticky_header":"x-session-id","ttl_s":600,"assignment":"min_load"}}"#,
@@ -8626,6 +8572,85 @@ mod tests {
         );
     }
 
+    /// A binding's overload block names no number. Either one is refused by
+    /// its path, with the block switched on, switched off or left as it
+    /// stands, at the crate's own number too, and the refusal says where a
+    /// threshold is stated and states the number as it was written. A block
+    /// that names both is refused by the count, switched off too.
+    #[test]
+    fn a_number_in_a_bindings_overload_block_is_refused_by_its_path() {
+        const STATED: &str =
+            "left out: a worker's registration states this threshold, or its program's default does";
+        let refused = |block: &str| {
+            let binding = format!(r#"{{"profile":"p","overload":{block}}}"#);
+            match spec_with_binding(&binding).validate().err() {
+                Some(SpecError::BadField {
+                    path,
+                    value,
+                    reason,
+                }) => (path, value, reason),
+                other => panic!("{block} validated as {other:?}"),
+            }
+        };
+        for (block, field, value) in [
+            (r#"{"waiting_requests":8}"#, "waiting_requests", "8"),
+            (r#"{"waiting_requests":0}"#, "waiting_requests", "0"),
+            (r#"{"waiting_requests":300}"#, "waiting_requests", "300"),
+            (
+                r#"{"enabled":true,"waiting_requests":32}"#,
+                "waiting_requests",
+                "32",
+            ),
+            (
+                r#"{"enabled":false,"waiting_requests":3}"#,
+                "waiting_requests",
+                "3",
+            ),
+            (r#"{"token_usage":0.8}"#, "token_usage", "0.8"),
+            (r#"{"token_usage":1.5}"#, "token_usage", "1.5"),
+            (r#"{"token_usage":0}"#, "token_usage", "0"),
+            (r#"{"token_usage":-0.5}"#, "token_usage", "-0.5"),
+            (
+                r#"{"enabled":true,"token_usage":0.9}"#,
+                "token_usage",
+                "0.9",
+            ),
+            (
+                r#"{"enabled":false,"token_usage":0.5}"#,
+                "token_usage",
+                "0.5",
+            ),
+            (
+                r#"{"waiting_requests":32,"token_usage":0.9,"shed_when_all_vetoed":true}"#,
+                "waiting_requests",
+                "32",
+            ),
+            (
+                r#"{"enabled":false,"waiting_requests":32,"token_usage":0.9}"#,
+                "waiting_requests",
+                "32",
+            ),
+        ] {
+            assert_eq!(
+                refused(block),
+                (
+                    format!("bindings[0].overload.{field}"),
+                    value.to_owned(),
+                    STATED
+                ),
+                "{block}"
+            );
+        }
+        // The refusal as a document's writer reads it.
+        let named = spec_with_binding(r#"{"profile":"p","overload":{"token_usage":0.9}}"#);
+        assert_eq!(
+            named.validate().err().map(|refusal| refusal.to_string()),
+            Some(format!(
+                "bindings[0].overload.token_usage = 0.9 is not {STATED}"
+            ))
+        );
+    }
+
     #[test]
     fn a_shape_error_outranks_what_the_build_lacks() {
         let spec = doc(
@@ -8724,7 +8749,7 @@ mod tests {
               "plan": "pd-pair", "profiles": { "prefill": "least_load", "decode": "least_load" } },
             { "match": { "model": "*" }, "profile": "cache_aware", "shadow": "spare",
               "canary": { "profile": "least_load", "percent": 5 }, "override": "allowed",
-              "overload": { "enabled": true, "waiting_requests": 64, "token_usage": 0.9, "shed_when_all_vetoed": false },
+              "overload": { "enabled": true, "shed_when_all_vetoed": false },
               "sessions": { "sticky_header": "x-session-id", "headers": ["x-session-id"], "ttl_s": 600, "sweep_s": 120, "assignment": "delegate", "inflight_cap": 2, "issue_session_id": false },
               "admission": { "enabled": false } }
           ]

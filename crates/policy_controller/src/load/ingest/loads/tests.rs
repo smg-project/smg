@@ -21,7 +21,7 @@ use super::{
 };
 use crate::{
     document::{
-        spec::{AcrossRanks, BindingSpec, OverloadSpec, SignalSpec},
+        spec::{AcrossRanks, BindingSpec, SignalSpec},
         AppliedSpec, PolicySpec,
     },
     engine::view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
@@ -36,6 +36,12 @@ use crate::{
 const METRICS_TEXT: &str = "vllm:num_requests_running{model_name=\"m\"} 3\n\
                            vllm:num_requests_waiting{model_name=\"m\"} 5\n\
                            vllm:kv_cache_usage_perc{model_name=\"m\"} 0.75\n";
+
+/// The same body with eight waiting: an engine at the crate's count of
+/// queued requests.
+const QUEUE_AT_THE_COUNT_TEXT: &str = "vllm:num_requests_running{model_name=\"m\"} 3\n\
+                                       vllm:num_requests_waiting{model_name=\"m\"} 8\n\
+                                       vllm:kv_cache_usage_perc{model_name=\"m\"} 0.75\n";
 
 /// One rank's figures the fake engine answers with.
 #[derive(Clone, Copy)]
@@ -1398,9 +1404,10 @@ fn an_address_whose_host_cannot_be_told_from_its_userinfo_is_named_by_a_marker()
     }
 }
 
-/// A generation whose one binding vetoes an engine at `waiting` queued
-/// requests over its ranks.
-fn vetoing_at(waiting: u32) -> AppliedSpec {
+/// A generation whose one binding has its overload block switched on: an
+/// engine is vetoed at the crate's count, eight queued requests over its
+/// ranks. No binding states a count of its own.
+fn vetoing() -> AppliedSpec {
     let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
     document.generation = 1;
     let profile = document
@@ -1411,11 +1418,6 @@ fn vetoing_at(waiting: u32) -> AppliedSpec {
         .clone();
     document.bindings = vec![BindingSpec {
         profile: Some(profile),
-        overload: Some(OverloadSpec {
-            waiting_requests: Some(waiting),
-            token_usage: Some(1.0),
-            ..OverloadSpec::default()
-        }),
         ..BindingSpec::default()
     }];
     AppliedSpec::validate(&document).expect("the document validates")
@@ -1439,12 +1441,12 @@ async fn a_failed_poll_is_the_word_that_no_report_came_and_clears_the_engines_ve
     let store = Arc::new(MemoryStore::new());
     let probe = Arc::new(FakeProbe::default());
     let id = ready(&store, "grpc://a:1", "grpc://a:1", 0, 1, WireModes::GRPC, 0);
-    store.apply(vetoing_at(5)).expect("applied");
+    store.apply(vetoing()).expect("applied");
     probe.answers(
         "grpc://a:1",
         &[Figures {
             running: 0,
-            waiting: 5,
+            waiting: 8,
             usage: 0.0,
         }],
     );
@@ -1457,7 +1459,7 @@ async fn a_failed_poll_is_the_word_that_no_report_came_and_clears_the_engines_ve
     probe.failing.lock().insert("grpc://a:1".to_owned());
     tokio::time::advance(TEN + Duration::from_secs(1)).await;
     tick(&driver, &mut schedule).await;
-    assert_eq!(row(&store, id, 0).map(|(r, _)| r.queued), Some(5));
+    assert_eq!(row(&store, id, 0).map(|(r, _)| r.queued), Some(8));
     assert_eq!((vetoed(&store), store.overload_flips()), (vec![false], 2));
 
     // The engine answers again: its report is judged as any other.
@@ -1480,11 +1482,11 @@ async fn a_failed_scrape_is_the_word_that_no_report_came_and_clears_the_engines_
         WireModes::HTTP,
         500,
     );
-    store.apply(vetoing_at(5)).expect("applied");
+    store.apply(vetoing()).expect("applied");
     probe
         .texts
         .lock()
-        .insert("http://h:1".to_owned(), METRICS_TEXT.to_owned());
+        .insert("http://h:1".to_owned(), QUEUE_AT_THE_COUNT_TEXT.to_owned());
     let driver = driver(&store, &probe, TEN);
     let mut schedule = Schedule::default();
     tick(&driver, &mut schedule).await;
@@ -1494,14 +1496,14 @@ async fn a_failed_scrape_is_the_word_that_no_report_came_and_clears_the_engines_
     probe.texts.lock().clear();
     tokio::time::advance(TEN + Duration::from_secs(1)).await;
     tick(&driver, &mut schedule).await;
-    assert_eq!(row(&store, id, 0).map(|(r, _)| r.queued), Some(5));
+    assert_eq!(row(&store, id, 0).map(|(r, _)| r.queued), Some(8));
     assert_eq!((vetoed(&store), store.overload_flips()), (vec![false], 2));
 
     // The engine's text is back: its row is judged as any other.
     probe
         .texts
         .lock()
-        .insert("http://h:1".to_owned(), METRICS_TEXT.to_owned());
+        .insert("http://h:1".to_owned(), QUEUE_AT_THE_COUNT_TEXT.to_owned());
     tokio::time::advance(TEN + Duration::from_secs(1)).await;
     tick(&driver, &mut schedule).await;
     assert_eq!((vetoed(&store), store.overload_flips()), (vec![true], 3));
@@ -1529,13 +1531,13 @@ async fn a_failed_poll_says_nothing_of_an_engine_whose_other_rank_its_stream_ser
         WireModes::GRPC,
         0,
     );
-    store.apply(vetoing_at(5)).expect("applied");
+    store.apply(vetoing()).expect("applied");
     // Rank 0's stream reports a queue at the count: the engine is over it.
     store.record(
         rank0,
         0,
         LoadRow {
-            queued: 5,
+            queued: 8,
             ..LoadRow::default()
         },
         now(),
@@ -1593,12 +1595,12 @@ async fn an_answer_with_no_row_says_nothing_of_an_engine_whose_other_rank_its_st
         WireModes::GRPC,
         0,
     );
-    store.apply(vetoing_at(5)).expect("applied");
+    store.apply(vetoing()).expect("applied");
     store.record(
         rank0,
         0,
         LoadRow {
-            queued: 5,
+            queued: 8,
             ..LoadRow::default()
         },
         now(),
@@ -1712,7 +1714,7 @@ async fn a_polled_rank_is_counted_through_one_lost_report_at_an_interval_near_th
         WireModes::GRPC,
         0,
     );
-    store.apply(vetoing_at(5)).expect("applied");
+    store.apply(vetoing()).expect("applied");
     let _driver = LoadDriver::new(
         Arc::clone(&store),
         Arc::clone(&probe),
@@ -1723,7 +1725,7 @@ async fn a_polled_rank_is_counted_through_one_lost_report_at_an_interval_near_th
     );
     // The poll that started at 0 s hears the rank at its threshold.
     let waiting = LoadRow {
-        queued: 5,
+        queued: 8,
         ..LoadRow::default()
     };
     store.report(&[(rank1, 1, Some(waiting))], now(), LoadSource::Poll);
@@ -1769,12 +1771,12 @@ async fn a_rank_that_is_not_ready_does_not_hold_the_word_off() {
         WireModes::GRPC,
         0,
     );
-    store.apply(vetoing_at(5)).expect("applied");
+    store.apply(vetoing()).expect("applied");
     store.record(
         rank0,
         0,
         LoadRow {
-            queued: 5,
+            queued: 8,
             ..LoadRow::default()
         },
         now(),
@@ -1816,7 +1818,7 @@ async fn an_engines_answer_is_one_write_so_ranks_that_trade_their_queues_move_no
             0,
         );
     }
-    store.apply(vetoing_at(8)).expect("applied");
+    store.apply(vetoing()).expect("applied");
     let figures = |waiting: i32| Figures {
         running: 0,
         waiting,
@@ -1964,14 +1966,14 @@ async fn a_lost_lead_drops_every_load_row_with_its_verdict_and_its_receipt() {
     let probe = Arc::new(FakeProbe::default());
     let own = ready(&store, "grpc://w:1", "grpc://w:1", 0, 1, WireModes::GRPC, 0);
     let other = ready(&store, "grpc://w:2", "grpc://w:2", 0, 1, WireModes::GRPC, 0);
-    store.apply(vetoing_at(5)).expect("applied");
+    store.apply(vetoing()).expect("applied");
     let figures = |waiting| Figures {
         running: 0,
         waiting,
         usage: 0.0,
     };
-    probe.answers("grpc://w:1", &[figures(5)]);
-    probe.answers("grpc://w:2", &[figures(7)]);
+    probe.answers("grpc://w:1", &[figures(8)]);
+    probe.answers("grpc://w:2", &[figures(10)]);
     let driver = Arc::new(driver(&store, &probe, TEN));
     let (_stop, stopped) = watch::channel(false);
     let (leads, polls) = watch::channel(Some(1));
@@ -1984,7 +1986,7 @@ async fn a_lost_lead_drops_every_load_row_with_its_verdict_and_its_receipt() {
     // The rank's own record behind the poll: its receipt holds the next
     // poll back for an interval.
     let pushed = LoadRow {
-        queued: 5,
+        queued: 8,
         ..LoadRow::default()
     };
     store.record(own, 0, pushed, now(), LoadSource::Stream);

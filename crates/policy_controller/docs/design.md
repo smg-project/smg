@@ -177,7 +177,7 @@ pub struct BindingSpec {
     pub profile: Option<String>,             // the profile of a single decision
     pub plan: Option<PlanName>,              // `single` (default), `pd-pair` or `epd`
     pub profiles: BTreeMap<String, String>,  // a profile for each side of a pair
-    pub overload: Option<OverloadSpec>,      // the overload thresholds of the workers decided here
+    pub overload: Option<OverloadSpec>,      // the overload switch and shed word of these workers
     pub routing_key: Option<RoutingKeySpec>, // where a request's routing key is read from
     pub sessions: Option<SessionsSpec>,      // sticky sessions
     pub shadow: Option<ShadowSpec>,          // a second profile run for comparison only
@@ -240,8 +240,8 @@ bindings:
 ### 3.3 From routing flags to a document
 
 A user who never writes a document still gets one. The crate turns the routing settings (the
-policy name and its options, the mode, the overload options, the sticky-session options) into the
-document they mean:
+policy name and its options, the mode, the overload switch and shed word, the sticky-session
+options) into the document they mean:
 
 ```text
 routing settings ──> RoutingSettings::policy_document() ──> PolicySpec ──> validate ──> AppliedSpec
@@ -1963,7 +1963,8 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 
 | Part | Mark | What is missing |
 |---|---|---|
-| The policy document: profiles, bindings by model and phase, plans, overload, routing key, sessions | **[built]** | |
+| The policy document: profiles, bindings by model and phase, plans, a binding's shed word and its refusal of an overload number, routing key, sessions | **[built]** | |
+| A binding's overload switch (`overload.enabled`) under worker objects | **[planned]** | no host reads it there yet: one word for the bindings a host runs, read where the host builds its workers' default (decision 10) |
 | Bindings by tenant, priority, header, prompt size, labels; a session id issued by the engine (`issue_session_id`) | **[planned]** | in the schema; a document that writes one is refused as not in this build |
 | `canary`, `override: allowed`, `admission` | **[planned]** | in the schema; a document that writes one is refused, and the error names the field |
 | `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; a pair's shadows run in no engine, and `explain.sample` is kept by the served controller alone (decision 7) |
@@ -2140,15 +2141,24 @@ controller (section 11) brings `--policy-controller-address` and three TLS optio
 | A load monitor that a controller can stop when it stops leading, and start again | one public `stop()` on the worker crate's monitor | about 110 lines with its test |
 | The facts of a worker that a decision reads and a worker object does not hold today (zone, the encode offer, vision, the admission window, the demand facts, pairing) | the controller keeps them beside the object (10.3, built); a fact moves to a field of the worker crate's object when that crate has one that holds it as stated, checked against the crate first | 245 lines of code for what is kept beside the object |
 
-One more point under this decision. A document writes overload thresholds for each binding, and
-a worker may state its own. A worker object holds one set. **Recommendation:** one set for each
-worker, the worker's own values over one default of the program, as the classic policies have
-it. A binding keeps whether its thresholds veto at all and whether a request is shed when every
-worker is vetoed. Under the one engine its two numbers have no reader: the two that a gateway's
-routing settings state are already the defaults its worker objects are built with, and the
-crate's translation of those settings, which writes one that is off its default onto every
-binding today, stops writing them there. A document that names one is then refused when it is
-applied; that refusal is planned, not built, and the validator takes such a document today.
+One more point under this decision. A document can write an `overload` block for each binding, and
+a worker may state thresholds of its own. A worker object holds one set. **Recommendation:** one
+set for each worker, the worker's own values over one default of the program, as the classic
+policies have it. What that leaves of a binding's block:
+
+- **Its two numbers [built].** A block names none. A document that names one is refused when it
+  is applied, by the number's path, and the refusal says where a number is stated: a worker's
+  registration, or its program's default. The two that a gateway's routing settings state are
+  the defaults its worker objects are built with, and the crate's translation of those settings
+  writes neither onto a binding. A gateway states them on its command line, beside a supplied
+  document too.
+- **Its shed word [built].** A binding keeps whether a request is shed when every worker is
+  vetoed. A decision reads it.
+- **Its switch [planned].** Whether the program's default vetoes at all is one word for the
+  bindings a host runs, because a worker object has one default. The host reads it where it
+  builds that default, a gateway and a controller alike. A gateway refuses a document whose
+  bindings disagree on it, or on the shed word, which its routes read once for the process. A
+  worker's own thresholds veto either way.
 
 ### Decision 11: the crate in CI and in the published set
 
