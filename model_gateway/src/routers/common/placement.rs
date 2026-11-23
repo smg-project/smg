@@ -6958,6 +6958,11 @@ pub(crate) mod tests {
         let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let unread = || -> Stated { panic!("a classic placement is handed nothing of it") };
         assert!(select_single(&registry, &classic, MODEL, pool, None, inputs, unread).is_some());
+        assert!(select_single_of(
+            &registry, &classic, MODEL, &snapshot, pool, None, inputs, unread
+        )
+        .is_some());
+        assert!(select_from(&registry, &classic, MODEL, pool, &slice, inputs, unread).is_some());
         let pairs = one_pair();
         let index = pairs_of(&pairs, &classic);
         let unread = || -> Stated { panic!("a classic pair is handed nothing of it") };

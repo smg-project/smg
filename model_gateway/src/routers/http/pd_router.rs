@@ -762,7 +762,7 @@ impl PDRouter {
     /// reserves its estimate once, before any dispatch, and the one answer
     /// the dispatch paths converge on resolves the reservation once
     /// (`tenant_rate_limit`), as the regular HTTP router's typed route does.
-    async fn execute_dual_dispatch<T: TenantCharge + Serialize>(
+    async fn execute_dual_dispatch<T: TenantCharge + Serialize + GenerationRequest>(
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: Option<&TenantRequestMeta>,
@@ -929,7 +929,7 @@ impl PDRouter {
     /// A retry selects around the workers the request's `ledger` closed the
     /// retry window on, and the attempt's answer is settled on that ledger
     /// ([`Self::settle_attempt`]).
-    async fn execute_dual_dispatch_attempt<T: Serialize>(
+    async fn execute_dual_dispatch_attempt<T: Serialize + GenerationRequest>(
         &self,
         attempt: u32,
         headers: Option<&HeaderMap>,
@@ -981,6 +981,15 @@ impl PDRouter {
                     tried: &tried_before,
                 },
                 sticky_key,
+                // The body's output limit, for the policy engine alone. The
+                // selection may wait for admission, so what rides with it
+                // is the lease's reference: the body is read where the
+                // engine decides and nowhere else.
+                move || {
+                    lease.with_view(|view| {
+                        placement::Stated::of_limit(view.request.max_output_tokens())
+                    })
+                },
             )
             .await;
         let ((prefill, decode), guards) = match selected {
@@ -2611,18 +2620,24 @@ impl PDRouter {
     }
 
     /// Select a PD pair and take its load. With Prefill admission enabled
-    /// the selection runs at the head of the admission queue.
+    /// the selection runs at the head of the admission queue. `stated`
+    /// states what the policy engine alone reads of the request
+    /// ([`placement::Stated`]): the pair placement makes that call where
+    /// the engine decides and nowhere else. The call rides with the
+    /// selection while it waits, for a pair the classic policies pick too:
+    /// that is what a classic pair selection pays for it.
     async fn select_pd_pair_with_admission(
         &self,
         model_id: &str,
         inputs: PlacementInputs<'_>,
         sticky_key: Option<&str>,
+        stated: impl Fn() -> placement::Stated + Send + Sync,
     ) -> Result<(PdPair, PdLoadGuards), Box<PdSelectionFailure>> {
         let ((prefill, decode), prefill_guard) = acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
             |(prefill, _): &(Placed, Placed)| prefill,
-            |capacity| self.select_pd_pair(model_id, inputs, capacity),
+            |capacity| self.select_pd_pair(model_id, inputs, capacity, &stated),
         )
         .await
         .map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
@@ -2696,6 +2711,7 @@ impl PDRouter {
         model_id: &str,
         inputs: PlacementInputs<'_>,
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+        stated: impl FnOnce() -> placement::Stated,
     ) -> Result<(Placed, Placed), Box<PairFailure>> {
         debug!("Selecting PD pair: model_id={:?}", model_id);
         let pairs = self.pd_pairs(model_id);
@@ -2707,10 +2723,7 @@ impl PDRouter {
             None,
             prefill_capacity,
             inputs,
-            // The pair route states nothing for the policy engine alone:
-            // its selection runs inside the admission's wait, where a
-            // reading of the body would ride for a classic pair too.
-            placement::Stated::nothing,
+            stated,
         )?;
 
         Ok((pair.prefill, pair.decode))
@@ -3262,30 +3275,33 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) =
-            match self.select_pd_pair(UNKNOWN_MODEL_ID, PlacementInputs::default(), None) {
-                Ok(pair) => pair,
-                // A deep probe that generates gets the same answer routing does:
-                // an all-vetoed fleet fails the probe, exactly as an all-circuit-
-                // broken one already did.
-                Err(failure) => match Self::pair_failure(*failure) {
-                    PdSelectionFailure::Shed(shed) => return shed,
-                    PdSelectionFailure::Incompatible(e) => {
-                        return error::service_unavailable("no_compatible_pd_pair", e);
-                    }
-                    PdSelectionFailure::Unavailable(e) => {
-                        return error::service_unavailable(
-                            "no_healthy_worker_pair",
-                            format!("No healthy worker pair available: {e}"),
-                        );
-                    }
-                    // The probe does not go through admission.
-                    rejection @ (PdSelectionFailure::QueueFull
-                    | PdSelectionFailure::QueueTimeout) => {
-                        return Self::handle_server_selection_error(rejection);
-                    }
-                },
-            };
+        let (prefill, decode) = match self.select_pd_pair(
+            UNKNOWN_MODEL_ID,
+            PlacementInputs::default(),
+            None,
+            placement::Stated::nothing,
+        ) {
+            Ok(pair) => pair,
+            // A deep probe that generates gets the same answer routing does:
+            // an all-vetoed fleet fails the probe, exactly as an all-circuit-
+            // broken one already did.
+            Err(failure) => match Self::pair_failure(*failure) {
+                PdSelectionFailure::Shed(shed) => return shed,
+                PdSelectionFailure::Incompatible(e) => {
+                    return error::service_unavailable("no_compatible_pd_pair", e);
+                }
+                PdSelectionFailure::Unavailable(e) => {
+                    return error::service_unavailable(
+                        "no_healthy_worker_pair",
+                        format!("No healthy worker pair available: {e}"),
+                    );
+                }
+                // The probe does not go through admission.
+                rejection @ (PdSelectionFailure::QueueFull | PdSelectionFailure::QueueTimeout) => {
+                    return Self::handle_server_selection_error(rejection);
+                }
+            },
+        };
 
         let prefill_url = prefill.endpoint_url("/health_generate");
         let (prefill_result, decode_result) = tokio::join!(
@@ -4559,7 +4575,12 @@ mod tests {
             .worker_registry
             .register_or_replace(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(UNKNOWN_MODEL_ID, PlacementInputs::default(), None);
+        let result = router.select_pd_pair(
+            UNKNOWN_MODEL_ID,
+            PlacementInputs::default(),
+            None,
+            placement::Stated::nothing,
+        );
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -4584,13 +4605,23 @@ mod tests {
         }
 
         let (prefill, decode) = router
-            .select_pd_pair("GLM-5.2-Coding", PlacementInputs::default(), None)
+            .select_pd_pair(
+                "GLM-5.2-Coding",
+                PlacementInputs::default(),
+                None,
+                placement::Stated::nothing,
+            )
             .expect("alias should select a PD pair");
         assert_eq!(prefill.url(), "http://prefill");
         assert_eq!(decode.url(), "http://decode");
 
         assert!(router
-            .select_pd_pair("GLM-5.2-Unknown", PlacementInputs::default(), None)
+            .select_pd_pair(
+                "GLM-5.2-Unknown",
+                PlacementInputs::default(),
+                None,
+                placement::Stated::nothing,
+            )
             .is_err());
     }
 
@@ -4598,7 +4629,12 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(UNKNOWN_MODEL_ID, PlacementInputs::default(), None);
+        let result = router.select_pd_pair(
+            UNKNOWN_MODEL_ID,
+            PlacementInputs::default(),
+            None,
+            placement::Stated::nothing,
+        );
 
         assert!(result.is_err());
         // No workers at all is the pre-existing unavailable string, not a shed:
@@ -7910,6 +7946,7 @@ mod tests {
                         UNKNOWN_MODEL_ID,
                         PlacementInputs::default(),
                         None,
+                        placement::Stated::nothing,
                     )
                     .await
                     .unwrap();
@@ -7938,6 +7975,7 @@ mod tests {
                     UNKNOWN_MODEL_ID,
                     PlacementInputs::default(),
                     None,
+                    placement::Stated::nothing,
                 );
                 tokio::pin!(next);
                 tokio::select! {
@@ -8002,6 +8040,7 @@ mod tests {
                         UNKNOWN_MODEL_ID,
                         PlacementInputs::default(),
                         None,
+                        placement::Stated::nothing,
                     )
                     .await
                     .unwrap();
@@ -8088,6 +8127,7 @@ mod tests {
                         UNKNOWN_MODEL_ID,
                         PlacementInputs::default(),
                         None,
+                        placement::Stated::nothing,
                     )
                     .await
                     .unwrap();
@@ -9592,9 +9632,10 @@ mod tests {
     /// that decode stops being ready meanwhile, under a document that picks
     /// a pair's decode behind its prefill. It is sent the request all the
     /// same and stays counted for it; the other decode is sent nothing and
-    /// is never counted. The engine hears each side's dispatch and end, the
-    /// decode booked at its send, and no release. Both transfer modes of a
-    /// pair sent prefill first.
+    /// is never counted. The engine hears the body's output limit at the
+    /// pair's one decision, each side's dispatch and end, the decode booked
+    /// at its send, and no release. Both transfer modes of a pair sent
+    /// prefill first.
     #[tokio::test]
     async fn a_moriio_pairs_decode_is_not_asked_again_behind_its_prefill() {
         for transfer in ["read", "write"] {
@@ -9667,6 +9708,7 @@ mod tests {
             assert_eq!(
                 *heard.lock().expect("the stage heard"),
                 [
+                    "limit 50",
                     "issued",
                     "dispatched Prefill",
                     "issued",
