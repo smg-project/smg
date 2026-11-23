@@ -2548,6 +2548,13 @@ fn anchored_digit_stages_cut_digit_runs_as_the_library_does() {
 #[test]
 fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
     let mut state = 0x5A5A_1234_5678_9ABCu64;
+    // Two pools for the whole test: every thread of each calls at once.
+    let pools = [3, 7].map(|threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("pool")
+    });
     for shape in shapes() {
         let tokenizer = tokenizer_of(&shape, &mut state);
         let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
@@ -2559,14 +2566,27 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
             .chain(shape.stripped.iter().map(|(s, _, _, _)| *s))
             .collect();
         let mut compared = 0;
-        for _ in 0..3 {
-            let text = long_text(&mut state, &added, 3 * PARALLEL_MIN_BYTES);
+        for round in 0..3 {
+            // The third text has a handful of units, which the threads take
+            // as their own: fewer than the larger pool has threads. The
+            // others have thousands.
+            let text = if round < 2 {
+                long_text(&mut state, &added, 3 * PARALLEL_MIN_BYTES)
+            } else {
+                let piece = long_text(&mut state, &[], 3 * PARALLEL_MIN_BYTES / 8);
+                [piece.as_str(); 3].join(&format!(" {} ", added.first().unwrap_or(&"")))
+            };
             let units = native.units(&text, true, true).as_slice().len();
             assert!(
                 units >= 4,
                 "{}: {units} units for {} bytes",
                 shape.name,
                 text.len()
+            );
+            assert!(
+                round < 2 || units < 7,
+                "{}: {units} units, every thread has its own",
+                shape.name
             );
             let pooled = native
                 .encode_with(Some(tokenizer.get_model()), &text, true, false)
@@ -2576,6 +2596,19 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
                 .expect("serial");
             compared += 1;
             assert_eq!(pooled, serial, "{}: the pool changed the ids", shape.name);
+            for pool in &pools {
+                for ids in pool.broadcast(|_| {
+                    native.encode_with(Some(tokenizer.get_model()), &text, true, false)
+                }) {
+                    assert_eq!(
+                        ids.expect("pooled"),
+                        serial,
+                        "{}: {} callers at once",
+                        shape.name,
+                        pool.current_num_threads()
+                    );
+                }
+            }
             let reference = tokenizer
                 .encode(text.as_str(), false)
                 .expect("encode")
