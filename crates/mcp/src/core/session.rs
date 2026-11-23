@@ -21,6 +21,7 @@ use super::{
 };
 use crate::{
     approval::ApprovalMode,
+    error::McpError,
     inventory::{QualifiedToolName, ToolCategory, ToolEntry},
     tenant::TenantContext,
 };
@@ -45,7 +46,8 @@ pub struct McpServerBinding {
     pub allowed_tools: Option<Vec<String>>,
     /// Why the server's tools could not be listed when this binding was made;
     /// `None` when they were listed. A request's item reports its own
-    /// connect's outcome, whatever the pool did since.
+    /// connect's outcome; a session adds `Server not found` for a binding
+    /// whose connection the pool holds no more when the session is built.
     pub list_error: Option<String>,
     /// The pool key a dynamic server was connected with; `None` for a
     /// configured server. A tool call of the binding on the key's own
@@ -118,12 +120,26 @@ impl<'a> McpToolSession<'a> {
     /// request context for downstream execution paths.
     pub fn new_with_headers(
         orchestrator: &'a McpOrchestrator,
-        mcp_servers: Vec<McpServerBinding>,
+        mut mcp_servers: Vec<McpServerBinding>,
         request_id: impl Into<String>,
         forwarded_headers: HashMap<String, String>,
     ) -> Self {
         let request_id = request_id.into();
         let tenant_ctx = TenantContext::default();
+        // A request's own server whose connection the pool holds no more:
+        // its calls find no server, and its listing says so, where it read
+        // as a listing of no tools.
+        for binding in &mut mcp_servers {
+            if binding.list_error.is_none()
+                && binding
+                    .pool_key
+                    .as_ref()
+                    .is_some_and(|key| !orchestrator.is_pooled(key))
+            {
+                binding.list_error =
+                    Some(McpError::ServerNotFound(binding.server_key.clone()).to_string());
+            }
+        }
         let server_keys: Vec<String> = mcp_servers.iter().map(|b| b.server_key.clone()).collect();
         let mut mcp_tools = Self::collect_visible_mcp_tools(orchestrator, &server_keys);
 
