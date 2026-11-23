@@ -629,12 +629,14 @@ impl Table {
             ruled: WarmUpState::default(),
             first_end: u64::MAX,
         };
-        if !reads {
+        // A list of no worker names no holder and writes no prefix, and its
+        // model would be the request's own word: nothing is read for it.
+        let Some(first) = workers.first().filter(|_| reads) else {
             return table;
-        }
+        };
         // The index is its workers' model's, by the id they registered
         // under: a request may name the model by another.
-        let registered = workers.first().map_or(model, |worker| worker.model_id());
+        let registered = first.model_id();
         let index = affinity
             .indexes
             .get()

@@ -87,9 +87,9 @@ fn pool(count: usize) -> (Vec<Arc<dyn Worker>>, Vec<WorkerId>) {
     (workers.collect(), ids.collect())
 }
 
-/// A host's indexes: one model's chain index, and how often it was asked.
-/// And the host's own token tree of the prompts it sent to the model's
-/// workers, where it keeps one.
+/// A host's indexes: one model's chain index, and the host's own token tree
+/// of the prompts it sent to the model's workers, where it keeps one. And
+/// how often it was asked for either.
 #[derive(Default)]
 struct Host {
     index: Option<Arc<ChainIndex>>,
@@ -109,6 +109,7 @@ impl CacheIndexes for Host {
     }
 
     fn token_tree(&self, model: &str, phase: Phase) -> Option<Arc<TokenTree>> {
+        self.asked.fetch_add(1, Ordering::Relaxed);
         let single = model == MODEL && phase == Phase::Single;
         self.tree.as_ref().filter(|_| single).cloned()
     }
@@ -961,6 +962,19 @@ fn a_pick_that_meets_a_held_record_leaves_its_prefix_out() {
         bed.decide(&request(&asked, 7, NOW + 2 * SECOND), Some(2));
     }
     assert_eq!(bed.affinity.left_out(), 1);
+}
+
+/// A list of no worker is read no table: its request is named no holder, no
+/// record of sent prefixes is made, and the host is asked for no index and
+/// no tree.
+#[test]
+fn a_list_of_no_worker_keeps_no_record() {
+    let (affinity, host, _) = hosted(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 0);
+    let asked = prompt(1_000, 4);
+    assert!(bed.holders(&asked, NOW).is_empty());
+    assert!(bed.affinity.records.lock().is_empty());
+    assert_eq!(host.asked.load(Ordering::Relaxed), 0);
 }
 
 /// A prompt of more blocks than one turn of the record's lock writes is
