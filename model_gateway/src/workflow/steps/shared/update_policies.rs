@@ -254,6 +254,10 @@ mod tests {
         model_card::ModelCard,
         worker::{HealthCheckConfig, RuntimeType, WorkerSpec, WorkerType},
     };
+    use smg_policy_controller::{
+        document::{AppliedSpec, PolicySpec},
+        engine::PolicyEngine,
+    };
     use smg_worker::jobs::WorkerJobAsker;
     use tracing_test::traced_test;
     use wfaas::WorkflowInstanceId;
@@ -387,6 +391,42 @@ mod tests {
                 assert_eq!(worker.completion_sink().is_some(), !policy_controller);
             }
             assert_eq!(app_context.policy_registry.classic_made_or_asked(), made);
+        }
+    }
+
+    /// Under the policy engine a worker's stream follows the document in
+    /// force, not the classic settings. The settings name `round_robin`
+    /// both times. Under a document that reads cache events the step
+    /// starts a regular worker's events stream, so its model gets an
+    /// index. Under a document that reads none it starts no such stream.
+    #[tokio::test]
+    async fn under_the_policy_engine_a_workers_events_stream_follows_the_document() {
+        for (preset, streams) in [("cache_aware", true), ("round_robin", false)] {
+            let mut config = RouterConfig::builder()
+                .policy(PolicyConfig::RoundRobin)
+                .build_unchecked();
+            config.policy_controller = true;
+            let mut context = AppContext::clone(&app_context_for_tests(
+                config.clone(),
+                Arc::new(WorkerRegistry::new()),
+                None,
+            ));
+            let policies = PolicyRegistry::of_config(&config);
+            let document = PolicySpec::preset(preset).expect("a stock preset");
+            let spec = AppliedSpec::validate(&document).expect("a valid document");
+            policies.set_engine(Box::leak(Box::new(PolicyEngine::new(spec))));
+            context.policy_registry = Arc::new(policies);
+            let monitor = Arc::new(KvEventMonitor::new());
+            context.kv_event_monitor = Some(Arc::clone(&monitor));
+            // As the app wires the pair: the add reads the registry.
+            monitor.set_worker_registry(&context.worker_registry);
+            let app_context = Arc::new(context);
+
+            register(&app_context, grpc_worker(WorkerType::Regular), &[]).await;
+
+            assert_eq!(monitor.get_indexer(MODEL).is_some(), streams, "{preset}");
+            assert_eq!(app_context.policy_registry.classic_made_or_asked(), 0);
+            monitor.stop().await;
         }
     }
 
