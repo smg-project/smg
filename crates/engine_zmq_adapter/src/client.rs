@@ -44,10 +44,11 @@ use crate::{
     sglang::{
         aggregate_control, constraint_ref as sglang_constraint_ref, control_outcome,
         encode_media_refs, fan_out_sglang_requests, translate_embed_request_sglang,
-        translate_request_sglang, RankPlacement, SglangGenerateStream, SglangProfileStart,
+        translate_request_sglang, RankPlacement, SglangConnection, SglangGenerateStream,
+        SglangProfileStart,
     },
     sglang_encode::{EncodeDispatchRequest, EncodeNotice, SglangEncodeDispatcher},
-    sglang_v41_items::V41Vision,
+    sglang_v41_items::PerImageItems,
     sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake},
     stream::{RequestDeadline, ZmqGenerateStream},
     structured_outputs::{
@@ -205,6 +206,11 @@ pub(crate) struct ZmqConnectionMeta {
     /// (see [`ZmqEngineClient::set_request_timeout`]); unset leaves the
     /// streams unbounded.
     request_timeout: OnceLock<Duration>,
+    /// What the ranks declared at their handshakes of a batch that goes on
+    /// as one item an image, read once here for every request of the
+    /// connection ([`PerImageItems::declared`]): on the SGLang wire, whose
+    /// translation alone asks it.
+    per_image: PerImageItems,
 }
 
 /// Bind the SMG-side ZMQ sockets and complete the handshake with the
@@ -423,6 +429,12 @@ impl ZmqEngineClient {
             ZmqDialect::Sglang => check_engine_layouts::<SglangProtocol>(&transport)?,
             ZmqDialect::Trtllm => check_engine_layouts::<TrtllmProtocol>(&transport)?,
         }
+        let per_image = match dialect {
+            ZmqDialect::Sglang => PerImageItems::declared(&transport.engines),
+            ZmqDialect::Vllm | ZmqDialect::TokenSpeed | ZmqDialect::Trtllm => {
+                PerImageItems::default()
+            }
+        };
         let backend = match dialect {
             ZmqDialect::Vllm => ZmqBackend::Vllm(Arc::new(EngineCoreClient::new(transport))),
             ZmqDialect::TokenSpeed => {
@@ -444,6 +456,7 @@ impl ZmqEngineClient {
                 engine_ranks_are_replicas: OnceLock::new(),
                 pin_yield: PinYieldNote::default(),
                 request_timeout: OnceLock::new(),
+                per_image,
             }),
         };
         // Every wire bounds a prompt by the window the engine reported
@@ -1214,7 +1227,6 @@ impl ZmqEngineClient {
         // the engine's own dispatcher would place it, by its data-parallel
         // pin, or on a prefill side that follows the room by its room's
         // residue ([`Self::note_engine_places_by_rendezvous_room`]).
-        let ranks = client.engines().len();
         let placement = if self.meta.engine_places_by_rendezvous_room.get().is_none() {
             RankPlacement::Pin
         } else if self.meta.engine_ranks_are_replicas.get().is_some() {
@@ -1222,24 +1234,20 @@ impl ZmqEngineClient {
         } else {
             RankPlacement::RoomResidue
         };
-        // The served DeepSeek-V4.1 model's patch geometry, as every rank
-        // declared it at its handshake: a request without a pin is placed on
-        // a rank at submit, by load, after this translation.
-        let v41_vision = V41Vision::from_handshakes(client.engines());
+        let connection = SglangConnection {
+            max_model_len,
+            ranks: client.engines().len(),
+            placement,
+            yields: &self.meta.pin_yield,
+            per_image: self.meta.per_image,
+        };
         let mut streams = Vec::new();
         // Fan-out clones share identical media; cache only within this request.
         let mut shared_hashes = None;
         for (index, sub) in fan_out_sglang_requests(req).into_iter().enumerate() {
             let media_refs = sub.mm_inputs.as_deref().and_then(encode_media_refs);
-            let mut request = translate_request_sglang(
-                sub,
-                max_model_len,
-                ranks,
-                placement,
-                &self.meta.pin_yield,
-                v41_vision,
-            )
-            .map_err(tonic::Status::invalid_argument)?;
+            let mut request = translate_request_sglang(sub, &connection)
+                .map_err(tonic::Status::invalid_argument)?;
             request.trace_headers.clone_from(&trace_headers);
             if let (Some(hasher), Some(mm)) = (hasher, request.mm_inputs.as_mut()) {
                 hasher
