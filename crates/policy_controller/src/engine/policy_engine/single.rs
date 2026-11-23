@@ -383,10 +383,10 @@ fn by_facts<const RETRY: bool>(
 /// Where the profile's stages read who holds the prompt, the lookup does
 /// behind this answer what it does behind any pick. It hands the prompt to
 /// the record of sent prefixes, or to the host's token tree by the entry
-/// and the target its maker names. It may also be the one decision a second
-/// that reads its list's table again, and a tree's match marks the path it
-/// walked as used. Where no binding of the phase reads affinity, the lookup
-/// is one test.
+/// and the target its maker names. It may read its list's table again, as
+/// any decision that finds the table expired, and a tree's match marks the
+/// path it walked as used. Where no binding of the phase reads affinity,
+/// the lookup is one test.
 ///
 /// Out of line: its code stays off the path of a request with no pin, and
 /// of a pin its rule keeps from the profile.
@@ -727,11 +727,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// A request stated ahead, with the list its host hands for it, and how
+    /// A request stated ahead, with the lists its host hands for it, and how
     /// many times the engine made it.
     pub(crate) struct Asks<'a> {
         pub(crate) request: Request<'a>,
-        pub(crate) members: Option<&'a PublishedList>,
+        pub(crate) members: WorkerLists<'a>,
         pub(crate) loads: Option<Arc<LoadSnapshot>>,
         pub(crate) made: Cell<u32>,
         /// The token ids the host names as the request's entry in a token
@@ -742,6 +742,14 @@ pub(crate) mod tests {
 
     impl<'a> Asks<'a> {
         pub(crate) fn of(request: Request<'a>, members: Option<&'a PublishedList>) -> Self {
+            let lists = match members {
+                Some(list) => WorkerLists::Single(list.lent()),
+                None => WorkerLists::None,
+            };
+            Self::over(request, lists)
+        }
+
+        fn over(request: Request<'a>, members: WorkerLists<'a>) -> Self {
             Self {
                 request,
                 members,
@@ -768,10 +776,7 @@ pub(crate) mod tests {
         }
 
         fn workers(&self) -> WorkerLists<'_> {
-            match self.members {
-                Some(list) => WorkerLists::Single(list.lent()),
-                None => WorkerLists::None,
-            }
+            self.members
         }
 
         fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
@@ -1978,8 +1983,9 @@ pub(crate) mod tests {
 
     /// What `engine`'s record of sent prefixes holds of the prompt `tokens`
     /// for each worker of `list`, in blocks: what a decision of the same
-    /// lookup is named. The read's own answer picks nobody, so it writes
-    /// nothing.
+    /// lookup is named. The lookup names the deepest holders alone, so a
+    /// shorter copy at another worker reads as none. The read's own answer
+    /// picks nobody, so it writes nothing.
     fn recorded(engine: &PolicyEngine, list: &[Arc<dyn Worker>], tokens: &[u32]) -> Vec<u32> {
         let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
         let mut asked = request();
@@ -2146,6 +2152,80 @@ pub(crate) mod tests {
         twin.targets.by_rule(RulePlaced::Told);
         assert_eq!(twin, own[0]);
         assert_ne!(kept[0], own[0], "the rule's word is on the pick");
+    }
+
+    /// A retry over a list where an engine holds several workers is its
+    /// own instance of the decision ([`retried`]), and it follows its key's
+    /// pin by one worker's record as a first attempt does: the pin's worker
+    /// is no rank of the engine the request tried. What is kept of the
+    /// retry's prompt is by the rule's word there too. Under `told` the
+    /// record holds it for the pin's worker alone, and under `untold` for
+    /// nobody.
+    #[test]
+    fn a_retrys_followed_pin_is_recorded_by_the_rules_word() {
+        for kept in [RulePlaced::Untold, RulePlaced::Told] {
+            let engine = PolicyEngine::new(default_under_sessions(kept));
+            // Two engines of two ranks, then two workers alone.
+            let (list, engine_of) = engines(&[2, 2, 1, 1]);
+            let members = PublishedList::new(Arc::clone(&list));
+            let prompt = |first: u32| (first..first + 1_024).collect::<Vec<u32>>();
+            // One request of `tokens` under the session key `key` that
+            // tried `tried`, sent to its first target and served there: the
+            // place it went to and its pick.
+            let sent = |tokens: &[u32], key: u64, tried: &[WorkerId]| {
+                let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+                let mut asked = request();
+                asked.facts.seed = key;
+                asked.facts.session_key = Identity::hashed(key);
+                if !tried.is_empty() {
+                    asked.facts.attempt = 1;
+                }
+                asked.facts.tried = tried;
+                hashes.write_to(&mut asked.facts);
+                let asks = Asks::of(asked, Some(&members));
+                let now = Instant::now();
+                let mut guard = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now)
+                    .expect("a decision");
+                let pick = *guard.decision().pick().expect("a pick");
+                let target = guard.take(0).expect("the first target");
+                guard.dispatched(now);
+                guard.completed(
+                    &Outcome {
+                        side: Side::Single,
+                        served: target.id,
+                        status: 200,
+                        class: TransportClass::Ok,
+                        ttft_micros: 0,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                        duration_micros: 0,
+                    },
+                    now,
+                );
+                (target.position as usize, pick)
+            };
+            for key in 1..=6_u32 {
+                let (own, session) = (key * 100_000, u64::from(key));
+                let (pin, _) = sent(&prompt(own), session, &[]);
+                // The key's next request tried a worker of another engine
+                // than its pin's, and comes again.
+                let other = engine_of.iter().position(|&of| of != engine_of[pin]);
+                let tried = [worker_id(list[other.expect("another engine")].as_ref())];
+                let fresh = prompt(own + 50_000);
+                let (went, pick) = sent(&fresh, session, &tried);
+                let answered = (went, pick.session_verdict, pick.placed_by());
+                let pinned = (pin, SessionVerdict::Pinned, PlacedBy::Rule);
+                assert_eq!(answered, pinned, "{kept:?}: key {key}");
+                let whole = !pick.trace.drew_first();
+                assert!(!whole, "{kept:?}: key {key}: the whole decision ran");
+                let mut held = vec![0; list.len()];
+                if kept == RulePlaced::Told {
+                    held[pin] = 64;
+                }
+                let read = recorded(&engine, &list, &fresh);
+                assert_eq!(read, held, "{kept:?}: key {key}: the retry's prompt");
+            }
+        }
     }
 
     /// A request stated ahead by a maker that states no plain request
@@ -2333,40 +2413,100 @@ pub(crate) mod tests {
 
     /// A request that hands no list of its kind is decided over no worker,
     /// as the one entry decides it: a single with no list, a pair's prefill
-    /// with none, and a prefill over a single's list. A decode or an encode
-    /// request sent on its own is refused.
+    /// with none, and a prefill over a single's list. A single over a pair's
+    /// two lists or an encode request's three is shed too. A decode or an
+    /// encode request sent on its own is refused.
     #[test]
     fn a_decision_without_a_lease_over_no_list_names_no_worker() {
+        use smg_worker::{test_support::worker_with_model_aliases, worker::WorkerType};
+
+        use crate::engine::{EncodeLists, EncoderFacts, PairAdmission, PairLists, PartnerClasses};
+
+        #[derive(Debug)]
+        struct Open;
+
+        impl PairAdmission for Open {
+            fn has_capacity(&self, _: usize) -> bool {
+                true
+            }
+
+            fn has_room(&self, _: usize) -> bool {
+                true
+            }
+        }
+
         let engine = preset("round_robin");
+        let document =
+            PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets");
+        let paired = PolicyEngine::new(AppliedSpec::validate(&document).expect("a valid document"));
         let list = pool(2);
         let members = PublishedList::new(Arc::clone(&list));
+        let side = |worker_type| {
+            let url = format!("http://{worker_type}:8000");
+            let worker = worker_with_model_aliases(&url, MODEL, &[], worker_type);
+            worker.set_status(WorkerStatus::Ready);
+            PublishedList::new(Arc::from([worker]))
+        };
+        let [prefill, decode, encoders] =
+            [WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode].map(side);
+        let classes = PartnerClasses::number(1, [&[0_u32][..]]);
+        let pair = PairLists {
+            prefill: prefill.lent(),
+            decode: decode.lent(),
+            classes: &classes,
+            admission: &Open,
+            prefill_places: None,
+            decode_places: None,
+            prefill_stalled: &[],
+            prefill_held: &[],
+            decode_stalled: &[],
+            decode_held: &[],
+        };
+        let encode = EncodeLists {
+            pair,
+            encoders: encoders.lent(),
+            encoders_stalled: &[],
+            encoders_held: &[],
+            facts: &[EncoderFacts {
+                class: 1,
+                ..EncoderFacts::default()
+            }],
+            prefill_classes: &[1],
+        };
         let stating = |phase, members| {
             let mut stated = request();
             stated.facts.phase = phase;
-            Asks::of(stated, members)
+            Asks::over(stated, members)
         };
         let none = (ShedReason::NoEndpoints, "none");
-        for (phase, members) in [
-            (Phase::Single, None),
-            (Phase::Prefill, None),
-            (Phase::Prefill, Some(&members)),
+        let single = WorkerLists::Single(members.lent());
+        let (both, three) = (WorkerLists::Pair(pair), WorkerLists::Encode(encode));
+        for (phase, over, members, engine) in [
+            (Phase::Single, "no list", WorkerLists::None, &engine),
+            (Phase::Prefill, "no list", WorkerLists::None, &engine),
+            (Phase::Prefill, "a single's list", single, &engine),
+            (Phase::Single, "a pair's lists", both, &paired),
+            (Phase::Single, "an encode request's lists", three, &paired),
         ] {
-            let listed = members.is_some();
             let shed = engine.decide_without_lease(&stating(phase, members), Instant::now());
             let Ok((Decision::Shed(shed), None)) = shed else {
-                panic!("{phase:?}, {listed}: a shed, not {shed:?}");
+                panic!("{phase:?} over {over}: a shed, not {shed:?}");
             };
-            assert_eq!((shed.reason, shed.emptied_by), none, "{phase:?}, {listed}");
+            assert_eq!(
+                (shed.reason, shed.emptied_by),
+                none,
+                "{phase:?} over {over}"
+            );
             let whole = Whole(stating(phase, members));
             let leased = engine.decide_under(GatewayId::LOCAL, &whole, Instant::now());
             let leased = leased.expect("an answer").whole().expect("no place").0;
             let Decision::Shed(theirs) = leased.decision else {
-                panic!("{phase:?}, {listed}: the one entry picks");
+                panic!("{phase:?} over {over}: the one entry picks");
             };
             assert_eq!((theirs.reason, theirs.emptied_by), none);
         }
         for phase in [Phase::Decode, Phase::Encode] {
-            let asks = stating(phase, None);
+            let asks = stating(phase, WorkerLists::None);
             let refused = engine.decide_without_lease(&asks, Instant::now());
             assert_eq!(refused.err(), Some(DecisionRefused::PairSide), "{phase:?}");
         }
@@ -2681,8 +2821,10 @@ pub(crate) mod tests {
                     assert_eq!(entry, (0, 0), "key {key}: a kept pin's entry");
                     assert_eq!(stored(&fresh), (0, Vec::new()), "key {key}: a kept prompt");
                 }
-                // The key's pin again, of a prompt its host does not send to
-                // the pin's worker: the tree takes none of it.
+                // The key's pin again, where the host answers that its caller
+                // sends to no target of the pick: the tree takes none of the
+                // prompt. The helper still dispatches on the pin's worker, so
+                // this holds what that answer does to the tree and no more.
                 let refused = prompt(key * 100_000 + 70_000);
                 let (went, _, entry) = sent(&refused, seed, 2, false);
                 assert_eq!(went, pin, "{kept:?}: key {key}");

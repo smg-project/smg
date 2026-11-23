@@ -1725,7 +1725,7 @@
           "default": "original"
         },
         "rule_placed": {
-          "description": "Whether a single request this rule placed alone is the profile's\nown (default `told`). Under `untold` no stage hears that request's\nissue or its dispatch, it is none of the profile's sends, and\nneither the engine's record of sent prefixes nor a lent token tree\ntakes its prompt. The session table still hears its dispatch,\nand the stages its completion and its release. A pair's sides are\ntold under either word. A host that tells a lease's words off its\nfile keeps no such word of a pick: it takes the rule, tells such a\nrequest as it tells any other, and records its prompt as any\nother's.",
+          "description": "Whether a single request this rule placed alone is the profile's\nown (default `told`). Under `untold` no stage hears that request's\nissue or its dispatch, it is none of the profile's sends, and\nneither the engine's record of sent prefixes nor a lent token tree\ntakes its prompt. The session table still hears its dispatch,\nand the stages its completion and its release. A pair's sides are\ntold under either word. A host that tells a lease's words off its\nfile keeps no such word of a pick: it takes the rule, and tells such\na request as it tells any other. Its decision is the engine's own,\nso its record of sent prefixes follows the word all the same.",
           "$ref": "#/$defs/RulePlaced"
         }
       },

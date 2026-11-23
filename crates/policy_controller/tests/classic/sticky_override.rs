@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use smg_policy_controller::{
     document::{
-        Assignment, LoadMetricSetting, PolicySettings, PolicySpec, RoutingKeyOverrideSettings,
-        RoutingSettings,
+        Assignment, IndexKind, LoadMetricSetting, PolicySettings, PolicySpec,
+        RoutingKeyOverrideSettings, RoutingSettings,
     },
     engine::{
         Candidate, Constraints, Engine, Health, Identity, PoolFacts, RequestFacts, Scratch,
@@ -115,6 +115,25 @@ impl Row {
                 balance_abs_threshold: 64,
                 balance_rel_threshold: 1.5,
                 bucket_adjust_interval_secs: 5,
+            },
+            "cache_aware" => PolicySettings::CacheAware {
+                cache_threshold: 0.3,
+                balance_abs_threshold: 64,
+                balance_rel_threshold: 1.5,
+                balance_prefix_margin_tokens: 0,
+                balance_uncached_credit: false,
+                eviction_interval_secs: 120,
+                max_tree_size: 67_108_864,
+                block_size: 16,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
+                cache_index: IndexKind::Tree,
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
+                selection_policy: None,
+                selection_accounting_ttl_ms: 0,
             },
             other => return Err(format!("no settings are written here for `{other}`")),
         };
@@ -355,14 +374,14 @@ fn a_key_used_after_its_idle_time_and_before_the_sweep_keeps_its_worker() {
 /// gateway asks its policy:
 ///
 /// - A key's first request goes where the policy sends it, and is pinned
-///   there (`:576-587`).
+///   there (`:769-780`).
 /// - The key's next request follows the pin, and the policy is not asked
-///   (`:540-546`, reached from `:468-469` ahead of the policy's call at
-///   `:471`). So a request with no key takes the policy's next answer, the
+///   (`:733-739`, reached from `:661-662` ahead of the policy's call at
+///   `:664`). So a request with no key takes the policy's next answer, the
 ///   same on both beds, and that answer is another worker by then.
 /// - With two requests of the key on its worker the policy is asked again
-///   (`:547-555`), and the key's next request goes to its pick, a worker
-///   under that count (`:565-567`).
+///   (`:740-748`), and the key's next request goes to its pick, a worker
+///   under that count (`:758-760`).
 ///
 /// The case runs over a list of three workers and over one of sixteen. From
 /// sixteen workers on the engine draws first for a request with no key and
@@ -421,7 +440,7 @@ fn a_key_goes_where_its_policy_sends_it_and_then_follows_its_pin() {
 
 /// `bucket` under the override, where the rule plans single requests alone.
 /// The gateway's policy holds a bucket of sizes for the prefill workers of
-/// a pair alone (`model_gateway/src/policies/registry.rs:1215-1226`), and
+/// a pair alone (`model_gateway/src/policies/registry.rs:1564-1575`), and
 /// draws a healthy worker among single ones
 /// (`model_gateway/src/policies/bucket.rs:186-191`). This crate's stage
 /// places a prefill decision alone and draws for every other. So a single
@@ -694,7 +713,7 @@ pub const INLINE: &str = r#"{
 /// whole.
 mod sends {
     use std::{
-        collections::VecDeque,
+        collections::{HashMap, VecDeque},
         sync::Arc,
         time::{Duration, Instant},
     };
@@ -702,8 +721,9 @@ mod sends {
     use smg_policy_controller::{
         document::{AppliedSpec, Assignment},
         engine::{
-            Constraints, Identity, LentList, ListCell, PlacedBy, PolicyEngine, Request,
-            RequestFacts, RequestMaker, WorkerLists,
+            Constraints, DecisionEngine, HashSeeds, Identity, LentList, ListCell, PlacedBy,
+            PolicyEngine, PromptHashes, Request, RequestFacts, RequestMaker, SessionVerdict,
+            WorkerLists,
         },
         store::GatewayId,
         tracking::{self, DecisionGuard, TransportClass},
@@ -824,28 +844,46 @@ mod sends {
         }
 
         /// The request `nth` of `tokens` prompt tokens under `key`, with no
-        /// key where it is empty, decided by `engine` and not sent yet.
+        /// key where it is empty, decided by `engine` and not sent yet. It
+        /// states no prompt.
         fn decide(
             &self,
             engine: &'e PolicyEngine,
             members: LentList<'_>,
+            asked: (&'static str, u32, u32),
+        ) -> Decided<'e> {
+            self.decide_prompt(engine, members, asked, None)
+        }
+
+        /// [`Self::decide`] for a request that states its prompt: `prompt`
+        /// is the hashes of the prompt's blocks, as `engine`'s document
+        /// reads a prompt.
+        fn decide_prompt(
+            &self,
+            engine: &'e PolicyEngine,
+            members: LentList<'_>,
             (key, tokens, nth): (&'static str, u32, u32),
+            prompt: Option<&PromptHashes>,
         ) -> Decided<'e> {
             let session_key = match key {
                 "" => Identity::NONE,
                 key => Identity::plain(key),
             };
+            let mut facts = RequestFacts {
+                model: MODEL,
+                seed: u64::from(nth),
+                prompt_tokens: tokens,
+                session_key,
+                session_counted: true,
+                ..RequestFacts::default()
+            };
+            if let Some(prompt) = prompt {
+                prompt.write_to(&mut facts);
+            }
             let asks = Asks {
                 request: Request {
                     id: b"request",
-                    facts: RequestFacts {
-                        model: MODEL,
-                        seed: u64::from(nth),
-                        prompt_tokens: tokens,
-                        session_key,
-                        session_counted: true,
-                        ..RequestFacts::default()
-                    },
+                    facts,
                     constraints: Constraints::default(),
                 },
                 members,
@@ -931,7 +969,7 @@ mod sends {
     /// with no key goes back to it.
     ///
     /// The gateway's policy hears of no request its sticky map placed
-    /// (`model_gateway/src/policies/registry.rs:543-546`), and prices a
+    /// (`model_gateway/src/policies/registry.rs:736-739`), and prices a
     /// request the gateway holds that it did not place at the mean prompt
     /// (`model_gateway/src/policies/least_load.rs:802`). Its `power_of_two`
     /// scores with the same credit
@@ -967,20 +1005,109 @@ mod sends {
         }
     }
 
+    /// Each key's leading pin, kept by the host's own book as the gateway's
+    /// rule moves it under `delegate`
+    /// (`model_gateway/src/policies/registry.rs`, `select_sticky`). The
+    /// book reads the gateway's counts and the place a request went to,
+    /// and no word of the engine it is held against. Every worker of these
+    /// cases takes requests all along, so a key's leading pin is the one
+    /// pin its rule reads.
+    #[derive(Default)]
+    struct Pins(HashMap<&'static str, usize>);
+
+    impl Pins {
+        /// Whether the worker at `at` carries two of `key`'s requests, the
+        /// cap of the override's rule.
+        fn at_cap(host: &Host<'_>, key: &str, at: usize) -> bool {
+            host.list[at].routing_key_inflight(key) >= 2
+        }
+
+        /// The place of `key`'s leading pin, and whether that worker stands
+        /// at the cap.
+        fn of(&self, host: &Host<'_>, key: &str) -> (Option<usize>, bool) {
+            let pin = self.0.get(key).copied();
+            (pin, pin.is_some_and(|at| Self::at_cap(host, key, at)))
+        }
+
+        /// The gateway's rule for a request of `key`, held against the
+        /// place it went to and who placed it. A request the rule placed
+        /// followed the key's leading pin, under its cap
+        /// (`model_gateway/src/policies/registry.rs:736-739`). A keyed
+        /// request the policy placed had no pin, or its pin at the cap
+        /// (`:740-748`, `:769-780`). Whether the pin stood at its cap.
+        fn rule(&self, host: &Host<'_>, key: &str, (place, by): (usize, PlacedBy)) -> bool {
+            let (pin, at_cap) = self.of(host, key);
+            if by == PlacedBy::Rule {
+                assert_eq!(
+                    Some(place),
+                    pin,
+                    "{key:?}: the rule follows the leading pin"
+                );
+                assert!(!at_cap, "{key:?}: a pin at its cap is no pin to follow");
+            } else {
+                assert!(
+                    key.is_empty() || pin.is_none() || at_cap,
+                    "{key:?}: the policy is asked of a pin under its cap"
+                );
+            }
+            at_cap
+        }
+
+        /// The request of `key` goes to `place`: the gateway's write of the
+        /// key's pin, read ahead of the request's own count. A key with no
+        /// pin pins the worker its policy picked (`:774-779`). A pin moves
+        /// to another worker that stands under the cap, and to none at it
+        /// (`:758-760`). The decision's `verdict` is held to that write: it
+        /// states a pin where the key's leading pin is `place` behind the
+        /// write, and none where the pin stayed on another worker.
+        fn sent(
+            &mut self,
+            host: &Host<'_>,
+            key: &'static str,
+            place: usize,
+            verdict: SessionVerdict,
+        ) {
+            if key.is_empty() {
+                return;
+            }
+            let pin = self.0.get(key).copied();
+            if pin.is_none_or(|pin| pin != place && !Self::at_cap(host, key, place)) {
+                self.0.insert(key, place);
+            }
+            assert_eq!(
+                verdict != SessionVerdict::None,
+                self.0.get(key) == Some(&place),
+                "{key:?}: {verdict:?} at {place} with the pin {pin:?}"
+            );
+        }
+    }
+
+    /// The verdict a held decision states of its key.
+    fn verdict(guard: &DecisionGuard<&PolicyEngine>) -> SessionVerdict {
+        guard.decision().pick().expect("a pick").session_verdict
+    }
+
+    /// A prompt as a request states it: the number of the key's first
+    /// prompt where it grows that one, and its own number.
+    type Stated = (Option<u32>, u32);
+
     /// `least_load` under the override, which no sheet of the gateway
     /// records, held to the gateway's rule
     /// (`model_gateway/src/policies/registry.rs`, `select_sticky`) by a twin
     /// engine that runs the policy alone over the same worker objects. The
     /// twin is asked, and told a dispatch, wherever the gateway asks its
     /// policy: at a key's first request, at a key's request with two of its
-    /// requests on its worker, and at a request with no key. It is not
-    /// asked at a pinned request and hears of none. So the two engines
+    /// requests on its pin's worker, and at a request with no key. It is
+    /// not asked at a pinned request and hears of none. So the two engines
     /// hold one count of sends, and each request the policy places goes to
     /// one worker under both, behind pinned requests of 500 to 20,000
     /// tokens. From the ninth request on the oldest request in flight ends
     /// ahead of every second decision, a pinned one or one the policy
     /// placed, so the two engines agree behind ends too, and a key still
-    /// meets its cap. Over three workers and over sixteen.
+    /// meets its cap. Each request is held to the gateway's rule by the
+    /// key's leading pin ([`Pins::rule`]), and each decision's verdict to
+    /// the gateway's write of that pin ([`Pins::sent`]). Over three workers
+    /// and over sixteen.
     #[test]
     fn least_load_places_under_the_override_as_the_policy_alone_places() {
         for workers in [3, 16] {
@@ -991,6 +1118,7 @@ mod sends {
             // own value of it.
             let (list, cell) = (Arc::clone(&host.list), ListCell::default());
             let members = lent(&list, &cell);
+            let mut pins = Pins::default();
             let (mut pinned, mut behind, mut ended, mut capped) = (0, 0, 0, 0);
             for nth in 0..48_u32 {
                 if nth >= 8 && nth % 2 == 0 {
@@ -1000,11 +1128,9 @@ mod sends {
                 }
                 let key = ["k0", "k1", "k2", "k3", "k4", ""][nth as usize % 6];
                 let tokens = [1_000, 12_000, 3_000, 20_000, 500][nth as usize % 5];
-                // Two of the key's requests stand on one worker: the cap of
-                // the override's rule.
-                let two = |worker: &Arc<dyn Worker>| worker.routing_key_inflight(key) >= 2;
-                let at_cap = !key.is_empty() && host.list.iter().any(two);
                 let (guard, place, by) = host.decide(&keyed, members, (key, tokens, nth));
+                let at_cap = pins.rule(&host, key, (place, by));
+                pins.sent(&host, key, place, verdict(&guard));
                 let mut guards = vec![guard];
                 if by == PlacedBy::Rule {
                     pinned += 1;
@@ -1016,12 +1142,6 @@ mod sends {
                     );
                     guards.push(asked);
                     behind += u32::from(pinned > 0);
-                    // The policy is asked of a key at its first request,
-                    // which is among the first six, and at its cap.
-                    assert!(
-                        key.is_empty() || nth < 6 || at_cap,
-                        "{workers} workers: request {nth}, {key:?}: a pin under its cap"
-                    );
                     capped += u32::from(at_cap);
                 }
                 host.sent(guards, (key, nth), place);
@@ -1029,7 +1149,147 @@ mod sends {
             assert!(
                 pinned >= 8 && behind >= 8 && ended >= 8 && capped >= 8,
                 "{workers} workers: {pinned} pinned requests, {behind} placed behind one, \
-                 {ended} pinned requests ended, {capped} keyed requests at their cap"
+                 {ended} pinned requests ended, {capped} keyed requests at their pin's cap"
+            );
+        }
+    }
+
+    /// `cache_aware` under the override, which no sheet of the gateway
+    /// records, held to the gateway's rule
+    /// (`model_gateway/src/policies/registry.rs`, `select_sticky`) by a twin
+    /// engine that runs the policy alone over the same worker objects, as
+    /// `least_load` is above. The gateway's policy writes a prompt for the
+    /// worker it placed the request on, and it is not asked at a pinned
+    /// request (`:736-739`). So the twin is asked, and writes a prompt,
+    /// wherever the engine under the override does: no pinned request's
+    /// prompt is in either record, and each request the policy places goes
+    /// to one worker under both.
+    ///
+    /// Under its cap, and at it on even rounds, a key's request states a
+    /// prompt of its own. At the cap on odd rounds it grows the key's first
+    /// prompt, as a session grows one prefix: that prompt whole, then a
+    /// tail of its own. A request with no key repeats an earlier prompt, a
+    /// pinned request's on even rounds and one the policy placed on odd
+    /// rounds:
+    ///
+    /// - A pinned request's prompt is in no record, so the policy places
+    ///   its repeat as a prompt nobody was sent, and on another worker than
+    ///   the pin's more often than not. An engine that recorded the pinned
+    ///   request would send the repeat to the pin's worker, and its twin
+    ///   would not.
+    /// - A prompt the policy placed goes back to its worker.
+    /// - A prompt that grows the key's first one goes, at the cap, where
+    ///   the policy finds that prefix: on the pinned worker again more
+    ///   often than a prompt of its own does. There the request goes over
+    ///   the cap, and the pin stays (`:740-761`).
+    ///
+    /// Each request is held to the gateway's rule by the key's leading pin
+    /// ([`Pins::rule`]), and each decision's verdict to the gateway's write
+    /// of that pin ([`Pins::sent`]). Over three workers and over sixteen.
+    #[test]
+    fn cache_aware_places_under_the_override_as_the_policy_alone_places() {
+        for workers in [3, 16] {
+            let (keyed, alone) = (engine("cache_aware", true), engine("cache_aware", false));
+            let queued: Vec<i32> = (0..workers).map(|at| at * 700).collect();
+            let mut host = Host::new(&queued);
+            let (list, cell) = (Arc::clone(&host.list), ListCell::default());
+            let members = lent(&list, &cell);
+            // A prompt of its own: 1,024 tokens no other prompt holds. A
+            // prompt that grows a key's first one: that prompt whole, then
+            // 256 tokens of its own. Hashed as each engine's document reads
+            // a prompt.
+            let prompt = |engine: &PolicyEngine, (first, of): Stated| {
+                let own = if first.is_some() { 256 } else { 1_024 };
+                let head = first.map_or(0..0, |first| first * 100_000..first * 100_000 + 1_024);
+                let tokens: Vec<u32> = head.chain(of * 100_000..of * 100_000 + own).collect();
+                engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN)
+            };
+            let mut pins = Pins::default();
+            // Each key's first request, by its number.
+            let mut firsts: HashMap<&str, u32> = HashMap::new();
+            // The prompts of the pinned requests and of the requests the
+            // policy placed, each with the place it went to.
+            let (mut kept, mut told) = (VecDeque::new(), VecDeque::new());
+            let (mut pinned, mut capped, mut ended) = (0, 0, 0);
+            // Each reading beside the count of requests it is read of: the
+            // repeats of a pinned request's prompt placed off the pin's
+            // worker, the repeats of a placed prompt sent back to its
+            // worker, and the prompts placed at the cap on the pinned
+            // worker again, the grown ones and those of their own.
+            let (mut elsewhere, mut back) = ((0, 0), (0, 0));
+            let (mut grown, mut own) = ((0, 0), (0, 0));
+            for nth in 0..96_u32 {
+                if nth >= 8 && nth % 2 == 0 {
+                    let oldest = host.held.pop_front().expect("a request in flight");
+                    ended += u32::from(oldest.0.len() == 1);
+                    host.ended(oldest, nth);
+                }
+                let key = ["k0", "k1", "k2", "k3", "k4", ""][nth as usize % 6];
+                let odd = nth / 6 % 2 == 1;
+                // A request with no key repeats a prompt: a pinned
+                // request's on even rounds, one the policy placed on odd
+                // rounds.
+                let repeated = match (key, odd) {
+                    ("", false) => kept.pop_front(),
+                    ("", true) => told.pop_front(),
+                    _ => None,
+                };
+                // A key's request at its pin's cap grows the key's first
+                // prompt on odd rounds. Every other states one of its own.
+                let (pin, at_cap) = pins.of(&host, key);
+                let first = *firsts.entry(key).or_insert(nth);
+                let grows = at_cap && odd;
+                let stated: Stated = match repeated {
+                    Some((stated, _)) => stated,
+                    None => (grows.then_some(first), nth),
+                };
+                let tokens = if stated.0.is_some() { 1_280 } else { 1_024 };
+                let hashes = prompt(&keyed, stated);
+                let asked = (key, tokens, nth);
+                let (guard, place, by) = host.decide_prompt(&keyed, members, asked, Some(&hashes));
+                pins.rule(&host, key, (place, by));
+                pins.sent(&host, key, place, verdict(&guard));
+                let mut guards = vec![guard];
+                if by == PlacedBy::Rule {
+                    pinned += 1;
+                    kept.push_back((stated, place));
+                } else {
+                    let hashes = prompt(&alone, stated);
+                    let asked = ("", tokens, nth);
+                    let (twin, twin_place, _) =
+                        host.decide_prompt(&alone, members, asked, Some(&hashes));
+                    assert_eq!(
+                        place, twin_place,
+                        "{workers} workers: request {nth}, {key:?}"
+                    );
+                    guards.push(twin);
+                    capped += u32::from(at_cap);
+                    let read = |(hits, of): (u32, u32), hit: bool| (hits + u32::from(hit), of + 1);
+                    if grows {
+                        grown = read(grown, Some(place) == pin);
+                    } else if at_cap {
+                        own = read(own, Some(place) == pin);
+                    }
+                    match repeated {
+                        Some((_, at)) if odd => back = read(back, place == at),
+                        Some((_, at)) => elsewhere = read(elsewhere, place != at),
+                        None => told.push_back((stated, place)),
+                    }
+                }
+                host.sent(guards, (key, nth), place);
+            }
+            let floors = pinned >= 8 && capped >= 8 && ended >= 8;
+            let readings = elsewhere.0 >= 4 && back.0 >= 4 && grown.0 >= 4;
+            // A grown prompt takes the pinned worker again more often than
+            // a prompt of its own: the prefix places it, not the load.
+            let by_prefix = grown.0 * own.1 > own.0 * grown.1;
+            assert!(
+                floors && readings && by_prefix,
+                "{workers} workers: {pinned} pinned requests, {capped} keyed requests at their \
+                 pin's cap, {ended} pinned requests ended, {elsewhere:?} repeats of a pinned \
+                 request's prompt placed off its pin's worker, {back:?} repeats of a placed \
+                 prompt sent back to its worker, {grown:?} grown prompts and {own:?} prompts of \
+                 their own placed at the cap on the pinned worker again"
             );
         }
     }

@@ -931,9 +931,10 @@ What an event does:
 | Completed | scorers and pickers that asked hear the outcome (status, time to first token, tokens in and out, duration) |
 | Released | the same stages hear the reason |
 
-A sessions rule places some requests alone, with no stage asked: it follows a pin of the request's
-key, or its own assignment places the key. The rule says whether such a request is the profile's
-own (`rule_placed`). Under `told`, the default, it is: the stages hear its issue and its dispatch,
+A sessions rule places some requests alone, behind the profile's filters and with no scorer or
+picker of the profile asked: it follows a pin of the request's key, or its own assignment places
+the key. The rule says whether such a request is the profile's own (`rule_placed`). Under `told`,
+the default, it is: the stages hear its issue and its dispatch,
 the profile counts it among its sends, and its prompt is recorded as behind any pick. Under
 `untold` it is kept from the profile: no stage hears its issue or its dispatch, no profile counts
 it, and neither the engine's record of sent prefixes nor a lent token tree takes its prompt. The
@@ -946,6 +947,7 @@ tree's store, and the hand-over of a pin followed by one row. Such a pin that is
 goes through the lookup that names a request's holders with its answer made, so its prompt is
 recorded as a pin's the whole decision follows. A controller that tells a dispatch off a lease on
 file has no such word yet: it takes the document, and its stages hear such a request as any other.
+Its decision is the engine's own, so its record of sent prefixes follows the word all the same.
 
 Upkeep, about once a second (`sweep`): expired session keys are removed, and the record of sent
 prefixes gets a bounded step of clean-up.
