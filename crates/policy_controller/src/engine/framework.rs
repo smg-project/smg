@@ -3746,6 +3746,18 @@ impl Marks {
         self.0 & Self::OTHER_PLACE != 0
     }
 
+    /// Whether a profile of these marks reads a lent ring by another kind
+    /// of place than a profile of `live`'s: one of the two places by the
+    /// routing value's own text and the other reads the ring by another
+    /// text. The place a request states is the live profile's kind, so it
+    /// is no place of such a profile. A profile that reads no ring is
+    /// apart from none.
+    const fn ring_apart(self, live: Self) -> bool {
+        let form = Self::KEY_PLACE | Self::OTHER_PLACE;
+        let (own, live) = (self.0 & form, live.0 & form);
+        own != 0 && live != 0 && own != live
+    }
+
     /// A scope to open and no key's mark: the opening's first arm.
     const fn opens_first(self) -> bool {
         self.0 & Self::SCOPED != 0
@@ -4905,10 +4917,13 @@ impl Engine {
     /// prefill, a scorer of its decode profile does. And no scorer of
     /// either reads a ring by another text: a pair's two sides are handed
     /// one ring and one place, so a side of another ring form would take
-    /// that place for its own. `false` where no binding matches. One
-    /// lookup, which only a request that lends a ring pays. A caller that
-    /// writes a request's facts itself asks it before it takes the place
-    /// with the request's keys
+    /// that place for its own. `false` where no binding matches. Only a
+    /// request that lends a ring pays for the answer: one lookup of its
+    /// binding, and a second for a pair's decode profile. A decode asked
+    /// again is answered for a decode request's own binding, which a
+    /// document may order ahead of the pair's, as [`Self::sample_for`]
+    /// answers. A caller that writes a request's facts itself asks it
+    /// before it takes the place with the request's keys
     /// ([`KeySources::derive_keys`](crate::document::KeySources::derive_keys)).
     #[must_use]
     pub fn states_key_place(&self, model: &str, phase: Phase) -> bool {
@@ -5789,7 +5804,10 @@ impl Engine {
     /// rows. The run only updates the shadow's stages and scratch. It
     /// claims and renews no session pin, and it is lent no word of the pool
     /// ([`PoolFacts::word`]): the live decision alone turns the list's
-    /// rotation.
+    /// rotation. It is lent the ring its request lends
+    /// ([`RequestFacts::ring`]) only where it reads a ring by the live
+    /// profile's kind of place: the place stated is the live profile's, so
+    /// a shadow that reads a ring by another text places on its own ring.
     ///
     /// Make the request's live decision through [`Self::decide_keeping`]
     /// and hand this call its scratch, before the scratch decides again.
@@ -5846,6 +5864,24 @@ impl Engine {
             };
             return Some(shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, trace));
         }
+        // The place a request states on a lent ring is the live profile's
+        // kind of place. A shadow that reads a ring by the other kind is
+        // lent none: the place is not its own, and it places on its own
+        // ring.
+        let live = profile_index(&entry.binding, facts.phase);
+        let live = live.and_then(|at| self.marks.get(usize::from(at)));
+        let unlent;
+        let facts = match live {
+            Some(&live) if facts.ring.is_some() && marks.ring_apart(live) => {
+                unlent = RequestFacts {
+                    ring: None,
+                    ring_positions: &[],
+                    ..*facts
+                };
+                &unlent
+            }
+            _ => facts,
+        };
         // The pool's own word counts the live decision's turns alone: a
         // shadow is lent none, and its picker turns a rotation of its own.
         let pool = &PoolFacts {
@@ -7025,6 +7061,13 @@ impl Engine {
     /// scratch and the shadow profile's stages, and nothing a commit
     /// reads.
     ///
+    /// A side's shadow is handed the ring its request lends whatever its
+    /// ring form: the rule of a single's shadow ([`Self::shadow`]) is not
+    /// asked here. No host asks a pair's shadows yet. The change that asks
+    /// them holds a side's shadow to that rule against both live sides'
+    /// marks together, as [`Self::states_key_place`] reads them: a pair is
+    /// lent one place for its two sides.
+    ///
     /// `None` where the binding names no shadow for the side, where the
     /// build did not find that profile free to run beside the live one
     /// ([`side_shadows`]), and where it would be handed another column
@@ -7114,7 +7157,9 @@ impl Engine {
     /// pair with the held `prefill`, on the call's own draw sequence.
     /// `at` is the pair binding's position ([`Self::pair_position`]). The
     /// run writes the scratch and the shadow profile's stages, and
-    /// nothing a commit reads.
+    /// nothing a commit reads. The shadow is handed the ring its request
+    /// lends as [`Self::shadow_side`] hands it, under the same word for
+    /// the change that asks it.
     ///
     /// `None` where [`Self::shadow_side`] says none for the decode side,
     /// and where the held prefill left the rows. The same beside a decode

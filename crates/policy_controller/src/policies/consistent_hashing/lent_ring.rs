@@ -18,7 +18,9 @@ use std::fmt;
 pub trait LentRing: fmt::Debug + Send + Sync {
     /// Where `key` stands on the ring: the ring's own hash of the key's
     /// text. A caller states it for the request's key. A ring that holds
-    /// no worker answers too: its key is placed by the position alone.
+    /// no worker answers too: the plain ring places its key by the
+    /// position alone, and the prefix form leaves it to the stages behind
+    /// the ring.
     fn position(&self, key: &str) -> u64;
 
     /// The walk from `position`: `take` is asked about the ring's workers,

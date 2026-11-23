@@ -674,6 +674,23 @@ fn the_classic_prefix_hash_rows_replay_pick_for_pick_and_share_for_share() {
     assert!(defects.is_empty(), "{defects:#?}");
 }
 
+/// The prefix hash rows that say where their requests stand on a ring are
+/// replayed a second time on a ring their caller lends, built from each
+/// row, and hold their recorded answers: the rows that list their workers
+/// in a request's ring order, the level rows and the row with nothing to
+/// hash. The pairs rows and the spread row are not among them: on a lent
+/// ring which tokens a key holds, and how keys spread, is its caller's.
+#[test]
+fn the_classic_prefix_hash_rows_replay_on_a_ring_their_caller_lends() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/classic/sheets");
+    let sheet = fs::read_to_string(dir.join("prefix_hash.json")).expect("the sheet is readable");
+    for (text, rows) in [(classic::prefix_hash::INLINE, 19), (sheet.as_str(), 31)] {
+        let (replayed, defects) = classic::prefix_hash::replay_on_a_lent_ring(text);
+        assert_eq!(replayed, rows, "the rows replayed on a lent ring");
+        assert!(defects.is_empty(), "{defects:#?}");
+    }
+}
+
 #[test]
 fn the_classic_sticky_override_rows_replay_pick_for_pick_and_share_for_share() {
     let (rows, defects) = replay_sheet(classic::sticky_override::INLINE, "the inline rows");

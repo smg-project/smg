@@ -4,6 +4,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{BTreeSet, HashMap},
     ptr,
+    sync::atomic::{self, AtomicU32},
     time::{Duration, Instant},
 };
 
@@ -19,10 +20,11 @@ use tokio::time::sleep;
 use super::*;
 use crate::{
     document::spec::{
-        FilterSpec, KeySourceSpec, OverloadSpec, PolicySpec, RoutingKeySpec, MANUAL_SESSION_HEADER,
+        BoundedLoadParams, ConsistentHashParams, FilterSpec, KeySourceSpec, OverloadSpec,
+        PolicySpec, RoutingKeySpec, ScoreStage, ShadowSpec, MANUAL_SESSION_HEADER,
     },
     engine::{
-        decision::{Queue, Shed, Target, Targets, Trace},
+        decision::{Queue, ShadowKind, Shed, Target, Targets, Trace},
         decision_engine::Decided,
         framework::{Filter, Picker, Place, TieBand},
         records::worker_id,
@@ -1634,10 +1636,30 @@ fn a_placement_names_the_routing_value_its_document_derived() {
 /// 882be6f4f). The caller states the ring and nothing else: the one call
 /// reads the value's place with the request's keys. A request with neither
 /// value states no place, and one that lends no ring is placed by the
-/// stage's own ring.
+/// stage's own ring. Under a bounded-load rule the ring stage reads the
+/// lent ring alike: every worker here is idle, so the place's owner is
+/// within the bound. A decision held to the workers a route's rule takes
+/// walks the ring from the same place: the walk passes every other worker
+/// over, and the first of the rule's workers it reaches is the place's
+/// owner, whichever of them stands first in the list.
 #[test]
 fn a_request_that_lends_its_ring_goes_where_that_rings_walk_reaches() {
-    let engine = hosted(preset("consistent_hashing"));
+    lent_ring_places(hosted(preset("consistent_hashing")));
+    let mut document = PolicySpec::preset("consistent_hashing").expect("a preset's name");
+    for profile in document.profiles.values_mut() {
+        profile.score[0] = ScoreStage::ConsistentHash(ConsistentHashParams {
+            bounded_load: Some(BoundedLoadParams::default()),
+            ..ConsistentHashParams::default()
+        })
+        .into();
+    }
+    lent_ring_places(hosted(engine_of(&document)));
+}
+
+/// The requests of
+/// [`a_request_that_lends_its_ring_goes_where_that_rings_walk_reaches`]
+/// under `engine`.
+fn lent_ring_places(engine: &'static PolicyEngine) {
     let list = pool(8);
     let members = engine.pool_members(&list);
     let order = [6, 1, 4, 0, 7, 2, 5, 3];
@@ -1681,6 +1703,103 @@ fn a_request_that_lends_its_ring_goes_where_that_rings_walk_reaches() {
     // No ring lent: the stage's own ring keeps the value on one worker.
     assert_eq!(stated(&keyed, None), (false, Vec::new()));
     assert_eq!(placed(&keyed, None), placed(&keyed, None));
+    // A route's rule that takes two workers alone: the sixth and the eighth
+    // the walk reaches from the key's place. It refuses the first decision's
+    // four targets, so the next one is held to the rule's two places.
+    let mut eighth_first = 0;
+    for key in ["conv-1", "conv-2", "conv-3", "conv-4", "conv-5", "conv-6"] {
+        let from = ring.position(key) % 8;
+        let along = |steps: u64| order[((from + steps) % 8) as usize];
+        let taken = [along(5), along(7)].map(|at| worker_id(list[at].as_ref()));
+        let admits = |worker: &dyn Worker| taken.contains(&worker_id(worker));
+        let headers = [("x-smg-routing-key", key)];
+        let ruled = PlaceRequest {
+            headers: &headers,
+            ring: Some(&ring),
+            admits: Some(&admits),
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        };
+        let placement = engine.place(&ruled).expect("a placement");
+        assert!(Arc::ptr_eq(&placement.worker, &list[along(5)]), "{key}");
+        eighth_first += usize::from(along(7) < along(5));
+    }
+    assert!(eighth_first > 0, "no key has the eighth ahead in the list");
+}
+
+/// [`Lent`], with a count of the keys it was asked the place of.
+#[derive(Debug)]
+struct Asked(Lent, AtomicU32);
+
+impl LentRing for Asked {
+    fn position(&self, key: &str) -> u64 {
+        self.1.fetch_add(1, atomic::Ordering::Relaxed);
+        self.0.position(key)
+    }
+
+    fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
+        self.0.walk(position, take);
+    }
+}
+
+/// A request's key is placed on the lent ring once: a second making of the
+/// request states the place the first took, and the ring is asked nothing.
+#[test]
+fn a_requests_key_is_asked_of_the_lent_ring_once() {
+    let engine = hosted(preset("consistent_hashing"));
+    let list = pool(2);
+    let members = engine.pool_members(&list);
+    let order = vec![list[1].url().to_owned(), list[0].url().to_owned()];
+    let ring = Asked(Lent(order), AtomicU32::new(0));
+    let headers = [("x-smg-routing-key", "conv-1")];
+    let request = PlaceRequest {
+        headers: &headers,
+        ring: Some(&ring),
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+    };
+    let made = Made::new(engine, &request, &[]);
+    let first = made.make(engine.spec()).facts.ring_positions.to_vec();
+    let again = made.make(engine.spec()).facts.ring_positions.to_vec();
+    assert_eq!(first, [ring.0.position("conv-1")]);
+    assert_eq!(again, first);
+    assert_eq!(ring.1.load(atomic::Ordering::Relaxed), 1);
+}
+
+/// A shadow profile is lent the request's ring only where it reads a ring
+/// by the live profile's kind of place. Beside a live `consistent_hashing`
+/// profile the place stated is the routing value's own text, and the
+/// client's for a request its client alone keys: no place of `prefix_hash`,
+/// which has nothing to hash for such a request and takes the worker with
+/// the fewest requests (`PrefixHashPolicy::select_worker_impl` in
+/// `model_gateway/src/policies/prefix_hash.rs`). So the shadow answers the
+/// idle worker, and is counted as another target than the ring's owner,
+/// which holds two requests.
+#[test]
+fn a_shadow_of_another_ring_form_is_lent_no_ring() {
+    let mut document = PolicySpec::preset("consistent_hashing").expect("a built-in preset");
+    let prefix = PolicySpec::preset("prefix_hash").expect("a built-in preset");
+    let twin = prefix.profiles.into_values().next();
+    document
+        .profiles
+        .insert("twin".into(), twin.expect("the preset's profile"));
+    document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+    document.generation = 1;
+    let engine = hosted(engine_of(&document));
+    let list = pool(2);
+    let members = engine.pool_members(&list);
+    let ring = Lent(vec![list[0].url().to_owned()]);
+    list[0].increment_load();
+    list[0].increment_load();
+    let headers = [("x-forwarded-for", "10.0.0.1")];
+    let request = PlaceRequest {
+        headers: &headers,
+        ring: Some(&ring),
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+    };
+    let placement = engine.place(&request).expect("a placement");
+    assert!(Arc::ptr_eq(&placement.worker, &list[0]), "the ring's owner");
+    // Agreed, another target, another outcome, skipped.
+    let counted = ShadowKind::ALL.map(|kind| engine.shadowed(0, kind));
+    assert_eq!(counted, [0, 1, 0, 0]);
 }
 
 /// A ring no decision may ask.
