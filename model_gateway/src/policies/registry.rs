@@ -417,8 +417,10 @@ impl PolicyRegistry {
     /// The registry of a gateway of `config`: the classic one
     /// ([`Self::with_override`]), or the one that makes no classic policy
     /// where the configuration runs the policy controller
-    /// ([`Self::for_policy_engine`]), under the configuration's pairing
-    /// mode. The one place that reads the option for the registry.
+    /// ([`Self::for_policy_engine`]), under the pairing mode in force
+    /// ([`RouterConfig::pd_pairing_in_force`]): a supplied document's own
+    /// where the policy controller runs one, else the configuration's. The
+    /// one place that reads the option for the registry.
     pub fn of_config(config: &RouterConfig) -> Self {
         let (policy, routing_key_override) =
             (config.policy.clone(), config.routing_key_override.clone());
@@ -427,7 +429,7 @@ impl PolicyRegistry {
         } else {
             Self::with_override(policy, routing_key_override)
         };
-        registry.with_pd_pairing_mode(config.pd_pairing_mode)
+        registry.with_pd_pairing_mode(config.pd_pairing_in_force())
     }
 
     /// The registry's fields from what a constructor made: `made` classic
@@ -1601,7 +1603,7 @@ impl LoadConsumer for PolicyRegistry {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
-    use smg_policy_controller::document::{AppliedSpec, PolicySpec};
+    use smg_policy_controller::document::{AppliedSpec, Pairing, PolicySpec};
     use smg_worker::{
         identity::basic::{Worker, WorkerLoadGuard, WorkerType},
         load::state::LoadSnapshot,
@@ -1612,6 +1614,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        config::RoutingMode,
         policies::{
             hash_ring::HashRing, test_support::headers_with_routing_key, BucketConfig,
             BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LeastLoadPolicy, SelectWorkerInfo,
@@ -1749,6 +1752,62 @@ mod tests {
         let cache_aware = PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096);
         assert_eq!(asked(cache_aware, "round_robin"), (false, false));
         assert_eq!(asked(PolicyConfig::RoundRobin, "cache_aware"), (true, true));
+    }
+
+    /// Under the policy engine a supplied document's pairing is the mode
+    /// the registry answers, by which every pair route reads its pair
+    /// index: the engine pairs within the classes that index states. The
+    /// configuration's own mode stands with the option off, and under the
+    /// document the routing settings mean, which states that mode.
+    #[test]
+    fn under_the_policy_engine_a_supplied_documents_pairing_is_the_registrys() {
+        let pair_mode = || RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        assert_eq!(
+            RouterConfig::default().pd_pairing_mode,
+            PdPairingMode::Lenient
+        );
+        for (pairing, mode) in [
+            (Pairing::Off, PdPairingMode::Off),
+            (Pairing::Lenient, PdPairingMode::Lenient),
+            (Pairing::Strict, PdPairingMode::Strict),
+        ] {
+            let mut document =
+                PolicySpec::pair_presets("round_robin", "round_robin").expect("paired presets");
+            document.plans.pd_pair.pairing = pairing;
+            let supplied = RouterConfig {
+                mode: pair_mode(),
+                policy_controller: true,
+                policy_spec: Some(document.clone()),
+                ..RouterConfig::default()
+            };
+            // The document is the one in force beside the default settings.
+            assert_eq!(supplied.policy_document_in_force(), Ok(document));
+            assert_eq!(PolicyRegistry::of_config(&supplied).pd_pairing_mode(), mode);
+            // With the option off no document is in force.
+            let off = RouterConfig {
+                policy_controller: false,
+                ..supplied
+            };
+            assert_eq!(
+                PolicyRegistry::of_config(&off).pd_pairing_mode(),
+                PdPairingMode::Lenient
+            );
+        }
+        let settings = RouterConfig {
+            mode: pair_mode(),
+            policy_controller: true,
+            pd_pairing_mode: PdPairingMode::Strict,
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            PolicyRegistry::of_config(&settings).pd_pairing_mode(),
+            PdPairingMode::Strict
+        );
     }
 
     /// The static needs the host answers before any request exists: a

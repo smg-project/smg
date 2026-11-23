@@ -51,6 +51,24 @@ impl RouterConfig {
         self.routing_settings().policy_document_in_force(&defaults)
     }
 
+    /// How strictly this gateway pairs a prefill with a decode. Where the
+    /// policy controller runs a supplied document, it is that document's
+    /// `plans.pd-pair.pairing`: the engine pairs within the classes the
+    /// gateway derives and derives none itself, so the document's word is
+    /// the mode they are derived under. Everywhere else it is the
+    /// configuration's own mode, which the document the routing settings
+    /// mean states too.
+    pub(crate) fn pd_pairing_in_force(&self) -> PdPairingMode {
+        match &self.policy_spec {
+            Some(document) if self.policy_controller => match document.plans.pd_pair.pairing {
+                Pairing::Off => PdPairingMode::Off,
+                Pairing::Lenient => PdPairingMode::Lenient,
+                Pairing::Strict => PdPairingMode::Strict,
+            },
+            _ => self.pd_pairing_mode,
+        }
+    }
+
     /// Validates the document over `stages`, with the gateway's own
     /// headers denied to the view: the form an engine is built from.
     ///
