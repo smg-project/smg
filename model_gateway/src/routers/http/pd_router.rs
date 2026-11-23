@@ -3262,10 +3262,10 @@ impl RouterTrait for PDRouter {
         // text, when a policy reads any, is owned by the selection's block and
         // dropped at its end, before the first await: neither its slot nor
         // its buffer rides in the task across the round trip.
-        let (worker, body) = {
+        let (placed, body) = {
             let (request_text, body) =
                 Self::count_tokens_routing_text(body, self.policies_need_request_text());
-            let Some(worker) = placement::select_single(
+            let Some(placed) = placement::select_single(
                 &self.worker_registry,
                 &self.policy_registry,
                 model_id,
@@ -3281,15 +3281,15 @@ impl RouterTrait for PDRouter {
                     candidate_filter: None,
                     tried: &[],
                 },
-            )
-            .map(placement::Placed::worker_alone_for_now) else {
+            ) else {
                 return error::service_unavailable(
                     "no_prefill_servers",
                     "No available prefill servers to count tokens",
                 );
             };
-            (worker, body)
+            (placed, body)
         };
+        let worker = placed.worker();
 
         if let Some(response) = overload::shed_if_worker_overloaded(
             worker.as_ref(),
@@ -3302,10 +3302,7 @@ impl RouterTrait for PDRouter {
             Ok(bytes) => bytes,
             Err(e) => return Self::handle_serialization_error(e),
         };
-        let _load_guard = WorkerLoadGuard::with_key(
-            worker.clone(),
-            self.policy_registry.sticky_header_key(headers),
-        );
+        let _load_guard = placed.guard(self.policy_registry.sticky_header_key(headers));
         let request = header_utils::apply_forwarded_request_headers(
             attach_sized_body(
                 worker
