@@ -1165,6 +1165,15 @@ impl PDRouter {
             // prefill was told of its decode (that engine's sizes, the rank
             // both sides go to, and the side channel a WRITE prefill pushes
             // to), so that pair's decode is not asked.
+            //
+            // Both sides stand as built for the decode the selection named,
+            // which is no MoRI-IO engine where the decode is asked. A MoRI-IO
+            // decode takes the transfer its prefill was told of, and this
+            // prefill was told of none. So the ask is held to a decode that
+            // is no such engine, beside the retry's rule.
+            let keeps_the_shape = |worker: &dyn Worker| {
+                !is_moriio_worker(worker) && candidate_filter.is_none_or(|accepts| accepts(worker))
+            };
             let moved_to = parking_lot::Mutex::new(None);
             let ask = |first: &Placed, ahead: WorkerLoadGuard| {
                 let inputs = PlacementInputs {
@@ -1175,7 +1184,7 @@ impl PDRouter {
                     // The derived key again, as the selection stated it.
                     rid: rid_key.as_deref(),
                     cache_namespace,
-                    candidate_filter,
+                    candidate_filter: Some(&keeps_the_shape),
                     tried: &tried_before,
                 };
                 let pairs = || self.pd_pairs(model_id);
