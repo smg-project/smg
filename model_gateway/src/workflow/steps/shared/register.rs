@@ -225,10 +225,11 @@ fn after_write(
     workers: &[Arc<dyn Worker>],
     symphony_table: Option<&'static str>,
 ) {
-    // Under Symphony the failure classes of the table that reads these
-    // workers' model exist at zero from here, once every worker of the
-    // batch is in the registry: a registration refused before leaves no
-    // series behind. The table was resolved where the model card and the
+    // Where Symphony reads these workers' model (under `--parser symphony`,
+    // and for the Harmony family under either choice) the failure classes
+    // of the table that reads it exist at zero from here, once every worker
+    // of the batch is in the registry: a registration refused before leaves
+    // no series behind. The table was resolved where the model card and the
     // names are (none for an HTTP worker, the legacy parsers or a model
     // no table reads).
     if let Some(table) = symphony_table {

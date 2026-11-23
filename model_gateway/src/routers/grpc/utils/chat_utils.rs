@@ -1403,8 +1403,75 @@ pub fn process_chat_messages_with_encoding(
         placeholder_tokens.as_ref(),
         MediaPartOrder::MediaFirst,
         ProviderProfile::for_model(&request.model),
+        false,
     )
     .map_err(String::from)
+}
+
+/// The turns of a conversation as the Harmony family's chat template reads them. It writes
+/// one call a turn and names a result by the call before it, so a turn of several calls
+/// becomes one turn a call, each followed by its own result. It reads a turn's earlier thought
+/// under `thinking`, and refuses one beside a content in a turn that calls.
+fn harmony_family_turns(messages: Vec<Value>) -> Vec<Value> {
+    let has_content = |message: &Value| match &message["content"] {
+        Value::Null => false,
+        Value::String(text) => !text.is_empty(),
+        Value::Array(parts) => !parts.is_empty(),
+        _ => true,
+    };
+    let mut out = Vec::with_capacity(messages.len());
+    let mut rest = messages.into_iter().peekable();
+    while let Some(mut message) = rest.next() {
+        if message["role"] != "assistant" {
+            out.push(message);
+            continue;
+        }
+        let calls = message["tool_calls"].as_array().map_or(0, Vec::len);
+        if message.get("thinking").is_none() && (calls == 0 || !has_content(&message)) {
+            let thought = message["reasoning_content"].as_str().map(str::to_string);
+            if let Some(thought) = thought {
+                message["thinking"] = Value::String(thought);
+            }
+        }
+        if calls < 2 {
+            out.push(message);
+            continue;
+        }
+        let mut results = Vec::new();
+        while rest.peek().is_some_and(|next| next["role"] == "tool") {
+            results.extend(rest.next());
+        }
+        let Some(Value::Array(turn_calls)) = message
+            .as_object_mut()
+            .and_then(|turn| turn.remove("tool_calls"))
+        else {
+            out.push(message);
+            out.extend(results);
+            continue;
+        };
+        for (at, call) in turn_calls.into_iter().enumerate() {
+            let mut turn = message.clone();
+            if at > 0 {
+                if let Some(turn) = turn.as_object_mut() {
+                    // The key goes: the template tests `"content" in message` and then
+                    // searches the content, so it refuses a null one.
+                    turn.remove("content");
+                    turn.remove("thinking");
+                    turn.remove("reasoning_content");
+                }
+            }
+            let result = results
+                .iter()
+                .position(|result| result["tool_call_id"] == call["id"]);
+            turn["tool_calls"] = Value::Array(vec![call]);
+            out.push(turn);
+            if let Some(result) = result {
+                out.push(results.remove(result));
+            }
+        }
+        out.extend(results);
+    }
+    out
 }
 
 /// Render the chat prompt. The second element says how the tokenize step must
@@ -1416,6 +1483,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
     provider: ProviderProfile,
+    harmony_family: bool,
 ) -> Result<(ProcessedMessages, PromptEncoding), PromptError> {
     let rendered = {
         // Get content format and transform messages accordingly: the format
@@ -1437,6 +1505,9 @@ pub(crate) fn process_chat_messages_with_placeholders(
         // Transformers docs expect.
         if !tokenizer.renderer_capabilities().raw_tool_call_arguments {
             process_tool_call_arguments(&mut transformed_messages);
+        }
+        if harmony_family {
+            transformed_messages = harmony_family_turns(transformed_messages);
         }
 
         // The tools as the template reads them, prepared once per distinct

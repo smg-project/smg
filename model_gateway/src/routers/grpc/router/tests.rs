@@ -179,7 +179,6 @@ fn pipelines_of(router: &GrpcRouter) -> Vec<&RequestPipeline> {
         Some(&router.pipeline),
         Some(&router.messages_pipeline),
         Some(&router.completion_pipeline),
-        router.harmony_pipeline.as_ref(),
         router.embedding_pipeline.as_ref(),
         router.classify_pipeline.as_ref(),
         router.decisions_pipeline.as_ref(),
@@ -1967,6 +1966,62 @@ async fn a_responses_answer_names_the_parser_the_chat_route_names() {
     }
 }
 
+/// A model of the Harmony family is read by its table under the legacy choice too, by the
+/// gateway's flag and by the request's header, on the chat route, on a Responses turn and on a
+/// Messages request: no legacy parser reads the family, so the answer names Symphony and holds
+/// the thought apart.
+#[tokio::test]
+async fn a_harmony_family_model_is_read_by_its_table_under_the_legacy_choice() {
+    const MODEL: &str = "openai/gpt-oss-20b";
+    const OUTPUT: &str = "<|channel|>analysis<|message|>plan<|end|><|start|>assistant\
+                          <|channel|>final<|message|>Hello";
+    const TEMPLATE: &str = "{% for message in messages %}<|start|>{{ message.role }}\
+                            <|message|>{{ message.content }}<|end|>{% endfor %}<|start|>assistant";
+    let mut legacy = HeaderMap::new();
+    legacy.insert("x-smg-parser", HeaderValue::from_static("legacy"));
+    for (flag, headers) in [
+        (ParserChoice::Legacy, HeaderMap::new()),
+        (ParserChoice::Symphony, legacy),
+    ] {
+        let ctx = grpc_ctx_with_parsers(regular_routing_mode(), flag, None).await;
+        register_tokenizer_for(&ctx, MODEL, TEMPLATE, (OUTPUT, 102)).await;
+        let port = spawn_engine(vec![102]).await;
+        register_worker(
+            &ctx,
+            &format!("grpc://127.0.0.1:{port}"),
+            WorkerType::Regular,
+            ModelCard::new(MODEL),
+        );
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("router");
+        let (status, parser, answer) = chat(&router, MODEL, &headers).await;
+        assert_eq!(status, StatusCode::OK, "{flag:?}: {answer}");
+        assert_eq!(parser.as_deref(), Some("symphony"), "{flag:?}: {answer}");
+        let message = &answer["choices"][0]["message"];
+        assert_eq!(message["reasoning_content"], "plan", "{flag:?}: {answer}");
+        assert_eq!(message["content"], "Hello", "{flag:?}: {answer}");
+        let (status, parser, answer) = responses(&router, MODEL, &headers, false).await;
+        assert_eq!(status, StatusCode::OK, "{flag:?}: {answer}");
+        assert_eq!(parser.as_deref(), Some("symphony"), "{flag:?}: {answer}");
+        let message = router
+            .route_messages(
+                Some(&headers),
+                &TenantRequestMeta::new(TenantKey::new("test-tenant")),
+                Arc::new(message_request(json!({
+                    "model": MODEL, "max_tokens": 16,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))),
+                MODEL,
+            )
+            .await;
+        assert_eq!(message.status(), StatusCode::OK, "{flag:?}");
+        assert_eq!(
+            message.headers().get("x-smg-parser"),
+            Some(&HeaderValue::from_static("symphony")),
+            "{flag:?}"
+        );
+    }
+}
+
 /// The per-request media series count a `max_tokens: 0` request as the
 /// route counts it, as a Messages request; a count_tokens call of the same
 /// prompt is not a request and leaves the series as they were.
@@ -2163,12 +2218,13 @@ async fn a_router_built_inside_a_storage_context_scope_stores_no_request_context
     let router = with_request_context(scope, async { GrpcRouter::new(&ctx, Mode::Regular) })
         .await
         .expect("regular router");
-    for context in [&router.responses_context, &router.harmony_responses_context] {
-        let context = context.as_ref().expect("a responses context");
-        assert!(
-            context.request_context.is_none(),
-            "the router stored a construction-time storage context: {:?}",
-            context.request_context
-        );
-    }
+    let context = router
+        .responses_context
+        .as_ref()
+        .expect("a responses context");
+    assert!(
+        context.request_context.is_none(),
+        "the router stored a construction-time storage context: {:?}",
+        context.request_context
+    );
 }

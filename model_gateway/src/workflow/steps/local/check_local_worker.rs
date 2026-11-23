@@ -21,13 +21,14 @@ use crate::{
     routers::{
         common::snapshot::WorkerRegistry,
         grpc::{
+            is_harmony_card,
             multimodal::{
                 mm_settings, pool_processes_media_refs, registration_lacks_media_processing,
             },
             regular::symphony::{
                 check_names, labels_select_nothing, set_aside_by_the_registry, table_label_read,
             },
-            utils::{ModelNames, Names},
+            utils::{ModelNames, Names, ParserResolver},
             zmq_client::zmq_handshake_address,
         },
     },
@@ -112,6 +113,7 @@ impl StepExecutor<WorkerWorkflowData> for CheckLocalWorkerStep {
         // Publish the table's counters only after the worker is registered.
         context.data.host_notes.symphony_table = symphony_table_of(
             &model_card,
+            ParserResolver::card_names_among(workers, &model_card.id),
             app_context.router_config.parser,
             *connection_mode,
             &flags,
@@ -223,7 +225,9 @@ pub(super) fn warn_on_conflicting_parser_overrides(
 /// strings a request carried, and these may be the worker's own report. Then parser-override
 /// names the registries don't know: the legacy parsers', and, under `--parser symphony`,
 /// Symphony's tables (`regular::symphony::check_names`). A name whose factory is absent is not
-/// checked against a registry (parsers unused in that configuration).
+/// checked against a registry (parsers unused in that configuration). The names are checked
+/// under the choice that reads the card's requests ([`choice_reading`]), so a card of the
+/// Harmony family may name its table under `--parser legacy` too.
 pub(super) fn validate_parser_overrides(
     card: &ModelCard,
     worker_url: &str,
@@ -235,7 +239,7 @@ pub(super) fn validate_parser_overrides(
         return Err(refusal);
     }
     check_names(
-        parser,
+        choice_reading(card, parser),
         &card_names(card),
         tool_parser_factory,
         reasoning_parser_factory,
@@ -258,8 +262,22 @@ fn card_names(card: &ModelCard) -> Names {
     }
 }
 
-/// Under `--parser symphony`, the table whose failure classes the registration step publishes at
-/// zero for a gRPC or ZMQ worker of `card`'s model, as this worker's labels and the gateway's flags
+/// The parser choice that reads the requests of `card`'s model at registration: the gateway's,
+/// but Symphony for a card of the Harmony family, whose table reads its requests under either
+/// choice (`regular::symphony::choice_for`).
+fn choice_reading(card: &ModelCard, parser: ParserChoice) -> ParserChoice {
+    if is_harmony_card(&card.architectures, card.hf_model_type.as_deref(), &card.id) {
+        ParserChoice::Symphony
+    } else {
+        parser
+    }
+}
+
+/// Where Symphony reads the requests of `card`'s model ([`choice_reading`]: under `--parser
+/// symphony`, and for a card of the Harmony family under either choice), the table whose failure
+/// classes the registration step publishes at zero for a gRPC or ZMQ worker of the model, as
+/// this worker's `labels` (the names a request reads for the model,
+/// `ParserResolver::card_names_among`) and the gateway's flags
 /// select it, so `failed`, `malformed` and the rest exist before the first such output
 /// (`regular::symphony::telemetry::init_table_series`, called once the worker is in the registry).
 /// Every worker of a model resolves one (a later worker whose labels select another table brings
@@ -269,14 +287,16 @@ fn card_names(card: &ModelCard) -> Names {
 /// start-up).
 fn symphony_table_of(
     card: &ModelCard,
+    labels: Names,
     parser: ParserChoice,
     connection_mode: ConnectionMode,
     flags: &Names,
 ) -> Option<&'static str> {
-    if parser != ParserChoice::Symphony || connection_mode == ConnectionMode::Http {
+    if choice_reading(card, parser) != ParserChoice::Symphony
+        || connection_mode == ConnectionMode::Http
+    {
         return None;
     }
-    let labels = card_names(card);
     table_label_read(&ModelNames { labels, flags }, &card.id)
 }
 
@@ -498,7 +518,13 @@ mod tests {
     fn a_workers_registration_resolves_the_table_whose_failure_classes_are_published() {
         let known = ModelCard::new("Qwen/Qwen3-8B");
         let table = |card: &ModelCard, parser, connection_mode| {
-            symphony_table_of(card, parser, connection_mode, &Names::default())
+            symphony_table_of(
+                card,
+                card_names(card),
+                parser,
+                connection_mode,
+                &Names::default(),
+            )
         };
         assert_eq!(
             table(&known, ParserChoice::Legacy, ConnectionMode::Grpc),
@@ -528,7 +554,7 @@ mod tests {
     /// worker is in the registry: under `--parser symphony` a gRPC worker of a model the registry
     /// knows resolves the registry's table in the check step, a registration the registration
     /// step refuses leaves no series behind, and an accepted one leaves the table's failure classes
-    /// at zero.
+    /// at zero. A worker of the Harmony family resolves its table under `--parser legacy` too.
     #[tokio::test]
     async fn a_refused_registration_publishes_no_table_and_an_accepted_one_its_failure_classes() {
         use crate::workflow::steps::RegisterWorkersStep;
@@ -592,6 +618,26 @@ mod tests {
             }),
             "{scrape}"
         );
+
+        // A worker of the Harmony family resolves its table under the legacy choice too: the
+        // table reads its requests under either.
+        let legacy = app_context_with(
+            RouterConfig::builder()
+                .worker_startup_timeout_secs(1)
+                .parser(ParserChoice::Legacy)
+                .build_unchecked(),
+        );
+        let mut ctx =
+            grpc_worker_context("openai/gpt-oss-20b", WorkerRegistrationMode::Upsert, legacy);
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        assert_eq!(
+            CheckLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        assert_eq!(ctx.data.host_notes.symphony_table, Some("gpt_oss"));
     }
 
     /// A registration context for a gRPC worker of `model` at a loopback URL
@@ -1349,6 +1395,14 @@ mod tests {
         card.reasoning_parser = Some("kimi_k3".to_string());
         assert!(check(&card, ParserChoice::Symphony).is_ok());
         assert!(check(&card, ParserChoice::Legacy).is_ok());
+        // A card of the Harmony family names its table under the legacy choice too, and binds
+        // the other override as under Symphony: the table reads its requests under either.
+        let mut family = ModelCard::new("openai/gpt-oss-20b");
+        family.tool_parser = Some("gpt_oss".to_string());
+        assert!(check(&family, ParserChoice::Legacy).is_ok());
+        family.reasoning_parser = Some("qwen3".to_string());
+        let err = check(&family, ParserChoice::Legacy).expect_err("bound to the table");
+        assert!(err.contains("same table"), "{err}");
     }
 
     #[test]

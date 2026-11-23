@@ -2237,8 +2237,11 @@ jobs:
             repository="${pinned%@*}"
             revision="${pinned##*@}"
             echo "$repository at $revision"
+            # A checkpoint may keep its chat template in a file of its own
+            # (gpt-oss does): without it the gateway has no prompt to render.
             bash scripts/ci_retry.sh 3 30 hf download "$repository" --revision "$revision" \
-              --include '*.json' --local-dir "$ROUTER_LOCAL_MODEL_PATH/$repository"
+              --include '*.json' --include 'chat_template.jinja' \
+              --local-dir "$ROUTER_LOCAL_MODEL_PATH/$repository"
           done
           # The Harmony vocab the gateway loads when a gpt-oss worker registers
           # (from this directory, TIKTOKEN_ENCODINGS_BASE on the test step; a

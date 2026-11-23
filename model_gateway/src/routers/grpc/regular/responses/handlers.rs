@@ -29,7 +29,10 @@ use openai_protocol::responses::{ResponsesRequest, ResponsesResponse};
 use tracing::debug;
 use uuid::Uuid;
 
-use super::{common::ResponsesCallContext, conversions, non_streaming, streaming};
+use super::{
+    common::{refuse_forced_call_beside_json_text, ResponsesCallContext},
+    conversions, non_streaming, streaming,
+};
 use crate::{
     middleware::TenantRequestMeta,
     routers::{
@@ -173,6 +176,11 @@ async fn route_responses_streaming(
         Ok(result) => result,
         Err(response) => return response,
     };
+    if let Err(response) =
+        refuse_forced_call_beside_json_text(ctx, &params.model_id, &request, has_mcp_tools)
+    {
+        return response;
+    }
 
     if has_mcp_tools {
         debug!("MCP tools detected in streaming mode, using streaming tool loop");

@@ -976,6 +976,7 @@ impl Recorded for Table {
             | Self::Mistral
             | Self::MistralV13
             | Self::LongCat
+            | Self::GptOss
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
             // tagged ones' (no call comes of the fence); IQuest, Hy V3 (whose `<tool_call>` opens a

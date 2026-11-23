@@ -9,6 +9,10 @@ pub mod backend_client; // Polymorphism over gRPC vs ZMQ transports
 pub mod client; // Used by core/
 pub(crate) mod common;
 pub(crate) mod context;
+#[expect(
+    dead_code,
+    reason = "unreached since the family reads its Symphony table; the removal follows"
+)]
 pub(crate) mod harmony;
 pub(crate) mod mode;
 pub(crate) mod multimodal;

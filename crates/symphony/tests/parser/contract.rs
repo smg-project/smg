@@ -581,9 +581,8 @@ fn gpt_oss_template() -> Box<dyn Parser> {
     ))
 }
 
-/// The crate's own gpt-oss table, which no registry row lists yet.
 fn gpt_oss_table() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::gpt_oss(), Declared::default()))
+    Box::new(Engine::new(Table::GptOss.format(), Declared::default()))
 }
 
 fn space() -> Class {
@@ -1130,10 +1129,10 @@ const FORMATS: &[Subject] = &[
         table: None,
     },
     Subject {
-        name: "gpt-oss table, not listed yet",
+        name: "gpt-oss",
         new: gpt_oss_table,
         outputs: GPT_OSS_TABLE_OUTPUTS,
-        table: None,
+        table: Some(Table::GptOss),
     },
     Subject {
         name: "shaped calls on abstract tags",

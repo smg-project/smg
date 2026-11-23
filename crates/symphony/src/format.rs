@@ -381,6 +381,8 @@ pub struct Format {
     /// How a shaped call's values read.
     values: Values,
     thinks_first: bool,
+    /// The variant without calls is the table itself ([`Self::reads_undeclared_calls`]).
+    reads_undeclared_calls: bool,
     marker_tokens: Vec<String>,
     /// How the model's chat template writes a turn, where the table holds one.
     layout: Option<Box<Layout>>,
@@ -493,6 +495,7 @@ impl Format {
             stop_tokens: Vec::new(),
             values: Values::Inferred,
             thinks_first: false,
+            reads_undeclared_calls: false,
             marker_tokens: Vec::new(),
             layout: None,
             answer_whitespace: Whitespace::Free,
@@ -812,6 +815,15 @@ impl Format {
         self
     }
 
+    /// The family's legacy path read a call whatever the request declared, so a request with
+    /// no tool, or whose `tool_choice` is `none`, still reads one: [`Self::without_calls`]
+    /// leaves the table as it is.
+    #[must_use]
+    pub(crate) fn reads_undeclared_calls(mut self) -> Self {
+        self.reads_undeclared_calls = true;
+        self
+    }
+
     /// Whether the template writes the thought before every call and answer.
     pub(crate) fn writes_thought_first(&self) -> bool {
         self.thinks_first
@@ -1000,6 +1012,9 @@ impl Format {
     /// (`Self::is_remade`): in the table the call's syntax reads it and says what it is.
     #[must_use]
     pub fn without_calls(mut self) -> Self {
+        if self.reads_undeclared_calls {
+            return self;
+        }
         let frame = self.message_frame();
         let framing = self.message_framing();
         let demoted: Vec<bool> = self
@@ -2400,6 +2415,20 @@ mod tests {
                 .any(|e| matches!(e, crate::event::Event::Malformed { .. })),
             "{out:?}"
         );
+    }
+
+    #[test]
+    fn without_calls_reads_a_gpt_oss_call_as_its_legacy_path_did() {
+        // The family's legacy path read a call whatever the request declared, so the variant
+        // is the table itself: a call the model writes with no tool declared is a call.
+        let format = crate::formats::gpt_oss().without_calls();
+        let out = events(
+            format,
+            "<|start|>assistant",
+            "<|channel|>commentary to=functions.get_time <|constrain|>json<|message|>{}<|call|>",
+        );
+        let (content, _, calls) = said(&out);
+        assert_eq!((content.as_str(), calls), ("", 1), "{out:?}");
     }
 
     #[test]

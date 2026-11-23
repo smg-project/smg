@@ -118,7 +118,7 @@ class TestSamplingParamsLocal(_SamplingParamsBase):
     """Regular model (Qwen via SGLang).
 
     The two ``stop`` rows read the gateway's own trim of the matched sequence; the Harmony
-    class has its own, where the sequence stays as the suffix of the output.
+    class has its own, which also read a turn that ended inside its thought.
     """
 
     def test_stop_sequence_ends_the_answer(self, model, api_client, mock_answers):
@@ -177,10 +177,8 @@ class TestSamplingParamsLocal(_SamplingParamsBase):
 class TestSamplingParamsHarmony(_SamplingParamsBase):
     """Harmony model (gpt-oss-20b via all gRPC backends).
 
-    The two ``stop`` rows read the Harmony shape of a stopped turn: the engine ends the
-    output at the sequence and the sequence stays as the suffix (the Harmony
-    detokenization is not channel-aware, as the chat rows of this model read it). On the
-    mock the engine's part is stated, so the rows read the shape; on an engine the
+    The two ``stop`` rows read the gateway's own trim of the matched sequence, as the rows
+    of the regular model do. On the mock the engine's part is stated; on an engine the
     forwarded ``stop`` is what ends the answer, and a dropped one runs on to the count's
     end.
     """
@@ -212,9 +210,7 @@ class TestSamplingParamsHarmony(_SamplingParamsBase):
         assert resp.status == "completed"
         text = self._answer_text(resp)
         assert text, "the text up to the stop sequence is the answer"
-        assert text.endswith(","), (
-            f"the stop sequence ',' should be the suffix of the output: {text!r}"
-        )
+        assert "," not in text, f"the stop sequence ',' should not appear: {text!r}"
         assert "2" not in text, f"the answer ran past the stop sequence: {text!r}"
 
     def test_stop_sequence_ends_the_streamed_answer(self, model, api_client, mock_answers):
@@ -242,7 +238,5 @@ class TestSamplingParamsHarmony(_SamplingParamsBase):
             f"the terminal object's text is the streamed text: {resp.output_text!r} vs {text!r}"
         )
         if text:
-            assert text.endswith(","), (
-                f"the stop sequence ',' should be the suffix of the streamed text: {text!r}"
-            )
+            assert "," not in text, f"the stop sequence ',' should not appear: {text!r}"
         assert "2" not in text, f"the answer ran past the stop sequence: {text!r}"

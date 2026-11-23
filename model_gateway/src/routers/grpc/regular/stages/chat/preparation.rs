@@ -3,7 +3,7 @@
 use axum::response::Response;
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{ToolChoice, ToolChoiceValue},
+    common::{ResponseFormat, ToolChoice, ToolChoiceValue},
     profile::ProviderProfile,
 };
 use tracing::{error, warn};
@@ -13,6 +13,7 @@ use crate::routers::{
     error,
     grpc::{
         context::{PreparationOutput, RequestContext},
+        harmony::HarmonyDetector,
         multimodal,
         regular::{
             stages::{
@@ -63,8 +64,13 @@ impl ChatPreparationStage {
         // when it carries one, else the gateway's --parser flag (see
         // `regular::symphony`). Decided once here; the constraint below and
         // request building read the same choice.
-        let parser = symphony::choice(ctx.components.parser, ctx.input.headers.as_ref())
-            .map_err(|why| error::bad_request("invalid_parser_header", why))?;
+        let parser = symphony::choice_for(
+            ctx.components.parser,
+            ctx.input.headers.as_ref(),
+            &ctx.components.worker_registry,
+            &ctx.input.model_id,
+        )
+        .map_err(|why| error::bad_request("invalid_parser_header", why))?;
         ctx.state.parser = Some(parser);
         let (token_ids, processed_messages, tool_constraints) =
             prepare_chat_like(ctx, request, self.wire_pools).await?;
@@ -90,6 +96,36 @@ pub(crate) async fn prepare_chat_like(
     request: &ChatCompletionRequest,
     wire_pools: &'static [RoutingPool],
 ) -> Result<(Vec<u32>, ProcessedMessages, symphony::PreparedConstraint), Response> {
+    // A turn of the Harmony family ends on its stop tokens: an engine told to write
+    // past them hands back a turn no reader can split.
+    let harmony_family = HarmonyDetector::is_harmony_model_in_registry(
+        &ctx.components.worker_registry,
+        &ctx.input.model_id,
+    );
+    if harmony_family && request.ignore_eos {
+        return Err(error::bad_request(
+            "ignore_eos_not_supported",
+            "ignore_eos is not supported for Harmony models",
+        ));
+    }
+    // A forced call beside a `response_format` that constrains the answer was refused by the
+    // family's own pipeline and stays refused: one turn cannot be held to both.
+    if harmony_family
+        && request.declares_tools()
+        && request
+            .tool_choice
+            .as_ref()
+            .is_some_and(ToolChoice::forces_call)
+        && request
+            .response_format
+            .as_ref()
+            .is_some_and(|format| !matches!(format, ResponseFormat::Text))
+    {
+        return Err(error::bad_request(
+            "invalid_request_parameters",
+            "Constrained decoding (response_format) is not compatible with tool calls",
+        ));
+    }
     // Validate against the rendered tool set, which allowed_tools may narrow.
     let body_ref = utils::request_as_rendered(request);
     utils::validate_chat_template_content_parts(&body_ref)
@@ -141,6 +177,7 @@ pub(crate) async fn prepare_chat_like(
                 media.placeholders(),
                 media_order,
                 provider,
+                harmony_family,
             ) {
                 Ok(msgs) => msgs,
                 Err(e) => {

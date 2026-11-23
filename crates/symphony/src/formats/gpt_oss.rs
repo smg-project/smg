@@ -19,7 +19,10 @@
 
 use crate::{
     format::{CallSyntax, Emits, Format},
-    shape::{self, Arguments, Atom, CallShape, Class, Dialect, NameSource, Pattern, Slot},
+    shape::{
+        self, Arguments, Atom, CallLayout, CallShape, Class, Dialect, Layout, Message, NameSource,
+        Pattern, Segment, Slot, Spellings, Written,
+    },
 };
 
 /// The most bytes a call's header holds undecided, the matcher's own default.
@@ -82,6 +85,44 @@ pub fn gpt_oss() -> Format {
         .closes_at_stop("call")
         .turn_anchor("<|start|>assistant")
         .stop_tokens(["<|return|>", "<|call|>"])
+        .thinks_first()
+        .reads_undeclared_calls()
+        .with_layout(layout())
+}
+
+/// How a forced call is written: on the commentary channel, the recipient, the JSON constraint,
+/// the arguments as one JSON value and `<|call|>`; a thought before it closes with `<|end|>`
+/// and the next message opens.
+fn layout() -> Layout {
+    let piece = |text: &str| Segment::Lit(text.into());
+    Layout {
+        call: CallLayout {
+            lead: Written([piece("<|channel|>commentary ")].into()),
+            header: Written(
+                [
+                    Segment::Slot(Slot::Name),
+                    piece(" <|constrain|>json<|message|>"),
+                ]
+                .into(),
+            ),
+            before: "".into(),
+            parameter: Written::default(),
+            between: "".into(),
+            after: "".into(),
+            trailer: "".into(),
+            close: Some("<|call|>".into()),
+        },
+        between_calls: None,
+        after_calls: "".into(),
+        values: Spellings::default(),
+        thought: Some(Message {
+            before: "".into(),
+            after: "<|start|>assistant".into(),
+            stops: false,
+            close: Some("<|end|>".into()),
+        }),
+        answer: None,
+    }
 }
 
 /// A call's header after `to=functions.`: the tool's name up to a space or the next marker,

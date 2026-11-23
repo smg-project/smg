@@ -1119,14 +1119,15 @@ call, the recipient `to=functions.NAME`, before the channel or after it, then an
   the table does not name are dropped; the body of an unnamed channel is content.
 - **A preamble and the model's own tools are the thought.** A commentary message with no recipient,
   a message to `python`, `browser` or `container` on any channel, and an analysis or commentary
-  message to any other recipient that is no function read as reasoning, as the gateway's Harmony
-  pipeline reads them; every thought of a turn is kept, in order.
+  message to any other recipient that is no function read as reasoning; every thought of a turn is
+  kept, in order.
 - **The stop closes the last call.** `<|call|>` and `<|return|>` are stop tokens the stop decoder
   hides; a `<|start|>` inside a call's body ends the call where it stands.
+- **The tag of a forced call writes the commentary message to the tool** (`Format::with_layout`):
+  the commentary channel, the recipient, the JSON constraint, the arguments as one JSON value and
+  `<|call|>`; a thought before it closes with `<|end|>` and the next message opens.
 
-What it leaves open: the registry does not list the table, since it has no layout yet and so
-writes no structural tag for a forced call or a JSON answer; the gateway's Harmony pipeline serves
-the family until both are there.
+What it leaves open: a JSON answer has no layout of its own.
 
 ## Kimi K2 (`kimi_k2`)
 

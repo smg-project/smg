@@ -102,6 +102,13 @@ pub(crate) enum Endpoint {
     Chat,
     Messages,
     Completion,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "unreached since the family reads its Symphony table; the removal follows"
+        )
+    )]
     Harmony,
     Embeddings,
     Classify,

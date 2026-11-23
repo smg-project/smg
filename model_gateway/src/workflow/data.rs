@@ -77,10 +77,11 @@ pub trait WorkerRegistrationData: WorkflowData {
 /// What the gateway's own steps keep on a registration between them.
 #[derive(Debug, Clone, Default)]
 pub struct RegistrationNotes {
-    /// Under Symphony, the table whose failure classes the registration step
-    /// publishes at zero once the worker is in the registry (the create step
-    /// resolves it from the model card and the names; none for an HTTP
-    /// worker, the legacy parsers or a model no table reads).
+    /// Where Symphony reads the model (under `--parser symphony`, and for the
+    /// Harmony family under either choice), the table whose failure classes
+    /// the registration step publishes at zero once the worker is in the
+    /// registry (the create step resolves it from the model card and the names;
+    /// none for an HTTP worker, the legacy parsers or a model no table reads).
     pub symphony_table: Option<&'static str>,
 }
 

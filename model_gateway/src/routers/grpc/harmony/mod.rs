@@ -44,5 +44,17 @@ pub(crate) use builder::{try_harmony_encoding, HarmonyBuilder};
 pub(crate) use detector::HarmonyDetector;
 pub(crate) use parser::HarmonyParserAdapter;
 pub(crate) use processor::{HarmonyResponseProcessor, ResponsesIterationResult};
-pub(crate) use responses::{serve_harmony_responses, serve_harmony_responses_stream};
+#[expect(
+    unused_imports,
+    reason = "unreached since the family reads its Symphony table; the removal follows"
+)]
+pub(crate) use responses::serve_harmony_responses;
+#[cfg_attr(
+    not(test),
+    expect(
+        unused_imports,
+        reason = "unreached since the family reads its Symphony table; the removal follows"
+    )
+)]
+pub(crate) use responses::serve_harmony_responses_stream;
 pub(crate) use streaming::HarmonyStreamingProcessor;

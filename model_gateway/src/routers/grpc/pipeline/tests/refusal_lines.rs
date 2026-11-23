@@ -652,6 +652,43 @@ async fn a_tokenizer_with_no_chat_template_keeps_the_error_line_on_both_doors() 
     }
 }
 
+/// A Responses request of the Harmony family that forces a call beside a JSON text format is
+/// refused under the code the family's own pipeline answered, not the chat route's: one WARN
+/// with the cause, the answer marked.
+#[tokio::test]
+async fn a_forced_call_beside_a_json_text_format_keeps_the_responses_code() {
+    let ctx = responses_context(&Arc::new(WorkerRegistry::new()), 0).await;
+    let request: Arc<ResponsesRequest> = Arc::new(
+        serde_json::from_value(serde_json::json!({
+            "model": "gpt-oss-20b",
+            "input": "weather as json",
+            "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}],
+            "tool_choice": {"type": "function", "name": "get_weather"},
+            "text": {"format": {"type": "json_object"}}
+        }))
+        .expect("responses request"),
+    );
+    let lines = LinesAtWarnOrAbove::default();
+    let _subscriber = test_subscriber(lines.clone());
+
+    let response =
+        route_responses(&ctx, request, None, anonymous(), "gpt-oss-20b".to_string()).await;
+
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error::extract_error_code_from_response(&response),
+        "conflicting_constraints"
+    );
+    assert!(marked(&response));
+    assert_eq!(
+        lines.lines(),
+        [(
+            Level::WARN,
+            "Conflicting constraints: both tool_choice and text format specified".to_string()
+        )]
+    );
+}
+
 /// A Responses input the chat pipeline has no form for is refused by the conversion: one WARN
 /// with the cause, the answer marked, no ERROR.
 #[tokio::test]

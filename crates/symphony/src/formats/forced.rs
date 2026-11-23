@@ -859,7 +859,9 @@ mod tests {
         };
         let mut found = Vec::new();
         for (from, on, to) in format.transitions() {
-            if from == 0 && thought(to) {
+            // Two states the variant made one may read a marker differently: the row listed
+            // first is the one taken, and a row behind it is no way in.
+            if from == 0 && thought(to) && format.next(from, on) == Some(to) {
                 for close in closes(to) {
                     found.push((String::new(), format.terminal_text(on).to_string(), close));
                 }
@@ -1082,17 +1084,17 @@ mod tests {
             (
                 "a name with a space",
                 vec![tool("look up", city())],
-                &["kimi_k2", "kimi"],
+                &["gpt_oss", "kimi_k2", "kimi"],
             ),
             (
                 "a name with a newline",
                 vec![tool("look\nup", city())],
-                &["kimi_k2", "kimi"],
+                &["gpt_oss", "kimi_k2", "kimi"],
             ),
             (
                 "a name with a quote and a bracket",
                 vec![tool("look\"up<", city())],
-                &["kimi_k2", "kimi", "muse_spark"],
+                &["gpt_oss", "kimi_k2", "kimi", "muse_spark"],
             ),
             (
                 "a name with a space beside a tool every syntax writes",

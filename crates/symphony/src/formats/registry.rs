@@ -32,9 +32,10 @@ use rustc_hash::FxBuildHasher;
 
 use super::{
     command, deepseek_v3, deepseek_v3_1, deepseek_v3_2, deepseek_v4, deepseek_v4_1, dots3,
-    function_gemma, gemma4, glm, glm4, hy4, hy_v3, inkling, inkling2, iquest, json, k2_horizon,
-    kimi, kimi_k2, kimi_k3, lfm2_5, ling, llama4, llama_nemotron, longcat, minicpm5, minimax_m2,
-    minimax_m3, mistral, mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    function_gemma, gemma4, glm, glm4, gpt_oss, hy4, hy_v3, inkling, inkling2, iquest, json,
+    k2_horizon, kimi, kimi_k2, kimi_k3, lfm2_5, ling, llama4, llama_nemotron, longcat, minicpm5,
+    minimax_m2, minimax_m3, mistral, mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3,
+    seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -130,6 +131,8 @@ tables! {
     Glm => "glm", glm;
     /// [`glm4()`].
     Glm4 => "glm4", glm4;
+    /// [`gpt_oss()`].
+    GptOss => "gpt_oss", gpt_oss;
     /// [`k2_horizon()`].
     K2Horizon => "k2_horizon", k2_horizon;
     /// [`longcat()`].
@@ -1045,6 +1048,12 @@ mod tests {
             unread
                 .validate()
                 .unwrap_or_else(|e| panic!("{}: without_calls: {e}", table.name()));
+            // The gpt-oss table reads a call whatever the request declares: its variant is
+            // the table itself.
+            if table.name() == "gpt_oss" {
+                assert!(unread.call_syntax().is_some());
+                continue;
+            }
             assert_eq!(unread.call_syntax(), None, "{}", table.name());
             assert!(
                 (0..unread.states()).all(|state| unread.emits(state) != Emits::Arguments),

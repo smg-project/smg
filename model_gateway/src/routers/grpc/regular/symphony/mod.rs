@@ -27,7 +27,9 @@
 //! name alone that no table answers to, other than `passthrough`, selects nothing. The names are
 //! checked at startup and at a worker's registration ([`check_names`]), which also says, once per
 //! model, when the registry's table sets the flags' choice aside ([`set_aside_by_the_registry`]).
-//! Every request read with `legacy` keeps the older parsers. The response names
+//! Every request read with `legacy` keeps the older parsers, but for a model of the Harmony
+//! family, which no legacy parser reads: its table reads it under either choice
+//! ([`choice_for`]). The response names
 //! the parser that read it in `x-smg-parser`, legacy when the choice was Symphony but no table
 //! took the request, so a client comparing the two can tell which one read each answer, and the
 //! gateway counts such a request once by the reason (`smg_symphony_fallback_total`,
@@ -72,7 +74,13 @@ pub(crate) mod testing;
 use axum::http::HeaderMap;
 pub(crate) use symphony::event::reasoning_text_tokens;
 
-use crate::{config::ParserChoice, routers::grpc::utils::StreamFailure};
+use crate::{
+    config::ParserChoice,
+    routers::{
+        common::snapshot::WorkerRegistry,
+        grpc::{harmony::HarmonyDetector, utils::StreamFailure},
+    },
+};
 
 /// The request header that names the parser for one request, `legacy` or `symphony`, over the
 /// gateway's `--parser` flag.
@@ -136,6 +144,23 @@ pub(crate) fn choice(
         SymphonyError::Header(format!(
             "{HEADER} must be legacy or symphony, not {spelled:?}"
         ))
+    })
+}
+
+/// [`choice`] for a request of `model`, where the chat and the Messages preparation decide it.
+/// A model of the Harmony family is read by its table under either choice: no legacy parser
+/// reads the family, and the pipeline that served it before its table followed no choice.
+pub(crate) fn choice_for(
+    default: ParserChoice,
+    headers: Option<&HeaderMap>,
+    registry: &WorkerRegistry,
+    model: &str,
+) -> Result<ParserChoice, SymphonyError> {
+    Ok(match choice(default, headers)? {
+        ParserChoice::Legacy if HarmonyDetector::is_harmony_model_in_registry(registry, model) => {
+            ParserChoice::Symphony
+        }
+        chosen => chosen,
     })
 }
 

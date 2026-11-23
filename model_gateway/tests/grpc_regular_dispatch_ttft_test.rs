@@ -1,7 +1,7 @@
 //! Regular gRPC latency starts at dispatch, including a worker that holds
 //! response headers until its first chunk: every streaming route and the
-//! collected ones, the batched completion stream, the Harmony pipeline, a
-//! dispatch that answers on its retry, and the client that leaves after the
+//! collected ones, the batched completion stream, a dispatch that answers
+//! on its retry, and the client that leaves after the
 //! first chunk (which records nothing). Each case captures metrics on a
 //! current-thread runtime, as the PD TTFT regressions do.
 //!
@@ -52,8 +52,6 @@ use smg_worker::identity::basic::{RuntimeType, WorkerType};
 use tonic::{Request, Response, Status};
 
 const MODEL: &str = "regular-dispatch-ttft-test-model";
-/// A model id the router reads as a Harmony model: its chat runs the Harmony pipeline.
-const HARMONY_MODEL: &str = "gpt-oss-dispatch-ttft-test-model";
 /// A model id the one transcription family recognises: a transcription is a
 /// chat-shaped generation to the engine.
 const ASR_MODEL: &str = "qwen3-asr-dispatch-ttft-test-model";
@@ -646,92 +644,6 @@ fn collected_chat_records_no_dispatch_wait() {
 #[test]
 fn collected_completions_records_no_dispatch_wait() {
     under_an_entry_stamp(Route::Completions, false);
-}
-
-/// The ids of one Harmony final-channel turn, as the engine streams them.
-#[expect(clippy::expect_used, reason = "test helper")]
-fn harmony_output_ids() -> Vec<u32> {
-    openai_harmony::load_harmony_encoding(openai_harmony::HarmonyEncodingName::HarmonyGptOss)
-        .expect("the Harmony encoding")
-        .tokenizer()
-        .encode_with_special_tokens("<|channel|>final<|message|>Hello<|return|>")
-}
-
-/// A Harmony collected chat anchors its generation at the dispatch: the
-/// Harmony pipeline's processor reads the attempt's dispatch, not its own
-/// entry.
-#[test]
-fn harmony_collected_chat_includes_the_held_header_delay() {
-    let ids = harmony_output_ids();
-    let tokens = u64::try_from(ids.len()).expect("a small count");
-    let rendered = render_after(|| async {
-        let port = serve_engine(held_headers_engine(Some(ids)).into_server()).await;
-        let router = router_over(&[port], HARMONY_MODEL, None).await;
-        let request =
-            serde_json::from_value(chat_request(HARMONY_MODEL, false)).expect("chat request");
-        let response = router
-            .route_chat(None, &tenant(), Arc::new(request), HARMONY_MODEL)
-            .await;
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-            .await
-            .expect("response body");
-        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON response");
-        assert_eq!(status, http::StatusCode::OK, "{body}");
-        assert_eq!(
-            body["usage"]["completion_tokens"].as_u64(),
-            Some(tokens),
-            "{body}"
-        );
-        assert_eq!(body["choices"][0]["message"]["content"], "Hello", "{body}");
-    });
-    // The Harmony pipeline records under its own backend label.
-    let labels = ["backend_type=\"harmony\"", "endpoint=\"chat\""];
-    let family = "smg_router_generation_duration_seconds";
-    assert_eq!(
-        metrics_capture::sample(&rendered, family, "count", &labels),
-        Some(1.0),
-        "harmony chat: one generation observation:\n{rendered}"
-    );
-    let generation =
-        metrics_capture::sample(&rendered, family, "sum", &labels).expect("histogram sum");
-    assert!(
-        generation >= (HELD_HEADERS_DELAY + POST_FIRST_DELAY).as_secs_f64(),
-        "harmony chat: generation {generation} must include the held-header and decode delays"
-    );
-}
-
-/// A Harmony streamed chat records its dispatch wait with its TTFT, under the
-/// Harmony pipeline's backend label.
-#[test]
-fn harmony_streaming_chat_records_its_dispatch_wait_with_its_ttft() {
-    // Read before the runtime starts: loading the encoding may fetch its vocabulary with a
-    // blocking client, which cannot be dropped inside the runtime.
-    let ids = harmony_output_ids();
-    let rendered = render_after(|| async {
-        let engine = held_headers_engine(Some(ids));
-        let port = serve_engine(engine.into_server()).await;
-        let router = router_over(&[port], HARMONY_MODEL, None).await;
-        let request =
-            serde_json::from_value(chat_request(HARMONY_MODEL, true)).expect("chat request");
-        let tenant = tenant();
-        let response = entered_a_lead_ago()
-            .scope(router.route_chat(None, &tenant, Arc::new(request), HARMONY_MODEL))
-            .await;
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-            .await
-            .expect("response body");
-        let body = String::from_utf8(bytes.to_vec()).expect("UTF-8 body");
-        assert_eq!(status, http::StatusCode::OK, "{body}");
-        assert!(body.contains("data: [DONE]"), "{body}");
-    });
-    let labels = ["backend_type=\"harmony\"", "endpoint=\"chat\""];
-    let wait = dispatch_wait_beside_the_ttft(&rendered, &labels);
-    assert!(
-        wait >= ENTRY_LEAD.as_secs_f64(),
-        "harmony chat: dispatch wait {wait} runs from the entry stamp ({ENTRY_LEAD:?} before the handler)"
-    );
 }
 
 /// An engine whose first generate call, across every worker it serves, fails

@@ -186,7 +186,9 @@ ZMQ workers; an HTTP worker's engine parses its own output, so the value changes
 nothing there. A deployment that set `--parser` through `router.extraArgs` removes
 it there when it sets this value: the gateway refuses the flag twice and exits at
 startup. A request's `X-SMG-Parser` header overrides the flag for that
-request. `router.toolCallParser` and `router.reasoningParser` are read
+request. The Harmony family (gpt-oss) is read by its Symphony table under
+either value and either header: no legacy parser reads it.
+`router.toolCallParser` and `router.reasoningParser` are read
 differently by each parser: under Symphony, a model the registry knows keeps
 its own table and the flags apply only to models it does not know; under
 `legacy`, each flag takes only a legacy parser's name of its own kind: `hf`

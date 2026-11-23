@@ -8,13 +8,13 @@
 //! A request's history is loaded by the shared
 //! [`crate::routers::grpc::common::responses::load_history`].
 
-use axum::http;
+use axum::{http, response::Response};
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{Tool, ToolChoice, ToolChoiceValue, ToolReference, Usage},
     responses::{
         self, ResponseInput, ResponseInputOutputItem, ResponseOutputItem, ResponseUsage,
-        ResponsesRequest,
+        ResponsesRequest, TextFormat,
     },
 };
 use serde_json::{json, Value};
@@ -30,10 +30,19 @@ use crate::{
             mcp_utils::prepare_hosted_dispatch_args,
             openai_bridge::{self, ResponseFormat},
         },
-        grpc::common::responses::{
-            history::current_input_items,
-            tool_call_limit,
-            utils::{add_model_call_usage, resolve_function_identity, tool_call_overflow},
+        error,
+        grpc::{
+            common::responses::{
+                history::current_input_items,
+                tool_call_limit,
+                utils::{
+                    add_model_call_usage, extract_tools_from_response_tools,
+                    resolve_function_identity, tool_call_overflow,
+                },
+                ResponsesContext,
+            },
+            harmony::HarmonyDetector,
+            utils,
         },
     },
 };
@@ -115,6 +124,40 @@ impl ToolLoopState {
 // ============================================================================
 // Tool Preparation and Extraction
 // ============================================================================
+
+/// The Harmony family's own pipeline refused a forced call beside a JSON text format under
+/// this code. Left to the chat preparation, the request would read the chat route's code and
+/// a message that names `response_format`, a field this route does not have.
+pub(super) fn refuse_forced_call_beside_json_text(
+    ctx: &ResponsesContext,
+    model_id: &str,
+    request: &ResponsesRequest,
+    has_mcp_tools: bool,
+) -> Result<(), Response> {
+    let json_text = matches!(
+        request.text.as_ref().and_then(|text| text.format.as_ref()),
+        Some(TextFormat::JsonObject | TextFormat::JsonSchema { .. })
+    );
+    if json_text
+        && request
+            .tool_choice
+            .as_ref()
+            .is_some_and(|choice| choice.to_chat_tool_choice().forces_call())
+        && HarmonyDetector::is_harmony_model_in_registry(&ctx.components.worker_registry, model_id)
+        && (has_mcp_tools
+            || !extract_tools_from_response_tools(request.tools.as_deref()).is_empty())
+    {
+        warn!(
+            function = "refuse_forced_call_beside_json_text",
+            "Conflicting constraints: both tool_choice and text format specified"
+        );
+        return Err(utils::reported(error::bad_request(
+            "conflicting_constraints",
+            "Cannot use both tool_choice (required/function) and text format (json_object/json_schema) simultaneously",
+        )));
+    }
+    Ok(())
+}
 
 /// Set tool_choice based on iteration (the MCP tools join the request's tools
 /// where the chat request is built: `conversions::responses_to_chat_with_mcp_tools`).

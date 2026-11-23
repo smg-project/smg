@@ -37,7 +37,6 @@ use super::{
         },
     },
     context::{RequestType, SharedComponents},
-    harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
     mode::Mode,
     multimodal::{mm_settings, MultimodalComponents},
     pipeline::{Endpoint, PipelineDeps, RequestPipeline},
@@ -72,15 +71,13 @@ use crate::{
 /// every pipeline and drives the per-mode retry-metric labels, `Debug` output,
 /// and `router_type`. Optional members are `None` when the mode doesn't serve
 /// them and the corresponding endpoints 501: `embedding_pipeline` and
-/// `classify_pipeline` are Regular-only; `harmony_pipeline`,
-/// `responses_context`, and `harmony_responses_context` exist in every mode
-/// but EPD.
+/// `classify_pipeline` are Regular-only; `responses_context` exists in every
+/// mode but EPD.
 #[derive(Clone)]
 pub struct GrpcRouter {
     worker_registry: Arc<WorkerRegistry>,
     mode: Mode,
     pipeline: RequestPipeline,
-    harmony_pipeline: Option<RequestPipeline>,
     embedding_pipeline: Option<RequestPipeline>,
     classify_pipeline: Option<RequestPipeline>,
     decisions_pipeline: Option<RequestPipeline>,
@@ -89,14 +86,13 @@ pub struct GrpcRouter {
     completion_pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
     responses_context: Option<ResponsesContext>,
-    harmony_responses_context: Option<ResponsesContext>,
     retry_config: RetryConfig,
 }
 
 impl GrpcRouter {
-    /// Regular and PD build the Harmony pipeline and responses contexts and
-    /// require the MCP orchestrator; EPD leaves them `None` and 501s those
-    /// endpoints. Embedding/classify pipelines are Regular-only.
+    /// Regular and PD build the responses context and require the MCP
+    /// orchestrator; EPD leaves it `None` and 501s that endpoint.
+    /// Embedding/classify pipelines are Regular-only.
     pub fn new(ctx: &Arc<AppContext>, mode: Mode) -> Result<Self, String> {
         // Get tokenizer registry (no longer requires pre-loaded tokenizer)
         let tokenizer_registry = ctx.tokenizer_registry.clone();
@@ -174,7 +170,7 @@ impl GrpcRouter {
                 Mode::EncodePrefillDecode => {}
             }
         }
-        // Deps for the parser-consuming endpoints (chat/messages/harmony).
+        // Deps for the parser-consuming endpoints (chat/messages).
         let configured_deps = PipelineDeps::new(
             worker_registry.clone(),
             policy_registry.clone(),
@@ -209,7 +205,6 @@ impl GrpcRouter {
             .ok_or_else(|| format!("gRPC router: no completion pipeline for mode {mode:?}"))?;
 
         // `None` when the (endpoint, mode) combo is unsupported; those endpoints 501.
-        let harmony_pipeline = RequestPipeline::build(Endpoint::Harmony, mode, &configured_deps);
         let embedding_pipeline = RequestPipeline::build(Endpoint::Embeddings, mode, &pair_deps);
         let classify_pipeline = RequestPipeline::build(Endpoint::Classify, mode, &pair_deps);
         let decisions_pipeline = RequestPipeline::build(Endpoint::Decisions, mode, &pair_deps);
@@ -218,8 +213,8 @@ impl GrpcRouter {
 
         // Responses contexts are the sole consumer of the MCP orchestrator; EPD
         // builds neither (it doesn't serve /v1/responses).
-        let (responses_context, harmony_responses_context) = if mode == Mode::EncodePrefillDecode {
-            (None, None)
+        let responses_context = if mode == Mode::EncodePrefillDecode {
+            None
         } else {
             let mcp_orchestrator = ctx
                 .mcp_orchestrator
@@ -252,21 +247,13 @@ impl GrpcRouter {
                 )
             };
 
-            let responses_context = create_responses_context(&pipeline);
-            let harmony_responses_context = harmony_pipeline
-                .as_ref()
-                .map(&create_responses_context)
-                .ok_or_else(|| {
-                    format!("gRPC router: mode {mode:?} must build a harmony pipeline")
-                })?;
-            (Some(responses_context), Some(harmony_responses_context))
+            Some(create_responses_context(&pipeline))
         };
 
         Ok(GrpcRouter {
             worker_registry,
             mode,
             pipeline,
-            harmony_pipeline,
             embedding_pipeline,
             classify_pipeline,
             decisions_pipeline,
@@ -275,7 +262,6 @@ impl GrpcRouter {
             completion_pipeline,
             shared_components,
             responses_context,
-            harmony_responses_context,
             retry_config: ctx.router_config.effective_retry_config(),
         })
     }
@@ -351,20 +337,7 @@ impl GrpcRouter {
             return Err(*response);
         }
 
-        // EPD has no Harmony pipeline, so its chat requests all use the single
-        // chat/generate pipeline.
-        let is_harmony = self.harmony_pipeline.is_some()
-            && HarmonyDetector::is_harmony_model_in_registry(&self.worker_registry, &body.model);
-
-        debug!(
-            "Processing chat completion request for model: {}, using_harmony={}",
-            model_id, is_harmony
-        );
-
-        let pipeline = match self.harmony_pipeline.as_ref() {
-            Some(harmony_pipeline) if is_harmony => harmony_pipeline,
-            _ => &self.pipeline,
-        };
+        debug!("Processing chat completion request for model: {}", model_id);
 
         // Canonicalize once, up front, so every dispatch attempt (and the
         // reservation) targets the same model -- see
@@ -377,7 +350,7 @@ impl GrpcRouter {
         if body.model != model_id_cloned {
             Arc::make_mut(&mut body).model.clone_from(&model_id_cloned);
         }
-        Ok((body, model_id_cloned, pipeline))
+        Ok((body, model_id_cloned, &self.pipeline))
     }
 
     /// Main route_chat implementation, over the request
@@ -481,8 +454,6 @@ impl GrpcRouter {
     }
 
     /// Main route_responses implementation
-    ///
-    /// Routes to either Harmony or regular responses implementation based on model detection
     async fn route_responses_impl(
         &self,
         headers: Option<&HeaderMap>,
@@ -490,9 +461,7 @@ impl GrpcRouter {
         mut body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
-        let (Some(responses_context), Some(harmony_responses_context)) =
-            (&self.responses_context, &self.harmony_responses_context)
-        else {
+        let Some(responses_context) = &self.responses_context else {
             return error::not_implemented(
                 "responses_not_implemented",
                 "Responses endpoint not implemented",
@@ -514,10 +483,6 @@ impl GrpcRouter {
             canonicalize_responses_request(&self.worker_registry, &mut body, model_id);
         let model_id = canonical_model_id.as_ref();
 
-        // Choose implementation based on Harmony model detection (checks worker metadata)
-        let is_harmony =
-            HarmonyDetector::is_harmony_model_in_registry(&self.worker_registry, &body.model);
-
         // `background: true` answers the queued object at once and runs the
         // work behind the response id; with the mode switched off such a
         // request runs in the foreground, and its object says so.
@@ -525,75 +490,41 @@ impl GrpcRouter {
         if body.background == Some(true) {
             if responses_context.background.enabled() {
                 let request_context = smg_data_connector::current_request_context();
-                let base = if is_harmony {
-                    harmony_responses_context
-                } else {
-                    responses_context
-                };
                 let ctx = ResponsesContext {
                     request_context,
-                    ..base.clone()
+                    ..responses_context.clone()
                 };
                 return self
-                    .route_background_responses(
-                        &ctx,
-                        is_harmony,
-                        headers,
-                        tenant_meta,
-                        body,
-                        model_id,
-                    )
+                    .route_background_responses(&ctx, headers, tenant_meta, body, model_id)
                     .await;
             }
             body.background = None;
         }
 
-        if is_harmony {
-            debug!(
-                "Processing Harmony responses request for model: {}, streaming: {}",
-                model_id,
-                body.stream.unwrap_or(false)
-            );
-            let harmony_ctx = ResponsesContext {
-                request_context: smg_data_connector::current_request_context(),
-                ..harmony_responses_context.clone()
-            };
-
-            if body.stream.unwrap_or(false) {
-                serve_harmony_responses_stream(&harmony_ctx, body, tenant_meta.clone(), None).await
-            } else {
-                match serve_harmony_responses(&harmony_ctx, body, tenant_meta.clone(), None).await {
-                    Ok(response) => json_response(&response),
-                    Err(error_response) => error_response,
-                }
-            }
-        } else {
-            // This request's storage context, read in the request task: the
-            // stream persists from a task of its own, where the middleware's
-            // task-local is gone.
-            let ctx = ResponsesContext {
-                request_context: smg_data_connector::current_request_context(),
-                ..responses_context.clone()
-            };
-            responses::route_responses(
-                &ctx,
-                Arc::new(body),
-                headers.cloned(),
-                tenant_meta.clone(),
-                model_id.to_string(),
-            )
-            .await
-        }
+        // This request's storage context, read in the request task: the
+        // stream persists from a task of its own, where the middleware's
+        // task-local is gone.
+        let ctx = ResponsesContext {
+            request_context: smg_data_connector::current_request_context(),
+            ..responses_context.clone()
+        };
+        responses::route_responses(
+            &ctx,
+            Arc::new(body),
+            headers.cloned(),
+            tenant_meta.clone(),
+            model_id.to_string(),
+        )
+        .await
     }
 
     /// `background: true`: the `queued` Response object is stored under a new
     /// id and answered (or streamed) at once; the work runs in a task of its
-    /// own behind that id, on the Harmony or the regular path. One beyond
-    /// the configured number in flight answers 429.
+    /// own behind that id. One beyond the configured number in flight
+    /// answers 429.
     async fn route_background_responses(
         &self,
         ctx: &ResponsesContext,
-        is_harmony: bool,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
         request: ResponsesRequest,
@@ -625,32 +556,22 @@ impl GrpcRouter {
                 &e,
             );
         }
-        debug!(response_id = %id, harmony = is_harmony, "Background response queued");
+        debug!(response_id = %id, "Background response queued");
 
         let tenant_meta = tenant_meta.clone();
         let headers = headers.cloned();
         let model_id = model_id.to_string();
         if request.stream.unwrap_or(false) {
             let stream = BackgroundStream::new(slot);
-            let answer = if is_harmony {
-                serve_harmony_responses_stream(
-                    ctx,
-                    Arc::unwrap_or_clone(request),
-                    tenant_meta,
-                    Some(stream),
-                )
-                .await
-            } else {
-                responses::route_responses_background_stream(
-                    ctx,
-                    request,
-                    headers,
-                    tenant_meta,
-                    model_id,
-                    stream,
-                )
-                .await
-            };
+            let answer = responses::route_responses_background_stream(
+                ctx,
+                request,
+                headers,
+                tenant_meta,
+                model_id,
+                stream,
+            )
+            .await;
             // A plain error before the stream opened closes the record as
             // failed; the stream itself runs behind the id.
             return background::close_before_stream(
@@ -662,43 +583,24 @@ impl GrpcRouter {
             .await;
         }
 
-        if is_harmony {
-            background::spawn(
-                ctx.clone(),
-                slot,
-                request,
-                Box::new(move |ctx, request| {
-                    Box::pin(async move {
-                        serve_harmony_responses(
-                            ctx,
-                            Arc::unwrap_or_clone(request),
-                            tenant_meta,
-                            Some(id),
-                        )
-                        .await
-                    })
-                }),
-            );
-        } else {
-            background::spawn(
-                ctx.clone(),
-                slot,
-                request,
-                Box::new(move |ctx, request| {
-                    Box::pin(async move {
-                        responses::route_responses_background(
-                            ctx,
-                            request,
-                            headers,
-                            tenant_meta,
-                            model_id,
-                            id,
-                        )
-                        .await
-                    })
-                }),
-            );
-        }
+        background::spawn(
+            ctx.clone(),
+            slot,
+            request,
+            Box::new(move |ctx, request| {
+                Box::pin(async move {
+                    responses::route_responses_background(
+                        ctx,
+                        request,
+                        headers,
+                        tenant_meta,
+                        model_id,
+                        id,
+                    )
+                    .await
+                })
+            }),
+        );
         json_response(&queued)
     }
 

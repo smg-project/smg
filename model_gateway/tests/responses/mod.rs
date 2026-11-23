@@ -1,9 +1,6 @@
 //! Responses API integration tests
 
 mod grpc_responses_stream_contract_test;
-mod harmony_loop_harness;
-mod harmony_loop_turn_end_test;
-mod harmony_loop_usage_test;
 mod history_tenant_scope_test;
 mod mcp_test;
 mod output_item_ids_test;

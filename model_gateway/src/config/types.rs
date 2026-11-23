@@ -39,12 +39,14 @@ pub const TEMPLATE_PARSER: &str = "hf";
 
 /// The parser that reads a chat completion's output: Symphony unless `--parser legacy` (the
 /// config key `parser: legacy`), or a request's `X-SMG-Parser: legacy` header, asks for the
-/// older parsers.
+/// older parsers. The Harmony family (gpt-oss) is read by its Symphony table under either choice:
+/// no older parser reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ParserChoice {
     /// The tool-call and reasoning parser crates, one parser per model family: the way back
-    /// from the default, for the whole gateway or for one request.
+    /// from the default, for the whole gateway or for one request, but for the Harmony family,
+    /// which its table reads under either choice.
     Legacy,
     /// Symphony's tables, the default, by one precedence per model
     /// (`routers::grpc::regular::symphony::names::reads`):

@@ -36,10 +36,6 @@ class TestChatCompletion:
     repository, one answer per choice the request samples.
     """
 
-    # Whether the backend trims stop sequences from output.
-    # Harmony (gpt-oss) does not trim because its detokenization is not channel-aware.
-    STOP_SEQUENCE_TRIMMED = True
-
     @pytest.mark.parametrize(
         "logprobs",
         [
@@ -386,12 +382,7 @@ convenient hands-free control to your smart devices.
         assert response.choices[0].finish_reason == "stop"
         msg = response.choices[0].message
         content = msg.content or getattr(msg, "reasoning_content", "") or ""
-        if self.STOP_SEQUENCE_TRIMMED:
-            assert "," not in content, f"Stop sequence ',' should not appear in output: {content}"
-        else:
-            assert content.endswith(","), (
-                f"Stop sequence ',' should be the suffix of output: {content}"
-            )
+        assert "," not in content, f"Stop sequence ',' should not appear in output: {content}"
 
     def test_stop_sequences_stream(self, model, api_client, mock_answers):
         """Test that stop sequences work in streaming mode."""
@@ -425,12 +416,7 @@ convenient hands-free control to your smart devices.
             for c in chunks
             if c.choices and self._delta_text(c.choices[0].delta)
         )
-        if self.STOP_SEQUENCE_TRIMMED:
-            assert "," not in content, f"Stop sequence ',' should not appear in output: {content}"
-        else:
-            assert content.endswith(","), (
-                f"Stop sequence ',' should be the suffix of output: {content}"
-            )
+        assert "," not in content, f"Stop sequence ',' should not appear in output: {content}"
 
     # -------------------------------------------------------------------------
     # Helper methods
@@ -455,8 +441,6 @@ class TestChatCompletionGptOss(TestChatCompletion):
 
     # Harmony channel markers add ~10 special tokens
     STREAMING_TOKEN_TOLERANCE = 10
-
-    STOP_SEQUENCE_TRIMMED = False
 
     @pytest.mark.parametrize(
         "logprobs",
@@ -494,7 +478,7 @@ class TestChatCompletionGptOss(TestChatCompletion):
     def test_regex(self, model, api_client):
         pass
 
-    @pytest.mark.skip(reason="gpt-oss Harmony pipeline doesn't implement continue_final_message")
+    @pytest.mark.skip(reason="gpt-oss: a prefilled answer is not proven on the standard path")
     def test_response_prefill(self, model, api_client):
         pass
 

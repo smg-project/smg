@@ -2878,6 +2878,7 @@ fn process_with_derived_profile(
         placeholder_tokens,
         media_order,
         ProviderProfile::for_model(&request.model),
+        false,
     )
     .map_err(String::from)
 }
@@ -3069,6 +3070,7 @@ fn rendered(template: Option<&str>, request: Value) -> Result<String, PromptErro
         None,
         MediaPartOrder::MediaFirst,
         ProviderProfile::for_model(&request.model),
+        false,
     )
     .map(|(processed, _)| processed.text)
 }
@@ -3258,4 +3260,24 @@ fn a_render_the_request_can_break_stays_a_400() {
 
     let bare = PromptError::from("a check of the gateway's own".to_string());
     assert_eq!(answered(bare), still_a_400);
+}
+
+/// A turn of two calls with a thought, as the Harmony family's template reads it: one turn a
+/// call, each followed by its own result, the thought under `thinking` in the first.
+#[test]
+fn a_harmony_family_turn_of_two_calls_becomes_one_turn_a_call() {
+    let call = |id: &str| json!({"id": id, "function": {"name": id, "arguments": "{}"}});
+    let result = |id: &str| json!({"role": "tool", "tool_call_id": id, "content": id});
+    let user = json!({"role": "user", "content": "go"});
+    let turns = harmony_family_turns(vec![
+        user.clone(),
+        json!({"role": "assistant", "reasoning_content": "both", "tool_calls": [call("a"), call("b")]}),
+        result("a"),
+        result("b"),
+    ]);
+    let first = json!({
+        "role": "assistant", "reasoning_content": "both", "thinking": "both", "tool_calls": [call("a")],
+    });
+    let second = json!({"role": "assistant", "tool_calls": [call("b")]});
+    assert_eq!(turns, vec![user, first, result("a"), second, result("b")]);
 }

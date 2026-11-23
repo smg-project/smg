@@ -70,8 +70,13 @@ impl MessagePreparationStage {
         // when it carries one, else the gateway's --parser flag (see
         // `regular::symphony`). Decided once here; the constraint below and
         // request building read the same choice.
-        let parser = symphony::choice(ctx.components.parser, ctx.input.headers.as_ref())
-            .map_err(|why| error::bad_request("invalid_parser_header", why))?;
+        let parser = symphony::choice_for(
+            ctx.components.parser,
+            ctx.input.headers.as_ref(),
+            &ctx.components.worker_registry,
+            &ctx.input.model_id,
+        )
+        .map_err(|why| error::bad_request("invalid_parser_header", why))?;
         ctx.state.parser = Some(parser);
 
         // Step 1: The response spec, built here because its chat tools (the

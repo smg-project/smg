@@ -18,9 +18,11 @@
 //! enclosing tag's end joins those texts' excluded strings (it stopped them before). And the older
 //! matcher cannot build the text of a tag whose excluded strings name the tag's own end (equal to
 //! it, or extending it); where the text is the last thing before the end, those excludes are
-//! redundant (the end closes the text before it could hold them) and are left out. Nothing else
-//! changes: the tags, their begins and ends, the triggers, the JSON schemas, the regular
-//! expressions and the single-token markers are written as derived.
+//! redundant (the end closes the text before it could hold them) and are left out, and so is an
+//! excluded string that extends another one of that text (the shorter holds it out already, and
+//! the older matcher cannot build the two together). Nothing else changes: the tags, their begins
+//! and ends, the triggers, the JSON schemas, the regular expressions and the single-token markers
+//! are written as derived.
 
 use super::{Bound, Grammar, Tag};
 
@@ -39,12 +41,18 @@ fn older(grammar: Grammar, ends: &[String], tail: bool) -> Grammar {
     match grammar {
         Grammar::AnyText { excludes } if tail && !ends.is_empty() => Grammar::AnyText {
             excludes: excludes
-                .into_iter()
+                .iter()
                 .filter(|exclude| {
                     !ends
                         .iter()
                         .any(|end| !end.is_empty() && exclude.starts_with(end.as_str()))
+                        && !excludes.iter().any(|shorter| {
+                            !shorter.is_empty()
+                                && shorter.len() < exclude.len()
+                                && exclude.starts_with(shorter.as_str())
+                        })
                 })
+                .cloned()
                 .collect(),
         },
         Grammar::Tag(tag) => Grammar::Tag(in_tag(tag)),
@@ -651,6 +659,42 @@ mod tests {
         assert_eq!(value.clone().in_older_vocabulary(), value);
         let prefix = Grammar::Tag(tag("<p>", free(&["</p"]), "</p>\n"));
         assert_eq!(prefix.clone().in_older_vocabulary(), prefix);
+    }
+
+    #[test]
+    fn a_thought_written_first_is_a_text_the_older_matcher_builds() {
+        // The older matcher builds no text whose excluded strings begin its tag's end or one
+        // another: the Harmony family's thought ends at its close, and the longer header goes.
+        let schema = Arc::new(json!({"type": "object"}));
+        let answer = crate::formats::gpt_oss()
+            .answer_grammar_for(&schema, false, GrammarStart::FirstToken)
+            .expect("the family's answer tag")
+            .in_older_vocabulary();
+        let Grammar::Sequence(elements) = answer else {
+            panic!("a sequence: {answer:?}");
+        };
+        assert_eq!(
+            elements[..2],
+            [
+                Grammar::Tag(tag(
+                    "<|channel|>analysis<|message|>",
+                    free(&[
+                        "<|channel|>final<|message|>",
+                        "<|channel|>analysis",
+                        "<|channel|>commentary",
+                        "to=python",
+                        "to=browser",
+                        "to=container",
+                        "<|message|>",
+                        "<|start|>",
+                        "to=functions.",
+                        "<|call|>",
+                    ]),
+                    "<|end|>",
+                )),
+                text("<|start|>assistant"),
+            ]
+        );
     }
 
     #[test]

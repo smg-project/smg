@@ -19,8 +19,8 @@ use super::{
     common::{
         build_next_request, convert_mcp_tools_to_chat_tools, dispatch_arguments,
         extract_all_tool_calls_from_chat, has_unfinished_mcp_call, partition_tool_calls,
-        prepare_tool_choice, record_mcp_call, McpToolCallLimit, ResponsesCallContext,
-        ToolLoopState,
+        prepare_tool_choice, record_mcp_call, refuse_forced_call_beside_json_text,
+        McpToolCallLimit, ResponsesCallContext, ToolLoopState,
     },
     conversions,
 };
@@ -78,6 +78,7 @@ pub(super) async fn route_responses_internal(
         request.tools.as_deref(),
     )
     .await?;
+    refuse_forced_call_beside_json_text(ctx, &params.model_id, &request, has_mcp_tools)?;
 
     let (responses_response, parser) = if has_mcp_tools {
         debug!("MCP tools detected, using tool loop");

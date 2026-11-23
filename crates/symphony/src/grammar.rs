@@ -1210,14 +1210,16 @@ impl Format {
             excludes: self.excluded_but(&[]),
         };
         let (before, after) = self.around(|layout| layout.thought.as_ref());
-        Some(Grammar::Sequence(vec![
-            Grammar::Tag(Tag::new(
-                format!("{before}{}", thought.open),
-                text,
-                format!("{}{after}", thought.close),
-            )),
-            body,
-        ]))
+        // The thought's tag ends at its own close, which its text excludes, and what the layout
+        // writes after it stands after the tag: an end that began with the excluded close and
+        // went on is one an older grammar compiler cannot build.
+        let mut elements = vec![Grammar::Tag(Tag::new(
+            format!("{before}{}", thought.open),
+            text,
+            thought.close,
+        ))];
+        elements.extend(after_the_close_then(after, body));
+        Some(Grammar::Sequence(elements))
     }
 
     /// What the table's layout writes before a region's opener and after its close, for the

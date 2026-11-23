@@ -23,7 +23,10 @@ use tool_parser::{
 };
 use tracing::warn;
 
-use crate::routers::{common::snapshot::WorkerRegistry, grpc::context::WorkerSelection};
+use crate::routers::{
+    common::snapshot::WorkerRegistry,
+    grpc::{context::WorkerSelection, harmony::detector::is_harmony_card},
+};
 
 /// Per-request parser-name resolution.
 ///
@@ -243,21 +246,29 @@ impl ParserResolver {
     pub(crate) fn card_names_among(workers: &[Arc<dyn Worker>], model: &str) -> Names {
         let mut tool = CardPick::default();
         let mut reasoning = CardPick::default();
+        // A card of the Harmony family names its table where no card names a tool-call
+        // parser, whatever the checkpoint is called.
+        let mut family = false;
         for worker in workers {
             let Some(card) = worker.metadata().spec.models.find(model) else {
                 continue;
             };
             tool.offer(ParserKind::Tool.of(card));
             reasoning.offer(ParserKind::Reasoning.of(card));
+            family |= is_harmony_card(&card.architectures, card.hf_model_type.as_deref(), &card.id);
         }
         Names {
-            tool: tool.chosen(model, ParserKind::Tool.label()),
+            tool: tool
+                .chosen(model, ParserKind::Tool.label())
+                .or_else(|| family.then(|| "gpt_oss".to_string())),
             reasoning: reasoning.chosen(model, ParserKind::Reasoning.label()),
         }
     }
 
     /// [`Self::card_names_among`] for one kind: the one pick over the same
-    /// walk, so a single reader clones nothing it did not ask for.
+    /// walk, so a single reader clones nothing it did not ask for. It leaves the
+    /// Harmony family's rule out on purpose: the legacy readers ask through it,
+    /// and the family's table is no legacy parser's name.
     fn card_name_among(
         workers: &[Arc<dyn Worker>],
         model: &str,
@@ -1794,6 +1805,7 @@ mod tests {
             None,
             MediaPartOrder::MediaFirst,
             ProviderProfile::for_model(&request.model),
+            false,
         )
         .expect("rendered");
         assert_eq!(processed.text, PREFILL_AFTER_THINKING_PROMPT);
@@ -2324,7 +2336,8 @@ mod parser_resolver_tests {
 
     use super::*;
     use crate::routers::{
-        common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder,
+        common::snapshot::WorkerRegistry,
+        grpc::{backend_client::BasicWorkerBuilder, utils::answering_to},
     };
 
     fn registry_with_card(card: ModelCard) -> Arc<WorkerRegistry> {
@@ -2486,6 +2499,30 @@ mod parser_resolver_tests {
             Some("alpha")
         );
         assert_eq!(resolver.names("m").labels.tool.as_deref(), Some("aardvark"));
+    }
+
+    /// A card of the Harmony family names the family's table where no card names a tool-call
+    /// parser, whatever the checkpoint is called; a card that names a parser keeps its name.
+    #[test]
+    fn a_card_of_the_harmony_family_names_its_table() {
+        let mut renamed = ModelCard::new("renamed-q4");
+        renamed.architectures = vec!["GptOssForCausalLM".to_string()];
+        let cards = [
+            (renamed, Some("gpt_oss")),
+            (ModelCard::new("org/GPT-OSS-20b-q4"), Some("gpt_oss")),
+            (ModelCard::new("plain-7b"), None),
+            (
+                ModelCard::new("labeled-gpt-oss").with_tool_parser("passthrough"),
+                Some("passthrough"),
+            ),
+        ];
+        for (card, tool) in cards {
+            let id = card.id.clone();
+            let workers = registry_with_card(card).get_by_model(&id);
+            let read = ParserResolver::card_names_among(&workers, &id);
+            assert_eq!(read.tool.as_deref(), tool, "{id}");
+        }
+        assert!(answering_to("gpt_oss").is_some());
     }
 
     #[test]
