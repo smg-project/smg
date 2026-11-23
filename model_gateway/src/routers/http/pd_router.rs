@@ -4228,6 +4228,9 @@ mod tests {
         );
     }
 
+    /// A worker's refusal goes back as the worker sent it (its status, its
+    /// body, its `Retry-After`), as the regular router's proxied GET relays
+    /// it, not as an error object of the gateway's own.
     #[tokio::test]
     async fn a_proxied_get_relays_the_workers_refusal() {
         let app = axum::Router::new().fallback(axum::routing::any(|| async {
