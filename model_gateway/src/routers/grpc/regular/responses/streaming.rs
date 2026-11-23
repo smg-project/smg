@@ -454,9 +454,8 @@ enum BodyRead {
 /// clients. A background response's wait is on the sender of its relay, which
 /// closes with the work and not with the client: its reads are the body's
 /// own, and the work outlives the client as it is meant to. `client_gone`
-/// is the wait the relay keeps for one chat body, polled only while the body
-/// has nothing, so a frame that is ready costs no registration with the
-/// channel.
+/// is the wait the relay keeps for one chat body; the order of a read is
+/// [`ClientGone::poll_read`]'s.
 async fn next_frame(stream: &mut BodyDataStream, client_gone: &mut ClientGone) -> BodyRead {
     std::future::poll_fn(|cx| client_gone.poll_read(cx, |cx| stream.poll_next_unpin(cx)))
         .await
@@ -1499,12 +1498,6 @@ impl ChatResponseAccumulator {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        future::Future,
-        sync::atomic::{AtomicUsize, Ordering},
-        task::{Context, Poll, Wake, Waker},
-    };
-
     use smg_external_router::retry::REQUEST_TIMEOUT_CODE;
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
@@ -2460,12 +2453,17 @@ mod tests {
         );
     }
 
-    /// The relay keeps one wait for the client across its reads: registered
-    /// while a read was parked on the body, it still wakes the reader when
-    /// the client leaves after that read returned its frame. A wait built
-    /// for each read is gone by then, and one never polled wakes nobody.
+    /// The client leaves between two reads of the chat body (while a call is
+    /// named): only a wait the relay kept from its parked read wakes it then.
     #[test]
     fn the_wait_a_parked_read_registered_wakes_the_reader_after_that_read() {
+        use std::{
+            cell::Cell,
+            future::Future,
+            sync::atomic::{AtomicUsize, Ordering},
+            task::{Context, Poll, Wake, Waker},
+        };
+
         struct Wakes(AtomicUsize);
         impl Wake for Wakes {
             fn wake(self: Arc<Self>) {
@@ -2477,20 +2475,31 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
 
         let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
-        let mut stream = Body::from_stream(ReceiverStream::new(body_rx)).into_data_stream();
+        let body = Body::from_stream(ReceiverStream::new(body_rx));
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
         let (tx, rx) = mpsc::channel(64);
-        let mut client_gone = ClientGone::of(&tx);
-        {
-            let mut read = std::pin::pin!(next_frame(&mut stream, &mut client_gone));
-            assert!(read.as_mut().poll(&mut cx).is_pending());
-            body_tx.try_send(Ok(Bytes::from_static(b"frame"))).unwrap();
-            assert!(matches!(
-                read.as_mut().poll(&mut cx),
-                Poll::Ready(BodyRead::Frame(Ok(_)))
-            ));
-        }
+        let rx = Cell::new(Some(rx));
+        let mut read = std::pin::pin!(convert_and_accumulate_stream(
+            body,
+            &mut emitter,
+            &tx,
+            |_| {
+                drop(rx.take());
+                true
+            }
+        ));
+        assert!(read.as_mut().poll(&mut cx).is_pending());
+        let call = json!({"tool_calls":[{"index":0,"id":"call_server","type":"function",
+            "function":{"name":"server_tool","arguments":""}}]});
+        body_tx
+            .try_send(Ok(Bytes::from(chat_event(call, None))))
+            .unwrap();
         assert_eq!(wakes.0.load(Ordering::SeqCst), 1, "the frame's wake");
-        drop(rx);
+        let Poll::Ready(Err(error)) = read.as_mut().poll(&mut cx) else {
+            panic!("the read ends at the first read after the client left");
+        };
+        assert_eq!(error["message"], "Client disconnected");
         assert_eq!(
             wakes.0.load(Ordering::SeqCst),
             2,

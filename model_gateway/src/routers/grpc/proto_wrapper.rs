@@ -749,7 +749,7 @@ pub struct WatchedStream {
     inner: Option<ProtoStream>,
     /// The wait for the client's leaving, one for the stream's whole life:
     /// built with the watch and polled only while the reader is parked on
-    /// the engine (see [`ProtoStream::next`]), so it registers with the
+    /// the engine (see [`ClientGone::poll_read`]), so it registers with the
     /// channel once, at the first park, instead of once per response.
     client_gone: ClientGone,
     request_id: String,
@@ -1997,15 +1997,8 @@ impl ProtoStream {
         } = &mut **watched;
         // Nothing after the client left: the inner stream went with it.
         let stream = inner.as_mut()?;
-        // The client's leaving is looked at first (the channel's flag), so a
-        // stream the engine keeps busy cannot outrun it; the inner stream is
-        // polled in place, without a boxed future per message; and the one
-        // wait for the client's leaving is polled only while the inner
-        // stream has nothing: a ready response costs no registration with
-        // the channel, and a parked reader finds the wait registered since
-        // its first park, so the moment the body is dropped it is woken.
-        // `None` here is the client's leaving, `Some(item)` the stream's own
-        // item or end.
+        // The inner stream is polled in place, without a boxed future per
+        // message.
         let item = {
             let mut next = std::pin::pin!(stream.next_unwatched());
             std::future::poll_fn(|cx| client_gone.poll_read(cx, |cx| next.as_mut().poll(cx))).await
