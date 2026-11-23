@@ -175,6 +175,13 @@ impl DecodeAhead {
         self.answer.worker().as_ref()
     }
 
+    /// Whether a dispatch owes this decode an ask behind its prefill's
+    /// answer ([`Placed::owed_behind_prefill`]): an attempt hands its
+    /// dispatch the ask ([`Self::again`]) for such a decode alone.
+    fn owed_behind_prefill(&self) -> bool {
+        self.answer.owed_behind_prefill()
+    }
+
     /// This decode asked again behind its prefill's answer, by the attempt's
     /// `ask`. Where the answer names another decode, the request goes to
     /// that one: its answer and the guard that counts it take the first's
@@ -303,8 +310,9 @@ impl std::fmt::Debug for PDRouter {
 }
 
 /// Who records the prefill side's outcome for an attempt: the attempt, from
-/// the response status, or the drain task once the prefill body is known
-/// (the early-commit path, where the response is the decode's).
+/// the response status, or whoever consumed the prefill body under a
+/// response that is the decode's: the drain task (the early-commit path), or
+/// the unary read of a body that was cut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrefillOutcome {
     FromStatus,
@@ -1165,6 +1173,15 @@ impl PDRouter {
             // prefill was told of its decode (that engine's sizes, the rank
             // both sides go to, and the side channel a WRITE prefill pushes
             // to), so that pair's decode is not asked.
+            //
+            // Both sides stand as built for the decode the selection named,
+            // which is no MoRI-IO engine where the decode is asked. A MoRI-IO
+            // decode takes the transfer its prefill was told of, and this
+            // prefill was told of none. So the ask is held to a decode that
+            // is no such engine, beside the retry's rule.
+            let keeps_the_shape = |worker: &dyn Worker| {
+                !is_moriio_worker(worker) && candidate_filter.is_none_or(|accepts| accepts(worker))
+            };
             let moved_to = parking_lot::Mutex::new(None);
             let ask = |first: &Placed, ahead: WorkerLoadGuard| {
                 let inputs = PlacementInputs {
@@ -1175,7 +1192,7 @@ impl PDRouter {
                     // The derived key again, as the selection stated it.
                     rid: rid_key.as_deref(),
                     cache_namespace,
-                    candidate_filter,
+                    candidate_filter: Some(&keeps_the_shape),
                     tried: &tried_before,
                 };
                 let pairs = || self.pd_pairs(model_id);
@@ -1186,7 +1203,10 @@ impl PDRouter {
                 (moved, guard)
             };
             let ask: &DecodeAsk<'_> = &ask;
-            let again = (mode != KvConnectorMode::MoriIo).then_some(ask);
+            // A decode the classic policies picked is owed no ask either:
+            // its answer's one test is all that pair pays behind its prefill.
+            let again = (mode != KvConnectorMode::MoriIo && guards.decode.owed_behind_prefill())
+                .then_some(ask);
 
             // Outcome accounting happens per-side inside the sequential path:
             // a prefill-only failure must not feed the decode worker's
@@ -1780,6 +1800,20 @@ impl PDRouter {
             let result = self
                 .process_prefill_response(resp, prefill.url(), context.return_logprob)
                 .await;
+            if let Ok((consumed, _)) = &result {
+                if consumed.is_server_error() {
+                    // The answer is the decode's: the cut is recorded here, as
+                    // the drain records it on a streamed request, while the
+                    // admission slot is still held.
+                    *prefill_outcome = PrefillOutcome::Drained;
+                    Self::record_sequential_side(
+                        ledger,
+                        prefill.as_ref(),
+                        metrics_labels::WORKER_PREFILL,
+                        *consumed,
+                    );
+                }
+            }
             drop(prefill_guard);
             let (_, body) = result.map_err(DispatchError::Prefill)?;
             Metrics::record_pd_prefill_duration(
@@ -2072,12 +2106,16 @@ impl PDRouter {
             }
             .emit();
 
+            // Each side's request names the rank its connector holds the
+            // pair to and, where the connector names none, the rank of the
+            // side's own worker object: an engine registered rank by rank is
+            // sent the rank of the row that was picked.
             let prefill_request = self.build_post_with_headers(
                 prefill.as_ref(),
                 context.route,
                 prefill_body,
                 headers,
-                dp_rank,
+                dp_rank.or_else(|| prefill.dp_rank()),
             );
             let prefill_bytes = match Self::prefill_side_bytes(
                 ledger,
@@ -2193,12 +2231,14 @@ impl PDRouter {
             Some(ask) if relay => decode.again(ask),
             _ => decode,
         };
+        // The decode's rank is read here, behind the ask: a decode that
+        // moved is sent the rank of the row it moved to.
         let decode_request = self.build_post_with_headers(
             decode.worker(),
             context.route,
             decode_body,
             headers,
-            dp_rank,
+            dp_rank.or_else(|| decode.worker().dp_rank()),
         );
         // The decode side goes out here, behind its prefill's answer: its
         // send is said.
@@ -2860,6 +2900,9 @@ impl PDRouter {
             .await);
         }
 
+        // What the body leaves on the prefill worker: its status, or the 502
+        // of a body that was cut while it was only consumed.
+        let mut consumed = prefill_status;
         // Read prefill body if needed for logprob merging
         let prefill_body = if return_logprob {
             match read_body_capped(prefill_response.bytes_stream(), self.max_payload_size).await {
@@ -2871,13 +2914,31 @@ impl PDRouter {
                     answer.extensions_mut().insert(OwnFailure(PdSide::Prefill));
                     return Err(answer);
                 }
-                Err(BodyReadError::Transport(e)) => {
+                // The request's own timeout is not the worker cutting its body:
+                // the request goes on to the decode read.
+                Err(BodyReadError::Transport(e)) if is_request_timeout(&e) => {
                     warn!(
                         worker = Endpoint::redacted_str(prefill_url),
                         "Failed to read prefill response body for logprobs: {}",
                         cause(&e)
                     );
                     None
+                }
+                // Cut short it is that side's failure too, under the code
+                // the handoff read answers a cut body with.
+                Err(BodyReadError::Transport(e)) => {
+                    error!(
+                        worker = Endpoint::redacted_str(prefill_url),
+                        "Failed to read prefill response body for logprobs: {}",
+                        cause(&e)
+                    );
+                    let mut answer = PdSide::Prefill.answer(
+                        SidePhase::Stream,
+                        StatusCode::BAD_GATEWAY,
+                        cause(&e),
+                    );
+                    answer.extensions_mut().insert(OwnFailure(PdSide::Prefill));
+                    return Err(answer);
                 }
             }
         } else {
@@ -2894,6 +2955,7 @@ impl PDRouter {
                             "Error consuming prefill response: {}",
                             cause(&e)
                         );
+                        consumed = StatusCode::BAD_GATEWAY;
                         break;
                     }
                     None => {
@@ -2905,16 +2967,17 @@ impl PDRouter {
             None
         };
 
-        Ok((prefill_status, prefill_body))
+        Ok((consumed, prefill_body))
     }
 
     /// One side's POST: the body, the allow-listed caller headers, and the
     /// credential with the precedence every other upstream call has (the
     /// caller's `Authorization`, else the worker's configured key), so a worker
     /// behind a key-protected gateway, whose caller key ends at the
-    /// middleware, still carries the key the worker requires; and, for a
-    /// MoRI-IO side, the data-parallel rank both sides are pinned to, set
-    /// after the forwarded headers.
+    /// middleware, still carries the key the worker requires; and the
+    /// data-parallel rank the side goes to, where its caller names one (the
+    /// rank a MoRI-IO pair is pinned to, or the side's own worker object's),
+    /// set after the forwarded headers.
     #[expect(
         clippy::unused_self,
         reason = "method on PDRouter for consistent API; may use self.api_key in future"
@@ -4880,7 +4943,7 @@ mod tests {
                 "Failed to read prefill response body for logprobs",
                 Chat(Prefill, true),
                 Cut,
-                StatusCode::OK,
+                BAD_GATEWAY,
             ),
         ];
 
@@ -5145,6 +5208,79 @@ mod tests {
         assert_eq!(
             read,
             [[false, true], [false, true], [true, false], [true, false]].map(refused)
+        );
+    }
+
+    /// A prefill body cut after its 2xx head is the prefill worker's failure,
+    /// and the decode worker beside it is not charged. With logprobs asked
+    /// that body is part of the answer and the request reads the side's 502.
+    /// Without them the client keeps the decode answer, and the cut stands on
+    /// the prefill worker beside the decode's success.
+    #[tokio::test]
+    async fn a_cut_prefill_body_is_charged_to_the_prefill_worker() {
+        let client = Arc::new(
+            http_client_builder()
+                .timeout(std::time::Duration::from_secs(1))
+                .build()
+                .unwrap(),
+        );
+        let mut read = Vec::new();
+        for logprobs in [true, false] {
+            let prefill_url = faulty_stub(Fault::CutAfterHead).await.0;
+            let decode_url = healthy_stub(Shape::Parallel, PdSide::Decode).await;
+            let router = single_attempt_router();
+            let pair = [
+                (prefill_url, WorkerType::Prefill),
+                (decode_url, WorkerType::Decode),
+            ]
+            .map(|(url, worker_type)| {
+                let worker = Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(worker_type)
+                        .http_client(Arc::clone(&client))
+                        .build(),
+                );
+                worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+                router
+                    .worker_registry
+                    .register_or_replace(Arc::clone(&worker) as Arc<dyn Worker>);
+                worker
+            });
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let chat: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "logprobs": logprobs,
+            }))
+            .expect("valid chat request");
+
+            let response = router
+                .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+                .await;
+
+            // The failures and the successes each worker's breaker counted.
+            let counted = pair.map(|worker| {
+                let stats = worker.circuit_breaker.load().stats();
+                (stats.total_failures, stats.total_successes)
+            });
+            read.push((
+                response.status(),
+                error_code(&response).map(str::to_owned),
+                counted,
+            ));
+        }
+
+        // Prefill then decode: the cut is the prefill worker's alone.
+        assert_eq!(
+            read,
+            [
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Some("prefill_stream_error".to_owned()),
+                    [(1, 0), (0, 0)]
+                ),
+                (StatusCode::OK, None, [(1, 0), (0, 1)]),
+            ]
         );
     }
 

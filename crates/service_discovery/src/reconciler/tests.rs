@@ -1,8 +1,9 @@
 use std::{slice, sync::Arc};
 
-use openai_protocol::worker::{WorkerStatus, WorkerType};
+use openai_protocol::worker::{RuntimeType, WorkerStatus, WorkerType};
 use smg_worker::{
     identity::endpoint::endpoint_key,
+    pd::pairing::{PairingMismatch, PdPairing, PdPairingMode},
     test_support::{assert_metric, render_with_recorder},
 };
 use tokio::runtime::Builder;
@@ -25,6 +26,7 @@ fn published(url: &str, discovery_id: &str) -> DiscoveredWorker {
         kv_connector: None,
         kv_role: None,
         kv_engine_id: None,
+        pairing_protocol: None,
         compat_labels: BTreeMap::new(),
     }
 }
@@ -412,6 +414,44 @@ fn owned_workers_exclude_mesh_imported_workers() {
     assert!(owned_workers(&*host, DiscoveryKind::Kubernetes).is_empty());
 }
 
+/// Workers published under different pairing protocols never pair under
+/// strict mode, and workers under one protocol do. Nothing else tells the
+/// two rollouts here apart: without the protocol a prefill of one would pair
+/// with a decode of the other.
+#[test]
+fn workers_of_different_pairing_protocols_never_pair_under_strict_mode() {
+    let host = TestHost::without_a_queue();
+    let pairing = |url: &str, worker_type: WorkerType, protocol: Option<&str>| {
+        let worker = DiscoveredWorker {
+            worker_type,
+            kv_connector: Some("NixlConnector".to_string()),
+            pairing_protocol: protocol.map(str::to_string),
+            ..published(url, url)
+        };
+        let mut spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*host);
+        // As registration completes the spec: the runtime its probe detects.
+        spec.runtime_type = RuntimeType::Vllm;
+        PdPairing::derive(&spec)
+    };
+    let prefill = |protocol| pairing("10.0.1.1:8080", WorkerType::Prefill, protocol);
+    let decode = |protocol| pairing("10.0.2.1:8080", WorkerType::Decode, protocol);
+    let strict = PdPairingMode::Strict;
+
+    for same in ["v1", "v2"] {
+        let (prefill, decode) = (prefill(Some(same)), decode(Some(same)));
+        assert_eq!(prefill.mismatch(&decode, strict), None, "{same}");
+    }
+    for (old, new) in [("v1", "v2"), ("v2", "v1")] {
+        let (prefill, decode) = (prefill(Some(old)), decode(Some(new)));
+        assert_eq!(
+            prefill.mismatch(&decode, strict),
+            Some(PairingMismatch::Explicit),
+            "a prefill of {old} and a decode of {new}"
+        );
+    }
+    assert_eq!(prefill(None).mismatch(&decode(None), strict), None);
+}
+
 #[test]
 fn build_worker_spec_carries_the_record_and_stamps_provenance() {
     let host = TestHost::without_a_queue();
@@ -422,6 +462,7 @@ fn build_worker_spec_carries_the_record_and_stamps_provenance() {
         kv_connector: Some("MooncakeConnector".to_string()),
         kv_role: Some("kv_producer".to_string()),
         kv_engine_id: Some("engine-1".to_string()),
+        pairing_protocol: Some("rollout-7".to_string()),
         ..published("10.0.0.1:8081", "uid-1:8081")
     };
     let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*host);
@@ -432,6 +473,7 @@ fn build_worker_spec_carries_the_record_and_stamps_provenance() {
     assert_eq!(spec.kv_connector.as_deref(), Some("MooncakeConnector"));
     assert_eq!(spec.kv_role.as_deref(), Some("kv_producer"));
     assert_eq!(spec.kv_engine_id.as_deref(), Some("engine-1"));
+    assert_eq!(spec.pairing_protocol.as_deref(), Some("rollout-7"));
     assert_eq!(
         spec.labels.get("served_model_name").map(String::as_str),
         Some("llama")

@@ -133,6 +133,7 @@ fn kubernetes_runtime(
         worker_ports_annotation: config.worker_ports_annotation.clone(),
         kv_connector_annotation: config.kv_connector_annotation.clone(),
         kv_engine_id_annotation: config.kv_engine_id_annotation.clone(),
+        pairing_protocol_label: config.pairing_protocol_label.clone(),
         model_id_source,
     };
     Ok(RuntimeDiscoveryConfig::Kubernetes(Box::new(settings)))
@@ -378,6 +379,7 @@ mod tests {
             worker_ports_annotation: "example.com/ports".to_string(),
             kv_connector_annotation: "example.com/connector".to_string(),
             kv_engine_id_annotation: "example.com/engine-id".to_string(),
+            pairing_protocol_label: "example.com/rollout".to_string(),
             model_id_source: Some("namespace".to_string()),
             ..Default::default()
         });
@@ -399,6 +401,7 @@ mod tests {
         assert_eq!(runtime.worker_ports_annotation, "example.com/ports");
         assert_eq!(runtime.kv_connector_annotation, "example.com/connector");
         assert_eq!(runtime.kv_engine_id_annotation, "example.com/engine-id");
+        assert_eq!(runtime.pairing_protocol_label, "example.com/rollout");
         assert!(matches!(
             runtime.model_id_source,
             Some(ModelIdSource::Namespace)

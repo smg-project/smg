@@ -389,7 +389,7 @@ impl VisionPreProcessor for Phi3VisionProcessor {
             .iter()
             .try_fold(1usize, |n, &d| n.checked_mul(d))
             .ok_or_else(|| {
-                TransformError::ShapeError(refused(format!("{shape:?} overflows usize")))
+                TransformError::ReserveRefused(refused(format!("{shape:?} overflows usize")))
             })?;
         let mut flat_data = scratch::try_take_f32_cap(len)
             .map_err(|error| TransformError::ReserveRefused(refused(error.to_string())))?;
@@ -867,7 +867,7 @@ mod tests {
         let error = processor.preprocess(&[&image]).expect_err("overflows");
 
         assert!(
-            matches!(&error, TransformError::ShapeError(message)
+            matches!(&error, TransformError::ReserveRefused(message)
                 if message.contains("overflows usize")),
             "{error}"
         );

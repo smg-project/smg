@@ -54,6 +54,8 @@
 mod conversations;
 #[path = "../tests/common/counting_alloc.rs"]
 mod counting_alloc;
+#[path = "in_process/encode.rs"]
+mod encode;
 #[path = "in_process/pair.rs"]
 mod pair;
 #[path = "in_process/place.rs"]
@@ -62,6 +64,8 @@ mod place;
 mod ruled;
 #[path = "in_process/signals.rs"]
 mod signals;
+#[path = "in_process/worded.rs"]
+mod worded;
 
 #[cfg(any(target_env = "msvc", target_env = "musl"))]
 use std::alloc::System as Allocator;
@@ -87,7 +91,7 @@ use smg_policy_controller::{
         Constraints, Decided, Identity, LentList, ListCell, Phase, Plain, PolicyEngine, Request,
         RequestFacts, RequestMaker, TokenEntry, TokenKey, WorkerId, WorkerLists,
     },
-    policies::consistent_hashing::LentRing,
+    policies::consistent_hashing::{Head, LentRing},
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Side, TransportClass},
 };
@@ -215,6 +219,29 @@ const CELLS: &[Cell] = &[
         request: keyed,
         ..Cell::PLAIN
     },
+    // The hash ring's document with a request that carries no key: the
+    // one cell of that document the one call for a request can be asked
+    // for (`--entry place`), where it reads the request's headers for the
+    // worker a request may name.
+    Cell {
+        name: "consistent_hashing_no_key",
+        document: || preset("consistent_hashing"),
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "encode_least_load",
+        document: || encode::of("least_load"),
+        request: encode::request,
+        words: encode::words,
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "encode_round_robin",
+        document: || encode::of("round_robin"),
+        request: encode::request,
+        words: encode::words,
+        ..Cell::PLAIN
+    },
     Cell {
         name: "least_load",
         document: || preset("least_load"),
@@ -258,6 +285,11 @@ const CELLS: &[Cell] = &[
         name: "prefix_hash",
         document: || preset("prefix_hash"),
         request: keyed,
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "prefix_hash_prompt",
+        document: || preset("prefix_hash"),
         ..Cell::PLAIN
     },
     Cell {
@@ -359,6 +391,14 @@ struct ListOrder(Vec<String>);
 impl LentRing for ListOrder {
     fn position(&self, _: &str) -> u64 {
         0
+    }
+
+    // A head stands at its own size: nothing is hashed for it either.
+    fn head_position(&self, head: Head<'_>) -> Option<u64> {
+        Some(match head {
+            Head::Tokens(ids) => ids.len() as u64,
+            Head::Text(text) => text.len() as u64,
+        })
     }
 
     fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
@@ -614,16 +654,8 @@ impl Host {
     #[inline(never)]
     fn told(held: &mut DecisionGuard<&PolicyEngine>, served: WorkerId, now: Instant) {
         held.dispatched(now);
-        let end = Outcome {
-            side: Side::Single,
-            served,
-            status: 200,
-            class: TransportClass::Ok,
-            ttft_micros: 0,
-            tokens_in: 1_024,
-            tokens_out: 0,
-            duration_micros: 0,
-        };
+        let mut end = Outcome::reported(200, TransportClass::Ok).with_served(Side::Single, served);
+        end.tokens_in = 1_024;
         held.completed(&end, now);
     }
 }
@@ -651,8 +683,9 @@ fn stretch<T>(
 
 fn main() {
     let run = run();
-    // A pair's cell hands two lists: its run is its file's.
-    if pair::runs(&run) {
+    // A pair's cell hands two lists and an encode request's three: such a
+    // run is its file's.
+    if pair::runs(&run) || encode::runs(&run) {
         return;
     }
     let Cell {
@@ -716,9 +749,15 @@ fn main() {
     let (publish, converted) = (|| feed.publish(&loads), || host.conversions());
     // The one call a host makes for a request, where the run asks it.
     if place::asked(&run, &host) {
-        let rule = ruled::stated(&run);
+        let (rule, ring) = (ruled::stated(&run), place::lent(&host));
+        if worded::stated(&run) {
+            measure(&run, &host, upkeep, publish, converted, |_| {
+                worded::one(&host)
+            });
+            return;
+        }
         measure(&run, &host, upkeep, publish, converted, |_| {
-            place::one(&host, rule)
+            place::one(&host, rule, ring)
         });
         return;
     }

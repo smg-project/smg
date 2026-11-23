@@ -177,6 +177,18 @@ pub struct EngineCoreReadyResponse {
     /// The checkpoint's video placeholder token id.
     #[serde(default)]
     pub video_token_id: Option<u32>,
+    /// A served DeepSeek-V4.1 model's `vision_patch_size`, off the model
+    /// config the SGLang scheduler loads from its server arguments, as its
+    /// model's is loaded (model overrides applied). With
+    /// `vision_downsample_ratio`, what a V4.1 image batch's patch rows and
+    /// spans are checked against. `None` from a scheduler whose model is not
+    /// a V4.1 or whose config does not hold both values, and from an engine
+    /// that declares none.
+    #[serde(default)]
+    pub vision_patch_size: Option<u64>,
+    /// See `vision_patch_size`.
+    #[serde(default)]
+    pub vision_downsample_ratio: Option<u64>,
 }
 
 /// The request type an engine lists for the generate path (`add`).
@@ -384,6 +396,38 @@ mod tests {
         let bytes = rmp_serde::to_vec_named(&json).unwrap();
         let resp: EngineCoreReadyResponse = decode_msgpack(&bytes).unwrap();
         assert!(resp.positional_layouts.is_empty());
+    }
+
+    /// An SGLang scheduler serving DeepSeek-V4.1 declares its model's patch
+    /// size and downsample ratio by name; one serving another model sends
+    /// them as nil, and an older plugin sends neither.
+    #[test]
+    fn ready_response_reads_a_v41_models_patch_geometry() {
+        let mut json = serde_json::json!({
+            "max_model_len": 4096u64,
+            "num_gpu_blocks": 1000u64,
+            "block_size": 16u64,
+            "dp_stats_address": serde_json::Value::Null,
+            "dtype": "bfloat16",
+            "vllm_version": "sglang-0.5.21",
+            "world_size": 1u64,
+            "data_parallel_size": 1u64,
+            "vision_patch_size": 14u64,
+            "vision_downsample_ratio": 3u64,
+        });
+        let geometry = |json: &serde_json::Value| {
+            let bytes = rmp_serde::to_vec_named(json).unwrap();
+            let resp: EngineCoreReadyResponse = decode_msgpack(&bytes).unwrap();
+            (resp.vision_patch_size, resp.vision_downsample_ratio)
+        };
+        assert_eq!(geometry(&json), (Some(14), Some(3)));
+        json["vision_patch_size"] = serde_json::Value::Null;
+        json["vision_downsample_ratio"] = serde_json::Value::Null;
+        assert_eq!(geometry(&json), (None, None));
+        let fields = json.as_object_mut().unwrap();
+        fields.remove("vision_patch_size");
+        fields.remove("vision_downsample_ratio");
+        assert_eq!(geometry(&json), (None, None));
     }
 
     #[test]

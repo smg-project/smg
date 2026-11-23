@@ -10,12 +10,13 @@
 //!
 //! The sheets live beside this target, in `tests/classic/sheets`, with the
 //! notes on their rows, and each recorder is a test module of the gateway
-//! crate beside the code it runs. Every run of the suite with the `ingest`
-//! and `in-process` features replays every row of each sheet that has a
+//! crate beside the code it runs. Every run of the suite with the `ingest`,
+//! `in-process` and `worker-host` features replays every row of each sheet
+//! that has a
 //! module here. A few rows of each form are copied into the policy's module
 //! from its sheet as well, and the replay holds every copied row to the
 //! sheet's row of its name. A row's reports reach the view through the
-//! `ingest` feature's row builder, and the four hard-demand modules decide
+//! `ingest` feature's row builder, and the three hard-demand modules decide
 //! over worker objects, which `in-process` brings: a bare test run of the
 //! crate builds no part of this target and replays no recorded row.
 //!
@@ -31,17 +32,18 @@
 //! pinned to by its key. Two hashes place no key alike, so it must replay
 //! with the requests of one key on one rank, and a counted row count for
 //! count or share for share.
-//! An overload row and a minimum-tokens row hold an answer of the host's
-//! load monitor: whether it read one worker as overloaded after each write
-//! of its loads, and the rank it gave each request on one worker. This
-//! crate's store judged both by rules of its own and is no longer read
-//! here, so the two sheets are owed ([`OWED_SHEETS`]).
-//! A retry-wire row, a media row, a context-window row and a rank-pin row
-//! hold the gateway's answer to each request of one pool, a retry that
-//! stays on its wire, a request that carries media, a request of some
-//! size and a request no rank can be pinned for among them: the workers
-//! the request may be placed on, or its refusal. Each must replay answer
-//! for answer, a refusal by its status and its code.
+//! An overload row picks nothing: it holds whether the gateway's load
+//! monitor read one worker as overloaded after each write of its loads, and
+//! must replay verdict for verdict through that monitor, built as a host of
+//! the engine over worker lists builds it, which `worker-host` brings.
+//! A minimum-tokens row holds the rank the load monitor gave each request
+//! on one worker. It must replay rank for rank through the rank cache of
+//! that monitor, which is the worker crate's own rank choice.
+//! A retry-wire row, a media row and a context-window row hold the
+//! gateway's answer to each request of one pool, a retry that stays on its
+//! wire, a request that carries media and a request of some size among
+//! them: the workers the request may be placed on, or its refusal. Each
+//! must replay answer for answer, a refusal by its status and its code.
 //! A pair-select row holds the gateway's answers to the requests of a
 //! prefill pool and a decode pool: the pair, or no pair and why. It must
 //! replay answer for answer, and a drawn row pair for pair and share for
@@ -52,6 +54,13 @@
 //! decide as recorded to the outcome its entry gives. The sticky rank
 //! module holds a row on which the gateway sets no rank to a rank of the
 //! worker for every request.
+//! The overload module replays a row of several ranks a second time with
+//! one worker object for each rank, where the load monitor judges each
+//! object by its own rank's figures, and holds the rows that answer apart
+//! there to the verdicts its entries give.
+//! The minimum-tokens module replays no row through the engine: the engine
+//! serves no rank option, and where each rank is a worker object it picks
+//! among them by its profile, which these rows do not record.
 //! A row whose form this crate does not build yet is owed: [`OWED`] names
 //! it with the validator's words and the
 //! change that builds it, and the replay fails once the row is no longer
@@ -76,13 +85,15 @@ mod classic {
     pub mod context_window;
     pub mod demand_bed;
     pub mod encode_pair;
+    pub mod load_bed;
     pub mod manual;
     pub mod media_refs;
+    pub mod minimum_tokens;
+    pub mod overload;
     pub mod pair_index;
     pub mod pair_select;
     pub mod power_of_two;
     pub mod prefix_hash;
-    pub mod rank_pin;
     pub mod retry_wire;
     pub mod sticky_override;
     pub mod sticky_rank;
@@ -136,28 +147,13 @@ struct OwedSheet {
     by: &'static str,
 }
 
-/// The owed sheets. The first was recorded before the change that replays
-/// it landed here. The other two record an answer of the host's own load
-/// monitor, which the engine over worker lists is never asked: their
-/// modules replayed them through this crate's store, by its own rules, and
-/// left when the store's decision views did.
-const OWED_SHEETS: &[OwedSheet] = &[
-    OwedSheet {
-        policy: "constraint-decider",
-        rows: 5,
-        by: "a request's hard demands: the constraint's decider on a retry",
-    },
-    OwedSheet {
-        policy: "minimum_tokens",
-        rows: 18,
-        by: "the load monitor's rank choice, asked of the host a controller runs",
-    },
-    OwedSheet {
-        policy: "overload",
-        rows: 25,
-        by: "the load monitor's overload verdict, asked of the host a controller runs",
-    },
-];
+/// The owed sheets: one, recorded before the change that replays
+/// it landed here.
+const OWED_SHEETS: &[OwedSheet] = &[OwedSheet {
+    policy: "constraint-decider",
+    rows: 5,
+    by: "a request's hard demands: the constraint's decider on a retry",
+}];
 
 /// The owed sheet of a policy, when one is owed.
 fn owed_sheet(policy: &str) -> Option<&'static OwedSheet> {
@@ -304,15 +300,18 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// names a rank or none, so the sticky rank module brings its own replay
 /// as well, and holds a copied row whole ([`whole_row_defects`]), as the
 /// pair-select module does.
+/// An overload row picks nothing either: its module brings its own replay,
+/// over a host's load monitor, and holds a copied row whole too.
+/// A minimum-tokens row names a rank or none: its module brings its own
+/// replay, over the rank cache of that monitor, and holds a copied row whole.
 /// An encode-pair row is replayed in its store part by its own module;
 /// its copied rows name no runtime either, and the pair index's rule
 /// holds them.
-/// A retry-wire row, a media row, a context-window row and a rank-pin
-/// row name the workers a request may take or its refusal, so each module
-/// brings its own replay too, over one bed; their copied rows name each
-/// runtime by a token, or name none, and the pair index's rule holds them
-/// as well.
-const MODULES: [Module; 15] = [
+/// A retry-wire row, a media row and a context-window row name the
+/// workers a request may take or its refusal, so each module brings its
+/// own replay too, over one bed; their copied rows name each runtime by a
+/// token, or name none, and the pair index's rule holds them as well.
+const MODULES: [Module; 16] = [
     module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
     module::<classic::bucket::Row>(classic::bucket::INLINE),
     module::<classic::cache_aware::Row>(classic::cache_aware::INLINE),
@@ -336,6 +335,18 @@ const MODULES: [Module; 15] = [
         copied: classic::pair_index::copied_row_defects,
     },
     Module {
+        policy: classic::minimum_tokens::POLICY,
+        inline: classic::minimum_tokens::INLINE,
+        replay: classic::minimum_tokens::replay_rows,
+        copied: whole_row_defects,
+    },
+    Module {
+        policy: classic::overload::POLICY,
+        inline: classic::overload::INLINE,
+        replay: classic::overload::replay_rows,
+        copied: whole_row_defects,
+    },
+    Module {
         policy: classic::pair_index::POLICY,
         inline: classic::pair_index::INLINE,
         replay: classic::pair_index::replay_rows,
@@ -353,12 +364,6 @@ const MODULES: [Module; 15] = [
         inline: classic::prefix_hash::INLINE,
         replay: classic::prefix_hash::replay_rows,
         copied: copied_row_defects,
-    },
-    Module {
-        policy: classic::rank_pin::POLICY,
-        inline: classic::rank_pin::INLINE,
-        replay: classic::rank_pin::replay_rows,
-        copied: classic::pair_index::copied_row_defects,
     },
     Module {
         policy: classic::retry_wire::POLICY,
@@ -723,6 +728,24 @@ fn the_classic_prefix_hash_rows_replay_on_a_ring_their_caller_lends() {
     }
 }
 
+/// The same rows through the one call a gateway asks, over worker objects:
+/// the caller lends each row's ring and states no place. The engine cuts a
+/// request into the heads the gateway's own policy cuts it into and asks
+/// the lender where each stands, and every request goes to its recorded
+/// worker. That the lender's own recipe for a head is the gateway's is
+/// proven where a gateway lends its ring, not here.
+#[cfg(feature = "in-process")]
+#[test]
+fn the_classic_prefix_hash_rows_replay_through_the_one_call_with_no_place_stated() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/classic/sheets");
+    let sheet = fs::read_to_string(dir.join("prefix_hash.json")).expect("the sheet is readable");
+    for (text, rows) in [(classic::prefix_hash::INLINE, 19), (sheet.as_str(), 31)] {
+        let (replayed, defects) = classic::prefix_hash::through_the_one_call::replay(text);
+        assert_eq!(replayed, rows, "the rows replayed through the one call");
+        assert!(defects.is_empty(), "{defects:#?}");
+    }
+}
+
 #[test]
 fn the_classic_sticky_override_rows_replay_pick_for_pick_and_share_for_share() {
     let (rows, defects) = replay_sheet(classic::sticky_override::INLINE, "the inline rows");
@@ -745,6 +768,20 @@ fn the_classic_sticky_rank_rows_replay_rank_for_rank_and_count_for_count() {
 }
 
 #[test]
+fn the_classic_overload_rows_replay_verdict_for_verdict() {
+    let (rows, defects) = replay_sheet(classic::overload::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
+fn the_classic_minimum_tokens_rows_replay_rank_for_rank() {
+    let (rows, defects) = replay_sheet(classic::minimum_tokens::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
 fn the_classic_media_rows_replay_answer_for_answer() {
     let (rows, defects) = replay_sheet(classic::media_refs::INLINE, "the inline rows");
     assert!(rows >= 8, "{rows} inline rows");
@@ -761,13 +798,6 @@ fn the_classic_context_window_rows_replay_answer_for_answer() {
 #[test]
 fn the_classic_retry_wire_rows_replay_answer_for_answer() {
     let (rows, defects) = replay_sheet(classic::retry_wire::INLINE, "the inline rows");
-    assert!(rows >= 8, "{rows} inline rows");
-    assert!(defects.is_empty(), "{defects:#?}");
-}
-
-#[test]
-fn the_classic_rank_pin_rows_replay_answer_for_answer() {
-    let (rows, defects) = replay_sheet(classic::rank_pin::INLINE, "the inline rows");
     assert!(rows >= 8, "{rows} inline rows");
     assert!(defects.is_empty(), "{defects:#?}");
 }
@@ -1287,11 +1317,12 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
             "encode_pair.json",
             "manual.json",
             "media-refs.json",
+            "minimum_tokens.json",
+            "overload.json",
             "pair-index.json",
             "pair-select.json",
             "power_of_two.json",
             "prefix_hash.json",
-            "rank-pin.json",
             "retry-wire.json",
             "sticky_override.json",
             "sticky_rank.json",

@@ -292,10 +292,12 @@ impl Engine {
         if let Some(weighted) = profile.scorers.first() {
             return Some(InTheWay::Scorer(weighted.scorer.name()));
         }
+        // The turns' mark says how the picker's draw picks: it asks no
+        // more of a decision than the draw's mark it stands beside.
         let asks_more = self
             .marks
             .get(usize::from(index))
-            .is_none_or(|marks| marks.0 & !Marks::DRAWS_FIRST != 0);
+            .is_none_or(|marks| marks.0 & !(Marks::DRAWS_FIRST | Marks::TURNS) != 0);
         if asks_more || !profile.picker.picks_alone() {
             return Some(InTheWay::Picker(profile.picker.name()));
         }
@@ -385,7 +387,7 @@ mod tests {
     /// whichever picker its profile holds, and both answers name the rule.
     #[test]
     fn a_place_whose_binding_states_a_sessions_rule_is_not_one_picks() {
-        for profile in ["round_robin", "passthrough"] {
+        for profile in ["round_robin", "random", "passthrough"] {
             let plain = engine_of(&preset(profile));
             let before = plain.place_for(MODEL, Phase::Single);
             assert!(matches!(before, Place::Alone(_)), "{profile}: {before:?}");
@@ -415,10 +417,10 @@ mod tests {
     /// shadow.
     #[test]
     fn a_stage_is_named_ahead_of_the_binding() {
-        let plain = engine_of(&preset("random"));
+        let plain = engine_of(&preset("power_of_two"));
         let before = plain.place_for(MODEL, Phase::Single);
-        let in_the_way = InTheWay::Picker("random");
-        let profile = "random";
+        let in_the_way = InTheWay::Scorer("least-load");
+        let profile = "power_of_two";
         assert_eq!(
             before,
             Place::NotAlone {
@@ -426,7 +428,7 @@ mod tests {
                 in_the_way
             }
         );
-        for document in [ruled("random"), shadowed_by("random", "round_robin")] {
+        for document in [ruled(profile), shadowed_by(profile, "round_robin")] {
             let engine = engine_of(&document);
             assert_eq!(engine.place_for(MODEL, Phase::Single), before);
         }

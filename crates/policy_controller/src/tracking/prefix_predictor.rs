@@ -5,9 +5,8 @@
 //! deepest block of its request that a worker was sent, and the workers
 //! sent it.
 //!
-//! An entry is a prediction made at the decision. The door and the stock
-//! controller write it where a single's lease is issued, so it says where
-//! a prefix was decided to go, whether or not the request then left. A
+//! An entry is a prediction made at the decision: it says where a prefix
+//! was decided to go, whether or not the request then left. A
 //! decision turned back behind its issue keeps its entry, and the next
 //! request of the prefix follows it: a false entry costs one miss on its
 //! worker, where no entry costs one miss on some worker, and it is true
@@ -25,14 +24,6 @@
 //! a request's keys once, in a buffer of its own
 //! ([`PrefixPredictor::fold_into`]), and hands them to the read and to the
 //! write behind it.
-//!
-//! The in-process door
-//! ([`StoreBackedEngine`](crate::engine::store_backed_engine::StoreBackedEngine))
-//! seats a request by its calling thread unless the generation holds a stage
-//! that keeps state a decider (`Engine::keeps_slot_state`). A stage that reads
-//! a predictor there joins that fact, or the predictor takes a shared owner:
-//! with neither, a door would split a model's predictor between its callers'
-//! seats, with no error.
 //!
 //! What is kept. A request carries its prefix as one hash a block of its
 //! content ([`RequestFacts::block_hashes`](crate::engine::RequestFacts::block_hashes)).

@@ -3,7 +3,7 @@
 
 use std::{
     cell::OnceCell,
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -18,7 +18,7 @@ use crate::{
         policy_engine::PolicyEngine,
         records,
         sticky_sessions::{shards_for_this_host, SessionVerdict},
-        view::{Constraints, Identity, Phase, PinSource, RequestFacts, Session, WorkerId},
+        view::{Constraints, Identity, Phase, RequestFacts, Session, WorkerId},
     },
     policies::consistent_hashing::{InOrder, LentRing},
     store::GatewayId,
@@ -112,7 +112,9 @@ fn served(worker: WorkerId) -> Outcome {
 /// Under the stock ring a keyed request over a list of worker objects goes
 /// to the workers its caller's ring reaches from where the caller says the
 /// key stands, in the ring's order: each worker the ring names by address
-/// is found in the list. A worker that is not ready passes the key on.
+/// is found in the list. A worker that is not ready passes the key on. No
+/// pass over the list runs: the decision writes the records of the workers
+/// its key reaches and of no other.
 ///
 /// The gateway's own policy takes the first eligible worker its ring
 /// reaches from the key (`model_gateway/src/policies/consistent_hashing.rs`,
@@ -127,6 +129,8 @@ fn a_rings_keyed_request_goes_to_the_workers_its_callers_ring_reaches() {
     let ring = InOrder(order.iter().map(|&at| list[at].url().to_owned()).collect());
     let places = |asks: &Asks<'_>| -> Vec<u32> {
         let decision = decided(&engine, asks).decision;
+        let trace = &decision.pick().expect("a pick").trace;
+        assert!(trace.drew_first(), "a pass over the list ran");
         targets(&decision).iter().map(|&(place, _)| place).collect()
     };
     let mut asks = keyed(9, &members);
@@ -431,44 +435,6 @@ fn a_key_idle_past_its_time_keeps_its_worker_until_the_sweep() {
     assert!(matches!(placed, SessionVerdict::Claimed(_)));
     assert_eq!(served_at(61), (SessionVerdict::Pinned, worker));
     assert!(matches!(served_at(3_600).0, SessionVerdict::Claimed(_)));
-}
-
-/// Pins of record: one worker for every key, and whether it was asked.
-#[derive(Debug)]
-struct Elsewhere(WorkerId, OnceLock<()>);
-
-impl PinSource for Elsewhere {
-    fn pinned(&self, _: Session, _: Option<u64>) -> Option<WorkerId> {
-        let _ = self.1.set(());
-        Some(self.0)
-    }
-}
-
-/// This engine reads no pins of record: a request that lends a record naming
-/// another worker is decided as one that lends none, where the whole pass
-/// places its key and where its pin is followed. The record is never asked.
-#[test]
-fn a_request_that_lends_pins_of_record_is_decided_as_one_that_lends_none() {
-    let (engine, twin) = (preset("manual"), preset("manual"));
-    let list = pool(16);
-    let (members, others) = (
-        PublishedList::new(Arc::clone(&list)),
-        PublishedList::new(Arc::clone(&list)),
-    );
-    // The whole pass places the key, then the key's pin is followed.
-    let twice = |engine: &PolicyEngine, asks: &Asks<'_>| {
-        [(); 2].map(|()| targets(&decided(engine, asks).decision))
-    };
-    let plain = twice(&twin, &keyed(41, &others));
-    let mut ids = list
-        .iter()
-        .map(|worker| records::worker_id(worker.as_ref()));
-    let other = ids.find(|id| *id != plain[0][0].1).expect("another worker");
-    let record = Elsewhere(other, OnceLock::new());
-    let mut lent = keyed(41, &members);
-    lent.request.constraints.pins = Some(&record);
-    assert_eq!(twice(&engine, &lent), plain);
-    assert!(record.1.get().is_none(), "the record is not asked");
 }
 
 /// A document is handed the engine's table ahead of its engine's first

@@ -105,6 +105,7 @@ fn create_pd_config() -> ServiceDiscoveryConfig {
         worker_ports_annotation: "smg.ai/worker-ports".to_string(),
         kv_connector_annotation: "smg.ai/kv-connector".to_string(),
         kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
+        pairing_protocol_label: "smg.ai/pairing-protocol".to_string(),
         model_id_source: None,
     }
 }
@@ -172,6 +173,7 @@ fn test_service_discovery_config_default() {
     assert_eq!(config.worker_ports_annotation, "smg.ai/worker-ports");
     assert_eq!(config.kv_connector_annotation, "smg.ai/kv-connector");
     assert_eq!(config.kv_engine_id_annotation, "smg.ai/kv-engine-id");
+    assert_eq!(config.pairing_protocol_label, "smg.ai/pairing-protocol");
 }
 
 #[test]
@@ -381,6 +383,7 @@ fn test_pod_info_is_healthy() {
         bootstrap_ports: vec![],
         kv_connector: None,
         kv_engine_ids: vec![],
+        pairing_protocol: None,
         model_id_override: None,
     };
     assert!(healthy_pod.is_healthy());
@@ -396,6 +399,7 @@ fn test_pod_info_is_healthy() {
         bootstrap_ports: vec![],
         kv_connector: None,
         kv_engine_ids: vec![],
+        pairing_protocol: None,
         model_id_override: None,
     };
     assert!(!not_ready_pod.is_healthy());
@@ -411,6 +415,7 @@ fn test_pod_info_is_healthy() {
         bootstrap_ports: vec![],
         kv_connector: None,
         kv_engine_ids: vec![],
+        pairing_protocol: None,
         model_id_override: None,
     };
     assert!(!not_running_pod.is_healthy());
@@ -549,6 +554,75 @@ fn test_from_pod_bootstrap_count_mismatch_ignored() {
     );
     let info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
     assert_eq!(info.bootstrap_ports, vec![None, None]);
+}
+
+// ========== Pairing protocol label ==========
+
+/// `pod` with one more label.
+fn with_label(mut pod: Pod, key: &str, value: &str) -> Pod {
+    pod.metadata
+        .labels
+        .get_or_insert_with(BTreeMap::new)
+        .insert(key.to_string(), value.to_string());
+    pod
+}
+
+/// A Pod's pairing-protocol label is read as its explicit pairing protocol:
+/// trimmed, and none where the label is absent, empty or blank.
+#[test]
+fn a_pods_pairing_protocol_label_is_read_trimmed_and_an_empty_one_states_none() {
+    let config = create_pd_config();
+    let read = |value: Option<&str>| {
+        let pod = create_pd_k8s_pod("decode-0", "10.0.0.1", "decode", None);
+        let pod = match value {
+            Some(value) => with_label(pod, "smg.ai/pairing-protocol", value),
+            None => pod,
+        };
+        let info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+        info.pairing_protocol
+    };
+    assert_eq!(read(Some("rollout-7")).as_deref(), Some("rollout-7"));
+    assert_eq!(read(Some("  rollout-7 ")).as_deref(), Some("rollout-7"));
+    assert_eq!(read(Some("")), None);
+    assert_eq!(read(Some("   ")), None);
+    assert_eq!(read(None), None);
+}
+
+/// The label's name is the configuration's: a Pod that carries both the
+/// configured label and the default one is read by the configured one.
+#[test]
+fn the_pairing_protocol_is_read_from_the_label_the_configuration_names() {
+    let mut config = create_pd_config();
+    config.pairing_protocol_label = "example.com/rollout".to_string();
+    let pod = create_pd_k8s_pod("decode-0", "10.0.0.1", "decode", None);
+    let pod = with_label(pod, "example.com/rollout", "blue");
+    let pod = with_label(pod, "smg.ai/pairing-protocol", "green");
+    let info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+    assert_eq!(info.pairing_protocol.as_deref(), Some("blue"));
+}
+
+/// Every worker a Pod publishes carries the Pod's pairing protocol. A Pod
+/// that is relabelled publishes the same instances under another
+/// fingerprint, which the reconciler answers with an update in place.
+#[test]
+fn each_worker_of_a_pod_carries_its_pairing_protocol_and_a_relabel_moves_its_fingerprint() {
+    let config = create_pd_config();
+    let published = |protocol: &str| {
+        let pod = create_pd_k8s_pod("decode-0", "10.0.0.1", "decode", None);
+        let mut pod = with_label(pod, "smg.ai/pairing-protocol", protocol);
+        let annotations = pod.metadata.annotations.as_mut().unwrap();
+        annotations.insert("smg.ai/worker-ports".to_string(), "8080,8081".to_string());
+        compute_desired_state(&store_snapshot(vec![pod]), &config)
+    };
+    let (first, relabelled) = (published("v1"), published("v2"));
+    assert_eq!(first.workers.len(), 2);
+    for (endpoint, worker) in &first.workers {
+        assert_eq!(worker.pairing_protocol.as_deref(), Some("v1"));
+        let again = &relabelled.workers[endpoint];
+        assert_eq!(again.discovery_id, worker.discovery_id);
+        assert_eq!(again.pairing_protocol.as_deref(), Some("v2"));
+        assert_ne!(again.fingerprint(), worker.fingerprint());
+    }
 }
 
 // ========== Desired state ==========

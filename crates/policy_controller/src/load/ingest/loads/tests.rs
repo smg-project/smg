@@ -21,14 +21,13 @@ use super::{
 };
 use crate::{
     document::{
-        spec::{AcrossRanks, BindingSpec, OverloadSpec, SignalSpec},
+        spec::{AcrossRanks, BindingSpec, SignalSpec},
         AppliedSpec, PolicySpec,
     },
     engine::view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
     store::{
-        GatewayId, JournalKinds, LoadSink, LoadSource, MembershipChange, MemoryStore, Position,
-        Reachability, Signals, ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore,
-        PUBLISH_WINDOW,
+        GatewayId, LoadSink, LoadSource, MembershipChange, MemoryStore, Position, Reachability,
+        Signals, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
 };
 
@@ -37,6 +36,12 @@ use crate::{
 const METRICS_TEXT: &str = "vllm:num_requests_running{model_name=\"m\"} 3\n\
                            vllm:num_requests_waiting{model_name=\"m\"} 5\n\
                            vllm:kv_cache_usage_perc{model_name=\"m\"} 0.75\n";
+
+/// The same body with eight waiting: an engine at the crate's count of
+/// queued requests.
+const QUEUE_AT_THE_COUNT_TEXT: &str = "vllm:num_requests_running{model_name=\"m\"} 3\n\
+                                       vllm:num_requests_waiting{model_name=\"m\"} 8\n\
+                                       vllm:kv_cache_usage_perc{model_name=\"m\"} 0.75\n";
 
 /// One rank's figures the fake engine answers with.
 #[derive(Clone, Copy)]
@@ -1028,28 +1033,11 @@ async fn run_shows_a_row_that_landed_inside_the_window_at_the_windows_end() {
     probe.answers("grpc://a:1", &[busy]);
     probe.answers("grpc://b:1", &[busy]);
     probe.held.lock().insert("grpc://b:1".to_owned());
-    // What a decision reads of the worker's load at this instant.
+    // What the published world holds of the worker's load at this instant.
     let seen = |id: WorkerId| {
-        let mut out = ViewBuffers::default();
-        store
-            .build_view(
-                "m",
-                Role::Single,
-                &ViewQuery {
-                    gateway: GatewayId::LOCAL,
-                    now: now(),
-                    pinned: None,
-                    affinity: false,
-                    signal_cells: false,
-                },
-                &mut out,
-            )
-            .expect("the pool");
-        out.candidates
-            .iter()
-            .find(|row| row.id == id)
-            .and_then(|row| row.load)
-            .map(|load| load.running)
+        let world = store.snapshot();
+        let row = world.first_row_of(id);
+        row.and_then(|row| row.load).map(|load| load.running)
     };
     let driver = Arc::new(driver(&store, &probe, TEN));
     let (stop, stopped) = watch::channel(false);
@@ -1416,9 +1404,10 @@ fn an_address_whose_host_cannot_be_told_from_its_userinfo_is_named_by_a_marker()
     }
 }
 
-/// A generation whose one binding vetoes an engine at `waiting` queued
-/// requests over its ranks.
-fn vetoing_at(waiting: u32) -> AppliedSpec {
+/// A generation whose one binding has its overload block switched on: an
+/// engine is vetoed at the crate's count, eight queued requests over its
+/// ranks. No binding states a count of its own.
+fn vetoing() -> AppliedSpec {
     let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
     document.generation = 1;
     let profile = document
@@ -1429,31 +1418,20 @@ fn vetoing_at(waiting: u32) -> AppliedSpec {
         .clone();
     document.bindings = vec![BindingSpec {
         profile: Some(profile),
-        overload: Some(OverloadSpec {
-            waiting_requests: Some(waiting),
-            token_usage: Some(1.0),
-            ..OverloadSpec::default()
-        }),
         ..BindingSpec::default()
     }];
     AppliedSpec::validate(&document).expect("the document validates")
 }
 
-/// Each row of the model's pool: whether it carries the overload verdict.
+/// Each worker on file, by id: whether its published row carries the
+/// overload verdict. Every worker of these cases serves the one pool.
 fn vetoed(store: &MemoryStore) -> Vec<bool> {
-    let mut out = ViewBuffers::default();
-    let ask = ViewQuery {
-        gateway: GatewayId(1),
-        now: now(),
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
-    };
-    store
-        .build_view("m", Role::Single, &ask, &mut out)
-        .expect("the pool");
-    out.candidates
-        .iter()
+    let world = store.snapshot();
+    let on_file = store.checkpoint().rows;
+    let mut ids: Vec<WorkerId> = on_file.iter().map(|row| row.id).collect();
+    ids.sort_unstable();
+    ids.into_iter()
+        .map(|id| world.first_row_of(id).expect("the worker's published row"))
         .map(|row| row.health.overloaded)
         .collect()
 }
@@ -1463,12 +1441,12 @@ async fn a_failed_poll_is_the_word_that_no_report_came_and_clears_the_engines_ve
     let store = Arc::new(MemoryStore::new());
     let probe = Arc::new(FakeProbe::default());
     let id = ready(&store, "grpc://a:1", "grpc://a:1", 0, 1, WireModes::GRPC, 0);
-    store.apply(vetoing_at(5)).expect("applied");
+    store.apply(vetoing()).expect("applied");
     probe.answers(
         "grpc://a:1",
         &[Figures {
             running: 0,
-            waiting: 5,
+            waiting: 8,
             usage: 0.0,
         }],
     );
@@ -1481,7 +1459,7 @@ async fn a_failed_poll_is_the_word_that_no_report_came_and_clears_the_engines_ve
     probe.failing.lock().insert("grpc://a:1".to_owned());
     tokio::time::advance(TEN + Duration::from_secs(1)).await;
     tick(&driver, &mut schedule).await;
-    assert_eq!(row(&store, id, 0).map(|(r, _)| r.queued), Some(5));
+    assert_eq!(row(&store, id, 0).map(|(r, _)| r.queued), Some(8));
     assert_eq!((vetoed(&store), store.overload_flips()), (vec![false], 2));
 
     // The engine answers again: its report is judged as any other.
@@ -1504,11 +1482,11 @@ async fn a_failed_scrape_is_the_word_that_no_report_came_and_clears_the_engines_
         WireModes::HTTP,
         500,
     );
-    store.apply(vetoing_at(5)).expect("applied");
+    store.apply(vetoing()).expect("applied");
     probe
         .texts
         .lock()
-        .insert("http://h:1".to_owned(), METRICS_TEXT.to_owned());
+        .insert("http://h:1".to_owned(), QUEUE_AT_THE_COUNT_TEXT.to_owned());
     let driver = driver(&store, &probe, TEN);
     let mut schedule = Schedule::default();
     tick(&driver, &mut schedule).await;
@@ -1518,14 +1496,14 @@ async fn a_failed_scrape_is_the_word_that_no_report_came_and_clears_the_engines_
     probe.texts.lock().clear();
     tokio::time::advance(TEN + Duration::from_secs(1)).await;
     tick(&driver, &mut schedule).await;
-    assert_eq!(row(&store, id, 0).map(|(r, _)| r.queued), Some(5));
+    assert_eq!(row(&store, id, 0).map(|(r, _)| r.queued), Some(8));
     assert_eq!((vetoed(&store), store.overload_flips()), (vec![false], 2));
 
     // The engine's text is back: its row is judged as any other.
     probe
         .texts
         .lock()
-        .insert("http://h:1".to_owned(), METRICS_TEXT.to_owned());
+        .insert("http://h:1".to_owned(), QUEUE_AT_THE_COUNT_TEXT.to_owned());
     tokio::time::advance(TEN + Duration::from_secs(1)).await;
     tick(&driver, &mut schedule).await;
     assert_eq!((vetoed(&store), store.overload_flips()), (vec![true], 3));
@@ -1553,13 +1531,13 @@ async fn a_failed_poll_says_nothing_of_an_engine_whose_other_rank_its_stream_ser
         WireModes::GRPC,
         0,
     );
-    store.apply(vetoing_at(5)).expect("applied");
+    store.apply(vetoing()).expect("applied");
     // Rank 0's stream reports a queue at the count: the engine is over it.
     store.record(
         rank0,
         0,
         LoadRow {
-            queued: 5,
+            queued: 8,
             ..LoadRow::default()
         },
         now(),
@@ -1617,12 +1595,12 @@ async fn an_answer_with_no_row_says_nothing_of_an_engine_whose_other_rank_its_st
         WireModes::GRPC,
         0,
     );
-    store.apply(vetoing_at(5)).expect("applied");
+    store.apply(vetoing()).expect("applied");
     store.record(
         rank0,
         0,
         LoadRow {
-            queued: 5,
+            queued: 8,
             ..LoadRow::default()
         },
         now(),
@@ -1736,7 +1714,7 @@ async fn a_polled_rank_is_counted_through_one_lost_report_at_an_interval_near_th
         WireModes::GRPC,
         0,
     );
-    store.apply(vetoing_at(5)).expect("applied");
+    store.apply(vetoing()).expect("applied");
     let _driver = LoadDriver::new(
         Arc::clone(&store),
         Arc::clone(&probe),
@@ -1747,7 +1725,7 @@ async fn a_polled_rank_is_counted_through_one_lost_report_at_an_interval_near_th
     );
     // The poll that started at 0 s hears the rank at its threshold.
     let waiting = LoadRow {
-        queued: 5,
+        queued: 8,
         ..LoadRow::default()
     };
     store.report(&[(rank1, 1, Some(waiting))], now(), LoadSource::Poll);
@@ -1793,12 +1771,12 @@ async fn a_rank_that_is_not_ready_does_not_hold_the_word_off() {
         WireModes::GRPC,
         0,
     );
-    store.apply(vetoing_at(5)).expect("applied");
+    store.apply(vetoing()).expect("applied");
     store.record(
         rank0,
         0,
         LoadRow {
-            queued: 5,
+            queued: 8,
             ..LoadRow::default()
         },
         now(),
@@ -1840,7 +1818,7 @@ async fn an_engines_answer_is_one_write_so_ranks_that_trade_their_queues_move_no
             0,
         );
     }
-    store.apply(vetoing_at(8)).expect("applied");
+    store.apply(vetoing()).expect("applied");
     let figures = |waiting: i32| Figures {
         running: 0,
         waiting,
@@ -1904,7 +1882,7 @@ async fn the_polls_group_the_membership_anew_at_a_take_after_a_restore_to_the_sa
         0,
     );
     assert_eq!(leader.epoch(), store.epoch());
-    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(store.restore_from(leader.checkpoint()));
     let before = probe.polls().len();
     tokio::time::sleep(TEN + TEN).await;
     assert_eq!(probe.polls().len(), before, "a follower polled");
@@ -1961,7 +1939,7 @@ async fn a_take_whose_word_folded_over_a_loss_starts_the_polls_anew() {
         0,
     );
     assert_eq!(leader.epoch(), store.epoch());
-    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(store.restore_from(leader.checkpoint()));
     leads.send_replace(Some(2));
     let before = probe.polls().len();
     tokio::time::sleep(TEN + TEN).await;
@@ -1980,19 +1958,22 @@ async fn a_take_whose_word_folded_over_a_loss_starts_the_polls_anew() {
 /// A follower is sent no load row, so a row left standing would be read at
 /// the next take, as old as the whole follow. The take comes inside one
 /// poll interval of the lost lead's last record: its poll goes out at once
-/// and writes the row anew.
+/// and writes the row anew. Two workers stand, so a drop of the first row
+/// alone leaves the second's.
 #[tokio::test(start_paused = true)]
 async fn a_lost_lead_drops_every_load_row_with_its_verdict_and_its_receipt() {
     let store = Arc::new(MemoryStore::new());
     let probe = Arc::new(FakeProbe::default());
     let own = ready(&store, "grpc://w:1", "grpc://w:1", 0, 1, WireModes::GRPC, 0);
-    store.apply(vetoing_at(5)).expect("applied");
+    let other = ready(&store, "grpc://w:2", "grpc://w:2", 0, 1, WireModes::GRPC, 0);
+    store.apply(vetoing()).expect("applied");
     let figures = |waiting| Figures {
         running: 0,
         waiting,
         usage: 0.0,
     };
-    probe.answers("grpc://w:1", &[figures(5)]);
+    probe.answers("grpc://w:1", &[figures(8)]);
+    probe.answers("grpc://w:2", &[figures(10)]);
     let driver = Arc::new(driver(&store, &probe, TEN));
     let (_stop, stopped) = watch::channel(false);
     let (leads, polls) = watch::channel(Some(1));
@@ -2001,41 +1982,46 @@ async fn a_lost_lead_drops_every_load_row_with_its_verdict_and_its_receipt() {
     tasks.spawn(async move { running.run_while(stopped, polls).await });
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(probe.polls_of("grpc://w:1"), 1);
+    assert_eq!(probe.polls_of("grpc://w:2"), 1);
     // The rank's own record behind the poll: its receipt holds the next
     // poll back for an interval.
     let pushed = LoadRow {
-        queued: 5,
+        queued: 8,
         ..LoadRow::default()
     };
     store.record(own, 0, pushed, now(), LoadSource::Stream);
-    assert_eq!(vetoed(&store), [true]);
-    // The loss: the row and its verdict are gone at the word.
+    assert_eq!(vetoed(&store), [true, true]);
+    // The loss: each row and its verdict are gone at the word.
     leads.send_replace(None);
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(
-        row(&store, own, 0).is_none(),
-        "a follower holds its lead's row"
+        row(&store, own, 0).is_none() && row(&store, other, 0).is_none(),
+        "a follower holds a row of its lead"
     );
-    assert_eq!(vetoed(&store), [false]);
+    assert_eq!(vetoed(&store), [false, false]);
     // The take, two seconds behind the record: no receipt of the lost lead
-    // holds its poll back, and the row is what the engine answers now.
+    // holds its poll back, and each row is what its engine answers now.
     probe.answers("grpc://w:1", &[figures(1)]);
+    probe.answers("grpc://w:2", &[figures(1)]);
     leads.send_replace(Some(2));
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(probe.polls_of("grpc://w:1"), 2);
     assert_eq!(row(&store, own, 0).map(|(row, _)| row.queued), Some(1));
-    assert_eq!(vetoed(&store), [false]);
-    // A loss and the take after it, read as one word: the row of the lead
-    // that ended is gone all the same, ahead of the next lead's first
-    // poll, which fails here and writes none.
-    probe.failing.lock().insert("grpc://w:1".to_owned());
+    assert_eq!(row(&store, other, 0).map(|(row, _)| row.queued), Some(1));
+    assert_eq!(vetoed(&store), [false, false]);
+    // A loss and the take after it, read as one word: the rows of the lead
+    // that ended are gone all the same, ahead of the next lead's first
+    // polls, which fail here and write none.
+    for failing in ["grpc://w:1", "grpc://w:2"] {
+        probe.failing.lock().insert(failing.to_owned());
+    }
     leads.send_replace(None);
     leads.send_replace(Some(3));
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(probe.polls_of("grpc://w:1"), 3);
     assert!(
-        row(&store, own, 0).is_none(),
-        "a lead read the row of the lead before it"
+        row(&store, own, 0).is_none() && row(&store, other, 0).is_none(),
+        "a lead read a row of the lead before it"
     );
 }
 
@@ -2053,19 +2039,11 @@ async fn a_followers_loop_pays_the_stores_publications_and_polls_no_engine() {
     let mut tasks = JoinSet::new();
     let running = Arc::clone(&driver);
     tasks.spawn(async move { running.run_while(stopped, polls).await });
-    // What a decision reads of the worker's load; `None` while the worker
-    // is no member of the published world.
+    // What the published world holds of the worker's load; `None` while the
+    // worker is no member of the published world.
     let seen = |id: WorkerId| {
-        let mut out = ViewBuffers::default();
-        let ask = ViewQuery {
-            gateway: GatewayId::LOCAL,
-            now: now(),
-            pinned: None,
-            affinity: false,
-            signal_cells: false,
-        };
-        store.build_view("m", Role::Single, &ask, &mut out)?;
-        let row = out.candidates.iter().find(|row| row.id == id)?;
+        let world = store.snapshot();
+        let row = world.first_row_of(id)?;
         Some(row.load.map(|load| load.running))
     };
     // The leader's registration and its status, followed as the applier
@@ -2117,35 +2095,6 @@ fn declare(store: &MemoryStore, generation: u64, signals: &[(&str, &str)]) {
     }
     let spec = AppliedSpec::validate(&document).expect("the document validates");
     store.apply(spec).expect("a newer generation");
-}
-
-/// Each row's signal cells once the window's writes are shown, by worker:
-/// a cell's value and its sample instant, or none.
-fn cells(store: &MemoryStore) -> HashMap<WorkerId, Vec<Option<(f64, u64)>>> {
-    if let Some(due) = store.publish_due() {
-        store.publish(due);
-    }
-    store.deciding(|world| {
-        let ask = ViewQuery {
-            gateway: GatewayId(1),
-            now: now(),
-            pinned: None,
-            affinity: false,
-            signal_cells: true,
-        };
-        let mut out = ViewBuffers::default();
-        let view = world
-            .view("m", Role::Single, &ask, false, &mut out)
-            .expect("the pool");
-        let block = view.signal_cells.expect("the publication's block");
-        let held = |cell: &crate::load::SignalCell| {
-            (!cell.is_none()).then_some((cell.value, cell.sampled_at_micros))
-        };
-        let cells = block.cells().chunks(block.signals());
-        let ids = view.candidates.iter().map(|row| row.id);
-        ids.zip(cells.map(|cells| cells.iter().map(held).collect()))
-            .collect()
-    })
 }
 
 /// One rank's answer: its depth by name, a name no document declares, and
@@ -2207,16 +2156,9 @@ async fn a_polls_answer_writes_each_ranks_declared_values_behind_its_row() {
             }),
         },
     );
-    // A value is as old as it says before the poll began, and one that
-    // states no age is as old as its row: an unstamped poll's is sampled
-    // at the poll's start, never at its arrival.
-    let aged = store.micros(started - Duration::from_millis(150));
-    let fresh = store.micros(started);
-    let held = cells(&store);
-    assert_eq!(held[&rank0], [Some((3.0, aged)), Some((1_024.0, fresh))]);
-    assert_eq!(held[&rank1], [Some((5.0, fresh)), Some((1_025.0, fresh))]);
-    // Each rank's row stands too, and the name no document declares was
-    // never offered: no write counts it.
+    // Each rank's row stands, and the store took the two declared names of
+    // each rank. The name no document declares was never offered: no write
+    // counts it.
     assert!(row(&store, rank0, 0).is_some() && row(&store, rank1, 1).is_some());
     assert_eq!(store.stats().signal_writes, [4, 0, 0, 0, 0, 0]);
 }
@@ -2248,11 +2190,9 @@ async fn a_row_the_store_passes_over_takes_its_values_with_it() {
             }),
         },
     );
-    let held = cells(&store);
-    assert_eq!(held[&rank0], [None]);
-    assert_eq!(held[&rank1], [Some((5.0, store.micros(started)))]);
     let (stands, source) = row(&store, rank0, 0).expect("rank 0's record");
     assert_eq!((stands.running, source), (9, LoadSource::Stream));
+    // The answer states one declared value a rank, and one was written.
     assert_eq!(store.stats().signal_writes, [1, 0, 0, 0, 0, 0]);
 }
 
@@ -2298,11 +2238,8 @@ async fn a_polled_list_is_put_under_the_bounds_before_it_is_read_and_what_left_i
             }),
         },
     );
-    // The 65th value is never read, the name's first statement stands,
-    // and the value that is no number never reaches the store.
-    let held = cells(&store);
-    assert_eq!(held[&rank0], [None, None]);
-    assert_eq!(held[&rank1], [Some((5.0, store.micros(started))), None]);
+    // Three values leave ahead of the read: the 65th, the name's second
+    // statement and the value that is no number. One reaches the store.
     assert_eq!(driver.stats().values_dropped.load(Ordering::Relaxed), 3);
     assert_eq!(store.stats().signal_writes, [1, 0, 0, 0, 0, 0]);
 }

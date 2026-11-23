@@ -41,10 +41,8 @@
 //! job. The price is a lag on a lull: a frame handed while the file's
 //! decider waits is applied one period later at most, and another file's
 //! decision reads what its apply writes that much later: its worker's
-//! count, high for a lease that ended and low on a target a dispatch
-//! moved a lease to, and what a stage keeps of a lease's events. A
-//! session's pin of record is read by its own model's decisions alone,
-//! which the file's decider makes behind its apply. A look says whether
+//! count, high for a lease that ended and low on a target a dispatch moved
+//! a lease to, and what a stage keeps of a lease's events. A look says whether
 //! it applied a frame ([`LookOutcome`]), and its host sets the time to its next
 //! look by that: short while the file's frames flow, longer over a quiet
 //! file. A watch ends where a look finds no lease on file: the decider
@@ -76,15 +74,6 @@
 //! the ring full. So a frame of a lease on file waits one period at
 //! most, but behind a thread that left its work by an unwind or rested
 //! on its watch: what it left is the next take's.
-//!
-//! A door in process has no deciding thread
-//! ([`crate::engine::StoreBackedEngine`]): each caller is at work at its seat's
-//! file for its one decision and rests as it leaves ([`AtWork::rest`]). No
-//! caller looks at a file again, so a door's file shows no watch: what is said
-//! of a lease is applied at once where no caller decides at its file, and by
-//! the caller at work otherwise, as it leaves. A report said through the door
-//! does not wait at a full ring: the door keeps it beside the ring, and the
-//! caller at work hands it on as it leaves.
 //!
 //! The hand-over, where a file shows no watch. A frame handed while the
 //! file's decider leaves its work waits on no lull: the leaver's last
@@ -148,16 +137,18 @@
 //! restore, from its start until it has read the ids on file
 //! ([`MemoryStore::restore_from`]). Under a turn come the world's load
 //! (no lock), a stage's own lock, the engine's sessions table, the store's
-//! pins, the journal's word of a term and the table of the members no
-//! world lists yet, a leaf lock. A standby's restore takes the
+//! session counts, the journal's word of a term, the table of the
+//! members no world lists yet, a leaf lock, and the entry of the worker
+//! objects a host's word to the engine asks, a leaf lock too. A standby's
+//! restore takes the
 //! store's tables under its turns too: the workers', the health's and the
 //! loads', in that order. No path takes one of those and then a turn. A
 //! lifecycle call of a served controller therefore runs under a turn, or
 //! after it where a decision gives its own lease up: it is bounded and
 //! calls no door of the leases. A registration that takes its key's pins
-//! along holds the workers lock over the store's pins, each shard a leaf
-//! under it. A debug build marks the thread that holds a turn and refuses
-//! a second take of it by that thread.
+//! along holds the workers lock over the engine's sessions table, each
+//! shard a leaf under it. A debug build marks the thread that holds a turn
+//! and refuses a second take of it by that thread.
 
 use std::{
     fmt,
@@ -192,8 +183,10 @@ use crate::{
 /// What tells the engine of a frame applied to a lease on file: the world
 /// the frame is told under, the lease as it stood before the frame, both
 /// its parts, what the frame said, and the decider whose file the lease is
-/// on, where the store's host named its deciders.
-type Teller = fn(&MemoryStore, &StoreSnapshot, &Sides, Said, Option<DecisionSlot>);
+/// on, where the store's host named its deciders. It holds what its host
+/// gave it: a served controller's holds the replica's worker objects.
+type Teller =
+    Arc<dyn Fn(&MemoryStore, &StoreSnapshot, &Sides, Said, Option<DecisionSlot>) + Send + Sync>;
 
 /// One load of the world for a run of words to the engine: the store's
 /// world, loaded at the run's first word and held to its last. A run is
@@ -504,7 +497,7 @@ pub enum LookOutcome {
 /// keeps and takes the turn once more: what was handed behind its last
 /// take is applied before the thread waits, and the hands apply in place
 /// from there. A thread that rests behind each job never looks, and
-/// keeps no watch: a caller of a door in process.
+/// keeps no watch.
 pub struct AtWork {
     store: Arc<MemoryStore>,
     file: usize,
@@ -814,13 +807,27 @@ impl MemoryStore {
 
     /// Gives the store the controller's word to the engine: what tells it
     /// of a frame applied to a lease on file. Given once: the first stays.
-    pub(crate) fn tell_through(&self, teller: Teller) {
-        self.files.teller.get_or_init(|| teller);
+    #[cfg_attr(
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "called by the served controller alone")
+    )]
+    pub(crate) fn tell_through(
+        &self,
+        teller: impl Fn(&MemoryStore, &StoreSnapshot, &Sides, Said, Option<DecisionSlot>)
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        self.files.teller.get_or_init(|| Arc::new(teller));
     }
 
     /// A lifecycle call the controller made for a lease panicked and was
     /// held: counted. `true` for the first of a streak, the one its caller
     /// writes a line for.
+    #[cfg_attr(
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "called by the served controller alone")
+    )]
     pub(crate) fn call_faulted(&self) -> bool {
         let faults = &self.files.faults;
         let first = faults.fetch_or(STREAK, Relaxed) & STREAK == 0;
@@ -831,6 +838,10 @@ impl MemoryStore {
     /// A lifecycle call the controller made for a lease returned: a
     /// streak of faults ends. One load where none stands, so a call that
     /// returns writes nothing the deciders share.
+    #[cfg_attr(
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "called by the served controller alone")
+    )]
     pub(crate) fn call_returned(&self) {
         let faults = &self.files.faults;
         if faults.load(Relaxed) & STREAK != 0 {
@@ -1045,10 +1056,7 @@ impl MemoryStore {
     }
 
     /// Hands the file a lease's id names what a frame said of `lease`: a
-    /// session's own hand. A host in process says the same through its
-    /// door
-    /// ([`StoreBackedEngine::report`](crate::engine::store_backed_engine::StoreBackedEngine::report)),
-    /// which a full ring does not hold. The frame is written into the file's
+    /// session's own hand. The frame is written into the file's
     /// ring. Where the file's decider keeps its watch the hand leaves it there:
     /// the decider applies it at its next take, one period of its host away at
     /// most. The word is read with no fence behind the ring's write, so a hand
@@ -1111,21 +1119,9 @@ impl MemoryStore {
         }
     }
 
-    /// One look of [`Self::hand`] at the file at `at`, the one `lease`
-    /// names ([`Self::file_of`]), for a caller that must not be held:
-    /// `false` where the file's ring is full and a thread at work there
-    /// has not applied yet. Nothing was written then: the caller keeps
-    /// what was said, and hands it again in the order said.
-    ///
-    /// Always inlined: the served hand is this look in a loop, and the
-    /// door's two callers would otherwise move it out of line under it.
-    #[inline(always)]
-    pub(crate) fn try_hand(&self, at: usize, hand: &Hand, lease: LeaseId, said: Said) -> bool {
-        self.try_hand_word(at, hand, lease, Word::Said(said))
-    }
-
-    /// [`Self::try_hand`] for either word of the ring, inlined with it: a
-    /// frame's word is the one the served hand and the door write.
+    /// Writes a word of `lease` into the file's ring and marks the hand.
+    /// `false` where the ring is full and stays so: a thread at work at the
+    /// file keeps what its ring holds.
     #[inline(always)]
     fn try_hand_word(&self, at: usize, hand: &Hand, lease: LeaseId, word: Word) -> bool {
         let file = &self.files[at];

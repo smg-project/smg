@@ -255,7 +255,7 @@ fn a_side_that_cannot_be_sent_to_is_left_out_of_the_next_ask_by_its_own_id() {
     let pair = lists.under(&classes, &Open);
     let request = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
     let mut call = Call::default();
-    let first = ask(engine, &request, &pair, &mut call);
+    let first = ask(engine.loaded(), &request, &pair, &mut call);
     assert!(matches!(first, Ok(None)), "no target holds");
     assert_eq!(
         call.missed,
@@ -271,7 +271,7 @@ fn a_side_that_cannot_be_sent_to_is_left_out_of_the_next_ask_by_its_own_id() {
             ("released CommitFailed".to_owned(), lists.decode_id(0)),
         ]
     );
-    let second = ask(engine, &request, &pair, &mut call);
+    let second = ask(engine.loaded(), &request, &pair, &mut call);
     let second = second.expect("an answer").expect("a placement");
     assert_eq!(lists.places(&second), (1, 0), "the decode is named again");
     drop(second);
@@ -287,7 +287,7 @@ fn a_side_that_cannot_be_sent_to_is_left_out_of_the_next_ask_by_its_own_id() {
         decode.set_status(WorkerStatus::NotReady);
     }
     let mut call = Call::default();
-    let third = ask(engine, &request, &pair, &mut call);
+    let third = ask(engine.loaded(), &request, &pair, &mut call);
     assert!(matches!(third, Ok(None)));
     assert_eq!(call.missed, [lists.decode_id(0), lists.decode_id(1)]);
 
@@ -295,7 +295,7 @@ fn a_side_that_cannot_be_sent_to_is_left_out_of_the_next_ask_by_its_own_id() {
     // the prefill every target of the decision names joins once.
     lists.prefills[0].set_status(WorkerStatus::NotReady);
     let mut call = Call::default();
-    let fourth = ask(engine, &request, &pair, &mut call);
+    let fourth = ask(engine.loaded(), &request, &pair, &mut call);
     assert!(matches!(fourth, Ok(None)));
     assert_eq!(
         call.missed,
@@ -306,7 +306,7 @@ fn a_side_that_cannot_be_sent_to_is_left_out_of_the_next_ask_by_its_own_id() {
     // told to leave decode 1 out, it names the prefill and decode 0.
     let mut call = Call::default();
     call.missed.push(lists.decode_id(1));
-    let fifth = ask(engine, &request, &pair, &mut call);
+    let fifth = ask(engine.loaded(), &request, &pair, &mut call);
     assert!(matches!(fifth, Ok(None)));
     assert_eq!(
         call.missed,
@@ -361,7 +361,7 @@ fn no_pair_crosses_the_classes_its_caller_states() {
     let request = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
     lists.decodes[0].set_status(WorkerStatus::NotReady);
     let mut call = Call::default();
-    let held = ask(keeps, &request, &pair, &mut call);
+    let held = ask(keeps.loaded(), &request, &pair, &mut call);
     assert!(matches!(held, Ok(None)), "prefill 0 has no other partner");
     assert_eq!(call.missed, [lists.decode_id(0)]);
 }
@@ -792,4 +792,66 @@ fn a_pair_that_lends_its_ring_has_each_side_placed_where_its_walk_reaches() {
         along.find(|side| side.0 == prefill).expect("a worker").1
     };
     assert_eq!(lists.places(&placement), (first(true), first(false)));
+}
+
+/// A pair whose request states a hard demand is placed on the workers of
+/// its two lists that meet it, whatever the pick's order names first, and
+/// its decode decided again is held to the decodes that meet it. A demand
+/// one side leaves nobody for leaves the request no worker: it is shed
+/// with no endpoint under that demand's stage, and nothing is issued.
+///
+/// The classic router holds both of a pair's pools to the request's own
+/// rule (`model_gateway/src/routers/common/placement.rs:1227`, the rule's
+/// read at `:1262-1266`, at main `b8c15d40a`).
+#[test]
+fn a_pair_that_states_a_demand_is_placed_on_the_workers_that_meet_it() {
+    let (engine, heard) = paired_picking(false, DecodePick::AfterPrefill);
+    let mut lists = Lists::of(2, 2);
+    // The second worker of each list takes images.
+    let seeing = |list: &Arc<[Arc<dyn Worker>]>| {
+        let second = Arc::clone(&list[1]);
+        PublishedList::with_facts(Arc::clone(list), |worker| FixedFacts {
+            vision: Arc::ptr_eq(worker, &second),
+            ..FixedFacts::default()
+        })
+    };
+    lists.published = [seeing(&lists.prefills), seeing(&lists.decodes)];
+    let classes = lists.every();
+    let stating = |demands: Demands| PlaceRequest {
+        demands,
+        decode_again: true,
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
+    };
+    // With no demand the picker's order names the first worker of each.
+    let plain = stating(Demands::default());
+    let placement = engine.place(&plain).expect("a placement");
+    assert_eq!(lists.places(&placement), (0, 0));
+    drop(placement);
+
+    let pixels = stating(Demands {
+        vision: true,
+        ..Demands::default()
+    });
+    let mut placement = engine.place(&pixels).expect("a placement");
+    assert_eq!(lists.places(&placement), (1, 1));
+    placement.sent(Side::Prefill);
+    assert_eq!(placement.decode_again(&pixels), Ok(()));
+    assert_eq!(lists.places(&placement), (1, 1));
+    drop(placement);
+
+    // No decode states a way to decide a constraint: the decodes are left
+    // nobody, and a prefill is not held to it.
+    let from = said(&heard).len();
+    let decided = stating(Demands {
+        decoding: 3,
+        ..Demands::default()
+    });
+    let none = Unplaced::Shed {
+        reason: ShedReason::NoEndpoints,
+        emptied_by: "decoding",
+        retry_after_secs: 1,
+    };
+    assert_eq!(engine.place(&decided).err(), Some(none));
+    assert_eq!(said(&heard).len(), from, "a shed issues nothing");
+    assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }

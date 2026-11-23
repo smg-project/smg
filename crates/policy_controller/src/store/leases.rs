@@ -23,17 +23,8 @@ use crate::{
 /// The state of a single's lease or of one side of a pair's lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeaseState {
-    /// Decided, not yet dispatched; the dispatch deadline bounds this. It
-    /// holds the TTL of the sessions rule the lease's decision was made
-    /// under, in microseconds, for the commit that ends the key's pin of
-    /// record by it: `u64::MAX` under a rule with no TTL and under no
-    /// rule, the session table's own form. The state has the room, so
-    /// no record grows for it. It dies at the dispatch, and no replica
-    /// is sent a lease's record: a log row of a lease's issue, when one
-    /// comes, carries it.
-    Issued {
-        session_ttl_micros: u64,
-    },
+    /// Decided, not yet dispatched; the dispatch deadline bounds this.
+    Issued,
     /// Dispatched to its target at `at`.
     Dispatched {
         at: Instant,
@@ -55,40 +46,15 @@ impl LeaseState {
     /// Whether a frame still moves a lease that stands so: issued or
     /// dispatched.
     pub const fn is_live(self) -> bool {
-        matches!(self, Self::Issued { .. } | Self::Dispatched { .. })
+        matches!(self, Self::Issued | Self::Dispatched { .. })
     }
 
-    /// Issued under no sessions rule, or under a rule with no TTL.
-    pub const ISSUED: Self = Self::Issued {
-        session_ttl_micros: u64::MAX,
-    };
-
-    /// Issued under a sessions rule of this TTL; `None`: a rule with no
-    /// TTL, or no rule.
-    pub fn issued(session_ttl_micros: Option<u64>) -> Self {
-        Self::Issued {
-            session_ttl_micros: session_ttl_micros.unwrap_or(u64::MAX),
-        }
-    }
+    /// The issued state, by the name its callers write.
+    pub const ISSUED: Self = Self::Issued;
 
     /// Whether the lease still waits for its dispatch.
     pub fn is_issued(self) -> bool {
-        matches!(self, Self::Issued { .. })
-    }
-
-    /// The TTL an issued lease's rule ends its key's pin by; `None` under
-    /// a rule with no TTL, under no rule, and once the lease left the
-    /// issued state. The pin's writer takes `None` as no end at all, so
-    /// it asks [`Self::is_issued`] first: the door tells a side's dispatch
-    /// once, with the side as it stood before its dispatch was written,
-    /// and a side past that state pins nothing by its lease's rule.
-    pub fn session_ttl_micros(self) -> Option<u64> {
-        match self {
-            Self::Issued { session_ttl_micros } if session_ttl_micros != u64::MAX => {
-                Some(session_ttl_micros)
-            }
-            _ => None,
-        }
+        matches!(self, Self::Issued)
     }
 }
 
@@ -344,7 +310,7 @@ impl Sides {
     /// - **The pick** is one of no target: no word of a single carries its
     ///   pick to a stage.
     /// - **The decode side** is a single's, as a guard lends it: no
-    ///   session, the lease's own size, never chosen.
+    ///   session, the lease's own three sizes, never chosen.
     ///
     /// The view is made in this call's frame and lent there: no part of it
     /// is moved, and no pick is built.
@@ -384,6 +350,8 @@ impl Sides {
             decode: HeldDecode {
                 session: Session::NONE,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: false,
             },
         }))

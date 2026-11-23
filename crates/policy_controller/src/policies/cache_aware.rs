@@ -276,7 +276,7 @@ impl Gates {
     /// request's hashes alone would understate it and overstate every
     /// holder's share.
     fn request_blocks(&self, facts: &RequestFacts<'_>) -> u32 {
-        let from_tokens = self.whole_blocks(facts.prompt_tokens, facts).max(1);
+        let from_tokens = self.whole_blocks(facts.prompt_size(), facts).max(1);
         let from_hashes = u32::try_from(facts.block_hashes.len()).unwrap_or(u32::MAX);
         from_tokens.max(from_hashes)
     }
@@ -291,7 +291,7 @@ impl Gates {
     fn whole(&self, facts: &RequestFacts<'_>) -> Whole {
         let block = self.block_size_of(facts);
         let hashed = u32::try_from(facts.block_hashes.len()).unwrap_or(u32::MAX);
-        let size = units_within(facts.prompt_tokens, facts.hash_kind);
+        let size = units_within(facts.prompt_size(), facts.hash_kind);
         Whole {
             block,
             size: size.max(block).max(hashed.saturating_mul(block)),
@@ -484,7 +484,7 @@ impl PrefixAffinity {
     }
 
     /// Leaves what this pass judges by for the word of the pick
-    /// ([`keep_prefix_pass`]). The first stage of a decision to judge keeps
+    /// ([`keep_prefix_pass`]). The first stage to judge on a thread keeps
     /// the slot, and a later pass of its own writes over it.
     fn judge(&self, best: u32, mean: f32) {
         keep_prefix_pass(self.id, best, mean);
@@ -769,9 +769,8 @@ impl Scorer for PrefixAffinity {
             // host hashes its text for a source that reads the record.
             sent_prefixes: placements,
             text_hashes: placements,
-            // A sent prefix's share is taken of the prompt's size, and a
-            // pick states its overlap of it: a host that can send a request
-            // on unread reads it under this stage.
+            // A sent prefix's share is taken of the prompt's size: a host
+            // that can send a request on unread reads it under this stage.
             prompt_size: true,
             loads: self.gates.kv_configured(),
             ..Needs::default()
@@ -1610,7 +1609,9 @@ mod tests {
         // The whole keeps what the request's block count guards: a size
         // stated under the hashes the host sent reads as the hashes, a
         // prompt of no size as one block, and the text kind's as its bytes
-        // beside a window of bytes.
+        // beside a window of bytes. A request of text states its length and
+        // no count of tokens: 100 two-byte characters are 200 bytes, and
+        // the share is taken of the bytes.
         let whole = |facts: RequestFacts<'_>| {
             let whole = Gates::of(None, None, Some(16)).whole(&facts);
             (whole.block, whole.size)
@@ -1629,7 +1630,9 @@ mod tests {
         let text = RequestFacts {
             hash_kind: HashKind::Text,
             block_size: 64,
-            ..sized(50)
+            prompt_chars: 100,
+            prompt_bytes: 200,
+            ..hashed
         };
         assert_eq!(whole(text), (64, 200));
     }
@@ -1645,14 +1648,8 @@ mod tests {
     /// The built-in document's decision over `pool`, a pool of more than
     /// twice its sample of sixteen rows, for a prompt of `tokens` tokens in
     /// three whole blocks whose first block was sent to row 7: the row
-    /// picked and what the pick states of it. The host names row 7, and the
-    /// decision runs behind a draw.
-    fn decided_past_the_sample(
-        engine: &Engine,
-        pool: &[Candidate],
-        tokens: u32,
-        seed: u64,
-    ) -> (u32, Overlap) {
+    /// picked. The host names row 7, and the decision runs behind a draw.
+    fn decided_past_the_sample(engine: &Engine, pool: &[Candidate], tokens: u32, seed: u64) -> u32 {
         static HASHES: [u64; 3] = [0; 3];
         let sent = [AffinityHolder {
             row: 7,
@@ -1667,7 +1664,7 @@ mod tests {
             named: Some(named(&sent, &[], false)),
             ..RequestFacts::default()
         };
-        let decision = engine.decide_stated(
+        let decision = engine.decide(
             &facts,
             &PoolFacts::default(),
             pool,
@@ -1676,8 +1673,7 @@ mod tests {
         );
         assert!(decision.trace().drew_first(), "seed {seed}");
         let pick = decision.pick().expect("a pick");
-        let first = pick.targets.first().expect("a target");
-        (first.position, pick.overlap())
+        pick.targets.first().expect("a target").position
     }
 
     /// Behind a draw the share is the same one. A pool of more than twice
@@ -1697,44 +1693,10 @@ mod tests {
             .collect();
         for seed in 0..32 {
             // 0.302 of 53 tokens, 0.296 of 54.
-            let (held, _) = decided_past_the_sample(&engine, &pool, 53, seed);
+            let held = decided_past_the_sample(&engine, &pool, 53, seed);
             assert_eq!(held, 7, "53 tokens, seed {seed}");
-            let (missed, _) = decided_past_the_sample(&engine, &pool, 54, seed);
+            let missed = decided_past_the_sample(&engine, &pool, 54, seed);
             assert_ne!(missed, 7, "54 tokens, seed {seed}");
-        }
-    }
-
-    /// What a pick states of its worker is the match its pass scored. A
-    /// worker picked by its load that was sent 16 tokens of a prompt of 54
-    /// was scored as holding nothing, and the pick states no match: a block
-    /// of the prompt's three whole blocks would be stated from the
-    /// predictor. The classic policy selects for such a request with no
-    /// holder named (`model_gateway/src/policies/cache_aware.rs:3579-3588`).
-    #[test]
-    fn a_pick_states_no_match_of_a_sent_prefix_under_its_share_of_the_whole_prompt() {
-        let engine = built_in();
-        // Sixty-four rows. Row 7 was sent the prefix and is the one idle
-        // row: it takes the request whether it holds it or not.
-        let pool: Vec<Candidate> = (0..64)
-            .map(|row| candidate(row, if row == 7 { 0 } else { 2 }, 0).0)
-            .collect();
-        let stated = |blocks, source| Overlap {
-            blocks,
-            of: 3,
-            source,
-            margin_held: false,
-        };
-        for seed in 0..32 {
-            assert_eq!(
-                decided_past_the_sample(&engine, &pool, 53, seed),
-                (7, stated(1, OverlapSource::Predictor)),
-                "53 tokens, seed {seed}"
-            );
-            assert_eq!(
-                decided_past_the_sample(&engine, &pool, 54, seed),
-                (7, stated(0, OverlapSource::None)),
-                "54 tokens, seed {seed}"
-            );
         }
     }
 
@@ -1903,11 +1865,14 @@ mod tests {
         capped.prompt_tokens = 16 * 16;
         assert_eq!(scores(&slice, &capped, &held(4)), vec![0.0, 0.0, 1.0]);
         assert_eq!(scores(&slice, &capped, &held(8)), vec![1.0, 1.0, 1.0]);
-        // A text-kind request counts characters: 64 tokens are 256
-        // characters, sixteen blocks of sixteen, the same quarter.
+        // A text-kind request states its length and no count of tokens.
+        // Its windows are bytes: 128 two-byte characters are 256 bytes,
+        // sixteen windows of sixteen, the same quarter. Read by its
+        // characters the request would be eight windows, and four of them
+        // half of it.
         let mut text = facts(8);
         text.hash_kind = HashKind::Text;
-        text.prompt_tokens = 64;
+        (text.prompt_tokens, text.prompt_chars, text.prompt_bytes) = (0, 128, 256);
         assert_eq!(scores(&slice, &text, &held(4)), vec![0.0, 0.0, 1.0]);
     }
 

@@ -2,9 +2,9 @@
 //! as the process, which a host counts a decision under.
 //!
 //! The engine makes the list once, at its start ([`of`]). A placement's
-//! label is one read of it ([`PolicyEngine::label_at`]).
+//! label is one read of it ([`Loaded::label_at`]).
 
-use super::PolicyEngine;
+use super::Loaded;
 use crate::{document::spec::AppliedSpec, names::intern};
 
 /// The labels of `spec`'s profiles, each at its profile's position in the
@@ -14,7 +14,7 @@ pub(super) fn of(spec: &AppliedSpec) -> Box<[&'static str]> {
     profiles.map(|profile| intern(&profile.name)).collect()
 }
 
-impl PolicyEngine {
+impl Loaded<'_, '_> {
     /// The label of the profile at `position` of the document: the
     /// profile's name as the document writes it, as a string that lives as
     /// long as the process. A placement holds it
@@ -31,7 +31,7 @@ impl PolicyEngine {
     /// where the document holds no profile at the position, as for a
     /// decision made ahead of every profile.
     #[must_use]
-    pub(crate) fn label_at(&self, position: u16) -> &'static str {
+    pub(crate) fn label_at(self, position: u16) -> &'static str {
         let label = self.document.labels.get(usize::from(position));
         label.copied().unwrap_or("")
     }
@@ -41,7 +41,7 @@ impl PolicyEngine {
 mod tests {
     use std::ptr;
 
-    use super::*;
+    use super::{super::PolicyEngine, *};
     use crate::{document::spec::PolicySpec, engine::decision::Trace};
 
     /// A profile's label is read by its position in the document, the
@@ -59,11 +59,14 @@ mod tests {
             PolicyEngine::new(AppliedSpec::validate(document).expect("the document validates"))
         };
         let (engine, another) = (engine_of(&document), engine_of(&document));
-        let labels = (engine.label_at(0), engine.label_at(1));
+        let labels = (engine.loaded().label_at(0), engine.loaded().label_at(1));
         assert_eq!(labels, ("a_spare", "round_robin"));
-        let same = ptr::eq(another.label_at(1), engine.label_at(1));
+        let same = ptr::eq(another.loaded().label_at(1), engine.loaded().label_at(1));
         assert!(same, "one string a name");
-        let none = (engine.label_at(2), engine.label_at(Trace::NO_PROFILE));
+        let none = (
+            engine.loaded().label_at(2),
+            engine.loaded().label_at(Trace::NO_PROFILE),
+        );
         assert_eq!(none, ("", ""));
     }
 }

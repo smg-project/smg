@@ -272,7 +272,7 @@ const SPEC_DOCUMENT: &str = r#"{
   "plans": { "pd-pair": { "pairing": "strict" } },
   "bindings": [
     { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "decode" },
-      "overload": { "enabled": true, "waiting_requests": 32, "token_usage": 0.9, "shed_when_all_vetoed": true } },
+      "overload": { "enabled": true, "shed_when_all_vetoed": true } },
     { "match": { "model": "*" }, "profile": "default", "overload": { "enabled": false }, "admission": { "enabled": false } }
   ]
 }"#;

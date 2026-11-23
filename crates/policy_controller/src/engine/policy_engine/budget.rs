@@ -8,7 +8,7 @@
 //! plugin's stage passes such a request by and counts a failure of its own.
 //! So this engine shows a stage the widest value where the host stated
 //! none. It does so where it takes the request its maker makes
-//! ([`PolicyEngine::made`](super::PolicyEngine::made)), which every entry
+//! ([`Loaded::made`](super::Loaded::made)), which every entry
 //! that makes one calls: a single's and a pair's, with a lease and without.
 //!
 //! The two calls a host makes with no engine above its lists turn a `0`
@@ -33,9 +33,7 @@ mod tests {
     //! What the gateway's own routing answers here: it states no budget for
     //! a selection and has no stage that reads one, so it passes no request
     //! by for want of time (`model_gateway/src/policies/mod.rs:486`, the
-    //! facts a selection carries). The engine over stored records shows a
-    //! stage the widest value for a request in process that states none
-    //! (`engine/store_backed_engine.rs`, where it takes a request up).
+    //! facts a selection carries).
 
     use std::{sync::Arc, time::Instant};
 
@@ -52,9 +50,9 @@ mod tests {
             decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
             framework::{DecisionScope, Filter},
             list_cell::tests::PublishedList,
-            view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts},
-            EncodeItems, EncodeLists, EncodePlaced, PairAdmission, PairLists, PartnerClasses,
-            PlaceRequest, PolicyEngine,
+            view::{Candidate, Constraints, Identity, Phase, PoolFacts, RequestFacts},
+            EncodeItems, EncodeLists, EncodePlaced, EncoderFacts, PairAdmission, PairLists,
+            PartnerClasses, PlaceRequest, PolicyEngine,
         },
         stages::{registry::StageRegistry, Lifecycle},
         store::GatewayId,
@@ -98,22 +96,59 @@ mod tests {
         }
     }
 
+    /// A filter of a host's own build that opens no scope: the engine asks
+    /// no stage of an encode side that opens one. It keeps every row and
+    /// notes the budget the row's request shows it.
+    #[derive(Debug)]
+    struct NotesRows(Noted);
+
+    impl Lifecycle for NotesRows {}
+
+    impl Filter for NotesRows {
+        fn name(&self) -> &'static str {
+            "notes-rows"
+        }
+
+        fn keep(&self, facts: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+            self.0.lock().push(facts.budget_micros);
+            true
+        }
+    }
+
     /// The engine of `document` with a stage that notes its budget in every
     /// profile, and what that stage noted.
-    fn noting(mut document: PolicySpec) -> (PolicyEngine, Noted) {
-        let noted = Noted::default();
-        let kept = Arc::clone(&noted);
+    fn noting(document: PolicySpec) -> (PolicyEngine, Noted) {
+        let (engine, noted, _) = noting_each_side(document);
+        (engine, noted)
+    }
+
+    /// [`noting`], with what the encode side's stage noted told apart: the
+    /// stage of the profile named `encode` opens no scope and notes at each
+    /// row it is asked for.
+    fn noting_each_side(mut document: PolicySpec) -> (PolicyEngine, Noted, Noted) {
+        let (noted, rows) = (Noted::default(), Noted::default());
+        let (kept, kept_rows) = (Arc::clone(&noted), Arc::clone(&rows));
         let mut catalog = StageRegistry::builtin();
         catalog
             .filter("notes", move || Box::new(Notes(Arc::clone(&kept))))
             .expect("a free name");
+        catalog
+            .filter("notes-rows", move || {
+                Box::new(NotesRows(Arc::clone(&kept_rows)))
+            })
+            .expect("a free name");
         document.generation = 1;
-        for profile in document.profiles.values_mut() {
-            profile.filter.push("notes".into());
+        for (name, profile) in &mut document.profiles {
+            let stage = if name == "encode" {
+                "notes-rows"
+            } else {
+                "notes"
+            };
+            profile.filter.push(stage.into());
         }
         let spec = AppliedSpec::validate_in(&document, &catalog, &[]);
-        let engine = PolicyEngine::new(spec.expect("the catalog holds the stage"));
-        (engine, noted)
+        let engine = PolicyEngine::new(spec.expect("the catalog holds the stages"));
+        (engine, noted, rows)
     }
 
     /// Every budget a stage was shown since the last call was `shown`, and
@@ -286,11 +321,15 @@ mod tests {
     /// request's `0` too, in the host's own request: a pair's two lists and
     /// an encode request's three show each side's stage the widest value,
     /// where each was shown `0`. A stated budget is shown as stated.
+    ///
+    /// An encode request with no item is its pair's alone, and no stage of
+    /// the encode side is asked for it: that side's stage is read under a
+    /// request with an item.
     #[test]
     fn the_calls_over_a_hosts_lists_show_a_stage_the_widest_with_no_engine_above() {
         let preset = "power_of_two";
         let presets = PolicySpec::epd_presets(preset, preset, preset);
-        let (engine, noted) = noting(presets.expect("the presets"));
+        let (engine, noted, rows) = noting_each_side(presets.expect("the presets"));
         let members = [0, 1, 2].map(|list| {
             let ready = |at| ready_worker(&format!("http://list-{list}-worker-{at}:8000"), MODEL);
             let workers: Arc<[Arc<dyn Worker>]> = (0..2).map(ready).collect();
@@ -309,14 +348,20 @@ mod tests {
             decode_stalled: &[],
             decode_held: &[],
         };
+        // Each encoder hands to both prefills.
+        let hands = [EncoderFacts {
+            class: 1,
+            ..EncoderFacts::default()
+        }; 2];
         let lists = EncodeLists {
             pair,
             encoders: members[2].lent(),
             encoders_stalled: &[],
             encoders_held: &[],
-            facts: &[],
-            prefill_classes: &[],
+            facts: &hands,
+            prefill_classes: &[1, 1],
         };
+        let item = [Identity::plain("item")];
         let now = Instant::now();
         for (stated, shown) in [(0, u32::MAX), (STATED, STATED)] {
             let mut theirs = stating(Phase::Prefill, stated);
@@ -331,6 +376,17 @@ mod tests {
             assert!(decision.pick().is_some(), "no pick: {decision:?}");
             all_shown(&noted, shown, "an encode request's lists");
             assert_eq!(theirs.facts.budget_micros, shown);
+            assert!(rows.lock().is_empty(), "no item, no encode side");
+
+            let mut theirs = stating(Phase::Prefill, stated);
+            let one = EncodeItems {
+                keys: &item,
+                ..EncodeItems::default()
+            };
+            let decision = lists.decide(&engine, None, now, &mut theirs, one, &mut placed);
+            assert!(decision.pick().is_some(), "no pick: {decision:?}");
+            all_shown(&noted, shown, "an encode request's pair, with an item");
+            all_shown(&rows, shown, "an encode request's encoders");
         }
     }
 

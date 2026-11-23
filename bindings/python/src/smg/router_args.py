@@ -61,8 +61,6 @@ DOCUMENT_REPLACES = (
     "balance_token_usage_threshold",
     "overload_token_usage_threshold",
     "worker_overload_protection",
-    "worker_overload_waiting_requests",
-    "worker_overload_token_usage",
     "worker_overload_shed",
     "overlap_decay",
     "selection_temperature",
@@ -433,11 +431,14 @@ class RouterArgs:
     # The worker discovery provider. service_discovery=True is the legacy
     # spelling of discovery_provider="kubernetes"; set one or the other.
     discovery_provider: str | None = None
+    # Deprecated, accepted and ignored: every registration reads an engine's
+    # data-parallel size and registers one worker per rank (warned at start-up)
     dp_aware: bool = False
     # Choose a data-parallel rank per request from the ranks' reported token
     # loads: the HTTP prefill-decode router, for an engine registered as one
-    # worker. Under dp_aware the ranks are workers and the policy's pick among
-    # them is the rank choice, so this chooses nothing there (warned at start-up)
+    # worker. An engine that reports its data-parallel size registers as one
+    # worker per rank and the policy's pick among them is the rank choice, so
+    # this chooses nothing there (warned at start-up)
     dp_minimum_tokens_scheduler: bool = False
     # Seconds a Ready worker is kept in Draining before it leaves the registry,
     # on every removal (a discovery deletion, an unhealthy worker's removal, the
@@ -588,6 +589,8 @@ class RouterArgs:
     otlp_traces_endpoint: str = "localhost:4317"
     overlap_decay: float = 0.0
     overload_token_usage_threshold: float = 1.0
+    # Kubernetes Pod label containing the worker's prefill/decode pairing protocol
+    pairing_protocol_label: str = "smg.ai/pairing-protocol"
     # Which parser reads a chat completion's reasoning and tool calls: Symphony ("symphony",
     # the default) for the models its registry knows, or the per-model parsers ("legacy"); a
     # request's X-SMG-Parser header overrides it
@@ -776,7 +779,8 @@ class RouterArgs:
     worker_warmup_thin_ratio: float = 0.5
     # Liveness: seconds without progress before a loaded worker is wedged
     worker_wedge_secs: int = 3
-    # DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped)
+    # DP engines per startup ZMQ worker, registered as one worker per engine
+    # (None = one worker, whose engines declare their count)
     zmq_engine_count: int | None = None
     # Seconds any one stage of a ZMQ engine's startup handshake may stay silent;
     # it alone covers the engine's init between its HELLO and its READY
@@ -1034,7 +1038,8 @@ class RouterArgs:
             help=(
                 "Run a policy document with the policy controller."
                 " The document replaces the routing options: one that is not at its"
-                " default is refused beside it by name."
+                " default is refused beside it by name. The two overload thresholds"
+                " stand beside it: the gateway builds its workers with them."
             ),
         )
         routing_group.add_argument(
@@ -1590,7 +1595,10 @@ class RouterArgs:
         routing_group.add_argument(
             f"--{prefix}dp-aware",
             action="store_true",
-            help="Enable data parallelism aware schedule",
+            help=(
+                "Deprecated, accepted and ignored: every registration reads an engine's"
+                " data-parallel size and registers one worker per rank (warned at start-up)"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}routing-key-override",
@@ -1619,9 +1627,11 @@ class RouterArgs:
             default=RouterArgs.grouped_dp_sticky,
             help=(
                 "Whether, and how, a request that carries a routing key is pinned to one"
-                " engine of a grouped data-parallel worker (a ZMQ worker several engines"
-                " dial, as many as --zmq-engine-count says or its engines declare), so a"
-                " conversation keeps one engine's prefix cache. The key is the first valid"
+                " engine of a grouped data-parallel worker (a ZMQ worker given no engine"
+                " count, whose socket set as many engines dial as they declare), so a"
+                " conversation keeps one engine's prefix cache. A worker given"
+                " --zmq-engine-count registers as one worker per engine, where the routing"
+                " policy picks the engine and this option does nothing. The key is the first valid"
                 " --routing-key-headers header, or the body rid under --routing-key-override."
                 " hash sends a key's requests to the engine its hash picks; off leaves each"
                 " request to the least-loaded engine"
@@ -1633,9 +1643,9 @@ class RouterArgs:
             help=(
                 "Choose a data-parallel rank per request from the ranks' reported token"
                 " loads: the HTTP prefill-decode router, for an engine registered as one"
-                " worker. Under --dp-aware the engine's ranks are workers and the policy's"
-                " pick among them is the rank choice, so this flag chooses nothing there"
-                " (warned at start-up)"
+                " worker. An engine that reports its data-parallel size registers as one"
+                " worker per rank and the policy's pick among them is the rank choice, so"
+                " this flag chooses nothing there (warned at start-up)"
             ),
         )
         routing_group.add_argument(
@@ -2122,6 +2132,16 @@ class RouterArgs:
             help="Per-worker KV engine ID Pod annotation (default: smg.ai/kv-engine-id)",
         )
         k8s_group.add_argument(
+            f"--{prefix}pairing-protocol-label",
+            type=str,
+            default=RouterArgs.pairing_protocol_label,
+            help=(
+                "Pod label containing the worker's prefill/decode pairing protocol: a prefill"
+                " and a decode pair only when their protocols are equal"
+                " (default: smg.ai/pairing-protocol)"
+            ),
+        )
+        k8s_group.add_argument(
             f"--{prefix}encode-selector",
             type=str,
             nargs="+",
@@ -2552,7 +2572,10 @@ class RouterArgs:
             f"--{prefix}cb-window-duration-secs",
             type=int,
             default=RouterArgs.cb_window_duration_secs,
-            help="Sliding window duration in seconds for tracking failures",
+            help=(
+                "While the circuit is closed, a failed request more than this many seconds"
+                " after the last one starts the count anew (at least 1)"
+            ),
         )
         cb_group.add_argument(
             f"--{prefix}disable-circuit-breaker",
@@ -2812,12 +2835,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.zmq_engine_count,
             help=(
-                "DP engines per startup ZMQ worker: each ipc:// or tcp:// worker becomes "
-                "a grouped worker whose handshake awaits this many engines on one "
-                "socket set (vLLM and TokenSpeed; default: as many as the first "
-                "engine to dial declares, one for an engine that declares none). "
-                "Under --dp-aware a worker given this count registers as one worker "
-                "per engine, which share the socket set"
+                "DP engines per startup ZMQ worker: each ipc:// or tcp:// worker given "
+                "a count above one registers as one worker per engine, which share one "
+                "socket set whose handshake awaits this many engines (vLLM and "
+                "TokenSpeed; default: one worker, whose handshake awaits as many "
+                "engines as the first to dial declares, one for an engine that "
+                "declares none)"
             ),
         )
         backend_group.add_argument(

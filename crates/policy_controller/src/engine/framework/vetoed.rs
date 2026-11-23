@@ -27,10 +27,19 @@
 //! rule with an in-flight cap keeps the key only where the host holds the
 //! cap's count ([`RequestFacts::session_counted`]). Under a sessions rule
 //! the key's pin is asked first, with the veto as it stands, and the lifted
-//! pass places a key no pin takes. Where the veto as it stands leaves the
-//! key's pool nobody, the kept pick says the lifted veto in its trace as the
-//! rule's own pick does ([`LiftedVeto::Overload`]): a host counts both from the
-//! one mark.
+//! pass places a key no pin takes.
+//!
+//! A pair's prefill profile that weighs load against affinity reads the
+//! word the same way ([`Engine::weighing_lift`]): where the binding steers,
+//! its run has the veto lifted, so a session keeps the prefill that holds
+//! its prefix while that prefill is over its thresholds.
+//!
+//! The mark of such a lifted run has one meaning. Where the veto as it
+//! stands leaves the pool nobody ([`all_vetoed`]), the pick exists by the
+//! lift, and it says the lifted veto in its trace as the rule's own pick
+//! does ([`LiftedVeto::Overload`]): a kept key's pick, and a pair placed by
+//! its weighing prefill profile. A host counts them all from the one mark.
+//! A pick beside a worker under its thresholds carries no mark.
 
 use super::{
     classed, engines::run_owned, filter, keep_folded, leads, places, reason_of, run_single, shed,
@@ -254,16 +263,18 @@ pub(super) fn lifted(
     ))
 }
 
-/// Whether the overload veto as it stands leaves a kept key's pool nobody.
-/// The lifted pass just placed the key, or the ring's walk did: `buf` holds
-/// that pass's survivors, or the rows the walk kept, each one of them, and
-/// `cx` is the decision's own, the veto standing in it. A survivor
-/// under its thresholds stands without the lift, so the pool was not
-/// emptied. The filters run again with the veto standing only over a pool
-/// whose survivors are all over: a soft filter of the lifted pass may have
-/// passed over a worker under its thresholds. That pass overwrites `buf`,
-/// and the caller reads nothing of it afterwards.
-fn all_vetoed(
+/// Whether the overload veto as it stands leaves nobody in a pool a lifted
+/// run just placed a request in: a kept key's pool ([`Engine::keep`]), or
+/// a pair's prefills under a profile that weighs load against affinity
+/// ([`Engine::decide_pair`]). The lifted pass just placed the request, or
+/// the ring's walk did: `buf` holds that pass's survivors, or the rows the
+/// walk kept, each one of them, and `cx` is the decision's own, the veto
+/// standing in it. A survivor under its thresholds stands without the
+/// lift, so the pool was not emptied. The filters run again with the veto
+/// standing only over a pool whose survivors are all over: a soft filter of
+/// the lifted pass may have passed over a worker under its thresholds. That
+/// pass overwrites `buf`, and the caller reads nothing of it afterwards.
+pub(super) fn all_vetoed(
     profile: &Profile,
     facts: &RequestFacts<'_>,
     set: Set<'_>,
@@ -708,14 +719,16 @@ impl<'a> Half<'a> {
 /// It answers for a prefill pool no worker of which stands (`:1395-1413`
 /// there) and for a decode pool no worker of which stands (`:1438-1465`).
 /// It answers `None`, and the caller's refusal stands, where:
-/// - a prefill with an open partner stands with its limit aside. Under a
-///   prefill profile that reads affinity (`weighs`) and a binding that
-///   steers, a prefill over its thresholds alone counts as standing there
-///   (`:1327-1340`). Such a profile is taken to weigh load against affinity
-///   itself, and a pick by load would move a session off the worker that
-///   holds its prefix;
-/// - a prefill and a decode both stand as they are: the prefills fail for
-///   want of a partner, and the decode pool is not vetoed on every worker.
+/// - a prefill with an open partner stands with its limit aside, under the
+///   constraints its profile's own run read. Under a prefill profile that
+///   reads affinity (`weighs`) and a binding that steers, that run had the
+///   overload veto lifted ([`Engine::weighing_lift`]), so a prefill over
+///   its thresholds alone stands there (`:1327-1346`): the run's own
+///   refusal is the answer, its admission limit's among them;
+/// - a prefill and a decode both stand as they are, with no lift: the
+///   prefills fail for want of a partner, and the decode pool is not vetoed
+///   on every worker. A weighing profile's pool is judged so too, as it was
+///   before the lift (`:1439-1447`).
 ///   The prefills judged are those with a decode to pair with anywhere in
 ///   the decode pool, in or outside the request's places: the gateway's
 ///   list of them is the pool's own and no request's
@@ -763,7 +776,9 @@ pub(super) fn paired(
         prefill.usable(lifted, steers, &mut scratch.single);
         decode.usable(lifted, steers, &mut scratch.decode);
         // Each usable prefill with the fewest requests among its usable
-        // partners. The prefills of the least pair stay.
+        // partners. The prefills of the least pair stay. A pair's rows hold
+        // their own counts, and no side is lent any ([`PairPools::side`]):
+        // they are read off the rows.
         let (prefills, decodes) = (&mut scratch.single.kept, &scratch.decode.kept);
         let loads = |at: &u32| {
             let row = &prefill.rows[*at as usize];
@@ -824,9 +839,8 @@ mod tests {
         engine::{
             decision::{Decision, LiftedVeto, ShedReason, Survivors},
             framework::{
-                tests::Stored, Binding, DecisionScope, Engine, Filter, Marks, PairPools, PairSide,
-                Picker, Plan, Profile, Scorer, Scratch, TieBand, WeightedScorer, DRAW_FROM,
-                WRITTEN_ROWS,
+                Binding, DecisionScope, Engine, Filter, Marks, PairPools, PairSide, Picker, Plan,
+                Profile, Scorer, Scratch, TieBand, WeightedScorer, DRAW_FROM, WRITTEN_ROWS,
             },
             sticky_sessions::{SessionRule, SessionVerdict},
             view::{
@@ -1529,18 +1543,74 @@ mod tests {
     /// [`pair_engine`] with its live sides' filters given: the prefill
     /// side's, then the decode side's.
     fn pair_engine_of(shed: bool, [prefill, decode]: [Vec<Box<dyn Filter>>; 2]) -> Engine {
-        let side = |name: &str, filters| Profile {
+        pair_engine_holding(shed, [prefill, decode], [None, None])
+    }
+
+    /// A scorer that stands in for a stage that weighs load against
+    /// affinity. The row at `holder` scores highest, as the worker that
+    /// holds a session's prefix does, and `weighs` says whether the stage
+    /// declares that it reads affinity.
+    #[derive(Clone, Copy, Debug)]
+    struct Holds {
+        holder: u32,
+        weighs: bool,
+    }
+
+    impl Lifecycle for Holds {}
+
+    impl Scorer for Holds {
+        fn name(&self) -> &'static str {
+            "holds"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            for (score, &row) in out.iter_mut().zip(kept) {
+                let holds = candidates[row as usize].position == self.holder;
+                *score = if holds { 1.0 } else { 0.0 };
+            }
+            TieBand::NORMALIZED
+        }
+
+        fn needs(&self) -> Needs {
+            Needs {
+                affinity: self.weighs,
+                ..Needs::default()
+            }
+        }
+    }
+
+    /// [`pair_engine_of`] with a scorer on the prefill side: the live
+    /// prefill profile's, then its shadow's. `None` leaves that profile
+    /// with no scorer.
+    fn pair_engine_holding(
+        shed: bool,
+        [prefill, decode]: [Vec<Box<dyn Filter>>; 2],
+        [live, shadow]: [Option<Holds>; 2],
+    ) -> Engine {
+        let side = |name: &str, filters, holds: Option<Holds>| Profile {
             name: name.into(),
             filters,
-            scorers: vec![],
+            scorers: holds
+                .map(|holds| WeightedScorer {
+                    scorer: Box::new(holds),
+                    weight: 1.0,
+                })
+                .into_iter()
+                .collect(),
             picker: Box::new(Best),
         };
         let mut engine = Engine::new(
             vec![
-                side("prefill", prefill),
-                side("decode", decode),
-                side("twin", vetoes()),
-                side("prefill-twin", vetoes()),
+                side("prefill", prefill, live),
+                side("decode", decode, None),
+                side("twin", vetoes(), None),
+                side("prefill-twin", vetoes(), shadow),
             ],
             vec![Binding {
                 model: "*".into(),
@@ -1837,17 +1907,19 @@ mod tests {
     }
 
     /// A prefill profile that reads affinity is taken to weigh load against
-    /// it itself. Under a binding that steers, its prefill over its
-    /// thresholds alone with an open partner keeps its refusal: a pick by
-    /// load would move a session off the worker that holds its prefix. The
-    /// default answers for such a profile everywhere else: under a binding
-    /// that sheds, and where every prefill is doubted. The gateway keeps
-    /// its default from such a policy's prefill the same way, and places
-    /// that prefill by the policy with the veto lifted, which no profile
-    /// here does yet
-    /// (`model_gateway/src/routers/common/placement.rs:1327-1340`).
+    /// it itself. Under a binding that steers, its run has the overload
+    /// veto lifted: a prefill over its thresholds alone with an open
+    /// partner is placed by the profile, where a pick by load would move a
+    /// session off the worker that holds its prefix. No prefill stood
+    /// without the lift here, so the pair's trace names the lifted veto.
+    /// The default answers for such a profile everywhere else: under a
+    /// binding that sheds, and where every prefill is doubted. The gateway
+    /// keeps its default from such a policy's prefill the same way, and
+    /// places that prefill by the policy with the veto lifted
+    /// (`model_gateway/src/routers/common/placement.rs:1327-1346`, at main
+    /// `b8c15d40a`).
     #[test]
-    fn a_profile_that_reads_affinity_keeps_a_busy_prefill_from_the_default() {
+    fn a_profile_that_reads_affinity_places_a_busy_prefill_itself() {
         #[derive(Debug)]
         struct ReadsAffinity;
         impl Filter for ReadsAffinity {
@@ -1871,14 +1943,226 @@ mod tests {
         };
         let decodes = [classed(free(0, 0), 1)];
         let busy = [classed(over(0, 1), 1), classed(doubted(1, 0), 1)];
-        let refused = decide_pair(&weighing(false), &busy, &decodes);
-        assert_eq!(shed_of(&refused), (ShedReason::Saturated, "not-overloaded"));
+        let placed = decide_pair(&weighing(false), &busy, &decodes);
+        assert_eq!(pair_of(&placed), (0, 0));
+        assert_eq!(placed.trace().lifted, LiftedVeto::Overload);
         let suspect = [classed(doubted(0, 2), 1), busy[1]];
         for (engine, prefills) in [(weighing(true), &busy), (weighing(false), &suspect)] {
             let paired = decide_pair(&engine, prefills, &decodes);
             assert_eq!(pair_of(&paired), (1, 0));
             assert_eq!(paired.trace().lifted, LiftedVeto::Liveness);
         }
+    }
+
+    /// A pair engine whose prefill profile holds the two vetoes and a stage
+    /// that prefers the prefill at `holder` ([`Holds`]): `weighs` says
+    /// whether that stage reads affinity. `shed` makes its binding shed.
+    fn holding(shed: bool, holder: u32, weighs: bool) -> Engine {
+        let live = Some(Holds { holder, weighs });
+        pair_engine_holding(shed, [vetoes(), vetoes()], [live, None])
+    }
+
+    /// Under a binding that steers, a prefill profile that weighs load
+    /// against affinity keeps a session on the prefill that holds its
+    /// prefix while that prefill is over its thresholds, beside a free
+    /// prefill too: its run has the overload veto lifted, and its own
+    /// stages weigh the load. The pick stands beside a prefill under its
+    /// thresholds, so the pair's trace names no lifted veto. A binding that
+    /// sheds keeps the veto, and so does a profile none of whose stages
+    /// reads affinity: each passes the busy holder over. The gateway's own
+    /// pair selection lifts the veto so
+    /// (`model_gateway/src/routers/common/placement.rs:2375-2394`; its case
+    /// `an_overloaded_prefill_holding_the_prefix_keeps_the_session_under_cache_aware`
+    /// at `:5881`, at main `55c35100d`).
+    #[test]
+    fn a_weighing_prefill_profile_keeps_a_session_on_its_busy_holder() {
+        let prefills = [classed(over(0, 3), 1), classed(free(1, 0), 1)];
+        let decodes = [classed(free(0, 0), 1)];
+        let kept = decide_pair(&holding(false, 0, true), &prefills, &decodes);
+        assert_eq!(pair_of(&kept), (0, 0));
+        assert_eq!(kept.trace().lifted, LiftedVeto::None);
+        for engine in [holding(true, 0, true), holding(false, 0, false)] {
+            let moved = decide_pair(&engine, &prefills, &decodes);
+            assert_eq!(pair_of(&moved), (1, 0));
+            assert_eq!(moved.trace().lifted, LiftedVeto::None);
+        }
+    }
+
+    /// Where every prefill is over its thresholds, a weighing profile under
+    /// a binding that steers places the pair itself: the prefill its stages
+    /// prefer, not the least loaded. No prefill stood without the lift, so
+    /// the pair's trace says the lifted overload veto, as a kept key's pick
+    /// does over a pool vetoed on every worker. A profile that reads no
+    /// affinity leaves such a pool to the pair's default, which takes the
+    /// least loaded, and a binding that sheds sheds it as saturated. The
+    /// gateway's own selection places such a pool by its prefill policy
+    /// (`model_gateway/src/routers/common/placement.rs:5853`, the case
+    /// `an_all_overloaded_prefill_pool_is_placed_by_the_prefill_policy`, at
+    /// main `55c35100d`).
+    #[test]
+    fn a_weighing_prefill_profile_places_a_pool_over_on_every_prefill() {
+        let prefills = [classed(over(0, 5), 1), classed(over(1, 1), 1)];
+        let decodes = [classed(free(0, 0), 1)];
+        let placed = decide_pair(&holding(false, 0, true), &prefills, &decodes);
+        assert_eq!(pair_of(&placed), (0, 0));
+        assert_eq!(placed.trace().lifted, LiftedVeto::Overload);
+        let by_load = decide_pair(&holding(false, 0, false), &prefills, &decodes);
+        assert_eq!(pair_of(&by_load), (1, 0));
+        assert_eq!(by_load.trace().lifted, LiftedVeto::Overload);
+        let shed = decide_pair(&holding(true, 0, true), &prefills, &decodes);
+        assert_eq!(shed_of(&shed), (ShedReason::Saturated, "not-overloaded"));
+    }
+
+    /// The lifted constraints of a weighing profile's run are a second
+    /// value: the pair's default judges the pool as it stands, with no
+    /// lift. Every prefill is over its thresholds, their partners are over
+    /// too, and the one free decode partners none of them. No prefill has
+    /// an open partner, so the prefill's run sheds and the default pairs by
+    /// load. Judged under the lift, the prefills would stand beside the
+    /// free decode, and the default would leave the refusal. The gateway
+    /// judges its default over such a pool "as it was before the lift"
+    /// (`model_gateway/src/routers/common/placement.rs:2486-2490`, at main
+    /// `55c35100d`).
+    #[test]
+    fn a_weighing_profiles_pool_is_judged_for_the_default_with_no_lift() {
+        let prefills = [classed(over(0, 2), 1), classed(over(1, 1), 1)];
+        let partners = [classed(over(0, 4), 1), classed(over(1, 0), 1)];
+        let decodes = [partners[0], partners[1], classed(free(2, 0), 2)];
+        let paired = decide_pair(&holding(false, 0, true), &prefills, &decodes);
+        assert_eq!(pair_of(&paired), (1, 1));
+        assert_eq!(paired.trace().lifted, LiftedVeto::Overload);
+    }
+
+    /// A weighing profile's refusal is its lifted run's own. The one
+    /// prefill is over its thresholds and at its admission limit: the
+    /// lifted run ends at the limit, the default leaves that refusal, and
+    /// the shed names the limit. Named with the veto standing, the stage
+    /// would be the veto. No request was steered, so the trace names no
+    /// lifted veto. The gateway refuses a lifted prefill at its limit the
+    /// same way
+    /// (`model_gateway/src/routers/common/placement.rs:2590-2595`, at main
+    /// `55c35100d`).
+    ///
+    /// The prefills that run could take are counted under the lift too.
+    /// Where the one prefill is over its thresholds and its only partner
+    /// is not ready, it is a routable prefill with no decode to go to, and
+    /// the shed names the decode side's stage. Counted with the veto
+    /// standing it would be no routable prefill, and the shed would name
+    /// the veto.
+    #[test]
+    fn a_weighing_profiles_refusal_names_the_stage_its_lifted_run_ended_at() {
+        let mut filters = vetoes();
+        filters.push(Box::new(HasCapacity));
+        let live = Some(Holds {
+            holder: 0,
+            weighs: true,
+        });
+        let engine = pair_engine_holding(false, [filters, vetoes()], [live, None]);
+        let full = decide_pair(
+            &engine,
+            &[classed(over(0, 1), 1)],
+            &[classed(free(0, 0), 1)],
+        );
+        assert_eq!(shed_of(&full), (ShedReason::NoEndpoints, "has-capacity"));
+        assert_eq!(full.trace().lifted, LiftedVeto::None);
+        let mut down = classed(free(0, 0), 1);
+        down.health.healthy = false;
+        let alone = decide_pair(&holding(false, 0, true), &[classed(over(0, 1), 1)], &[down]);
+        assert_eq!(shed_of(&alone), (ShedReason::NoEndpoints, "healthy"));
+    }
+
+    /// The prefill's shadow is lifted by its own profile's word, as the
+    /// live run is by the live profile's: a shadow that weighs load against
+    /// affinity keeps the busy holder beside a live profile that passes it
+    /// over, and a shadow that reads no affinity passes it over beside a
+    /// live profile that keeps it. A pair the weighing lift alone placed
+    /// gets no shadow on either side: its trace names the lifted veto, and
+    /// the prefill buffer carries the mark.
+    #[test]
+    fn a_prefills_shadow_is_lifted_by_its_own_profiles_word() {
+        let (req, pool, cx) = (facts(1), PoolFacts::default(), Constraints::default());
+        let decodes = [classed(free(0, 0), 1)];
+        let said = |prefills: &[Candidate], live: bool, shadow: bool| {
+            let sides = [live, shadow].map(|weighs| Some(Holds { holder: 0, weighs }));
+            let engine = pair_engine_holding(false, [vetoes(), vetoes()], sides);
+            let pools = PairPools {
+                prefills,
+                decodes: &decodes,
+                ..PairPools::default()
+            };
+            let scratch = &mut Scratch::new();
+            let pair = engine.decide_pair(&req, &pool, pools, &cx, &cx, scratch);
+            let pick = pair.pick().expect("a pair");
+            let twins = PairSide::BOTH.map(|side| {
+                let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, pick, scratch);
+                twin.map(|shadow| order(&shadow)[0])
+            });
+            (pair_of(&pair).0, pick.trace.lifted, twins)
+        };
+        // A busy holder beside a free prefill: no pick exists by the lift.
+        let beside = [classed(over(0, 3), 1), classed(free(1, 0), 1)];
+        let none = LiftedVeto::None;
+        assert_eq!(said(&beside, true, true), (0, none, [Some(0), Some(0)]));
+        assert_eq!(said(&beside, true, false), (0, none, [Some(1), Some(0)]));
+        assert_eq!(said(&beside, false, true), (1, none, [Some(0), Some(0)]));
+        assert_eq!(said(&beside, false, false), (1, none, [Some(1), Some(0)]));
+        // Every prefill over: the pick exists by the lift, and no shadow
+        // is said beside it.
+        let alone = [classed(over(0, 3), 1)];
+        let lifted = LiftedVeto::Overload;
+        assert_eq!(said(&alone, true, true), (0, lifted, [None, None]));
+    }
+
+    /// The pair's default asks each side's hard filters alone
+    /// ([`Half::stands`]). The one decode has no room, so a soft filter of
+    /// its profile refuses it, and the default still takes it for the
+    /// prefill pool it answers for: a room steers no default, as no soft
+    /// filter does.
+    #[test]
+    fn a_pairs_default_asks_no_soft_filter() {
+        let mut roomed = vetoes();
+        roomed.push(Box::new(HasRoom));
+        let engine = pair_engine_of(false, [vetoes(), roomed]);
+        let paired = decide_pair(
+            &engine,
+            &[classed(over(0, 1), 1)],
+            &[classed(free(0, 0), 1)],
+        );
+        assert_eq!(pair_of(&paired), (0, 0));
+        assert_eq!(paired.trace().lifted, LiftedVeto::Overload);
+    }
+
+    /// Each side of the pair's default is steered by its own facts. Equal
+    /// pairs are drawn by the prefill side's seed, which is the request's,
+    /// and equal partners by the decode side's own draw sequence: seed by
+    /// seed, the pair is the worker the rule draws over each side's rows
+    /// alone under that side's seed. The pair's trace is the prefill's: it
+    /// is made under the prefill profile and carries the request's seed.
+    #[test]
+    fn a_pairs_default_steers_each_side_by_its_own_facts() {
+        let (engine, alone) = (pair_engine(false), engine_of("round_robin", false));
+        let prefills = [classed(over(0, 2), 1), classed(over(1, 2), 1)];
+        let decodes = [classed(over(0, 3), 1), classed(over(1, 3), 1)];
+        let first = |seed: u64, pool: &[Candidate]| order(&decide(&alone, &facts(seed), pool))[0];
+        let mut parted = 0;
+        for seed in 1..=64 {
+            let pools = PairPools {
+                prefills: &prefills,
+                decodes: &decodes,
+                ..PairPools::default()
+            };
+            let (pool, cx) = (PoolFacts::default(), Constraints::default());
+            let scratch = &mut Scratch::new();
+            let paired = engine.decide_pair(&facts(seed), &pool, pools, &cx, &cx, scratch);
+            let own = crate::Draw::new(seed).next_u64();
+            let drawn = (first(seed, &prefills), first(own, &decodes));
+            assert_eq!(pair_of(&paired), drawn, "seed {seed}");
+            assert_eq!(paired.trace().seed, seed);
+            assert_eq!(paired.trace().made_under(), Some(0));
+            parted += u32::from(first(seed, &decodes) != drawn.1);
+        }
+        // The decode side's sequence is no copy of the request's.
+        assert!(parted > 0, "the two sides drew alike under every seed");
     }
 
     /// A free decode keeps its pool from the rule, whoever it pairs with: a
@@ -2849,7 +3133,9 @@ mod tests {
     /// A pool over on every worker keeps no pin standing: the pin's test
     /// reads the veto as it stands, under which nobody is kept, and no rule
     /// answers that pass. The ring's own worker takes the key, and the trace
-    /// says the lifted veto.
+    /// says the lifted veto. The pin stands ahead of that worker's claim, and
+    /// once the pool is under its thresholds the key returns to it (the
+    /// manual preset's rule recovers the original).
     #[test]
     fn a_pin_yields_in_a_pool_over_on_every_worker() {
         let engine = ring_under_a_rule(Assignment::Delegate);
@@ -2870,6 +3156,28 @@ mod tests {
         let whole = decide(&engine, &request, &pool);
         assert_eq!(order(&whole)[0], ring[0], "the pin yields");
         assert_eq!(whole.trace().lifted, LiftedVeto::Overload);
+        assert_eq!(
+            engine
+                .sessions()
+                .pins(request.session())
+                .map(|pins| pins[0]),
+            Some(pool[ring[1] as usize].id),
+            "the pin is the key's first"
+        );
+        // The pool is under its thresholds again: the key is its pin's.
+        for worker in &mut pool {
+            worker.health.overloaded = false;
+        }
+        let later = RequestFacts {
+            now_micros: 3_000,
+            ..keyed("k1")
+        };
+        let back = decide(&engine, &later, &pool);
+        assert_eq!(order(&back)[0], ring[1], "the pinned worker");
+        assert_eq!(
+            back.pick().expect("a pick").session_verdict,
+            SessionVerdict::Pinned
+        );
     }
 
     /// Under a sessions rule the lifted placement says the veto the same
@@ -3135,9 +3443,8 @@ mod tests {
 
     /// Keeps every row. The first time it is asked under the lifted veto it
     /// runs the request once more, on the same engine and over the staged
-    /// pool, lent the pins of record its caller was lent: another
-    /// decision's whole run, in the gap between a decision's read of the
-    /// pins and its own claim.
+    /// pool: another decision's whole run, in the gap between a decision's
+    /// read of the pins and its own claim.
     #[derive(Debug)]
     struct InTheGap(Arc<Gap>);
 
@@ -3150,16 +3457,12 @@ mod tests {
                 let staged = std::mem::take(&mut *self.0.staged.lock().expect("the staged pool"));
                 if let Some(engine) = self.0.engine.get().and_then(Weak::upgrade) {
                     if !staged.is_empty() {
-                        let lent = Constraints {
-                            pins: cx.pins,
-                            ..Constraints::default()
-                        };
                         let mut scratch = Scratch::new();
                         let _ = engine.decide(
                             facts,
                             &PoolFacts::default(),
                             &staged,
-                            &lent,
+                            &Constraints::default(),
                             &mut scratch,
                         );
                     }
@@ -3455,60 +3758,6 @@ mod tests {
         assert_eq!(dispatched(&engine, &pool, 3_000), ring[0], "the pin stood");
     }
 
-    /// A kept key the lifted pass puts back on its pin of record follows
-    /// that pin as it follows a pin the table holds. The table holds no pin
-    /// of the key, the host's record names the key's ring worker, and that
-    /// worker is over its thresholds: the read at a miss passes it over
-    /// under the veto as it stands, the ring names it with the veto lifted,
-    /// and the pin is written back with no claim. When the host dispatches
-    /// the decision to its alternate, the worker is still the key's first
-    /// pin, and the key returns there.
-    #[test]
-    fn a_kept_key_put_back_on_its_pin_of_record_claims_nothing() {
-        let engine = ring_under_a_rule(Assignment::Delegate);
-        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
-        let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
-        let owner = ring[0] as usize;
-        let request = RequestFacts {
-            now_micros: 2_000,
-            ..keyed("k1")
-        };
-        // The table holds nothing of the key. The record names its worker,
-        // over its thresholds beside free workers.
-        let record = Stored::of(request.session_key.hash, pool[owner].id);
-        pool[owner].health.overloaded = true;
-        let decision = engine.decide(
-            &request,
-            &PoolFacts::default(),
-            &pool,
-            &Constraints {
-                pins: Some(&record),
-                ..Constraints::default()
-            },
-            &mut Scratch::new(),
-        );
-        let pick = *decision.pick().expect("a pick");
-        assert_eq!(order(&decision)[..2], ring[..2], "the ring's order");
-        let verdict = pick.session_verdict;
-        // The host dispatches the decision to its alternate.
-        let alternate = *pick.targets.iter().nth(1).expect("an alternate");
-        let lease = Lease {
-            issued_micros: 2_000,
-            session: request.session(),
-            session_verdict: verdict,
-            ..Lease::default()
-        };
-        engine.on_dispatched(&lease, &alternate, Side::Single, 0);
-        // The worker is under its thresholds again: the key is still its.
-        pool[owner].health.overloaded = false;
-        let back = dispatched(&engine, &pool, 3_000);
-        assert_eq!(
-            (verdict, back),
-            (SessionVerdict::Pinned, ring[0]),
-            "no claim, and the pin stood"
-        );
-    }
-
     /// A pin the lifted pass lands on leads no worker that carries the cap's
     /// requests of the key. A dispatch on an alternate writes that worker
     /// among the key's pins, and the cap bounds where a pin may go. The free
@@ -3682,189 +3931,16 @@ mod tests {
         assert_eq!(verdict(&stays), SessionVerdict::Pinned);
     }
 
-    /// The rule's in-flight cap holds for a pin of record the lifted pass
-    /// lands on as it holds for a pin the table held. The record names the
-    /// key's ring worker, over its thresholds and carrying the cap's
-    /// requests of the key: the pin is written back and hands the key to
-    /// the ring's next worker, where a claim would have kept it.
+    /// A claim made in the gap beside a pin that stands is followed too,
+    /// and the pin stays. The key's pin is the ring's third worker, over
+    /// its thresholds in both views: each decision's lifted pass keeps it.
+    /// Another decision of the key, which sees the ring's first worker
+    /// down, claims the ring's next worker between this decision's read of
+    /// the pins and its own claim. This decision's claim sees the newcomer
+    /// beside the pin it read and follows the other's worker, under either
+    /// recovery. A second claim there would drop the pin.
     #[test]
-    fn a_followed_pin_of_record_at_the_rules_cap_hands_the_key_on() {
-        let engine = ring_under_a_cap(2);
-        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
-        let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
-        let owner = ring[0] as usize;
-        let request = RequestFacts {
-            now_micros: 2_000,
-            ..keyed("k1")
-        };
-        let record = Stored::of(request.session_key.hash, pool[owner].id);
-        pool[owner].health.overloaded = true;
-        pool[owner].session_in_flight = 2;
-        let decision = engine.decide(
-            &request,
-            &PoolFacts::default(),
-            &pool,
-            &Constraints {
-                pins: Some(&record),
-                ..Constraints::default()
-            },
-            &mut Scratch::new(),
-        );
-        assert_eq!(order(&decision)[0], ring[1], "handed on at the cap");
-        assert_eq!(
-            decision.pick().expect("a pick").session_verdict,
-            SessionVerdict::Respill
-        );
-        assert_eq!(decision.trace().lifted, LiftedVeto::None);
-    }
-
-    /// A pin of record on another worker than the ring's stands through a
-    /// pool over its thresholds on every worker. The ring's worker takes
-    /// the request with the veto lifted, a claim behind the record's pin
-    /// written back, and once the pool is under its thresholds the key
-    /// returns to its recorded worker (the manual preset's rule recovers
-    /// the original).
-    #[test]
-    fn a_pin_of_record_off_the_rings_worker_stands_through_a_pool_over_on_every_worker() {
-        let engine = ring_under_a_rule(Assignment::Delegate);
-        let mut pool = [over(0, 4), over(1, 4), over(2, 4), over(3, 4)];
-        let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
-        let request = RequestFacts {
-            now_micros: 2_000,
-            ..keyed("k1")
-        };
-        let recorded = pool[ring[1] as usize].id;
-        let record = Stored::of(request.session_key.hash, recorded);
-        let lent = Constraints {
-            pins: Some(&record),
-            ..Constraints::default()
-        };
-        let mut scratch = Scratch::new();
-        let over_all = engine.decide(&request, &PoolFacts::default(), &pool, &lent, &mut scratch);
-        assert_eq!(
-            order(&over_all)[0],
-            ring[0],
-            "the ring's worker, by the lift"
-        );
-        assert_eq!(over_all.trace().lifted, LiftedVeto::Overload);
-        assert_eq!(
-            engine
-                .sessions()
-                .pins(request.session())
-                .map(|pins| pins[0]),
-            Some(recorded),
-            "the record's pin is the key's first"
-        );
-        // The pool is under its thresholds again: the key is its record's.
-        for worker in &mut pool {
-            worker.health.overloaded = false;
-        }
-        let later = RequestFacts {
-            now_micros: 3_000,
-            ..keyed("k1")
-        };
-        let back = engine.decide(&later, &PoolFacts::default(), &pool, &lent, &mut scratch);
-        assert_eq!(order(&back)[0], ring[1], "the recorded worker");
-        assert_eq!(
-            back.pick().expect("a pick").session_verdict,
-            SessionVerdict::Pinned
-        );
-    }
-
-    /// A pin of record on a worker the lifted pass drops as well (it is not
-    /// ready) is passed over, as the plain form passes it: nothing is
-    /// written back, and the ring's worker takes the key as a fresh one.
-    #[test]
-    fn a_pin_of_record_the_lifted_pass_drops_is_passed_over() {
-        let engine = ring_under_a_rule(Assignment::Delegate);
-        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
-        let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
-        let request = RequestFacts {
-            now_micros: 2_000,
-            ..keyed("k1")
-        };
-        let down = ring[1] as usize;
-        let record = Stored::of(request.session_key.hash, pool[down].id);
-        pool[down].health.healthy = false;
-        let lent = Constraints {
-            pins: Some(&record),
-            ..Constraints::default()
-        };
-        let mut scratch = Scratch::new();
-        let decision = engine.decide(&request, &PoolFacts::default(), &pool, &lent, &mut scratch);
-        let taker = pool[ring[0] as usize].id;
-        assert_eq!(order(&decision)[0], ring[0], "the ring's worker");
-        assert_eq!(
-            decision.pick().expect("a pick").session_verdict,
-            SessionVerdict::Claimed(taker)
-        );
-        assert_eq!(
-            engine
-                .sessions()
-                .pins(request.session())
-                .map(|pins| pins[0]),
-            Some(taker),
-            "nothing is written back"
-        );
-    }
-
-    /// The write-back does not take another request's claim for this
-    /// decision's own read. Another decision of the key, which sees the
-    /// recorded worker down, claims the ring's next worker in the gap
-    /// between this decision's read of the pins and its write-back. The
-    /// door then writes nothing, and the pins that stand are not this
-    /// decision's: its claim sees the move and follows the other's worker.
-    /// Taken for its own, they would let it claim the recorded worker over
-    /// the standing claim, and the two decisions would part.
-    #[test]
-    fn a_claim_made_ahead_of_the_write_back_is_followed() {
-        let rule = SessionRule {
-            assignment: Assignment::Delegate,
-            inflight_cap: 0,
-            ttl_micros: None,
-            sweep_micros: 0,
-            recovery: Recovery::Original,
-            rule_placed: RulePlaced::Told,
-        };
-        let (ringed, _) = ring_with_a_gap(None);
-        let (engine, gap) = ring_with_a_gap(Some(rule));
-        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
-        let ring = ring_order(&ringed, &keyed("k1"), &pool);
-        let request = keyed("k1");
-        let recorded = ring[0] as usize;
-        let record = Stored::of(request.session_key.hash, pool[recorded].id);
-        let mut theirs = pool.to_vec();
-        theirs[recorded].health.healthy = false;
-        *gap.staged.lock().expect("the staged pool") = theirs;
-        pool[recorded].health.overloaded = true;
-        let lent = Constraints {
-            pins: Some(&record),
-            ..Constraints::default()
-        };
-        let mut scratch = Scratch::new();
-        let decision = engine.decide(&request, &PoolFacts::default(), &pool, &lent, &mut scratch);
-        assert!(
-            gap.staged.lock().expect("the staged pool").is_empty(),
-            "the other decision ran"
-        );
-        assert_eq!(order(&decision)[..2], [ring[1], ring[0]]);
-        assert_eq!(
-            decision.pick().expect("a pick").session_verdict,
-            SessionVerdict::Pinned,
-            "the claim of record is the other decision's"
-        );
-    }
-
-    /// A claim made behind the record is not this decision's own read
-    /// either. Another decision of the key, lent the same record, writes
-    /// it back first and claims the ring's next worker behind it: it sees
-    /// the ring's first worker down. Where the rule recovers the original
-    /// the record still leads the pins that stand. This decision's sight
-    /// is the record alone, so its claim sees the pin behind it and
-    /// follows the other's worker. Taken whole, the pins would let it
-    /// claim a second worker, and the record's pin would be dropped.
-    #[test]
-    fn a_claim_made_behind_the_record_is_followed() {
+    fn a_claim_made_in_the_gap_beside_a_standing_pin_is_followed() {
         for recovery in [Recovery::Original, Recovery::Latest] {
             let rule = SessionRule {
                 assignment: Assignment::Delegate,
@@ -3879,21 +3955,17 @@ mod tests {
             let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
             let ring = ring_order(&ringed, &keyed("k1"), &pool);
             let request = keyed("k1");
-            // The record names the ring's third worker, over its thresholds
+            // The key's pin is the ring's third worker, over its thresholds
             // in both views: each decision's lifted pass keeps it.
-            let recorded = ring[2] as usize;
-            let record = Stored::of(request.session_key.hash, pool[recorded].id);
-            pool[recorded].health.overloaded = true;
+            let pinned = ring[2] as usize;
+            let table = engine.sessions();
+            table.lookup(request.session(), request.now_micros, &rule);
+            table.dispatched(request.session(), SessionVerdict::Pinned, pool[pinned].id);
+            pool[pinned].health.overloaded = true;
             let mut theirs = pool.to_vec();
             theirs[ring[0] as usize].health.healthy = false;
             *gap.staged.lock().expect("the staged pool") = theirs;
-            let lent = Constraints {
-                pins: Some(&record),
-                ..Constraints::default()
-            };
-            let mut scratch = Scratch::new();
-            let decision =
-                engine.decide(&request, &PoolFacts::default(), &pool, &lent, &mut scratch);
+            let decision = decide(&engine, &request, &pool);
             assert!(
                 gap.staged.lock().expect("the staged pool").is_empty(),
                 "the other decision ran"
@@ -3905,7 +3977,7 @@ mod tests {
                 "{recovery:?}: the claim of record is the other decision's"
             );
             let pins = engine.sessions().pins(request.session()).expect("the pins");
-            assert!(pins.contains(&pool[recorded].id), "{recovery:?}: {pins:?}");
+            assert!(pins.contains(&pool[pinned].id), "{recovery:?}: {pins:?}");
             assert!(
                 pins.contains(&pool[ring[1] as usize].id),
                 "{recovery:?}: {pins:?}"

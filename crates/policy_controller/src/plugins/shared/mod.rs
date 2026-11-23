@@ -61,7 +61,7 @@ pub(crate) fn shown_hashes<'a>(facts: &RequestFacts<'a>, needs: Needs) -> &'a [u
 /// always, it reads zero in its first test.
 pub(crate) fn shown_size(facts: &RequestFacts<'_>, needs: Needs) -> u32 {
     if needs.prompt_size {
-        facts.prompt_tokens
+        facts.prompt_size()
     } else {
         0
     }

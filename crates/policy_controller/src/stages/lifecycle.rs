@@ -95,11 +95,16 @@ pub trait Lifecycle: Send + Sync {
     /// that takes no lock does not.
     fn on_membership(&self, _change: &Membership<'_>) {}
 
-    fn on_signal(&self, _signal: &Signal) {}
+    /// A signal about one worker: a load row, a health change or a
+    /// gateway's veto. A load row lends its report's named values for
+    /// this call alone ([`Signal::Load`]): a stage copies out what it
+    /// keeps, and a cell is `Copy`. The word does not outlive the call.
+    fn on_signal(&self, _signal: &Signal<'_>) {}
 
     /// Whether the stage keeps a number of each rank's report, which a host
-    /// tells it ([`Signal::Load`] with the report's sample instant, and with
-    /// the rank's slot where the host keeps counts). The policy store tells
+    /// tells it ([`Signal::Load`] with the report's sample instant, with
+    /// the rank's slot where the host keeps counts, and with the report's
+    /// named values where the host states them). The policy store tells
     /// every report before it shows a decision that report. The engine over
     /// a host's worker lists tells a report that is new before it keeps the
     /// report's snapshot for its decisions, and its own doc names the
@@ -194,7 +199,7 @@ impl<T: Lifecycle + ?Sized> Lifecycle for Box<T> {
         (**self).on_membership(change);
     }
 
-    fn on_signal(&self, signal: &Signal) {
+    fn on_signal(&self, signal: &Signal<'_>) {
         (**self).on_signal(signal);
     }
 
@@ -232,7 +237,7 @@ mod tests {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
 
-        fn on_signal(&self, _: &Signal) {
+        fn on_signal(&self, _: &Signal<'_>) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
 

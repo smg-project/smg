@@ -3,8 +3,8 @@
 //! list of worker objects. A shadow's answer is counted and never served:
 //! the answer a request is given is the live profile's whole decision.
 //! Where that decision draws by the request's seed it is held to the one
-//! the same document gives with no shadow named. A rotation takes its
-//! turns as a whole decision does, which are not one pick's turns.
+//! the same document gives with no shadow named. A rotation's whole
+//! decision takes its list's own turn, the one a pick alone takes.
 //!
 //! The classic router asks the one policy of a request's model
 //! (`placement.rs:502`) and runs no second one beside it. So a shadow's
@@ -528,7 +528,8 @@ fn what_a_shadow_said_names_its_binding_its_kind_and_its_first_target() {
     let maker = Asks::of(asked, Some(&members));
     let now = Instant::now();
     let made = engine.members_of(members.lent());
-    let (decision, said) = super::decide(&engine, &mut asked, made, &maker, None, now, word);
+    let (decision, said) =
+        super::decide(engine.loaded(), &mut asked, made, &maker, None, now, word);
     // The shadow's picker takes the row behind the live pick's: the live
     // pick's alternate.
     let pick = decision.pick().expect("a pick");
@@ -569,7 +570,15 @@ fn a_shadow_equal_to_the_live_profile_agrees_at_every_seed() {
             loads: loads.clone(),
             ..Asks::of(request(seed), Some(&members))
         };
-        decided(engine, &asks).decision
+        // A plain `random` request with no shadow is answered a place: its
+        // whole decision is the one the entry that issues no lease makes.
+        match answered(engine, &asks).whole() {
+            Some((decided, _)) => decided.decision,
+            None => {
+                let whole = engine.decide_without_lease(&asks, Instant::now());
+                whole.expect("a whole decision").0
+            }
+        }
     };
     for preset in ["least_load", "power_of_two", "random"] {
         let engine = engine_of(with_shadow_profile(preset, profile_of(preset)), &stages);
@@ -644,6 +653,37 @@ fn a_plain_request_of_a_binding_with_a_shadow_takes_the_whole_decision() {
     let _ = decided(&engine, &Asks::of(request(7), Some(&other)));
     assert_eq!(kinds_at(&engine, 1).iter().sum::<u64>(), 9);
     assert_eq!(kinds_at(&engine, 0), [0; 4]);
+}
+
+/// Round robin under a binding that names a shadow takes its list's workers
+/// one after the other, as its one pick does with no shadow named: the
+/// whole decision takes the list's own turn at every size, and the shadow's
+/// run, a round robin of its own, moves no turn of it. So the list's word
+/// moves once a request. The classic router turns the list it is handed
+/// whole (`model_gateway/src/policies/round_robin.rs:151`) and runs no
+/// second policy beside it.
+#[test]
+fn a_shadow_leaves_the_live_rotation_one_turn_a_request() {
+    let stages = StageRegistry::builtin();
+    for workers in [3, 16, 64] {
+        let document = with_shadow_profile("round_robin", profile_of("round_robin"));
+        let engine = engine_of(document, &stages);
+        let members = PublishedList::new(pool(workers));
+        let word = &engine.members_of(members.lent()).rotation.0;
+        let before = word.load(Ordering::Relaxed);
+        let asks = Asks::of(request(7), Some(&members));
+        let places: Vec<usize> = (0..2 * workers)
+            .map(|_| first(&decided(&engine, &asks).decision) as usize)
+            .collect();
+        let in_turn: Vec<usize> = (0..2 * workers)
+            .map(|turn| (places[0] + turn) % workers)
+            .collect();
+        assert_eq!(places, in_turn, "{workers} workers");
+        let turned = word.load(Ordering::Relaxed) - before;
+        assert_eq!(turned, 2 * workers as u64, "{workers} workers");
+        assert_eq!(kinds(&engine)[3], 0, "each shadow profile ran");
+        assert_eq!(kinds(&engine).iter().sum::<u64>(), 2 * workers as u64);
+    }
 }
 
 /// The default policy's prompt goes back to the worker it was sent to, by

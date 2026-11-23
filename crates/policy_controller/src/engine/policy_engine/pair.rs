@@ -25,6 +25,17 @@
 //! host reads it at that instant ([`PairAdmission`]). The stock pair
 //! document filters by both bits (`has-capacity`, `has-room`).
 //!
+//! **A hard demand** ([`Demands`]). A pair's request that states one is
+//! held to it a side at a time: each side to the places of its list whose
+//! worker meets the demand as that side's role is held to it
+//! ([`Demands::held_by`]), among the places its host states for the side,
+//! by a single request's own rule ([`single::held_in`]). A side the demand
+//! leaves nobody sheds the pair with no endpoint, under the stage of the
+//! demand that took that side's last worker, the prefills' first. The
+//! decode asked again judges its decodes alone. An encode request's three
+//! lists are held to no demand: such a request is shed under the wires'
+//! name.
+//!
 //! **The words.** A side is told its issue once: with the prefill's
 //! ([`issue`]), or, where the request sends its decode later, at the decode
 //! call ([`issue_decode`]) or at the dispatch that sends the decode with no
@@ -67,17 +78,18 @@ use std::{
 
 use smg_worker::load::state::LoadSnapshot;
 
-use super::{signals, single, PolicyEngine, PoolMembers};
+use super::{signals, single, Loaded, PolicyEngine, PoolMembers};
 use crate::{
     engine::{
         decision::{shed, Decision, ShedReason, Target, SUBSET_HINT, WIRES},
         decision_engine::{DecideOutcome, HeldDecision, Leased, Request},
+        demands::{Demands, UnmetDemand},
         framework::{release, Engine, PairPools, Scratch},
         lease_events,
         list_cell::LentList,
         pair_classes::PartnerClasses,
-        records::{vetoes, HeldCells, Live},
-        view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, Session},
+        records::{vetoes, HeldCells, Live, PoolRecords},
+        view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role, Session, WorkerId},
     },
     stages::Lifecycle,
     tracking::lease::{Lease, LeaseId, LeaseKind, Side, DISPATCH_TTL},
@@ -166,11 +178,15 @@ pub struct PairLists<'a> {
 
 /// What a host states of one side's list beside the list: the places the
 /// request may take, and the places its standing vetoes mask and hold.
+/// Where the request states a hard demand, the places are those of them
+/// whose worker meets it ([`Self::meeting`]), and a side the demand leaves
+/// nobody names the demand that took its last worker.
 #[derive(Clone, Copy, Debug)]
 struct Beside<'a> {
     places: Option<&'a [u32]>,
     stalled: &'a [u32],
     held: &'a [u32],
+    unmet: Option<UnmetDemand>,
 }
 
 impl<'a> Beside<'a> {
@@ -178,6 +194,32 @@ impl<'a> Beside<'a> {
     /// the side's as they stand.
     const fn states_nothing(&self) -> bool {
         self.places.is_none() && self.stalled.is_empty() && self.held.is_empty()
+    }
+
+    /// The side held to the places of its list whose worker meets
+    /// `demands`, among the places it states, by a single request's own
+    /// rule ([`single::held_in`]): they are written into `kept`, a list
+    /// the calling thread keeps for the side. Where every worker the side
+    /// may take meets the demands it stands as it was stated, and where
+    /// none does it names the demand that took the last one. Out of line:
+    /// its code stays off the path of a pair that states no demand.
+    #[inline(never)]
+    fn meeting(self, records: &PoolRecords, demands: Demands, kept: &'a mut Vec<u32>) -> Self {
+        let stated = Constraints {
+            demands,
+            places: self.places,
+            ..Constraints::default()
+        };
+        match single::held_in(records, stated, kept) {
+            Ok(held) => Self {
+                places: held.places,
+                ..self
+            },
+            Err(unmet) => Self {
+                unmet: Some(unmet),
+                ..self
+            },
+        }
     }
 
     /// The request's constraints with this side's places and mask.
@@ -228,6 +270,7 @@ impl<'a> PairLists<'a> {
                 places: None,
                 stalled,
                 held,
+                unmet: None,
             };
             side.of(cx)
         };
@@ -261,6 +304,16 @@ impl<'a> PairLists<'a> {
     /// the values of this call's snapshot. Cells on `request` are read by
     /// neither side, and under no snapshot every worker reads no value.
     ///
+    /// A request that states a hard demand ([`Constraints::demands`]) is
+    /// decided with each side held to the places of its list whose worker
+    /// meets the demand as that side's role is held to it
+    /// ([`Demands::held_by`]), among the places stated for the side here.
+    /// The decode decided again judges its decodes alone. A side the
+    /// demand leaves nobody sheds the pair with no endpoint under the
+    /// stage of the demand that took that side's last worker, the
+    /// prefills' first. A request that states places of its own beside a
+    /// demand is declined under the places' name.
+    ///
     /// Prefills that are all at their admission limit shed a first
     /// decision, which reads as a request that waits ([`prefills_full`]).
     ///
@@ -275,6 +328,7 @@ impl<'a> PairLists<'a> {
         request: &mut Request<'_>,
         held: Option<&Target>,
     ) -> Decision {
+        let engine = engine.loaded();
         let sides = (
             engine.members_of(self.prefill),
             engine.members_of(self.decode),
@@ -286,12 +340,48 @@ impl<'a> PairLists<'a> {
     /// its caller asked of their cells.
     pub(super) fn decide_over(
         &self,
-        engine: &PolicyEngine,
+        engine: Loaded<'_, '_>,
+        sides: (&PoolMembers, &PoolMembers),
+        loads: Option<&Arc<LoadSnapshot>>,
+        now: Instant,
+        request: &mut Request<'_>,
+        held: Option<&Target>,
+    ) -> Decision {
+        self.decide_sides(engine, sides, loads, now, request, held, true)
+    }
+
+    /// A pair's first decision with a hard demand its request states left
+    /// to the records' decision, which sheds it ([`not_decided`]): what an
+    /// encode request's entry asks for a request its three lists do not
+    /// decide. Those lists are held to no demand.
+    pub(super) fn decide_unjudged(
+        &self,
+        engine: Loaded<'_, '_>,
+        sides: (&PoolMembers, &PoolMembers),
+        loads: Option<&Arc<LoadSnapshot>>,
+        now: Instant,
+        request: &mut Request<'_>,
+    ) -> Decision {
+        self.decide_sides(engine, sides, loads, now, request, None, false)
+    }
+
+    /// [`Self::decide_over`], and whether a hard demand the request states
+    /// is `judged` over the two lists: each side is then held to the
+    /// places whose worker meets it, and the records' decision is handed
+    /// none.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a pair's decision over its two lists, and how it reads a demand"
+    )]
+    fn decide_sides(
+        &self,
+        engine: Loaded<'_, '_>,
         (prefill, decode): (&PoolMembers, &PoolMembers),
         loads: Option<&Arc<LoadSnapshot>>,
         now: Instant,
         request: &mut Request<'_>,
         held: Option<&Target>,
+        judged: bool,
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
         // One value for both lists' records: this call's instant on the
@@ -302,29 +392,75 @@ impl<'a> PairLists<'a> {
         request.facts.now_micros = live.now_micros();
         request.facts.budget_micros = super::budget::shown(request.facts.budget_micros);
         let (facts, cx) = (&request.facts, &request.constraints);
+        // A retry leaves every worker of the engines it tried, each list by
+        // its own engines: where a list holds several workers of one
+        // engine, the facts name them all, as a single request's do. A
+        // first attempt runs nine instructions for it: the test of its
+        // empty list, and behind its decision the test of a list to hand
+        // back.
+        let tried = if facts.tried.is_empty() {
+            None
+        } else {
+            tried_engines(engine, facts.tried, &[prefill, decode])
+        };
+        let widened;
+        let facts = match &tried {
+            Some(tried) => {
+                widened = RequestFacts { tried, ..*facts };
+                &widened
+            }
+            None => facts,
+        };
         let sides = [
             Beside {
                 places: self.prefill_places,
                 stalled: self.prefill_stalled,
                 held: self.prefill_held,
+                unmet: None,
             },
             Beside {
                 places: self.decode_places,
                 stalled: self.decode_stalled,
                 held: self.decode_held,
+                unmet: None,
             },
         ];
         let decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;
-            let (workers, records) = (prefill.workers(), prefill.records(spec, clock));
-            let (prefills, prefill_facts) = records.write(workers, &live, prefills);
-            let (workers, records) = (decode.workers(), decode.records(spec, clock));
-            let (decodes, decode_facts) = records.write(workers, &live, decodes);
+            let (workers, prefill_records) = (prefill.workers(), prefill.records(spec, clock));
+            let (prefills, prefill_facts) = prefill_records.write(workers, &live, prefills);
+            let (workers, decode_records) = (decode.workers(), decode.records(spec, clock));
+            let (decodes, decode_facts) = decode_records.write(workers, &live, decodes);
             stamp(prefills, decodes, self.classes, self.admission);
             let (engine, scratch) = (spec.engine(), &mut buffers.scratch);
+            let [prefill_side, decode_side] = sides;
+            // A hard demand the request states is judged here, a side at a
+            // time, by what each side's role is held to. The records'
+            // decision is handed the places and no demand. The decode
+            // asked again judges no prefill: the held one ran already.
+            let spent;
+            let (cx, prefill_side, decode_side) = if judged && !cx.demands.is_none() {
+                let [prefill_kept, decode_kept] = &mut buffers.meeting;
+                let demands = cx.demands;
+                let prefill_side = match held {
+                    None => {
+                        let demands = demands.held_by(Role::Prefill);
+                        prefill_side.meeting(prefill_records, demands, prefill_kept)
+                    }
+                    Some(_) => prefill_side,
+                };
+                let demands = demands.held_by(Role::Decode);
+                let decode_side = decode_side.meeting(decode_records, demands, decode_kept);
+                spent = Constraints {
+                    demands: Demands::default(),
+                    ..*cx
+                };
+                (&spent, prefill_side, decode_side)
+            } else {
+                (cx, prefill_side, decode_side)
+            };
             // A side whose profile shows its rows is handed its mask in
             // them. The decode asked again reads no mask of the prefills.
-            let [prefill_side, decode_side] = sides;
             let decode_side = decode_side.written(engine, facts.model, Phase::Decode, decodes);
             let prefill_side = match held {
                 None => prefill_side.written(engine, facts.model, Phase::Prefill, prefills),
@@ -361,24 +497,64 @@ impl<'a> PairLists<'a> {
                 }
             }
         };
-        BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
+        let decision = BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
             Ok(mut buffers) => decide(&mut buffers),
             // A stage asked for a decision from inside its own, on this
             // thread: that decision takes buffers of its own.
             Err(_) => decide(&mut Buffers::default()),
-        })
+        });
+        // The thread's list goes back for its next retry.
+        if let Some(tried) = tried {
+            single::TRIED.set(tried);
+        }
+        decision
     }
+}
+
+/// The workers of the engines a retry tried: `tried` as its host named
+/// them, and behind them every other worker of an engine of one of
+/// `lists` that holds a tried worker, each list read by its own engines
+/// (`PoolRecords::tried_engines`). A pair hands its two lists and an
+/// encode request its three. `None` where no list holds several workers
+/// of one engine: the request's own list stands.
+///
+/// The workers stand in the calling thread's own list ([`single::TRIED`]),
+/// which the caller puts back behind its decision: a retry allocates
+/// nothing once the list has grown. Out of line and cold: a first attempt
+/// runs none of it.
+#[cold]
+#[inline(never)]
+pub(super) fn tried_engines(
+    engine: Loaded<'_, '_>,
+    tried: &[WorkerId],
+    lists: &[&PoolMembers],
+) -> Option<Vec<WorkerId>> {
+    let (spec, clock) = (&engine.document.spec, &engine.clock);
+    let mut ranked = lists
+        .iter()
+        .map(|list| list.records(spec, clock))
+        .filter(|records| records.has_ranks());
+    let first = ranked.next()?;
+    let mut whole = single::TRIED.take();
+    first.tried_engines(tried, &mut whole);
+    for records in ranked {
+        records.more_tried_engines(tried, &mut whole);
+    }
+    Some(whole)
 }
 
 /// What one thread keeps for its pair decisions: each list's records, the
 /// prefills' first, and the engine's scratch. An encode request's decision
 /// keeps its encoders' records here too ([`super::encode`]): a pair's
-/// leaves them as they were.
+/// leaves them as they were. A pair that states a hard demand keeps each
+/// side's places that meet it here, the prefills' first: such a request
+/// allocates nothing once each list has grown to its side.
 #[derive(Debug, Default)]
 pub(super) struct Buffers {
     pub(super) rows: [Vec<Candidate>; 2],
     pub(super) encoders: Vec<Candidate>,
     pub(super) scratch: Scratch,
+    meeting: [Vec<u32>; 2],
 }
 
 thread_local! {
@@ -408,10 +584,13 @@ pub(super) fn stamp(
     }
 }
 
-/// How a pair's request is shed where it states what a pair's lists are not
-/// narrowed by, and the stage it is shed under: a subset hint, a hard
-/// demand, or places of its list. A pair's records keep no demand fact, so
-/// such a request is shed and never placed past its demand. A hint of some
+/// How a pair's request is shed where it states what a pair's records are
+/// not narrowed by, and the stage it is shed under: a subset hint, a hard
+/// demand, or places of its list. A pair's records keep no demand fact. A
+/// pair's own decision judges a demand ahead of them, a side at a time
+/// ([`PairLists::decide`]), and hands them none. A demand that reaches
+/// them is an encode request's, whose three lists are held to none: it is
+/// shed, and the request is never placed past its demand. A hint of some
 /// records is declined: no stage here takes a part of a list. So are
 /// places the request states itself ([`single::PLACES`]): one set cannot
 /// hold two lists, and each side's places are its lists' to state
@@ -460,9 +639,12 @@ fn decode_session(facts: &RequestFacts<'_>) -> Session {
 /// was written into its records states none here ([`Beside::written`]).
 ///
 /// One side alone is no pair: where either list holds no record the engine
-/// answers over no candidate. A request that states a hard demand or a
-/// subset hint of none is shed under the stage's name the engine over a
-/// store sheds it by, and a hint of some records is declined under it.
+/// answers over no candidate. A hard demand that reaches the records, or a
+/// subset hint of none, is shed, and a hint of some records is declined,
+/// each under a stage's name ([`not_decided`]). A side the request's
+/// demand left nobody ([`Beside::meeting`]) sheds the pair with no
+/// endpoint under that demand's stage, the prefills' first, behind what
+/// the records decline by name.
 fn decide_records(
     engine: &Engine,
     facts: &RequestFacts<'_>,
@@ -482,6 +664,11 @@ fn decide_records(
         return shed(reason, stage, facts.seed, pool.generation);
     }
     let [prefills, decodes] = sides;
+    // A side the request's demand left nobody: the prefills' first.
+    if let Some(unmet) = prefills.unmet.or(decodes.unmet) {
+        let stage = unmet.stage();
+        return shed(ShedReason::NoEndpoints, stage, facts.seed, pool.generation);
+    }
     if prefills.states_nothing() && decodes.states_nothing() {
         return engine.decide_pair(facts, pool, pools, cx, cx, scratch);
     }
@@ -520,6 +707,8 @@ pub(super) fn issue(
         session_verdict: pick.session_verdict,
         issued_micros: facts.now_micros,
         tokens: facts.prompt_tokens,
+        chars: facts.prompt_chars,
+        bytes: facts.prompt_bytes,
     };
     let decode = lease_events::decode_as_issued(&lease, first, session)?;
     engine.on_decision_issued(&lease, decision);
@@ -544,7 +733,9 @@ pub(super) fn issue(
 ///
 /// The held prefill is looked for before what the request states is
 /// judged: a call whose prefill is in no list of records reads
-/// `prefill-gone` from the engine's entry too, whatever it states.
+/// `prefill-gone` from the engine's entry too, whatever it states. Behind
+/// a prefill that stands in its list, decodes the request's demand left
+/// nobody of shed the call under that demand's stage.
 fn decide_decode_records(
     engine: &Engine,
     facts: &RequestFacts<'_>,
@@ -567,9 +758,14 @@ fn decide_decode_records(
         let no_lists = PairPools::default();
         return engine.decide_decode(&facts, &none, no_lists, prefill, None, cx, scratch);
     }
-    let listed = |_: &_| pools.prefills.iter().any(|row| row.id == prefill);
-    if let Some((reason, stage)) = not_decided(cx).filter(listed) {
+    let listed = || pools.prefills.iter().any(|row| row.id == prefill);
+    if let Some((reason, stage)) = not_decided(cx).filter(|_| listed()) {
         return shed(reason, stage, facts.seed, pool.generation);
+    }
+    // The decodes the request's demand left nobody of.
+    if let Some(unmet) = side.unmet.filter(|_| listed()) {
+        let stage = unmet.stage();
+        return shed(ShedReason::NoEndpoints, stage, facts.seed, pool.generation);
     }
     let first = held.pair.map(|pair| (pair.decode_id, pair.decode_dp_rank));
     if side.states_nothing() {
@@ -605,13 +801,17 @@ pub(super) fn issue_decode(
 
 /// The decode side's lease for a pick of the decode decided again, as
 /// [`issue_decode`] hands it back, and no word to a stage: under the id and
-/// the generation of `prefill`, with the size the call states.
+/// the generation of `prefill`, with the three sizes the call states: its
+/// token count and its text's two lengths. A call may state another text
+/// than the first decision did, and its side reads the call's.
 ///
 /// `None` for a decision that picks no pair.
 fn decode_side(facts: &RequestFacts<'_>, decision: &Decision, prefill: &Lease) -> Option<Lease> {
     let first = decision.pick()?.targets.first()?;
     Some(Lease {
         tokens: facts.prompt_tokens,
+        chars: facts.prompt_chars,
+        bytes: facts.prompt_bytes,
         ..lease_events::decode_as_issued(prefill, first, decode_session(facts))?
     })
 }
@@ -627,7 +827,7 @@ fn decode_side(facts: &RequestFacts<'_>, decision: &Decision, prefill: &Lease) -
 /// A panic in the decision itself is not held here: it costs the call its
 /// decision, as a first decision's does.
 fn issue_decode_caught(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     facts: &RequestFacts<'_>,
     decision: &Decision,
     prefill: &Lease,
@@ -657,7 +857,7 @@ fn issue_decode_caught(
 /// lists' own decision makes.
 #[inline]
 pub(super) fn decide(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     lists: &PairLists<'_>,
     request: &mut Request<'_>,
     target: Option<&Target>,
@@ -683,7 +883,7 @@ pub(super) fn decide(
 /// reports in `loads`: the snapshot the request gives for this call, or
 /// the newest the engine's own task keeps at hand.
 pub(super) fn decided(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     lists: &PairLists<'_>,
     request: &mut Request<'_>,
     held: Option<&HeldDecision<'_>>,
@@ -707,7 +907,7 @@ pub(super) fn decided(
 // instructions, counted with Callgrind.
 #[inline(always)]
 pub(super) fn issued(
-    own: &PolicyEngine,
+    own: Loaded<'_, '_>,
     request: &Request<'_>,
     decision: Decision,
     held: Option<&HeldDecision<'_>>,
@@ -736,7 +936,7 @@ pub(super) fn issued(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, sync::Arc, time::Duration};
+    use std::{cell::RefCell, collections::BTreeSet, sync::Arc, time::Duration};
 
     use parking_lot::Mutex;
     use smg_worker::{
@@ -752,16 +952,12 @@ mod tests {
         engine::{
             decision::{Pair, Pick, Target, Targets},
             decision_engine::{DecisionEngine, HeldDecode, RequestMaker, WorkerLists},
-            demands::Demands,
+            demands::DemandFacts,
             framework::{Filter, Picker, TieBand},
             list_cell::tests::PublishedList,
             records::worker_id,
             sticky_sessions::{DecodeVerdict, SessionVerdict},
-            store_backed_engine::{
-                tests::{later_request, pair_fleet, pair_request, GATEWAY},
-                StoreBackedEngine,
-            },
-            view::{Identity, Role, WireModes, WorkerId},
+            view::{FixedFacts, Identity, WireModes},
         },
         policies::consistent_hashing::InOrder,
         stages::{Best, HasCapacity, StageRegistry},
@@ -794,6 +990,13 @@ mod tests {
         SIZES.with_borrow_mut(std::mem::take)
     }
 
+    thread_local! {
+        /// The side of each word a stage heard on this thread, and what
+        /// its lease stated of its request's text: its characters, its
+        /// bytes and the size made of them ([`Lease::prompt_size`]).
+        static LENGTHS: RefCell<Vec<(Side, [u32; 3])>> = const { RefCell::new(Vec::new()) };
+    }
+
     /// A picker that picks as [`Best`] and keeps every word it hears.
     #[derive(Debug)]
     struct Hears(Arc<Mutex<Vec<Word>>>);
@@ -810,6 +1013,8 @@ mod tests {
                 named,
             ));
             SIZES.with_borrow_mut(|sizes| sizes.push((word, lease.side, lease.tokens)));
+            let stated = [lease.chars, lease.bytes, lease.prompt_size()];
+            LENGTHS.with_borrow_mut(|lengths| lengths.push((lease.side, stated)));
         }
     }
 
@@ -976,6 +1181,7 @@ mod tests {
             places,
             stalled: &[],
             held: &[],
+            unmet: None,
         }
     }
 
@@ -1626,7 +1832,7 @@ mod tests {
         let prefill = &host.prefills[taken.position as usize];
         let decode = &host.decodes[pair.decode_position as usize];
         let placement = crate::tracking::Placement::taken(
-            &host.engine,
+            host.engine.loaded(),
             decided,
             later,
             now,
@@ -1654,7 +1860,7 @@ mod tests {
         drop(placement);
         let (decided, later, now, _, _) = whole();
         let unsent = crate::tracking::Placement::taken(
-            &host.engine,
+            host.engine.loaded(),
             decided,
             later,
             now,
@@ -2030,6 +2236,246 @@ mod tests {
         assert_eq!(shed_under(0, 1), (ShedReason::NoEndpoints, "prefill-gone"));
     }
 
+    /// [`Host::of`] whose host says what each worker states for a request's
+    /// demands: `stated` answers for a side, the prefills' `0`, and a place
+    /// of that side's list.
+    fn stating(
+        prefills: usize,
+        decodes: usize,
+        stated: impl Fn(usize, usize) -> FixedFacts,
+    ) -> Host {
+        let mut host = Host::of(prefills, decodes);
+        let said = |side: usize, list: &Arc<[Arc<dyn Worker>]>| {
+            let mut places = 0..;
+            PublishedList::with_facts(Arc::clone(list), |_| {
+                stated(side, places.next().expect("a place"))
+            })
+        };
+        host.lists = [said(0, &host.prefills), said(1, &host.decodes)];
+        host
+    }
+
+    /// A pair's constraints that state `demands` and nothing else.
+    fn demanding(demands: Demands) -> Constraints<'static> {
+        Constraints {
+            demands,
+            ..Constraints::default()
+        }
+    }
+
+    /// The places of each list that twelve first decisions of `host` name
+    /// for a request that states `cx`, each list held to `places`.
+    fn places_named(
+        host: &Host,
+        cx: Constraints<'_>,
+        places: [Option<&[u32]>; 2],
+    ) -> (BTreeSet<usize>, BTreeSet<usize>) {
+        let picks = (0..12).map(|seed| {
+            let decision = host.decide_among(&OPEN, seed, None, cx, places);
+            host.picked(&decision)
+        });
+        picks.unzip()
+    }
+
+    /// What a decision that sheds is shed for, and under which stage.
+    fn shed_of(decision: &Decision) -> (ShedReason, &'static str) {
+        match decision {
+            Decision::Shed(shed) => (shed.reason, shed.emptied_by),
+            other => panic!("not shed: {other:?}"),
+        }
+    }
+
+    /// A pair that states a hard demand is decided over its two lists,
+    /// each side held to the workers that meet the demand: every pick
+    /// names one of them on each side, and each of them takes its turn.
+    /// With no demand the other workers take theirs.
+    ///
+    /// The classic router holds both of a pair's pools to the request's
+    /// own rule (`model_gateway/src/routers/common/placement.rs:1227`, the
+    /// rule's read at `:1262-1266`; its cases at `:3272` and `:3324`, at
+    /// main `b8c15d40a`).
+    #[test]
+    fn a_pair_that_states_a_demand_is_decided_among_the_workers_of_each_side_that_meet_it() {
+        // The second prefill takes images, and so do the first and the
+        // third decode.
+        let host = stating(2, 3, |side, at| FixedFacts {
+            vision: if side == 0 { at == 1 } else { at != 1 },
+            ..FixedFacts::default()
+        });
+        let pixels = demanding(Demands {
+            vision: true,
+            ..Demands::default()
+        });
+        let seeing = (BTreeSet::from([1]), BTreeSet::from([0, 2]));
+        assert_eq!(places_named(&host, pixels, [None, None]), seeing);
+        let all = (BTreeSet::from([0, 1]), BTreeSet::from([0, 1, 2]));
+        assert_eq!(
+            places_named(&host, Constraints::default(), [None, None]),
+            all
+        );
+    }
+
+    /// A prefill is held to neither the completion's bound nor the way a
+    /// constraint was decided ([`Demands::held_by`]): it runs the input,
+    /// and the decode beside it holds the budget and generates the tokens.
+    /// So a prefill whose window is under the completion's bound stays a
+    /// candidate while a decode under it leaves, and the input's bound
+    /// holds both sides.
+    #[test]
+    fn a_pairs_prefill_is_held_to_neither_the_completions_bound_nor_a_constraints_way() {
+        // Every worker states a window of 4,096 but the second decode,
+        // which states 16,384. The first decode alone states a way to
+        // decide a constraint.
+        let host = stating(2, 2, |side, at| FixedFacts {
+            demands: DemandFacts {
+                window: if (side, at) == (1, 1) { 16_384 } else { 4_096 },
+                decoding: if (side, at) == (1, 0) { 3 } else { 0 },
+                ..DemandFacts::default()
+            },
+            ..FixedFacts::default()
+        });
+        let both = BTreeSet::from([0, 1]);
+        let long = demanding(Demands {
+            output_window: 8_000,
+            ..Demands::default()
+        });
+        let wide = (both.clone(), BTreeSet::from([1]));
+        assert_eq!(places_named(&host, long, [None, None]), wide);
+        let decided = demanding(Demands {
+            decoding: 3,
+            ..Demands::default()
+        });
+        let alike = (both, BTreeSet::from([0]));
+        assert_eq!(places_named(&host, decided, [None, None]), alike);
+        // The input's bound is every worker's: no prefill holds it.
+        let prompt = demanding(Demands {
+            input_window: 8_000,
+            ..Demands::default()
+        });
+        let decision = host.decide_among(&OPEN, 0, None, prompt, [None, None]);
+        let narrow = (ShedReason::NoEndpoints, "context-window");
+        assert_eq!(shed_of(&decision), narrow);
+    }
+
+    /// A side the demand leaves nobody sheds the pair with no endpoint
+    /// under the stage of the demand that took that side's last worker, as
+    /// a single request's list is shed. Where each side is left nobody, the
+    /// prefills' demand is the one named.
+    #[test]
+    fn a_side_a_demand_leaves_nobody_sheds_the_pair_under_that_demands_stage() {
+        // No prefill takes images. Every decode does, and each states a
+        // window of 4,096.
+        let host = stating(2, 2, |side, _| FixedFacts {
+            vision: side == 1,
+            demands: DemandFacts {
+                window: if side == 1 { 4_096 } else { 0 },
+                ..DemandFacts::default()
+            },
+            ..FixedFacts::default()
+        });
+        let shed_under = |demands: Demands| {
+            let decision = host.decide_among(&OPEN, 0, None, demanding(demands), [None, None]);
+            shed_of(&decision)
+        };
+        let pixels = Demands {
+            vision: true,
+            ..Demands::default()
+        };
+        assert_eq!(shed_under(pixels), (ShedReason::NoEndpoints, "vision"));
+        let long = Demands {
+            output_window: 8_000,
+            ..Demands::default()
+        };
+        let narrow = (ShedReason::NoEndpoints, "context-window");
+        assert_eq!(shed_under(long), narrow);
+        // Both sides are left nobody, each by another demand.
+        let each = Demands {
+            vision: true,
+            ..long
+        };
+        assert_eq!(shed_under(each), (ShedReason::NoEndpoints, "vision"));
+    }
+
+    /// A demand is judged among the places a pair's host states for a
+    /// side: the side is held to those of them whose worker meets it, and
+    /// a side none of whose places meets it sheds the pair, whatever a
+    /// worker outside them states.
+    #[test]
+    fn a_pairs_demand_is_judged_among_the_places_its_host_states() {
+        // The second and the third worker of each list take images.
+        let host = stating(3, 3, |_, at| FixedFacts {
+            vision: at != 0,
+            ..FixedFacts::default()
+        });
+        let pixels = demanding(Demands {
+            vision: true,
+            ..Demands::default()
+        });
+        let held = places_named(&host, pixels, [Some(&[0, 1]), Some(&[1, 2])]);
+        assert_eq!(held, (BTreeSet::from([1]), BTreeSet::from([1, 2])));
+        let blind = host.decide_among(&OPEN, 0, None, pixels, [None, Some(&[0])]);
+        assert_eq!(shed_of(&blind), (ShedReason::NoEndpoints, "vision"));
+    }
+
+    /// A pair's request that states both a hard demand and places of its
+    /// own is declined under the places' name, whether its sides meet the
+    /// demand or not: a pair's places are its lists' to state, and that
+    /// answer comes ahead of the demand's.
+    #[test]
+    fn a_pair_that_states_a_demand_and_places_of_its_own_is_declined_under_the_places() {
+        let pixels = demanding(Demands {
+            vision: true,
+            ..Demands::default()
+        });
+        let stated = Constraints {
+            places: Some(&[0]),
+            ..pixels
+        };
+        let declined = (ShedReason::PolicyDeclined, single::PLACES);
+        // Every worker takes images, then none does.
+        for sees in [true, false] {
+            let host = stating(1, 1, |_, _| FixedFacts {
+                vision: sees,
+                ..FixedFacts::default()
+            });
+            let decision = host.decide_among(&OPEN, 0, None, stated, [None, None]);
+            assert_eq!(shed_of(&decision), declined, "takes images: {sees}");
+        }
+    }
+
+    /// The decode asked again behind a held prefill is held to the decodes
+    /// that meet the demand, and judges no prefill: the held one ran
+    /// already, whatever it states. Where no decode meets the demand the
+    /// call is shed under that demand's stage.
+    ///
+    /// The classic router decides no decode again (`placement.rs:1227`, at
+    /// main `b8c15d40a`): this answer is the engine's own.
+    #[test]
+    fn a_decode_asked_again_is_held_to_the_decodes_that_meet_the_demand() {
+        let pixels = demanding(Demands {
+            vision: true,
+            ..Demands::default()
+        });
+        // No prefill takes images, and the second decode alone does.
+        let host = stating(1, 2, |side, at| FixedFacts {
+            vision: (side, at) == (1, 1),
+            ..FixedFacts::default()
+        });
+        let held = prefill_alone(worker_id(host.prefills[0].as_ref()));
+        for seed in 0..6 {
+            let again = host.decide_among(&OPEN, seed, Some(&held), pixels, [None, None]);
+            assert_eq!(host.picked(&again), (0, 1));
+        }
+        // The pair's first decision judges its prefills.
+        let first = host.decide_among(&OPEN, 0, None, pixels, [None, None]);
+        assert_eq!(shed_of(&first), (ShedReason::NoEndpoints, "vision"));
+        // No decode takes images.
+        let blind = stating(1, 2, |_, _| FixedFacts::default());
+        let held = prefill_alone(worker_id(blind.prefills[0].as_ref()));
+        let again = blind.decide_among(&OPEN, 0, Some(&held), pixels, [None, None]);
+        assert_eq!(shed_of(&again), (ShedReason::NoEndpoints, "vision"));
+    }
+
     /// Under round robin on both sides a pair's first decision takes the
     /// decode rotation's turn, and the decode decided again is handed the
     /// decode that decision named and keeps it. So requests that come one
@@ -2374,6 +2820,8 @@ mod tests {
             decode: HeldDecode {
                 session,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: false,
             },
         };
@@ -2459,6 +2907,8 @@ mod tests {
             decode: HeldDecode {
                 session,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: false,
             },
         };
@@ -2497,6 +2947,8 @@ mod tests {
             decode: HeldDecode {
                 session,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: true,
             },
         };
@@ -2529,6 +2981,8 @@ mod tests {
             decode: HeldDecode {
                 session,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: true,
             },
         };
@@ -2614,9 +3068,22 @@ mod tests {
         for _ in 0..4 {
             let mut asked = alone.asks(&classes, false);
             let mut leased = leasing.asks(&classes, false);
-            let decision = decide(&alone.engine, &asked.1, &mut asked.0, None, None, now);
-            let outcome =
-                super::decided(&leasing.engine, &leased.1, &mut leased.0, None, None, now);
+            let decision = decide(
+                alone.engine.loaded(),
+                &asked.1,
+                &mut asked.0,
+                None,
+                None,
+                now,
+            );
+            let outcome = super::decided(
+                leasing.engine.loaded(),
+                &leased.1,
+                &mut leased.0,
+                None,
+                None,
+                now,
+            );
             assert!(outcome.lease.is_some(), "the leasing form issues its pick");
             assert_eq!(alone.picked(&decision), leasing.picked(&outcome.decision));
         }
@@ -2624,8 +3091,22 @@ mod tests {
         // behind the target each engine's first pick names.
         let mut asked = alone.asks(&classes, true);
         let mut leased = leasing.asks(&classes, true);
-        let first = decide(&alone.engine, &asked.1, &mut asked.0, None, None, now);
-        let outcome = super::decided(&leasing.engine, &leased.1, &mut leased.0, None, None, now);
+        let first = decide(
+            alone.engine.loaded(),
+            &asked.1,
+            &mut asked.0,
+            None,
+            None,
+            now,
+        );
+        let outcome = super::decided(
+            leasing.engine.loaded(),
+            &leased.1,
+            &mut leased.0,
+            None,
+            None,
+            now,
+        );
         assert_eq!(alone.picked(&first), leasing.picked(&outcome.decision));
         let (ours, theirs) = (target_at(&first, 0), target_at(&outcome.decision, 0));
         let lease = outcome.lease.expect("the pair's lease").lease;
@@ -2637,12 +3118,14 @@ mod tests {
             decode: HeldDecode {
                 session: outcome.decode_session,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: true,
             },
         };
         let call = now + Duration::from_millis(1);
         let again = decide(
-            &alone.engine,
+            alone.engine.loaded(),
             &asked.1,
             &mut asked.0,
             Some(&ours),
@@ -2650,7 +3133,7 @@ mod tests {
             call,
         );
         let issued = super::decided(
-            &leasing.engine,
+            leasing.engine.loaded(),
             &leased.1,
             &mut leased.0,
             Some(&held),
@@ -2663,7 +3146,14 @@ mod tests {
         // A request held to a wire no worker of the lists is dialed on.
         let mut undialed = alone.asks(&classes, false);
         undialed.0.constraints.wire_modes = WireModes::ZMQ;
-        match decide(&alone.engine, &undialed.1, &mut undialed.0, None, None, now) {
+        match decide(
+            alone.engine.loaded(),
+            &undialed.1,
+            &mut undialed.0,
+            None,
+            None,
+            now,
+        ) {
             Decision::Shed(shed) => assert_eq!(
                 (shed.reason, shed.emptied_by),
                 (ShedReason::PolicyDeclined, WIRES)
@@ -2676,7 +3166,7 @@ mod tests {
         refused.0.constraints.wire_modes = WireModes::ZMQ;
         for behind in [None, Some(&held)] {
             let declined = super::decided(
-                &leasing.engine,
+                leasing.engine.loaded(),
                 &refused.1,
                 &mut refused.0,
                 behind,
@@ -2759,6 +3249,8 @@ mod tests {
             decode: HeldDecode {
                 session: outcome.decode_session,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: true,
             },
         };
@@ -2873,6 +3365,8 @@ mod tests {
             decode: HeldDecode {
                 session: outcome.decode_session,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: true,
             },
         };
@@ -3012,9 +3506,7 @@ mod tests {
     ///
     /// The gateway's own routing picks a pair's decode with its prefill and
     /// has no stage that hears an issue
-    /// (`model_gateway/src/routers/common/placement.rs:1227`). The engine
-    /// over stored records holds such a panic and hands back the pick its
-    /// file holds (`engine/store_backed_engine.rs`, `issue_decode`).
+    /// (`model_gateway/src/routers/common/placement.rs:1227`).
     #[test]
     fn a_stage_that_panics_at_a_decode_calls_issue_costs_the_call_nothing() {
         let host = Host::under(stopping(), 1, 2);
@@ -3128,35 +3620,46 @@ mod tests {
         assert_eq!(decode, own);
     }
 
-    /// The engine over a store keeps a decode side's own size on its file
-    /// and tells every word of the side under it. The same sequence gives
-    /// the same sizes there as the engine over worker lists tells from what
-    /// its guard lends.
+    /// A decode call may state another text than the first decision did.
+    /// The side is issued under the call's three sizes, and its dispatch,
+    /// its end and its release state them too: a stage that books a
+    /// request of text by its characters reads one length at every word of
+    /// the side, and a plugin is shown the size the call's own request
+    /// showed. Neither request here states a token count: the first is a
+    /// text of 400 characters in 800 bytes, the call's one of 900 in 1,800.
+    /// The prefill side states the first decision's lengths behind the
+    /// call as before it, and so does a decode that goes out with no call.
     #[test]
-    fn the_engine_over_a_store_tells_a_decode_calls_side_under_the_calls_size() {
-        let store = pair_fleet(1, 2).expect("a pair's fleet");
-        let (spec, _) = hearing();
-        store.apply(spec).expect("a later generation");
-        let door = StoreBackedEngine::new(store);
-        let mut first = later_request(b"pair");
-        first.facts.prompt_tokens = 40;
-        let mut again = later_request(b"pair");
-        again.facts.prompt_tokens = 47;
-        let own = [("issued", 40), ("dispatched", 40), ("completed", 40)];
-        let [prefill, decode] = sizes_by_side(&door, GATEWAY, &first, Some(&again), false);
-        assert_eq!(prefill, own);
-        assert_eq!(
-            decode,
-            [("issued", 47), ("dispatched", 47), ("completed", 47)]
-        );
-        let [_, decode] = sizes_by_side(&door, GATEWAY, &first, Some(&again), true);
-        assert_eq!(decode, [("issued", 47), ("released", 47)]);
-        let [_, decode] = sizes_by_side(&door, GATEWAY, &first, None, false);
-        assert_eq!(decode, own);
-        let mut with = pair_request(b"pair");
-        with.facts.prompt_tokens = 40;
-        let [_, decode] = sizes_by_side(&door, GATEWAY, &with, None, false);
-        assert_eq!(decode, own);
+    fn a_decode_calls_side_states_the_calls_text_lengths_at_every_word() {
+        let host = Host::of(1, 2);
+        let classes = every(1, 2);
+        let of_text = |chars, bytes| {
+            let mut asks = host.asks(&classes, true);
+            let facts = &mut asks.0.facts;
+            (facts.prompt_tokens, facts.prompt_chars, facts.prompt_bytes) = (0, chars, bytes);
+            asks
+        };
+        let (first, again) = (of_text(400, 800), of_text(900, 1_800));
+        let (door, local) = (&host.engine, GatewayId::LOCAL);
+        // What each word of a side stated: the prefill's, then the decode's.
+        let heard = |again, released| {
+            LENGTHS.with_borrow_mut(Vec::clear);
+            let _ = sizes_by_side(door, local, &first, again, released);
+            let heard = LENGTHS.with_borrow_mut(std::mem::take);
+            let of = |side| {
+                let words = heard.iter().filter(|word| word.0 == side);
+                words.map(|word| word.1).collect::<Vec<_>>()
+            };
+            [of(Side::Prefill), of(Side::Decode)]
+        };
+        let (own, called) = ([400, 800, 200], [900, 1_800, 450]);
+        let [prefill, decode] = heard(Some(&again), false);
+        assert_eq!(prefill, [own; 3], "issued, sent and ended");
+        assert_eq!(decode, [called; 3], "issued, sent and ended");
+        let [_, decode] = heard(Some(&again), true);
+        assert_eq!(decode, [called; 2], "issued and released");
+        let [_, decode] = heard(None, false);
+        assert_eq!(decode, [own; 3], "with no call");
     }
 
     /// Four prefills and four decodes under the pair document of the two
@@ -3706,6 +4209,8 @@ mod tests {
                 decode: HeldDecode {
                     session: decode_session(&asks.0.facts),
                     tokens: before.lease.tokens,
+                    chars: before.lease.chars,
+                    bytes: before.lease.bytes,
                     chosen: guard.decode_chosen(),
                 },
             };
@@ -3794,6 +4299,8 @@ mod tests {
             decode: HeldDecode {
                 session: first.decode_session,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: true,
             },
         };
@@ -3889,5 +4396,128 @@ mod tests {
             assert_eq!(partners(0, Some(&places)), places, "reachable {places:?}");
             assert_eq!(partners(1, Some(&places)), shared, "reachable {places:?}");
         }
+    }
+
+    /// One side's list engine after engine, one engine a number of
+    /// `shape`: that many ranks of one data-parallel engine in their
+    /// order, or a worker that registered no rank for a `1`. Beside it,
+    /// each worker's engine by its place in the list.
+    fn ranked(
+        name: &str,
+        worker_type: WorkerType,
+        shape: &[usize],
+    ) -> (Arc<[Arc<dyn Worker>]>, Vec<usize>) {
+        let (mut list, mut engine_of) = (Vec::new(), Vec::new());
+        for (engine, &size) in shape.iter().enumerate() {
+            for rank in 0..size {
+                let built = <BasicWorkerBuilder>::from_spec(WorkerSpec {
+                    worker_type,
+                    ..WorkerSpec::new(format!("grpc://{name}-{engine}:9000"))
+                });
+                let built = match size {
+                    1 => built,
+                    _ => built.dp_config(rank, size),
+                };
+                let worker = built.health_config(no_health_check()).build();
+                worker.set_status(WorkerStatus::Ready);
+                list.push(Arc::new(worker) as Arc<dyn Worker>);
+                engine_of.push(engine);
+            }
+        }
+        (list.into(), engine_of)
+    }
+
+    /// A pair's retry leaves every rank of the engines it tried, a side at
+    /// a time: a tried prefill takes its engine's other rank out of the
+    /// prefills and leaves the decodes as they were, a tried decode does
+    /// the same on its side, and both together move both sides. Named the
+    /// tried rank alone, each side kept its engine's other rank. That is
+    /// the gateway's classic answer for a pair: each side steps aside from
+    /// the engines the request tried
+    /// (`model_gateway/src/routers/common/placement.rs:1486-1493` and
+    /// `:1562-1569` at main `75d279287`).
+    #[test]
+    fn a_pairs_retry_leaves_every_rank_of_the_engines_it_tried() {
+        use std::collections::BTreeSet;
+
+        // On each side two ranks of one engine, then two of another.
+        let (prefills, prefill_engine) = ranked("prefill", WorkerType::Prefill, &[2, 2]);
+        let (decodes, decode_engine) = ranked("decode", WorkerType::Decode, &[2, 2]);
+        let classes = every(prefills.len(), decodes.len() as u32);
+        let tried_prefill = worker_id(prefills[1].as_ref());
+        let tried_decode = worker_id(decodes[0].as_ref());
+        let host = Host::over(hearing(), prefills, decodes);
+        // The engines a retry's targets stand on, a side each, over the
+        // turns of both lists.
+        let landed = |tried: &[WorkerId]| {
+            let (mut on_prefills, mut on_decodes) = (BTreeSet::new(), BTreeSet::new());
+            for seed in 0..32 {
+                let mut asks = host.asks(&classes, false);
+                asks.0.facts.seed = seed;
+                asks.0.facts.attempt = 1;
+                asks.0.facts.tried = tried;
+                let outcome = leased(&host, &asks, Instant::now());
+                for target in named(&outcome.decision) {
+                    let pair = target.pair.expect("a pair");
+                    on_prefills.insert(prefill_engine[target.position as usize]);
+                    on_decodes.insert(decode_engine[pair.decode_position as usize]);
+                }
+            }
+            (on_prefills, on_decodes)
+        };
+        let (both, second) = (BTreeSet::from([0, 1]), BTreeSet::from([1]));
+        assert_eq!(landed(&[]), (both.clone(), both.clone()), "nobody tried");
+        assert_eq!(
+            landed(&[tried_prefill]),
+            (second.clone(), both.clone()),
+            "the tried prefill's engine steps aside, and no decode does"
+        );
+        assert_eq!(
+            landed(&[tried_decode]),
+            (both, second.clone()),
+            "the tried decode's engine steps aside, and no prefill does"
+        );
+        assert_eq!(
+            landed(&[tried_prefill, tried_decode]),
+            (second.clone(), second),
+            "a tried pair moves on both sides"
+        );
+    }
+
+    /// The decode asked again behind a held prefill leaves every rank of
+    /// the engine its retry tried, as the pair's first decision does.
+    #[test]
+    fn the_decode_asked_again_leaves_every_rank_of_the_engine_it_tried() {
+        use std::collections::BTreeSet;
+
+        let (prefills, _) = ranked("prefill", WorkerType::Prefill, &[1]);
+        let (decodes, decode_engine) = ranked("decode", WorkerType::Decode, &[2, 2]);
+        let classes = every(prefills.len(), decodes.len() as u32);
+        let held = prefill_alone(worker_id(prefills[0].as_ref()));
+        // The first engine's second rank was tried.
+        let tried = [worker_id(decodes[1].as_ref())];
+        let host = Host::over(hearing(), prefills, decodes);
+        let landed = |tried: &[WorkerId]| {
+            let mut on_decodes = BTreeSet::new();
+            for seed in 0..32 {
+                let Asks(mut request, lists, _) = host.asks(&classes, true);
+                request.facts.seed = seed;
+                request.facts.attempt = 1;
+                request.facts.tried = tried;
+                let now = Instant::now();
+                let again = lists.decide(&host.engine, None, now, &mut request, Some(&held));
+                for target in named(&again) {
+                    let pair = target.pair.expect("a pair");
+                    on_decodes.insert(decode_engine[pair.decode_position as usize]);
+                }
+            }
+            on_decodes
+        };
+        assert_eq!(landed(&[]), BTreeSet::from([0, 1]), "nobody tried");
+        assert_eq!(
+            landed(&tried),
+            BTreeSet::from([1]),
+            "the tried decode's engine"
+        );
     }
 }

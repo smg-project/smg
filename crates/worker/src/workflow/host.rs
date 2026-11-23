@@ -70,7 +70,6 @@ pub(crate) mod testing {
             startup_timeout_secs: 1,
             startup_delay_secs: 0,
             startup_check_interval_secs: 1,
-            dp_aware: false,
             model_path: None,
             model_aliases: Default::default(),
             retry: Default::default(),
@@ -138,17 +137,6 @@ pub(crate) mod testing {
             Self::with_settings(
                 RegistrationSettings {
                     upstream_http2,
-                    ..registration_settings()
-                },
-                connector,
-            )
-        }
-
-        /// A host whose settings turn the DP read on.
-        pub(crate) fn reading_dp(connector: ScriptedConnector) -> Arc<Self> {
-            Self::with_settings(
-                RegistrationSettings {
-                    dp_aware: true,
                     ..registration_settings()
                 },
                 connector,

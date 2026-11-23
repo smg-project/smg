@@ -74,12 +74,7 @@ mod tests {
     //! The classic router keeps a doubt of a worker on the worker's own
     //! object, in its one process, and selects no worker that carries one
     //! (`crates/worker/src/identity/basic.rs:438-443`). It keeps no veto of
-    //! one gateway among several, and it has no stage that is shown its
-    //! rows. The engine over stored records writes such a veto into the
-    //! rows it hands such a stage (`store/snapshot.rs`, `mask`), with the
-    //! case
-    //! `a_profile_that_shows_its_rows_is_handed_written_rows_and_decides_under_a_veto`
-    //! (`service/controller/decision_slots.rs`).
+    //! one gateway among several, and it has no stage that is shown its rows.
 
     use std::{sync::Arc, time::Instant};
 

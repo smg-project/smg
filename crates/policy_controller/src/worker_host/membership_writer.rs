@@ -1,18 +1,25 @@
 //! The membership writer: a host's writes of worker rows into the store.
 
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "A drain's, a removal's and a refresh's rules run at the replica's own door, which the host owns."
+    )
+)]
+
 use std::{mem, slice, sync::Arc};
 
-use parking_lot::Mutex;
 use smg_worker::{
     identity::{basic::Worker, builder::rank_url},
     settings::UnhealthyRemovalScope,
 };
 
-use super::{found::paired, kv_feed::asks_events, RowRevision};
+use super::{kv_feed::asks_events, RowRevision};
 use crate::{
     engine::view::WorkerId,
     store::{
-        membership::{self, FactPastBound, NotRegistrant, WorkerFactsChange},
+        membership::{FactPastBound, NotRegistrant, WorkerFactsChange},
         pairing::PairingDescriptor,
         HealthSink, MembershipChange, MemoryStore, Registrant, WorkerFacts, WorkerPatch, WorkerRow,
         WorkerStatus, WorkersStore,
@@ -28,12 +35,6 @@ pub enum MembershipWriteOutcome {
     Unmoved(WorkerId),
     Draining(WorkerId),
     Removed(WorkerId),
-}
-
-impl MembershipWriteOutcome {
-    fn changed(&self) -> bool {
-        !matches!(self, Self::Unmoved(_))
-    }
 }
 
 /// A write the door refused. Nothing was written, with one exception: a
@@ -118,10 +119,11 @@ pub enum Precondition {
 /// The object a guarded write replaces, named by the write's verb: the
 /// object its asker read and built from.
 ///
-/// A kept object can change while its row's revision stands, so a door
-/// that hands the built worker in refuses the write as moved where another
-/// object stands for the row by then. A door that keeps no object has
-/// nothing to hold it against, and still reads the verb.
+/// An object can change while its row's revision stands: a registration
+/// that states another credential alone lays another. So a registration
+/// line that keeps credentials refuses the write as moved where another
+/// object stands for the row by then. A door holds the write against no
+/// object, and reads the verb.
 #[derive(Clone, Copy)]
 pub enum Over<'a> {
     /// A replacement by id. It is its maker's whole statement of what a
@@ -174,8 +176,7 @@ pub trait MembershipWriter: Send + Sync + 'static {
     /// worker its registration built, over what it expects to stand. A
     /// row's URL is its worker's, and its facts are the ones the worker
     /// states over the standing row ([`facts`]), by the
-    /// write's verb. A door whose rows hold a pairing descriptor states the
-    /// one the worker derived at its build in place of the standing row's.
+    /// write's verb.
     /// The engine is the one the rows' own facts state, so no caller names
     /// it another way.
     ///
@@ -195,15 +196,11 @@ pub trait MembershipWriter: Send + Sync + 'static {
     /// ([`Precondition::AtRevision`]) states the one row its asker saw and
     /// changes it where it stands, by that row's own rule.
     ///
-    /// Each door says what it does with the objects. A door whose host
-    /// keeps built objects hands them to the holder for the write's turn
-    /// ([`Objects::handing`](super::Objects::handing)). A door over a door
-    /// passes the call on. Any other door writes the facts alone, and its
-    /// host's holder builds each object from its row.
+    /// A door writes the facts alone, and its host's holder builds each
+    /// object from its row. A door over a door passes the call on.
     ///
     /// `over` names the object a guarded write replaces, by the write's
-    /// verb ([`Over`]). A door that hands the objects in holds the write
-    /// against that object. Every door reads the verb: a replacement by id
+    /// verb ([`Over`]). Every door reads the verb: a replacement by id
     /// states its thresholds whole, and any other write keeps the standing
     /// row's where a built worker states none.
     ///
@@ -262,19 +259,13 @@ pub trait MembershipWriter: Send + Sync + 'static {
     /// equal descriptor write nothing and answer
     /// [`MembershipWriteOutcome::Unmoved`].
     ///
-    /// Each door says what it does with the object, as for
-    /// [`Self::found_built`]. A door whose host keeps built objects hands
-    /// `built` to the holder in the write's turn, whether or not a label
-    /// moved: a refresh can rebuild what no row states. A door over a door
-    /// passes the call on. Any other door writes the row alone.
+    /// A door writes the row alone, as for [`Self::found_built`]. A door
+    /// over a door passes the call on.
     ///
     /// `over` is the object the refresh rebuilt from. Equal labels and an
     /// equal descriptor move no revision, so the row's guard cannot tell an
-    /// older rebuild from a newer one: a door that hands `built` in refuses
-    /// the refresh as moved where another object stands for the row by
-    /// then, or none. It asks ahead of the row's guard, so a worker that
-    /// left reads as moved there. A door that keeps no object has nothing
-    /// to hold it against.
+    /// older rebuild from a newer one, and a door that writes the row alone
+    /// has nothing to hold the refresh against.
     ///
     /// [`facts`]: super::facts
     fn refreshed(
@@ -288,6 +279,26 @@ pub trait MembershipWriter: Send + Sync + 'static {
 /// What a door owns of a write, beside the rules every door shares.
 pub(crate) trait Turn {
     fn store(&self) -> &MemoryStore;
+
+    /// The turn's write of a registration's facts: the store's own
+    /// ([`WorkersStore::upsert_by`]), unless the door's worker objects
+    /// decide a row's write. `None` where another writer moved the row
+    /// under the turn.
+    fn upsert(&self, facts: WorkerFacts, maker: Registrant) -> Option<MembershipChange> {
+        Some(self.store().upsert_by(facts, maker))
+    }
+
+    /// The turn's write of a patch, as [`Self::upsert`] writes a
+    /// registration ([`WorkersStore::patch`]).
+    fn patch(&self, id: WorkerId, patch: WorkerPatch, revision: u64) -> Option<MembershipChange> {
+        self.store().patch(id, patch, revision)
+    }
+
+    /// The turn's removal of a row, as [`Self::upsert`] writes a
+    /// registration ([`WorkersStore::remove`]).
+    fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
+        self.store().remove(id, revision)
+    }
 
     /// Check the term ahead of a write. A registration asks before each
     /// row it writes and each row it removes.
@@ -336,10 +347,9 @@ const RANKS: MembershipWriteRefused = MembershipWriteRefused::Past(FactPastBound
 });
 
 /// How a door reads the facts a built worker states over the row that
-/// stands under its URL, by the write's verb. A door whose rows hold a
-/// pairing descriptor reads the worker's own with them ([`paired`]). A door
-/// whose log carries none reads the facts alone, and the row keeps the
-/// descriptor that stands.
+/// stands under its URL, by the write's verb. The controller's door, whose
+/// log carries no pairing descriptor, reads the facts alone, and the row
+/// keeps the descriptor that stands.
 pub(crate) type Reading = fn(&dyn Worker, Option<&WorkerFacts>, Option<Over<'_>>) -> WorkerFacts;
 
 /// The rows `built` states, handed to `write`: each worker's URL, and its
@@ -610,7 +620,7 @@ pub(crate) fn lay_ready(
     for row in left {
         turn.check_term()?;
         let wrote = changed(
-            store.remove(row.id, row.revision),
+            turn.remove(row.id, row.revision),
             MembershipWriteOutcome::Removed,
         )?;
         turn.told(wrote);
@@ -636,7 +646,8 @@ fn write_row(
     }
     let store = turn.store();
     let probes = facts.health.probes;
-    let change = store.upsert_by(facts, maker.clone());
+    let change = turn.upsert(facts, maker.clone());
+    let change = change.ok_or(MembershipWriteRefused::Moved)?;
     let wrote = match change {
         MembershipChange::Registered { id } => MembershipWriteOutcome::Registered(id),
         MembershipChange::Relabelled { id } | MembershipChange::Resized { id } => {
@@ -727,14 +738,14 @@ pub(crate) fn drain(
 
 /// Remove the guarded row while the door holds its turn.
 pub(crate) fn take(
-    store: &MemoryStore,
+    turn: &impl Turn,
     by: Remover<'_>,
     url: &str,
     seen: RowRevision,
 ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
-    let row = removal_row(store, by, url, seen)?;
+    let row = removal_row(turn.store(), by, url, seen)?;
     changed(
-        store.remove(row.id, row.revision),
+        turn.remove(row.id, row.revision),
         MembershipWriteOutcome::Removed,
     )
 }
@@ -807,14 +818,17 @@ fn refresh_stated(
     // is asked ahead of it.
     turn.check_term()?;
     if pairing_moved {
-        return match store.upsert_by(stated, row.maker) {
-            MembershipChange::Relabelled { id } | MembershipChange::Resized { id } => {
+        return match turn.upsert(stated, row.maker) {
+            Some(MembershipChange::Relabelled { id } | MembershipChange::Resized { id }) => {
                 Ok(MembershipWriteOutcome::InPlace(id))
             }
-            MembershipChange::Registered { .. }
-            | MembershipChange::Replaced { .. }
-            | MembershipChange::Removed { .. }
-            | MembershipChange::StatusChanged { .. } => Err(MembershipWriteRefused::Moved),
+            Some(
+                MembershipChange::Registered { .. }
+                | MembershipChange::Replaced { .. }
+                | MembershipChange::Removed { .. }
+                | MembershipChange::StatusChanged { .. },
+            )
+            | None => Err(MembershipWriteRefused::Moved),
         };
     }
     let patch = WorkerPatch {
@@ -822,162 +836,14 @@ fn refresh_stated(
         ..WorkerPatch::default()
     };
     changed(
-        store.patch(row.id, patch, row.revision),
+        turn.patch(row.id, patch, row.revision),
         MembershipWriteOutcome::InPlace,
     )
 }
 
-/// The membership writer over a store alone, for a host with no election or
-/// log. A host shares one door for its store so its writes share a turn.
-/// Its rows hold a pairing descriptor: a write of a built worker states the
-/// one the worker derived at its build.
-pub struct StoreMembershipWriter {
-    store: Arc<MemoryStore>,
-    base: u64,
-    turn: Mutex<()>,
-    told: Option<Box<dyn Fn() + Send + Sync>>,
-}
-
-impl StoreMembershipWriter {
-    /// The one term such a host writes under.
-    pub const TERM: u64 = 0;
-
-    /// Open a door over the store, with a base for this run's lives.
-    pub fn new(store: Arc<MemoryStore>) -> Self {
-        Self {
-            store,
-            base: membership::base(),
-            turn: Mutex::new(()),
-            told: None,
-        }
-    }
-
-    /// Call `told` once after a turn that changed any rows is released.
-    #[must_use]
-    pub fn telling(mut self, told: impl Fn() + Send + Sync + 'static) -> Self {
-        self.told = Some(Box::new(told));
-        self
-    }
-
-    fn call<T>(
-        &self,
-        write: impl FnOnce() -> Result<T, MembershipWriteRefused>,
-        changed: impl FnOnce(&T) -> bool,
-    ) -> Result<T, MembershipWriteRefused> {
-        let turn = self.turn.lock();
-        let answer = write();
-        drop(turn);
-        if answer.as_ref().is_ok_and(changed) {
-            if let Some(told) = &self.told {
-                told();
-            }
-        }
-        answer
-    }
-
-    /// The registration's write over rows of stated facts, in the door's
-    /// turn.
-    fn rows(
-        &self,
-        maker: &Registrant,
-        expect: Precondition,
-        rows: &[Stated<'_>],
-    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
-        self.call(
-            || lay(self, maker, expect, rows),
-            |answer| answer.iter().any(MembershipWriteOutcome::changed),
-        )
-    }
-}
-
-impl Turn for StoreMembershipWriter {
-    fn store(&self) -> &MemoryStore {
-        &self.store
-    }
-
-    fn life(&self) -> Result<u64, MembershipWriteRefused> {
-        Ok(membership::life(Self::TERM, self.base, self.store.epoch()))
-    }
-
-    fn room(&self, _: &WorkerFacts, _: &Registrant) -> Result<(), MembershipWriteRefused> {
-        Ok(())
-    }
-}
-
-impl MembershipWriter for StoreMembershipWriter {
-    fn found(
-        &self,
-        maker: &Registrant,
-        expect: Precondition,
-        url: &str,
-        state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
-    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
-        self.call(
-            || lay_one(self, maker, expect, url, state),
-            MembershipWriteOutcome::changed,
-        )
-    }
-
-    // This door has no holder. The rows take the facts alone, by the
-    // write's verb, each with its worker's own pairing descriptor.
-    fn found_rows(
-        &self,
-        maker: &Registrant,
-        expect: Precondition,
-        built: &[Arc<dyn Worker>],
-        over: Option<Over<'_>>,
-    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
-        stating(built, over, paired, |rows| self.rows(maker, expect, rows))
-    }
-
-    fn drained(
-        &self,
-        by: Remover<'_>,
-        url: &str,
-        seen: RowRevision,
-    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
-        self.call(
-            || drain(&self.store, by, url, seen),
-            MembershipWriteOutcome::changed,
-        )
-    }
-
-    fn gone(
-        &self,
-        by: Remover<'_>,
-        url: &str,
-        seen: RowRevision,
-    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
-        self.call(
-            || take(&self.store, by, url, seen),
-            MembershipWriteOutcome::changed,
-        )
-    }
-
-    // This door has no holder. The row alone takes the refresh.
-    fn refreshed(
-        &self,
-        seen: RowRevision,
-        built: &Arc<dyn Worker>,
-        _: &Arc<dyn Worker>,
-    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
-        self.call(
-            || refresh(self, seen, built.as_ref(), paired),
-            MembershipWriteOutcome::changed,
-        )
-    }
-}
-
 #[cfg(test)]
 pub(super) mod tests {
-    use std::{
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            mpsc, Arc, Barrier, Weak,
-        },
-        thread,
-        time::Duration,
-    };
+    use std::sync::Arc;
 
     use smg_worker::{
         identity::{basic::Worker, builder::BasicWorkerBuilder},
@@ -987,8 +853,9 @@ pub(super) mod tests {
     };
 
     use super::{
-        changed, lay, lay_one, refresh_stated, MembershipWriteOutcome, MembershipWriteRefused,
-        MembershipWriter, Precondition, Remover, RowRevision, Stated, StoreMembershipWriter, Turn,
+        super::found, changed, drain, lay, lay_one, refresh, refresh_stated, stating, take,
+        MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Over, Precondition,
+        Remover, RowRevision, Stated, Turn,
     };
     use crate::{
         document::spec::{AppliedSpec, PolicySpec},
@@ -1007,9 +874,92 @@ pub(super) mod tests {
 
     const URL: &str = "http://worker:8000";
 
-    fn door() -> (Arc<MemoryStore>, StoreMembershipWriter) {
+    /// A door over a store alone, with no election, no log and no holder:
+    /// each call runs the door's rules over the store's own writes. The
+    /// cases of the rules write through it, and so does a case elsewhere
+    /// that needs a row written as a door writes one.
+    pub(crate) struct StoreDoor {
+        store: Arc<MemoryStore>,
+        base: u64,
+    }
+
+    impl StoreDoor {
+        pub(crate) fn new(store: Arc<MemoryStore>) -> Self {
+            Self {
+                store,
+                base: membership::base(),
+            }
+        }
+    }
+
+    impl Turn for StoreDoor {
+        fn store(&self) -> &MemoryStore {
+            &self.store
+        }
+
+        fn life(&self) -> Result<u64, MembershipWriteRefused> {
+            Ok(membership::life(0, self.base, self.store.epoch()))
+        }
+
+        fn room(&self, _: &WorkerFacts, _: &Registrant) -> Result<(), MembershipWriteRefused> {
+            Ok(())
+        }
+    }
+
+    impl MembershipWriter for StoreDoor {
+        fn found(
+            &self,
+            maker: &Registrant,
+            expect: Precondition,
+            url: &str,
+            state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
+            lay_one(self, maker, expect, url, state)
+        }
+
+        fn found_rows(
+            &self,
+            maker: &Registrant,
+            expect: Precondition,
+            built: &[Arc<dyn Worker>],
+            over: Option<Over<'_>>,
+        ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
+            stating(built, over, found::stated, |rows| {
+                lay(self, maker, expect, rows)
+            })
+        }
+
+        fn drained(
+            &self,
+            by: Remover<'_>,
+            url: &str,
+            seen: RowRevision,
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
+            drain(&self.store, by, url, seen)
+        }
+
+        fn gone(
+            &self,
+            by: Remover<'_>,
+            url: &str,
+            seen: RowRevision,
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
+            take(self, by, url, seen)
+        }
+
+        fn refreshed(
+            &self,
+            seen: RowRevision,
+            built: &Arc<dyn Worker>,
+            _: &Arc<dyn Worker>,
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
+            refresh(self, seen, built.as_ref(), found::stated)
+        }
+    }
+
+    fn door() -> (Arc<MemoryStore>, StoreDoor) {
         let store = Arc::new(MemoryStore::default());
-        let door = StoreMembershipWriter::new(Arc::clone(&store));
+        let door = StoreDoor::new(Arc::clone(&store));
         (store, door)
     }
 
@@ -1036,14 +986,14 @@ pub(super) mod tests {
         ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused>;
     }
 
-    impl Rows for StoreMembershipWriter {
+    impl Rows for StoreDoor {
         fn rows(
             &self,
             maker: &Registrant,
             expect: Precondition,
             rows: &[Stated<'_>],
         ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
-            StoreMembershipWriter::rows(self, maker, expect, rows)
+            lay(self, maker, expect, rows)
         }
     }
 
@@ -1463,14 +1413,8 @@ pub(super) mod tests {
 
     #[test]
     fn the_same_ranks_stated_again_write_nothing() {
-        let heard = Arc::new(AtomicUsize::new(0));
-        let count = Arc::clone(&heard);
-        let store = Arc::new(MemoryStore::default());
-        let door = StoreMembershipWriter::new(Arc::clone(&store)).telling(move || {
-            count.fetch_add(1, Ordering::Relaxed);
-        });
+        let (store, door) = door();
         check_unchanged(&store, &door).expect("the same four ranks stand");
-        assert_eq!(heard.load(Ordering::Relaxed), 1);
     }
 
     fn check_unchanged(store: &MemoryStore, door: &dyn Rows) -> Result<(), &'static str> {
@@ -2304,13 +2248,8 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn equal_facts_write_nothing_and_tell_nobody() {
-        let store = Arc::new(MemoryStore::default());
-        let count = Arc::new(AtomicUsize::new(0));
-        let heard = Arc::clone(&count);
-        let door = StoreMembershipWriter::new(Arc::clone(&store)).telling(move || {
-            heard.fetch_add(1, Ordering::Relaxed);
-        });
+    fn equal_facts_write_nothing() {
+        let (store, door) = door();
         let maker = Registrant::provider("pool", "first").expect("a maker");
         door.found_one(&maker, URL, &|_| stated())
             .expect("registered");
@@ -2322,13 +2261,12 @@ pub(super) mod tests {
         let seen = standing(&row);
         assert_eq!(store.by_key(URL), Some(row));
         assert_eq!(store.epoch(), 1);
-        assert_eq!(count.load(Ordering::Relaxed), 1);
 
         assert!(matches!(
             door.gone(Remover::Registrant(&Registrant::Control), URL, seen),
             Err(MembershipWriteRefused::NotRegistrant(_))
         ));
-        assert_eq!(count.load(Ordering::Relaxed), 1);
+        assert_eq!(store.epoch(), 1);
     }
 
     #[test]
@@ -2774,48 +2712,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_listener_is_told_once_a_write_with_the_turn_released() {
-        let store = Arc::new(MemoryStore::default());
-        let count = Arc::new(AtomicUsize::new(0));
-        let heard = Arc::clone(&count);
-        let maker = Registrant::provider("pool", "first").expect("a maker");
-        let door = Arc::new_cyclic(|door: &Weak<StoreMembershipWriter>| {
-            let door = door.clone();
-            StoreMembershipWriter::new(Arc::clone(&store)).telling(move || {
-                let door = door.upgrade().expect("the calling door");
-                assert_eq!(
-                    door.gone(
-                        Remover::Registrant(&Registrant::Control),
-                        "http://absent",
-                        ABSENT
-                    ),
-                    Err(MembershipWriteRefused::Absent)
-                );
-                heard.fetch_add(1, Ordering::Relaxed);
-            })
-        });
-        let (done, finished) = mpsc::channel();
-        let writer = thread::spawn(move || {
-            let found = door.found_one(&maker, URL, &|_| stated());
-            let seen = standing(&store.by_key(URL).expect("the registered row"));
-            let by = Remover::Registrant(&maker);
-            let drained = door.drained(by, URL, seen);
-            let gone = door.gone(by, URL, seen);
-            done.send([found, drained, gone]).expect("the answers");
-        });
-        let [found, drained, gone] = finished
-            .recv_timeout(Duration::from_secs(5))
-            .expect("a listener can call the door");
-        let Ok(MembershipWriteOutcome::Registered(id)) = found else {
-            panic!("the row was not registered: {found:?}")
-        };
-        assert_eq!(drained, Ok(MembershipWriteOutcome::Draining(id)));
-        assert_eq!(gone, Ok(MembershipWriteOutcome::Removed(id)));
-        assert_eq!(count.load(Ordering::Relaxed), 3);
-        writer.join().expect("the writer finished");
-    }
-
-    #[test]
     fn a_worker_whose_checks_are_off_is_ready_at_once() {
         let (store, door) = door();
         let maker = Registrant::provider("pool", "first").expect("a maker");
@@ -2840,49 +2736,6 @@ pub(super) mod tests {
         let fresh = store.by_key(URL).expect("the newly registered row");
         assert_eq!(wrote, Ok(MembershipWriteOutcome::Registered(fresh.id)));
         assert_eq!((fresh.status, fresh.revision), (WorkerStatus::Ready, 1));
-    }
-
-    #[test]
-    fn calls_at_once_take_their_turn() {
-        let (store, door) = door();
-        let maker = Registrant::provider("pool", "first").expect("a maker");
-        let ready = Barrier::new(4);
-        let answers = thread::scope(|scope| {
-            let callers = (0..4)
-                .map(|_| {
-                    scope.spawn(|| {
-                        ready.wait();
-                        door.found_one(&maker, URL, &|_| {
-                            assert!(
-                                door.turn.is_locked(),
-                                "the facts are stated in the door's turn"
-                            );
-                            stated()
-                        })
-                    })
-                })
-                .collect::<Vec<_>>();
-            callers
-                .into_iter()
-                .map(|caller| caller.join().expect("the call finished"))
-                .collect::<Vec<_>>()
-        });
-        let row = store.by_key(URL).expect("the registered row");
-        assert_eq!(
-            answers
-                .iter()
-                .filter(|answer| **answer == Ok(MembershipWriteOutcome::Registered(row.id)))
-                .count(),
-            1
-        );
-        assert_eq!(
-            answers
-                .iter()
-                .filter(|answer| **answer == Ok(MembershipWriteOutcome::Unmoved(row.id)))
-                .count(),
-            3
-        );
-        assert_eq!(store.epoch(), 1);
     }
 
     #[test]
@@ -2937,7 +2790,7 @@ pub(super) mod tests {
             worker::{RuntimeType, WorkerType},
         };
 
-        use super::{door, standing, stated, URL};
+        use super::{door, stated, URL};
         use crate::{
             document::spec::{AppliedSpec, Pairing, PolicySpec},
             engine::{
@@ -2947,8 +2800,8 @@ pub(super) mod tests {
             },
             store::{MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
             worker_host::{
-                facts, Members, MembershipWriteOutcome, MembershipWriter, Objects, OpenAdmission,
-                Precondition,
+                facts, pairing_descriptor, Members, MembershipWriteOutcome, MembershipWriter,
+                Objects, OpenAdmission, Precondition,
             },
         };
 
@@ -3020,17 +2873,15 @@ pub(super) mod tests {
             )
         }
 
-        /// The store's door holds a pairing descriptor in its rows, so it
-        /// states the one a built worker derived, at a registration and at
-        /// a refresh. A holder still takes the object for the row's, since
-        /// the table keeps the row's own descriptor, and the same
-        /// registration again writes nothing. A refresh that moves the
-        /// version label moves the descriptor, and under the strict rule
-        /// the next decision over the holder's lists reads it: the classes
-        /// pair no prefill with the decode, the pair's request is shed, and
-        /// it is placed once the prefill follows.
+        /// A registration that states the pairing descriptor its worker
+        /// derived lays it in the row, and the same registration again
+        /// writes nothing. One that moves the version label moves the
+        /// descriptor in place, and under the strict rule the next decision
+        /// over the holder's lists reads it: the classes pair no prefill
+        /// with the decode, the pair's request is shed, and it is placed
+        /// once the prefill follows.
         #[test]
-        fn the_stores_door_states_the_pairing_its_worker_derived() {
+        fn a_pairing_a_registration_moves_is_read_by_the_next_decision() {
             const DECODE: &str = "http://decode:8000";
             let (store, door) = door();
             let mut strict =
@@ -3041,10 +2892,19 @@ pub(super) mod tests {
             let engine = PolicyEngine::new(applied);
             let prefill = partner(URL, WorkerType::Prefill, "1");
             let decode = partner(DECODE, WorkerType::Decode, "1");
+            // A registration of a built worker, which states the worker's
+            // facts over the standing row's and the descriptor it derived.
+            let state = |built: &Arc<dyn Worker>, expect: Precondition| {
+                door.found(&Registrant::Control, expect, built.url(), &|standing| {
+                    WorkerFacts {
+                        pairing: pairing_descriptor(built.as_ref()),
+                        ..facts(built.as_ref(), standing)
+                    }
+                })
+            };
             // Each row is laid, and a check's word makes it ready.
             let ready = |built: &Arc<dyn Worker>| {
-                let wrote =
-                    door.found_built(&Registrant::Control, Precondition::Absent, built, None);
+                let wrote = state(built, Precondition::Absent);
                 assert!(wrote.is_ok(), "{wrote:?}");
                 let laid = store.by_key(built.url()).expect("the registered row");
                 let _ = store.set_status(laid.id, WorkerStatus::Ready, laid.revision);
@@ -3056,7 +2916,7 @@ pub(super) mod tests {
             assert_eq!(said.transport.as_deref(), Some("nixl"));
             assert_eq!(said.version.as_deref(), Some("1"));
             assert_eq!(facts(decode.as_ref(), Some(&row.facts)), row.facts);
-            let again = door.found_built(&Registrant::Control, Precondition::Any, &decode, None);
+            let again = state(&decode, Precondition::Any);
             assert_eq!(again, Ok(MembershipWriteOutcome::Unmoved(row.id)));
             let holder = holder();
             // A pair's request, decided over the two lists the holder lends
@@ -3099,9 +2959,11 @@ pub(super) mod tests {
             // The decode comes back on another version: the classes pair
             // no prefill with it.
             let rebuilt = partner(DECODE, WorkerType::Decode, "2");
-            let wrote = door.refreshed(standing(&row), &rebuilt, &decode);
+            let wrote = state(&rebuilt, Precondition::Any);
             assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(row.id)));
-            let moved = store.by_key(DECODE).expect("the refreshed row");
+            let moved = store
+                .by_key(DECODE)
+                .expect("the row of the moved descriptor");
             let version = moved
                 .facts
                 .pairing
@@ -3115,7 +2977,7 @@ pub(super) mod tests {
 
             // The prefill follows, and the same request is placed again.
             let followed = partner(URL, WorkerType::Prefill, "2");
-            let wrote = door.refreshed(standing(&first), &followed, &prefill);
+            let wrote = state(&followed, Precondition::Any);
             assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(first.id)));
             assert_eq!(placed(), (true, the_pair));
         }

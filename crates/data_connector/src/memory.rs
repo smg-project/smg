@@ -1013,6 +1013,21 @@ impl ResponseStorage for MemoryResponseStorage {
         Ok(chain)
     }
 
+    async fn get_response_chain_for(
+        &self,
+        response_id: &ResponseId,
+        tenant: Option<&str>,
+    ) -> ResponseResult<ResponseChain> {
+        // One pass under one lock, as for the whole chain (one snapshot, one
+        // depth limit); the cut is made on what that pass holds.
+        let mut chain = self.get_response_chain(response_id, None).await?;
+        if chain.responses.last().is_some_and(|head| is_unstored(head)) {
+            chain.responses.clear();
+        }
+        chain.responses = visible_chain(chain.responses, tenant);
+        Ok(chain)
+    }
+
     async fn find_response_by_output_item(
         &self,
         item_id: &str,

@@ -108,10 +108,12 @@ fn check_batch(
             }
             Ok(())
         }
-        // One ID replaces one worker. `PUT` is refused up front when the
-        // router runs data-parallel, which is the only expansion that turns
-        // one spec into several workers; the check keeps a future caller from
-        // writing a partial batch.
+        // One ID replaces one worker. `PUT` is refused up front for a rank
+        // worker. A plain worker whose engine reports several ranks by now
+        // is the one other spec that turns into several workers: the
+        // creation step refuses its `PUT` first, since the ranks would
+        // stand beside the plain worker, and this check stands behind it,
+        // before any of them is written.
         WorkerRegistrationMode::ReplaceById { worker_id, .. } if workers.len() != 1 => {
             Err(step_failed(format!(
                 "Replacing worker {worker_id} needs exactly one worker, got {}",

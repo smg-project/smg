@@ -721,6 +721,9 @@ async fn an_eviction_keeps_the_tools_of_a_server_that_is_still_pooled() {
         listed,
         "the tools of a server that a pooled connection still serves"
     );
+    // Three pooled connections were opened and one left: the pool counts
+    // them, the count of configured servers' connections does not.
+    assert_eq!(manager.metrics().snapshot().active_connections, 0);
     manager.shutdown().await;
 }
 

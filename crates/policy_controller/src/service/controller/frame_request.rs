@@ -9,15 +9,18 @@
 //! **No seed and no block hash is made here.** A frame's routing key, its
 //! seed and the block hashes of its prompt were made once, by the gateway
 //! that asks, and the frame carries them. They are read by the one reader
-//! of a frame ([`Checked::facts`], [`Checked::constraints`]), as they are
-//! read for the engine over stored records. That reader fingerprints a
-//! tenant or a session key the frame carries in the clear, at each read.
+//! of a frame ([`Checked::facts`], [`Checked::constraints`]). That reader
+//! fingerprints a tenant or a session key the frame carries in the clear,
+//! at each read.
 //!
 //! **What a controller adds.** The block hashes are cut at the depth the
 //! deciding document reads of them. The budget is what is left of the
 //! frame's at the decision. The places of its list the asking gateway may
 //! take, and the positions its standing vetoes hold back, are stated by
-//! position ([`FrameRequest::held_to`]).
+//! position ([`FrameRequest::held_to`]). A keyed frame's request says that
+//! its key's requests are counted on each worker, and the maker says under
+//! what name ([`RequestMaker::session_counted_under`]): the session's
+//! number, by the decisions the controller holds on file.
 //!
 //! **What the maker does not state.**
 //!
@@ -30,8 +33,7 @@
 //!   decision over no candidates, and the maker keeps it. Its answer is
 //!   the caller's to give before it asks the engine
 //!   (`GatewayPlaces::taken`), and the engine refuses a frame whose caller
-//!   gave none: it declines a single request, and it sheds a pair as the
-//!   engine over stored records sheds it.
+//!   gave none: it declines a single request, and it sheds a pair.
 //! - A plain request ([`RequestMaker::plain`]). Every decision of a
 //!   controller is a whole one, with the alternates its pass finds. A
 //!   gateway's dispatch names a target of the answer by its index, and a
@@ -45,14 +47,16 @@
 //! the store's ids: a frame names the workers it tried and the ones it
 //! excludes by them.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
+
+use smg_worker::load::state::LoadSnapshot;
 
 use super::wire::{Checked, FrameLists};
 use crate::{
     document::spec::AppliedSpec,
     engine::{
         decision_engine::{Request, RequestMaker, WorkerLists},
-        view::{Constraints, WireModes},
+        view::{Constraints, RequestFacts, SessionCountedUnder, WireModes},
     },
 };
 
@@ -67,6 +71,9 @@ pub(crate) struct FrameRequest<'a> {
     /// What is left of the frame's budget at the decision, in microseconds.
     budget_micros: u32,
     workers: WorkerLists<'a>,
+    /// The load snapshot the request's decision reads; `None` for the one
+    /// its engine keeps.
+    loads: Option<&'a Arc<LoadSnapshot>>,
     /// The places of its list the request may take; `None` for every place.
     places: Option<&'a [u32]>,
     /// The positions a standing veto of the asking gateway holds back.
@@ -84,7 +91,8 @@ impl<'a> FrameRequest<'a> {
     /// frame's lists bears that frame's headers and exclusions.
     ///
     /// The request may take every place of its list, and no position is
-    /// held back ([`Self::held_to`]).
+    /// held back ([`Self::held_to`]). Its decision reads the load snapshot
+    /// its engine keeps ([`Self::reading`]).
     ///
     /// `left` is a microsecond or more. A frame with less left is answered
     /// where its decider takes it, and no request is made of it: a request
@@ -102,6 +110,7 @@ impl<'a> FrameRequest<'a> {
             // than the field holds reads as its widest.
             budget_micros: u32::try_from(left.as_micros()).unwrap_or(u32::MAX),
             workers,
+            loads: None,
             places: None,
             stalled: &[],
             held: &[],
@@ -129,11 +138,20 @@ impl<'a> FrameRequest<'a> {
             ..self
         }
     }
+
+    /// The request with the load snapshot its decision reads: the newest
+    /// its deciding thread holds of the replica's load monitor
+    /// ([`FrameLoads::newest`](super::frame_loads::FrameLoads::newest)).
+    #[must_use]
+    pub(crate) fn reading(self, loads: &'a Arc<LoadSnapshot>) -> Self {
+        Self {
+            loads: Some(loads),
+            ..self
+        }
+    }
 }
 
 // `plain` keeps the trait's answer: a controller's request is never plain.
-// `loads` keeps it too: the engine reads the newest snapshot its own task
-// keeps.
 impl RequestMaker for FrameRequest<'_> {
     fn model(&self) -> &str {
         self.frame.model()
@@ -141,9 +159,15 @@ impl RequestMaker for FrameRequest<'_> {
 
     fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
         let frame = self.frame;
+        let facts = frame.facts(self.lists, frame.hashes_read(spec), self.budget_micros);
         Request {
             id: frame.id(),
-            facts: frame.facts(self.lists, frame.hashes_read(spec), self.budget_micros),
+            facts: RequestFacts {
+                // The decisions a controller holds on file count a key's
+                // requests on each worker: a keyed frame's count stands.
+                session_counted: !facts.session_key.is_none(),
+                ..facts
+            },
             constraints: Constraints {
                 // The gateway's wires are the caller's to state, as places.
                 wire_modes: WireModes::NONE,
@@ -161,6 +185,17 @@ impl RequestMaker for FrameRequest<'_> {
 
     fn workers(&self) -> WorkerLists<'_> {
         self.workers
+    }
+
+    fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
+        self.loads
+    }
+
+    // A controller serves no request, so no guard of its own counts one
+    // under its key's text. The decisions it holds on file count a key's
+    // requests on each worker, under the session's number.
+    fn session_counted_under(&self) -> SessionCountedUnder {
+        SessionCountedUnder::SessionNumber
     }
 }
 

@@ -2,8 +2,9 @@
 //! breaker's unit: a plugin fails a decision once, however many of its opens
 //! fail in it (each side of a pair, each binding), and its last close of the
 //! decision takes the decision's one latency sample: what the decision
-//! charged the plugin, over the decision's budget. The ring and its marks
-//! are the in-process form's; no thread is ever armed here, since a remote
+//! charged the plugin, over the frames the plugin was given in it, at most
+//! the decision's budget ([`Latency::frame`]). The ring and its marks are
+//! the in-process form's; no thread is ever armed here, since a remote
 //! plugin's time is not the deciding thread's CPU. An opening writes the
 //! one line every plugin kind writes.
 
@@ -29,9 +30,10 @@ pub(crate) struct Unit {
     breaker: Breaker,
     /// Per thread: the latency ring, one sample per decision.
     latency: ThreadLocal<RefCell<Latency>>,
-    /// Per thread: the plugin's part in the decision open there, and what
-    /// that decision charged the plugin ([`Unit::charge`]): its sample.
-    part: ThreadLocal<Cell<(Part, u64)>>,
+    /// Per thread: the plugin's part in the decision open there, what that
+    /// decision charged the plugin and the frames of those charges
+    /// ([`Unit::charge`]): its sample, and what the sample is taken over.
+    part: ThreadLocal<Cell<(Part, u64, u64)>>,
     /// When a stream's failure last counted: a plugin's streams are one
     /// lane to the breaker.
     outage: Mutex<Option<Instant>>,
@@ -54,10 +56,14 @@ impl Unit {
     /// with no frame and no second count.
     pub(crate) fn enter(&self, decision: u64) -> bool {
         let cell = self.part.get_or_default();
-        let (mut part, charged) = cell.get();
-        let charged = if part.is_of(decision) { charged } else { 0 };
+        let (mut part, charged, frames) = cell.get();
+        let (charged, frames) = if part.is_of(decision) {
+            (charged, frames)
+        } else {
+            (0, 0)
+        };
         let failed = part.open(decision);
-        cell.set((part, charged));
+        cell.set((part, charged, frames));
         failed
     }
 
@@ -66,9 +72,9 @@ impl Unit {
     /// ([`Self::failed_in`]). Outside a decision nothing is marked.
     pub(crate) fn fail(&self, now_micros: u64) {
         let cell = self.part.get_or_default();
-        let (mut part, charged) = cell.get();
+        let (mut part, charged, frames) = cell.get();
         part.fail();
-        cell.set((part, charged));
+        cell.set((part, charged, frames));
         self.report(now_micros);
     }
 
@@ -102,24 +108,30 @@ impl Unit {
     /// Whether the plugin already failed decision `decision` on this thread;
     /// true until the thread's next decision opens it.
     pub(crate) fn failed_in(&self, decision: u64) -> bool {
-        let (part, _) = self.part.get_or_default().get();
+        let (part, _, _) = self.part.get_or_default().get();
         part.failed_in(decision)
     }
 
-    /// `micros` that decision `decision` charged the plugin on this thread:
-    /// part of the decision's sample, judged by the latency rule alone.
-    pub(crate) fn charge(&self, decision: u64, micros: u64) {
+    /// `micros` that decision `decision` charged the plugin on this thread
+    /// for a round trip whose frame is `frame_micros`: part of the decision's
+    /// sample and of what the sample is taken over, judged by the latency
+    /// rule alone.
+    pub(crate) fn charge(&self, decision: u64, micros: u64, frame_micros: u64) {
         let cell = self.part.get_or_default();
-        let (part, charged) = cell.get();
+        let (part, charged, frames) = cell.get();
         if part.is_of(decision) {
-            cell.set((part, charged.saturating_add(micros)));
+            cell.set((
+                part,
+                charged.saturating_add(micros),
+                frames.saturating_add(frame_micros),
+            ));
         }
     }
 
     /// What decision `decision` charged the plugin on this thread so far:
     /// the plugin's own spend in the decision.
     pub(crate) fn charged(&self, decision: u64) -> u64 {
-        let (part, charged) = self.part.get_or_default().get();
+        let (part, charged, _) = self.part.get_or_default().get();
         if part.is_of(decision) {
             charged
         } else {
@@ -129,24 +141,25 @@ impl Unit {
 
     /// One of the plugin's closes of decision `decision` on this thread. The
     /// last one takes the decision's latency sample: the charges
-    /// ([`Self::charge`]) over the decision's budget `seed_micros`. A
+    /// ([`Self::charge`]) over the decision's budget `seed_micros`, or over
+    /// their frames where those are the lesser ([`Latency::frame`]). A
     /// decision that charged the plugin nothing records nothing; a window
     /// that reads slow opens the breaker at `now()`.
     pub(crate) fn leave(&self, decision: u64, seed_micros: u64, now: impl FnOnce() -> u64) {
         let cell = self.part.get_or_default();
-        let (mut part, charged) = cell.get();
+        let (mut part, charged, frames) = cell.get();
         let last = part.close(decision);
-        cell.set((part, charged));
+        cell.set((part, charged, frames));
         if !last || charged == 0 {
             return;
         }
         let sample = u32::try_from(charged).unwrap_or(u32::MAX);
-        let seed = u32::try_from(seed_micros).unwrap_or(u32::MAX);
+        let frame = Latency::frame(seed_micros, frames);
         let slow = self
             .latency
             .get_or(|| RefCell::new(Latency::new()))
             .borrow_mut()
-            .record(sample, seed);
+            .record(sample, frame);
         if slow && self.breaker.slow(now()) {
             self.opened("latency");
         }
@@ -198,13 +211,47 @@ mod tests {
         for decision in 1..=Latency::EVERY as u64 {
             assert!(!unit.enter(decision));
             assert!(!unit.enter(decision), "the other side of the pair");
-            unit.charge(decision, 300);
-            unit.charge(decision, 300);
+            unit.charge(decision, 300, BUDGET);
+            unit.charge(decision, 300, BUDGET);
             unit.leave(decision, BUDGET, || 5);
             assert_eq!(unit.opens(), 0, "one open is still to close");
             unit.leave(decision, BUDGET, || 5);
         }
         assert_eq!(unit.opens(), 1, "the window's first read");
+    }
+
+    /// Under a budget wider than the frames of a decision's round trips, the
+    /// sample is taken over those frames: a request in process may state no
+    /// budget, and its decision is then seeded with the widest. A plugin that
+    /// used six tenths of its one frame reads slow there, where its charge
+    /// over that budget read as nothing.
+    #[test]
+    fn a_charge_is_read_against_its_frame_under_a_wider_budget() {
+        let unit = unit();
+        let widest = u64::from(u32::MAX);
+        for decision in 1..=Latency::EVERY as u64 {
+            assert!(!unit.enter(decision));
+            unit.charge(decision, 600, BUDGET);
+            unit.leave(decision, widest, || 5);
+        }
+        assert_eq!(unit.opens(), 1, "the window's first read");
+    }
+
+    /// The frames of a decision add up: three round trips that each used
+    /// four tenths of their frame are four tenths of the decision's frames,
+    /// not twelve tenths of one.
+    #[test]
+    fn three_calls_under_half_their_frames_are_no_slow_sample() {
+        let unit = unit();
+        let widest = u64::from(u32::MAX);
+        for decision in 1..=Latency::EVERY as u64 {
+            assert!(!unit.enter(decision));
+            for _ in 0..3 {
+                unit.charge(decision, 400, BUDGET);
+            }
+            unit.leave(decision, widest, || 5);
+        }
+        assert_eq!(unit.opens(), 0);
     }
 
     /// A decision's charges start over with the decision: one slow decision
@@ -214,7 +261,7 @@ mod tests {
         let unit = unit();
         for decision in 1..=Latency::EVERY as u64 {
             assert!(!unit.enter(decision));
-            unit.charge(decision, if decision == 1 { 900 } else { 100 });
+            unit.charge(decision, if decision == 1 { 900 } else { 100 }, BUDGET);
             unit.leave(decision, BUDGET, || 5);
         }
         assert_eq!(unit.opens(), 0);
@@ -227,7 +274,7 @@ mod tests {
         let unit = unit();
         for decision in 1..=Latency::EVERY as u64 {
             assert!(!unit.enter(decision));
-            unit.charge(decision + 1_000, 900);
+            unit.charge(decision + 1_000, 900, BUDGET);
             unit.leave(decision, BUDGET, || 5);
         }
         assert_eq!(unit.opens(), 0);
@@ -245,7 +292,7 @@ mod tests {
         }
         for decision in idle + 1..=idle + Latency::EVERY as u64 {
             assert!(!unit.enter(decision));
-            unit.charge(decision, 600);
+            unit.charge(decision, 600, BUDGET);
             unit.leave(decision, BUDGET, || 5);
         }
         assert_eq!(unit.opens(), 1, "the 64 charged decisions are the window");
@@ -259,8 +306,8 @@ mod tests {
         let unit = unit();
         assert!(!unit.enter(1));
         assert_eq!(unit.charged(1), 0);
-        unit.charge(1, 300);
-        unit.charge(1, 200);
+        unit.charge(1, 300, BUDGET);
+        unit.charge(1, 200, BUDGET);
         assert_eq!((unit.charged(1), unit.charged(2)), (500, 0));
         unit.leave(1, BUDGET, || 5);
         assert!(!unit.enter(2));

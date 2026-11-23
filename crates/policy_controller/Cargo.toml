@@ -345,9 +345,10 @@ required-features = ["in-process"]
 
 # Replays recorded rows through the load report conversion under `ingest`,
 # and the hard-demand rows over worker objects under `in-process`.
+# The overload rows run a host's load monitor, which `worker-host` brings.
 [[test]]
 name = "classic_rows"
-required-features = ["ingest", "in-process"]
+required-features = ["ingest", "in-process", "worker-host"]
 
 [[test]]
 name = "controller"

@@ -165,13 +165,9 @@ impl RowRemainder {
     /// status, the address it dials as the engine of a row that names one,
     /// and every other fact as it was stated.
     ///
-    /// It is the row the object was laid from, where the holder built the
-    /// object from the row or a registration handed it in with the row, and
-    /// nothing was set on the object since: models set on the object read
-    /// back as set, under the revision this was taken at. A kept object
-    /// whose row moved with no hand-in states the six as it was handed in,
-    /// and as the engine the address it dials, where the moved row names
-    /// one.
+    /// It is the row the object was laid from, where nothing was set on
+    /// the object since: models set on the object read back as set, under
+    /// the revision this was taken at.
     pub(super) fn row(&self, worker: &dyn Worker) -> WorkerRow {
         let Self {
             standing,
@@ -244,11 +240,7 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
     use smg_worker::{
-        health::overload::OverloadThresholds,
-        identity::{basic::Worker, builder::BasicWorkerBuilder},
-        model_card::ModelCard,
-        registry::WorkerRegistry,
-        worker::HealthCheckConfig,
+        health::overload::OverloadThresholds, registry::WorkerRegistry, worker::HealthCheckConfig,
     };
 
     use super::RowRemainder;
@@ -260,12 +252,10 @@ mod tests {
         store::{
             encoding::{EncodeHandoff, EncodeOffer},
             pairing::PairingDescriptor,
-            GatewayId, HealthPolicy, JournalKinds, MemoryStore, Overload, Reachability, Registrant,
-            Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore as _,
+            GatewayId, HealthPolicy, MemoryStore, Overload, Reachability, Registrant, Signals,
+            WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore as _,
         },
-        worker_host::{
-            Members, MembershipWriter as _, Objects, Precondition, StoreMembershipWriter,
-        },
+        worker_host::{Members, Objects},
     };
 
     fn holder() -> Objects<Members> {
@@ -591,7 +581,7 @@ mod tests {
         let other = MemoryStore::new();
         let second = Registrant::provider("found", "two").expect("a maker");
         assert_eq!(other.upsert_by(at(URL), second.clone()).id(), id);
-        assert!(store.restore_from(other.checkpoint(JournalKinds::Watched)));
+        assert!(store.restore_from(other.checkpoint()));
         assert_eq!(read_back(&store, &objects, "another history"), 1);
 
         let after = objects.remainder(&object).expect("the remainder");
@@ -786,76 +776,5 @@ mod tests {
         assert_ne!(store.upsert(next).id(), id);
         assert_eq!(read_back(&store, &objects, "incarnation"), 2);
         assert_eq!(objects.object(id), None);
-    }
-
-    /// A holder that keeps the objects its registrations hand in, its
-    /// store, and the object of one registration at `url`, handed in
-    /// through its write.
-    fn handed(url: &str) -> (Arc<MemoryStore>, Objects<Members>, Arc<dyn Worker>) {
-        let store = Arc::new(MemoryStore::new());
-        let objects = holder().with_built_kept();
-        let door = StoreMembershipWriter::new(Arc::clone(&store));
-        let worker = <BasicWorkerBuilder>::new(url).model(ModelCard::new("m"));
-        let built: Arc<dyn Worker> = Arc::new(worker.build());
-        let wrote = objects.handing_one(store.as_ref(), &built, None, || {
-            door.found_built(&Registrant::Control, Precondition::Any, &built, None)
-        });
-        wrote.expect("the registration's write");
-        (store, objects, built)
-    }
-
-    /// A kept object whose row moves fact by fact, with no hand-in: the
-    /// object stays, and the row read back states the six facts the object
-    /// holds whole as it was handed in, as the engine the address the
-    /// object dials where the moved row names one, and every other fact as
-    /// it moved. The remainder is the moved row's.
-    #[test]
-    fn a_kept_objects_row_reads_back_its_own_facts_and_the_rest_as_moved() {
-        const URL: &str = "http://kept:8000";
-        let unnamed: fn(&mut WorkerFacts) = |facts: &mut WorkerFacts| facts.engine.clear();
-        let (store, objects, built) = handed(URL);
-        let first = store.by_key(URL).expect("the row");
-        let object = objects.object(first.id).expect("the row's object");
-        let read = objects.row_of(&object).expect("the row read back");
-        same(&read, &first, "handed in");
-        let handed = first.facts;
-        assert_eq!(handed.engine, URL, "the object dials its own address");
-
-        for (fact, change) in moves().into_iter().chain([("engine, unnamed", unnamed)]) {
-            let before = store.by_key(URL).expect("the row").facts;
-            let mut facts = before.clone();
-            change(&mut facts);
-            store.upsert(facts);
-            objects.follow(store.as_ref());
-            let stands = store.by_key(URL).expect("the row");
-            assert_ne!(stands.facts, before, "{fact}: the fact moved");
-            assert_eq!(objects.object(stands.id).as_ref(), Some(&object), "{fact}");
-            let kept = objects.registry().get(&object).expect("the object");
-            assert!(Arc::ptr_eq(&kept, &built), "{fact}: the object is kept");
-
-            let engine = if stands.facts.engine.is_empty() {
-                String::new()
-            } else {
-                URL.to_owned()
-            };
-            let own = WorkerFacts {
-                engine,
-                role: handed.role,
-                models: handed.models.clone(),
-                labels: handed.labels.clone(),
-                kv_block_size: handed.kv_block_size,
-                bootstrap_port: handed.bootstrap_port,
-                ..stands.facts.clone()
-            };
-            let expected = WorkerRow {
-                facts: own,
-                ..stands.clone()
-            };
-            let read = objects.row_of(&object).expect("the row read back");
-            same(&read, &expected, fact);
-            let beside = objects.remainder(&object).expect("the remainder");
-            assert_eq!(*beside, RowRemainder::of(&stands), "{fact}");
-        }
-        assert!(objects.unhanded() > 0, "each lay was counted");
     }
 }

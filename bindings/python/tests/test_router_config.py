@@ -265,6 +265,7 @@ class TestRouterConfigValidation:
         assert args.worker_ports_annotation == "smg.ai/worker-ports"
         assert args.kv_connector_annotation == "smg.ai/kv-connector"
         assert args.kv_engine_id_annotation == "smg.ai/kv-engine-id"
+        assert args.pairing_protocol_label == "smg.ai/pairing-protocol"
 
     def test_prometheus_config_validation(self):
         """Test Prometheus configuration validation."""
@@ -757,6 +758,22 @@ class TestPolicyDocument:
         )
         with pytest.raises(ValueError, match=f"these are set beside it: {name}$"):
             router.start()
+
+    def test_the_overload_thresholds_stand_beside_a_document(self, policy_document):
+        # No document names an overload threshold: the gateway builds its
+        # worker objects with the two, so both stand beside a document.
+        flags = ["--worker-overload-waiting-requests", "32", "--worker-overload-token-usage", "0.9"]
+        path = policy_document("round_robin")
+        args = parse_router_args(["--policy-controller", "on", "--policy-spec", str(path), *flags])
+        assert args.options_a_document_replaces() == []
+        assert args.worker_overload_waiting_requests == 32
+        assert args.worker_overload_token_usage == pytest.approx(0.9)
+        Router.from_args(args)
+        # The native start refuses by its own copy of the list. With the two
+        # beside it the start reads the document: it ends in the document's
+        # own refusal.
+        refused = policy_document("round_robin", kind="PolicySpec")
+        self.assert_start_refusal(refused, '"PolicySpec"', *flags)
 
     def test_the_routing_options_at_their_defaults_stand_beside_a_document(self, policy_document):
         # The chart's line carries these six at their defaults on every render.

@@ -325,6 +325,11 @@ fn build_worker_spec(
     spec.kv_connector.clone_from(&worker.kv_connector);
     spec.kv_role.clone_from(&worker.kv_role);
     spec.kv_engine_id.clone_from(&worker.kv_engine_id);
+    // On the spec it is the explicit protocol, which the pairing prefers to
+    // the one an engine reports about itself (a worker label): what the
+    // source states for its rollout outranks what the engine was started
+    // with.
+    spec.pairing_protocol.clone_from(&worker.pairing_protocol);
     host.stamp(&mut spec);
     spec
 }

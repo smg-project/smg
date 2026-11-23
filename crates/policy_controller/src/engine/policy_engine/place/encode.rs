@@ -4,7 +4,7 @@
 //! to, the call decides again as a pair's does ([`place`]).
 //!
 //! The engine's entry for an encode request decides the pair and each
-//! item's encoder in one call ([`PolicyEngine::decide_encode_at`]). The
+//! item's encoder in one call ([`Loaded::decide_encode_at`]). The
 //! targets of its pick share one prefill, and an item's encoder hands to
 //! that prefill. So the pair's targets are walked as a pair's are
 //! ([`sides`]), and the encoders stand beside whichever is taken.
@@ -34,7 +34,7 @@ use super::{
 use crate::{
     engine::{
         framework::{EncodeItems, EncodePlaced},
-        policy_engine::PolicyEngine,
+        policy_engine::Loaded,
         prefills_full, EncodeLists,
     },
     tracking::{Encoders, Placement},
@@ -67,7 +67,7 @@ thread_local! {
 /// the caller's admission limit answer [`Unplaced::PrefillsFull`], as a
 /// pair's do.
 pub(super) fn ask<'a>(
-    engine: &'static PolicyEngine,
+    engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
     lists: &EncodeLists<'_>,
     items: EncodeItems<'_>,
@@ -90,14 +90,14 @@ pub(super) fn ask<'a>(
 
 /// [`ask`], with `placed` to take each item's encoder.
 fn asked<'a>(
-    engine: &'static PolicyEngine,
+    engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
     lists: &EncodeLists<'_>,
     items: EncodeItems<'_>,
     call: &mut Call,
     placed: &mut EncodePlaced,
 ) -> Result<Option<Placement<'a>>, Unplaced> {
-    let made = Made::asked(engine, request, call);
+    let made = Made::asked(engine.object, request, call);
     let dated = Cell::new(None);
     let clock = || {
         let now = Instant::now();
@@ -167,7 +167,7 @@ fn asked<'a>(
 /// What an ask answers, and [`Unplaced::NoWorkers`] where the call's last
 /// ask takes no placement.
 pub(super) fn place<'a>(
-    engine: &'static PolicyEngine,
+    engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
     lists: &EncodeLists<'_>,
     items: EncodeItems<'_>,
@@ -188,7 +188,7 @@ pub(super) fn place<'a>(
 /// What the call for its items or for its pair answers.
 #[inline(never)]
 pub(super) fn three<'a>(
-    engine: &'static PolicyEngine,
+    engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
     lists: &EncodeLists<'_>,
 ) -> Result<Placement<'a>, Unplaced> {

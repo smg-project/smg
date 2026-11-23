@@ -18,9 +18,9 @@
 //! dropped. A snapshot's pages carry no page number, so a page of a stream let
 //! go would read as a first page.
 //!
-//! **No journal.** A watch tells no load row, so the places it is told
-//! skip, and no log continues over a gap. The store a watcher writes holds
-//! no journal: the place is the watcher's own.
+//! **No journal.** A watch tells no start of a term and no generation, so
+//! the places it is told skip, and no log continues over a gap. The store a
+//! watcher writes holds no journal: the place is the watcher's own.
 //!
 //! **Every model.** A followed write takes the next epoch alone. A watch
 //! that names models is told some changes only, so the watcher's request
@@ -335,7 +335,6 @@ impl Watcher {
             at,
             epoch,
             rows: staged.rows,
-            loads: Vec::new(),
         };
         if !self.store.watch_from(cut) {
             return Err(WatchPositionLost::Apart);
@@ -363,9 +362,8 @@ mod tests {
             replication::Log,
         },
         store::{
-            GatewayId, JournalKinds, LeaseRecord, LeaseState, LeasesStore, MembershipChange,
-            MemoryStore, PickRecord, Position, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
-            WorkersStore,
+            GatewayId, LeaseRecord, LeaseState, LeasesStore, MembershipChange, MemoryStore,
+            PickRecord, Position, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
         },
         tracking::lease::{Lease, LeaseId},
     };
@@ -409,8 +407,8 @@ mod tests {
             change: MembershipChange,
             before: Option<&WorkerRow>,
         ) -> proto::WorkerEvent {
-            // Load rows take places between two events of a watch: the
-            // places a watcher is told skip.
+            // Writes a watch is not told take places between two of its
+            // events: the places a watcher is told skip.
             self.seq += 3;
             let event = match change {
                 MembershipChange::Registered { id } => worker_wire::registered(&self.row(id)),
@@ -432,7 +430,7 @@ mod tests {
 
         /// The snapshot of the store as it stands, `rows` a page.
         fn pages(&self, rows: usize) -> Vec<proto::WorkerEvent> {
-            let cut = self.store.checkpoint(JournalKinds::Watched);
+            let cut = self.store.checkpoint();
             let mut chunks: Vec<&[WorkerRow]> = cut.rows.chunks(rows).collect();
             if chunks.is_empty() {
                 chunks.push(&[]);
@@ -778,7 +776,7 @@ mod tests {
     fn a_snapshot_a_stores_journal_refuses_loses_the_place() {
         let told = Told::new();
         WorkersStore::upsert(&told.store, facts("grpc://10.0.0.1:8000", 1));
-        let store = Arc::new(MemoryStore::journaled(Arc::new(Log::new(8, 8))));
+        let store = Arc::new(MemoryStore::journaled(Arc::new(Log::new(8))));
         let mut watcher = Watcher::new(Arc::clone(&store));
         // A place under no term, which a log takes from nobody.
         let mut page = told.pages(8).remove(0);

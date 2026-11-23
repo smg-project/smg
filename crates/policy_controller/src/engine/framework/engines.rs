@@ -146,7 +146,8 @@ pub(super) fn run_owned(
     }
     let at = usize::from(index);
     let (profile, rows) = (&engine.profiles[at], engine.row_tests[at]);
-    let stage = &profile.scorers.first()?.scorer;
+    let weighted = profile.scorers.first()?;
+    let stage = &weighted.scorer;
     buf.reserve(candidates.len());
     buf.kept.clear();
     let kept = &mut buf.kept;
@@ -168,15 +169,18 @@ pub(super) fn run_owned(
         return None;
     }
     // The scorer's order is the targets': each row a step under the one
-    // before it, as the scores of a ring's walk stand.
+    // before it, as the scores of a ring's walk stand, by the stage's
+    // share of the profile's weights. The whole pass folds that share
+    // into a score, and a weight's share of itself need not be one.
     let mut targets = Targets::new();
     kept.truncate(MAX_TARGETS);
     for &row in kept.iter() {
         targets.push(target_of(&candidates[row as usize]));
     }
+    let share = weighted.sole_share();
     let steps = kept.iter().enumerate().map(|(place, &row)| {
         let step = 1.0 - place as f32 / MAX_TARGETS as f32;
-        (candidates[row as usize].id, step)
+        (candidates[row as usize].id, share * step)
     });
     let trace = trace_ordered(index, facts, pool, steps);
     Some(Decision::Pick(Pick {

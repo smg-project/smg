@@ -136,9 +136,6 @@ pub struct Pooled {
     /// Whether it takes images: its record's own bit.
     pub vision: bool,
     pub facts: DemandFacts,
-    /// The rank it registered and its group's size, where its row records
-    /// the two.
-    pub rank: Option<(usize, usize)>,
 }
 
 /// A row's pool: the engine, the row's one list, what its workers state
@@ -200,22 +197,15 @@ fn on_wire(runtime: u32, wire: ConnectionMode) -> u32 {
 }
 
 /// The worker object of `worker`, at `place` of its row: its wire is the
-/// one its object dials, its state is its object's own, and a rank it
-/// registered is its object's to say, with the rank and the group size
-/// its row records.
+/// one its object dials, and its state is its object's own.
 fn object(place: usize, worker: &Pooled) -> Result<Arc<dyn Worker>, String> {
-    let mut built = <BasicWorkerBuilder>::new(format!("http://w{place}:8000"))
+    let built = <BasicWorkerBuilder>::new(format!("http://w{place}:8000"))
         .connection_mode(dialed(worker.wire_modes)?)
         .model(ModelCard::new(MODEL))
         .health_config(HealthCheckConfig {
             disable_health_check: true,
             ..HealthCheckConfig::default()
         });
-    match (worker.facts.ranked, worker.rank) {
-        (true, Some((rank, size))) => built = built.dp_config(rank, size),
-        (false, None) => {}
-        _ => return Err(format!("place {place} states a rank and its numbers apart")),
-    }
     let object = built.build();
     object.set_status(match worker.state {
         State::Down => WorkerStatus::NotReady,

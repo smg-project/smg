@@ -34,7 +34,7 @@
 //! | `signals`, `reachable_from` | not carried: the object has no field for them, and a collector reads them of the row by the id the holder keeps. A host that is no gateway has the object of a row one gateway alone reaches built with its checks off ([`Objects::with_host_local_unchecked`]) |
 //! | `zone`, `encode`, `max_running`, `priority` | not carried: a decision's facts, read of the store's rows and never of an object |
 //! | `vision`, `demand_facts` | not carried to the object: a decision's facts, which the holder keeps beside the object and lends with each list (`Objects::lent`) |
-//! | `pairing` | not carried to the object: a decision's fact, read of the store's rows. The object derives its own at its build, and the store's door states that one in the row. [`facts()`] keeps the standing row's, and so does the controller's door, whose log carries none |
+//! | `pairing` | not carried to the object: a decision's fact, read of the store's rows. The object derives its own at its build ([`pairing_descriptor`] reads it). [`facts()`] keeps the standing row's, and so does the controller's door, whose log carries none |
 //! | `overload` | not carried to the object, where the store judges overload: a decision's fact, read of the store's rows. Under a host whose own load monitor judges it ([`Objects::with_overload_thresholds`]), the object's thresholds: the row's own, each over the host's default for its signal, the usage as a ratio. [`facts()`] states the thresholds of the object's own registration over the standing row's. A replacement by id states them whole: one it leaves out is cleared ([`Over::Replaced`]) |
 //!
 //! A new object starts at its row's status. A replacement takes the
@@ -58,23 +58,11 @@
 //! [`registration_into_store_keeping_credentials`] makes these calls with the
 //! keeper the host's holder was built with.
 //!
-//! A host whose registrations run in its own process needs none of that.
-//! Its registration built a whole object a row, and the holder keeps each
-//! as its row's ([`Objects::with_built_kept`]): the door hands them in
-//! with the write ([`MembershipWriter::found_rows`], [`Objects::handing`]). An
-//! object holds what the table does not carry, its credential first.
-//!
 //! # The adapters
 //!
 //! [`HealthAdapter`] writes probe outcomes and connect signals to the store
 //! and sets the object's status to the status that stands there. The host
-//! supplies the [`Lead`] and the term the adapter writes under. Its
-//! projection ([`HealthAdapter::project`]) writes what the object knows of
-//! its worker onto the row: the object's liveness veto is the row's stalled
-//! bit, for every gateway. The worker crate's collector drives it through
-//! the adapter: at each move of that veto, for an object laid over another,
-//! and for every object where a collector starts. A host that runs the
-//! collector calls no projection of its own.
+//! supplies the [`Lead`] and the term the adapter writes under.
 //!
 //! [`load_monitor`] is the worker crate's own load monitor over the
 //! holder's registry, with no adapter under it. It publishes the workers'
@@ -92,9 +80,9 @@
 //!
 //! # The door
 //!
-//! The host hands out a [`MembershipWriter`] door. A host without election uses
-//! [`StoreMembershipWriter`]. A replica that may lead uses the controller's
-//! door.
+//! The host hands out a [`MembershipWriter`] door. The crate holds one: the
+//! controller's, for a replica that may lead. It holds none over a store
+//! alone.
 //!
 //! [`registration_into_store`] writes the created workers' rows, and hands
 //! each built worker to the door with its write.
@@ -103,8 +91,8 @@
 //! through the door. [`Objects`] remains the registry's one writer.
 //!
 //! The health loop's refresh of a worker's engine has an entry of its own
-//! ([`MembershipWriter::refreshed`]). It asks no maker, writes the row's labels
-//! and no other fact, and hands the rebuilt worker in with the write.
+//! ([`MembershipWriter::refreshed`]). It asks no maker, and writes the row's
+//! labels and no other fact.
 //!
 //! # What the module does not hold
 //!
@@ -145,7 +133,7 @@ pub use members::OpenAdmission;
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use membership_writer::tests::{
     check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
-    check_one_row, check_provider, check_rank_rows, check_refresh, FindOne, Rows,
+    check_one_row, check_provider, check_rank_rows, check_refresh, FindOne, Rows, StoreDoor,
 };
 #[cfg(feature = "controller")]
 pub(crate) use membership_writer::{
@@ -153,7 +141,6 @@ pub(crate) use membership_writer::{
 };
 pub use membership_writer::{
     MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Over, Precondition, Remover,
-    StoreMembershipWriter,
 };
 pub use object::object;
 pub use objects::{Objects, RowRevision};

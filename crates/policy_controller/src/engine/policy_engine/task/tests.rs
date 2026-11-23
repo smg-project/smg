@@ -25,7 +25,7 @@ use tokio::{
 use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
-        decision_engine::{DecisionEngine, Request, RequestMaker, SweepOutcome, WorkerLists},
+        decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
         list_cell::tests::PublishedList,
         policy_engine::{
             membership::tests::{handed, id, in_id_order, registry, told},
@@ -184,7 +184,6 @@ async fn polled_once(engine: &Arc<PolicyEngine>) -> (JoinHandle<()>, Arc<AtomicU
     let (step, counted) = (Arc::clone(engine), Arc::clone(&runs));
     let count = move |_: Instant| {
         counted.fetch_add(1, Ordering::Relaxed);
-        SweepOutcome::default()
     };
     #[expect(
         clippy::disallowed_methods,
@@ -525,7 +524,6 @@ async fn the_upkeep_runs_once_for_the_seconds_a_stall_missed() {
         counted.fetch_add(1, Ordering::Relaxed);
         let since = now.saturating_duration_since(start);
         last.store(since.as_secs(), Ordering::Relaxed);
-        SweepOutcome::default()
     };
     let task = spawned(async move { step.run_with(count).await }).await;
     assert_eq!(runs.load(Ordering::Relaxed), 1, "the first run");
@@ -553,7 +551,6 @@ async fn the_task_outlives_its_monitor_and_reads_the_next_one() {
     let (step, counted) = (Arc::clone(&engine), Arc::clone(&runs));
     let count = move |_: Instant| {
         counted.fetch_add(1, Ordering::Relaxed);
-        SweepOutcome::default()
     };
     let task = spawned(async move { step.run_with(count).await }).await;
     assert_eq!(picked(&engine, &asks(7, &members, None)), 2);

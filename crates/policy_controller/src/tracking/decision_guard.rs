@@ -79,12 +79,33 @@ use crate::{
             DecideOutcome, DecisionEngine, DecisionRefused, DecodeRefused, HeldDecision,
             HeldDecode, Leased, Request, RequestMaker,
         },
-        framework::{EncodeItems, EncodePlaced},
         view::WorkerId,
     },
     store::GatewayId,
-    tracking::lease::{Dispatch, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass},
+    tracking::lease::{
+        Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass,
+    },
 };
+
+/// The three sizes a side's words state: its lease's token count and its
+/// text's two lengths ([`Lease::tokens`], [`Lease::chars`] and
+/// [`Lease::bytes`]).
+#[derive(Clone, Copy, Default)]
+struct Stated {
+    tokens: u32,
+    chars: u32,
+    bytes: u32,
+}
+
+impl Stated {
+    const fn of(lease: &Lease) -> Self {
+        Self {
+            tokens: lease.tokens,
+            chars: lease.chars,
+            bytes: lease.bytes,
+        }
+    }
+}
 
 /// Where a handle's decision came from, and where its reports go.
 enum Arm<D> {
@@ -163,10 +184,10 @@ pub struct DecisionGuard<D: Deref<Target: DecisionEngine>> {
     /// chosen. A decode that owes a dispatch or an end was then picked by
     /// a decode call, and was issued with its prefill otherwise.
     later: bool,
-    /// The prompt size the decode side's words state: the lease's own, and
+    /// The three sizes the decode side's words state: the lease's own, and
     /// a decode call's from the call that picks the side. Nothing reads a
     /// single's.
-    stated: u32,
+    stated: Stated,
     /// The target at that index.
     target: Target,
     owed: Owed,
@@ -232,31 +253,6 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         Self::hold(Arm::Engine { door, gateway }, decided, later, now)
     }
 
-    /// Holds the decision made with the request's encode items
-    /// ([`DecisionEngine::decide_encode_pair`]). For a pair, the handle
-    /// reports the prefill and decode.
-    ///
-    /// # Errors
-    ///
-    /// [`DecisionRefused`]: the door made no decision for the request.
-    pub fn decide_encode_pair(
-        door: D,
-        gateway: GatewayId,
-        request: &Request<'_>,
-        items: EncodeItems<'_>,
-        placed: &mut EncodePlaced,
-        now: Instant,
-    ) -> Result<Self, DecisionRefused> {
-        let decided = door.decide_encode_pair(gateway, request, items, placed, now)?;
-        let later = request.constraints.decode_later;
-        Ok(Self::hold(
-            Arm::Engine { door, gateway },
-            decided,
-            later,
-            now,
-        ))
-    }
-
     fn hold(arm: Arm<D>, decided: DecideOutcome, later: bool, now: Instant) -> Self {
         let first = decided
             .decision
@@ -288,9 +284,10 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         } else {
             Owed::Nothing
         };
-        // The size the decode side's words state until a decode call picks
+        // The sizes the decode side's words state until a decode call picks
         // the side: the lease's own.
-        let stated = decided.lease.map_or(0, |leased| leased.lease.tokens);
+        let stated = decided.lease.map(|leased| Stated::of(&leased.lease));
+        let stated = stated.unwrap_or_default();
         Self {
             arm,
             decided,
@@ -314,11 +311,13 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
             index: self.index,
             target: &self.target,
             // Lent as the handle keeps them, with no test of the lease's
-            // side: a single's answer names no decode session, its size is
+            // side: a single's answer names no decode session, its sizes are
             // the lease's own and its decode side never stands chosen.
             decode: HeldDecode {
                 session: self.decided.decode_session,
-                tokens: self.stated,
+                tokens: self.stated.tokens,
+                chars: self.stated.chars,
+                bytes: self.stated.bytes,
                 chosen: matches!(self.decode, Owed::Later { .. }),
             },
         })
@@ -451,8 +450,8 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         if let Some((leased, target)) = answer.lease.zip(first) {
             self.decided.decision = answer.decision;
             self.decided.decode_session = answer.decode_session;
-            // The call issued the side under the size it stated.
-            self.stated = leased.lease.tokens;
+            // The call issued the side under the three sizes it stated.
+            self.stated = Stated::of(&leased.lease);
             (self.index, self.target) = (0, *target);
             self.decode = self.decode.sent_later();
             if let Some(held) = &mut self.decided.lease {
@@ -686,6 +685,9 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     }
 
     /// Says a dispatch and keeps the worker it named for a cancelled end.
+    /// It stands in line in its two callers: a host says a dispatch once
+    /// a request.
+    #[inline]
     fn dispatch(&self, owed: Owed, worker: WorkerId, now: Instant) -> Owed {
         let Owed::Dispatch {
             lease,
@@ -816,6 +818,24 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         matches!(self.owed, Owed::Completion { .. }) && self.decode_chosen()
     }
 
+    /// The span from `side`'s dispatch to `at`, in whole microseconds: what
+    /// an end of class cancelled states of a side given up at `at`
+    /// ([`Self::released`]). Zero for a side whose dispatch was not said,
+    /// and for one whose end was.
+    #[cfg(feature = "in-process")]
+    #[must_use]
+    pub(crate) fn since_sent(&self, side: Side, at: Instant) -> u32 {
+        let owed = match side {
+            Side::Decode if self.decided.pair() => self.decode,
+            _ => self.owed,
+        };
+        if let Owed::Completion { sent, .. } = owed {
+            micros(at.saturating_duration_since(sent))
+        } else {
+            0
+        }
+    }
+
     fn release(&self, owed: Owed, reason: ReleaseReason, now: Instant) -> Owed {
         match owed {
             Owed::Nothing | Owed::Later { .. } => {}
@@ -938,7 +958,6 @@ impl<D: Deref<Target: DecisionEngine>> fmt::Debug for DecisionGuard<D> {
 #[cfg(feature = "in-process")]
 mod tests {
     use std::{
-        error::Error,
         sync::{Arc, Barrier},
         thread,
         time::{Duration, Instant},
@@ -955,16 +974,15 @@ mod tests {
         engine::{
             decision::{Decision, Target, Targets},
             decision_engine::{Request, RequestMaker, WorkerLists},
-            framework::{EncodeItems, EncodePlaced, Picker, TieBand},
+            framework::{Picker, TieBand},
             list_cell::tests::PublishedList,
             policy_engine::PolicyEngine,
-            store_backed_engine::tests::{pair_counts, pair_request, push_fleet, GATEWAY},
-            view::{Candidate, Constraints, Identity, RequestFacts, WorkerId},
+            view::{Candidate, Constraints, RequestFacts, WorkerId},
         },
         policies::random::Random,
         stages::{lifecycle::Lifecycle, registry::StageRegistry},
-        store::{GatewayId, LeaseState, LeasesStore, MemoryStore},
-        tracking::lease::{EventSet, Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+        store::GatewayId,
+        tracking::lease::{EventSet, Lease, Outcome, ReleaseReason, Side, TransportClass},
     };
 
     /// The model of the list's workers.
@@ -1145,7 +1163,7 @@ mod tests {
     /// read before this number moves.
     #[test]
     fn a_handle_is_the_size_it_has_in_a_build_with_no_link() {
-        const HELD: usize = 488;
+        const HELD: usize = 504;
         assert_eq!(size_of::<DecisionGuard<Arc<PolicyEngine>>>(), HELD);
         assert_eq!(size_of::<DecisionGuard<&PolicyEngine>>(), HELD);
         // A placement is the handle and what its host reads of the answer:
@@ -1153,6 +1171,12 @@ mod tests {
         // label of a pair's decode side and one pointer to an encode
         // request's encoders.
         assert_eq!(size_of::<crate::tracking::Placement<'_>>(), HELD + 88);
+        // The lease the handle keeps states its request's text's two
+        // lengths beside its token count: eight bytes more, the handle's
+        // too. The second length sits in the padding the first left. The
+        // handle keeps the two lengths the decode side's words state
+        // beside that side's token count: eight bytes more.
+        assert_eq!(size_of::<Lease>(), 72);
     }
 
     /// A request that is served: its lease is issued on the pick's first
@@ -1468,53 +1492,6 @@ mod tests {
     }
 
     mod pairs;
-
-    fn states(store: &MemoryStore, lease: LeaseId) -> Option<[LeaseState; 2]> {
-        let filed = store.sides(GATEWAY, lease)?;
-        Some([filed.record.state, filed.decode?.state])
-    }
-
-    #[test]
-    fn a_handle_of_an_encode_pair_holds_the_pairs_two_sides() -> Result<(), Box<dyn Error>> {
-        let (door, encoder) = push_fleet()?;
-        let store = door.store();
-        let now = Instant::now();
-        let items = EncodeItems {
-            keys: &[Identity::hashed(11)],
-            ..EncodeItems::default()
-        };
-        let mut placed = EncodePlaced::new();
-        let mut handle = DecisionGuard::decide_encode_pair(
-            &door,
-            GATEWAY,
-            &pair_request(b"pair"),
-            items,
-            &mut placed,
-            now,
-        )
-        .expect("a decision");
-        let lease = handle.lease().expect("the prefill's lease");
-        let id = lease.lease.id;
-        assert_eq!(lease.lease.side, Side::Prefill);
-        let target = handle.take(0).expect("the first pair");
-        let decode = target.pair.expect("the decode's target");
-        assert_eq!(placed.encoders().len(), 1);
-        assert_eq!(
-            placed.encoders().first().map(|target| target.id),
-            Some(encoder)
-        );
-        assert_eq!(states(store, id), Some([LeaseState::ISSUED; 2]));
-        handle.dispatched_decode(now);
-        assert_eq!(
-            states(store, id),
-            Some([LeaseState::ISSUED, LeaseState::Dispatched { at: now }])
-        );
-        drop(handle);
-        assert!(store.sides(GATEWAY, id).is_none());
-        assert_eq!(pair_counts(store, [target.id, decode.decode_id]), [0, 0]);
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
-        Ok(())
-    }
 
     /// A single's handle holds no decode side: a decode's take, dispatch
     /// and release say nothing. Its lease ends under any side its host

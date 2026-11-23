@@ -401,8 +401,8 @@ mod tests {
         }
     }
 
-    /// Each decider keeps every third shed.
-    /// A shed for one decider leaves the other decider's count alone.
+    /// Each count keeps every third shed, and interleaving two counts does
+    /// not shift either.
     #[test]
     fn each_decider_keeps_every_nth_answer_by_its_own_count() {
         let mut document = PolicySpec::preset("random").expect("a preset");

@@ -308,7 +308,7 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request(
 ///
 /// # Safety
 /// - `request_json` must be a valid null-terminated C string
-/// - `tokenizer_handle` must be a valid pointer returned by `sgl_tokenizer_create`
+/// - `tokenizer_handle` must be a valid pointer returned by `sgl_tokenizer_create_from_file`
 /// - `prompt_text_out`, `token_ids_out`, `token_ids_len_out`, `prompt_tokens_out` must be valid pointers
 /// - `tool_constraints_json_out` may be null; if non-null, must point to writable memory
 /// - `tools_json_out` may be null; if non-null, must point to writable memory
@@ -411,7 +411,7 @@ pub unsafe extern "C" fn sgl_preprocessed_request_free(
 ///
 /// # Safety
 /// - `request_json` must be a valid null-terminated C string.
-/// - `tokenizer_handle` must be a valid pointer returned by `sgl_tokenizer_create`.
+/// - `tokenizer_handle` must be a valid pointer returned by `sgl_tokenizer_create_from_file`.
 /// - `require_reasoning_out` must point to writable memory.
 /// - `error_out` may be null; if non-null, must point to writable memory.
 #[no_mangle]

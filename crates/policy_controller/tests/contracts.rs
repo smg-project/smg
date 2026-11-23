@@ -25,15 +25,15 @@ use prost_types::{
     DescriptorProto, FileDescriptorProto, FileDescriptorSet, ServiceDescriptorProto,
 };
 use smg_policy_controller::{
+    cases,
     document::{PolicySpec, DENIED_HEADERS},
     engine::{
         fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Health, Identity, LiftedVeto,
         LoadRow, MediaCounts, OverloadRegime, Pair, Phase, PoolFacts, Queue, RequestFacts, Role,
         Shed, ShedReason, SignalSource, Target, Trace, ZoneCapacity,
     },
-    tracking::{
-        Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass,
-    },
+    mirrored, record,
+    tracking::{Lease, LeaseKind, Side},
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
@@ -67,36 +67,13 @@ fn the_header_deny_list_holds_its_seven_names() {
     }
 }
 
-/// A record's field names in declaration order. The pattern names every
-/// field without `..`, so the crate's type cannot gain, lose or rename one
-/// without this file failing to compile: the wire tables below cannot drift
-/// from the record silently. A field written `name as "spelled"` is listed
-/// under the name the contracts spell, the pattern still naming the
-/// struct's own: a pair, both sides checked.
-macro_rules! record {
-    (@spelled $field:ident) => { stringify!($field) };
-    (@spelled $field:ident $spelled:literal) => { $spelled };
-    ($ty:ty, $name:ident { $($field:ident $(as $spelled:literal)?),+ $(,)? }) => {{
-        // Never called: its pattern is the exhaustiveness proof.
-        fn exhaustive(value: $ty) {
-            let $name { $($field: _),+ } = value;
-        }
-        let _: fn($ty) = exhaustive;
-        &[$(record!(@spelled $field $($spelled)?)),+][..]
-    }};
-}
-
-/// An enum's variant names in declaration order, by the same proof: a match
-/// without a wildcard arm.
-macro_rules! cases {
-    ($ty:ty, $name:ident { $($case:ident),+ $(,)? }) => {{
-        fn exhaustive(value: $ty) {
-            match value { $($name::$case { .. } => {}),+ }
-        }
-        let _: fn($ty) = exhaustive;
-        &[$(stringify!($case)),+][..]
-    }};
-}
+// A record's field names and an enum's case names are listed by the
+// library's two proof macros (`record!`, `cases!`, its module `mirrored`):
+// a pattern that names every field without `..` and a match without a
+// wildcard arm, so a type cannot gain, lose or rename one without this file
+// failing to compile. No such pattern of a type marked non-exhaustive
+// builds outside the library: the lists of those five are stated there, by
+// the same macros, and read here (`mirrored::outcome` and its like).
 
 fn candidate_record() -> &'static [&'static str] {
     record!(
@@ -169,6 +146,8 @@ fn request_record() -> &'static [&'static str] {
             media,
             seed,
             block_size,
+            prompt_chars,
+            prompt_bytes,
             now_micros,
             pinned_at,
             lent_in_flight,
@@ -216,7 +195,6 @@ fn constraints_record() -> &'static [&'static str] {
             demands,
             stalled,
             held,
-            pins,
             places
         }
     )
@@ -356,24 +334,14 @@ fn lease_record() -> &'static [&'static str] {
             session_verdict,
             issued_micros,
             tokens,
+            chars,
+            bytes,
         }
     )
 }
 
 fn outcome_record() -> &'static [&'static str] {
-    record!(
-        Outcome,
-        Outcome {
-            side,
-            served,
-            status,
-            class,
-            ttft_micros,
-            tokens_in,
-            tokens_out,
-            duration_micros,
-        }
-    )
+    mirrored::outcome()
 }
 
 /// The crate's enums the two contracts spell out, with the proto enum (a
@@ -478,50 +446,19 @@ fn enum_mirrors() -> Vec<(
             "Completed.Class",
             "CLASS",
             "transport-class",
-            cases!(
-                TransportClass,
-                TransportClass {
-                    Ok,
-                    ClientError,
-                    ServerError,
-                    ConnectFailed,
-                    Timeout,
-                    Cancelled,
-                }
-            ),
+            mirrored::transport_class(),
         ),
         (
             "Released.Reason",
             "REASON",
             "release-reason",
-            cases!(
-                ReleaseReason,
-                ReleaseReason {
-                    Abandoned,
-                    LateDecision,
-                    ClientGone,
-                    CommitFailed,
-                    Expired,
-                    WorkerRemoved,
-                }
-            ),
+            mirrored::release_reason(),
         ),
         (
             "MembershipChange.Kind",
             "KIND",
             "membership",
-            cases!(
-                Membership<'_>,
-                Membership {
-                    Added,
-                    Removed,
-                    Replaced,
-                    Relabelled,
-                    Resized,
-                    Snapshot,
-                    Left,
-                }
-            ),
+            mirrored::membership(),
         ),
     ]
 }
@@ -544,14 +481,7 @@ fn shed_reasons() -> &'static [&'static str] {
 /// The signal kinds have a WIT variant; the proto spells them as a `oneof`
 /// whose third case names its unit.
 fn signal_cases() -> &'static [&'static str] {
-    cases!(
-        Signal,
-        Signal {
-            Load,
-            Health,
-            GatewayVeto
-        }
-    )
+    mirrored::signal()
 }
 
 /// How a message of the protocol relates to the record it mirrors.
@@ -658,6 +588,8 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
             // The affinity column rides the request in the crate; the wire
             // carries each entry in its candidate.
             host_only: &[
+                "prompt_chars",
+                "prompt_bytes",
                 "now_micros",
                 "pinned_at",
                 "lent_in_flight",
@@ -699,14 +631,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Constraints",
             record: constraints_record(),
-            host_only: &[
-                "decode_later",
-                "demands",
-                "stalled",
-                "held",
-                "pins",
-                "places",
-            ],
+            host_only: &["decode_later", "demands", "stalled", "held", "places"],
             wire_only: &[],
             wire: &[
                 ("excluded", Type::Fixed64),
@@ -832,7 +757,13 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Lease",
             record: lease_record(),
-            host_only: &["booked", "session_verdict", "issued_micros"],
+            host_only: &[
+                "booked",
+                "session_verdict",
+                "issued_micros",
+                "chars",
+                "bytes",
+            ],
             wire_only: &["term", "dispatch_ttl_ms", "origin"],
             wire: &[
                 ("id", Type::Fixed64),
@@ -911,6 +842,8 @@ fn wit_mirrors() -> Vec<WitMirror> {
             record: "request",
             crate_record: request_record(),
             host_only: &[
+                "prompt_chars",
+                "prompt_bytes",
                 "now_micros",
                 "pinned_at",
                 "lent_in_flight",
@@ -944,7 +877,13 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "lease",
             crate_record: lease_record(),
-            host_only: &["booked", "session_verdict", "issued_micros"],
+            host_only: &[
+                "booked",
+                "session_verdict",
+                "issued_micros",
+                "chars",
+                "bytes",
+            ],
             before: &[],
             beside: &[],
         },

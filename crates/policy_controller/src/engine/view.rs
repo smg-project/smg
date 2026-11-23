@@ -107,8 +107,23 @@ pub enum HashKind {
 
 /// Bytes of a request's text a token, for a host with no tokenizer. A text
 /// window is this many times the model's block size in bytes, and a text's
-/// size in tokens is its bytes over this.
+/// size in tokens is its bytes over this (`tokens_or_text`).
 pub const TEXT_BYTES_PER_TOKEN: u32 = 4;
+
+/// A request's size in tokens for a reader that prices a request of text
+/// by its length: `tokens`, the count of its token ids, and where it states
+/// none its text's `length` in bytes at [`TEXT_BYTES_PER_TOKEN`] a token.
+/// The one statement of the rule: a request's facts read it
+/// ([`RequestFacts::prompt_size`]), and so does a held decision's record,
+/// by the bytes its lease keeps
+/// ([`Lease::prompt_size`](crate::tracking::lease::Lease::prompt_size)).
+pub(crate) const fn tokens_or_text(tokens: u32, length: u32) -> u32 {
+    if tokens == 0 {
+        length / TEXT_BYTES_PER_TOKEN
+    } else {
+        tokens
+    }
+}
 
 /// The first `tokens` tokens of a request hashed in `kind`, in the unit its
 /// blocks are sized in: tokens, and under the text kind their bytes.
@@ -223,11 +238,8 @@ pub struct Health {
     /// breaker bit too. A host writes it into a row it copies for the
     /// decision. Over a publication's own rows the asking host's vetoes
     /// stand beside the rows instead, and a reader of this bit asks both
-    /// ([`Constraints::masks`]). A store's own rows carry the bit for one
-    /// doubt, the leader's own, whoever asks
-    /// ([`HealthSink::leader_bits`](crate::store::HealthSink::leader_bits)).
-    /// The all-vetoed rule lifts it as its last resort, on a row whose
-    /// breaker bit is clear.
+    /// ([`Constraints::masks`]). The all-vetoed rule lifts it as its last
+    /// resort, on a row whose breaker bit is clear.
     pub stalled: bool,
     /// Being drained; nothing new goes there.
     pub draining: bool,
@@ -257,8 +269,8 @@ impl Health {
 }
 
 /// A ratio as a permille field: the one rounding a report's ratio and a
-/// spec's usage threshold both take, so one rank's usage at or above a
-/// threshold in the document's unit is never read as under it. A mean of
+/// usage threshold both take, so one rank's usage at or above a threshold
+/// stated as a ratio is never read as under it. A mean of
 /// several ranks' rounded usages within a permille of the threshold can
 /// read on either side of it.
 pub fn permille(ratio: f64) -> u16 {
@@ -277,6 +289,9 @@ pub(crate) fn threshold_permille(usage: f64) -> u16 {
 /// One load row as the view carries it: the engine load record's routing
 /// core, in the record's own names, rounded to narrow fields by the host.
 /// Permille fields are the record's ratios times 1000.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..LoadRow::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoadRow {
     /// Requests running on the engine.
@@ -290,7 +305,8 @@ pub struct LoadRow {
     pub kv_usage_permille: u16,
     /// The share of the KV cache the running requests hold, in permille.
     pub active_kv_permille: u16,
-    /// Tokens per second the worker drains; `0` when unknown.
+    /// Tokens per second the worker drains; `0` when unknown, and a known
+    /// rate under one reads as `1`.
     pub live_rate: u32,
     /// Context tokens resident for the running requests; `0` too when the
     /// engine does not count them.
@@ -434,6 +450,28 @@ impl Session {
         self.0
     }
 
+    /// The bytes [`Self::text`] writes: a `u64` in sixteen hexadecimal
+    /// digits.
+    pub const TEXT_LEN: usize = 16;
+
+    /// The session's number as text, written into `buffer`: sixteen
+    /// lower-case hexadecimal digits, the highest first. A worker object
+    /// counts a key's requests under a text, and where held decisions on
+    /// file count a session's requests there, this is that text
+    /// ([`HostCount::session_booked`](crate::tracking::HostCount::session_booked)).
+    /// It is the one writer of it: what moves a held decision's count onto
+    /// a worker object and what reads a record's count both call it, so
+    /// the two name one entry. Nothing is allocated: the buffer is the
+    /// caller's, on its stack.
+    pub fn text(self, buffer: &mut [u8; Self::TEXT_LEN]) -> &str {
+        for (at, digit) in buffer.iter_mut().enumerate() {
+            let nibble = (self.0 >> (60 - 4 * at)) & 0xf;
+            *digit = b"0123456789abcdef"[nibble as usize];
+        }
+        // Sixteen ASCII digits: the conversion cannot fail.
+        std::str::from_utf8(buffer).unwrap_or_default()
+    }
+
     /// A session from the scoped value a lease carries on the wire.
     #[cfg(any(test, feature = "client"))]
     pub(crate) const fn from_raw(value: u64) -> Self {
@@ -449,6 +487,9 @@ impl Session {
 /// held by a worker just admitted, which is what every candidate reads as
 /// when the column is empty. On a wire the five are fields of the
 /// candidate's own record, at the numbers they were given.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..AffinityFacts::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AffinityFacts {
     /// Prefix blocks of the request this worker holds, by the event index.
@@ -735,6 +776,9 @@ impl Reads<'_> {
 /// The wire form drops the position and the sample instant, carries the
 /// candidate's [`AffinityFacts`] in the same record and encodes to about 76
 /// bytes with its load row.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..Candidate::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(align(64))]
 pub struct Candidate {
@@ -751,6 +795,11 @@ pub struct Candidate {
     /// ([`RequestFacts::in_flight`]): the row's place in the host's pool,
     /// whatever its index.
     pub position: u32,
+    /// The worker's id ([`WorkerId`]). Each rank of a data-parallel engine
+    /// is a row of its own with an id of its own: a rank's worker object
+    /// stands at an address of its own, and its id is that address's
+    /// fingerprint. The rows of one engine are joined by
+    /// [`Self::engine`], and never by this id.
     pub id: WorkerId,
     pub role: Role,
     pub dp_rank: u16,
@@ -768,6 +817,13 @@ pub struct Candidate {
     /// that lends its counts beside the rows
     /// ([`RequestFacts::lent_in_flight`]) leaves this zero, so a reader
     /// asks [`RequestFacts::in_flight`].
+    ///
+    /// The in-process front reads it off the worker object at every
+    /// decision: the object's own counter, which a host raises where it
+    /// makes the worker's load guard and lowers where the guard is
+    /// dropped. A guard can be made ahead of its send. The decode of a
+    /// pair named at the first decision is so counted on its row before
+    /// it is sent, and the classic policies count it the same way.
     pub in_flight: u32,
     /// The latest load row, when the host has a report for the worker.
     pub load: Option<LoadRow>,
@@ -814,7 +870,9 @@ pub struct Candidate {
     pub labels: u64,
     /// Encode-side compatibility for an encode-prefill-decode dispatch.
     pub ec_compatible: bool,
-    /// The worker takes images.
+    /// The worker takes pixel media: an image or a video
+    /// ([`MediaCounts::holds_pixels`]). The crate's docs say of such a
+    /// worker that it takes images.
     pub vision: bool,
     /// Reachable from one gateway only (a host-local wire).
     pub host_local: bool,
@@ -898,7 +956,8 @@ impl Candidate {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FixedFacts {
-    /// Whether the worker takes images ([`Candidate::vision`]).
+    /// Whether the worker takes pixel media, an image or a video
+    /// ([`Candidate::vision`]).
     pub vision: bool,
     /// The id the program knows the worker by ([`Candidate::id`]): a
     /// controller's id of the stored worker an object stands for. A
@@ -977,6 +1036,15 @@ impl MediaCounts {
         video: 0,
         bytes: 0,
     };
+
+    /// Whether the request holds pixels: an image or a video. Only a
+    /// worker with a vision encoder takes such media, so a test of vision
+    /// by these counts reads this, never the image count alone. A host
+    /// states each count as it is.
+    #[must_use]
+    pub const fn holds_pixels(&self) -> bool {
+        (self.images | self.video) != 0
+    }
 }
 
 /// An allow-listed header: its name as a position into the spec's declared
@@ -1046,8 +1114,57 @@ pub struct KeyedRow {
     pub in_flight: u16,
 }
 
+/// Where a worker's object counts the requests of a request's session
+/// key: the name the count stands under there. A request's maker states it
+/// ([`RequestMaker::session_counted_under`](super::decision_engine::RequestMaker::session_counted_under)),
+/// and the reader of a record's count asks under that name.
+///
+/// One worker object stands in one process, which counts by its own guards
+/// or by the decisions it holds on file and never by both, so the two
+/// names do not meet on one object.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SessionCountedUnder {
+    /// The key's own text: the caller's own guard counts each request on
+    /// the worker it sends it to, for as long as the request runs. What a
+    /// process that serves its requests itself does.
+    #[default]
+    KeyText,
+    /// The session's number written as text ([`Session::text`]): the
+    /// decisions held on file count them, one a lease that books the
+    /// worker
+    /// ([`HostCount::session_booked`](crate::tracking::HostCount::session_booked)).
+    /// What a controller does, which serves no request. Its frame carries
+    /// the key in the clear or hashed: the lease carries the number alone.
+    SessionNumber,
+}
+
+impl SessionCountedUnder {
+    /// The name the count of `facts`' session key stands under on a
+    /// worker's object: the key's text as the request carries it, or the
+    /// session's number as [`Session::text`] writes it into `buffer`.
+    /// `None` for a request with no such name: no key in the clear under
+    /// the first, no key at all under the second. The one place that turns
+    /// the statement into the name.
+    pub fn name<'a: 'b, 'b>(
+        self,
+        facts: &RequestFacts<'a>,
+        buffer: &'b mut [u8; Session::TEXT_LEN],
+    ) -> Option<&'b str> {
+        match self {
+            Self::KeyText => facts.session_key.plain,
+            Self::SessionNumber => {
+                let session = facts.session();
+                (!session.is_none()).then(|| session.text(buffer))
+            }
+        }
+    }
+}
+
 /// One request as a decision sees it. Borrowed from the host for the
 /// duration of the decision.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..RequestFacts::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RequestFacts<'a> {
     /// The resolved model id, after aliasing.
@@ -1060,7 +1177,12 @@ pub struct RequestFacts<'a> {
     pub priority: i32,
     pub streaming: bool,
     pub max_output_tokens: u32,
-    /// The host's token count or estimate. A stage that reads it declares
+    /// The count of the request's token ids, or the count its host states,
+    /// and zero where the request gives no ids: a request of text alone
+    /// states its text's length ([`Self::prompt_bytes`],
+    /// [`Self::prompt_chars`]) and no count, so
+    /// a stage that prices a request of no stated size prices it by its
+    /// own rule. A stage that reads the size declares
     /// [`Needs::prompt_size`](crate::document::Needs::prompt_size): a host
     /// that sends a request on without reading its prompt states zero
     /// where no stage does. Nothing masks the field for a stage of a
@@ -1106,6 +1228,25 @@ pub struct RequestFacts<'a> {
     /// that carries hashes and states none. Last on the wire (the
     /// numbering follows the record's order).
     pub block_size: u32,
+    /// The length of the request's text in characters, where the request
+    /// gives text and no token ids and a stage of the document reads a
+    /// request's size ([`Needs::prompt_size`](crate::document::Needs::prompt_size));
+    /// `0` otherwise. Its reader at a decision is a stage that sizes a
+    /// request of text by its characters, as `bucket` does, and a lease
+    /// keeps it ([`Lease::chars`](crate::tracking::lease::Lease::chars)).
+    /// Counting it is one pass over the text, made once a request.
+    /// In-process only: a frame states a count.
+    pub prompt_chars: u32,
+    /// The length of the request's text in bytes, where the request gives
+    /// text and no token ids; `0` otherwise. It is written wherever the
+    /// text is at hand and costs no pass. [`Self::prompt_size`] makes a
+    /// count of it, which every reader that prices a request of text by
+    /// its length takes: the room rule, a plugin's view of a request, the
+    /// prefix stages, whose windows of text are bytes, and a frame. A
+    /// lease keeps it ([`Lease::bytes`](crate::tracking::lease::Lease::bytes)),
+    /// so a held decision reads the same count.
+    /// In-process only: a frame states a count.
+    pub prompt_bytes: u32,
     /// The host's clock at the decision, in microseconds since its origin.
     /// In-process only; no absolute instant crosses the wire.
     pub now_micros: u64,
@@ -1147,7 +1288,9 @@ pub struct RequestFacts<'a> {
     /// rule's in-flight cap reads the count either way. A key kept on its
     /// worker over the overload veto is kept under a capped rule only
     /// where this is set: with no count the cap could not hand the key on,
-    /// so the veto stands for it as for any request. In-process only.
+    /// so the veto stands for it as for any request. Where the count
+    /// stands on a worker's object is the request's maker's to say
+    /// ([`SessionCountedUnder`]). In-process only.
     pub session_counted: bool,
     /// The candidates' affinity facts, by index in the candidate slice the
     /// decision is made over: the one column the affinity stages read, in
@@ -1232,9 +1375,10 @@ pub struct RequestFacts<'a> {
     /// keeps it beside the request. A prompt gives one entry for each of
     /// its heads the caller's ring places it by, the deepest first: a stage
     /// under a bounded-load rule tries the entries in that order, and any
-    /// other reads the first. The one call states a routing value's entry
-    /// alone: a prompt's entries are stated by a host that writes the
-    /// request's facts itself. In-process only: no frame carries it.
+    /// other reads the first. The one call states them by the profile's
+    /// word: a routing value's own entry under the plain ring, and under
+    /// the prefix form what the lender answers for each head
+    /// ([`LentRing::head_position`]). In-process only: no frame carries it.
     pub ring_positions: &'a [u64],
 }
 
@@ -1279,6 +1423,18 @@ pub const fn key_of_session(session: u64, model: u64, phase: Phase) -> u64 {
 }
 
 impl<'a> RequestFacts<'a> {
+    /// The request's size in tokens for a reader that prices a request of
+    /// text by its length (`tokens_or_text`): the count of its token ids
+    /// ([`Self::prompt_tokens`]), and where it states none its text's
+    /// bytes at [`TEXT_BYTES_PER_TOKEN`] a token ([`Self::prompt_bytes`]).
+    /// Zero where it states neither. A window of text is bytes, so a
+    /// prefix stage divides one unit by the same unit.
+    #[inline]
+    #[must_use]
+    pub const fn prompt_size(&self) -> u32 {
+        tokens_or_text(self.prompt_tokens, self.prompt_bytes)
+    }
+
     /// The rows the host named, where they answer: beside an empty column.
     /// The column is asked first, so a host that fills one pays nothing for
     /// the rows it does not name.
@@ -1404,21 +1560,12 @@ impl<'a> RequestFacts<'a> {
     }
 }
 
-/// A table of session pins that outlives an engine's own (design 5.1, the
-/// sessions row), lent by the deciding host among a decision's
-/// [`Constraints`]. A sessions rule asks it once a decision, for a key its
-/// engine's table holds no pin of: the table goes with its generation, the
-/// pins of record do not.
-pub trait PinSource: std::fmt::Debug + Sync {
-    /// The worker `key` is pinned to, where that pin has not ended by the
-    /// host's record and was last used less than `ttl_micros` ago (`None`:
-    /// a pin of any age). The host answers by its own clock.
-    fn pinned(&self, key: Session, ttl_micros: Option<u64>) -> Option<WorkerId>;
-}
-
 /// What only the deciding host knows now: its standing vetoes, the wires it
 /// speaks and the request-level lifts around the profile. The admission bits
 /// of a prefill window and a decode room ride the candidate rows.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..Constraints::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Constraints<'a> {
     /// Candidates this host just failed to reach.
@@ -1446,9 +1593,12 @@ pub struct Constraints<'a> {
     /// ([`Demands`](crate::engine::Demands)). A door keeps the demands before any
     /// stage runs, where it keeps its gateway's wires, and no stage reads
     /// them: an engine handed rows by a host of its own is handed rows
-    /// that meet them. A pair's sides keep none yet: a door sheds a
-    /// pair's request that states a demand, under the stage `wires`,
-    /// whatever its sides state. In-process only: this protocol version
+    /// that meet them. Over a pair's two worker lists each side is held
+    /// to the workers that meet them as its role is held to them
+    /// ([`Demands::held_by`](crate::engine::Demands::held_by)). An encode
+    /// request's three lists keep none yet: such a request that states a
+    /// demand is shed under the stage `wires`, whatever its lists state.
+    /// In-process only: this protocol version
     /// states no demand, and a handle refuses a request that states one
     /// before it sends it over a link (`DecisionGuard::asked`).
     pub demands: crate::engine::Demands,
@@ -1472,14 +1622,6 @@ pub struct Constraints<'a> {
     /// there a held row carries the breaker bit beside the stalled one.
     /// In-process only.
     pub held: &'a [u32],
-    /// The pins of record, where the host keeps a table that outlives the
-    /// engine's ([`PinSource`]): a sessions rule asks it for a key its own
-    /// table holds no pin of, and no other stage reads it. `None` where
-    /// the engine's table is the only one, as in a host that embeds the
-    /// engine. In-process only. A decision lent them ends a key with its
-    /// idle time in the engine's table too, as the record counts no sweep.
-    /// The engine over worker lists reads none.
-    pub pins: Option<&'a dyn PinSource>,
     /// The places of the pool's list the request may take, ascending, each
     /// once, where its host holds it to a part of the pool: the workers a
     /// retry may still take, the worker a request names, the workers that
@@ -1593,6 +1735,9 @@ impl<'a> Engines<'a> {
 }
 
 /// Pool-wide facts beside the candidates.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..PoolFacts::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PoolFacts<'a> {
     /// Pool size before any narrowing.
@@ -1758,12 +1903,13 @@ mod tests {
     /// them, so their size is a cost of those decisions: the pin is exact.
     /// The signal cells are one word, for every signal, and the client's
     /// key is one word more. The ring a caller lends is two words, and
-    /// where the request stands on it two more. A field the facts gain
-    /// moves this number and carries the decision bench's cells that copy
-    /// the facts (`benches/decision.rs`).
+    /// where the request stands on it two more. A text's two lengths are
+    /// one word: its characters fill what was spare, and its bytes take
+    /// the word. A field the facts gain moves this number and carries the
+    /// decision bench's cells that copy the facts (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
-        assert_eq!(size_of::<RequestFacts<'_>>(), 328);
+        assert_eq!(size_of::<RequestFacts<'_>>(), 336);
     }
 
     #[test]
@@ -2138,6 +2284,53 @@ mod tests {
             ..plain
         };
         assert!(keyless.session().is_none());
+    }
+
+    /// A session key's count stands on a worker's object under one of two
+    /// names. Under the key's text the name is the text the request
+    /// carries, and a key carried as its fingerprint alone has none. Under
+    /// the session's number it is the number's sixteen digits: one name for
+    /// the key in either form, another for another model. A request with
+    /// no key has no name under either.
+    #[test]
+    fn a_sessions_count_is_named_by_where_it_stands() {
+        let plain = RequestFacts {
+            model: "model-a",
+            session_key: Identity::plain("conversation-7"),
+            ..RequestFacts::default()
+        };
+        let hashed = RequestFacts {
+            session_key: Identity::hashed(plain.session_key.hash),
+            ..plain
+        };
+        let named = |under: SessionCountedUnder, facts: &RequestFacts<'_>| {
+            let mut buffer = [0; Session::TEXT_LEN];
+            under.name(facts, &mut buffer).map(str::to_owned)
+        };
+        let text = SessionCountedUnder::KeyText;
+        let number = SessionCountedUnder::SessionNumber;
+        assert_eq!(SessionCountedUnder::default(), text);
+        assert_eq!(named(text, &plain).as_deref(), Some("conversation-7"));
+        assert_eq!(named(text, &hashed), None);
+        let digits = format!("{:016x}", plain.session().get());
+        assert_eq!(named(number, &plain).as_deref(), Some(digits.as_str()));
+        assert_eq!(named(number, &hashed).as_deref(), Some(digits.as_str()));
+        let other = RequestFacts {
+            model: "model-b",
+            ..plain
+        };
+        assert_ne!(named(number, &other), Some(digits));
+        let keyless = RequestFacts::default();
+        assert_eq!(named(text, &keyless), None);
+        assert_eq!(named(number, &keyless), None);
+        // The number's text: every digit, the highest first.
+        let text_of = |value| {
+            let mut buffer = [0; Session::TEXT_LEN];
+            Session::from_raw(value).text(&mut buffer).to_owned()
+        };
+        assert_eq!(text_of(0x1f), "000000000000001f");
+        assert_eq!(text_of(u64::MAX), "ffffffffffffffff");
+        assert_eq!(text_of(0x0123_4567_89ab_cdef), "0123456789abcdef");
     }
 
     /// A carried fingerprint is the host's word that it is the name's. A

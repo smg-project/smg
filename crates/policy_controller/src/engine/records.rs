@@ -91,7 +91,7 @@ use super::{
 };
 use crate::{
     document::spec::AppliedSpec,
-    load::{load_row, signal_values, SignalCells, SignalColumn},
+    load::{load_row, signal_values, ReportSignals, SignalCells, SignalColumn},
 };
 
 /// A worker's id in the engine's own state (a load stage's credit of
@@ -200,8 +200,9 @@ pub struct Live<'a> {
     clock: &'a DecisionClock,
     now_micros: u64,
     loads: Option<&'a Arc<LoadSnapshot>>,
-    /// The request's session key, where a stage of the document reads a
-    /// worker's count of the key's requests in flight.
+    /// The name the request's session key is counted under on a worker's
+    /// object, where a stage of the document reads a worker's count of the
+    /// key's requests in flight.
     counted_key: Option<&'a str>,
     /// Whether a stage of the document reads a worker's count of session
     /// keys with a request in flight.
@@ -215,7 +216,9 @@ impl<'a> Live<'a> {
     /// The reads of one decision at `now` on `clock`, under `engine`'s
     /// document: the workers' reports from `loads`, the load monitor's
     /// snapshot as the caller holds it for the decision, and `session_key`,
-    /// the text of the request's session key where it carries one.
+    /// the name the request's session key is counted under on a worker's
+    /// object where it has one
+    /// ([`SessionCountedUnder::name`](super::view::SessionCountedUnder::name)).
     ///
     /// The two counts of sessions a worker object keeps are read only for a
     /// document one of whose stages reads them ([`Engine::needs`]): the
@@ -375,6 +378,52 @@ pub(super) fn stated_report(
     // The conversion is asked the age of a report at its own sample.
     let row = load_row(report, role, sampled_at, sampled_at, SignalSource::Poll);
     (row, clock.micros(sampled_at))
+}
+
+/// A report's named values as a record states them, written into the row
+/// of `cells` at `position`, and whether a named value is read of the
+/// report at all. They are made by the crate's one conversion
+/// ([`signal_values`]) under `columns`, the document's, and written where
+/// a decision may read them ([`SignalCells::write`]): under the signal's
+/// own unit and in range, each sample instant on `clock`. A report of
+/// several ranks states none ([`several_ranks`]), and nothing is written
+/// of it. One reading for a list's cells and for the report a stage is
+/// told.
+fn write_signals(
+    report: &WorkerLoadResponse,
+    sampled_at: Instant,
+    columns: &[SignalColumn],
+    clock: &DecisionClock,
+    position: u32,
+    cells: &mut SignalCells,
+) -> bool {
+    if several_ranks(report) {
+        return false;
+    }
+    signal_values(report, columns, sampled_at, |column, unit, value, at| {
+        cells.write(position, column, unit, value, clock.micros(at));
+    });
+    true
+}
+
+/// A report's named values as a stage is told them
+/// ([`Signal::Load`](crate::tracking::lease::Signal)): one cell a column
+/// of `columns`, as a list's cells state the report ([`write_signals`]),
+/// and none for a report of several ranks. They stand in `cells`, which
+/// the caller keeps from one report to the next: behind the call it holds
+/// this report's values and no other's, and its room is kept.
+pub(super) fn stated_signals<'c>(
+    report: &WorkerLoadResponse,
+    sampled_at: Instant,
+    columns: &[SignalColumn],
+    clock: &DecisionClock,
+    cells: &'c mut SignalCells,
+) -> ReportSignals<'c> {
+    cells.blank(1, columns.len());
+    if !write_signals(report, sampled_at, columns, clock, 0, cells) {
+        return ReportSignals::NONE;
+    }
+    ReportSignals::new(cells.row(0).unwrap_or_default())
 }
 
 /// The records of one list with each worker's report written, as one load
@@ -694,6 +743,14 @@ impl PoolRecords {
     pub(crate) fn tried_engines(&self, tried: &[WorkerId], whole: &mut Vec<WorkerId>) {
         whole.clear();
         whole.extend_from_slice(tried);
+        self.more_tried_engines(tried, whole);
+    }
+
+    /// [`Self::tried_engines`] for a further list of the same decision, as
+    /// a pair's second list is: adds to `whole` the id of every row of an
+    /// engine of this list that holds a row `tried` names, where `whole`
+    /// does not hold it yet, and takes nothing out of `whole`.
+    pub(crate) fn more_tried_engines(&self, tried: &[WorkerId], whole: &mut Vec<WorkerId>) {
         for &id in tried {
             let Some(place) = self.place_of(id) else {
                 continue;
@@ -1011,12 +1068,12 @@ impl PoolRecords {
     /// Writes into `cells` the list's signal cells as the reports of
     /// `loads` state them: one cell a worker a signal the document
     /// declares, by the worker's place in the list, each sample instant on
-    /// `clock`. A report's values are made by the crate's one conversion
-    /// ([`signal_values`]) and written where a decision may read them
-    /// ([`SignalCells::write`]): under the signal's own unit, and in
-    /// range. A worker the snapshot holds no report of, and a name its
-    /// report does not state, keep a cell with no value. So does a worker
-    /// whose report is of several ranks ([`several_ranks`]).
+    /// `clock`. A report's values are written as a record states them
+    /// ([`write_signals`]): made by the crate's one conversion, under the
+    /// signal's own unit, and in range. A worker the snapshot holds no
+    /// report of, and a name its report does not state, keep a cell with
+    /// no value. So does a worker whose report is of several ranks
+    /// ([`several_ranks`]).
     ///
     /// The cells are what this snapshot's reports state and nothing more:
     /// no value of an earlier snapshot is kept.
@@ -1032,17 +1089,8 @@ impl PoolRecords {
             let Some((report, sampled_at)) = loads.report(worker.url()) else {
                 continue;
             };
-            if several_ranks(report) {
-                continue;
-            }
-            signal_values(
-                report,
-                &self.signals,
-                sampled_at,
-                |column, unit, value, at| {
-                    cells.write(fixed.position, column, unit, value, clock.micros(at));
-                },
-            );
+            let columns = &self.signals;
+            write_signals(report, sampled_at, columns, clock, fixed.position, cells);
         }
     }
 
@@ -1094,10 +1142,10 @@ impl PoolRecords {
 /// entries of the ranks that pushed while it was asked, under one instant
 /// too. A snapshot states no instant a rank.
 ///
-/// The list's cells take no named value of such a report
-/// ([`PoolRecords::write_cells`]). A value is read where its report is one
-/// rank's, as the report of a worker object that is one rank is, however
-/// it arrived.
+/// The list's cells take no named value of such a report, and a stage is
+/// told none of it ([`write_signals`]). A value is read where its report
+/// is one rank's, as the report of a worker object that is one rank is,
+/// however it arrived.
 fn several_ranks(report: &WorkerLoadResponse) -> bool {
     report.loads.len() > 1 || report.dp_rank_count > 1
 }

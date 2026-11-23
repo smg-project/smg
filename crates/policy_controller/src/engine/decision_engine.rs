@@ -1,12 +1,10 @@
 //! What a host's decisions stand on: the engine that makes a whole decision
 //! and hears what its host says of the decision's lease.
 //!
-//! Two engines are one to a host. [`StoreBackedEngine`](super::StoreBackedEngine) decides over the
-//! policy store's rows: a controller's own, and a gateway's that follows a
-//! controller. The engine of a gateway's own process decides over the
-//! gateway's worker objects and holds no store. A
-//! [`DecisionGuard`](crate::tracking::DecisionGuard) holds a decision of
-//! either, and a host's own object asks either, through [`DecisionEngine`].
+//! The engine decides over the worker objects its host lends and holds no
+//! store. A [`DecisionGuard`](crate::tracking::DecisionGuard) holds a
+//! decision of it, and a host's own object asks it, through
+//! [`DecisionEngine`].
 //!
 //! **What a guard lends.** A guard lends its engine one view of the
 //! decision it holds, with each word and with a pair's decode call
@@ -41,10 +39,9 @@ use smg_worker::load::state::LoadSnapshot;
 
 use super::{
     decision::{Decision, Pick, ShadowKind, Survivors, Target, Targets, Trace},
-    framework::{EncodeItems, EncodePlaced},
     prompt_hashes::{HashSeeds, PromptHashes},
     sticky_sessions::SessionVerdict,
-    view::{Constraints, Phase, RequestFacts, Session, WireModes, WorkerId},
+    view::{Constraints, Phase, RequestFacts, Session, SessionCountedUnder, WireModes, WorkerId},
 };
 use crate::{
     document::AppliedSpec,
@@ -90,6 +87,46 @@ pub trait RequestMaker {
     /// answers `None` here.
     fn plain(&self) -> Option<Plain> {
         None
+    }
+
+    /// The length of the request's text in characters, as the request made
+    /// would state it
+    /// ([`RequestFacts::prompt_chars`](super::view::RequestFacts::prompt_chars)):
+    /// zero for a request of token ids or of no text, and from a maker
+    /// that does not say.
+    ///
+    /// An engine that decides over its host's lists asks this where it
+    /// issues the lease of a plain request's pick, which states the
+    /// length, and nowhere else. So [`RequestMaker::plain`] stays cheap,
+    /// and a text is passed over once a request: here for a pick that is
+    /// leased ahead of the request's making, and at the making otherwise.
+    fn prompt_chars(&self) -> u32 {
+        0
+    }
+
+    /// The length of the request's text in bytes, as the request made
+    /// would state it
+    /// ([`RequestFacts::prompt_bytes`](super::view::RequestFacts::prompt_bytes)):
+    /// zero for a request of token ids or of no text, and from a maker
+    /// that does not say. Asked where [`RequestMaker::prompt_chars`] is,
+    /// for the same lease. It costs no pass over the text.
+    fn prompt_bytes(&self) -> u32 {
+        0
+    }
+
+    /// Where a worker's object counts the requests of the request's
+    /// session key ([`SessionCountedUnder`]). The trait's answer is the
+    /// key's own text, where the caller's own guard counts each request it
+    /// sends. A host that serves no request counts by the decisions it
+    /// holds on file, and answers the session's number.
+    ///
+    /// An engine that decides over its host's lists asks this for a
+    /// document with a stage that reads the count
+    /// ([`Needs::session_in_flight`](crate::document::spec::Needs::session_in_flight)),
+    /// and reads each worker's count under the name it gives
+    /// ([`SessionCountedUnder::name`]). It asks under no other document.
+    fn session_counted_under(&self) -> SessionCountedUnder {
+        SessionCountedUnder::KeyText
     }
 
     /// The workers the request may be sent to, where its host holds them:
@@ -188,6 +225,14 @@ impl RequestMaker for Request<'_> {
             prompt_tokens: facts.prompt_tokens,
         })
     }
+
+    fn prompt_chars(&self) -> u32 {
+        self.facts.prompt_chars
+    }
+
+    fn prompt_bytes(&self) -> u32 {
+        self.facts.prompt_bytes
+    }
 }
 
 /// What a plain request states ([`RequestMaker::plain`]): all that a pick
@@ -210,7 +255,9 @@ pub struct Plain {
     pub wires: WireModes,
     /// The size of its prompt in tokens, as the request made would state it
     /// ([`RequestFacts::prompt_tokens`](super::view::RequestFacts::prompt_tokens)):
-    /// a lease issued for it states the size.
+    /// a lease issued for it states the size. Its text's two lengths are
+    /// asked apart, where that lease is issued
+    /// ([`RequestMaker::prompt_chars`], [`RequestMaker::prompt_bytes`]).
     pub prompt_tokens: u32,
 }
 
@@ -244,8 +291,8 @@ pub enum WorkerLists<'a> {
     /// asked again. Such a decision does not read whether a decode takes
     /// images, so the encode entry declines a request that states the
     /// later decode where its decode is held to the ones that take images:
-    /// by its demand, or by the preference of image references beside an
-    /// image.
+    /// by its demand, or by the preference of references beside an image
+    /// or a video.
     Encode(super::policy_engine::encode::EncodeLists<'a>),
 }
 
@@ -293,8 +340,9 @@ impl fmt::Debug for TokenKey<'_> {
 /// from it in its side, in the worker it books (the decode of the pick's
 /// first target where the side was issued with its prefill, the decode of
 /// the target taken where it stood chosen), in its session
-/// ([`HeldDecode::session`]) and, behind a decode call, in its size
-/// ([`HeldDecode::tokens`]). A decode issued later is dated at its
+/// ([`HeldDecode::session`]) and, behind a decode call, in its three sizes
+/// ([`HeldDecode::tokens`], [`HeldDecode::chars`] and
+/// [`HeldDecode::bytes`]). A decode issued later is dated at its
 /// issue, the decode call's instant or its dispatch's, and its later words
 /// bear the first decision's instant, which is this lease's
 /// ([`Lifecycle::on_decision_issued`](crate::stages::Lifecycle::on_decision_issued)).
@@ -336,6 +384,12 @@ pub struct HeldDecode {
     /// side was issued with its prefill or goes out with no call, and a
     /// decode call's own once one picked the side.
     pub tokens: u32,
+    /// The characters of the text the side's words state
+    /// ([`Lease::chars`]), by the rule of [`Self::tokens`]: the first
+    /// decision's, and a decode call's own once one picked the side.
+    pub chars: u32,
+    /// The bytes of that text ([`Lease::bytes`]), by the same rule.
+    pub bytes: u32,
     /// The side stood chosen until this word: its request stated the later
     /// decode, no decode call picked it, and nothing was issued for it.
     /// The side's dispatch said under this is its issue too, dated at the
@@ -506,22 +560,6 @@ pub trait DecisionEngine {
         self.decide_decode_under(gateway, request, held, now)
     }
 
-    /// One decision for a pair with the encode `items` of its request: the
-    /// pair, and a worker for each item, written to `placed`. `placed` is
-    /// left empty where no decision is made.
-    ///
-    /// # Errors
-    ///
-    /// [`DecisionRefused`]: the engine made no decision for the request.
-    fn decide_encode_pair(
-        &self,
-        gateway: GatewayId,
-        request: &Request<'_>,
-        items: EncodeItems<'_>,
-        placed: &mut EncodePlaced,
-        now: Instant,
-    ) -> Result<DecideOutcome, DecisionRefused>;
-
     /// What the host says of a lease at `now`: a side's dispatch, a side's
     /// end, or a release. `held` is the guard's view of the decision at the
     /// word. The word names its side. Whoever applies the word tells the
@@ -532,7 +570,7 @@ pub trait DecisionEngine {
 
     /// One pass of the engine's clock at `now`, about once a second: what
     /// lives past its end is ended, and what was told of it is said.
-    fn sweep(&self, now: Instant) -> SweepOutcome;
+    fn sweep(&self, now: Instant);
 
     /// Reads the document in force. A host names a profile, reads a
     /// binding's key sources and a document's own rules here, under the
@@ -571,8 +609,7 @@ pub struct Request<'a> {
     /// under a rule with an in-flight cap. A budget of 0 leaves a decision
     /// in process unbounded. Over a link it says the request's time is spent.
     pub facts: RequestFacts<'a>,
-    /// What the host alone knows. The door writes its standing vetoes and
-    /// the pins of record over the host's.
+    /// What the host alone knows.
     pub constraints: Constraints<'a>,
 }
 
@@ -613,15 +650,6 @@ pub struct Leased {
     /// leases whose dispatch span has passed and whose dispatch is still
     /// owed.
     pub due: Instant,
-}
-
-/// What one pass of an engine's clock ended ([`DecisionEngine::sweep`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SweepOutcome {
-    /// The leases past their dispatch span, ended as abandoned.
-    pub leases: usize,
-    /// The pins of record past their end, gone from their table.
-    pub pins: usize,
 }
 
 /// Why a door has no decision for a request.

@@ -14,6 +14,7 @@ mod prober;
 
 pub(crate) use follower::WorkerObjects;
 pub(crate) use lead::ElectedLead;
+pub(crate) use load_monitor::LoadMonitor;
 pub(crate) use prober::Prober;
 
 /// The wake of the follower of the replica's worker objects: told once a

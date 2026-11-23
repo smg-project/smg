@@ -33,9 +33,9 @@ pub(super) fn engine_of(worker: &dyn Worker) -> &str {
 /// writes a replacement by id ([`Over::Replaced`]) clears it past this
 /// reading.
 ///
-/// The pairing descriptor is the standing row's here too. A door whose rows
-/// hold one states the worker's own in its place (`paired`, below). The
-/// controller's door states none: its log carries no descriptor.
+/// The pairing descriptor is the standing row's here too. A host that
+/// states the worker's own reads it of the worker ([`pairing_descriptor`]).
+/// The controller's door states none: its log carries no descriptor.
 pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts {
     let defaults = WorkerFacts::default();
     let standing = standing.unwrap_or(&defaults);
@@ -115,6 +115,10 @@ fn thresholds(spec: &WorkerSpec) -> Overload {
 /// A replacement is its maker's whole statement of what a registration can
 /// state, so a threshold it leaves out is cleared. An add finds no row to
 /// keep one from. An upsert and an update keep the standing row's.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the replica's own door reads a worker so")
+)]
 pub(crate) fn stated(
     built: &dyn Worker,
     standing: Option<&WorkerFacts>,
@@ -159,21 +163,6 @@ pub fn pairing_descriptor(worker: &dyn Worker) -> Option<Arc<PairingDescriptor>>
     (descriptor != PairingDescriptor::default()).then(|| Arc::new(descriptor))
 }
 
-/// [`stated`], with the pairing descriptor `built` derived at its build in
-/// place of the standing row's ([`pairing_descriptor`]): the reading of a
-/// door whose rows hold a descriptor. A worker that reports nothing
-/// withdraws the standing one.
-pub(crate) fn paired(
-    built: &dyn Worker,
-    standing: Option<&WorkerFacts>,
-    over: Option<Over<'_>>,
-) -> WorkerFacts {
-    WorkerFacts {
-        pairing: pairing_descriptor(built),
-        ..stated(built, standing, over)
-    }
-}
-
 /// Convert the worker's seconds to the policy's milliseconds, up to the
 /// largest interval the row can hold.
 fn milliseconds(seconds: u64) -> u32 {
@@ -191,7 +180,7 @@ mod tests {
         worker::{HealthCheckConfig, OverloadUpdate, RuntimeType, WorkerSpec},
     };
 
-    use super::{facts, paired, pairing_descriptor};
+    use super::{facts, pairing_descriptor};
     use crate::{
         document::spec::Pairing,
         engine::{
@@ -399,16 +388,13 @@ mod tests {
         let read = pairing_descriptor(&padded).expect("a descriptor");
         assert_eq!(read.transport.as_deref(), Some("custom"));
 
-        // A worker that reports nothing offers no descriptor, and withdraws
-        // the standing row's at a door that reads its own.
+        // A worker that reports nothing offers no descriptor.
         let silent = offering(RuntimeType::Sglang, &[("version", " ")]);
         assert_eq!(pairing_descriptor(&silent), None);
         let standing = WorkerFacts {
             pairing: Some(stated),
             ..WorkerFacts::default()
         };
-        assert_eq!(paired(&silent, Some(&standing), None).pairing, None);
-        assert_eq!(paired(&worker, None, None).pairing, standing.pairing);
         // The table states the standing row's descriptor, and none of its own.
         assert_eq!(facts(&worker, None).pairing, None);
         assert_eq!(facts(&silent, Some(&standing)).pairing, standing.pairing);
@@ -467,7 +453,10 @@ mod tests {
         ];
         let rows: Vec<_> = fleet
             .iter()
-            .map(|worker| paired(worker, None, None))
+            .map(|worker| WorkerFacts {
+                pairing: pairing_descriptor(worker),
+                ..facts(worker, None)
+            })
             .collect();
         let modes = [
             (Pairing::Strict, PdPairingMode::Strict),
@@ -521,7 +510,7 @@ mod tests {
     }
 
     /// A threshold of the object's own under half a permille is held as
-    /// one, as a document's is.
+    /// one.
     #[test]
     fn a_threshold_under_half_a_permille_is_held_as_one() {
         let spec = WorkerSpec {

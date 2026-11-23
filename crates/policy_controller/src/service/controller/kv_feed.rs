@@ -3,12 +3,7 @@
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashSet,
-        future::Future,
-        sync::Arc,
-        time::{Duration, Instant},
-    };
+    use std::{collections::HashSet, future::Future, sync::Arc, time::Duration};
 
     use kv_index::compute_content_hash;
     use mock_worker::{config::Config as MockConfig, engine::EngineParams, grpc};
@@ -31,19 +26,17 @@ mod tests {
 
     use crate::{
         document::{AppliedSpec, PolicySpec},
-        engine::view::{Role, WireModes, WorkerId as RowId},
+        engine::view::{WireModes, WorkerId as RowId},
         service::controller::{
             config::tests::valid,
             worker_objects::{ObjectsWake, WorkerObjects},
             Controller,
         },
         store::{
-            AffinityQuery, AffinityRowsBuffers, GatewayId, KvEventSink as _, MemoryStore,
-            Registrant, Signals, ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore,
+            KvEventSink as _, MemoryStore, Registrant, Signals, WorkerFacts, WorkerStatus,
+            WorkersStore,
         },
-        worker_host::{
-            KvFeed, Members, MembershipWriter as _, Objects, Precondition, StoreMembershipWriter,
-        },
+        worker_host::{KvFeed, Members, MembershipWriter as _, Objects, Precondition, StoreDoor},
     };
 
     const MODEL: &str = "m";
@@ -240,7 +233,7 @@ mod tests {
         f.store
             .apply(AppliedSpec::validate(&spec).expect("the preset validates"))
             .expect("the first generation");
-        let door = StoreMembershipWriter::new(Arc::clone(&f.store));
+        let door = StoreDoor::new(Arc::clone(&f.store));
         f.check(async {
             door.found(&Registrant::Control, Precondition::Absent, FIRST, &|_| {
                 facts(FIRST, WireModes::GRPC, false)
@@ -567,44 +560,9 @@ mod tests {
             .expect("the feed dials through the worker object's connector");
 
             let hashes = [compute_content_hash(&tokens).0];
-            let holders = || {
-                store.deciding(|world| {
-                    let gateway = GatewayId(0);
-                    let ask = ViewQuery {
-                        gateway,
-                        now: Instant::now(),
-                        pinned: None,
-                        affinity: false,
-                        signal_cells: false,
-                    };
-                    let mut view = ViewBuffers::default();
-                    let built = world
-                        .build(MODEL, Role::Single, &ask, &mut view)
-                        .expect("the worker's pool");
-                    let naming = AffinityQuery {
-                        gateway,
-                        block_hashes: &hashes,
-                        namespace_seed: 0,
-                        seed: 0,
-                        cap: 0,
-                        wires: None,
-                        now_micros: built.now_micros,
-                    };
-                    let mut named = AffinityRowsBuffers::default();
-                    world.fill_affinity_rows(
-                        MODEL,
-                        Role::Single,
-                        &naming,
-                        &view.candidates,
-                        &mut named,
-                    );
-                    named
-                        .holders
-                        .iter()
-                        .map(|h| (view.candidates[h.row as usize].id, h.overlap_blocks))
-                        .collect::<Vec<_>>()
-                })
-            };
+            // The workers the model's index holds a leading block of the
+            // request for, each with its count of them.
+            let holders = || store.kv().overlaps(MODEL, &hashes);
             assert!(holders().is_empty());
             let client = SchedulerClient::connect(&url)
                 .await

@@ -37,6 +37,10 @@
 //! answered a [`Placement`], which it keeps with the request, or the reason
 //! there is none ([`Unplaced`]).
 //!
+//! A single request that names its worker, under a document whose binding
+//! says which header names it, is held to that one worker and goes to no
+//! other ([`target`]).
+//!
 //! A request with a pair's two lists is placed a target at a time over both
 //! its workers ([`pair`]), three decisions a call at most. Its later
 //! decisions are not held to the workers the rule takes.
@@ -55,22 +59,20 @@
 mod decode_again;
 mod encode;
 mod pair;
+mod target;
 
 use std::{
     any::Any,
     cell::{Cell, OnceCell},
-    collections::hash_map::RandomState,
     fmt,
-    hash::BuildHasher,
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     sync::Arc,
-    thread,
     time::Instant,
 };
 
 use smg_worker::identity::basic::Worker;
 
-use super::PolicyEngine;
+use super::{Loaded, PolicyEngine};
 use crate::{
     document::{
         spec::{AppliedSpec, DecodePick},
@@ -85,16 +87,18 @@ use crate::{
         demands::Demands,
         framework::EncodeItems,
         list_cell::LentList,
-        prompt_hashes::{prompt_tokens_of, HashSeeds, PromptHashes},
+        prompt_hashes::{
+            prompt_bytes_of, prompt_chars_of, prompt_tokens_of, HashSeeds, PromptHashes,
+        },
         records::worker_id,
         view::{
             Constraints, Header, Identity, MediaCounts, Phase, RequestFacts, WireModes, WorkerId,
         },
     },
-    policies::consistent_hashing::LentRing,
+    fresh_seed,
+    policies::consistent_hashing::{Head, LentRing},
     store::GatewayId,
     tracking::{lease::ReleaseReason, DecisionGuard, Placement},
-    Draw,
 };
 
 /// A request's headers, as its caller holds them.
@@ -275,9 +279,9 @@ pub struct PlaceRequest<'a> {
     /// under every document. The word is a pair's: over one list it asks
     /// nothing, and a first attempt that carries it is plain still. An
     /// encode request whose decode is held to the workers that take images
-    /// ([`EncodeItems::decode_images`], or references beside an image)
-    /// books its decode with its prefill whatever it states here: a decode
-    /// asked again reads no image fact.
+    /// ([`EncodeItems::decode_images`], or references beside an image or a
+    /// video) books its decode with its prefill whatever it states here: a
+    /// decode asked again reads no image fact.
     pub decode_again: bool,
     /// The hash ring the caller keeps of the model's workers, lent to the
     /// request's decision ([`LentRing`]): one ring for a pair's two lists,
@@ -285,8 +289,13 @@ pub struct PlaceRequest<'a> {
     /// routing value by its own text, the value goes to the worker this
     /// ring's walk reaches, where the caller's own ring policy puts it:
     /// the engine reads the value's place on the ring with the request's
-    /// keys. Under any other document the ring is asked nothing. `None`
-    /// from a caller that keeps no ring: the stage places by its own.
+    /// keys. Under the prefix form of the ring stage the engine asks the
+    /// ring where each head of the request stands
+    /// ([`LentRing::head_position`]). A ring that answers nothing for a
+    /// head is asked nothing more and is not lent, and neither is a ring
+    /// to a request that has no head. Under any other document the ring
+    /// is asked nothing. `None` from a caller that keeps no ring: the
+    /// stage places by its own.
     pub ring: Option<&'a dyn LentRing>,
     /// The route's own rule for a worker its request may be sent to, and
     /// `None` for a route that has none. It is asked of the workers the
@@ -310,7 +319,9 @@ pub struct PlaceRequest<'a> {
     /// worker before. It is asked of no pair's list: a pair's worker it
     /// refuses is passed over like one that is not ready. A rule that
     /// holds for every request of a route belongs to the list its caller
-    /// hands.
+    /// hands. For a single request that names its worker
+    /// ([`PolicyEngine::place`]) it is asked ahead of the call's decision
+    /// too, of each available worker the request's number counts.
     ///
     /// Where a pair's decode is decided again on its decode side
     /// ([`PlacementSide::decode_again`](crate::tracking::PlacementSide::decode_again)),
@@ -365,25 +376,6 @@ impl<'a> PlaceRequest<'a> {
     }
 }
 
-/// A seed no other request of this thread was given: the one randomness a
-/// stage gets ([`RequestFacts::seed`]). Under a constant seed a policy that
-/// draws picks the same worker of an unchanged pool every time.
-///
-/// Each thread walks a draw sequence of its own ([`Draw`]). Its start is
-/// the standard library's process-random hash of the thread's id, so two
-/// threads and two runs of a process start apart.
-fn fresh_seed() -> u64 {
-    thread_local! {
-        static NEXT: Cell<u64> = Cell::new(RandomState::new().hash_one(thread::current().id()));
-    }
-    NEXT.with(|next| {
-        let mut draw = Draw::new(next.get());
-        let seed = draw.next_u64();
-        next.set(draw.state());
-        seed
-    })
-}
-
 /// One request as the engine makes it of what its caller stated: the one
 /// place a fact of a request is made.
 pub(super) struct Made<'r, 'a> {
@@ -404,9 +396,11 @@ pub(super) struct Made<'r, 'a> {
     /// The prompt's block hashes, made at the request's first making and
     /// borrowed by each one after it.
     hashes: OnceCell<PromptHashes>,
-    /// The cell of the call the request is asked in ([`Call`]): the hashes
-    /// are then made in it, once a call, and `hashes` stays empty.
-    of_call: Option<&'r OnceCell<PromptHashes>>,
+    /// The call the request is asked in ([`Call`]): the hashes are then
+    /// made in its cell, once a call, and `hashes` stays empty. Where the
+    /// call says so, the request is made with no routing value and no
+    /// client's value, whatever its sources hold ([`Call::unkeyed`]).
+    of_call: Option<&'r Call>,
     /// The headers of the document's view that the request carries, made
     /// at the request's first making like the hashes.
     headers: OnceCell<Vec<Header<'a>>>,
@@ -417,6 +411,10 @@ pub(super) struct Made<'r, 'a> {
     /// at the request's first making and borrowed by each one after it:
     /// none where the request carries no key or is lent no ring.
     place: OnceCell<Option<u64>>,
+    /// Where the request's heads stand on that ring under the prefix form
+    /// of the ring stage: asked of the lender at the request's first
+    /// making, like the key's place.
+    heads: OnceCell<Places>,
     /// The panic of the route's rule where it was asked inside the lookup
     /// of a lent token tree ([`RequestMaker::sends_to`]): kept for the
     /// call, which raises it again outside the decision ([`raise`]).
@@ -490,6 +488,7 @@ impl<'r, 'a> Made<'r, 'a> {
             headers: OnceCell::new(),
             key: Cell::new(None),
             place: OnceCell::new(),
+            heads: OnceCell::new(),
             panicked: OnceCell::new(),
             sent: Cell::new(Sent::NONE),
         }
@@ -499,18 +498,16 @@ impl<'r, 'a> Made<'r, 'a> {
     /// the call missed so far, is held to the places the call keeps
     /// ([`Call::admitted`]), and borrows the prompt's hashes where an
     /// earlier ask of the call made them. The headers of the document's
-    /// view and the key's place on a lent ring are made again by each ask
-    /// that makes the request: a later ask is the call's cold path.
+    /// view and the key's place on a lent ring, or the heads' places, are
+    /// made again by each ask that makes the request: a later ask is the
+    /// call's cold path.
     pub(super) fn asked(
         engine: &'a PolicyEngine,
         request: &'r PlaceRequest<'a>,
         call: &'r Call,
     ) -> Self {
-        // The places are kept behind a target the rule refused, which the
-        // call missed: a request held to them is never plain.
-        debug_assert!(call.admitted.is_none() || !call.missed.is_empty());
         Self {
-            of_call: Some(&call.hashes),
+            of_call: Some(call),
             places: call.admitted.as_deref(),
             ..Self::new(engine, request, call.missed.as_slice())
         }
@@ -525,34 +522,157 @@ impl<'r, 'a> Made<'r, 'a> {
 
     /// The request's routing value and its client's value, by the sources
     /// its binding names in the engine's document, with where the value a
-    /// ring places it by stands on `ring`
+    /// ring places it by stands on a ring, as `place` answers for that
+    /// value's text and for whether it is the client's
     /// ([`KeySources::derive_keys`](crate::document::KeySources::derive_keys)).
     /// The routing value is the first source that holds one; none where
     /// the binding names no source or none holds a value. The client's
     /// value is read only where the request has no routing value: it
-    /// places where no session does.
-    fn keys(&self, ring: Option<&dyn LentRing>) -> DerivedKeys<'a> {
+    /// places where no session does. A request its call makes with no key
+    /// has neither ([`Call::unkeyed`]).
+    fn keys(&self, place: impl FnOnce(&str, bool) -> Option<u64>) -> DerivedKeys<'a> {
         let request = self.request;
         let spec = self.engine.spec();
-        let Some(sources) = spec.key_sources_for(request.model, request.phase()) else {
+        let sources = spec.key_sources_for(request.model, request.phase());
+        let unkeyed = || self.of_call.is_some_and(|call| call.unkeyed);
+        let Some(sources) = sources.filter(|_| !unkeyed()) else {
             return DerivedKeys::default();
         };
         let headers = request.headers;
         let header = move |name: &str| headers.header(name);
-        sources.derive_keys(header, request.request_id, ring)
+        sources.derive_keys_by(header, request.request_id, place)
     }
 
-    /// The ring the request's caller lends, where a stage of the profile
-    /// that decides the request places a routing value by its own text
-    /// ([`Engine::states_key_place`](crate::engine::Engine::states_key_place)),
-    /// and none under any other profile. The prefix form of the ring is
-    /// asked for another text, whose place this maker does not state: such
-    /// a request is lent no ring, and its stage places by its own.
-    fn ring(&self) -> Option<&'a dyn LentRing> {
+    /// The request's keys, the ring its decision is lent and where the
+    /// request stands on it, by the word of the profile that decides the
+    /// request. A stage that places a routing value by its own text
+    /// ([`Engine::states_key_place`](crate::engine::Engine::states_key_place))
+    /// is stated that text's place, read with the keys. The prefix form of
+    /// the ring
+    /// ([`Engine::states_head_places`](crate::engine::Engine::states_head_places))
+    /// is stated where the lender puts each head of the request
+    /// ([`LentRing::head_position`]): the routing value where the request
+    /// carries one, else the prompt's heads, the deepest first. A lender
+    /// that places no head lends no ring, a request that has no head is
+    /// lent none, and a request under any other profile lends none: its
+    /// stage places by its own. The lender is asked at the first making
+    /// of one ask of the call, and a later making of that ask borrows
+    /// what it answered. A call that asks again makes its request anew,
+    /// and asks the lender again.
+    fn stated<'w>(
+        &'w self,
+        spec: &'w AppliedSpec,
+    ) -> (DerivedKeys<'a>, Option<&'a dyn LentRing>, &'w [u64]) {
         let request = self.request;
-        let engine = self.engine.spec().engine();
-        let ring = request.ring;
-        ring.filter(|_| engine.states_key_place(request.model, request.phase()))
+        let (model, phase) = (request.model, request.phase());
+        let Some(ring) = request.ring else {
+            return (self.keys(|_, _| None), None, &[]);
+        };
+        // The two questions are asked of one lookup of the binding.
+        let engine = spec.engine();
+        let profiles = engine.ring_profiles(model, phase);
+        if engine.key_place_of(profiles) {
+            let first = self.place.get().is_none();
+            let keys = self.keys(|text, _| first.then(|| ring.position(text)));
+            let place = self.place.get_or_init(|| keys.ring_position);
+            return (keys, Some(ring), place.as_slice());
+        }
+        let Some(rule) = engine.head_rule_of(profiles) else {
+            return (self.keys(|_, _| None), None, &[]);
+        };
+        // A routing value leads the prompt: its text is the one head. A
+        // client's value places nothing under this form.
+        let key_at = Cell::new(None);
+        let first = self.heads.get().is_none();
+        let keys = self.keys(|text, client| {
+            if first && !client {
+                key_at.set(Some(ring.head_position(Head::Text(text))));
+            }
+            None
+        });
+        let heads = self.heads.get_or_init(|| {
+            let mut places = Places::default();
+            match key_at.take() {
+                Some(answer) => places.state(answer),
+                None => {
+                    let (tokens, text) = (request.prompt.tokens, request.prompt.text);
+                    rule.heads(tokens, text, |head| {
+                        // A lender that places no head is asked nothing more.
+                        if !places.unplaced {
+                            places.state(ring.head_position(head));
+                        }
+                    });
+                    places.turn();
+                }
+            }
+            places
+        });
+        // The ring is lent with a place: a request that has no head, and
+        // one whose lender places none, state nothing and lend nothing.
+        let places = heads.as_slice();
+        let ring = (!places.is_empty()).then_some(ring);
+        (keys, ring, places)
+    }
+}
+
+/// How many of a request's places on a lent ring its maker keeps in the
+/// list itself ([`Places`]).
+const HEADS_INLINE: usize = 8;
+
+/// Where a request's heads stand on the ring its caller lends, as the
+/// lender answered for each ([`Made::stated`]). As many as [`HEADS_INLINE`]
+/// stand in the list itself. A prompt that reaches more boundaries has its
+/// list on the heap, made once an ask of the call: the gateway's own
+/// policy lists every boundary a prompt reaches
+/// (`model_gateway/src/policies/prefix_hash.rs`, lines 172 to 180 at
+/// 882be6f4f).
+#[derive(Default)]
+struct Places {
+    inline: [u64; HEADS_INLINE],
+    /// How many places `inline` holds, while `spilled` holds none.
+    len: usize,
+    spilled: Vec<u64>,
+    /// The lender places no head: the request is lent no ring and states
+    /// no place.
+    unplaced: bool,
+}
+
+impl Places {
+    /// The lender's answer for one head, behind those stated so far.
+    fn state(&mut self, answer: Option<u64>) {
+        let Some(place) = answer else {
+            self.unplaced = true;
+            return;
+        };
+        if self.spilled.is_empty() && self.len < HEADS_INLINE {
+            self.inline[self.len] = place;
+            self.len += 1;
+            return;
+        }
+        if self.spilled.is_empty() {
+            self.spilled.extend_from_slice(&self.inline);
+        }
+        self.spilled.push(place);
+    }
+
+    /// The list turned round: its heads were stated the shallowest first.
+    fn turn(&mut self) {
+        if self.spilled.is_empty() {
+            self.inline[..self.len].reverse();
+        } else {
+            self.spilled.reverse();
+        }
+    }
+
+    /// The places, and none where the lender places no head.
+    fn as_slice(&self) -> &[u64] {
+        if self.unplaced {
+            &[]
+        } else if self.spilled.is_empty() {
+            &self.inline[..self.len]
+        } else {
+            &self.spilled
+        }
     }
 }
 
@@ -565,11 +685,9 @@ impl RequestMaker for Made<'_, '_> {
         let request = self.request;
         // The engine decides under its one document, the one it hands here.
         debug_assert!(std::ptr::eq(spec, self.engine.spec()));
-        let ring = self.ring();
-        // The key's place is taken at the first making: a later one hands
-        // the keys' reader no ring, and nothing is hashed again.
-        let keys = self.keys(ring.filter(|_| self.place.get().is_none()));
-        let place = self.place.get_or_init(|| keys.ring_position);
+        // The request's place is taken at the first making: a later one
+        // asks the ring nothing, and nothing is hashed again.
+        let (keys, ring, places) = self.stated(spec);
         let session_key = keys.session.map_or(Identity::NONE, |derived| derived.key);
         self.key.set(session_key.plain);
         // The headers the document's view shows a stage, each named by its
@@ -598,7 +716,7 @@ impl RequestMaker for Made<'_, '_> {
             session_key,
             client_key: keys.client_key,
             ring,
-            ring_positions: place.as_slice(),
+            ring_positions: places,
             attempt: request.attempt,
             tried: request.tried,
             budget_micros: self.budget_micros,
@@ -609,23 +727,34 @@ impl RequestMaker for Made<'_, '_> {
         };
         let (tokens, text) = (request.prompt.tokens, request.prompt.text);
         if tokens.is_some() || text.is_some() {
-            let hashes = self.of_call.unwrap_or(&self.hashes).get_or_init(|| {
+            let cell = self.of_call.map_or(&self.hashes, |call| &call.hashes);
+            let hashes = cell.get_or_init(|| {
+                // By the id the list's workers registered under, as their
+                // table finds its index: a request may name the model by
+                // another.
+                let listed = match &request.lists {
+                    WorkerLists::None => None,
+                    WorkerLists::Single(list) => list.workers.first(),
+                    WorkerLists::Pair(lists) => lists.prefill.workers.first(),
+                    WorkerLists::Encode(lists) => lists.pair.prefill.workers.first(),
+                };
+                let model = listed.map_or(request.model, |worker| worker.model_id());
                 self.engine
-                    .prompt_hashes(request.model, tokens, text, request.prompt.seeds)
+                    .prompt_hashes(model, tokens, text, request.prompt.seeds)
             });
             hashes.write_to(&mut facts);
         }
         // The document's word, like the keys: read from the generation
         // that decides. An encode request whose decode is held to the ones
-        // that take images, by its demand or by the preference of image
-        // references, states no later decode: a decode asked again reads
-        // no image fact. The hold is read last, so a request that asks no
-        // decode again reads none of it.
+        // that take images, by its demand or by the preference of
+        // references beside pixels, states no later decode: a decode asked
+        // again reads no image fact. The hold is read last, so a request
+        // that asks no decode again reads none of it.
         let later = request.decode_again
             && spec.decode_pick() == DecodePick::AfterPrefill
             && !request
                 .encode
-                .is_some_and(|items| items.holds_decode_to_images(request.media.images > 0));
+                .is_some_and(|items| items.holds_decode_to_images(request.media.holds_pixels()));
         Request {
             id: request.request_id.map_or(&[], str::as_bytes),
             facts,
@@ -639,22 +768,39 @@ impl RequestMaker for Made<'_, '_> {
         }
     }
 
-    // A first attempt that names nothing tried or missed, demands nothing,
-    // carries no encode item and asks no decode again is plain. Its size
+    // A first attempt that names nothing tried or missed, is held to no
+    // place of its list, demands nothing, carries no encode item and asks
+    // no decode again is plain. Its size
     // is the one the request made would state. A decode asked again is a
     // pair's word, over its two lists or an encode request's three: over
     // one list it asks nothing, and the request is plain still.
     fn plain(&self) -> Option<Plain> {
         let request = self.request;
         let first = request.attempt == 0 && request.tried.is_empty() && self.missed.is_empty();
+        let first = first && self.places.is_none();
         let pair = matches!(request.lists, WorkerLists::Pair(_) | WorkerLists::Encode(_));
         let again = request.decode_again && pair;
         let asks_more = !request.demands.is_none() || request.encode.is_some() || again;
         (first && !asks_more).then(|| Plain {
             phase: request.phase(),
             wires: WireModes::NONE,
-            prompt_tokens: prompt_tokens_of(request.prompt.tokens, request.prompt.text),
+            prompt_tokens: prompt_tokens_of(request.prompt.tokens),
         })
+    }
+
+    // Asked where a plain request's pick is leased, ahead of its making:
+    // the hashing counts the text of a request that is made, so a text is
+    // passed over once.
+    fn prompt_chars(&self) -> u32 {
+        let prompt = self.request.prompt;
+        let sized = self.engine.spec().needs().prompt_size;
+        prompt_chars_of(prompt.tokens, prompt.text, sized)
+    }
+
+    // The text's bytes, for the same lease: its length is at hand.
+    fn prompt_bytes(&self) -> u32 {
+        let prompt = self.request.prompt;
+        prompt_bytes_of(prompt.tokens, prompt.text)
     }
 
     fn workers(&self) -> WorkerLists<'_> {
@@ -727,8 +873,9 @@ pub enum Unplaced {
         /// The stage that left no worker, what of the request the engine
         /// does not decide, or what of the request ended its call: a
         /// route's rule that takes no worker of the list (`admits`), a
-        /// budget the call's earlier decisions used up (`budget`). A
-        /// caller's refusal line names it.
+        /// budget the call's earlier decisions used up (`budget`), a
+        /// worker the request names that cannot take it
+        /// (`target-worker`). A caller's refusal line names it.
         emptied_by: &'static str,
         /// The seconds after which a retry may find room: a caller's
         /// retry hint.
@@ -825,7 +972,7 @@ const fn declined(stated: &'static str) -> Unplaced {
 /// a decode decided again is asked through its guard ([`decode_again`]).
 #[inline]
 pub(super) fn decide(
-    engine: &PolicyEngine,
+    engine: Loaded<'_, '_>,
     made: &Made<'_, '_>,
 ) -> Result<(Decided, Option<Instant>), DecisionRefused> {
     let dated = Cell::new(None);
@@ -876,7 +1023,7 @@ pub(super) type Sides = (Arc<dyn Worker>, Option<Arc<dyn Worker>>);
 /// The decision's shed or its queue ([`picked`]).
 #[inline]
 pub(super) fn walk<'a>(
-    engine: &'static PolicyEngine,
+    engine: Loaded<'static, '_>,
     decided: DecideOutcome,
     later: bool,
     now: Instant,
@@ -898,7 +1045,7 @@ pub(super) fn walk<'a>(
         match catch_unwind(AssertUnwindSafe(ask)) {
             Ok(held) => held,
             Err(panic) => {
-                give_up(engine, decided, later, now);
+                give_up(engine.object, decided, later, now);
                 resume_unwind(panic)
             }
         }
@@ -906,7 +1053,7 @@ pub(super) fn walk<'a>(
         ask()
     };
     let Some((index, (worker, decode))) = held else {
-        give_up(engine, decided, later, now);
+        give_up(engine.object, decided, later, now);
         for id in failed.into_iter().flatten().flatten() {
             if !missed.contains(&id) {
                 missed.push(id);
@@ -1014,8 +1161,17 @@ pub(super) struct Call {
     /// decision none of whose targets could be sent to where the rule
     /// refused one that was ready ([`hold_to_rule`]). The call's later
     /// asks are held to them ([`Constraints::places`]). `None` ahead of
-    /// that decision, and for a request with no rule.
+    /// that decision, and for a request with no rule. For a request that
+    /// names its worker they are that worker's one place, from ahead of
+    /// the call's first ask ([`target`]), and the rule is not asked of
+    /// the list again.
     admitted: Option<Vec<u32>>,
+    /// Whether the call's requests are made with no routing value and no
+    /// client's value: a request that names its worker over a list none of
+    /// whose workers can be sent to ([`target`]). The worker a request
+    /// names outranks its routing value, so that value keeps no worker
+    /// over a veto.
+    unkeyed: bool,
     /// The instant of the call's first ask, for a request that states a
     /// budget: the budget is counted from it ([`Call::left`]). `None` for
     /// a request that states no budget: no clock is read for its budget.
@@ -1079,7 +1235,7 @@ impl Call {
 /// decision's filters compare. The engine's value of the list holds the
 /// records, and the ask's decision filled the list's cell, so this ask of
 /// the cell fills nothing.
-fn named(engine: &PolicyEngine, list: Option<LentList<'_>>, place: u32) -> Option<WorkerId> {
+fn named(engine: Loaded<'_, '_>, list: Option<LentList<'_>>, place: u32) -> Option<WorkerId> {
     let records = engine
         .members_of(list?)
         .records(&engine.document.spec, &engine.clock);
@@ -1118,18 +1274,18 @@ fn raise(
 /// Where the rule refused one of them that was ready, the call's later
 /// asks are held to the workers the rule takes ([`hold_to_rule`]).
 fn single<'a>(
-    engine: &'static PolicyEngine,
+    engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
     list: Option<LentList<'_>>,
     call: &mut Call,
 ) -> Result<Placement<'a>, Unplaced> {
     let mut made = Made {
         budget_micros: call.left(request)?,
-        ..Made::asked(engine, request, call)
+        ..Made::asked(engine.object, request, call)
     };
     let decided = decide(engine, &made);
     if let Some(panic) = made.panicked.take() {
-        raise(engine, panic, decided);
+        raise(engine.object, panic, decided);
     }
     let (decided, dated) = decided.map_err(Unplaced::Refused)?;
     let (key, sent) = (made.key(), made.sent.get());
@@ -1296,6 +1452,31 @@ impl PolicyEngine {
     /// is read by its state alone: the route's rule is asked of the pair's
     /// two workers. With no item the three lists are placed as their pair.
     ///
+    /// A single request may name its worker. Under a document whose
+    /// binding names a target source
+    /// ([`KeySourceSpec::target`](crate::document::spec::KeySourceSpec::target)),
+    /// the header's number counts, from 0 and in the list's order, the
+    /// workers of the request's list it can be sent to when the call reads
+    /// them: available by the worker's own test, and taken by the route's
+    /// rule, which is asked of each available worker up to the one the
+    /// number reaches. So a number names another worker while one ahead of
+    /// it is down, and a worker over its overload thresholds is not
+    /// counted. The call's one decision is held to the place of the worker
+    /// the number reaches ([`Constraints::places`]), ahead of the
+    /// request's routing value and of every other rule of the document:
+    /// its filters read the worker, and a retry is handed the worker it
+    /// tried. The request goes to that worker or to none. It is shed with
+    /// no endpoint, under `target-worker`, where the header's text is no
+    /// number, fewer workers can be sent to, the decision names no worker
+    /// because of the worker, or the worker cannot be sent to after all.
+    /// Where no worker of the list can be sent to, there is none to count:
+    /// the request is placed as one that names no worker, by the binding's
+    /// rule for workers that are all vetoed, and with no routing value,
+    /// which a named worker outranks. A header that is absent, empty or
+    /// not text names no worker. A pair's request and an encode request
+    /// are not read for a target: they are placed by the rest of the
+    /// document.
+    ///
     /// Declined by name ([`ShedReason::PolicyDeclined`]): a request that
     /// carries encode items over other lists than an encode request's
     /// three (`encode-items`). A pair that states a demand is shed with no
@@ -1343,14 +1524,21 @@ impl PolicyEngine {
         if request.encode.is_some() && !matches!(request.lists, WorkerLists::Encode(_)) {
             return Err(declined(ENCODE_ITEMS));
         }
+        let own = self.loaded();
         match request.lists {
-            WorkerLists::Pair(ref lists) => pair::place(self, request, lists, &mut Call::default()),
-            WorkerLists::Single(list) => single(self, request, Some(list), &mut Call::default()),
-            WorkerLists::None => single(self, request, None, &mut Call::default()),
+            WorkerLists::Pair(ref lists) => pair::place(own, request, lists, &mut Call::default()),
+            // Whether a binding names a target source was decided when the
+            // document was applied: under one that names none, a request
+            // pays this test and no read of a header.
+            WorkerLists::Single(list) if own.document.spec.names_target() => {
+                target::single(own, request, list)
+            }
+            WorkerLists::Single(list) => single(own, request, Some(list), &mut Call::default()),
+            WorkerLists::None => single(own, request, None, &mut Call::default()),
             // A pair's lists and an encode request's are read where the
             // request holds them: a copy of either here costs every request
             // a larger frame.
-            WorkerLists::Encode(ref lists) => encode::three(self, request, lists),
+            WorkerLists::Encode(ref lists) => encode::three(own, request, lists),
         }
     }
 }

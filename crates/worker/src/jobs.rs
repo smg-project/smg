@@ -42,10 +42,19 @@ pub enum WorkerJobAsker {
 /// Semantics of the final worker registry write.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkerRegistrationMode {
-    /// `POST /workers`: fail when the URL is already registered.
+    /// `POST /workers`: fail when a worker stands at the URL, the plain one
+    /// or a rank worker at `{url}@{rank}`, whoever registered it.
     CreateOnly,
-    /// Startup and service discovery: register the URL, replacing whatever
-    /// holds it. Both reconcile declared state against the registry.
+    /// Startup and service discovery: register the URL, replacing every
+    /// worker this node registered at it, each under its own address. Both
+    /// reconcile declared state against the registry. A registration that
+    /// would leave one of them beside its own is refused and changes
+    /// nothing: one that reads ranks where a plain worker stands, no ranks
+    /// where rank workers stand, or fewer ranks than stand. Remove the
+    /// workers at the address to register the new shape. A worker imported
+    /// from a peer is claimed where the registration writes its address. A
+    /// peer's worker of another shape is left, and the engine can stand
+    /// twice on this node until the peer's state changes.
     #[default]
     Upsert,
     /// `PUT /workers/{id}`: replace the worker only while `worker_id` still

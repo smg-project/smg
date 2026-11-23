@@ -50,8 +50,7 @@ use smg_policy_controller::{
         },
     },
     store::{
-        HealthPolicy, JournalKinds, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus,
-        WorkersStore,
+        HealthPolicy, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore,
     },
 };
 use tokio::{
@@ -918,7 +917,7 @@ fn churn(store: &MemoryStore, stop: &AtomicBool) -> u32 {
 /// Waits, within 20 s, until `store` wrote past position `seq`.
 async fn written_past(store: &MemoryStore, seq: u64) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    while store.checkpoint(JournalKinds::Watched).at.seq <= seq {
+    while store.checkpoint().at.seq <= seq {
         assert!(Instant::now() < deadline, "no write past {seq} in 20 s");
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
@@ -1102,7 +1101,7 @@ async fn a_store_past_one_message_restores_a_standby_whole_on_its_stream() {
         assert!(standby.parts.iter().all(|part| *part <= page));
         // Every row the leader holds, at its head, and no load row of its
         // table.
-        let held = leader.store.checkpoint(JournalKinds::Watched);
+        let held = leader.store.checkpoint();
         let at = (restored.replication_seq, restored.replication_term);
         assert_eq!(at, (held.at.seq, held.at.term));
         assert_eq!(restored.membership_epoch, held.epoch);
@@ -1227,7 +1226,7 @@ async fn operators_snapshot_numbers(workers: u32) {
         let mut cuts = Vec::new();
         for _ in 0..11 {
             let began = Instant::now();
-            let cut = leader.store.checkpoint(JournalKinds::Watched);
+            let cut = leader.store.checkpoint();
             cuts.push(began.elapsed().as_micros());
             assert_eq!(cut.rows.len(), workers as usize);
         }
@@ -1723,7 +1722,7 @@ impl Replica {
     /// What the replica holds, without its instants: its place, then its
     /// epoch and its rows.
     fn held(&self) -> ((u64, u64), impl PartialEq + std::fmt::Debug) {
-        let cut = self.store.checkpoint(JournalKinds::Watched);
+        let cut = self.store.checkpoint();
         let rows: Vec<_> = cut
             .rows
             .into_iter()
@@ -1734,7 +1733,8 @@ impl Replica {
 
     /// How many load rows the replica's own table holds.
     fn load_rows(&self) -> usize {
-        self.store.checkpoint(JournalKinds::All).loads.len()
+        let rows = self.store.checkpoint().rows;
+        rows.iter().map(|row| self.store.ranks(row.id)).sum()
     }
 
     /// Waits, within 20 s, until the replica stands at `place`.

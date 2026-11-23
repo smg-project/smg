@@ -468,8 +468,7 @@ fn each_workers_stated_value_is_read_at_its_place_in_the_list() {
 /// caller's own positions, and the engine reads the snapshot its decision
 /// holds. Here the caller's cells hold a value at every place. The stage
 /// reads the one value the snapshot states, and under no snapshot it reads
-/// no value at all. The store-backed engine holds the same rule in
-/// `the_door_reads_none_of_the_cells_a_caller_hands_on_the_request`.
+/// no value at all.
 #[test]
 fn cells_a_caller_put_on_the_request_are_not_read() {
     let built = built(&reads("", "best"));
@@ -949,6 +948,64 @@ async fn each_rank_that_is_a_row_reads_its_own_pushed_values() {
     let loads = published(&monitor, &channel);
     let read = read_at(&built, &asks(7, &members, Some(&loads)), later);
     assert_eq!(read, [(0, Some(6.0)), (1, None)]);
+}
+
+/// A worker that pushes its load is read its two token counts between the
+/// records that state them. A record of an event batch states neither: the
+/// worker crate's monitor keeps both as they were last stated, and its
+/// report offers each by name as old as that statement. So the rule of
+/// the two counts still keeps the worker a request fits behind such a
+/// record. Each count ends by its signal's maximum age, counted from the
+/// record that stated it: past it no worker reads a value, none has room,
+/// and the rule, which is soft, lets every worker stand.
+#[tokio::test]
+async fn a_pushing_workers_token_counts_are_read_behind_a_record_that_leaves_them_out() {
+    let built = built(&format!(
+        r#"{{"apiVersion":"smg.policy/v1","generation":1,
+            "signals":{{"kv_tokens_capacity":{{"unit":"tokens","max_age_ms":500}},
+                        "kv_tokens_used":{{"unit":"tokens","max_age_ms":500}}}},
+            "profiles":{{"p":{{"filter":["healthy",{ROOM}],
+                               "score":["least-requests"],"pick":"best"}}}}}}"#
+    ));
+    let list = pool(2);
+    let members = PublishedList::new(Arc::clone(&list));
+    let (monitor, channel) = monitor_over(&list);
+    let start = Instant::now();
+    // A request of 200 tokens fits the second worker alone.
+    for (worker, used) in list.iter().zip([900, 100]) {
+        let states = common_proto::EngineLoad {
+            num_used_tokens: Some(used),
+            max_total_num_tokens: Some(1_000),
+            ..Default::default()
+        };
+        monitor.apply_pushed_load(worker, 0, &states, start);
+    }
+    // 200 ms on each sends a record that is the core alone.
+    let core = common_proto::EngineLoad::default();
+    for worker in list.iter() {
+        monitor.apply_pushed_load(worker, 0, &core, start + Duration::from_millis(200));
+    }
+    let loads = published(&monitor, &channel);
+    let (report, sampled) = loads.report(list[0].url()).expect("a report");
+    let counts = (
+        report.loads[0].num_used_tokens,
+        report.loads[0].max_total_num_tokens,
+    );
+    assert_eq!(counts, (900, 1_000), "the entry keeps both figures");
+    let picked = |seed: u64, after: u64| {
+        let mut asks = asks(seed, &members, Some(&loads));
+        asks.request.facts.prompt_tokens = 200;
+        let now = sampled + Duration::from_millis(after);
+        first_of(&decided_at(&built.engine, &asks, now))
+    };
+    // The counts are 200 ms old at the record's sample, and end 500 ms
+    // behind the record that stated them. Read, they leave the second
+    // worker alone with room. Ended, no worker has room, every worker
+    // stands, and the first is picked too.
+    for seed in 0..16 {
+        assert_eq!(picked(seed, 300), 1, "seed {seed}");
+    }
+    assert!((0..16).any(|seed| picked(seed, 301) == 0));
 }
 
 /// A worker object that stands for several ranks and pushes its load gives

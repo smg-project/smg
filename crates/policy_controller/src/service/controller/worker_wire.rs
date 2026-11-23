@@ -19,15 +19,15 @@ use prost::Message as _;
 
 use crate::{
     document::operator::snapshot,
-    engine::view::{Role, SignalSource, WireModes, WorkerId},
+    engine::view::{Role, WireModes, WorkerId},
     service::{
         proto::{self, worker_event::Event},
         replication::{Entry, Event as Written},
     },
     store::{
-        membership::blank, GatewayId, HealthPolicy, LoadSample, MembershipChange, Overload,
-        Position, ProviderKeyError, Reachability, Registrant, Signals, WorkerFacts, WorkerPatch,
-        WorkerRow, WorkerStatus,
+        membership::blank, GatewayId, HealthPolicy, MembershipChange, Overload, Position,
+        ProviderKeyError, Reachability, Registrant, Signals, WorkerFacts, WorkerPatch, WorkerRow,
+        WorkerStatus,
     },
 };
 
@@ -527,55 +527,13 @@ pub(crate) fn member(entry: &Entry) -> Option<proto::WorkerEvent> {
     Some(event(told, entry.at.seq, *epoch, entry.at.term))
 }
 
-const fn signal_source(source: SignalSource) -> proto::SignalSource {
-    match source {
-        SignalSource::None => proto::SignalSource::None,
-        SignalSource::Events => proto::SignalSource::Events,
-        SignalSource::Scrape => proto::SignalSource::Scrape,
-        SignalSource::Relay => proto::SignalSource::Relay,
-        SignalSource::Poll => proto::SignalSource::Poll,
-    }
-}
-
-/// One rank's load row as a standby is sent it at `now`. The age is the
-/// sample's at the send: never under the age the sample arrived with.
-/// Whether the report counts resident tokens crosses beside the row: the
-/// row's zero does not say it.
-pub(crate) fn load(
-    id: WorkerId,
-    rank: u16,
-    sample: &LoadSample,
-    now: Instant,
-) -> proto::LoadSample {
-    let row = &sample.row;
-    let age = now.saturating_duration_since(sample.sampled_at).as_millis();
-    proto::LoadSample {
-        worker_id: id.0,
-        dp_rank: u32::from(rank),
-        load: Some(proto::LoadRow {
-            running: row.running,
-            queued: row.queued,
-            waiting_uncached_tokens: row.waiting_uncached_tokens,
-            kv_usage_permille: u32::from(row.kv_usage_permille),
-            active_kv_permille: u32::from(row.active_kv_permille),
-            live_rate: row.live_rate,
-            resident_tokens: row.resident_tokens,
-            report_age_ms: u32::try_from(age).unwrap_or(u32::MAX),
-            source: signal_source(row.source) as i32,
-            max_running: row.max_running,
-        }),
-        resident_counted: row.resident_counted,
-    }
-}
-
-/// A log entry as a standby is sent it at `now`. An entry this build
+/// A log entry as a standby is sent it. An entry this build
 /// cannot tell is sent with no case set: the standby reads it as one it
 /// does not know, never as nothing.
-pub(crate) fn replication(entry: &Entry, now: Instant) -> proto::ReplicationEvent {
+pub(crate) fn replication(entry: &Entry) -> proto::ReplicationEvent {
     use proto::replication_event::Event as Sent;
     let event = match &entry.event {
         Written::Member { .. } => member(entry).map(Sent::Membership),
-        Written::Load { id, rank, sample } => Some(Sent::Load(load(*id, *rank, sample, now))),
         Written::Term => Some(Sent::TermStart(proto::TermStart {})),
         Written::Generation { generation } => Some(Sent::Generation(generation_told(*generation))),
     };
@@ -1237,19 +1195,19 @@ mod tests {
     use prost::Message as _;
 
     use super::{
-        event, load, member, page, patch, refused, registration, removed, replaced, replication,
-        row, start_again, status, status_changed, told_change, told_part, told_row, Refused,
-        KEY_BYTES, LABELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
+        event, member, page, patch, refused, registration, removed, replaced, replication, row,
+        start_again, status, status_changed, told_change, told_part, told_row, Refused, KEY_BYTES,
+        LABELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
     };
     use crate::{
-        engine::view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
+        engine::view::{Role, WireModes, WorkerId},
         service::{
             proto::{self, replication_event::Event as Sent, worker_event::Event},
             replication::{Entry, Event as Written},
         },
         store::{
-            identity, GatewayId, HealthPolicy, LoadSample, LoadSource, MembershipChange, Overload,
-            Position, Reachability, Registrant, Signals, WorkerFacts, WorkerRow, WorkerStatus,
+            identity, GatewayId, HealthPolicy, MembershipChange, Overload, Position, Reachability,
+            Registrant, Signals, WorkerFacts, WorkerRow, WorkerStatus,
         },
     };
 
@@ -2690,73 +2648,11 @@ mod tests {
     }
 
     #[test]
-    fn a_load_row_is_sent_at_its_age_at_the_send() {
-        let sampled = Instant::now();
-        let sample = LoadSample {
-            row: LoadRow {
-                running: 3,
-                queued: 2,
-                waiting_uncached_tokens: 700,
-                kv_usage_permille: 815,
-                active_kv_permille: 410,
-                live_rate: 1_900,
-                resident_tokens: 64_000,
-                resident_counted: true,
-                report_age_ms: 40,
-                source: SignalSource::Events,
-                max_running: 96,
-            },
-            received_at: sampled + Duration::from_millis(40),
-            sampled_at: sampled,
-            source: LoadSource::Stream,
-        };
-        // Sent 25 ms after it arrived 40 ms old: 65 ms, never under 40.
-        let now = sampled + Duration::from_millis(65);
-        let sent = load(WorkerId(7), 2, &sample, now);
-        assert_eq!((sent.worker_id, sent.dp_rank), (7, 2));
-        assert!(sent.resident_counted, "the flag crosses beside the row");
-        assert_eq!(
-            sent.load,
-            Some(proto::LoadRow {
-                running: 3,
-                queued: 2,
-                waiting_uncached_tokens: 700,
-                kv_usage_permille: 815,
-                active_kv_permille: 410,
-                live_rate: 1_900,
-                resident_tokens: 64_000,
-                report_age_ms: 65,
-                source: proto::SignalSource::Events as i32,
-                max_running: 96,
-            })
-        );
-        // A send before the sample's own instant reads an age of zero.
-        assert_eq!(
-            load(WorkerId(7), 2, &sample, sampled)
-                .load
-                .map(|row| row.report_age_ms),
-            Some(0)
-        );
-    }
-
-    #[test]
     fn every_kind_of_log_entry_is_sent_under_a_case_of_its_own() {
         let at = Position { seq: 3, term: 2 };
-        let now = Instant::now();
-        let sample = LoadSample {
-            row: LoadRow::default(),
-            received_at: now,
-            sampled_at: now,
-            source: LoadSource::Poll,
-        };
         let stored = full();
         let entries = [
             Written::Term,
-            Written::Load {
-                id: WorkerId(7),
-                rank: 1,
-                sample,
-            },
             Written::Member {
                 epoch: 1,
                 change: MembershipChange::Registered { id: stored.id },
@@ -2764,14 +2660,10 @@ mod tests {
                 left: None,
             },
         ]
-        .map(|event| replication(&Entry { at, event }, now).event);
+        .map(|event| replication(&Entry { at, event }).event);
         assert_eq!(entries[0], Some(Sent::TermStart(proto::TermStart {})));
         assert_eq!(
             entries[1],
-            Some(Sent::Load(load(WorkerId(7), 1, &sample, now)))
-        );
-        assert_eq!(
-            entries[2],
             Some(Sent::Membership(event(
                 Event::Registered(row(&stored)),
                 3,
@@ -2787,7 +2679,7 @@ mod tests {
             row: None,
             left: None,
         };
-        assert_eq!(replication(&Entry { at, event: untold }, now).event, None);
+        assert_eq!(replication(&Entry { at, event: untold }).event, None);
     }
 
     #[test]
@@ -3047,22 +2939,18 @@ mod tests {
     #[test]
     fn a_parts_load_rows_are_read_past() {
         let at = Instant::now();
-        let sample = LoadSample {
-            row: LoadRow {
-                running: 3,
-                source: SignalSource::Poll,
-                ..LoadRow::default()
-            },
-            received_at: at,
-            sampled_at: at,
-            source: LoadSource::Poll,
-        };
         // A row no build reads: its source names no ingress. An older
         // leader's part carries load rows, and this build keeps none.
-        let mut sent = load(WorkerId(7), 2, &sample, at);
-        if let Some(row) = &mut sent.load {
-            row.source = 99;
-        }
+        let sent = proto::LoadSample {
+            worker_id: 7,
+            dp_rank: 2,
+            load: Some(proto::LoadRow {
+                running: 3,
+                source: 99,
+                ..proto::LoadRow::default()
+            }),
+            ..proto::LoadSample::default()
+        };
         let part = proto::ReplicationSnapshot {
             workers: vec![row(&full())],
             loads: vec![sent],

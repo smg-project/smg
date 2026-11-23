@@ -1,6 +1,7 @@
 //! What the gateway's start hands the policy engine it starts: the worker
 //! registry, whose events the engine's task follows, and the monitor of the
-//! workers' cache events.
+//! workers' cache events. And what a start under a supplied document builds
+//! its worker objects with: the overload thresholds of its own settings.
 
 use std::{
     sync::{Arc, Mutex},
@@ -154,6 +155,28 @@ async fn the_started_engine_tells_a_stage_a_worker_that_joins_and_one_that_leave
         told_of(&told, 2).await,
         [("joined", worker), ("left", worker)]
     );
+}
+
+/// No document names an overload threshold: a gateway started under a
+/// supplied document builds its worker objects with the two of its own
+/// settings. A threshold off its default beside the document does not end
+/// the start, and the registration settings every worker object is built
+/// from hold the two.
+#[tokio::test]
+async fn the_started_gateway_builds_its_workers_with_its_own_overload_thresholds() {
+    let config = RouterConfig {
+        policy_controller: true,
+        policy_spec: Some(PolicySpec::preset("round_robin").expect("a stock policy")),
+        worker_overload_waiting_requests: Some(32),
+        worker_overload_token_usage: Some(0.9),
+        ..RouterConfig::default()
+    };
+    let app = build_app_context(&ServerConfig::minimal(config), Extensions::new())
+        .await
+        .expect("the gateway starts");
+    let built = app.registration_settings.overload_defaults;
+    assert_eq!(built.waiting_requests, Some(32));
+    assert_eq!(built.token_usage, Some(0.9));
 }
 
 /// The token ids of prompt `number`: as many as [`BLOCKS`] blocks hold.

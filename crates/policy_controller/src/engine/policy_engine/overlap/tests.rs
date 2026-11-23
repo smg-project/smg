@@ -87,9 +87,9 @@ fn pool(count: usize) -> (Vec<Arc<dyn Worker>>, Vec<WorkerId>) {
     (workers.collect(), ids.collect())
 }
 
-/// A host's indexes: one model's chain index, and how often it was asked.
-/// And the host's own token tree of the prompts it sent to the model's
-/// workers, where it keeps one.
+/// A host's indexes: one model's chain index, and the host's own token tree
+/// of the prompts it sent to the model's workers, where it keeps one. And
+/// how often it was asked for either.
 #[derive(Default)]
 struct Host {
     index: Option<Arc<ChainIndex>>,
@@ -109,6 +109,7 @@ impl CacheIndexes for Host {
     }
 
     fn token_tree(&self, model: &str, phase: Phase) -> Option<Arc<TokenTree>> {
+        self.asked.fetch_add(1, Ordering::Relaxed);
         let single = model == MODEL && phase == Phase::Single;
         self.tree.as_ref().filter(|_| single).cloned()
     }
@@ -963,6 +964,19 @@ fn a_pick_that_meets_a_held_record_leaves_its_prefix_out() {
     assert_eq!(bed.affinity.left_out(), 1);
 }
 
+/// A list of no worker is read no table: its request is named no holder, no
+/// record of sent prefixes is made, and the host is asked for no index and
+/// no tree.
+#[test]
+fn a_list_of_no_worker_keeps_no_record() {
+    let (affinity, host, _) = hosted(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 0);
+    let asked = prompt(1_000, 4);
+    assert!(bed.holders(&asked, NOW).is_empty());
+    assert!(bed.affinity.records.lock().is_empty());
+    assert_eq!(host.asked.load(Ordering::Relaxed), 0);
+}
+
 /// A prompt of more blocks than one turn of the record's lock writes is
 /// recorded to its end.
 #[test]
@@ -1789,6 +1803,43 @@ fn a_cap_the_records_holders_fill_is_not_read_past() {
     with_buffers(|buffers| {
         assert_eq!(buffers.kept.len(), 1, "the first index answer survives");
     });
+}
+
+/// Under a source that reads the record alone the record's holders are
+/// named ahead of the index's, and the index is asked in the room they
+/// leave. Where the record names fewer holders than the profile's sample
+/// and the index holds the request for another worker, each holder stands
+/// in the naming once: the record is not read again behind the index.
+#[test]
+fn a_record_named_ahead_is_not_named_again_behind_the_index() {
+    use crate::document::spec::{AffinitySource, BestParams, PickStage, ScoreSpec};
+
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    document.generation = 1;
+    let profile = document
+        .profiles
+        .get_mut("cache_aware")
+        .expect("the profile");
+    profile.pick = PickStage::Best(BestParams { sample: 3 }).into();
+    for stage in &mut profile.score {
+        if let ScoreSpec::Params(ScoreStage::PrefixAffinity(prefix)) = stage {
+            prefix.source = Some(AffinitySource::Predictor);
+        }
+    }
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    assert_eq!(spec.engine().affinity_rows_cap(MODEL, Phase::Single), 3);
+
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 4);
+    store(&index, 0, &hashes_of(&asked));
+    let bed = Bed::new(affinity, spec, 3);
+    // The pick writes the record: the prefix was sent to the second worker.
+    let first = bed.decide(&request(&asked, 0, NOW), Some(1)).expect("rows");
+    assert_eq!(first.holders, [(0, 4, 0)]);
+    // One holder of the record and one of the index, under a sample of
+    // three: the room left is not filled by the record a second time.
+    assert_eq!(bed.holders(&asked, NOW), [(0, 4, 0), (1, 0, 4)]);
 }
 
 /// A naming is made once a decision, ahead of its filters. The holder the

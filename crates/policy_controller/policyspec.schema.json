@@ -1347,7 +1347,7 @@
           }
         },
         "overload": {
-          "description": "The overload veto's defaults for the workers of the pools decided\nunder the binding: the pools whose model and phase it is the first\nto match. A decode pool of a model whose prefill lookup resolves to\na pair binding (`pd-pair` or `epd`) is decided under that binding,\nso its block judges the pool: a decode-phase binding's block is not\nread for it, and a pair binding with its block switched off leaves\nthe pool unjudged. Where a binding of another plan takes the\nmodel's prefill lookup first, no pair decision runs for the model\nand its decode pool is the decode phase's own.",
+          "description": "What the binding says of the overload veto for the workers of the\npools decided under it: the pools whose model and phase it is the first\nto match. A decode pool of a model whose prefill lookup resolves to\na pair binding (`pd-pair` or `epd`) is decided under that binding,\nso its block judges the pool: a decode-phase binding's block is not\nread for it, and a pair binding with its block switched off leaves\nthe pool unjudged. Where a binding of another plan takes the\nmodel's prefill lookup first, no pair decision runs for the model\nand its decode pool is the decode phase's own.",
           "anyOf": [
             {
               "$ref": "#/$defs/OverloadSpec"
@@ -1582,7 +1582,7 @@
       ]
     },
     "OverloadSpec": {
-      "description": "The overload veto's defaults for the workers of the pools decided under\nthe binding, as the binding's `overload` field says: evaluated per load\nreport by the host and latched, never per request; a worker's own\nregistration thresholds resolve over these.",
+      "description": "What a binding says of the overload veto on the workers of the pools\ndecided under it, as its `overload` field: whether the default\nthresholds veto at all, and what a decision does where every worker is\nvetoed. The veto is evaluated per load report by the host and latched,\nnever per request. The block names no threshold: a worker's\nregistration states its own two, over its program's default where the\nprogram has one. The store's judge reads the switch; a host that judges\non its worker objects does not read it yet.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -1591,23 +1591,12 @@
           "default": true
         },
         "waiting_requests": {
-          "description": "Queued requests, summed over an engine's ranks, at or above which a\nworker is vetoed; at least 1 (default 8).",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 1
+          "description": "A number here is refused: a binding names no count of queued\nrequests. A worker's registration states the count at or above which\nit is vetoed, or its program's default does. The field stands so\nthat a document which names a number is refused by its path. Its\nschema is `null` alone, as a writer that spells an absent field\nwrites it: an editor refuses the number on shape.",
+          "type": "null"
         },
         "token_usage": {
-          "description": "Mean active KV usage over an engine's ranks at or above which a\nworker is vetoed; above 0 and at most 1 (default 0.8). A rank that\nreports no active share counts its whole usage.",
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "float",
-          "maximum": 1.0,
-          "exclusiveMinimum": 0
+          "description": "A number here is refused: a binding names no KV usage. A worker's\nregistration states the usage at or above which it is vetoed, or its\nprogram's default does. The field stands so that a document which\nnames a number is refused by its path, and its schema is `null`\nalone.",
+          "type": "null"
         },
         "shed_when_all_vetoed": {
           "description": "Shed with a 503 when every usable worker is vetoed, instead of\nfalling back to the least-vetoed one. The same word decides what a\nsession key does while its own worker is vetoed, where the ring\nalone places the request: under the single plan, in a profile whose\nonly scorer is `consistent-hash` with no `prefix_tokens` and no\n`bounded_load`, picked by `best` with no parameters, under no\nsessions rule or one that delegates. A rule with an in-flight cap\nkeeps the key only under a host that counts the key's requests, as\nthe controller's own service does. A rule with\n`inflight_cap: 65535` has no cap. Set, the key moves on: under a\nsessions rule to its next routable pin, and to the ring's next\nworker where no pin stands or no rule does. Unset, the key stays\non its worker over the veto. Everywhere else a keyed request\nkeeps the veto. The word is the overload veto's alone: a worker\nthe liveness check doubts still takes a request no other worker\ncan, unless it is over its thresholds too.",
@@ -1622,13 +1611,13 @@
       "type": "object",
       "properties": {
         "sources": {
-          "description": "The sources, read in order: one to eight, each named once, and up\nto four client sources beside them.",
+          "description": "The sources, read in order: one to eight, each named once, with up\nto four client sources and one target source beside them.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/KeySourceSpec"
           },
           "minItems": 1,
-          "maxItems": 12
+          "maxItems": 13
         },
         "strip_lineage": {
           "description": "Take the turn and retry suffixes off a key, so every turn of a\nconversation shares one (`conv_t2_r1` keys as `conv`); default\nfalse.",
@@ -1668,6 +1657,10 @@
         "client": {
           "description": "A source that tells one client from another, not one session: a\nheader a proxy or a browser sets. Its key places a request that\ncarries no session key on a ring. It lifts no overload veto, pins\nno session and is counted under no key. Of a binding's client\nsources, the first whose header a request carries is the one read,\nand a value it cannot hand ends the read. The value is read whole\nand leaves as its fingerprint alone, so `rid` and `max_bytes` are\nrefused beside it. A header may be named both ways: capped as a\nsession's source, and whole as a client's where that read handed no\nkey. Default false.",
           "type": "boolean"
+        },
+        "target": {
+          "description": "A source that names the one worker the request goes to, and hands\nno key. The header's value is a number that counts, from 0 and in\nthe order of the request's list of workers, the workers that can\ntake the request when it arrives: so a number names another worker\nwhile one ahead of it is down. A request that carries it goes to\nthat worker and to no other. Where the value is no number, or\nfewer workers can take the request, it is shed under\n`target-worker`. Where no worker at all can take it, it is placed\nas a request that names none and carries no key. A header that is\nabsent, empty or not text names no worker. One entry a block,\nbeside the eight and never without one of them: a header alone,\nso `rid`, `max_bytes` and `client` are refused beside it. It is\nread for a single request a program places in process, and for no\npair. Default false.",
+          "type": "boolean"
         }
       },
       "additionalProperties": false
@@ -1688,14 +1681,14 @@
           }
         },
         "ttl_s": {
-          "description": "How long an idle key stays pinned, in seconds, before the rule's\nnext sweep forgets it; above zero (default 14400), `4294967295` for\never. A host that keeps a record of the pins, as the controller's\nown service does, forgets the key at `ttl_s` itself.",
+          "description": "How long an idle key stays pinned, in seconds, before the rule's\nnext sweep forgets it; above zero (default 14400), `4294967295` for\never.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
           "default": 14400
         },
         "sweep_s": {
-          "description": "The sweep cadence of idle keys, in seconds: a key idle for `ttl_s`\nis forgotten at the next sweep, and one used again ahead of it stays\npinned. Above zero (default 120), `4294967295` for never, allowed\nunder a `ttl_s` for ever alone. Under a host that keeps a record of\nthe pins the sweep only reclaims.",
+          "description": "The sweep cadence of idle keys, in seconds: a key idle for `ttl_s`\nis forgotten at the next sweep, and one used again ahead of it stays\npinned. Above zero (default 120), `4294967295` for never, allowed\nunder a `ttl_s` for ever alone.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
@@ -1725,7 +1718,7 @@
           "default": "original"
         },
         "rule_placed": {
-          "description": "Whether a single request this rule placed alone is the profile's\nown (default `told`). Under `untold` no stage hears that request's\nissue or its dispatch, it is none of the profile's sends, and\nneither the engine's record of sent prefixes nor a lent token tree\ntakes its prompt. The session table still hears its dispatch,\nand the stages its completion and its release. A pair's sides are\ntold under either word. A host that tells a lease's words off its\nfile keeps no such word of a pick: it takes the rule, tells such a\nrequest as it tells any other, and records its prompt as any\nother's.",
+          "description": "Whether a single request this rule placed alone is the profile's\nown (default `told`). Under `untold` no stage hears that request's\nissue or its dispatch, it is none of the profile's sends, and\nneither the engine's record of sent prefixes nor a lent token tree\ntakes its prompt. The session table still hears its dispatch,\nand the stages its completion and its release. A pair's sides are\ntold under either word. A host that tells a lease's words off its\nfile keeps no such word of a pick: it takes the rule, and tells such\na request as it tells any other. Its decision is the engine's own,\nso its record of sent prefixes follows the word all the same.",
           "$ref": "#/$defs/RulePlaced"
         }
       },

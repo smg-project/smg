@@ -383,6 +383,7 @@ async fn poll(
                 kv_connector: None,
                 kv_role: None,
                 kv_engine_id: None,
+                pairing_protocol: None,
                 compat_labels: BTreeMap::new(),
             });
         }
