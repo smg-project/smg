@@ -1180,15 +1180,21 @@ struct Asked<'a> {
 /// A request it names an entry for is decided inside the tree's match.
 /// `decide` is called once either way.
 ///
+/// `sends_to` says whether the request's caller sends it to a target of the
+/// pick ([`RequestMaker::sends_to`]). A decision made inside the tree's
+/// match asks it of the pick's targets, best first, and the tree stores the
+/// request's pages for the first one it takes. No other decision asks it.
+///
 /// The rows live in the calling thread's buffers until this returns:
 /// `decide` reads them and keeps nothing of them. Nothing is allocated once
 /// the buffers have grown, but where a table is read (once a list, and then
 /// by one decision a second) and by a tree's own match and write.
 ///
 /// [`Engine::needs_for_phase`]: crate::engine::Engine::needs_for_phase
+/// [`RequestMaker::sends_to`]: crate::engine::RequestMaker::sends_to
 #[expect(
     clippy::too_many_arguments,
-    reason = "the list, what is kept beside it, the request's facts and its entry in a tree, and the decision"
+    reason = "the list, what is kept beside it, the request's facts, its entry in a tree and the target its caller takes, and the decision"
 )]
 pub fn decide<'p>(
     affinity: &Affinity,
@@ -1198,6 +1204,7 @@ pub fn decide<'p>(
     ids: &[WorkerId],
     facts: &mut RequestFacts<'_>,
     token_key: impl FnOnce(usize) -> Option<TokenKey<'p>>,
+    sends_to: impl Fn(&Target) -> bool,
     mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
 ) -> Decision {
     // No binding of the phase reads affinity: one test, and no table.
@@ -1221,7 +1228,7 @@ pub fn decide<'p>(
     };
     with_buffers(|buffers| {
         pool.with_table(&asked, |table| {
-            table.decide(workers, facts, buffers, token_key, decide)
+            table.decide(workers, facts, buffers, token_key, sends_to, decide)
         })
     })
 }
@@ -1357,13 +1364,21 @@ impl PoolAffinity {
     }
 }
 
-/// The address of the worker a decision sent its request to by the
-/// profile's stages ([`sent_by_stages`]), in the list it was made over: the
-/// worker a tree's match writes the request's prefix for. `None` where the
-/// decision picked nobody or the binding's sessions rule placed the request
-/// alone, and the tree stores nothing.
-fn first_address<'w>(workers: &'w [Arc<dyn Worker>], decision: &Decision) -> Option<&'w str> {
-    let target = sent_by_stages(decision)?;
+/// The address of the worker a decision's request goes to, in the list it
+/// was made over: the first target of a pick by the profile's stages
+/// ([`sent_by_stages`]) that the request's caller sends to (`sends_to`),
+/// asked best first. It is the worker a tree's match writes the request's
+/// prefix for. `None` where the decision picked nobody, the binding's
+/// sessions rule placed the request alone, or the caller sends to none of
+/// the pick's targets, and the tree stores nothing.
+fn sent_address<'w>(
+    workers: &'w [Arc<dyn Worker>],
+    decision: &Decision,
+    sends_to: impl Fn(&Target) -> bool,
+) -> Option<&'w str> {
+    sent_by_stages(decision)?;
+    let mut targets = decision.pick()?.targets.iter();
+    let target = targets.find(|target| sends_to(target))?;
     Some(workers.get(target.position as usize)?.url())
 }
 
@@ -1378,6 +1393,7 @@ impl Table {
         facts: &mut RequestFacts<'_>,
         buffers: &mut Buffers,
         token_key: impl FnOnce(usize) -> Option<TokenKey<'p>>,
+        sends_to: impl Fn(&Target) -> bool,
         mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
     ) -> Decision {
         if !self.reads {
@@ -1391,7 +1407,7 @@ impl Table {
         let sent = self.sent.as_deref();
         let keyed = sent.and_then(|sent| Some((sent, token_key(sent.page_size())?)));
         if let Some((sent, key)) = keyed {
-            return self.decide_in_tree(sent, &key, workers, facts, buffers, decide);
+            return self.decide_in_tree((sent, &key), sends_to, workers, facts, buffers, decide);
         }
         let read = self.name(facts, buffers);
         let decision = decide(&mut RequestFacts {
@@ -1434,16 +1450,19 @@ impl Table {
     }
 
     /// One decision of a request inside the match of the host's token tree
-    /// for its place. The match names the workers sent the deepest prefix
-    /// of the request, the decision is made over them, and the same descent
-    /// writes the request's whole pages for the worker picked. A decision
-    /// that picks nobody stores nothing: the match has marked the path it
-    /// walked as used, as every match of the tree does. The record of hashed
-    /// prefixes is neither read nor written.
+    /// for its place, by the tree and the request's entry in it. The match
+    /// names the workers sent the deepest prefix of the request, the
+    /// decision is made over them, and the same descent writes the
+    /// request's whole pages for the worker the request goes to: the first
+    /// target of the pick its caller sends to (`sends_to`). A decision that
+    /// picks nobody, or none of whose targets its caller sends to, stores
+    /// nothing: the match has marked the path it walked as used, as every
+    /// match of the tree does. The record of hashed prefixes is neither
+    /// read nor written.
     fn decide_in_tree(
         &self,
-        sent: &TokenTree,
-        key: &TokenKey<'_>,
+        (sent, key): (&TokenTree, &TokenKey<'_>),
+        sends_to: impl Fn(&Target) -> bool,
         workers: &[Arc<dyn Worker>],
         facts: &RequestFacts<'_>,
         buffers: &mut Buffers,
@@ -1466,7 +1485,7 @@ impl Table {
             // The marker is no part of the prompt.
             let matched = found.matched_token_count.saturating_sub(key.marker);
             let decision = decide_over(&found.matched_tenants, self.blocks_of(matched, facts));
-            let to = first_address(workers, &decision);
+            let to = sent_address(workers, &decision, &sends_to);
             decided = Some(decision);
             to
         });

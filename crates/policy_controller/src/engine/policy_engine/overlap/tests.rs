@@ -1,7 +1,7 @@
 //! The naming of a decision's rows from a host's index of cache events, its
 //! token tree of sent prefixes and the engine's record of sent prefixes.
 
-use std::{borrow::Cow, sync::atomic::AtomicUsize, thread, time::Duration};
+use std::{borrow::Cow, cell::RefCell, sync::atomic::AtomicUsize, thread, time::Duration};
 
 use kv_index::{
     compute_request_content_hashes, request_prefix_hashes, ChainBlockMap, ChainIndex, ContentHash,
@@ -260,6 +260,7 @@ impl Bed {
             &self.ids,
             &mut { *facts },
             |_| key,
+            |_| true,
             |facts| {
                 named = facts.named.map(|rows| Named {
                     holders: rows
@@ -491,6 +492,7 @@ fn a_pick_the_sessions_rule_placed_is_recorded_at_neither_write() {
                 &bed.ids,
                 &mut request(&asked, 7, NOW),
                 |_| None,
+                |_| true,
                 |facts| {
                     assert_eq!(facts.named.is_none(), whole);
                     match facts.named {
@@ -563,6 +565,7 @@ fn a_pick_the_sessions_rule_placed_is_written_to_no_tree() {
             &bed.ids,
             &mut request(&hashes, 7, NOW),
             |_| Some(key),
+            |_| true,
             |_| answer(),
         );
     };
@@ -750,6 +753,75 @@ fn the_host_and_the_engine_read_and_write_one_tree() {
     assert_eq!(&*found.tenant, address(0));
 }
 
+/// The tree stores a prompt for the first target of the pick its caller
+/// sends to, asked best first, and for no worker where the caller sends to
+/// none: a worker the caller passed over is named no holder.
+///
+/// The classic policy stores the worker it selected, among the candidates
+/// its router can send to
+/// (`model_gateway/src/policies/cache_aware.rs:3470-3491`, behind
+/// `model_gateway/src/routers/common/placement.rs:504-509`, `:536-553`).
+#[test]
+fn a_tree_stores_a_prompt_for_the_first_target_its_caller_sends_to() {
+    let (affinity, tree) = lending(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    // The workers at 1, 2 and 3, best first.
+    let three = || {
+        let mut targets = Targets::new();
+        for position in 1..4 {
+            targets.push(Target {
+                position,
+                id: bed.ids[position as usize],
+                ..Target::default()
+            });
+        }
+        Decision::Pick(Pick {
+            targets,
+            trace: Trace::default(),
+            session_verdict: SessionVerdict::None,
+        })
+    };
+    // One decision of `key` that picks the three, under a caller that sends
+    // to the places `sent` names. Says the places the caller was asked of.
+    let place = |key: &[u32], sent: &[u32]| {
+        let hashes = hashed(key);
+        let asked = RefCell::new(Vec::new());
+        let entry = TokenKey {
+            tokens: Cow::Borrowed(key),
+            marker: 0,
+        };
+        decide(
+            &bed.affinity,
+            &bed.pool,
+            &bed.spec,
+            &bed.workers,
+            &bed.ids,
+            &mut request(&hashes, 7, NOW),
+            |_| Some(entry),
+            |target| {
+                asked.borrow_mut().push(target.position);
+                sent.contains(&target.position)
+            },
+            |_| three(),
+        );
+        asked.into_inner()
+    };
+    // A caller that sends to the first target is asked of it alone.
+    let (first, second, none) = (tokens(1_000, 4), tokens(2_000, 4), tokens(3_000, 4));
+    assert_eq!(place(&first, &[1, 2, 3]), [1]);
+    assert_eq!(bed.keyed(&first, 0, None), [(1, 0, 4)]);
+    // One that passes the first over is stored for the second alone.
+    assert_eq!(place(&second, &[2, 3]), [1, 2]);
+    assert_eq!(bed.keyed(&second, 0, None), [(2, 0, 4)]);
+    // One that sends to none is asked of each, and nothing is stored.
+    assert_eq!(place(&none, &[]), [1, 2, 3]);
+    assert!(bed.keyed(&none, 0, None).is_empty());
+    let held = tree.get_tenant_token_counts();
+    assert_eq!(held.get(&address(1)), Some(&first.len()));
+    assert_eq!(held.get(&address(2)), Some(&second.len()));
+    assert_eq!(held.len(), 2);
+}
+
 /// The host is asked for the entry once a decision, with the tree's page,
 /// here four of the document's blocks, and only where it lends the place a
 /// tree: not where it lends none, not for a model with an index of cache
@@ -780,6 +852,7 @@ fn the_entry_is_asked_for_once_and_only_where_the_host_lends_a_tree() {
                 ids,
                 facts,
                 asks,
+                |_| true,
                 |_| shed(),
             );
         }
@@ -1024,6 +1097,7 @@ fn the_engine_decides_by_the_rows_named() {
                 &bed.ids,
                 &mut request,
                 |_| None,
+                |_| true,
                 |request| {
                     let engine = bed.spec.engine();
                     engine.decide(
@@ -1188,6 +1262,7 @@ fn a_profile_named_no_row_is_handed_the_column() {
         &bed.ids,
         &mut request(&asked, 7, NOW),
         |_| None,
+        |_| true,
         |facts| {
             assert!(facts.named.is_none());
             seen = Some(held(facts.affinity));

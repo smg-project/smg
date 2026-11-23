@@ -137,6 +137,27 @@ pub trait RequestMaker {
         let _ = page;
         None
     }
+
+    /// Whether the request's caller sends it to `target`, a target of the
+    /// decision's pick. A decision made inside the host's token tree
+    /// ([`Self::token_key`]) asks it of the pick's targets, best first, and
+    /// the tree stores the prompt for the first one answered `true`: for
+    /// none where each is answered `false`, so the tree names no worker
+    /// the request was not sent to.
+    ///
+    /// It is asked behind the pick and ahead of the decision's lease,
+    /// inside the decision: an answer asks the engine nothing. No other
+    /// decision asks it.
+    ///
+    /// `true` from a maker that does not say: its caller sends to the
+    /// first target of a decision. A maker whose caller may send to a
+    /// later target answers it, or the tree names the first target for a
+    /// prompt that went to another.
+    #[cfg(feature = "in-process")]
+    fn sends_to(&self, target: &Target) -> bool {
+        let _ = target;
+        true
+    }
 }
 
 impl RequestMaker for Request<'_> {

@@ -8,20 +8,42 @@
 //! answered. It lends no load snapshot: the engine reads its own. The
 //! result line names the entry asked (`entry=`).
 //!
+//! Every request states its prompt's entry in a token tree
+//! ([`Prompt::entry`]), as a host that lends one states it for each
+//! request. A cell whose document reads no tree never has it asked: its
+//! count is what the stated field costs unread. A cell whose callers hold
+//! conversations states each turn's own ([`turn`]).
+//!
 //! [`PolicyEngine::place`]: smg_policy_controller::engine::PolicyEngine::place
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    borrow::Cow,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use smg_policy_controller::{
-    engine::{Identity, PlaceRequest, Prompt, WorkerLists},
+    engine::{Identity, PlaceRequest, Prompt, TokenEntry, TokenKey, WorkerLists},
     tracking::{Outcome, Placement, Side, TransportClass},
 };
 
-use super::{ruled, Host, Run, MODEL};
+use super::{conversations, ruled, Host, Run, MODEL};
 
 /// The prompt a request by the one call states: 1,024 token ids, the size
 /// the plain request states.
 static PROMPT: [u32; 1_024] = [0; 1_024];
+
+/// The plain prompt's entry in a token tree: its token ids, under no cache
+/// partition.
+struct Whole;
+
+impl TokenEntry for Whole {
+    fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
+        Some(TokenKey {
+            tokens: Cow::Borrowed(&PROMPT),
+            marker: 0,
+        })
+    }
+}
 
 /// The entry `value` names: `decide_at`, the engine's entry, `place`, or
 /// `place` with a rule ([`ruled::ENTRY`]).
@@ -61,6 +83,7 @@ pub(super) fn one(host: &Host, rule: bool) -> Option<u32> {
     let request = PlaceRequest {
         prompt: Prompt {
             tokens: Some(&PROMPT),
+            entry: Some(&Whole),
             ..Prompt::NONE
         },
         admits: ruled::admits(rule),
@@ -72,6 +95,40 @@ pub(super) fn one(host: &Host, rule: bool) -> Option<u32> {
         said(placement);
     }
     Some(0)
+}
+
+/// Whether this run's requests go through the one call, for a cell whose
+/// callers make their own turns, and whether they state a route's rule
+/// then ([`ruled::ENTRY`]).
+pub(super) fn asks() -> Option<bool> {
+    let asked = ASKED.load(Ordering::Relaxed);
+    asked.then(|| ruled::word().is_some())
+}
+
+/// One turn of a conversation by the one call: the model, the list, the
+/// turn's token ids and its entry in the tree the cell's host lends. The
+/// engine hashes the prompt itself here, where the engine's entry is handed
+/// the hashes. Says the worker the turn was placed on, by its id's low
+/// half: the call answers a worker and no place of the list. With `rule`
+/// the turn states a route's rule ([`ruled::admits`]), which a decision
+/// made inside the tree asks ahead of the tree's write.
+pub(super) fn turn(host: &Host, prompt: &conversations::Turn<'_>, rule: bool) -> Option<u32> {
+    let request = PlaceRequest {
+        prompt: Prompt {
+            tokens: Some(prompt.tokens),
+            entry: Some(prompt),
+            ..Prompt::NONE
+        },
+        admits: ruled::admits(rule),
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(host.list.lent()))
+    };
+    let mut answer = host.engine.place(&request);
+    let placement = answer.as_mut().ok()?;
+    let worker = placement.id().0 as u32;
+    if placement.owes_events() {
+        said(placement);
+    }
+    Some(worker)
 }
 
 /// The dispatch and the end a host says of a placement, in a function of

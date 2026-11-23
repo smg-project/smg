@@ -6,7 +6,9 @@
 //! sent and lends it to the engine, as a gateway lends the one its own
 //! policy keeps ([`CacheIndexes::token_tree`]). A turn has its host state
 //! the prompt's block hashes and hand its token ids, in the request the
-//! runner states for it.
+//! runner states for it. Under `--entry place` a turn is asked by the one
+//! call instead, which is handed the token ids and the turn's entry, and
+//! under `--entry place_ruled` a route's rule too.
 //!
 //! A caller makes its prompts before its first turn, about half a kilobyte
 //! a decision, so such a cell is run with a stated `--decisions`, and stops
@@ -20,6 +22,7 @@
 //! call, read from the two profiles by function.
 
 use std::{
+    borrow::Cow,
     hint::black_box,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -30,9 +33,10 @@ use std::{
 use kv_index::TokenTree;
 use smg_policy_controller::engine::{
     CacheIndex, CacheIndexes, DecisionEngine, HashSeeds, Phase, PolicyEngine, PromptHashes,
+    TokenEntry, TokenKey,
 };
 
-use super::{mix, stretch, Host, Run, CALLER_WARM, MODEL};
+use super::{mix, place, ruled, stretch, Host, Run, CALLER_WARM, MODEL};
 
 /// A conversation's sizes in tokens: the head every prompt begins with, a
 /// conversation's first prompt, what a turn adds, and its last prompt.
@@ -55,6 +59,17 @@ static RETURNED: AtomicU64 = AtomicU64::new(0);
 pub(super) struct Turn<'a> {
     pub(super) tokens: &'a [u32],
     pub(super) hashes: &'a PromptHashes,
+}
+
+/// A turn's entry in its host's token tree: its token ids, under no cache
+/// partition. The runner's maker and the one call's request state the same.
+impl TokenEntry for Turn<'_> {
+    fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
+        Some(TokenKey {
+            tokens: Cow::Borrowed(self.tokens),
+            marker: 0,
+        })
+    }
 }
 
 /// A caller's conversations, made before its first turn: each one's full
@@ -107,13 +122,13 @@ fn ids_of(turns: u64) -> u64 {
 }
 
 /// What the cell asks of a run ahead of its callers: it asks the engine's
-/// entry, which its callers ask, and every caller's prompts fit the token
-/// ids. A caller that stopped alone would leave the others, and the runner,
-/// at their start.
+/// entry or the one call, which its callers ask, and every caller's prompts
+/// fit the token ids. A caller that stopped alone would leave the others,
+/// and the runner, at their start.
 pub(super) fn fits(run: &Run) {
-    assert_eq!(
-        run.entry, "decide_at",
-        "the cell's callers ask the engine's entry"
+    assert!(
+        matches!(run.entry.as_str(), "decide_at" | "place" | ruled::ENTRY),
+        "the cell's callers ask the engine's entry or the one call"
     );
     let ids = run.callers as u64 * ids_of(CALLER_WARM + run.decisions);
     assert!(
@@ -152,14 +167,19 @@ pub(super) fn lends(engine: &PolicyEngine) {
 
 /// One caller's turns: each carries one of the caller's conversations on,
 /// by the engine's own entry, under the seed the runner gives that caller's
-/// turn. Timed as every caller's turns are ([`stretch`]).
+/// turn, or by the one call where the run asks it ([`place::turn`]). Timed
+/// as every caller's turns are ([`stretch`]).
 pub(super) fn caller(host: &Host, start: &Barrier, decisions: u64, caller: u64) -> (u64, u64, u64) {
     let said = Said::by(host.engine, caller, CALLER_WARM + decisions);
+    let by_call = place::asks();
     let (mut carried, mut returned, mut last) = (0u64, 0u64, None);
     let timed = stretch(start, decisions, |turn| {
         let (prompt, carries) = said.turn(turn);
         let seed = mix(caller << 40 | turn);
-        let place = host.place(black_box(seed), Some(&prompt));
+        let place = match by_call {
+            Some(rule) => place::turn(host, black_box(&prompt), rule),
+            None => host.place(black_box(seed), Some(&prompt)),
+        };
         if carries && turn >= CALLER_WARM {
             carried += 1;
             returned += u64::from(place == last);

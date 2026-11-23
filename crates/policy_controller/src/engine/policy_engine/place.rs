@@ -18,6 +18,13 @@
 //!   making, and never for a request a place answers
 //!   ([`RequestMaker::plain`]): such a request is not made at all.
 //!
+//! One thing of the request the engine does not make: the prompt's entry in
+//! a token tree its caller lends. The caller names it ([`Prompt::entry`]),
+//! by its own rule for a cache partition, and a decision that reads the
+//! tree asks it. That decision stores the prompt in the tree for the first
+//! of its targets this call can send to ([`RequestMaker::sends_to`]), and
+//! for none where it can send to none.
+//!
 //! The engine then decides, and takes the first target of the decision that
 //! can be sent to: ready ([`ready`]), and admitted by its route's own rule
 //! ([`PlaceRequest::admits`]). Where no target of a decision can be sent
@@ -44,6 +51,7 @@ mod decode_again;
 mod pair;
 
 use std::{
+    any::Any,
     cell::{Cell, OnceCell},
     collections::hash_map::RandomState,
     fmt,
@@ -66,7 +74,7 @@ use crate::{
         decision::{Decision, Pick, ShedReason, Target, MAX_TARGETS},
         decision_engine::{
             DecideOutcome, Decided, DecisionEngine, DecisionRefused, Plain, Request, RequestMaker,
-            WorkerLists,
+            TokenKey, WorkerLists,
         },
         demands::Demands,
         framework::EncodeItems,
@@ -120,6 +128,21 @@ impl HeaderRead for http::HeaderMap {
     }
 }
 
+/// A prompt's entry in a token tree, as the request's caller names it: the
+/// one question a decision asks where it reads the tree the caller lends
+/// ([`CacheIndexes::token_tree`]). A caller of [`PolicyEngine::place`]
+/// answers it for its request ([`Prompt::entry`]), as a maker written by
+/// hand answers [`RequestMaker::token_key`].
+///
+/// [`CacheIndexes::token_tree`]: crate::engine::CacheIndexes::token_tree
+pub trait TokenEntry {
+    /// The entry by token ids for a tree whose page is `page` tokens
+    /// ([`TokenKey`]): `None` where the caller holds no token ids of the
+    /// prompt. The marker of a cache partition fills whole pages, which is
+    /// why the page is asked with.
+    fn token_key(&self, page: usize) -> Option<TokenKey<'_>>;
+}
+
 /// A request's prompt, as its caller holds it: what the stages that place a
 /// prompt on the worker that holds its beginning read.
 #[derive(Clone, Copy)]
@@ -133,6 +156,29 @@ pub struct Prompt<'a> {
     /// [`HashSeeds::PLAIN`] for a request with none. The caller's own rule
     /// keeps two partitions apart.
     pub seeds: HashSeeds,
+    /// The prompt's entry in the token tree the caller lends
+    /// ([`CacheIndexes::token_tree`]), named by the caller's own rule as
+    /// the seeds are: the same cache partition, for a tree's lookup.
+    /// `None` from a caller that lends no tree or holds no token ids: the
+    /// request is then named its holders from the record of hashed
+    /// prefixes. One entry answers for every tree the request is decided
+    /// in, a pair's two sides too when a pair reads one: the tree's page
+    /// is the question's argument.
+    ///
+    /// It is asked once by each decision of the call that reads the tree,
+    /// and never where no stage of the request's place reads the tree. The
+    /// tree then stores the prompt for the worker the call can send to:
+    /// the first target of that decision that is ready and that the
+    /// route's rule admits ([`PlaceRequest::admits`]), and no worker where
+    /// no target is.
+    ///
+    /// The object is borrowed as its caller holds it and is not asked to
+    /// be [`Sync`], so a prompt is neither [`Send`] nor [`Sync`], whether
+    /// it states an entry or not: its caller makes it with the request,
+    /// between two awaits.
+    ///
+    /// [`CacheIndexes::token_tree`]: crate::engine::CacheIndexes::token_tree
+    pub entry: Option<&'a dyn TokenEntry>,
 }
 
 impl Prompt<'_> {
@@ -141,6 +187,7 @@ impl Prompt<'_> {
         tokens: None,
         text: None,
         seeds: HashSeeds::PLAIN,
+        entry: None,
     };
 }
 
@@ -151,6 +198,7 @@ impl fmt::Debug for Prompt<'_> {
             .field("tokens", &self.tokens.map(<[u32]>::len))
             .field("text", &self.text.map(str::len))
             .field("seeds", &self.seeds)
+            .field("entry", &self.entry.is_some())
             .finish()
     }
 }
@@ -167,9 +215,10 @@ pub type WorkerRule<'a> = &'a dyn Fn(&dyn Worker) -> bool;
 /// else:
 /// `PlaceRequest { streaming: true, tried: &tried, ..PlaceRequest::of(model, lists) }`.
 ///
-/// A request is not [`Send`]: its headers and its route's rule are borrowed
-/// as their caller holds them, and neither is asked to be [`Sync`]. A
-/// caller makes one for each call, between two awaits.
+/// A request is not [`Send`]: its headers, its route's rule and its
+/// prompt's entry in a token tree are borrowed as their caller holds them,
+/// and none is asked to be [`Sync`]. A caller makes one for each call,
+/// between two awaits.
 pub struct PlaceRequest<'a> {
     /// The model the request is for, as its caller resolved it.
     pub model: &'a str,
@@ -230,7 +279,17 @@ pub struct PlaceRequest<'a> {
     /// The route's own rule for a worker its request may be sent to, and
     /// `None` for a route that has none. It is asked of the workers the
     /// engine picked: a request whose first pick it admits pays one call
-    /// of it, and a pair's request one for each of its two workers. Behind
+    /// of it, and a pair's request one for each of its two workers. A
+    /// request decided inside a token tree its caller lends
+    /// ([`Prompt::entry`]) pays one more for each target up to the one it
+    /// is placed on: the rule is asked inside that decision too, ahead of
+    /// the tree's write, so the tree stores the prompt for a worker the
+    /// rule takes. A rule asked there runs inside a decision: it asks the
+    /// engine nothing, and where it panics the tree stores nothing and
+    /// the panic reaches the caller behind the decision. A rule that
+    /// answers one worker two ways within a call can leave the tree
+    /// naming another worker than the request's: that ask and the pick's
+    /// are two asks. Behind
     /// a single request's decision none of whose picks can be sent to,
     /// where it refused one that was ready, it is asked of every worker of
     /// the list, once a call, and the call decides again among the workers
@@ -337,6 +396,10 @@ pub(super) struct Made<'r, 'a> {
     /// at the request's first making and borrowed by each one after it:
     /// none where the request carries no key or is lent no ring.
     place: OnceCell<Option<u64>>,
+    /// The panic of the route's rule where it was asked inside the lookup
+    /// of a lent token tree ([`RequestMaker::sends_to`]): kept for the
+    /// call, which raises it again outside the decision ([`raise`]).
+    panicked: OnceCell<Box<dyn Any + Send>>,
 }
 
 impl<'r, 'a> Made<'r, 'a> {
@@ -357,6 +420,7 @@ impl<'r, 'a> Made<'r, 'a> {
             headers: OnceCell::new(),
             key: Cell::new(None),
             place: OnceCell::new(),
+            panicked: OnceCell::new(),
         }
     }
 
@@ -515,6 +579,44 @@ impl RequestMaker for Made<'_, '_> {
 
     fn workers(&self) -> WorkerLists<'_> {
         self.request.lists
+    }
+
+    // The caller's own naming, handed on: nothing else reads the field.
+    fn token_key(&self, page: usize) -> Option<TokenKey<'_>> {
+        self.request.prompt.entry?.token_key(page)
+    }
+
+    // The walk's own read of a single request's target, made ahead of the
+    // walk for the tree's write: ready, and admitted by the route's rule,
+    // which is asked of a worker that is ready and of no other.
+    //
+    // A rule that panics here panics inside a decision, where the engine's
+    // own catch would answer it as a decision that faulted. It is the
+    // caller's rule, and its panic is the caller's: the panic is kept, no
+    // later target is asked or stored, and the call raises it again behind
+    // the decision ([`raise`]). The walk catches the rule's panic the same
+    // way where it asks ([`walk`]).
+    fn sends_to(&self, target: &Target) -> bool {
+        let WorkerLists::Single(list) = self.request.lists else {
+            return true;
+        };
+        let Some(worker) = list.workers.get(target.position as usize) else {
+            return false;
+        };
+        let worker = worker.as_ref();
+        if self.panicked.get().is_some() || !ready(worker) {
+            return false;
+        }
+        let Some(admits) = self.request.admits else {
+            return true;
+        };
+        match catch_unwind(AssertUnwindSafe(|| admits(worker))) {
+            Ok(admitted) => admitted,
+            Err(panic) => {
+                drop(self.panicked.set(panic));
+                false
+            }
+        }
     }
 }
 
@@ -895,6 +997,25 @@ fn named(engine: &PolicyEngine, list: Option<LentList<'_>>, place: u32) -> Optio
     records.ids().get(place as usize).copied()
 }
 
+/// Raises again the panic of a route's rule that was asked inside the
+/// lookup of a lent token tree ([`RequestMaker::sends_to`]), behind the
+/// decision that asked it. That decision stored nothing in the tree. A
+/// lease it was issued is given up by name first, as the walk gives one up
+/// behind a rule that panics there. Out of line: a rule that panics is no
+/// request's path.
+#[cold]
+#[inline(never)]
+fn raise(
+    engine: &'static PolicyEngine,
+    panic: Box<dyn Any + Send>,
+    decided: Result<(Decided, Option<Instant>), DecisionRefused>,
+) -> ! {
+    if let Ok((Decided::Whole(decided, later), dated)) = decided {
+        give_up(engine, decided, later, dated.unwrap_or_else(Instant::now));
+    }
+    resume_unwind(panic)
+}
+
 /// One ask for a single request over `list`, the list its caller lent:
 /// one decision, and the first of its targets that can be sent to
 /// ([`walk`]): ready ([`ready`]) and admitted by its route's rule. At a
@@ -910,11 +1031,15 @@ fn single<'a>(
     list: Option<LentList<'_>>,
     call: &mut Call,
 ) -> Result<Placement<'a>, Unplaced> {
-    let made = Made {
+    let mut made = Made {
         budget_micros: call.left(request)?,
         ..Made::asked(engine, request, call)
     };
-    let (decided, dated) = decide(engine, &made).map_err(Unplaced::Refused)?;
+    let decided = decide(engine, &made);
+    if let Some(panic) = made.panicked.take() {
+        raise(engine, panic, decided);
+    }
+    let (decided, dated) = decided.map_err(Unplaced::Refused)?;
     let key = made.key();
     let at = |place: u32| list?.workers.get(place as usize);
     // Each arm answers its own placement: a place's holds no decision, and
@@ -1009,7 +1134,8 @@ impl PolicyEngine {
     ///
     /// A worker the rule refuses is left out like one that is not ready.
     /// The rule is asked of a decision's picks first: a request whose
-    /// first pick it admits pays one call of it. Behind the first decision
+    /// first pick it admits pays one call of it, and two where its
+    /// decision is made inside a lent token tree. Behind the first decision
     /// none of whose picks can be sent to, where the rule refused one that
     /// was ready, the decision is given up and the rule is asked of every
     /// worker of the list, ready or not, once a call. The call's later
@@ -1036,6 +1162,14 @@ impl PolicyEngine {
     /// placement on a later target tells that record nothing, and the next
     /// decision does not learn that the rule refused the first: the
     /// prompt's next request is drawn to the refused worker again.
+    ///
+    /// A token tree the caller lends is written otherwise. A decision made
+    /// inside its lookup ([`Prompt::entry`]) asks, ahead of the write,
+    /// which of its targets this call can send to
+    /// ([`RequestMaker::sends_to`]): ready, and admitted by the route's
+    /// rule. The tree stores the prompt for the first such target, the one
+    /// the call then takes, and for no worker where there is none: a
+    /// decision that is given up leaves no holder in it.
     ///
     /// A request with a pair's two lists is placed over both, a target at
     /// a time. The first target both of whose workers can be sent to is
