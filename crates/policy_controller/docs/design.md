@@ -503,9 +503,8 @@ request goes to.
   cache events reads the index and the hash table together, as today.
 - **[built]** A prefill-decode pair decided over worker lists reads the hash table and the
   host's index of cache events for each side, by the side's own list, and writes each side's
-  pick into the hash table. An encode request's pair reads neither yet.
-  Classic keeps
-  trees for each side. **[planned]** The engine reads the host's trees for each side.
+  pick into the hash table. An encode request's pair reads neither yet. Classic keeps trees
+  for each side. **[planned]** The engine reads the host's trees for each side.
 
 A decision of the engine publishes no insert to other gateways.
 

@@ -3298,18 +3298,22 @@ fn side_shadows(binding: &Binding, live: &[bool], marks: &[Marks]) -> [Option<u1
 /// of sent prefixes: those of the profile a request of the pool's phase
 /// asked alone resolves to ([`Engine::pool_rule_for`],
 /// [`Engine::pool_record_for`]). That profile is the pair's side profile
-/// unless a binding of that phase is listed ahead of the pair's. A
-/// shadow profile of another ruling than its side's, or of another
-/// reading of the record, would be handed another column live. One that
-/// reads no column is handed none either way.
+/// unless a binding of that phase is listed ahead of the pair's. Even
+/// then a decode pool keeps the record the pair's decode profile reads,
+/// where that binding's profile reads none. A shadow profile of another
+/// ruling than its side's, or of another reading of the record, would
+/// be handed another column live. One that reads no column is handed
+/// none either way.
 ///
-/// Two limits stand. A pair's column carries each row's admission age
-/// and no overlap: a side reads no holder of a prefix, live or in its
-/// shadow, so the test skips more than today's column tells apart. And
-/// the test compares the binding's own two profiles: under a binding of
-/// the side's phase listed ahead of the pair's, the pool carries that
-/// binding's ruling, for the live side and for its shadow alike, and
-/// the test still answers by the pair's two.
+/// Two limits stand. A pair decided over a store's rows is handed each
+/// row's admission age and no overlap: a side reads no holder of a
+/// prefix there, live or in its shadow, so the test skips more than
+/// that column tells apart. A prefill-decode pair decided over worker
+/// lists reads its holders, a side at a time. And the test compares the
+/// binding's own two profiles: under a binding of the side's phase
+/// listed ahead of the pair's, the pool carries that binding's ruling,
+/// and its record where its profile reads one, for the live side and
+/// for its shadow alike, and the test still answers by the pair's two.
 fn side_reads_another_column(
     binding: &Binding,
     side: PairSide,
@@ -3346,6 +3350,11 @@ fn side_reads_another_column(
 /// two bindings at a time, so it says yes too where a third takes the
 /// pools those two would share. A profile counts as a reader where its
 /// pool keeps the record for it ([`Engine::reads_sent_for`]).
+///
+/// A pair's decode profile counts in the decode pool whichever binding
+/// covers the decode phase first. A pair found by its prefill decides
+/// its decode side under its own binding, and the pool keeps the record
+/// for that side where the first binding's profile reads none.
 fn live_reader_beside(bindings: &[Binding], at: usize, named_by: &[NamedBy]) -> bool {
     let Some(own) = bindings.get(at) else {
         return false;
@@ -3370,10 +3379,13 @@ fn live_reader_beside(bindings: &[Binding], at: usize, named_by: &[NamedBy]) -> 
             !takes && PHASES.iter().any(|&phase| reads(other, phase))
         } else {
             // This binding is found first: the other decides a pool of
-            // a model of its own only in a phase this one leaves.
-            PHASES
-                .iter()
-                .any(|&phase| !own.covers(phase) && reads(other, phase))
+            // a model of its own only in a phase this one leaves. A pair
+            // left the prefill lookup decides its decode side too, in
+            // the decode pool, whether or not this one covers that phase.
+            let pairs = matches!(other.plan, Plan::PdPair | Plan::Epd { .. });
+            let side = pairs && !own.covers(Phase::Prefill) && reads(other, Phase::Decode);
+            let left = |&phase: &Phase| !own.covers(phase) && reads(other, phase);
+            side || PHASES.iter().any(left)
         }
     })
 }
@@ -5432,9 +5444,27 @@ impl Engine {
     /// is named no such rows where a live profile reads the record of
     /// the same model ([`live_reader_beside`]): the entries kept for a
     /// shadow share a bound with no live reader's.
+    ///
+    /// A decode pool is read by its model's pair too: the pair's decode
+    /// side runs under the pair's binding, whatever binding a decode
+    /// request asked alone resolves to ([`Self::pool_binding`]). Where
+    /// that request's profile reads no record, the pool keeps the one
+    /// the pair's decode profile reads: that side is a live reader of
+    /// the model's record.
     pub(crate) fn pool_record_for(&self, model: &str, phase: Phase) -> Option<bool> {
         if self.reads_sent_for(model, phase) {
             return Some(self.reads_sent_alone_for(model, phase));
+        }
+        // A pair's decode side reads the decode pool, whichever binding
+        // the phase resolves to.
+        let pairs = phase == Phase::Decode && self.needs.sent_prefixes;
+        let side = pairs
+            .then(|| self.pair_binding(model))
+            .flatten()
+            .and_then(|binding| profile_index(binding, Phase::Decode))
+            .and_then(|index| self.named_by.get(usize::from(index)));
+        if let Some(by) = side.filter(|by| by.sent) {
+            return Some(by.sent_alone);
         }
         // The shadow's rows are its own with another record than the
         // live profile's only where that profile is named no row
@@ -9849,6 +9879,79 @@ mod tests {
                 "{shadowed:?} beside {other:?}"
             );
         }
+    }
+
+    /// A decode pool is read by its model's pair, whose decode side runs
+    /// under the pair's binding. So the pool keeps the record that side's
+    /// profile reads where a binding of the decode phase listed ahead
+    /// reads none, and a shadow of that binding is not asked beside the
+    /// side. The first binding's word stands where its own profile reads
+    /// the record, and a pair whose decode side reads none adds nothing.
+    #[test]
+    fn a_decode_pool_keeps_the_record_its_models_pair_reads() {
+        use crate::document::spec::{AffinitySource, PrefixAffinityParams, ScoreStage, ShadowSpec};
+        // A profile that reads the record alone: its holders are named
+        // ahead of the index's, which the preset's are not.
+        let aware = PolicySpec::preset("cache_aware").expect("a preset");
+        let by_record = aware.profiles.into_values().next();
+        let mut by_record = by_record.expect("the preset's profile");
+        let prefix = PrefixAffinityParams {
+            weight: 4.0,
+            source: Some(AffinitySource::Predictor),
+            ..PrefixAffinityParams::default()
+        };
+        by_record.score[1] = ScoreStage::PrefixAffinity(prefix).into();
+        // The pair of `round_robin` prefills and `decode` decodes, behind
+        // a `round_robin` binding of the decode phase alone.
+        let behind = |decode: &str| {
+            let pair = PolicySpec::pair_presets("round_robin", decode);
+            let mut document = pair.expect("the pair presets");
+            let stock = PolicySpec::preset("round_robin").expect("a preset");
+            let mut first = stock.bindings[0].clone();
+            first.matcher.phase = vec![Phase::Decode];
+            first.profile = Some("first".into());
+            document.bindings.insert(0, first);
+            let turns = stock.profiles.into_values().next();
+            let turns = turns.expect("the preset's profile");
+            document.profiles.insert("first".into(), turns);
+            document
+        };
+        // The first binding's shadow word and the pool's record.
+        let word = |document: &PolicySpec| {
+            let engine = document.validate().expect("two bindings");
+            let rows = engine.shadow_for("m", Phase::Decode);
+            let record = engine.pool_record_for("m", Phase::Decode);
+            (rows.map(|(_, rows)| rows), record)
+        };
+
+        // A decode request asked alone resolves to the first binding,
+        // whose profile reads no record: the pool keeps the pair's.
+        let pairs = behind("cache_aware");
+        let engine = pairs.validate().expect("two bindings");
+        assert!(!engine.reads_sent_for("m", Phase::Decode));
+        assert_eq!(engine.pool_record_for("m", Phase::Prefill), None);
+        assert_eq!(word(&pairs), (None, Some(false)));
+        assert_eq!(word(&behind("round_robin")), (None, None));
+
+        // The first binding's own word stands where its profile reads
+        // the record.
+        let mut reader = behind("cache_aware");
+        reader.profiles.insert("first".into(), by_record.clone());
+        assert_eq!(word(&reader), (None, Some(true)));
+
+        // A shadow of the first binding has the pool keep the record for
+        // it alone where the pair's decode side reads none. Beside a side
+        // that reads the record it is not asked, and the pool's is the
+        // side's.
+        let shadowed = |decode: &str| {
+            let mut document = behind(decode);
+            document.profiles.insert("second".into(), by_record.clone());
+            document.bindings[0].shadow = Some(ShadowSpec::Profile("second".into()));
+            document
+        };
+        let (own, apart) = (ShadowRows::Own, ShadowRows::Apart);
+        assert_eq!(word(&shadowed("round_robin")), (Some(own), Some(true)));
+        assert_eq!(word(&shadowed("cache_aware")), (Some(apart), Some(false)));
     }
 
     /// Two bindings share a model where one id matches both patterns, as

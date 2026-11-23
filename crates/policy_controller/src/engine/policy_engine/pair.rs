@@ -67,7 +67,9 @@
 //! events and by the record of sent prefixes, read at the side's phase.
 //! Behind a pick its profile is told of, each side's record keeps where
 //! the prompt went ([`overlap::record_prefix`]). The decode asked again
-//! reads the decodes' column alone.
+//! reads the decodes' column alone. The two sides write into the model's
+//! one record under its one bound: a pair's request spends a placement a
+//! block for each side, where a single's spends one.
 //!
 //! **Named signals.** Under a document a stage of which reads a named
 //! signal, a side whose profile reads one is lent its own list's signal
@@ -4511,10 +4513,15 @@ mod tests {
     /// A host of four prefills and four decodes under the stock policies
     /// `prefill` and `decode` of a pair's two sides.
     fn host_under(prefill: &str, decode: &str) -> Host {
-        let mut document = PolicySpec::pair_presets(prefill, decode).expect("the pair presets");
+        let document = PolicySpec::pair_presets(prefill, decode).expect("the pair presets");
+        host_of(document, 4, 4)
+    }
+
+    /// A host of `prefills` and `decodes` workers under `document`.
+    fn host_of(mut document: PolicySpec, prefills: usize, decodes: usize) -> Host {
         document.generation = 3;
         let spec = AppliedSpec::validate(&document).expect("a valid document");
-        Host::under((spec, Arc::default()), 4, 4)
+        Host::under((spec, Arc::default()), prefills, decodes)
     }
 
     /// A prompt of four whole blocks as its host hashes it, its tokens
@@ -4598,5 +4605,66 @@ mod tests {
             decodes.insert(again.1);
         }
         assert_eq!(decodes.len(), 4, "{decodes:?}");
+    }
+
+    /// Asserts that under `host` a prompt's decode stays while its prefills
+    /// take their turns, and that the decode asked again behind a held
+    /// prefill is the prompt's too.
+    fn the_decode_stays_and_the_prefills_turn(host: &Host) {
+        let sent = prompt(host, 1_000);
+        let (prefill, decode) = host.picked(&decide_prompt(host, &sent, 1, None));
+        let held = prefill_alone(worker_id(host.prefills[prefill].as_ref()));
+        let mut prefills = BTreeSet::from([prefill]);
+        for seed in 2..10 {
+            let again = host.picked(&decide_prompt(host, &sent, seed, None));
+            assert_eq!(again.1, decode, "seed {seed}");
+            prefills.insert(again.0);
+            let behind = decide_prompt(host, &sent, seed, Some(&held));
+            assert_eq!(host.picked(&behind), (prefill, decode), "seed {seed}");
+        }
+        assert_eq!(prefills.len(), 4, "{prefills:?}");
+    }
+
+    /// The mirror of the case above, where the decode alone reads: with
+    /// `round_robin` on the prefills and `cache_aware` on the decodes, a
+    /// prompt's decode stays and its prefills take their turns. The
+    /// decode's pick is written and none for the prefill.
+    #[test]
+    fn a_decode_that_reads_alone_keeps_its_prompts_decode() {
+        the_decode_stays_and_the_prefills_turn(&host_under("round_robin", "cache_aware"));
+    }
+
+    /// A binding of the decode phase alone listed ahead of the pair's takes
+    /// a decode request asked alone and leaves the pair its decode side.
+    /// The decodes' list keeps the record that side reads where the first
+    /// binding reads none, so a prompt's decode stays there too.
+    #[test]
+    fn a_decode_binding_listed_ahead_leaves_the_pair_its_record() {
+        let pair = PolicySpec::pair_presets("round_robin", "cache_aware");
+        let mut document = pair.expect("the pair presets");
+        let stock = PolicySpec::preset("round_robin").expect("a preset");
+        let mut ahead = stock.bindings[0].clone();
+        ahead.matcher.phase = vec![Phase::Decode];
+        ahead.profile = Some("ahead".into());
+        document.bindings.insert(0, ahead);
+        let turns = stock.profiles.into_values().next();
+        let turns = turns.expect("the preset's profile");
+        document.profiles.insert("ahead".into(), turns);
+        the_decode_stays_and_the_prefills_turn(&host_of(document, 4, 4));
+    }
+
+    /// Each side's column is its own list's, whatever the lists' sizes:
+    /// over two prefills and four decodes a prompt sent to a pair goes to
+    /// that pair again under any draw.
+    #[test]
+    fn a_prompt_stays_with_its_pair_over_lists_of_two_sizes() {
+        let pair = PolicySpec::pair_presets("cache_aware", "cache_aware");
+        let host = host_of(pair.expect("the pair presets"), 2, 4);
+        let sent = prompt(&host, 1_000);
+        let first = host.picked(&decide_prompt(&host, &sent, 1, None));
+        for seed in 2..34 {
+            let again = host.picked(&decide_prompt(&host, &sent, seed, None));
+            assert_eq!(again, first, "seed {seed}");
+        }
     }
 }
