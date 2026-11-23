@@ -1169,9 +1169,10 @@ mod tests {
         assert_eq!(size_of::<DecisionGuard<Arc<PolicyEngine>>>(), HELD);
         assert_eq!(size_of::<DecisionGuard<&PolicyEngine>>(), HELD);
         // A placement is the handle and what its host reads of the answer:
-        // two worker pointers, the routing key, the profile's label and the
-        // label of a pair's decode side.
-        assert_eq!(size_of::<crate::tracking::Placement<'_>>(), HELD + 80);
+        // two worker pointers, the routing key, the profile's label, the
+        // label of a pair's decode side and one pointer to an encode
+        // request's encoders.
+        assert_eq!(size_of::<crate::tracking::Placement<'_>>(), HELD + 88);
     }
 
     /// A request that is served: its lease is issued on the pick's first

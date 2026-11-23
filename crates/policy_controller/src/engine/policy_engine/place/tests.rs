@@ -1,3 +1,4 @@
+mod encode;
 mod pair;
 
 use std::{
@@ -198,6 +199,18 @@ fn pool(workers: usize) -> Arc<[Arc<dyn Worker>]> {
     (0..workers)
         .map(|at| ready_worker(&format!("http://worker-{at}:8000"), MODEL))
         .collect()
+}
+
+/// Opens `worker`'s circuit breaker: the worker stays healthy and cannot be
+/// sent to.
+fn trip(worker: &Arc<dyn Worker>) {
+    for _ in 0..64 {
+        if !worker.circuit_breaker_can_execute() {
+            break;
+        }
+        worker.record_circuit_breaker_outcome(false);
+    }
+    assert!(worker.routing_state().healthy && !ready(worker.as_ref()));
 }
 
 /// A document whose binding reads a routing value from a header, then from
@@ -1515,10 +1528,10 @@ fn an_ask_is_made_of_what_its_call_handed_on() {
 }
 
 /// A request with no worker is answered why. A decision's shed keeps its
-/// reason and the stage that left nobody. What this call does not place
-/// yet is declined by name: encode items. A demand no worker of the list
-/// meets is shed under the demand's name. A decision that panics is
-/// refused, and costs its request alone.
+/// reason and the stage that left nobody. Encode items over other lists
+/// than an encode request's three are declined by name. A demand no worker
+/// of the list meets is shed under the demand's name. A decision that
+/// panics is refused, and costs its request alone.
 #[test]
 fn a_request_with_no_worker_is_answered_why() {
     let engine = hosted(preset("round_robin"));
@@ -1536,14 +1549,6 @@ fn a_request_with_no_worker_is_answered_why() {
     assert_eq!(
         engine.place(&none).err(),
         shed(ShedReason::NoEndpoints, "none")
-    );
-    // An encode request's three lists, with no item stated, are declined
-    // by name.
-    let partners = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
-    let three = PlaceRequest::of(MODEL, three_of(pair_of(&members, &partners)));
-    assert_eq!(
-        engine.place(&three).err(),
-        shed(ShedReason::PolicyDeclined, "encode-lists")
     );
     let demands = Demands {
         vision: true,

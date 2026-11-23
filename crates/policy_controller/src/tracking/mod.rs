@@ -20,6 +20,8 @@ pub use lease::{
     Said, Side, Signal, TransportClass,
 };
 #[cfg(feature = "in-process")]
+pub use placement::Encoders;
+#[cfg(feature = "in-process")]
 pub use placement::Placement;
 #[cfg(feature = "in-process")]
 pub use placement_side::PlacementSide;

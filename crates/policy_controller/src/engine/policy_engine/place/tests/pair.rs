@@ -97,18 +97,6 @@ fn said(heard: &HeardBy) -> Vec<(String, WorkerId)> {
     said
 }
 
-/// Opens `worker`'s circuit breaker: the worker stays healthy and cannot be
-/// sent to.
-fn trip(worker: &Arc<dyn Worker>) {
-    for _ in 0..64 {
-        if !worker.circuit_breaker_can_execute() {
-            break;
-        }
-        worker.record_circuit_breaker_outcome(false);
-    }
-    assert!(worker.routing_state().healthy && !ready(worker.as_ref()));
-}
-
 /// A caller's two lists of ready workers as it publishes them, each with
 /// its cell.
 struct Lists {

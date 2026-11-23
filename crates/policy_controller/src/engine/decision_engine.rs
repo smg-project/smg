@@ -221,10 +221,10 @@ pub enum WorkerLists<'a> {
     /// The engine's other entries take no items: through them the three
     /// are the pair's two, for a request with no item and for a decode
     /// asked again. Such a decision does not read whether a decode takes
-    /// images, so the encode entry declines a request that asks images of
-    /// its decode and states the later decode. A request whose items are
-    /// references and that states images only prefers such a decode: it is
-    /// decided, and its decode asked again is held to no image fact.
+    /// images, so the encode entry declines a request that states the
+    /// later decode where its decode is held to the ones that take images:
+    /// by its demand, or by the preference of image references beside an
+    /// image.
     Encode(super::policy_engine::encode::EncodeLists<'a>),
 }
 
