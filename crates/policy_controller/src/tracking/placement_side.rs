@@ -180,7 +180,18 @@ impl Pair {
     /// `side`'s end. A prefill's is held back where saying it now would
     /// take the chosen decode with it, and one that waited is said behind
     /// the decode's.
+    ///
+    /// An outcome says that its side went out: a send never said is said
+    /// here first, at the report's instant, as a placement's own end says
+    /// it ([`Placement::ended`]). So a prefill reported with no send is
+    /// held back like any other while its decode stands chosen.
     fn ended(&mut self, side: Side, end: End) {
+        if let (Some(_), Some(held)) = (end.outcome, &mut self.placement.held) {
+            match side {
+                Side::Decode => held.dispatched_decode(end.at),
+                _ => held.dispatched(end.at),
+            }
+        }
         let lease = self.placement.held.as_ref();
         if side != Side::Decode && lease.is_some_and(|held| held.end_takes_decode()) {
             self.held_end = Some(end);
@@ -466,7 +477,9 @@ impl SideEnd {
     /// into it, whatever its holder wrote there: the side, the worker that
     /// served, and the span from the side's dispatch to this report. An
     /// outcome reported of a side whose send was never said says the send
-    /// first, as [`Placement::ended`] does.
+    /// first, as [`Placement::ended`] does. A pair's prefill reported so is
+    /// held back for its decode's word as one that was sent: the decode
+    /// that stands chosen stays, and may still be sent or asked again.
     ///
     /// The last report of a side's handles stands: a later one writes the
     /// earlier over, with its own instant.
@@ -1577,6 +1590,48 @@ mod tests {
         let heard = one_end(&host);
         assert_eq!((heard.side, heard.status), (P, 200));
         assert_eq!(host.words(), [("ended", P)]);
+    }
+
+    /// A prefill reported with no send, while its decode stands chosen,
+    /// keeps the pair whole: its send is said first, and its end is held
+    /// back for the decode side's word as a sent prefill's is. The decode
+    /// still goes out under its lease, and both ends are said in the
+    /// pair's order.
+    #[test]
+    fn a_prefill_reported_with_no_send_leaves_its_chosen_decode() {
+        let host = Host::of_pairs();
+        let (prefill, mut decode) = host.pair(true);
+        let end = prefill.side_end();
+        end.reported(read(502, TransportClass::ConnectFailed));
+        drop((prefill, end));
+        let sent = [("issued", P), ("sent", P)];
+        assert_eq!(host.words(), sent, "the send is said, and the end waits");
+        assert!(owes(&decode), "the chosen decode stays");
+        decode.sent();
+        let heard = one_end(&host);
+        let stated = (P, 502, TransportClass::ConnectFailed, 0);
+        let told = (heard.side, heard.status, heard.class, heard.duration_micros);
+        assert_eq!(told, stated);
+        let behind = [("issued", D), ("sent", D), ("ended", P)];
+        assert_eq!(host.words(), behind);
+        drop(decode);
+        assert_eq!(host.words(), [("ended", D)]);
+
+        // The decode asked again behind such a prefill is decided and sent.
+        let host = Host::of_later_pairs();
+        let classes = PartnerClasses::number(1, [&[0_u32][..]]);
+        let request = later(host.lists(&classes));
+        let (prefill, mut decode) = sides_of(&host, &request);
+        let end = prefill.side_end();
+        end.reported(read(200, TransportClass::Ok));
+        drop((prefill, end));
+        assert_eq!(host.words(), sent, "the send is said, and the end waits");
+        decode.decode_again(&request).expect("a decode");
+        assert_eq!(one_end(&host).status, 200);
+        assert_eq!(host.words(), [("issued", D), ("ended", P)]);
+        decode.sent();
+        drop(decode);
+        assert_eq!(host.words(), [("sent", D), ("ended", D)]);
     }
 
     /// Under a document none of whose stages takes an end a side keeps its
