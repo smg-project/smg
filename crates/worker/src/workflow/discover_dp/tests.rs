@@ -276,19 +276,27 @@ async fn a_zmq_workers_shape_is_its_specs() {
 /// its server info, for a runtime whose row says the size stands there, on
 /// a host given no setting for it. A worker of several ranks is asked its
 /// load route once, and keeps its shape where the answer holds a row for
-/// every rank, in whatever order.
+/// every rank, in whatever order. The route is asked over HTTP however the
+/// worker's address was registered: with its scheme, with a slash behind
+/// it, or bare, as service discovery registers a `host:port`.
 #[tokio::test]
 async fn an_http_workers_shape_is_read_from_its_labels() {
     let (base, reads) = engine_with_loads(StatusCode::OK, loads_of(&[3, 0, 2, 1])).await;
-    let mut ctx = http_context(&base, 1);
-    ctx.data.discovered_labels = server_info_labels(2, Some(2));
+    let bare = base.strip_prefix("http://").unwrap();
+    for (asked, registered) in [base.clone(), format!("{base}/"), bare.to_string()]
+        .iter()
+        .enumerate()
+    {
+        let mut ctx = http_context(registered, 1);
+        ctx.data.discovered_labels = server_info_labels(2, Some(2));
 
-    let result = DiscoverDpInfoStep.execute(&mut ctx).await.unwrap();
+        let result = DiscoverDpInfoStep.execute(&mut ctx).await.unwrap();
 
-    assert_eq!(result, StepResult::Success);
-    let dp_info = ctx.data.dp_info.as_ref().unwrap();
-    assert_eq!((dp_info.dp_size, dp_info.model_id.as_str()), (4, "model-a"));
-    assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(result, StepResult::Success, "{registered}");
+        let dp_info = ctx.data.dp_info.as_ref().unwrap();
+        assert_eq!((dp_info.dp_size, dp_info.model_id.as_str()), (4, "model-a"));
+        assert_eq!(reads.load(Ordering::SeqCst), asked + 1, "{registered}");
+    }
 }
 
 /// An HTTP worker of several ranks is left with no shape, and so registers

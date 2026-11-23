@@ -2081,6 +2081,32 @@ mod tests {
         );
     }
 
+    /// An engine registered by a bare `host:port`, as service discovery
+    /// registers one, is asked its load route over HTTP as the reads before
+    /// it are, and stands as its two rank workers.
+    #[tokio::test]
+    async fn an_engine_at_a_bare_address_registers_its_ranks() {
+        use http::StatusCode;
+        use serde_json::json;
+
+        use crate::app_context::testing::live_app_context;
+
+        let two_ranks = (StatusCode::OK, json!({"dp_size": 2}));
+        let (base, _) = engine_whose_server_info_turns(two_ranks.clone(), two_ranks).await;
+        let context = live_app_context();
+        let marks = DashSet::new();
+        let bare = base.strip_prefix("http://").expect("an HTTP base");
+        let upsert = add_worker(bare, WorkerRegistrationMode::Upsert);
+
+        let result = execute_job(&upsert, &context, &marks, None).await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            standing_at(&context, &base),
+            [format!("{base}@0"), format!("{base}@1")]
+        );
+    }
+
     /// An engine keeps the shape of its first registration when its load
     /// route turns, either way. One that answered by rank stands as two rank
     /// workers, and an upsert made once the route is no longer served reads

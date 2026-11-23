@@ -10,11 +10,12 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 use super::{
     data::{DpInfo, WorkerKind, WorkerRegistrationWorkflowData},
     host::{require_host, WorkflowHost},
+    reach::http_base_url,
     registration::DISCOVER_DP_STEP,
     runtimes::reports_dp,
 };
 use crate::{
-    identity::{basic::ConnectionMode, endpoint::Endpoint, metadata::join_base},
+    identity::{basic::ConnectionMode, endpoint::Endpoint},
     load::monitor::{NativeLoads, WorkerMonitor, ENGINE_LOADS_ROUTE},
     worker::WorkerSpec,
     UNKNOWN_MODEL_ID,
@@ -217,7 +218,9 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Discov
                                     .and_then(|id| id.parse().ok())
                                     .unwrap_or(config.runtime_type),
                                 &client,
-                                join_base(&config.url),
+                                // The base the metadata read asked, which a
+                                // poll asks too: a bare address is HTTP.
+                                &http_base_url(&config.url),
                                 config.api_key.as_deref(),
                             )
                             .await;
