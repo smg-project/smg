@@ -1143,9 +1143,12 @@ type AddedTokenList = Vec<Added>;
 
 /// One set of added tokens, matched leftmost-longest as `AddedVocabulary`
 /// matches them. The automaton's own search scans a text for the tokens'
-/// first bytes when there are at most three of them, all ASCII; a set the
-/// scan cannot take (a token starting beyond ASCII, or more than three
-/// first bytes) it searches by the tokens' rarest bytes instead, which for a
+/// first bytes when there are at most three of them, all ASCII, each `<`,
+/// `[` or `]`; a set of two or three with another first byte takes a byte
+/// search of its own ([`Search::FirstBytes`]), unless a token of it holds
+/// more than one place of that search past its start. A set the scan cannot
+/// take (a token starting beyond ASCII, or more than three first bytes) the
+/// automaton searches by the tokens' rarest bytes instead, which for a
 /// vocabulary of a thousand `<` tokens and one fenced in fullwidth bars were
 /// the bars' continuation bytes, frequent in CJK text: that search was a
 /// third of a 2 KB encode (measured). Such a set takes its candidates from
@@ -1176,9 +1179,11 @@ pub(crate) struct AddedTokens {
 /// [`Self::MAX_FIRST_BYTES`]: a hit then is a byte that starts some token,
 /// and the automaton anchored there decides, where the unanchored automaton
 /// walked every byte of the text (measured at about thirty instructions per
-/// byte on a 6,415-token set).
+/// byte on a 6,415-token set). A set of two or three first bytes, all ASCII,
+/// takes no prefixes: a byte search for them finds its places
+/// ([`Search::FirstBytes`]).
 struct Prefixes {
-    searcher: packed::Searcher,
+    searcher: Search,
 }
 
 impl Prefixes {
@@ -1194,9 +1199,16 @@ impl Prefixes {
     /// shorter one would stop the pass at places no token stands.
     const NARROW_MIN_LEN: usize = 8;
     const MAX_FIRST_BYTES: usize = 16;
+    /// The most places of the byte search a token may hold past its own
+    /// start: one, the slash of `</think>` in a set with `/think`.
+    const MAX_INNER: usize = 1;
 
-    /// Whether the automaton's start-byte scan declines `tokens`: a first
-    /// byte beyond ASCII, or more than three distinct first bytes.
+    /// Whether a search of our own beats the automaton's on `tokens`: a first
+    /// byte beyond ASCII or more than three distinct ones, which its
+    /// first-byte scan declines; and two or three unless each is `<`, `[` or
+    /// `]`: beside a first byte more common in text (a slash) the automaton
+    /// scans for the tokens' rarest bytes instead, letters among them, and
+    /// text is full of those.
     fn wanted(tokens: &[Added]) -> bool {
         let mut firsts: Vec<u8> = tokens
             .iter()
@@ -1204,7 +1216,9 @@ impl Prefixes {
             .collect();
         firsts.sort_unstable();
         firsts.dedup();
-        firsts.len() > 3 || firsts.iter().any(|first| !first.is_ascii())
+        firsts.len() > 3
+            || firsts.iter().any(|first| !first.is_ascii())
+            || (firsts.len() > 1 && firsts.iter().any(|first| !b"<[]".contains(first)))
     }
 
     /// The distinct prefixes of `tokens` of up to `len` bytes.
@@ -1243,17 +1257,69 @@ impl Prefixes {
         (!cut_short || len >= Self::MIN_LEN).then_some(prefixes)
     }
 
-    /// The searcher over the prefixes of `tokens` ([`Self::chosen`]); none
-    /// when there are none to take or the library declines the set.
+    /// What searches for `tokens`: the byte search for two or three first
+    /// bytes, all ASCII; else the searcher over the prefixes
+    /// ([`Self::chosen`]), none when there are none to take or the library
+    /// declines the set, and none where the byte search would have a text
+    /// walked over and over.
     fn of(tokens: &[Added]) -> Option<Self> {
+        let firsts = Self::distinct(tokens, 1);
+        let bytes: Vec<u8> = firsts
+            .iter()
+            .filter_map(|first| first.first().copied())
+            .collect();
+        if let [a, .., c] = bytes[..] {
+            if bytes.len() <= 3 && bytes.iter().all(u8::is_ascii) {
+                let bytes = [a, bytes[1], c];
+                let mut seconds = [[false; 256]; 3];
+                for token in tokens {
+                    let content = token.content.as_bytes();
+                    let Some(which) = bytes.iter().position(|byte| content.first() == Some(byte))
+                    else {
+                        continue;
+                    };
+                    match content.get(1) {
+                        Some(&second) => seconds[which][usize::from(second)] = true,
+                        None => seconds[which] = [true; 256],
+                    }
+                }
+                // A token that holds places of this search past its own start
+                // has the anchored automaton walk them again from each. With
+                // at most `MAX_INNER` in a token, no byte of a text is walked
+                // more than that plus three times; a set beyond it (`aaaab`: a
+                // text of `a` walked from every byte) keeps the automaton's
+                // own search.
+                let inner = |token: &Added| {
+                    let content = token.content.as_bytes();
+                    let pairs = content.iter().zip(content.iter().skip(1));
+                    pairs
+                        .skip(1)
+                        .filter(|(first, second)| {
+                            bytes
+                                .iter()
+                                .position(|byte| byte == *first)
+                                .is_some_and(|which| seconds[which][usize::from(**second)])
+                        })
+                        .count()
+                };
+                if tokens.iter().any(|token| inner(token) > Self::MAX_INNER) {
+                    return None;
+                }
+                let pair = Pair::of(bytes, &seconds);
+                return Some(Self {
+                    searcher: Search::FirstBytes(bytes, Box::new(seconds), pair),
+                });
+            }
+        }
         let prefixes = Self::chosen(tokens)?;
         let searcher = Self::searcher(&prefixes).or_else(|| {
-            let firsts = Self::distinct(tokens, 1);
             (firsts.len() <= Self::MAX_FIRST_BYTES)
                 .then(|| Self::searcher(&firsts))
                 .flatten()
         })?;
-        Some(Self { searcher })
+        Some(Self {
+            searcher: Search::Packed(searcher),
+        })
     }
 
     /// The library's packed searcher over `patterns`, none when it declines
@@ -1266,12 +1332,175 @@ impl Prefixes {
             .build()
     }
 
-    /// The first position at or after `from` where a prefix stands.
-    fn next(&self, text: &str, from: usize) -> Option<usize> {
-        self.searcher
-            .find_in(text, Span::from(from..text.len()))
-            .map(|found| found.start())
+    /// The first position at or after `from` where a token may start.
+    /// `sought` is this text's: through it the byte search counts the places
+    /// of a common first byte that start nothing and hands the text to the
+    /// split search ([`Pair`]).
+    fn next(&self, text: &str, from: usize, sought: &mut Sought) -> Option<usize> {
+        match &self.searcher {
+            Search::Packed(searcher) => searcher
+                .find_in(text, Span::from(from..text.len()))
+                .map(|found| found.start()),
+            Search::FirstBytes([a, b, c], seconds, pair) => {
+                let bytes = text.as_bytes();
+                let mut from = from;
+                loop {
+                    if let Some(pair) = pair {
+                        if sought.misses >= Pair::MISSES {
+                            return pair.next(bytes, from, [*a, *b, *c], seconds, sought);
+                        }
+                    }
+                    let mut at = from + memchr::memchr3(*a, *b, *c, bytes.get(from..)?)?;
+                    // A first byte right behind one that starts no token (a
+                    // doubled slash) is tested in place: a new search call
+                    // would only find it again.
+                    loop {
+                        let which = match bytes.get(at)? {
+                            byte if byte == a => 0,
+                            byte if byte == b => 1,
+                            _ => 2,
+                        };
+                        match bytes.get(at + 1) {
+                            Some(&second) if !seconds[which][usize::from(second)] => {
+                                if pair.as_ref().is_some_and(|pair| pair.common == which) {
+                                    sought.misses = sought.misses.saturating_add(1);
+                                    if sought.misses >= Pair::MISSES {
+                                        from = at + 1;
+                                        break;
+                                    }
+                                }
+                                if [*a, *b, *c].contains(&second) {
+                                    at += 1;
+                                } else {
+                                    from = at + 2;
+                                    break;
+                                }
+                            }
+                            _ => return Some(at),
+                        }
+                    }
+                }
+            }
+        }
     }
+}
+
+/// What finds the next place a token may start: the packed prefixes, or,
+/// for two or three ASCII first bytes, a byte search for them (the last
+/// stands twice for two) that passes a place only when the byte after it
+/// follows that first byte in some token, so that the automaton is not
+/// asked at every slash or bracket of a text. Where one of the first bytes
+/// is common in text, a text dense in it goes on by the split search
+/// ([`Pair`]).
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per tokenizer, never moved once built; a box adds a load to a search call"
+)]
+enum Search {
+    Packed(packed::Searcher),
+    FirstBytes([u8; 3], Box<[[bool; 256]; 3]>, Option<Pair>),
+}
+
+/// The split search of a set with one first byte common in text (a slash)
+/// that every token of it follows with the same second byte: that pair is
+/// searched as two bytes and the other first bytes by the byte search, so the
+/// common byte alone stops nothing. A text takes it after [`Self::MISSES`]
+/// places of the common byte that start no token; until then it pays what
+/// the search for all three bytes pays.
+struct Pair {
+    common: usize,
+    rare: [u8; 2],
+    finder: memchr::memmem::Finder<'static>,
+}
+
+impl Pair {
+    /// Two: a text with one such place keeps the one search, and the two
+    /// searches of the split start where the common byte has stopped it twice.
+    const MISSES: u8 = 2;
+
+    /// The split of `firsts` (sorted, the last standing twice for two), none
+    /// unless one of them alone is common and one byte follows it.
+    fn of(firsts: [u8; 3], seconds: &[[bool; 256]; 3]) -> Option<Self> {
+        let mut distinct = firsts.to_vec();
+        distinct.dedup();
+        let (rare, commons): (Vec<u8>, Vec<u8>) = distinct
+            .iter()
+            .copied()
+            .partition(|first| b"<[]".contains(first));
+        let [common] = commons[..] else {
+            return None;
+        };
+        let which = firsts.iter().position(|first| *first == common)?;
+        let mut follows = (0..=u8::MAX).filter(|second| seconds[which][usize::from(*second)]);
+        let (Some(second), None) = (follows.next(), follows.next()) else {
+            return None;
+        };
+        Some(Self {
+            common: which,
+            rare: [*rare.first()?, *rare.last()?],
+            finder: memchr::memmem::Finder::new(&[common, second]).into_owned(),
+        })
+    }
+
+    /// The first place at or after `from`: the earlier of the next rare first
+    /// byte a token can go on from and the next pair, each kept in `sought`
+    /// until the search has passed it. `from` is past the start of the text
+    /// here (a place was missed), so the zeros of a new `sought` are stale.
+    fn next(
+        &self,
+        bytes: &[u8],
+        from: usize,
+        firsts: [u8; 3],
+        seconds: &[[bool; 256]; 3],
+        sought: &mut Sought,
+    ) -> Option<usize> {
+        if sought.rare < from {
+            sought.rare = self.rare_from(bytes, from, firsts, seconds);
+        }
+        if sought.pair < from {
+            sought.pair = bytes
+                .get(from..)
+                .and_then(|rest| self.finder.find(rest))
+                .map_or(usize::MAX, |found| from + found);
+        }
+        let at = sought.rare.min(sought.pair);
+        (at != usize::MAX).then_some(at)
+    }
+
+    /// The first rare first byte at or after `from` that a token can go on
+    /// from, `usize::MAX` for none.
+    fn rare_from(
+        &self,
+        bytes: &[u8],
+        mut from: usize,
+        firsts: [u8; 3],
+        seconds: &[[bool; 256]; 3],
+    ) -> usize {
+        let [a, b] = self.rare;
+        while let Some(found) = bytes
+            .get(from..)
+            .and_then(|rest| memchr::memchr2(a, b, rest))
+        {
+            let at = from + found;
+            let which = firsts
+                .iter()
+                .position(|first| bytes.get(at) == Some(first))
+                .unwrap_or(0);
+            match bytes.get(at + 1) {
+                Some(&second) if !seconds[which][usize::from(second)] => from = at + 1,
+                _ => return at,
+            }
+        }
+        usize::MAX
+    }
+}
+
+/// What the search of one text remembers between its calls.
+#[derive(Default)]
+struct Sought {
+    misses: u8,
+    rare: usize,
+    pair: usize,
 }
 
 impl AddedTokens {
@@ -1323,6 +1552,7 @@ impl AddedTokens {
     fn matches<'a>(&'a self, text: &'a str) -> impl Iterator<Item = (Range<usize>, usize)> + 'a {
         let mut at = 0;
         let mut taken = 0;
+        let mut sought = Sought::default();
         std::iter::from_fn(move || loop {
             let Some(prefixes) = &self.prefixes else {
                 let input = Input::new(text).range(at..);
@@ -1336,7 +1566,7 @@ impl AddedTokens {
                 taken = range.end;
                 return Some((range, index));
             };
-            let start = prefixes.next(text, at)?;
+            let start = prefixes.next(text, at, &mut sought)?;
             let input = Input::new(text).range(start..).anchored(Anchored::Yes);
             if let Some(found) = self.automaton.find(input) {
                 at = found.end();
