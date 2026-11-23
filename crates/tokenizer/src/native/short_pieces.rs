@@ -377,11 +377,58 @@ impl ShortPieceTable {
     /// make the tag.
     #[inline(always)]
     fn first_slot(&self, key: ShortPieceKey) -> (usize, u8) {
+        let hash = Self::hash_of(key);
+        (hash as usize & self.mask, (hash >> 57) as u8 | 0x80)
+    }
+
+    /// The hash a probe of `key` begins from, in every table: the folded
+    /// product of the key's salted halves. For a caller that holds a piece
+    /// between the read of its lines and its probe.
+    #[inline(always)]
+    pub(super) fn hash_of(key: ShortPieceKey) -> u64 {
         let low = key.0 as u64 ^ LOW_SALT;
         let high = (key.0 >> 64) as u64 ^ HIGH_SALT;
         let product = u128::from(low) * u128::from(high);
-        let hash = (product as u64) ^ ((product >> 64) as u64);
-        (hash as usize & self.mask, (hash >> 57) as u8 | 0x80)
+        (product as u64) ^ ((product >> 64) as u64)
+    }
+
+    /// [`Self::touch`] from the key's hash ([`Self::hash_of`]).
+    #[inline(always)]
+    pub(super) fn touch_hashed(&self, hash: u64) -> u8 {
+        let slot = hash as usize & self.mask;
+        self.tags[slot] ^ (self.entries[slot].key as u8)
+    }
+
+    /// [`Self::lookup`] from the key's hash ([`Self::hash_of`]), with the
+    /// walk of [`Self::probe`] written out: one walk for both cost every
+    /// loop that compiles the probe in 1.0 to 1.8 instructions a token
+    /// (counted).
+    #[inline(always)]
+    pub(super) fn lookup_hashed(
+        &self,
+        key: ShortPieceKey,
+        hash: u64,
+        out: &mut Vec<u32>,
+    ) -> Option<Vacancy> {
+        let (mut slot, tag) = (hash as usize & self.mask, (hash >> 57) as u8 | 0x80);
+        loop {
+            let found = self.tags[slot];
+            if found == tag {
+                let entry = &self.entries[slot];
+                if entry.key & KEY_MASK == key.0 {
+                    self.append(entry, out);
+                    return None;
+                }
+            } else if found == EMPTY_TAG {
+                return Some(Vacancy {
+                    key,
+                    slot: slot as u32,
+                    mask: self.mask as u32,
+                    tag,
+                });
+            }
+            slot = (slot + 1) & self.mask;
+        }
     }
 
     /// Appends the ids of `key` to `out` and answers whether the table had

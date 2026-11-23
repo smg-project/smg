@@ -4468,6 +4468,53 @@ fn a_thread_whose_table_outgrew_its_reservation_does_not_wait() {
     assert!(cache.waiting.is_empty());
 }
 
+/// A thread whose table is past [`ASK_AHEAD_SLOTS`] holds the pieces of a
+/// unit cut by blocks and answers them [`ASK_AHEAD`] at a time, in the
+/// order they were cut, also where the lean scan hands the rest of a unit
+/// over: new text and the same text read again take the library's ids.
+#[test]
+fn a_table_past_the_near_caches_answers_held_pieces_in_the_order_cut() {
+    let mut state = 0x4153_4B5F_4148_4541u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "cl100k-ignore-merges")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    {
+        let mut cache = native.thread_piece_cache().borrow_mut();
+        cache.packed = ShortPieceTable::for_entries(ASK_AHEAD_SLOTS);
+        assert!(cache.packed.slots() > ASK_AHEAD_SLOTS);
+    }
+    // All ASCII: the lean scan leaves it to the block pass at a piece's end.
+    let handed = "let x = a[1]; // one, two\n".repeat(64);
+    // Stretches of ASCII, so the unit is cut by blocks; not all ASCII, so
+    // the lean scan does not take it.
+    let mixed: String = (0..600u32)
+        .map(|item| {
+            let head = if item.is_multiple_of(20) {
+                "caf\u{e9} "
+            } else {
+                ""
+            };
+            format!("{head}item {item} costs {}, ", item * 37 % 1000)
+        })
+        .collect();
+    for (cut, text) in [("handed over", handed), ("by blocks", mixed)] {
+        let reference = tokenizer
+            .encode(text.as_str(), false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        for lap in ["new text", "read again"] {
+            let ids = native
+                .encode_with(Some(tokenizer.get_model()), &text, false, false)
+                .expect("serial");
+            assert_eq!(ids, reference, "{cut}, {lap}");
+        }
+    }
+}
+
 /// `callers` threads have called `native`, none of them a thread of a pool.
 fn callers_join(native: &NativeEncoder, callers: usize) {
     native.threads.store(callers, Ordering::Relaxed);
