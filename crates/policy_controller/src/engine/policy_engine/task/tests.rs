@@ -18,7 +18,7 @@ use smg_worker::{
     worker::WorkerLoadResponse,
 };
 use tokio::{
-    task::JoinHandle,
+    task::{yield_now, JoinHandle},
     time::{advance, sleep},
 };
 
@@ -27,7 +27,11 @@ use crate::{
     engine::{
         decision_engine::{DecisionEngine, Request, RequestMaker, SweepOutcome, WorkerLists},
         list_cell::tests::PublishedList,
-        policy_engine::PolicyEngine,
+        policy_engine::{
+            membership::tests::{handed, id, in_id_order, registry, told},
+            single::tests::hearing,
+            PolicyEngine,
+        },
         view::{Constraints, Identity, RequestFacts, WorkerId},
         PlaceRequest,
     },
@@ -168,6 +172,62 @@ pub(in crate::engine::policy_engine) async fn running(
 ) -> JoinHandle<()> {
     let engine = Arc::clone(engine);
     spawned(async move { engine.run().await }).await
+}
+
+/// The engine's task, spawned as a host spawns it and polled once, with
+/// the count of its upkeep's runs. The clock is first moved off a whole
+/// millisecond, where a program's clock stands: a tick due at once still
+/// waits there on the runtime's timer, and one yield does not reach it.
+async fn polled_once(engine: &Arc<PolicyEngine>) -> (JoinHandle<()>, Arc<AtomicU64>) {
+    advance(Duration::from_micros(500)).await;
+    let runs = Arc::new(AtomicU64::new(0));
+    let (step, counted) = (Arc::clone(engine), Arc::clone(&runs));
+    let count = move |_: Instant| {
+        counted.fetch_add(1, Ordering::Relaxed);
+        SweepOutcome::default()
+    };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the case holds the task's handle and ends the task"
+    )]
+    let task = tokio::spawn(async move { step.run_with(count).await });
+    yield_now().await;
+    (task, runs)
+}
+
+/// The task's first upkeep runs at its first poll, and with it the task
+/// reads the registry its host handed: a host that spawns the task and
+/// yields once has stages that were told the workers that stand.
+#[tokio::test(start_paused = true)]
+async fn the_task_tells_the_workers_that_stand_at_its_first_poll() {
+    let (engine, heard) = hearing(false);
+    let engine = Arc::new(engine);
+    let registry = registry(2);
+    engine.set_registry(handed(&registry));
+    let (task, runs) = polled_once(&engine).await;
+    assert_eq!(runs.load(Ordering::Relaxed), 1, "the first upkeep");
+    let stand = vec![("joined", id(0)), ("joined", id(1))];
+    assert_eq!(in_id_order(told(&heard)), in_id_order(stand));
+    task.abort();
+}
+
+/// The task takes the load channel its host handed at its first poll: a
+/// host that spawns the task and yields once has an engine that reads the
+/// channel's reports for a request that gives none.
+#[tokio::test(start_paused = true)]
+async fn the_task_takes_the_load_channel_at_its_first_poll() {
+    let engine = preset("least_load");
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    let (_feed, channel) = monitor(&reports(4, 2));
+    engine.set_loads(channel);
+    let (task, runs) = polled_once(&engine).await;
+    assert_eq!(runs.load(Ordering::Relaxed), 1, "the first upkeep");
+    for seed in 0..32 {
+        let place = picked(&engine, &asks(seed, &members, None));
+        assert_eq!(place, 2, "seed {seed}: the shortest queue handed");
+    }
+    task.abort();
 }
 
 /// The task keeps the newest snapshot of its host's channel at hand: a

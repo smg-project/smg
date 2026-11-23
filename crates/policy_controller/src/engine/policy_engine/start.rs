@@ -64,7 +64,7 @@ impl PolicyEngine {
     /// - The engine's own task ([`Self::run`]). The program spawns it once,
     ///   ahead of its first request, on a runtime of its choice that has its
     ///   timer on: the engine spawns nothing, and on a runtime with no timer
-    ///   the task ends at its first step with a panic. The task runs the
+    ///   the task ends at its first poll with a panic. The task runs the
     ///   engine's upkeep off a request's path, keeps the newest load
     ///   snapshot at hand, tells the document's stages a worker that
     ///   joined or was removed, and tells the stages that keep load reports
@@ -72,9 +72,12 @@ impl PolicyEngine {
     ///   the four.
     ///
     /// Every hand-over of `data` is made when the call returns: no decision
-    /// of the engine runs ahead of one. At its first step the task reads
-    /// the registry whole and takes the load channel, where the engine kept
-    /// one, so a request decided ahead of that step reads no load report
+    /// of the engine runs ahead of one. The task takes them at its first
+    /// poll: it reads the registry whole there, so the document's stages
+    /// are told the workers that stand, and takes the load channel, where
+    /// the engine kept one. A program relies on both once the task has been
+    /// polled once, not when this call returns: a request decided ahead of
+    /// that poll reaches stages told no worker, and reads no load report
     /// but one it gives itself.
     ///
     /// Of what a program hands here it hands one thing again: its load

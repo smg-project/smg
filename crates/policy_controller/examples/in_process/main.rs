@@ -131,11 +131,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for address in addresses {
         assert!(program.join(worker(address)), "a free address joins");
     }
-    // The yield hands the engine's task its first poll. The task follows
-    // the registry from its first upkeep, which waits on the runtime's
-    // timer, and this short run does not wait for it. The requests below
-    // need no word of a join: each lends the engine the lists the
-    // registry holds at that moment.
+    // The yield hands the engine's task its first poll: there it reads the
+    // registry whole and tells the document's stages each worker.
     tokio::task::yield_now().await;
     let asked = Asked {
         model: MODEL,
@@ -150,9 +147,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for address in addresses {
         assert!(program.leave(address), "a worker that joined leaves");
     }
-    // A task that follows the registry is told each leave by it. The
-    // request below does not wait for that word either: the registry's
-    // lists hold no worker now.
+    // The registry's word of each leave woke the task: at this yield it
+    // tells the document's stages each one.
     tokio::task::yield_now().await;
     let answer = program.serve(&asked);
     println!(

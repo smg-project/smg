@@ -1080,7 +1080,9 @@ The engine's background task does what a host did by hand. Four of its jobs are 
 swapped when the monitor publishes one, so that a decision reads it without touching the
 channel. The third is a worker that joined or was removed told to the policies, read from the events of the registry the host hands at the start (section 8.1). A host that
 builds another load monitor hands its channel again (`engine.set_loads`): a channel ends with
-its monitor.
+its monitor. The task's first upkeep runs at its first poll, where it reads the registry and
+takes the load channel: a host relies on both once the task has been polled once, not when the
+start returns.
 
 The fourth job serves a policy that keeps a number of each worker's load report
 (`Lifecycle::keeps_loads`). At each load snapshot the task takes, it tells such a policy the

@@ -27,7 +27,10 @@ use parking_lot::Mutex;
 use smg_worker::load::state::{LoadReceiver, LoadSnapshot};
 use tokio::time::{self, MissedTickBehavior};
 
-use super::{membership, PolicyEngine};
+use super::{
+    membership::{self, Follow},
+    PolicyEngine,
+};
 use crate::{
     engine::{
         decision_engine::{DecisionEngine, RequestMaker, SweepOutcome},
@@ -174,6 +177,11 @@ impl PolicyEngine {
     /// host spawns it once, at its start, on a runtime whose timer is
     /// enabled, and it runs for as long as the engine stands.
     ///
+    /// Its first upkeep runs at its first poll, and each later one a
+    /// second behind the one before. So what a host handed ahead of the
+    /// spawn is taken at that poll: a host relies on the registry it
+    /// handed and on its load channel once the task has been polled once.
+    ///
     /// - The upkeep once a second ([`DecisionEngine::sweep`]), dated at its
     ///   run by the runtime's clock. A task that was not run for a while
     ///   runs it once for the seconds it missed. A panic in it is held and
@@ -247,28 +255,21 @@ impl PolicyEngine {
     /// The task's loop. `upkeep` is the step it runs once a second under
     /// a catch of its own: [`Self::run`] hands the engine's own.
     async fn run_with(&self, upkeep: impl Fn(Instant) -> SweepOutcome) {
-        let mut tick = time::interval(UPKEEP);
+        // The first upkeep runs at this poll, below, and the first tick is
+        // due a second behind it. A tick due at once still waits on the
+        // runtime's timer: a host that spawned the task and yielded once
+        // would decide ahead of it.
+        let mut tick = time::interval_at(time::Instant::now() + UPKEEP, UPKEEP);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         // The host's channel while its monitor publishes, and the count of
         // the hand-over it came with.
         let (mut taken, mut feed) = (0, None);
         // The follow of the host's registry, once it is handed.
         let mut members = None;
+        self.step(&upkeep, &mut members, &mut taken, &mut feed);
         loop {
             tokio::select! {
-                _ = tick.tick() => {
-                    // Dated at this run, not at the second its tick was due.
-                    let now = time::Instant::now().into_std();
-                    let _swept = self.held(|| upkeep(now));
-                    // Ahead of a hand-over's telling: it tells the reports
-                    // of the workers the follow told as joined.
-                    self.follow_registry(&mut members);
-                    if let Some(handed) = self.loads.handed_past(taken) {
-                        (taken, feed) = handed;
-                        let tell = |newest: &_| self.tell_loads(&mut members, newest);
-                        self.loads.keep(feed.as_mut(), tell);
-                    }
-                }
+                _ = tick.tick() => self.step(&upkeep, &mut members, &mut taken, &mut feed),
                 went_on = published(feed.as_mut()) => {
                     if went_on {
                         let tell = |newest: &_| self.tell_loads(&mut members, newest);
@@ -279,6 +280,32 @@ impl PolicyEngine {
                 }
                 word = membership::next(members.as_mut()) => self.heard(members.as_mut(), word),
             }
+        }
+    }
+
+    /// One upkeep of the task, at its first poll and then once a second:
+    /// `upkeep` under a catch of its own, then what the host handed since
+    /// the upkeep before. That is the follow of the registry the host
+    /// handed ([`Self::follow_registry`]), then the host's load channel,
+    /// where it handed one the task has not taken: `taken` counts the
+    /// hand-over `feed` came with.
+    fn step(
+        &self,
+        upkeep: &impl Fn(Instant) -> SweepOutcome,
+        members: &mut Option<Follow>,
+        taken: &mut u64,
+        feed: &mut Option<LoadReceiver>,
+    ) {
+        // Dated at this run, not at the second its tick was due.
+        let now = time::Instant::now().into_std();
+        let _swept = self.held(|| upkeep(now));
+        // Ahead of a hand-over's telling: it tells the reports of the
+        // workers the follow told as joined.
+        self.follow_registry(members);
+        if let Some(handed) = self.loads.handed_past(*taken) {
+            (*taken, *feed) = handed;
+            let tell = |newest: &_| self.tell_loads(members, newest);
+            self.loads.keep(feed.as_mut(), tell);
         }
     }
 }
