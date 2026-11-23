@@ -165,7 +165,7 @@ impl<E: PrefillCandidateError + ?Sized> PrefillCandidateError for Box<E> {
     }
 }
 
-/// Why [`acquire_prefill`] could not reserve Prefill capacity.
+/// Why `acquire_prefill` could not reserve Prefill capacity.
 pub enum PrefillAcquireError<E> {
     /// Candidate selection found no worker to wait for. With admission
     /// enabled this is the verdict of the last attempt at the queue head.
