@@ -76,6 +76,7 @@ pub mod prefill_admission;
 pub(crate) mod rate_limit_cell;
 pub use smg_external_router::realtime;
 pub mod request_lease;
+pub(crate) mod responses_compat;
 pub(crate) use smg_external_router::sglang_fields;
 pub use smg_external_router::{retry, sse};
 pub mod snapshot;

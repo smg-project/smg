@@ -28,10 +28,16 @@ use serde_json::json;
 use tracing::{debug, enabled, trace, warn, Level};
 
 use super::types::HarmonyBuildOutput;
-use crate::routers::grpc::{
-    common::responses::{history::hosted_call_result, utils::extract_tools_from_response_tools},
-    proto_wrapper::ProtoOutputLogProbs,
-    utils,
+use crate::routers::{
+    common::responses_compat::format_agent_message_text,
+    grpc::{
+        common::responses::{
+            history::hosted_call_result,
+            utils::{custom_tool_as_function, extract_tools_from_response_tools},
+        },
+        proto_wrapper::ProtoOutputLogProbs,
+        utils,
+    },
 };
 
 /// Global Harmony encoding (lazy-initialized)
@@ -290,6 +296,7 @@ impl ToolLike for ResponseTool {
         matches!(
             self,
             ResponseTool::Function(_)
+                | ResponseTool::Custom(_)
                 | ResponseTool::Namespace(_)
                 | ResponseTool::ImageGeneration(_)
         )
@@ -313,6 +320,14 @@ impl ToolLike for ResponseTool {
                 ft.function.description.clone().unwrap_or_default(),
                 Some(ft.function.parameters_schema().clone()),
             )),
+            ResponseTool::Custom(ct) => {
+                let function = custom_tool_as_function(ct);
+                Some(ToolDescription::new(
+                    function.name,
+                    function.description.unwrap_or_default(),
+                    function.parameters,
+                ))
+            }
             ResponseTool::ImageGeneration(_) => Some(image_generation_tool_description()),
             _ => None,
         }
@@ -755,6 +770,7 @@ impl HarmonyBuilder {
                         item,
                         ResponseInputOutputItem::McpListTools { .. }
                             | ResponseInputOutputItem::McpApprovalRequest { .. }
+                            | ResponseInputOutputItem::AdditionalTools { .. }
                     ) {
                         continue;
                     }
@@ -951,8 +967,33 @@ impl HarmonyBuilder {
             // Left out before this conversion (see the item loop of
             // `construct_input_messages_with_harmony`).
             ResponseInputOutputItem::McpListTools { .. }
-            | ResponseInputOutputItem::McpApprovalRequest { .. } => {
+            | ResponseInputOutputItem::McpApprovalRequest { .. }
+            | ResponseInputOutputItem::AdditionalTools { .. } => {
                 Err("Unsupported input item type".to_string())
+            }
+
+            ResponseInputOutputItem::AgentMessage {
+                author,
+                recipient,
+                content,
+                ..
+            } => {
+                let text =
+                    format_agent_message_text(author, recipient, content).map_err(|part| {
+                        format!(
+                            "Harmony does not support \"{part}\" content parts in an agent_message"
+                        )
+                    })?;
+                Ok(HarmonyMessage {
+                    author: Author {
+                        role: Role::User,
+                        name: None,
+                    },
+                    recipient: None,
+                    content: vec![Content::Text(TextContent { text })],
+                    channel: None,
+                    content_type: None,
+                })
             }
 
             ResponseInputOutputItem::ImageGenerationCall { .. } => {
@@ -2253,5 +2294,31 @@ mod tests {
 
         assert!(logs_contain(&format!("decoded_length={}", decoded.len())));
         assert!(logs_contain("DECODED_TEXT_START"));
+    }
+
+    #[test]
+    fn build_from_responses_renders_top_level_custom_tool_in_prompt() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-oss-120b",
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a unified patch to files."
+            }],
+            "input": "Edit main.rs"
+        }))
+        .unwrap();
+        let output = HarmonyBuilder::new()
+            .build_from_responses(&request)
+            .expect("harmony build must succeed");
+        let decoded = try_harmony_encoding()
+            .expect("harmony encoding must load")
+            .tokenizer()
+            .decode_utf8(&output.input_ids)
+            .expect("decode harmony tokens");
+        assert!(
+            decoded.contains("apply_patch"),
+            "top-level custom tool must be rendered in Harmony prompt: {decoded}"
+        );
     }
 }

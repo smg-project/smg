@@ -29,13 +29,16 @@ use openai_protocol::{
 };
 use tracing::warn;
 
-use crate::routers::grpc::common::responses::{
-    history::hosted_call_result,
-    streaming::OutputItemKind,
-    utils::{
-        custom_tool_input, custom_tool_names, cut_call, decode_reasoning_content,
-        encode_reasoning_content, extract_tools_from_response_tools, function_call_status,
-        generation_failure_error, resolve_function_identity, response_status,
+use crate::routers::{
+    common::responses_compat::format_agent_message_text,
+    grpc::common::responses::{
+        history::hosted_call_result,
+        streaming::OutputItemKind,
+        utils::{
+            custom_tool_input, custom_tool_names, cut_call, decode_reasoning_content,
+            encode_reasoning_content, extract_tools_from_response_tools, function_call_status,
+            generation_failure_error, resolve_function_identity, response_status,
+        },
     },
 };
 
@@ -191,6 +194,21 @@ fn push_item(
     item: &ResponseInputOutputItem,
 ) -> Result<(), ConversionError> {
     match item {
+        ResponseInputOutputItem::AdditionalTools { .. } => {}
+        ResponseInputOutputItem::AgentMessage {
+            author,
+            recipient,
+            content,
+            ..
+        } => {
+            let text = format_agent_message_text(author, recipient, content).map_err(|part| {
+                ConversionError::UnsupportedContentPart {
+                    part,
+                    why: "only plaintext \"input_text\" parts are carried in an agent_message",
+                }
+            })?;
+            push_role_message(messages, "user", MessageContent::Text(text))?;
+        }
         ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
             let content = match content {
                 StringOrContentParts::String(s) => MessageContent::Text(s.clone()),
@@ -2183,5 +2201,47 @@ mod tests {
         assert!(matches!(&parts[0], ContentPart::Text { text } if text == "first"));
         assert!(matches!(&parts[1], ContentPart::ImageUrl { .. }));
         assert!(matches!(&parts[2], ContentPart::Text { text } if text == "last"));
+    }
+
+    #[test]
+    fn responses_to_chat_converts_plaintext_agent_message_and_rejects_encrypted() {
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": [{
+                "type": "agent_message",
+                "id": "am_1",
+                "author": "/root",
+                "recipient": "/root/worker",
+                "content": [{"type": "input_text", "text": "Reply OK"}]
+            }]
+        }))
+        .unwrap();
+
+        let chat = responses_to_chat(&req).expect("plaintext agent_message converts");
+        assert_eq!(chat.messages.len(), 1);
+        match &chat.messages[0] {
+            ChatMessage::User {
+                content: MessageContent::Text(text),
+                ..
+            } => {
+                assert!(text.contains("Sender: /root"), "{text}");
+                assert!(text.contains("Recipient: /root/worker"), "{text}");
+                assert!(text.ends_with("Reply OK"), "{text}");
+            }
+            other => panic!("expected user text message, got {other:?}"),
+        }
+
+        let encrypted: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": [{
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": "/root/worker",
+                "content": [{"type": "encrypted_content", "encrypted_content": "opaque"}]
+            }]
+        }))
+        .unwrap();
+        let err = responses_to_chat(&encrypted).expect_err("encrypted agent_message must fail");
+        assert_eq!(err.code(), "unsupported_content_part");
     }
 }

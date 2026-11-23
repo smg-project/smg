@@ -315,6 +315,15 @@ fn stored_item_as_input(item: ConversationItem) -> Option<ResponseInputOutputIte
                 }
             }
         }
+        "additional_tools" | "agent_message" => {
+            match serde_json::from_value::<ResponseInputOutputItem>(item.content) {
+                Ok(replayed) => Some(replayed),
+                Err(e) => {
+                    tracing::error!("Failed to deserialize {}: {}", item.item_type, e);
+                    None
+                }
+            }
+        }
         "reasoning" => None,
         _ => {
             warn!("Unknown item type in conversation: {}", item.item_type);
@@ -724,6 +733,24 @@ mod tests {
         ))
         .expect("a call replays");
         assert_eq!(shape(&[call]), vec!["function_call:call_A"]);
+        let inline_tools = stored_item_as_input(row(
+            "additional_tools",
+            json!({"type": "additional_tools", "id": "at_1", "role": "developer", "tools": [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}]}),
+        ))
+        .expect("additional_tools replays");
+        assert!(matches!(
+            inline_tools,
+            ResponseInputOutputItem::AdditionalTools { .. }
+        ));
+        let agent_msg = stored_item_as_input(row(
+            "agent_message",
+            json!({"type": "agent_message", "id": "am_1", "author": "/root", "recipient": "/root/worker", "content": [{"type": "input_text", "text": "task"}]}),
+        ))
+        .expect("agent_message replays");
+        assert!(matches!(
+            agent_msg,
+            ResponseInputOutputItem::AgentMessage { .. }
+        ));
         assert!(stored_item_as_input(row("reasoning", json!({}))).is_none());
         assert!(stored_item_as_input(row("mystery", json!({}))).is_none());
         assert!(

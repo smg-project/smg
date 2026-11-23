@@ -166,7 +166,7 @@ async fn route_responses_streaming(
     let (has_mcp_tools, mcp_servers) = match ensure_mcp_connection(
         &ctx.mcp_orchestrator,
         &ctx.mcp_format_registry,
-        request.tools.as_deref(),
+        modified_request.tools.as_deref(),
     )
     .await
     {
