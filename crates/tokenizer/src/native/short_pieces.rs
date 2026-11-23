@@ -1141,34 +1141,45 @@ mod tests {
         assert_eq!(table.slots(), ShortPieceTable::slots_for(100));
     }
 
-    /// A run that wrapped around the old slots' end is placed again whole:
-    /// for homes that stay behind that end, for homes at the grown table's
-    /// end, where the run wraps again, and for a run that mixes the two,
-    /// the one a walk from the first slot loses entries of.
+    /// A run that wrapped around the old slots' end is placed again whole,
+    /// in a step by four and in a thread table's first step: for homes that
+    /// stay behind that end, for homes at the grown table's end, where the
+    /// run wraps again, and for a run that mixes the two, the one a walk
+    /// from the first slot loses entries of.
     #[test]
     fn a_run_wrapped_around_the_old_end_reads_back_after_growth() {
-        let grown = ShortPieceTable::for_entries(100);
-        assert_eq!(grown.slots(), 256);
-        let slot_of = |i: u32| grown.first_slot(key(&i.to_le_bytes())).0;
-        for homes in [&[62, 63][..], &[254, 255], &[62, 63, 254, 255]] {
-            let wrapped: Vec<u32> = (0..4000)
+        for (slots, homes) in [
+            (256, &[62, 63][..]),
+            (256, &[254, 255]),
+            (256, &[62, 63, 254, 255]),
+            (FIRST_GROWTH_SLOTS, &[62, 63]),
+            (FIRST_GROWTH_SLOTS, &[1022, 1023]),
+            (FIRST_GROWTH_SLOTS, &[62, 63, 1022, 1023]),
+        ] {
+            let grown = ShortPieceTable::with_slots(slots, slots);
+            let slot_of = |i: u32| grown.first_slot(key(&i.to_le_bytes())).0;
+            let wrapped: Vec<u32> = (0..40_000)
                 .filter(|&i| homes.contains(&slot_of(i)))
                 .take(6)
                 .collect();
             assert_eq!(wrapped.len(), 6);
-            let mut table = ShortPieceTable::for_entries(0);
+            let mut table = if slots == FIRST_GROWTH_SLOTS {
+                ShortPieceTable::new()
+            } else {
+                ShortPieceTable::for_entries(0)
+            };
             for &i in &wrapped {
                 assert!(table.insert(key(&i.to_le_bytes()), &[i], 1000));
             }
             assert_ne!(table.tags[3], EMPTY_TAG, "the run wrapped to the start");
             let mut stored = wrapped.clone();
-            let mut rest = (0..4000).filter(|&i| slot_of(i) % MIN_SLOTS < 62);
+            let mut rest = (0..40_000).filter(|&i| slot_of(i) % MIN_SLOTS < 62);
             while table.slots() == MIN_SLOTS {
                 let i = rest.next().expect("pieces enough to grow the table");
                 assert!(table.insert(key(&i.to_le_bytes()), &[i], 1000));
                 stored.push(i);
             }
-            assert_eq!(table.slots(), 256);
+            assert_eq!(table.slots(), slots);
             for &i in &stored {
                 assert_eq!(ids_of(&table, &i.to_le_bytes()), Some(vec![i]), "{i}");
             }
