@@ -387,5 +387,7 @@ fn a_generation_of_no_member_lends_empty_lists() {
     assert_eq!(replica.objects.unstated(), 0);
 }
 
+/// The cases of an encode request's columns, in a file of their own.
+mod encode;
 /// The cases of a pair's classes, in a file of their own.
 mod pairs;

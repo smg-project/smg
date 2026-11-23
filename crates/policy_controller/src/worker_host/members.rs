@@ -1,7 +1,8 @@
 //! What a holder keeps of a registry's generation: the members, and where
 //! the build holds the engine over worker lists, the members by role, each
-//! role's list with its cell, its facts and its reach, and the pair classes
-//! of its prefill and decode lists.
+//! role's list with its cell, its facts and its reach, the pair classes of
+//! its prefill and decode lists, and the columns an encode request's
+//! decision reads beside its encoder and prefill lists.
 
 use std::sync::Arc;
 #[cfg(feature = "in-process")]
@@ -34,6 +35,10 @@ pub struct Members {
     /// mode.
     #[cfg(feature = "in-process")]
     pairs: pairs::PairSets,
+    /// The columns an encode request's decision reads beside the encoder
+    /// and prefill lists: derived at the first ask, once.
+    #[cfg(feature = "in-process")]
+    encode: OnceLock<EncodeColumns>,
     #[cfg(feature = "in-process")]
     by_role: ByRole,
 }
@@ -44,6 +49,8 @@ impl Generation for Members {
             members,
             #[cfg(feature = "in-process")]
             pairs: pairs::PairSets::default(),
+            #[cfg(feature = "in-process")]
+            encode: OnceLock::new(),
             #[cfg(feature = "in-process")]
             by_role: ByRole::default(),
         }
@@ -165,7 +172,11 @@ impl Members {
 }
 
 #[cfg(feature = "in-process")]
+mod encode;
+#[cfg(feature = "in-process")]
 mod pairs;
+#[cfg(feature = "in-process")]
+pub use encode::EncodeColumns;
 #[cfg(feature = "in-process")]
 pub use pairs::OpenAdmission;
 

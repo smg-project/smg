@@ -23,7 +23,7 @@ use smg_worker::{
 };
 
 #[cfg(feature = "in-process")]
-use super::members::{Members, Stated};
+use super::members::{EncodeColumns, Members, Stated};
 #[cfg(feature = "in-process")]
 use super::reach::{ListReach, Reach};
 use super::{
@@ -36,7 +36,10 @@ use super::{
 use crate::{
     document::spec::Pairing,
     engine::{FixedFacts, LentList, PartnerClasses, Role},
-    store::pairing::{Member, PairClasses},
+    store::{
+        encoding::{EncodeClasses, EncodeMember, EncodeOffer},
+        pairing::{Member, PairClasses},
+    },
 };
 use crate::{
     engine::view::WorkerId,
@@ -788,8 +791,9 @@ impl<G: Generation> Objects<G> {
     /// State the entry of the object that stands for `row` again, from the
     /// row: its maker and the time it was admitted at. The caller found the
     /// row's facts and revision to be the ones the object was built from
-    /// ([`Self::stands`]), so nothing a generation's lists or pair classes
-    /// are derived from moves here, and the registry is not written.
+    /// ([`Self::stands`]), so nothing a generation's lists, pair classes or
+    /// encode columns are derived from moves here, and the registry is not
+    /// written.
     fn restate(&self, row: &WorkerRow) {
         let held = &mut *self.held.write();
         let entry = held.objects.get(&row.id);
@@ -1024,25 +1028,100 @@ impl Objects<Members> {
             )
         }
         let lists = [Role::Prefill, Role::Decode].map(|role| self.lent(generation, role));
-        // What the row of each lent worker states, where the row's object
-        // still stands for it: read under the entry's lock, which is let
-        // go before the rule runs.
-        let stated = {
-            let held = self.held.read();
-            lists.map(|list| -> Vec<Option<Arc<RowRemainder>>> {
-                let facts = list.facts.unwrap_or_default();
-                let row = |(worker, fact): (&Arc<dyn Worker>, &FixedFacts)| {
-                    let laid = held.rows.get(held.objects.get(&fact.id?)?)?;
-                    Arc::ptr_eq(&laid.object, worker).then(|| Arc::clone(&laid.remainder))
-                };
-                list.workers.iter().zip(facts).map(row).collect()
-            })
-        };
+        let stated = self.remainders(lists);
         let members = [&stated[0], &stated[1]]
             .map(|side| side.iter().flatten().map(member).collect::<Vec<_>>());
         let derived = PairClasses::derive(&members[0], &members[1], mode);
         let stands = |side: usize| stated[side].iter().map(Option::is_some);
         derived.by_place(stands(0), stands(1))
+    }
+
+    /// What an encode request's decision reads beside `generation`'s
+    /// encoder list and beside its prefill list: what the encode side
+    /// reads of each encoder and the encode class each prefill names, by a
+    /// worker's place in its list AS LENT ([`Self::lent`]). Each column
+    /// holds one entry a worker of its list, whatever the workers state,
+    /// so a host hands both with the lists as they are
+    /// ([`EncodeLists::facts`](crate::engine::EncodeLists::facts),
+    /// [`EncodeLists::prefill_classes`](crate::engine::EncodeLists::prefill_classes)).
+    ///
+    /// The classes are the store's own encode rule and no other
+    /// ([`EncodeClasses::derive`]), over one member for each lent worker
+    /// in its list's order, made of what the worker's row states: its
+    /// engine kind and its end of the encode handoff. So a place of the
+    /// rule is a place of the list lent. A lent worker whose row's object
+    /// was replaced or ended before the columns are derived states no end
+    /// there: an encoder of class `0`, which takes no item, and a prefill
+    /// no encoder hands to.
+    ///
+    /// The rule runs over whatever is lent. Where no prefill is lent, an
+    /// encoder keeps the class of its end, and the pair's own decision
+    /// answers for the side that is missing. The store's pools read
+    /// otherwise there: the store derives no class for a model with no
+    /// prefill, and each of its encoders reads class `0`.
+    ///
+    /// A generation keeps one pair of columns, derived at the first ask
+    /// as a set of its pair classes is ([`Self::pair_classes`]): behind
+    /// the cut of the lists, with one read of the holder's entry under its
+    /// read lock, and the rule run with that lock let go. What they are
+    /// derived from does not move under a generation: a write that moves a
+    /// row's engine kind or its encode offer gets the row a new object,
+    /// and a new object publishes another generation. Every later ask is
+    /// one read and takes no lock.
+    #[must_use]
+    pub fn encode_columns<'a>(&self, generation: &'a Members) -> &'a EncodeColumns {
+        generation.encode_columns(|| self.derive_encode(generation))
+    }
+
+    /// The encode columns of `generation`'s two lists as lent, derived now.
+    fn derive_encode(&self, generation: &Members) -> EncodeColumns {
+        /// A lent worker as the rule reads it: its row's engine kind and
+        /// offer, and for a worker no row stands for an unknown runtime
+        /// with `none`, the offer that states nothing.
+        fn member<'a>(
+            row: Option<&'a Arc<RowRemainder>>,
+            none: &'a EncodeOffer,
+        ) -> EncodeMember<'a> {
+            row.map_or(
+                EncodeMember {
+                    runtime: "",
+                    offer: none,
+                },
+                |row| EncodeMember {
+                    runtime: &row.engine_kind,
+                    offer: &row.encode,
+                },
+            )
+        }
+        let lists = [Role::Encode, Role::Prefill].map(|role| self.lent(generation, role));
+        let [encoders, prefills] = self.remainders(lists);
+        let none = EncodeOffer::default();
+        let classes = EncodeClasses::derive(
+            encoders.iter().map(|row| member(row.as_ref(), &none)),
+            prefills.iter().map(|row| member(row.as_ref(), &none)),
+        );
+        let offers = encoders.iter().map(|row| member(row.as_ref(), &none).offer);
+        let prefill_classes = (0..prefills.len()).map(|at| classes.prefill_class(at));
+        EncodeColumns::new(classes.encoder_facts(offers), prefill_classes.collect())
+    }
+
+    /// What the row of each worker of `lists` states, at the worker's
+    /// place in its list, where the row's object still stands for the
+    /// worker: one read of the holder's entry, under its read lock, which
+    /// is let go before a rule runs over what was read.
+    fn remainders<const N: usize>(
+        &self,
+        lists: [LentList<'_>; N],
+    ) -> [Vec<Option<Arc<RowRemainder>>>; N] {
+        let held = self.held.read();
+        lists.map(|list| {
+            let facts = list.facts.unwrap_or_default();
+            let row = |(worker, fact): (&Arc<dyn Worker>, &FixedFacts)| {
+                let laid = held.rows.get(held.objects.get(&fact.id?)?)?;
+                Arc::ptr_eq(&laid.object, worker).then(|| Arc::clone(&laid.remainder))
+            };
+            list.workers.iter().zip(facts).map(row).collect()
+        })
     }
 }
 

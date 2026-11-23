@@ -129,7 +129,7 @@ pub use lead::{Lead, SoleLead};
 pub use loads::load_monitor;
 pub use members::Members;
 #[cfg(feature = "in-process")]
-pub use members::OpenAdmission;
+pub use members::{EncodeColumns, OpenAdmission};
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use membership_writer::tests::{
     check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,

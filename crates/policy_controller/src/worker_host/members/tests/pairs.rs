@@ -26,7 +26,7 @@ const DECODE_1: &str = "http://decode-1:8000";
 const DECODE_2: &str = "http://decode-2:8000";
 
 /// Write the row `facts` state and have the holder follow: the row's id.
-fn state(replica: &Replica, facts: WorkerFacts) -> WorkerId {
+pub(super) fn state(replica: &Replica, facts: WorkerFacts) -> WorkerId {
     let row = replica.store.upsert(facts).id();
     replica.objects.follow(&replica.store);
     row
@@ -34,7 +34,7 @@ fn state(replica: &Replica, facts: WorkerFacts) -> WorkerId {
 
 /// What the row of a pair's worker at `url` states: its side, and the KV
 /// transport it offers a partner.
-fn pair_side(url: &str, role: Role, transport: &str) -> WorkerFacts {
+pub(super) fn pair_side(url: &str, role: Role, transport: &str) -> WorkerFacts {
     let descriptor = PairingDescriptor {
         transport: Some(transport.to_string()),
         ..PairingDescriptor::default()
@@ -52,7 +52,7 @@ fn pair_side(url: &str, role: Role, transport: &str) -> WorkerFacts {
 }
 
 /// A prefill another writer registered: the holder lays no row for it.
-fn stray_prefill() -> Arc<dyn Worker> {
+pub(super) fn stray_prefill() -> Arc<dyn Worker> {
     let worker = <BasicWorkerBuilder>::new(STRAY).model(ModelCard::new(MODEL));
     Arc::new(worker.worker_type(WorkerType::Prefill).build())
 }
