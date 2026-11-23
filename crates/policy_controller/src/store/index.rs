@@ -25,29 +25,18 @@
 //! indexed under its first model name, and only when its signals ask for
 //! events.
 //!
-//! A decision reads an index through its pool's standing in it
-//! (`PoolIndex`), which the store publishes with the pool's rows: where
-//! each index id stands in the pool, and the pool's warming rows as a
-//! write last read them. The lookup itself is live, as the index is: the
-//! request's blocks are looked up once a decision, under the cap of its
-//! profile (its sample, or no cap where it takes none), and the holders
-//! are named by their place in the decision's rows. An index id is free
-//! for the next row once its row leaves, and a decision may read a world
-//! published before that: the index counts its takes and keeps the count
-//! each id was last taken at (`Index`), and a row is named a holder only
-//! where its id was not taken since the tables the decision holds were
-//! known whole. Two cases alone make the lookup again: a row it kept had
-//! its id taken since, or its cap is full of holders the pass refuses.
+//! The store publishes each pool's standing in its model's index
+//! (`PoolIndex`) with the pool's rows: where each index id stands in the
+//! pool, and the pool's warming rows as a write last read them. An index
+//! id is free for the next row once its row leaves: the index counts its
+//! takes and keeps the count each id was last taken at (`Index`).
 //!
 //! A pool whose profile reads sent prefixes holds its model's record of
 //! sends. The record speaks for a row until the row's lane is heard: a row
 //! with no lane, and a row whose lane applied no event yet, since a
 //! worker that asks for cache events may never publish one. A lane says so
-//! by one bit of its model's index (`Index`), which a decision reads with
-//! no lock: no publication follows its first applied event. Naming lists the
-//! record's holders beside the index's under one cap: after them, in the
-//! room they leave, or ahead of them where no prefix stage of the profile
-//! reads cache events. Issuing a lease writes the blocks sent to its
+//! by one bit of its model's index (`Index`): no publication follows its
+//! first applied event. Issuing a lease writes the blocks sent to its
 //! first target while the record speaks for it: token blocks, or windows
 //! of a request's text, which the index of cache events is never asked
 //! for. Once a lane is heard the index alone speaks for its row, and what
@@ -79,17 +68,14 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     engine::{
-        view::{AffinityHolder, AffinityRows, Candidate, HashKind, Role, WorkerId},
+        view::{Candidate, Role, WorkerId},
         warm_up::{WarmUpRule, WarmUpState},
     },
     store::{
         kv_events::{BatchAdmission, BatchFacts, BatchOutcome, KvCursor, RankCursor, ResyncReason},
-        snapshot::AffinityQuery,
         workers::WorkerRow,
-        GatewayId,
     },
     tracking::prefix_predictor::PrefixPredictor,
-    Draw,
 };
 
 #[cfg(test)]
@@ -472,78 +458,6 @@ const MASK_WORDS: usize = INDEX_WORKERS / 64;
 /// The bits of the wire type: a pool keeps one mask a bit.
 const WIRE_BITS: usize = u8::BITS as usize;
 
-/// The streams of a decision's seed the cut of its holders and the cut of
-/// its warming rows are drawn from: none another site reads ([`Draw`]).
-const HOLDERS_STREAM: u64 = 0x3c6e_f372_fe94_f82b;
-const WARMING_STREAM: u64 = 0xa54f_f53a_5f1d_36f1;
-
-/// A value under `under` from `draw`, by a multiply: no division.
-fn below(draw: &mut Draw, under: u32) -> u32 {
-    ((u128::from(draw.next_u64()) * u128::from(under)) >> 64) as u32
-}
-
-/// The rows a naming wrote in the affinity column's place
-/// ([`StoreSnapshot::fill_affinity_rows`](crate::store::StoreSnapshot::fill_affinity_rows)),
-/// with the naming's own buffers: a host keeps it across decisions beside its
-/// view.
-#[derive(Debug, Default)]
-pub struct AffinityRowsBuffers {
-    /// The rows that hold a leading part of the request, ascending by row.
-    pub holders: Vec<AffinityHolder>,
-    /// The pool's warming rows the decision reads, ascending.
-    pub warming: Vec<u32>,
-    /// The warming rows are the thin.
-    pub thin: bool,
-    kept: Vec<(u32, u32)>,
-    picked: Vec<u32>,
-    live: Vec<(u32, u64)>,
-    // One key per block read and one id per worker at the deepest block.
-    // Both buffers keep their room for the next naming.
-    keys: Vec<u64>,
-    deepest: Vec<WorkerId>,
-    sent: RecordRead,
-}
-
-/// What a naming read of the record its issue may write.
-#[derive(Debug)]
-struct RecordRead {
-    /// The pool's place in the world. `NONE` if no record was read.
-    pool: u32,
-}
-
-impl Default for RecordRead {
-    fn default() -> Self {
-        Self { pool: NONE }
-    }
-}
-
-impl AffinityRowsBuffers {
-    /// The lists as a request carries them
-    /// ([`RequestFacts::named`](crate::engine::RequestFacts::named)).
-    pub fn affinity(&self) -> AffinityRows<'_> {
-        AffinityRows {
-            holders: &self.holders,
-            warming: &self.warming,
-            thin: self.thin,
-            mean_in_flight: None,
-        }
-    }
-
-    /// No row named.
-    pub(super) fn clear(&mut self) {
-        self.holders.clear();
-        self.warming.clear();
-        self.thin = false;
-        self.clear_sent();
-    }
-
-    /// The next issue has no record to write. The buffers stay in place.
-    #[inline]
-    pub(crate) fn clear_sent(&mut self) {
-        self.sent.pool = NONE;
-    }
-}
-
 /// One model's record of the prefixes sent to its workers whose cache
 /// events the store has not heard, shared by every deciding thread.
 ///
@@ -572,6 +486,10 @@ pub(super) struct Predict {
 
 /// Where a pool stands in its model's index, as the membership write that
 /// made the pool derived it.
+#[expect(
+    dead_code,
+    reason = "the decision views were the one reader of four of these fields: the tables leave in a following change"
+)]
 struct Tables {
     /// The pool the tables are of: its model and its rows' role.
     model: Box<str>,
@@ -608,183 +526,6 @@ struct Tables {
     taken: AtomicU64,
 }
 
-impl Tables {
-    /// The pool's lanes the record speaks for, a bit an id: those no batch
-    /// with an event was applied in. `None` where it speaks for no row of the
-    /// pool: every row holds a lane and every lane was heard. That is one
-    /// read of the index's heard bits against the pool's members, a word
-    /// for 64 rows, and all a pool whose events flow pays for the record
-    /// it holds.
-    ///
-    /// A naming reads each word once, here, and that one read serves its
-    /// whole run: whether the record is read at all, which rows the record
-    /// may name ([`Self::spoken`]) and which lanes the lookup is kept
-    /// within ([`heard_within`]). So for a request hashed by its token ids
-    /// a member is asked of the index or of the record, never of both and
-    /// never of neither, whatever a lane hears or loses meanwhile. A
-    /// request hashed by windows of its text asks the record alone: a
-    /// heard lane is cold for it. A pair names two pools and reads once
-    /// for each.
-    fn unheard(&self) -> Option<[u64; MASK_WORDS]> {
-        let index = self.index.as_deref();
-        let among = index.and_then(|index| index.unheard_among(&self.members));
-        among.or_else(|| self.lacking.then_some([0; MASK_WORDS]))
-    }
-
-    /// Whether the record speaks for the pool's row at `row` under one
-    /// naming's read of the unheard lanes ([`Self::unheard`]): the row
-    /// holds no lane, or its lane's bit stands there.
-    fn spoken(&self, row: usize, unheard: &[u64; MASK_WORDS]) -> bool {
-        match self.id_of[row] {
-            NONE => true,
-            id => {
-                let word = unheard.get((id / 64) as usize);
-                word.is_some_and(|word| word & (1 << (id % 64)) != 0)
-            }
-        }
-    }
-
-    /// The workers a read is kept within for the view a decision holds: the
-    /// pool's members, those that state one of its gateway's wires where it
-    /// states them, less another gateway's host-local rows. `mask` is the
-    /// caller's, written where the pool's own does not serve as it stands.
-    fn within<'a>(
-        &'a self,
-        naming: &AffinityQuery<'_>,
-        locals: &[(u32, GatewayId)],
-        mask: &'a mut [u64; MASK_WORDS],
-    ) -> &'a [u64] {
-        let foreign = locals.iter().any(|&(_, owner)| owner != naming.gateway);
-        if naming.wires.is_none() && !foreign {
-            return &self.members;
-        }
-        let words = self.members.len().min(MASK_WORDS);
-        let mask = &mut mask[..words];
-        match naming.wires {
-            None => mask.copy_from_slice(&self.members[..words]),
-            Some(wires) => {
-                mask.fill(0);
-                // The narrowing's own test, a bit of the wire type at a time:
-                // a member is kept where it states one of the gateway's.
-                for (bit, stated) in self.by_wire.iter().enumerate() {
-                    if wires.bits() & (1 << bit) != 0 {
-                        for (word, stated) in mask.iter_mut().zip(stated.iter()) {
-                            *word |= stated;
-                        }
-                    }
-                }
-            }
-        }
-        for &(row, owner) in locals {
-            let id = self.id_of.get(row as usize).copied().unwrap_or(NONE);
-            if owner != naming.gateway && id != NONE {
-                if let Some(word) = mask.get_mut((id / 64) as usize) {
-                    *word &= !(1u64 << (id % 64));
-                }
-            }
-        }
-        mask
-    }
-
-    /// The workers a read is kept within for a view its caller cut further
-    /// than [`Self::within`] reads it: the view's own rows, each found
-    /// among the pool's by one walk of the two lists, which stand in one
-    /// order. A row the index does not hold is no bit.
-    fn within_view<'a>(
-        &'a self,
-        pool: &[Candidate],
-        view: &[Candidate],
-        mask: &'a mut [u64; MASK_WORDS],
-    ) -> &'a [u64] {
-        let words = self.members.len().min(MASK_WORDS);
-        let mask = &mut mask[..words];
-        mask.fill(0);
-        let mut rows = pool.iter().zip(self.id_of.iter());
-        for kept in view {
-            let found = rows.find(|(row, _)| row.id == kept.id);
-            debug_assert!(
-                found.is_some(),
-                "a cut view's rows stand among its pool's, in their order"
-            );
-            let Some((_, &id)) = found else {
-                break;
-            };
-            if id != NONE {
-                if let Some(word) = mask.get_mut((id / 64) as usize) {
-                    *word |= 1u64 << (id % 64);
-                }
-            }
-        }
-        mask
-    }
-
-    /// How many rounds a lookup is made again. For a read that kept an id
-    /// taken since ([`Self::again`]) each round more needs a take under a
-    /// row it kept, and past them the naming names no holder.
-    const ROUNDS: usize = 4;
-
-    /// What stands of the read in `kept`, kept within `within`, for a
-    /// decision whose tables were known whole at `whole_at` and whose index
-    /// counts a take since. Each row kept is asked whether its id was taken
-    /// since ([`Index::taken_since`]): a take tells a later count for good,
-    /// the same row back on its id included, so the ask is right at any
-    /// instant behind the lookup's fence. Where no id kept was taken since,
-    /// the read stands. Else a block may be another row's, and the lookup
-    /// is made again ([`Self::again`]). The asks stand in a frame of their
-    /// own: a decision that holds tables from before a take pays them, and
-    /// nothing of a lookup it does not make. Off a decision's usual path.
-    #[cold]
-    #[inline(never)]
-    fn look_again(
-        &self,
-        naming: &AffinityQuery<'_>,
-        within: &[u64],
-        cap: usize,
-        whole_at: u64,
-        kept: &mut Vec<(u32, u32)>,
-    ) {
-        let Some(index) = self.index.as_deref() else {
-            return;
-        };
-        if kept.iter().any(|&(id, _)| index.taken_since(id, whole_at)) {
-            Self::again(index, naming, within, cap, whole_at, kept);
-        }
-    }
-
-    /// The lookup made again for a read that kept an id taken since
-    /// `whole_at`: within the ids not taken since, by a draw of that round's
-    /// own ([`Index::deepest_again`]), and its rows are asked again. Past
-    /// [`Self::ROUNDS`] lookups no read of the naming stands, and it names
-    /// no holder. Out of line: the rounds' frame and their seeds are no
-    /// cost of the asks.
-    #[cold]
-    #[inline(never)]
-    fn again(
-        index: &Index,
-        naming: &AffinityQuery<'_>,
-        within: &[u64],
-        cap: usize,
-        whole_at: u64,
-        kept: &mut Vec<(u32, u32)>,
-    ) {
-        let words = within.len().min(MASK_WORDS);
-        // A round's stream is seeded by the first value of the one before
-        // it, the first round's by the holders' stream.
-        let mut seed = naming.seed ^ HOLDERS_STREAM;
-        for _ in 0..Self::ROUNDS {
-            seed = Draw::new(seed).next_u64();
-            let own = index.own(&within[..words], whole_at);
-            index.deepest_again(naming, &own[..words], cap, seed, kept);
-            // As in the naming: the read before the fence, the asks after.
-            fence(Ordering::Acquire);
-            if !kept.iter().any(|&(id, _)| index.taken_since(id, whole_at)) {
-                return;
-            }
-        }
-        kept.clear();
-    }
-}
-
 /// What a publication carries of one pool's index: where the pool stands in
 /// it, and the pool's warming rows by its profile's warm-up ruling as a
 /// write last read them. The tables are of the membership write that made
@@ -806,6 +547,10 @@ pub(super) struct PoolIndex {
     ruled: WarmUpState,
     /// The earliest end among the rows: a decision before it names them as
     /// they stand.
+    #[expect(
+        dead_code,
+        reason = "the decision views were this instant's one reader: it leaves in a following change"
+    )]
     first_end: u64,
 }
 
@@ -931,313 +676,6 @@ impl PoolIndex {
             first_end: ends.min().unwrap_or(u64::MAX),
         }
     }
-
-    /// Name the rows of a decision's view for the affinity stages
-    /// ([`AffinityRows`]): the request's deepest holders and the pool's
-    /// warming rows, each list at most `naming.cap` rows, ascending, by
-    /// position in `view`. `pool` is the pool's rows as the publication
-    /// holds them, `locals` its host-local rows, and `view` the rows the
-    /// decision is made over: the pool's, less another gateway's host-local
-    /// rows and the rows its gateway's wires took.
-    ///
-    /// The holders are one lookup under the cap: whole depths from the
-    /// deepest while they fit, the depth the cap cuts by a draw from the
-    /// decision's seed on a stream of its own; a head the whole pool holds
-    /// is never listed. The lookup is kept within the rows the view can
-    /// hold, so the cap is filled from them. Where an id of the index was
-    /// taken since the pool's tables were known whole, each row the lookup
-    /// kept is asked whether its own id was. Where one was, the lookup runs
-    /// again, within the ids not taken since: a row that left is named by
-    /// no block of the row that took its id, and takes no place of the cap.
-    /// The warming rows are the
-    /// publication's that the view holds, less the rows whose naming ended
-    /// by the decision's instant: whole within the cap, a draw of the cap
-    /// past it, on another stream.
-    ///
-    /// Where the pool holds a record of sent prefixes, its rows with no
-    /// heard lane are named beside the index's holders under the same cap: after
-    /// them, in the room they leave, or ahead of them where no prefix stage
-    /// of the profile reads cache events. That lookup finds the deepest
-    /// block a worker of the view was sent. The index is asked for a token
-    /// request alone, the record for a request of either kind.
-    #[inline]
-    pub(super) fn name(
-        &self,
-        naming: &AffinityQuery<'_>,
-        pool: (u32, &[Candidate]),
-        locals: &[(u32, GatewayId)],
-        view: &[Candidate],
-        hash_kind: HashKind,
-        named: &mut AffinityRowsBuffers,
-    ) {
-        self.name_in::<false>(naming, pool, locals, view, hash_kind, named);
-    }
-
-    /// [`Self::name`] for a view its caller cut by more than its gateway's
-    /// wires since the build, as a request's hard demands cut it: the
-    /// holders' lookup is kept within the view's own rows, so a row the
-    /// cut took is named by nobody and takes no place of the cap. The
-    /// record names a row where the view holds it, under either naming.
-    pub(super) fn name_cut(
-        &self,
-        naming: &AffinityQuery<'_>,
-        pool: (u32, &[Candidate]),
-        locals: &[(u32, GatewayId)],
-        view: &[Candidate],
-        hash_kind: HashKind,
-        named: &mut AffinityRowsBuffers,
-    ) {
-        self.name_in::<true>(naming, pool, locals, view, hash_kind, named);
-    }
-
-    /// The one naming, built once for each of its two callers. `CUT` says
-    /// which rows the holders' lookup is kept within, and a build a
-    /// caller keeps each caller's lookup in a frame of its own.
-    fn name_in<const CUT: bool>(
-        &self,
-        naming: &AffinityQuery<'_>,
-        (pool_at, pool): (u32, &[Candidate]),
-        locals: &[(u32, GatewayId)],
-        view: &[Candidate],
-        hash_kind: HashKind,
-        named: &mut AffinityRowsBuffers,
-    ) {
-        named.thin = self.ruled.thin;
-        let tables = &*self.tables;
-        let whole = view.len() == pool.len();
-        let cap = match naming.cap {
-            0 => usize::MAX,
-            cap => cap as usize,
-        };
-        // Where a row of the pool stands in the view: at its own index where
-        // the view is the pool whole, else by its id, the sorted slice its
-        // own index.
-        let place = |row: u32| -> Option<u32> {
-            if whole {
-                return Some(row);
-            }
-            let id = pool.get(row as usize)?.id;
-            let at = view.binary_search_by_key(&id, |candidate| candidate.id);
-            at.ok().map(|at| at as u32)
-        };
-        let mut draw = Draw::new(naming.seed ^ HOLDERS_STREAM);
-        let hashed = !naming.block_hashes.is_empty();
-        // The count the tables are whole at, read before every read it
-        // covers: the pool's unheard lanes, then the lookup. A membership
-        // write that keeps the tables tells a later count, and that count
-        // covers only what is read after it. A row that takes an id behind
-        // this read is refused by the count, and is cold for this decision.
-        let whole_at = tables.taken.load(Ordering::Acquire);
-        // The record is read where it speaks for a row of the pool: a pool
-        // whose lanes are all heard reads the heard bits and no record.
-        // The lanes it speaks for are read once, for the whole naming: the
-        // record names those rows and the lookup is kept within the
-        // others, so no row is named twice ([`Tables::unheard`]).
-        let record = tables.predicted.as_ref().filter(|_| hashed);
-        let record = record.and_then(|predicted| Some((predicted, tables.unheard()?)));
-        // The record's holders, in the room the cap leaves where this runs.
-        let name_record = |named: &mut AffinityRowsBuffers, draw: &mut Draw| {
-            let Some((predicted, unheard)) = &record else {
-                return;
-            };
-            // The row of the view a recorded worker stands at, where the
-            // record may name it: a row of the pool with no heard lane that
-            // is not another gateway's host-local row.
-            let row_of = |id: WorkerId| -> Option<u32> {
-                let row = pool.binary_search_by_key(&id, |row| row.id).ok()?;
-                if !tables.spoken(row, unheard) {
-                    return None;
-                }
-                let row = row as u32;
-                let local = locals.binary_search_by_key(&row, |&(row, _)| row);
-                if local.is_ok_and(|at| locals[at].1 != naming.gateway) {
-                    return None;
-                }
-                place(row)
-            };
-            let usable = |id| row_of(id).is_some();
-            let blocks = predicted.name(naming, pool_at, &usable, named);
-            name_predicted(row_of, (blocks, cap), named, draw);
-        };
-        // A profile no prefix stage of which reads cache events takes the
-        // record's holders first: its prefix stage reads no overlap, so the
-        // index's holders must not take its room under the cap.
-        let ahead = self.predict.is_some_and(|predict| predict.ahead);
-        if ahead {
-            name_record(named, &mut draw);
-        }
-        let room = cap.saturating_sub(named.holders.len());
-        // An engine's events are token blocks. A request hashed by windows
-        // of its text asks the record alone, so a lane whose events are
-        // heard is cold for it.
-        let tokens = hashed && hash_kind == HashKind::Token;
-        let index = tables.index.as_ref();
-        if let Some(index) = index.filter(|_| tokens && room > 0) {
-            let mut mask = [0u64; MASK_WORDS];
-            let within = if CUT {
-                tables.within_view(pool, view, &mut mask)
-            } else {
-                tables.within(naming, locals, &mut mask)
-            };
-            // A lane the record speaks for is the record's to name: the
-            // lookup is kept within the others, by the naming's one read.
-            let heard;
-            let within = match &record {
-                Some((_, unheard)) => {
-                    let words = within.len().min(MASK_WORDS);
-                    heard = heard_within(within, unheard);
-                    &heard[..words]
-                }
-                None => within,
-            };
-            // The naming's own lookup, in its own frame: one instantiation
-            // with a second caller goes out of line for every decision
-            // ([`Index::deepest_again`]).
-            index.chain.deepest_into(
-                naming.block_hashes,
-                |hash| *hash,
-                within,
-                room,
-                |under| below(&mut draw, under),
-                &mut named.kept,
-            );
-            // Every read of the lookup stands before this fence, and the
-            // question of what was taken since after it ([`Index`]).
-            fence(Ordering::Acquire);
-            if index.taken() != whole_at {
-                tables.look_again(naming, within, room, whole_at, &mut named.kept);
-            }
-            for &(id, blocks) in &named.kept {
-                let row = tables.row_of.get(id as usize).copied().unwrap_or(NONE);
-                debug_assert!(row != NONE, "a read is kept within the pool's rows");
-                let at = place(row);
-                debug_assert!(
-                    at.is_some(),
-                    "a holder the read was kept within is in the view"
-                );
-                if let Some(at) = at {
-                    named.holders.push(AffinityHolder {
-                        row: at,
-                        overlap_blocks: blocks,
-                        predicted_blocks: 0,
-                    });
-                }
-            }
-        }
-        if !ahead {
-            name_record(named, &mut draw);
-        }
-        named.holders.sort_unstable_by_key(|holder| holder.row);
-        // The warming rows of the decision's instant: nobody before the
-        // ruling names them, and each row until its own end.
-        let now = naming.now_micros;
-        if now < self.ruled.from {
-            return;
-        }
-        // The warming rows the view holds at the decision's instant, each
-        // by its place there: the cap and the draw are over these, so a
-        // view its gateway narrowed is named the cap of its own rows. The
-        // pool's list serves as it stands where the view is the pool whole
-        // and no naming has ended.
-        let mut warming: &[(u32, u64)] = &self.warming;
-        if !whole || now >= self.first_end {
-            named.live.clear();
-            let live = warming.iter().filter(|&&(_, until)| now < until);
-            let placed = live.filter_map(|&(row, until)| Some((place(row)?, until)));
-            named.live.extend(placed);
-            warming = &named.live;
-        }
-        if warming.len() <= cap {
-            named.warming.extend(warming.iter().map(|&(row, _)| row));
-            return;
-        }
-        // Past the cap, a draw of the cap by position: each row as likely as
-        // another, none twice.
-        let mut draw = Draw::new(naming.seed ^ WARMING_STREAM);
-        let count = warming.len() as u32;
-        named.picked.clear();
-        for last in count - cap as u32..count {
-            let at = below(&mut draw, last + 1);
-            let taken = named.picked.contains(&at);
-            named.picked.push(if taken { last } else { at });
-        }
-        let rows = named
-            .picked
-            .iter()
-            .filter_map(|&at| warming.get(at as usize));
-        named.warming.extend(rows.map(|&(row, _)| row));
-        named.warming.sort_unstable();
-    }
-}
-
-impl Predicted {
-    /// Folds the request once and copies out its deepest group under the
-    /// shared guard: the deepest that a worker `usable` passes was sent, so
-    /// a worker outside the view hides no row inside it. Choosing and
-    /// sorting the rows runs after the guard.
-    fn name(
-        &self,
-        naming: &AffinityQuery<'_>,
-        pool: u32,
-        usable: &dyn Fn(WorkerId) -> bool,
-        named: &mut AffinityRowsBuffers,
-    ) -> u32 {
-        PrefixPredictor::fold_into(&mut named.keys, naming.namespace_seed, naming.block_hashes);
-        let record = self.record.read();
-        let deepest = record.deepest_among(&named.keys, usable);
-        let blocks = deepest.blocks();
-        named.deepest.clear();
-        named.deepest.extend(deepest.holders());
-        named.sent = RecordRead { pool };
-        blocks
-    }
-}
-
-/// The ids of `within` less the lanes of `unheard`, a bit an id: what a
-/// naming's lookup is kept within where its record speaks for those lanes
-/// ([`Tables::unheard`]).
-fn heard_within(within: &[u64], unheard: &[u64; MASK_WORDS]) -> [u64; MASK_WORDS] {
-    let mut heard = [0u64; MASK_WORDS];
-    for ((heard, &within), &unheard) in heard.iter_mut().zip(within).zip(unheard) {
-        *heard = within & !unheard;
-    }
-    heard
-}
-
-/// The deepest group's workers that stand at a row of the view (`row_of`),
-/// behind the holders the index gave: the index's first, then a draw from
-/// this group where it would fill more than the room the cap leaves.
-fn name_predicted(
-    row_of: impl Fn(WorkerId) -> Option<u32>,
-    (blocks, cap): (u32, usize),
-    named: &mut AffinityRowsBuffers,
-    draw: &mut Draw,
-) {
-    let base = named.holders.len();
-    let room = cap.saturating_sub(base);
-    if room == 0 {
-        return;
-    }
-    let mut seen = 0;
-    for &id in &named.deepest {
-        let Some(row) = row_of(id) else {
-            continue;
-        };
-        let holder = AffinityHolder {
-            row,
-            overlap_blocks: 0,
-            predicted_blocks: blocks,
-        };
-        seen += 1;
-        if seen <= room {
-            named.holders.push(holder);
-        } else {
-            let drawn = below(draw, seen as u32) as usize;
-            if drawn < room {
-                named.holders[base + drawn] = holder;
-            }
-        }
-    }
 }
 
 /// One model's index: the chain index, how many times an id was taken, the
@@ -1245,14 +683,15 @@ fn name_predicted(
 ///
 /// The chain frees an id for the next row once its row leaves, and a pool's
 /// tables of before still map the id to the row that left
-/// ([`Tables::row_of`]). So a decision asks after its lookup whether the
-/// count of takes stands where its tables were known whole before it
-/// ([`Self::taken`]), and the answer must be no older than the blocks the
-/// lookup read. Where it moved, each row the lookup kept is asked whether
-/// its id was taken since ([`Self::taken_since`]). The chain reads its
-/// coverage relaxed and writes it by release, and its reader runs an
-/// acquire fence after its reads, for its own snapshot: this file rests on
-/// neither. What orders the answer after a block, by who wrote it:
+/// ([`Tables::row_of`]). So a reader of the tables has to ask after its
+/// lookup whether the count of takes stands where its tables were known
+/// whole before it ([`Self::taken`]), and the answer must be no older than
+/// the blocks the lookup read. Where it moved, each row the lookup kept is
+/// asked whether its id was taken since, by the count its last take made.
+/// The chain reads its coverage relaxed and writes it by release, and its
+/// reader runs an acquire fence after its reads, for its own snapshot: this
+/// file rests on neither. What orders the answer after a block, by who
+/// wrote it:
 ///
 /// - the row's own lane: the take is said under the table's lock before
 ///   the row's lane exists ([`KvTables::member`]), a batch finds its lane
@@ -1265,11 +704,10 @@ fn name_predicted(
 ///   split and the store that publishes a grown table stand behind one. A
 ///   holding stands on a run by a write under that lock, or by the write
 ///   of the lane that made the run, before another lane could find it;
-/// - the reader: an acquire fence in the naming, between its lookup and
-///   its question ([`PoolIndex::name`]).
+/// - the reader: an acquire fence between its lookup and its question.
 ///
 /// A release fence and the reader's synchronize where the lookup read what
-/// was written behind the first, so a decision that read a row's block
+/// was written behind the first, so a reader that read a row's block
 /// counts that row's take, and reads the count that take left on its id.
 /// A take tells its id a later count than any before it, so an id taken
 /// since a count answers so for good, whoever took it. The orderings of
@@ -1288,15 +726,8 @@ struct Index {
     /// event sets nothing, and neither does one the lane's cursor refuses:
     /// the index holds nothing of the row yet, so the record keeps its
     /// cover. The lane's own word says less, that any batch ran through it
-    /// ([`Lane::heard`]). The lane writes its own bit under its lock,
-    /// and a decision reads it with no lock: until the bit is set the
-    /// record of sent prefixes speaks for the row. A naming reads the
-    /// pool's bits once for its whole run ([`Tables::unheard`]).
+    /// ([`Lane::heard`]). The lane writes its own bit under its lock.
     /// The bit is a hint of the instant it was read at and orders nothing.
-    /// A lane first heard behind a naming's read is spoken for by the
-    /// record once more, and its index entries are left unread for that
-    /// decision. A lane reset behind it is the index's for that decision:
-    /// the lookup names what it read of the lane. Neither is named twice.
     heard: [AtomicU64; MASK_WORDS],
 }
 
@@ -1332,23 +763,6 @@ impl Index {
         word.is_some_and(|word| word.load(Ordering::Relaxed) & (1 << (id % 64)) != 0)
     }
 
-    /// The lanes among `members` that were not heard, a bit an id; `None`
-    /// where every one was heard. Each word is read once: the words ahead
-    /// of the first unheard lane are read and not written, so a pool whose
-    /// lanes are all heard pays the reads alone.
-    fn unheard_among(&self, members: &[u64]) -> Option<[u64; MASK_WORDS]> {
-        let words = members.iter().zip(&self.heard).enumerate();
-        let mut words =
-            words.map(|(at, (&members, heard))| (at, members & !heard.load(Ordering::Relaxed)));
-        let (first, word) = words.find(|&(_, word)| word != 0)?;
-        let mut unheard = [0u64; MASK_WORDS];
-        unheard[first] = word;
-        for (at, word) in words {
-            unheard[at] = word;
-        }
-        Some(unheard)
-    }
-
     /// A row takes `id`, which the chain just handed out: the take is
     /// counted, and the id keeps the count it made. Said under the table's
     /// lock, before the row's lane exists: every block the row writes
@@ -1373,62 +787,6 @@ impl Index {
     /// name.
     fn taken(&self) -> u64 {
         self.taken.load(Ordering::Acquire)
-    }
-
-    /// The naming's lookup made again ([`Tables::again`]): the request's
-    /// deepest holders within `within`
-    /// under `cap`, into `kept` by index id, the depth the cap cuts by a
-    /// draw from `seed`, the round's own. A round runs only where the
-    /// lookup before it kept an id taken since, or a cap full of holders
-    /// the pass refuses: the stream that lookup cut by would cut by the
-    /// same values again, and favour the rows it reaches first. A lookup of
-    /// its own beside the naming's: with one instantiation for both, every
-    /// decision would pay a call for the lookup it makes once.
-    fn deepest_again(
-        &self,
-        naming: &AffinityQuery<'_>,
-        within: &[u64],
-        cap: usize,
-        seed: u64,
-        kept: &mut Vec<(u32, u32)>,
-    ) {
-        let mut draw = Draw::new(seed);
-        self.chain.deepest_into(
-            naming.block_hashes,
-            |hash| *hash,
-            within,
-            cap,
-            |under| below(&mut draw, under),
-            kept,
-        );
-    }
-
-    /// Whether `id` was taken since the count `whole_at`. A reader asks
-    /// behind its lookup's fence, for an id it read blocks under: a take
-    /// counts for good, the same row back on its id included, so the blocks
-    /// are the row's that held the id at that count only where this says
-    /// no. An id nobody took since says no for a row that left, and the
-    /// chain holds none of that row's blocks.
-    fn taken_since(&self, id: u32, whole_at: u64) -> bool {
-        let took = self.took.get(id as usize);
-        took.is_none_or(|took| took.load(Ordering::Relaxed) > whole_at)
-    }
-
-    /// `within` less the ids taken since `whole_at`: what a lookup made
-    /// again is kept within ([`Tables::again`]).
-    fn own(&self, within: &[u64], whole_at: u64) -> [u64; MASK_WORDS] {
-        let mut own = [0u64; MASK_WORDS];
-        for (word, (own, &ids)) in own.iter_mut().zip(within).enumerate() {
-            let mut left = ids;
-            while left != 0 {
-                let bit = left.trailing_zeros();
-                left &= left - 1;
-                if !self.taken_since(word as u32 * 64 + bit, whole_at) {
-                    *own |= 1 << bit;
-                }
-            }
-        }
-        own
     }
 }
 
