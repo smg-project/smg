@@ -1364,3 +1364,143 @@ fn three_lists_are_the_pairs_two_for_the_other_entries_and_other_lists_are_refus
         assert_eq!(unleased.err(), Some(DecisionRefused::PairSide));
     }
 }
+
+/// Equal item keys share an encoder under consistent hashing.
+/// Different keys reach both encoders.
+/// Excluding the first choice sends both copies to the other encoder.
+#[test]
+fn equal_keys_are_placed_on_one_encoder() {
+    use std::collections::BTreeSet;
+
+    let document = PolicySpec::epd_presets("consistent_hashing", "power_of_two", "power_of_two")
+        .expect("the presets");
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let host = Host::under(spec, 1, 1, 2);
+    let said = (&[of(1), of(1)][..], &[1][..]);
+    let lists = host.lists(said);
+    let asks = host.asks(said);
+    let (engine, now) = (&host.engine, Instant::now());
+    let spec = engine.spec();
+    let ids = [0, 1].map(|at| worker_id(host.worker(2, at).as_ref()));
+    let mut placed = EncodePlaced::new();
+    let mut seen = BTreeSet::new();
+
+    for n in 0..32_u64 {
+        let hash = n << 59;
+        let keys = [Identity::hashed(hash); 2];
+        let items = EncodeItems {
+            keys: &keys,
+            ..EncodeItems::default()
+        };
+        let mut request = asks.make(spec);
+        // Hash zero leaves the choice to the seeded picker.
+        request.facts.seed = 7;
+        let decision = lists.decide(engine, None, now, &mut request, items, &mut placed);
+        let [first, second] = placed.encoders() else {
+            panic!("expected two placements for hash {hash}, got {decision:?}");
+        };
+        assert_eq!(first.id, second.id, "duplicate hash {hash}");
+        seen.insert(first.id);
+
+        let excluded = [first.id];
+        let other = if first.id == ids[0] { ids[1] } else { ids[0] };
+        request.constraints.excluded = &excluded;
+        let retry = lists.decide(engine, None, now, &mut request, items, &mut placed);
+        let [first, second] = placed.encoders() else {
+            panic!("expected two retry placements for hash {hash}, got {retry:?}");
+        };
+        assert_eq!([first.id, second.id], [other; 2], "retry for hash {hash}");
+    }
+    assert_eq!(
+        seen,
+        BTreeSet::from(ids),
+        "initial picks reach both encoders"
+    );
+}
+
+/// The build records the encode picker's need for text.
+/// Two requests place their items without asking the picker for its needs again.
+#[test]
+fn an_encode_profiles_stage_is_asked_what_it_needs_at_the_build_alone() {
+    use std::sync::atomic::AtomicBool;
+
+    use crate::document::spec::Needs;
+
+    #[derive(Debug)]
+    struct BuildNeeds(Arc<AtomicBool>);
+
+    impl Lifecycle for BuildNeeds {}
+
+    impl Picker for BuildNeeds {
+        fn name(&self) -> &'static str {
+            "build-needs"
+        }
+
+        fn needs(&self) -> Needs {
+            assert!(
+                !self.0.load(Ordering::Relaxed),
+                "needs called after the build"
+            );
+            Needs {
+                text: true,
+                ..Needs::default()
+            }
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            rows: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Best.pick(facts, rows, kept, scores, band, out);
+        }
+    }
+
+    let armed = Arc::new(AtomicBool::new(false));
+    let stage = Arc::clone(&armed);
+    let mut catalog = StageRegistry::builtin();
+    catalog
+        .picker("build-needs", move || {
+            Box::new(BuildNeeds(Arc::clone(&stage)))
+        })
+        .expect("a free picker name");
+    let mut document = stock();
+    let encode = document
+        .profiles
+        .get_mut("encode")
+        .expect("the encode profile");
+    encode.pick = "build-needs".into();
+    let digest = document.digest().expect("a digest");
+    let spec =
+        AppliedSpec::validate_digested(&document, digest, &catalog, &[]).expect("a valid document");
+    assert!(
+        spec.needs().text,
+        "the build records the encode picker's needs"
+    );
+
+    let host = Host::under(spec, 1, 1, 1);
+    armed.store(true, Ordering::Relaxed);
+    let said = (&[of(1)][..], &[1][..]);
+    let asks = host.asks(said);
+    let keys = [Identity::hashed(11), Identity::hashed(12)];
+    let items = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    let mut placed = EncodePlaced::new();
+    for _ in 0..2 {
+        host.engine
+            .decide_encode_at(&asks, items, &mut placed, Instant::now)
+            .expect("an encode decision");
+        assert_eq!(
+            placed.encoders().len(),
+            keys.len(),
+            "one placement per item"
+        );
+    }
+    assert_eq!(host.engine.faults(), 0);
+}

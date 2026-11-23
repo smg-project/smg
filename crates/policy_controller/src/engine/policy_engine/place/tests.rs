@@ -2021,3 +2021,62 @@ fn the_last_of_256_view_headers_is_named_by_its_place() {
     };
     assert_eq!(made.make(engine.spec()).facts.headers, [last]);
 }
+
+/// The profile's picker receives the request's stated budget in microseconds.
+/// The request gets a leased pick.
+#[test]
+fn the_picker_is_told_the_budget_a_request_states() {
+    const NAME: &str = "record-budget";
+
+    #[derive(Debug)]
+    struct BudgetPicker(Arc<Mutex<Vec<u32>>>);
+
+    impl Lifecycle for BudgetPicker {
+        fn hears(&self) -> EventSet {
+            EventSet::LEASE
+        }
+    }
+
+    impl Picker for BudgetPicker {
+        fn name(&self) -> &'static str {
+            NAME
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            _: &[f32],
+            _: TieBand,
+            out: &mut Targets,
+        ) {
+            self.0.lock().push(facts.budget_micros);
+            push_drawn(candidates, kept, out);
+        }
+    }
+
+    let budgets = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&budgets);
+    let mut stages = StageRegistry::builtin();
+    stages
+        .picker(NAME, move || Box::new(BudgetPicker(Arc::clone(&observed))))
+        .expect("a free picker name");
+    let mut document = PolicySpec::preset("random").expect("a built-in preset");
+    let profile = document
+        .profiles
+        .get_mut("random")
+        .expect("the random profile");
+    profile.pick = NAME.into();
+    let spec = AppliedSpec::validate_in(&document, &stages, &[]).expect("a valid document");
+    let engine = hosted(PolicyEngine::new(spec));
+
+    let members = PublishedList::new(pool(3));
+    let request = PlaceRequest {
+        budget_micros: 5_000,
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+    };
+    let placement = engine.place(&request).expect("a placement");
+    assert!(placement.owes_events(), "the pick has a lease");
+    assert_eq!(budgets.lock().as_slice(), [5_000]);
+}

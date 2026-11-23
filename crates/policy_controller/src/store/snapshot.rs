@@ -2146,11 +2146,6 @@ impl StoreSnapshot {
         self.indexes.get(self.index(model, role)?)?.clone()
     }
 
-    #[cfg(test)]
-    pub(crate) fn sent_slices(&self, model: &str, role: Role) -> Option<usize> {
-        self.standing(model, role)?.sent_slices()
-    }
-
     /// Every pool's standing, for the cases: a membership write that moved
     /// none publishes the same list.
     #[cfg(test)]

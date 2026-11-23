@@ -1713,4 +1713,56 @@ mod tests {
         }
         assert_eq!(times, [7, 7, 0, 7, 7, 7]);
     }
+
+    /// The maker receives the document that governs the single request.
+    /// The pick records the generation the maker reads.
+    #[test]
+    fn a_request_is_made_from_the_document_its_decision_is_made_under() {
+        use super::single::tests::{request, Asks};
+
+        struct ReadsDocument<'a> {
+            asks: Asks<'a>,
+            expected: &'a AppliedSpec,
+            generation: Cell<Option<u64>>,
+        }
+
+        impl RequestMaker for ReadsDocument<'_> {
+            fn model(&self) -> &str {
+                self.asks.model()
+            }
+
+            fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+                assert!(
+                    ptr::eq(spec, self.expected),
+                    "the maker receives the engine's own document"
+                );
+                self.generation.set(Some(spec.generation()));
+                self.asks.make(spec)
+            }
+
+            fn workers(&self) -> WorkerLists<'_> {
+                self.asks.workers()
+            }
+        }
+
+        let mut document = PolicySpec::preset("random").expect("a built-in preset");
+        document.generation = 17;
+        let engine = engine_of(&document);
+        let members = PublishedList::new(pool(3));
+        let maker = ReadsDocument {
+            asks: Asks::of(request(), Some(&members)),
+            expected: engine.spec(),
+            generation: Cell::new(None),
+        };
+
+        let (outcome, _) = engine
+            .decide_at(&maker, Instant::now)
+            .expect("a decision")
+            .whole()
+            .expect("a whole decision");
+        let pick = outcome.decision.pick().expect("a pick");
+        let generation = maker.generation.get().expect("the maker ran");
+        assert_eq!(generation, document.generation);
+        assert_eq!(pick.trace.generation, generation);
+    }
 }
