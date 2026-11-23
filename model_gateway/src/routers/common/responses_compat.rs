@@ -232,10 +232,21 @@ pub(crate) fn lower_responses_request_for_local_backend(
                 _ => {}
             }
         }
-        if let Some(ResponsesToolChoice::Function(choice)) = &mut request.tool_choice {
-            if choice.namespace.as_deref() == Some(DEFAULT_FUNCTION_NAMESPACE) {
+        match &mut request.tool_choice {
+            Some(ResponsesToolChoice::Function(choice))
+                if choice.namespace.as_deref() == Some(DEFAULT_FUNCTION_NAMESPACE) =>
+            {
                 choice.namespace = None;
             }
+            Some(ResponsesToolChoice::Custom { name, .. }) => {
+                if let Some(bare) = name
+                    .strip_prefix(DEFAULT_FUNCTION_NAMESPACE)
+                    .and_then(|rest| rest.strip_prefix('.'))
+                {
+                    *name = bare.to_owned();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -403,6 +414,20 @@ mod tests {
             req.tool_choice,
             Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto))
         ));
+
+        // Custom tool_choice targeting an unwrapped default-namespace tool must
+        // strip the `functions.` qualifier to match the bare offered tool name.
+        let mut custom_choice_req = req.clone();
+        custom_choice_req.tool_choice = Some(
+            serde_json::from_value(json!({"type": "custom", "name": "functions.apply_patch"}))
+                .unwrap(),
+        );
+        lower_responses_request_for_local_backend(&mut custom_choice_req)
+            .expect("lowering succeeds with custom tool_choice");
+        assert_eq!(
+            serde_json::to_value(&custom_choice_req.tool_choice).unwrap(),
+            json!({"type": "custom", "name": "apply_patch"})
+        );
 
         lower_responses_request_for_local_backend(&mut req).expect("lowering succeeds");
 
