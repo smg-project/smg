@@ -107,7 +107,8 @@ use nfc::NfcQuick;
 use pattern::Pattern;
 use sentencepiece::{CharSymbols, Marker, WORD_MARKER};
 use short_pieces::{
-    Entry, ShortPieceKey, ShortPieceTable, Vacancy, SHORT_PIECE_MAX_BYTES, THREAD_BACKING_SLOTS,
+    Entry, ShortPieceKey, ShortPieceTable, Vacancy, INLINE_IDS, MIN_SLOTS, SHORT_PIECE_MAX_BYTES,
+    THREAD_BACKING_SLOTS,
 };
 use wide_pieces::{WideKey, WidePieceTable};
 
@@ -483,8 +484,9 @@ const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
 /// loads on its own, sized by its host) reads on that pool instead.
 const SEED_THREADS: usize = 4;
 /// Ids the vocabulary seed's pass reads at a time: one list of this many
-/// slots, a megabyte and a half, is all the pass holds of its reads beside
-/// what the tables are built from (see `vocabulary_seed`).
+/// slots, three quarters of a megabyte, is all the pass holds of its reads
+/// beside the tables, the long spellings and the model's own answers of
+/// more than four ids, each in a block of its own (see `vocabulary_seed`).
 const SEED_WINDOW: usize = 1 << 14;
 /// Text on each side of a candidate cut that every stage's pattern is run
 /// over to confirm a piece starts there (widened to the spaces around it:
@@ -539,25 +541,31 @@ type PieceIds = FxHashMap<Box<[u8]>, Box<[u32]>>;
 /// thread that cuts (`NativeEncoder::cut_spans`).
 type CutSpans = [Vec<(usize, usize)>; 3];
 
-/// The ids of one vocabulary entry while the seed is built, in a fixed slot
-/// (a byte-level piece of `n` bytes has at most `n` ids), so the pass over
-/// the vocabulary allocates one list rather than one per entry.
-#[derive(Clone, Copy, Default)]
+/// The ids of one vocabulary entry as a seed thread hands them to the
+/// loading thread: their count and the first four, all the seed's table
+/// keeps in an entry, so a slot of the window is 48 bytes; the loading
+/// thread reads an entry of more ids again.
+#[derive(Clone, Copy)]
 struct SeededIds {
     count: u8,
-    ids: [u32; SHORT_PIECE_MAX_BYTES],
+    ids: [u32; INLINE_IDS],
 }
 
 impl SeededIds {
-    /// Takes one more id; `None` when the slot is full.
-    fn push(&mut self, id: u32) -> Option<()> {
-        *self.ids.get_mut(usize::from(self.count))? = id;
-        self.count += 1;
-        Some(())
+    fn of(ids: &[u32]) -> Self {
+        let mut first = [0; INLINE_IDS];
+        for (to, &id) in first.iter_mut().zip(ids) {
+            *to = id;
+        }
+        Self {
+            count: ids.len() as u8,
+            ids: first,
+        }
     }
 
-    fn as_slice(&self) -> &[u32] {
-        &self.ids[..usize::from(self.count)]
+    /// The ids, when the slot holds them all.
+    fn inline(&self) -> Option<&[u32]> {
+        self.ids.get(..usize::from(self.count))
     }
 }
 
@@ -576,8 +584,14 @@ struct SeedScratch {
 /// filter the whole-piece lookup consults (see `long_entries`).
 enum Seeded {
     Short(ShortPieceKey, SeededIds),
+    /// A short piece the model gave more ids than a slot holds, all of
+    /// them: the loading thread asks the model for no entry, since a call
+    /// leaves a record of the model in the calling thread's word cache.
+    Asked(ShortPieceKey, Box<[u32]>),
     Long(Box<[u8]>),
 }
+
+const _: () = assert!(size_of::<Option<Option<Seeded>>>() == 48);
 
 /// Most short pieces that wait for the seed's answer together (see
 /// `Native::waits`): the far lines of that many are read at once, and more
@@ -2442,10 +2456,8 @@ impl NativeEncoder {
         // only where the path has no table: it allocates a word and a token
         // list per call.
         let ids_of = |id: u32, entry: &str, piece: &[u8], scratch: &mut SeedScratch| {
-            let mut ids = SeededIds::default();
             if bpe.ignore_merges {
-                ids.push(id)?;
-                return Some(ids);
+                return Some(SeededIds::of(&[id]));
             }
             scratch.ids.clear();
             match (chars, merges) {
@@ -2457,16 +2469,13 @@ impl NativeEncoder {
                     table.merge(piece, &mut scratch.ids);
                 }
                 (None, None) => {
-                    for token in &model.tokenize(entry).ok()? {
-                        ids.push(token.id)?;
-                    }
-                    return Some(ids);
+                    let tokens = model.tokenize(entry).ok()?;
+                    // One id past the limit tells that the entry is over it.
+                    let ids = tokens.iter().take(SHORT_PIECE_MAX_BYTES + 1);
+                    scratch.ids.extend(ids.map(|token| token.id));
                 }
             }
-            for &id in &scratch.ids {
-                ids.push(id)?;
-            }
-            Some(ids)
+            (scratch.ids.len() <= SHORT_PIECE_MAX_BYTES).then(|| SeededIds::of(&scratch.ids))
         };
         // One id's read: `None` for an id that is no entry, else the seeded
         // piece, the bytes of a long byte-level piece, or `None` inside for
@@ -2506,10 +2515,12 @@ impl NativeEncoder {
                     return Some(Seeded::Long(long.into_boxed_slice()));
                 }
                 let key = ShortPieceKey::of(&piece[..len])?;
-                Some(Seeded::Short(
-                    key,
-                    ids_of(id, entry, &piece[..len], scratch)?,
-                ))
+                let ids = ids_of(id, entry, &piece[..len], scratch)?;
+                Some(if merges.is_none() && ids.inline().is_none() {
+                    Seeded::Asked(key, scratch.ids.as_slice().into())
+                } else {
+                    Seeded::Short(key, ids)
+                })
             })();
             Some(seeded)
         };
@@ -2518,32 +2529,54 @@ impl NativeEncoder {
         let vocab_size =
             listing.map_or_else(|| bpe.get_vocab_size(), |listing| listing.len() as usize);
         // The pass reads a window of ids at a time into one list of slots
-        // the calling thread owns and reuses, and keeps of each window what
-        // the tables are built from, packed: the key and the ids of a short
-        // piece, the bytes of a long one. One list of a slot per entry
-        // (ninety-six bytes each, 25 MB for a vocabulary of 262k entries),
-        // collected by a thread of the pool, stayed behind after the load
-        // as free memory in that thread's heap: the system allocator gives
-        // back no free top below the threshold that a freed block as large
-        // as the vocabulary file has raised.
+        // the calling thread owns and reuses, and the calling thread puts
+        // each window's short pieces straight into the table: no list of
+        // them as long as the vocabulary stands beside it (the long
+        // spellings wait for the filter). What the pass holds for
+        // a time stays behind after the load as free memory: the system
+        // allocator gives back no free top below the threshold that a freed
+        // block as large as the vocabulary file has raised. The table is
+        // made before the pass, so in the slots for a count the listing
+        // gives without a merge: a short piece has no more characters than
+        // its key has bytes.
+        let mut table = match listing {
+            Some(listing) => ShortPieceTable::for_entries(if chars.is_some() {
+                // The marker is three bytes of an entry and one of its key.
+                listing.within(WORD_MARKER.len_utf8() * SHORT_PIECE_MAX_BYTES)
+            } else {
+                listing.of_at_most(SHORT_PIECE_MAX_BYTES)
+            }),
+            // No count before the pass: the table starts small and grows
+            // in place, in a reservation for the whole vocabulary, its only
+            // bound: 33 bytes a slot of address space, written only as far
+            // as pieces are stored. Below 4,096 slots a step of growth is
+            // more than a doubling (64 to 1,024 at the 49th piece), so
+            // `fitted` may make a smaller table of what this one holds.
+            None => ShortPieceTable::with_slots(MIN_SLOTS, ShortPieceTable::slots_for(vocab_size)),
+        };
         let mut slots: Vec<Option<Option<Seeded>>> =
             Vec::with_capacity(SEED_WINDOW.min(vocab_size));
         let mut entries = 0usize;
-        let mut keys: Vec<ShortPieceKey> = Vec::with_capacity(vocab_size);
-        let mut counts: Vec<u8> = Vec::with_capacity(vocab_size);
-        let mut short_ids: Vec<u32> = Vec::with_capacity(vocab_size);
         let mut long_entries: Vec<Box<[u8]>> = Vec::new();
+        let mut again = SeedScratch::default();
         // An id that was an entry has a slot that is `Some`; the seeded
-        // pieces are the inner `Some`s.
-        let mut keep = |slots: &mut Vec<Option<Option<Seeded>>>| {
-            for read in slots.drain(..) {
-                let Some(seeded) = read else { continue };
+        // pieces are the inner `Some`s. A read leaves a short entry's ids
+        // in its scratch: one of more ids than a slot holds is read again
+        // (the model's come whole, see `Seeded::Asked`).
+        let mut keep = |first: u32, slots: &mut Vec<Option<Option<Seeded>>>| {
+            for (id, slot) in (first..).zip(slots.drain(..)) {
+                let Some(seeded) = slot else { continue };
                 entries += 1;
                 match seeded {
                     Some(Seeded::Short(key, ids)) => {
-                        keys.push(key);
-                        counts.push(ids.count);
-                        short_ids.extend_from_slice(ids.as_slice());
+                        if let Some(ids) = ids.inline() {
+                            table.insert(key, ids, vocab_size);
+                        } else if let Some(Some(Seeded::Short(..))) = read(id, &mut again) {
+                            table.insert(key, &again.ids, vocab_size);
+                        }
+                    }
+                    Some(Seeded::Asked(key, ids)) => {
+                        table.insert(key, &ids, vocab_size);
                     }
                     Some(Seeded::Long(bytes)) => long_entries.push(bytes),
                     None => {}
@@ -2583,8 +2616,9 @@ impl NativeEncoder {
         // (The name fits the fifteen bytes a thread's name keeps.)
         let threads = if rayon::current_thread_index().is_some() {
             for window in windows() {
+                let first = window.start;
                 read_window(window, &mut slots);
-                keep(&mut slots);
+                keep(first, &mut slots);
             }
             rayon::current_num_threads()
         } else {
@@ -2595,8 +2629,9 @@ impl NativeEncoder {
                     |thread| thread.run(),
                     |pool| {
                         for window in windows() {
+                            let first = window.start;
                             pool.install(|| read_window(window, &mut slots));
-                            keep(&mut slots);
+                            keep(first, &mut slots);
                         }
                     },
                 );
@@ -2609,25 +2644,18 @@ impl NativeEncoder {
                     );
                     let mut scratch = SeedScratch::default();
                     for window in windows() {
+                        let first = window.start;
                         slots.extend(window.map(|id| read(id, &mut scratch)));
-                        keep(&mut slots);
+                        keep(first, &mut slots);
                     }
                     1
                 }
             }
         };
         let covers = entries == vocab_size;
-        let (short, long) = (keys.len(), long_entries.len());
-        let mut table = ShortPieceTable::for_entries(short);
+        let long = long_entries.len();
+        let table = table.fitted();
         let mut filter = LongEntryFilter::for_entries(long);
-        // The inserts the one list gave, in its order: the short pieces by
-        // id into the table, the long ones by id into the filter.
-        let mut at = 0;
-        for (key, &count) in keys.iter().zip(&counts) {
-            let end = at + usize::from(count);
-            table.insert(*key, &short_ids[at..end], short);
-            at = end;
-        }
         for bytes in &long_entries {
             filter.insert(bytes);
         }

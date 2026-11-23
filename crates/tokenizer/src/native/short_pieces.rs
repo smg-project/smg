@@ -31,7 +31,7 @@
 /// Longest piece the table keys: its bytes and length fit a `u128`.
 pub(super) const SHORT_PIECE_MAX_BYTES: usize = 15;
 /// Ids an entry keeps inline; an encoding with more goes to the spill.
-const INLINE_IDS: usize = 4;
+pub(super) const INLINE_IDS: usize = 4;
 /// Bit of a key where the piece's length begins; the bytes are below it.
 const LENGTH_SHIFT: u32 = 120;
 /// Bit of a stored key where the id count begins; a probe key has zeros
@@ -277,6 +277,34 @@ impl ShortPieceTable {
         Self::with_slots(slots, slots)
     }
 
+    /// The table in the slots [`Self::for_entries`] gives the entries it
+    /// holds, and no reservation beyond them. One that inserts filled to its
+    /// fill bound stands in half those slots and grows once more. One with
+    /// more slots is made anew, every entry stored again in slot order (a
+    /// piece keeps its ids; it may lie nearer to its home slot or further
+    /// from it than an insert in id order puts it).
+    pub(super) fn fitted(mut self) -> Self {
+        let slots = Self::slots_for(self.len);
+        if slots >= self.slots() {
+            if slots > self.slots() {
+                self.grow(slots);
+            }
+            self.tags.shrink_to_fit();
+            self.entries.shrink_to_fit();
+            return self;
+        }
+        let mut fitted = Self::for_entries(self.len);
+        let mut ids = Vec::with_capacity(MAX_IDS);
+        for (slot, entry) in self.entries.iter().enumerate() {
+            if self.tags[slot] != EMPTY_TAG {
+                ids.clear();
+                self.append(entry, &mut ids);
+                fitted.insert(ShortPieceKey(entry.key & KEY_MASK), &ids, self.len);
+            }
+        }
+        fitted
+    }
+
     /// The slots a table for about `entries` pieces has: a power of two that
     /// holds them under the fill bound, [`MIN_SLOTS`] at least.
     pub(super) const fn slots_for(entries: usize) -> usize {
@@ -290,7 +318,7 @@ impl ShortPieceTable {
 
     /// A table of `slots` slots with room for `reserved` before it has to
     /// move; the room is capacity, not written.
-    fn with_slots(slots: usize, reserved: usize) -> Self {
+    pub(super) fn with_slots(slots: usize, reserved: usize) -> Self {
         let mut tags = Vec::with_capacity(reserved.max(slots));
         tags.resize(slots, EMPTY_TAG);
         let mut entries = Vec::with_capacity(reserved.max(slots));
@@ -766,6 +794,31 @@ mod tests {
             }
         }
         assert_eq!(ShortPieceKey::in_window(&text, 5, 4), None);
+    }
+
+    #[test]
+    fn a_fitted_table_stands_in_the_slots_for_its_pieces_and_reserves_none() {
+        // Made for 48 pieces and given one; made small in a reservation and
+        // given one; the same given 48, which fill its 64 slots to the
+        // bound: it grows to the slots for 48, not into the reservation.
+        // A piece has more ids than an entry holds.
+        let small = || ShortPieceTable::with_slots(MIN_SLOTS, FIRST_GROWTH_SLOTS);
+        let fitted = [
+            (ShortPieceTable::for_entries(48), 1),
+            (small(), 1),
+            (small(), 48),
+        ]
+        .map(|(mut table, pieces)| {
+            for i in 0..pieces {
+                table.insert(key(&word(i)), &[1, 2, 3, 4, 5], 48);
+            }
+            let table = table.fitted();
+            let ids = ids_of(&table, &word(0));
+            (table.slots(), table.backing(), table.tags.capacity(), ids)
+        });
+        let ids = Some(vec![1, 2, 3, 4, 5]);
+        let one = (MIN_SLOTS, MIN_SLOTS, MIN_SLOTS, ids.clone());
+        assert_eq!(fitted, [one.clone(), one, (128, 128, 128, ids)]);
     }
 
     #[test]
