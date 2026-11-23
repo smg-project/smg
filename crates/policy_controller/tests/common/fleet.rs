@@ -5,10 +5,6 @@
 //! Included by path beside `common/engines.rs` and `common/net.rs` (the
 //! including binary names them `engines` and `net`).
 //!
-//! A second holder, [`Embedded`], is the same fleet under a host that
-//! embeds the engine: no controller, the store in the case's own hands,
-//! the same engines and the same stand-in prober.
-//!
 //! Every fact the store holds of an engine came from that engine, through a
 //! sink. Loads are the controller's own load driver's: the harness writes no
 //! load row. Health and KV events are the controller's own where its build
@@ -20,9 +16,8 @@
 //! that feature has no driver of either, so there each stands in for one.
 //! The dialer writes what it heard, never what the case knows, and the
 //! listener decodes each batch into the events an index applies and hands
-//! it to the sink. A host that embeds the engine ([`Embedded`]) has no
-//! controller, so its dialer writes in every build. A dial is bounded, so
-//! an engine that stops answering costs a turn that bound and no more.
+//! it to the sink. A dial is bounded, so an engine that stops answering
+//! costs a turn that bound and no more.
 //!
 //! An engine speaks the wire of its kind ([`Shape::runtime`]): the fleet's
 //! first wire, or the one whose load report counts resident tokens. The
@@ -84,7 +79,7 @@ use smg_policy_controller::{
         MemoryStore, ResyncReason, SequenceHash, Signals, StoredBlock, ViewBuffers, ViewQuery,
         WorkerFacts, WorkerStatus, WorkersStore,
     },
-    tracking::{LeaseId, TransportClass},
+    tracking::LeaseId,
 };
 use tokio::{
     io::{copy, sink},
@@ -648,8 +643,7 @@ async fn start_engine(ranks: u16, runtime: RuntimeType) -> Result<Engine, String
 }
 
 /// One rank written into the store by its membership write, pending: a
-/// rank of a wider engine under a controller, and every rank of a fleet
-/// that has no control listener.
+/// rank of a wider engine under a controller.
 fn written(store: &MemoryStore, endpoint: &str, shape: &Shape, rank: u16) -> WorkerId {
     store
         .upsert(WorkerFacts {
@@ -2072,158 +2066,5 @@ impl Harness {
             }
         }
         self.replica.stop().await
-    }
-}
-
-/// A fleet under a host that embeds the engine: the same engines and the
-/// same stand-in prober, over a store of the case's own process with no
-/// controller beside it. A store has one host at its files, so every
-/// decision over this fleet is its door's.
-pub struct Embedded {
-    store: Arc<MemoryStore>,
-    engines: Vec<Engine>,
-    probed: Arc<Mutex<Vec<Probed>>>,
-    turns: Arc<Turns>,
-    stop_feeds: watch::Sender<bool>,
-    feeds: JoinSet<()>,
-}
-
-impl Embedded {
-    /// A store of `deciders` files of leases with `document` applied as
-    /// its first generation, and no engine yet.
-    pub fn start(deciders: usize, mut document: PolicySpec) -> Result<Self, String> {
-        let store = MemoryStore::new().with_decision_slots(deciders);
-        document.generation = 1;
-        let spec = AppliedSpec::validate(&document).map_err(|error| error.to_string())?;
-        store.apply(spec).map_err(|error| error.to_string())?;
-        let (stop_feeds, _) = watch::channel(false);
-        Ok(Self {
-            store: Arc::new(store),
-            engines: Vec::new(),
-            probed: Arc::default(),
-            turns: Arc::default(),
-            stop_feeds,
-            feeds: JoinSet::new(),
-        })
-    }
-
-    /// Register: starts one mock engine a shape and writes each of its
-    /// ranks into the store, pending: only a probe's verdict makes a rank
-    /// ready. Returns the engines' indexes, in the shapes' order.
-    pub async fn register(&mut self, shapes: &[Shape]) -> Result<Vec<usize>, String> {
-        let mut started = Vec::with_capacity(shapes.len());
-        for shape in shapes {
-            let running = start_engine(shape.ranks, shape.runtime).await?;
-            let endpoint = running.endpoint.clone();
-            let ranks = 0..shape.ranks;
-            let ids = ranks.map(|rank| written(&self.store, &endpoint, shape, rank));
-            let probed = Probed {
-                engine: self.engines.len(),
-                runtime: shape.runtime,
-                endpoint: endpoint.clone(),
-                ids: ids.collect(),
-            };
-            // The build these registrations owe, asked: the case reads
-            // the rows at once.
-            self.store.publish_now();
-            started.push(probed.engine);
-            self.probed.lock().push(probed);
-            self.engines.push(running);
-        }
-        Ok(started)
-    }
-
-    /// Feed: starts the stand-in prober over every engine registered now
-    /// and later.
-    pub fn feed(&mut self) {
-        self.feeds.spawn(probe(
-            Arc::clone(&self.store),
-            Arc::clone(&self.probed),
-            Arc::clone(&self.turns),
-            self.stop_feeds.subscribe(),
-            true,
-        ));
-    }
-
-    /// The store: the host's door decides over it.
-    pub fn store(&self) -> &Arc<MemoryStore> {
-        &self.store
-    }
-
-    /// The engine a row of the fleet stands for.
-    pub fn engine_of(&self, id: WorkerId) -> Option<usize> {
-        let probed = self.probed.lock();
-        let owner = probed.iter().find(|engine| engine.ids.contains(&id));
-        owner.map(|engine| engine.engine)
-    }
-
-    /// Each engine as a decision of `gateway` reads it in the pool that
-    /// serves `model` at this instant, in the engines' order: whether
-    /// every rank of it reads healthy, and the requests the leases on
-    /// file book on it.
-    pub fn read(&self, model: &str, gateway: GatewayId) -> Vec<(bool, u32)> {
-        let ask = ViewQuery {
-            gateway,
-            now: Instant::now(),
-            pinned: None,
-            affinity: false,
-            signal_cells: false,
-        };
-        let mut out = ViewBuffers::default();
-        self.store.deciding(|world| {
-            if let Some(built) = world.build(model, Role::Single, &ask, &mut out) {
-                world.count_in_flight(&built, &ask, &mut out.candidates);
-            }
-        });
-        let probed = self.probed.lock();
-        let engines = probed.iter().map(|engine| {
-            let rows = out.candidates.iter();
-            let own: Vec<_> = rows.filter(|row| engine.ids.contains(&row.id)).collect();
-            let healthy = own.len() == engine.ids.len() && own.iter().all(|row| row.health.healthy);
-            (healthy, own.iter().map(|row| row.in_flight).sum())
-        });
-        engines.collect()
-    }
-
-    /// Sends one short request named `id` to the engine at `engine` on the
-    /// engine's own wire and reads it to its end, as a host that committed
-    /// its pick sends one: the class the transport read and the frames
-    /// read.
-    pub async fn send(&self, engine: usize, id: &str) -> Result<(TransportClass, u32), String> {
-        let slot = self.engines.get(engine);
-        let endpoint = slot.map(|engine| engine.endpoint.clone());
-        let endpoint = endpoint.ok_or_else(|| format!("no engine {engine}"))?;
-        let (class, frames) = sent(&endpoint, id.to_owned()).await;
-        let class = match class {
-            Class::Ok => TransportClass::Ok,
-            Class::ConnectFailed => TransportClass::ConnectFailed,
-            Class::Timeout => TransportClass::Timeout,
-            _ => TransportClass::ServerError,
-        };
-        Ok((class, frames))
-    }
-
-    /// Kills the engine at `engine`: every socket of it has closed at the
-    /// return.
-    pub async fn kill(&mut self, engine: usize) -> Result<(), String> {
-        let slot = self.engines.get_mut(engine);
-        let slot = slot.ok_or_else(|| format!("no engine {engine}"))?;
-        if slot.die().await? {
-            Ok(())
-        } else {
-            Err(format!("engine {engine} is dead already"))
-        }
-    }
-
-    /// Ends the prober and the engines, each under a bound.
-    pub async fn stop(mut self) -> Result<(), String> {
-        self.stop_feeds.send_replace(true);
-        while let Some(joined) = bounded("a feed ends", ROOM, self.feeds.join_next()).await? {
-            joined.map_err(|error| error.to_string())?;
-        }
-        for engine in &mut self.engines {
-            engine.die().await?;
-        }
-        Ok(())
     }
 }
