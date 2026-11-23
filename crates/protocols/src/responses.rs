@@ -5332,7 +5332,17 @@ pub fn from_turn_boundary(items: Vec<ResponseInputOutputItem>) -> Vec<ResponseIn
     if start == 0 {
         return items;
     }
-    items.into_iter().skip(start).collect()
+    let mut prefix = items;
+    let tail = prefix.split_off(start);
+    let mut kept: Vec<_> = prefix
+        .into_iter()
+        .filter(|item| matches!(item, ResponseInputOutputItem::AdditionalTools { .. }))
+        .collect();
+    if kept.is_empty() {
+        return tail;
+    }
+    kept.extend(tail);
+    kept
 }
 
 /// Whether `item` is a message the client sent (a user, developer or system
@@ -6481,6 +6491,21 @@ mod tests {
             kinds(&from_turn_boundary(whole)),
             ["message:user", "message:assistant"]
         );
+    }
+
+    #[test]
+    fn from_turn_boundary_retains_additional_tools_from_trimmed_prefix() {
+        let window = items(serde_json::json!([
+            {"type": "function_call_output", "call_id": "call_gone", "output": "1"},
+            {"type": "additional_tools", "id": "at_1", "role": "developer",
+             "tools": [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}]},
+            {"type": "message", "id": "msg_1", "role": "assistant",
+             "content": [{"type": "output_text", "text": "tail", "annotations": []}]},
+            {"type": "agent_message", "id": "am_1", "author": "/root", "recipient": "/root/worker",
+             "content": [{"type": "input_text", "text": "run check"}]}
+        ]));
+        let kept = from_turn_boundary(window);
+        assert_eq!(kinds(&kept), ["additional_tools", "agent_message"]);
     }
 
     /// The Responses API usage of a chat-style usage: both detail objects
