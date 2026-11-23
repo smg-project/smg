@@ -1044,6 +1044,8 @@ bindings:
           client: true
         - header: cookie
           client: true
+        - header: x-smg-target-worker
+          target: true
 ```
 
 ### `prefix_hash`

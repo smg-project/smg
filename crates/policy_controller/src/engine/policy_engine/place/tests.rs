@@ -1,6 +1,7 @@
 mod encode;
 mod pair;
 mod prompt_entry;
+mod target;
 
 use std::{
     cell::{Cell, RefCell},
@@ -127,6 +128,14 @@ fn in_order(panics: bool) -> (&'static PolicyEngine, Heard) {
 
 /// [`in_order`], and the budget each of its decisions was given.
 fn in_order_budgets(panics: bool) -> (&'static PolicyEngine, Heard, Budgets) {
+    in_order_edited(panics, |_| {})
+}
+
+/// [`in_order_budgets`] under its document as `edit` leaves it.
+fn in_order_edited(
+    panics: bool,
+    edit: impl FnOnce(&mut PolicySpec),
+) -> (&'static PolicyEngine, Heard, Budgets) {
     let (heard, budgets) = (Heard::default(), Budgets::default());
     let (kept, told) = (Arc::clone(&heard), Arc::clone(&budgets));
     let mut stages = StageRegistry::builtin();
@@ -146,6 +155,7 @@ fn in_order_budgets(panics: bool) -> (&'static PolicyEngine, Heard, Budgets) {
     profile
         .filter
         .retain(|filter| *filter != FilterSpec::Name("healthy".to_owned()));
+    edit(&mut document);
     let spec = AppliedSpec::validate_in(&document, &stages, &[]);
     let engine = PolicyEngine::new(spec.expect("the stages hold the picker"));
     (hosted(engine), heard, budgets)

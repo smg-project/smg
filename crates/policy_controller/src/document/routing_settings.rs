@@ -21,6 +21,7 @@ use crate::{
             Gates, DEFAULT_THRESHOLD, DEFAULT_WARMUP_BLOCKS, DEFAULT_WARMUP_DIVERT_EVERY,
             DEFAULT_WARMUP_SECS, DEFAULT_WARMUP_SHARE, DEFAULT_WARMUP_THIN_RATIO,
         },
+        consistent_hashing::target_source,
         power_of_two::PowerOfTwoMetric,
     },
     stages::scorers::{
@@ -1442,11 +1443,11 @@ impl Bound {
 /// lists differ: a binding names one list for every side. The sides are held
 /// to the same session sources. Client sources are the hash ring's alone, and
 /// no other side's stage reads their key, so the binding takes them from the
-/// side that names them.
+/// side that names them, and its target source with them.
 fn one_list(
     keys: Vec<(&'static str, RoutingKeySpec)>,
 ) -> Result<Option<RoutingKeySpec>, RoutingSettingsError> {
-    let of_session = |source: &&KeySourceSpec| !source.client;
+    let of_session = |source: &&KeySourceSpec| !source.client && !source.target;
     let mut keys = keys.into_iter();
     let Some((first, mut key)) = keys.next() else {
         return Ok(None);
@@ -1469,12 +1470,13 @@ fn one_list(
 }
 
 /// A `routing_key` block holds eight sources at most, its client sources
-/// not counted.
+/// and its target source not counted.
 fn within_a_block(
     key: &RoutingKeySpec,
     config: &RoutingSettings,
 ) -> Result<(), RoutingSettingsError> {
-    if key.sources.iter().filter(|source| !source.client).count() > MAX_KEY_SOURCES {
+    let of_session = |source: &&KeySourceSpec| !source.client && !source.target;
+    if key.sources.iter().filter(of_session).count() > MAX_KEY_SOURCES {
         return Err(unsupported(
             "routing_key_override.headers",
             spelled(&config.routing_key_override.headers),
@@ -1519,6 +1521,11 @@ const CLIENT_HEADERS: [&str; 2] = ["x-forwarded-for", "cookie"];
 /// and lifts no overload veto. A configured `x-forwarded-for` is named both
 /// ways, as the gateway reads it: within the cap as a session's key, and
 /// whole as a client's.
+///
+/// `consistent_hashing` alone names its target header, as its target
+/// source ([`target_source`]): a request that
+/// carries it goes to the worker its number reaches, and no other policy's
+/// request reads it.
 fn key_sources(
     policy: &PolicySettings,
     config: &RoutingSettings,
@@ -1592,6 +1599,7 @@ fn key_sources(
     }
     if matches!(policy, PolicySettings::ConsistentHashing) {
         sources.extend(CLIENT_HEADERS.map(|name| header(name, true)));
+        sources.push(target_source());
     }
     Ok(Some(RoutingKeySpec {
         sources,
@@ -2450,7 +2458,8 @@ mod tests {
                     { "header": "x-session-id" },
                     { "header": "x-smg-routing-key" },
                     { "header": "x-forwarded-for", "client": true },
-                    { "header": "cookie", "client": true }
+                    { "header": "cookie", "client": true },
+                    { "header": "x-smg-target-worker", "target": true }
                 ])
             ))
         );
@@ -2481,7 +2490,8 @@ mod tests {
                 { "header": "x-forwarded-for" },
                 { "header": "x-smg-routing-key" },
                 { "header": "x-forwarded-for", "client": true },
-                { "header": "cookie", "client": true }
+                { "header": "cookie", "client": true },
+                { "header": "x-smg-target-worker", "target": true }
             ]),
         );
         assert_eq!(both_ways.policy_document().as_ref(), Ok(&document));
@@ -2520,7 +2530,8 @@ mod tests {
                         { "header": "x-smg-routing-key" },
                         { "rid": true },
                         { "header": "x-forwarded-for", "client": true },
-                        { "header": "cookie", "client": true }
+                        { "header": "cookie", "client": true },
+                        { "header": "x-smg-target-worker", "target": true }
                     ],
                     "strip_lineage": true
                 });
@@ -2580,7 +2591,7 @@ mod tests {
                 .and_then(|binding| binding.routing_key.as_ref())
                 .map(|key| key.sources.len())
         });
-        assert_eq!(sources, Ok(Some(4)));
+        assert_eq!(sources, Ok(Some(5)));
     }
 
     /// The policies under which the sticky override lands as a session
