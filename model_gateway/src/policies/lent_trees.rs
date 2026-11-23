@@ -125,10 +125,19 @@ impl LentTrees {
             .map(|url| TenantId::from(url.as_str()))
             .collect();
         let model = normalize_model_key(model_id);
+        // The stores are copied out and the lock is let go ahead of the
+        // purge: a purge walks a tree once for every worker, and a decision
+        // that builds a model's table asks for its tree under this lock.
+        let stores: Vec<Arc<ModelTrees>> = self
+            .stores
+            .lock()
+            .iter()
+            .map(|store| Arc::clone(&store.trees))
+            .collect();
         // A model's tree stands in one store, and the others hold none of
         // its name.
-        for store in self.stores.lock().iter() {
-            store.trees.remove_tenants_from_model(model, &tenants);
+        for trees in stores {
+            trees.remove_tenants_from_model(model, &tenants);
         }
     }
 }
@@ -283,19 +292,19 @@ mod tests {
     #[test]
     fn the_size_pass_holds_a_tree_to_its_index_entrys_size() {
         let mut stated = document(128, 1);
-        let roomy = entry(4_096, 1);
-        stated.index.insert("roomy*".to_owned(), roomy);
+        let roomier = entry(256, 1);
+        stated.index.insert("roomy*".to_owned(), roomier);
         let trees = owner(stated);
         let (small, large) = (filled(&trees, MODEL), filled(&trees, "roomy-a"));
         let until = Instant::now() + Duration::from_secs(20);
-        while small.total_token_size() > 128 && Instant::now() < until {
+        let over = || small.total_token_size() > 128 || large.total_token_size() > 256;
+        while over() && Instant::now() < until {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(small.total_token_size() <= 128, "the pass ran on its timer");
-        // The other entry's pass has the same cadence: it ran too, at its
-        // own size.
-        thread::sleep(Duration::from_millis(1_500));
-        assert_eq!(large.total_token_size(), 512, "its own entry's size");
+        // The other entry's pass ran too, and cut its tree to its own size.
+        let kept = large.total_token_size();
+        assert!(kept <= 256 && kept > 128, "its own entry's size: {kept}");
 
         let unheld = owner(document(128, 0));
         unheld.token_tree(MODEL);

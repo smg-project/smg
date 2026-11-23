@@ -1,5 +1,6 @@
-//! One request's routing under the classic policies, over one fleet of
-//! workers a model, every one ready unless the cell says otherwise.
+//! One request's routing, by the classic policies or by the policy engine,
+//! over one fleet of workers a model, every one ready unless the cell says
+//! otherwise.
 //!
 //! `--path classic`, the default, routes by the classic policies over the
 //! worker registry. `--path engine` routes the same cell by the policy
