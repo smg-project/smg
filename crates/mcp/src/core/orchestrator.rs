@@ -1841,25 +1841,34 @@ impl McpOrchestrator {
             }
         };
 
-        // The tools go to the inventory by URL; the listing's outcome stays
-        // with this connection (its pool key) and goes to the caller's binding.
-        let list_error = match tools_of(client.as_ref(), &server_key, ToolCategory::Dynamic).await {
-            Ok(entries) => {
-                for entry in entries {
-                    inventory_clone.insert_entry(entry);
-                }
-                None
-            }
-            Err(message) => Some(message),
-        };
-        self.connection_pool.set_listing(
+        // The tools go to the inventory by URL, while this connection is
+        // still pooled under its key; the listing's outcome stays with this
+        // connection (its pool key) and goes to the caller's binding.
+        let (entries, list_error) =
+            match tools_of(client.as_ref(), &server_key, ToolCategory::Dynamic).await {
+                Ok(entries) => (entries, None),
+                Err(message) => (Vec::new(), Some(message)),
+            };
+        let still_pooled = self.connection_pool.set_listing(
             &pool_key,
             &client,
             match &list_error {
                 Some(message) => Listing::Failed(message.clone()),
                 None => Listing::Listed,
             },
+            || {
+                for entry in entries {
+                    inventory_clone.insert_entry(entry);
+                }
+            },
         );
+        if !still_pooled {
+            debug!(
+                "Dynamic server '{}' (tenant: {:?}) left the pool during its listing - its \
+                 tools stay out of the inventory",
+                pool_key.url, pool_key.tenant_id
+            );
+        }
 
         if opened {
             self.metrics.record_connection_opened();
@@ -2805,6 +2814,92 @@ mod tests {
             mapping.overrides,
             vec![("enable_brave".to_string(), serde_json::json!(false))]
         );
+    }
+
+    /// A tool listing that ends after its connection left the pool puts no
+    /// tool into the inventory: no pooled connection is left to clear it.
+    #[tokio::test]
+    async fn a_listing_that_ends_after_its_connection_left_the_pool_lists_nothing() {
+        use rmcp::{
+            model::{ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig},
+            service::RequestContext,
+            RoleServer, ServerHandler, ServiceExt,
+        };
+        use tokio::sync::Notify;
+
+        /// A server whose listing says it was asked, then waits to be let go.
+        struct Slow {
+            asked: Arc<Notify>,
+            go: Arc<Notify>,
+        }
+        impl ServerHandler for Slow {
+            fn get_info(&self) -> ServerConfig {
+                ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            }
+
+            async fn list_tools(
+                &self,
+                _request: Option<PaginatedRequestParams>,
+                _context: RequestContext<RoleServer>,
+            ) -> Result<ListToolsResult, rmcp::ErrorData> {
+                self.asked.notify_one();
+                self.go.notified().await;
+                Ok(ListToolsResult::with_all_items(vec![create_test_tool(
+                    "late",
+                )]))
+            }
+        }
+
+        let mut config = McpConfig::default();
+        config.pool.max_connections = 1;
+        let orchestrator = &McpOrchestrator::new(config).await.unwrap();
+        let (asked, go) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let server_at = |url: &str| McpServerConfig {
+            transport: McpTransport::Streamable {
+                url: url.to_string(),
+                token: None,
+                headers: HashMap::new(),
+            },
+            ..sse_server("tools", url)
+        };
+        let pool = |url: &str, client| {
+            orchestrator.connection_pool.get_or_create(
+                PoolKey::from_config(&server_at(url), None),
+                server_at(url),
+                |_, _| std::future::ready(Ok(client)),
+            )
+        };
+        let slow = Slow {
+            asked: Arc::clone(&asked),
+            go: Arc::clone(&go),
+        };
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let (_server, client) = tokio::join!(slow.serve(server_io), ().serve(client_io));
+        let url = "http://slow.example/mcp";
+        pool(url, client.unwrap()).await.unwrap();
+        // The connection that takes the pool's one place is never asked.
+        let (_idle_io, client_io) = tokio::io::duplex(64);
+        let other = pool(
+            "http://other.example/mcp",
+            rmcp::service::serve_directly((), client_io, None),
+        );
+        let (listed, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(orchestrator.connect_dynamic_server(server_at(url)), async {
+                asked.notified().await;
+                other.await.unwrap();
+                go.notify_one();
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(listed.unwrap().list_error, None);
+
+        let key = PoolKey::from_config(&server_at(url), None);
+        assert!(orchestrator.connection_pool.get(&key).is_none());
+        assert!(orchestrator
+            .tool_inventory()
+            .get_entry(url, "late")
+            .is_none());
     }
 
     #[test]
