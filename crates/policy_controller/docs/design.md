@@ -1558,9 +1558,11 @@ allocation and no lock. Under one that does, a side shares its placement with it
 allocation a side.
 
 A pair's two sides share the pair's one placement behind a lock of that one request. The
-crate keeps the order of a pair's words itself: a prefill side that ends while the decode still
-stands chosen holds its end back until the decode side speaks, and says it then as it stood:
-with the outcome reported, or with the instant of its own drop.
+crate keeps the order of a pair's words itself: a prefill side let go while the decode still
+stands chosen holds its word back until the decode side speaks, and says it then as it stood.
+A prefill that went out says its end, with the outcome reported or with the instant of its own
+drop. One that never went out is released. So a host that sends a pair's decode and no prefill
+orders nothing by hand.
 
 A host that keeps sides asks the decode again on the pair's decode side, once the prefill
 side's send was said. It may let the prefill side go before that call or behind it: a
