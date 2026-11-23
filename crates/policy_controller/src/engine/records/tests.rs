@@ -1191,3 +1191,77 @@ fn a_workers_place_is_found_by_its_id_and_by_no_id_two_rows_carry() {
         assert_eq!(pool.place_of(worker_id(worker.as_ref())), None);
     }
 }
+
+/// A retry's tried workers are widened to their engines: the workers as
+/// they were named, and behind them every other rank of an engine one of
+/// them is a rank of, each once, in the engine's ranks' order. A worker
+/// that stands alone and an id the list does not hold add nothing. A
+/// program's own ids come back as it stated them. Where two rows carry one
+/// id nothing is added, and a list of workers that each stand alone says
+/// it holds no ranks.
+#[test]
+fn a_tried_worker_names_every_rank_of_its_engine_once() {
+    let spec = applied("least_load");
+    let clock = DecisionClock::new();
+    // One rank of the three-rank engine at `engine`.
+    let rank = |engine: &str, rank: usize| -> Arc<dyn Worker> {
+        Arc::new(
+            <BasicWorkerBuilder>::new(engine.to_owned())
+                .dp_config(rank, 3)
+                .health_config(no_health_check())
+                .build(),
+        )
+    };
+    let (a, b) = ("grpc://engine-a:9000", "grpc://engine-b:9000");
+    // Two engines' ranks out of their order, around a worker alone.
+    let workers = vec![
+        rank(a, 2),
+        rank(b, 0),
+        ready_worker(&url(0), MODEL),
+        rank(a, 0),
+        rank(b, 1),
+        rank(a, 1),
+        rank(b, 2),
+    ];
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    assert!(pool.has_ranks());
+    let id = |place: usize| worker_id(workers[place].as_ref());
+    // What the list held before is not kept.
+    let mut whole = vec![WorkerId(9)];
+    pool.tried_engines(&[id(5)], &mut whole);
+    assert_eq!(whole, [id(5), id(3), id(0)], "the tried rank first");
+    pool.tried_engines(&[id(1)], &mut whole);
+    assert_eq!(whole, [id(1), id(4), id(6)], "the second engine's own");
+    pool.tried_engines(&[id(2)], &mut whole);
+    assert_eq!(whole, [id(2)], "a worker alone names itself");
+
+    let stranger = WorkerId(77);
+    pool.tried_engines(&[id(0), id(2), stranger, id(3), id(4)], &mut whole);
+    let both = [id(0), id(2), stranger, id(3), id(4), id(5), id(1), id(6)];
+    assert_eq!(whole, both, "each rank once, behind the workers named");
+
+    let mut next = 100;
+    let stated = PoolRecords::with_fixed_facts(&workers, &spec, &clock, |_| {
+        next += 1;
+        FixedFacts {
+            id: Some(WorkerId(next)),
+            ..FixedFacts::default()
+        }
+    });
+    stated.tried_engines(&[WorkerId(106)], &mut whole);
+    assert_eq!(whole, [WorkerId(106), WorkerId(104), WorkerId(101)]);
+
+    // One rank listed twice: no id of the list has a place.
+    let twice = vec![rank(a, 0), rank(a, 1), rank(a, 0)];
+    let pool = PoolRecords::new(&twice, &spec, &clock);
+    let named = [worker_id(twice[1].as_ref())];
+    pool.tried_engines(&named, &mut whole);
+    assert_eq!(whole, named);
+
+    let alone = fleet(3);
+    let pool = PoolRecords::new(&alone, &spec, &clock);
+    assert!(!pool.has_ranks());
+    let named = [worker_id(alone[1].as_ref())];
+    pool.tried_engines(&named, &mut whole);
+    assert_eq!(whole, named);
+}

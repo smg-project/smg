@@ -35,6 +35,16 @@
 //! demand that took its last worker. A pair that states a demand is
 //! shed.
 //!
+//! **A retry** names the workers it tried ([`RequestFacts::tried`]). Over
+//! a list where an engine holds several workers, the ranks of a
+//! data-parallel engine, it is decided with every worker of a tried
+//! worker's engine named as tried ([`PoolRecords::tried_engines`]): a
+//! failed attempt reached the engine its ranks share. So a stage that
+//! passes a tried worker over passes its engine over, and hands the
+//! engine again where no other worker is left. The keyed decision and the
+//! whole pass read the same list. A tried worker the list no longer holds
+//! names itself alone.
+//!
 //! **What is refused by name.** The list a host hands is its request's own:
 //! every worker of it is dialed on a wire the request states. A list that is
 //! not, and a subset hint, are declined under the stage that would have run
@@ -63,7 +73,7 @@ use crate::{
         framework::Engine,
         records::{self, PoolRecords},
         sticky_sessions::SessionVerdict,
-        view::{Constraints, Phase, RequestFacts, Session},
+        view::{Constraints, Phase, RequestFacts, Session, WorkerId},
     },
     stages::Lifecycle,
     tracking::lease::{EventKind, EventSet, Lease, LeaseId, LeaseKind, Side, DISPATCH_TTL},
@@ -74,6 +84,12 @@ thread_local! {
     /// demands, taken for one decision and put back behind it: such a
     /// request allocates nothing once the list has grown to its pool.
     static MEETING: Cell<Vec<u32>> = const { Cell::new(Vec::new()) };
+
+    /// The calling thread's own list of the workers a retry is decided to
+    /// have tried, where an engine of its list holds several
+    /// ([`retried`]): taken for one decision and put back behind it, as
+    /// [`MEETING`] is.
+    static TRIED: Cell<Vec<WorkerId>> = const { Cell::new(Vec::new()) };
 }
 
 /// The stage a pair whose request states places is declined under
@@ -217,6 +233,11 @@ impl WholeDecision for WithoutShadow {
 /// nobody is shed with no endpoint under the stage of the demand that took
 /// its last worker ([`UnmetDemand::stage`]), as a pool its request's
 /// demands emptied is shed over a store's rows.
+///
+/// A retry over a list where an engine holds several workers is decided
+/// with every worker of the engines it tried named as tried ([`retried`]).
+/// A first attempt pays one test for it, and a retry over any other list
+/// one more.
 pub(super) fn decide(
     own: &PolicyEngine,
     request: &mut Request<'_>,
@@ -262,10 +283,44 @@ pub(super) fn decide(
     let key = facts.session_key.plain;
     let live =
         records::Live::at(spec.engine(), &own.clock, now, loads, key).turning(&members.rotation.0);
+    // A retry leaves every worker of the engines it tried: over a list
+    // where an engine holds several, its facts name them all.
+    let decision = if facts.tried.is_empty() || !records.has_ranks() {
+        by_facts::<false>(own, members, records, &live, facts, cx, whole)
+    } else {
+        retried(own, members, records, &live, facts, cx, whole)
+    };
+    if let Some(meeting) = meeting {
+        MEETING.set(meeting);
+    }
+    decision
+}
+
+/// [`decide`]'s decision by the facts handed, which are the request's own
+/// or a retry's ([`retried`]): by the rows the key names where they answer,
+/// and else the whole decision, run as `whole` states.
+///
+/// In line at both its callers: a first attempt calls nothing for it.
+/// `RETRY` says which caller's instance this is, [`retried`]'s or
+/// [`decide`]'s. Each instance so has one caller, and the compiler keeps
+/// what a first attempt runs in line there. With one instance for both
+/// callers a first attempt's whole decision was called, 30 instructions a
+/// decision more.
+#[inline(always)]
+fn by_facts<const RETRY: bool>(
+    own: &PolicyEngine,
+    members: &PoolMembers,
+    records: &PoolRecords,
+    live: &records::Live<'_>,
+    facts: &mut RequestFacts<'_>,
+    cx: &Constraints<'_>,
+    whole: impl WholeDecision,
+) -> Decision {
+    let spec = &own.spec;
     let (engine, workers) = (spec.engine(), members.workers());
     // A keyed request is decided by the rows its key names, where they say
     // what the whole pass would: its key's pin.
-    let decision = match keys::decide(engine, records, workers, &live, facts, cx) {
+    match keys::decide(engine, records, workers, live, facts, cx) {
         Some(keyed) => keyed,
         // A profile whose stages read who holds the prompt is named its
         // rows from the gateway's own data, at the decision's instant the
@@ -278,12 +333,43 @@ pub(super) fn decide(
             workers,
             records.ids(),
             facts,
-            |facts| whole.decide(engine, records, workers, &live, facts, cx),
+            |facts| whole.decide(engine, records, workers, live, facts, cx),
         ),
-    };
-    if let Some(meeting) = meeting {
-        MEETING.set(meeting);
     }
+}
+
+/// A retry's decision over a list where an engine holds several workers.
+/// The request is decided ([`by_facts`]) by a copy of its facts whose tried
+/// workers are its own and every other worker of their engines
+/// ([`PoolRecords::tried_engines`]). The key's rows, the whole pass and a
+/// binding's shadow profile so read one list, and the request's own list
+/// stays as its host made it. The decision's instant is written back into
+/// `facts`: the request's lease is dated by it.
+///
+/// The workers stand in the calling thread's own list ([`TRIED`]), so a
+/// retry allocates nothing once the list has grown. Out of line and cold:
+/// a first attempt's path, and a retry's over a list with no such engine,
+/// hold one test of this and nothing else.
+#[cold]
+#[inline(never)]
+fn retried(
+    own: &PolicyEngine,
+    members: &PoolMembers,
+    records: &PoolRecords,
+    live: &records::Live<'_>,
+    facts: &mut RequestFacts<'_>,
+    cx: &Constraints<'_>,
+    whole: impl WholeDecision,
+) -> Decision {
+    let mut tried = TRIED.take();
+    records.tried_engines(facts.tried, &mut tried);
+    let mut widened = RequestFacts {
+        tried: &tried,
+        ..*facts
+    };
+    let decision = by_facts::<true>(own, members, records, live, &mut widened, cx, whole);
+    facts.now_micros = widened.now_micros;
+    TRIED.set(tried);
     decision
 }
 
@@ -1036,6 +1122,257 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(shared, in_turn, "{workers} workers, one list");
         }
+    }
+
+    /// A list of ready workers engine after engine, one engine a number
+    /// of `shape`: that many ranks of one data-parallel engine in their
+    /// order, or a worker that registered no rank for a `1`. Beside it,
+    /// each worker's engine by its place in the list.
+    fn engines(shape: &[usize]) -> (Arc<[Arc<dyn Worker>]>, Vec<usize>) {
+        let address = |engine: usize| format!("http://engine-{engine}:8000");
+        let rank = |engine: usize, rank: usize, size: usize| -> Arc<dyn Worker> {
+            let worker = <BasicWorkerBuilder>::new(address(engine))
+                .model(ModelCard::new(MODEL))
+                .dp_config(rank, size)
+                .health_config(no_health_check())
+                .build();
+            worker.set_status(WorkerStatus::Ready);
+            Arc::new(worker)
+        };
+        let (mut list, mut engine_of) = (Vec::new(), Vec::new());
+        for (engine, &size) in shape.iter().enumerate() {
+            for at in 0..size {
+                list.push(match size {
+                    1 => ready_worker(&address(engine), MODEL),
+                    _ => rank(engine, at, size),
+                });
+                engine_of.push(engine);
+            }
+        }
+        (list.into(), engine_of)
+    }
+
+    /// A retry leaves every rank of the engine it tried while its list
+    /// holds another worker: no target it is answered, first or
+    /// alternate, is a rank of that engine, under each built-in policy,
+    /// over a short list and over one long enough for the passes that
+    /// draw. Named the tried rank alone, the stages kept the engine's
+    /// other ranks. That is the gateway's classic answer: its tried list
+    /// names an engine by the base address its ranks share, and a tried
+    /// engine steps aside for the retry while another candidate is
+    /// available (`model_gateway/src/routers/common/placement.rs:556-576`
+    /// and `:1174-1179` at main `ef096118a`).
+    #[test]
+    fn a_retry_leaves_every_rank_of_the_engine_it_tried() {
+        // Four ranks, a worker alone, two ranks and a worker alone; then
+        // three engines of eight ranks.
+        for shape in [&[4, 1, 2, 1][..], &[8, 8, 8]] {
+            let (list, engine_of) = engines(shape);
+            // The first engine's last rank was tried.
+            let tried = [worker_id(list[shape[0] - 1].as_ref())];
+            for name in [
+                "round_robin",
+                "random",
+                "passthrough",
+                "power_of_two",
+                "least_load",
+                "bucket",
+                "cache_aware",
+                "consistent_hashing",
+                "prefix_hash",
+                "manual",
+            ] {
+                let engine = preset(name);
+                let members = engine.pool_members(&list);
+                let mut landed = BTreeSet::new();
+                for seed in 0..64 {
+                    let mut retry = request();
+                    retry.facts.seed = seed;
+                    retry.facts.attempt = 1;
+                    retry.facts.tried = &tried;
+                    // A ring and a sessions rule place a request by its key.
+                    retry.facts.session_key = Identity::hashed(seed + 1);
+                    let asks = Asks::of(retry, Some(&members));
+                    let outcome = decided(&engine, &asks);
+                    let pick = outcome.decision.pick().expect("a pick");
+                    landed.extend(pick.targets.iter().map(|target| target.position));
+                }
+                let tried_engine: Vec<_> = landed
+                    .iter()
+                    .filter(|&&place| engine_of[place as usize] == 0)
+                    .collect();
+                assert!(
+                    tried_engine.is_empty(),
+                    "{name} over {shape:?}: places {tried_engine:?} are ranks of the tried engine"
+                );
+                assert!(!landed.is_empty(), "{name} over {shape:?}");
+            }
+        }
+    }
+
+    /// Over a list that is one engine, a retry is handed the engine again:
+    /// no other worker is left, so the stage that passes tried workers over
+    /// steps aside for the whole list, the tried rank with the others. That
+    /// is the gateway's classic answer: where no untried candidate is
+    /// available, its pool is used whole
+    /// (`model_gateway/src/routers/common/placement.rs:571-573` at main
+    /// `ef096118a`). Named the tried rank alone, the stage kept the other
+    /// ranks and never handed that one.
+    #[test]
+    fn a_retry_over_one_engine_is_handed_its_ranks_again() {
+        let engine = preset("random");
+        let (list, _) = engines(&[4]);
+        let members = engine.pool_members(&list);
+        let tried = [worker_id(list[1].as_ref())];
+        let mut firsts = BTreeSet::new();
+        for seed in 0..64 {
+            let mut retry = request();
+            retry.facts.seed = seed;
+            retry.facts.tried = &tried;
+            let asks = Asks::of(retry, Some(&members));
+            let outcome = decided(&engine, &asks);
+            let pick = outcome.decision.pick().expect("a pick");
+            firsts.insert(pick.targets.first().expect("a target").position);
+        }
+        assert_eq!(firsts, BTreeSet::from([0, 1, 2, 3]), "the engine whole");
+    }
+
+    /// A key pinned on one rank of an engine leaves that engine on a retry
+    /// that tried another of its ranks: the key's rows are read under the
+    /// retry's whole list of tried workers, so the pin is not followed, and
+    /// the whole pass places the request on another engine. The gateway's
+    /// classic sticky policy is handed its candidates with the tried
+    /// engines out, and picks another worker where none of its key's is
+    /// among them (`model_gateway/src/routers/common/placement.rs:556-576`
+    /// and `model_gateway/src/policies/manual.rs:303-308` at main
+    /// `ef096118a`).
+    #[test]
+    fn a_keyed_retry_leaves_the_engine_its_key_is_pinned_on() {
+        // The stock sessions rule: its binding pins a key.
+        let engine = preset("manual");
+        let (list, engine_of) = engines(&[4, 4]);
+        let members = engine.pool_members(&list);
+        // One request of `key` that tried `tried`, served by its first
+        // target: that target's place.
+        let sent = |key: u64, tried: &[WorkerId]| {
+            let mut keyed = request();
+            keyed.facts.seed = key;
+            keyed.facts.session_key = Identity::hashed(key);
+            keyed.facts.tried = tried;
+            let asks = Asks::of(keyed, Some(&members));
+            served(&engine, &asks, Instant::now()).position as usize
+        };
+        for key in 1..=16 {
+            let pin = sent(key, &[]);
+            assert_eq!(sent(key, &[]), pin, "key {key}: its pin");
+            // Another rank of the pin's engine was tried.
+            let other = (pin & !3) | ((pin + 1) & 3);
+            let tried = [worker_id(list[other].as_ref())];
+            let went = sent(key, &tried);
+            assert_ne!(
+                engine_of[went], engine_of[pin],
+                "key {key}: place {went} is a rank of the tried engine"
+            );
+        }
+    }
+
+    /// The workers a retry is decided to have tried stand in the calling
+    /// thread's own list, which only a retry over ranks takes: a first
+    /// attempt leaves it as it was, and so does a retry over workers that
+    /// each stand alone. It grows at a thread's first such retry and is
+    /// kept: the retries behind it allocate nothing for it.
+    #[test]
+    fn only_a_retry_over_ranks_takes_the_threads_list_and_it_grows_once() {
+        let engine = preset("random");
+        let (ranks, _) = engines(&[4, 4]);
+        let ranked = engine.pool_members(&ranks);
+        let alone = pool(8);
+        let unranked = engine.pool_members(&alone);
+        // Where the thread's list stands and what it holds room for.
+        let kept = || {
+            let list = TRIED.take();
+            let stands = (list.as_ptr(), list.capacity());
+            TRIED.set(list);
+            stands
+        };
+        let asked = |members: &PoolMembers, tried: &[WorkerId]| {
+            let mut asked = request();
+            asked.facts.tried = tried;
+            let asks = Asks::of(asked, Some(members));
+            assert!(decided(&engine, &asks).decision.pick().is_some());
+        };
+        asked(&ranked, &[]);
+        assert_eq!(kept().1, 0, "a first attempt takes no list");
+        asked(&unranked, &[worker_id(alone[0].as_ref())]);
+        assert_eq!(kept().1, 0, "nor a retry over workers that stand alone");
+        let tried = [worker_id(ranks[1].as_ref())];
+        asked(&ranked, &tried);
+        let grown = kept();
+        assert!(grown.1 >= 4, "the engine's four ranks stand in it");
+        asked(&ranked, &tried);
+        assert_eq!(kept(), grown, "the list is kept as it grew");
+    }
+
+    /// A retry decided under its whole list of tried workers is leased as
+    /// a first attempt is: its lease is dated at the decision's instant on
+    /// the engine's clock, which the decision writes into the request.
+    #[test]
+    fn a_retry_over_ranks_is_leased_at_its_decisions_instant() {
+        // The stock sessions rule takes a word on a lease.
+        let engine = preset("manual");
+        let (list, _) = engines(&[4, 4]);
+        let members = engine.pool_members(&list);
+        let now = Instant::now() + Duration::from_secs(2);
+        let dated = |tried: &[WorkerId]| {
+            let mut keyed = request();
+            keyed.facts.session_key = Identity::hashed(9);
+            keyed.facts.tried = tried;
+            let asks = Asks::of(keyed, Some(&members));
+            let decided = engine.decide_under(GatewayId::LOCAL, &asks, now);
+            let whole = decided.expect("an answer").whole().expect("whole").0;
+            whole.lease.expect("a lease").lease.issued_micros
+        };
+        let first = dated(&[]);
+        assert!(first >= 2_000_000, "the engine's clock at `now`: {first}");
+        let tried = [worker_id(list[1].as_ref())];
+        assert_eq!(dated(&tried), first, "the retry's lease is dated alike");
+    }
+
+    /// A tried worker its list no longer holds names itself alone: the
+    /// list says nothing of its engine, so the engine's other ranks stay
+    /// candidates. A list holds some ranks of an engine and not the others
+    /// while its registry removes them, one after another. The gateway's
+    /// classic passes them over there: its tried list names the engine's
+    /// base address, whichever of its ranks the list still holds
+    /// (`model_gateway/src/routers/common/placement.rs:1174-1179` at main
+    /// `ef096118a`).
+    #[test]
+    fn a_tried_worker_its_list_no_longer_holds_names_itself_alone() {
+        let engine = preset("random");
+        let (whole, engine_of) = engines(&[4, 4]);
+        // The first engine's first rank was tried, and has left the list.
+        let tried = [worker_id(whole[0].as_ref())];
+        let list: Arc<[Arc<dyn Worker>]> = whole[1..].iter().cloned().collect();
+        let members = engine.pool_members(&list);
+        let mut firsts = BTreeSet::new();
+        for seed in 0..64 {
+            let mut retry = request();
+            retry.facts.seed = seed;
+            retry.facts.tried = &tried;
+            let asks = Asks::of(retry, Some(&members));
+            let outcome = decided(&engine, &asks);
+            let pick = outcome.decision.pick().expect("a pick");
+            firsts.insert(pick.targets.first().expect("a target").position);
+        }
+        // A place of the shorter list is one less than the worker's place
+        // in the whole one.
+        let stayed = firsts
+            .iter()
+            .any(|&place| engine_of[place as usize + 1] == 0);
+        assert!(
+            stayed,
+            "{firsts:?}: the tried engine's ranks stay candidates"
+        );
     }
 
     /// A request that hands no list is decided over no worker. One that
