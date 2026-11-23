@@ -1266,6 +1266,7 @@ impl Router {
             &self.worker_registry,
             &self.policy_registry,
             model_id,
+            RoutingPool::HttpRegular,
             &non_dp_workers,
             PlacementInputs {
                 text: routing.text.as_deref(),

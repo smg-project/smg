@@ -692,7 +692,8 @@ impl ByEngine {
 /// A classic ring policy is handed the model's ring for every list a
 /// request is placed over: the pool's own, the part of it on a retry's
 /// pinned wire, a caller's own slice (`select_pass`). The engine is lent
-/// that ring for the same lists and walks it as the classic policy does
+/// that ring for the same requests, a part of a pool held to by the
+/// request's rule, and walks it as the classic policy does
 /// ([`HashRing::find_healthy_url`]), so a routing value keeps the worker it
 /// has.
 enum ModelRing<'a> {
@@ -838,23 +839,6 @@ fn placed_by_engine(
     }
 }
 
-/// [`placed_by_engine`] over a list nobody names: the engine's value of it
-/// is made for this one request and falls with it. The ring is the model's
-/// all the same: a ring is no part of a list, and a worker of the ring that
-/// the list does not hold is passed over.
-fn placed_over_unnamed(
-    engine: &'static PolicyEngine,
-    policies: &PolicyRegistry,
-    model_id: &str,
-    candidates: &[Arc<dyn Worker>],
-    ring: Option<&dyn LentRing>,
-    inputs: PlacementInputs<'_>,
-) -> Option<Placed> {
-    let list: Arc<[Arc<dyn Worker>]> = Arc::from(candidates);
-    let members = engine.pool_members(&list);
-    placed_by_engine(engine, policies, model_id, &members, ring, inputs)
-}
-
 /// [`select_single`] where the gateway started the policy engine, out of
 /// line: the engine places the request over the pool's list of the model's
 /// snapshot as it stands now.
@@ -876,7 +860,9 @@ fn single_by_engine(
 /// line: the engine places the request over the pool's list as the snapshot
 /// lends it ([`ModelWorkerSnapshot::lent`]), on the hash ring of that
 /// snapshot ([`ModelRing::of`]). A retry pinned to its retained plan's wire
-/// is placed over a list of its own, which nobody names.
+/// is placed over the same list, held to the wire by the request's rule
+/// ([`WireConstraint::admits`], beside the request's own): the engine keeps
+/// a list's turn and its records with the list, so they are the pool's.
 #[inline(never)]
 fn single_of_by_engine(
     engine: &'static PolicyEngine,
@@ -889,30 +875,54 @@ fn single_of_by_engine(
 ) -> Option<Placed> {
     let ring = ModelRing::of(engine, policies, model_id, snapshot);
     let ring = ring.lent();
+    let members = engine.members_of(snapshot.lent(pool));
     if wire.is_none() {
-        let members = engine.members_of(snapshot.lent(pool));
         return placed_by_engine(engine, policies, model_id, members, ring, inputs);
     }
-    let pinned = Candidates::of(Arc::clone(snapshot.pool(pool)), wire);
-    let pinned = pinned.as_slice();
-    placed_over_unnamed(engine, policies, model_id, pinned, ring, inputs)
+    let own = inputs.candidate_filter;
+    let on_wire = move |worker: &dyn Worker| {
+        WireConstraint::admits(wire, worker) && own.is_none_or(|accepts| accepts(worker))
+    };
+    let inputs = PlacementInputs {
+        candidate_filter: Some(&on_wire),
+        ..inputs
+    };
+    placed_by_engine(engine, policies, model_id, members, ring, inputs)
 }
 
 /// [`select_from`] where the gateway started the policy engine, out of
-/// line: the engine places the request over the caller's slice, on the hash
-/// ring the registry answers for the model now ([`ModelRing::read`]).
+/// line: the engine places the request over `pool`'s own list of the model's
+/// snapshot as it stands now, on that snapshot's hash ring
+/// ([`ModelRing::of`]), held to the caller's slice by the request's rule: a
+/// worker is taken where the slice holds that worker object, beside the
+/// request's own rule. The engine keeps a list's turn and its records with
+/// the list, so they are the pool's. A worker that joined the pool behind
+/// the caller's read is in no slice and takes no such request.
 #[inline(never)]
 fn from_by_engine(
     engine: &'static PolicyEngine,
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
     model_id: &str,
+    pool: RoutingPool,
     candidates: &[Arc<dyn Worker>],
     inputs: PlacementInputs<'_>,
 ) -> Option<Placed> {
-    let ring = ModelRing::read(engine, policies, registry, model_id);
+    let snapshot = registry.get_routing_snapshot(model_id);
+    let ring = ModelRing::of(engine, policies, model_id, &snapshot);
     let ring = ring.lent();
-    placed_over_unnamed(engine, policies, model_id, candidates, ring, inputs)
+    let members = engine.members_of(snapshot.lent(pool));
+    let own = inputs.candidate_filter;
+    let in_slice = move |worker: &dyn Worker| {
+        let at = std::ptr::from_ref(worker);
+        let held = |kept: &Arc<dyn Worker>| std::ptr::addr_eq(Arc::as_ptr(kept), at);
+        candidates.iter().any(held) && own.is_none_or(|accepts| accepts(worker))
+    };
+    let inputs = PlacementInputs {
+        candidate_filter: Some(&in_slice),
+        ..inputs
+    };
+    placed_by_engine(engine, policies, model_id, members, ring, inputs)
 }
 
 /// Pick one worker for `model_id` from `pool`, or `None` when nothing is
@@ -1010,17 +1020,23 @@ fn classic_single_of(
 
 /// [`select_single`] over an explicit candidate slice: the entry for a caller
 /// with a candidate rule the pools cannot express, such as dropping DP-aware
-/// workers from a path that cannot pin a rank. Nobody names such a list.
+/// workers from a path that cannot pin a rank. Nobody names such a list for
+/// a classic policy. `candidates` are the caller's own part of `pool`, which
+/// the policy engine alone reads: it places the request over the pool's own
+/// list, held to that part.
 #[inline(always)]
 pub(crate) fn select_from(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
     model_id: &str,
+    pool: RoutingPool,
     candidates: &[Arc<dyn Worker>],
     inputs: PlacementInputs<'_>,
 ) -> Option<Placed> {
     if let Some(engine) = policies.engine() {
-        return from_by_engine(engine, registry, policies, model_id, candidates, inputs);
+        return from_by_engine(
+            engine, registry, policies, model_id, pool, candidates, inputs,
+        );
     }
     select_among(registry, policies, model_id, candidates, None, inputs).map(Placed::from)
 }
@@ -4124,6 +4140,7 @@ pub(crate) mod tests {
             &registry,
             &policies,
             MODEL,
+            RoutingPool::HttpRegular,
             &only_second,
             PlacementInputs::default(),
         )
@@ -4485,6 +4502,7 @@ pub(crate) mod tests {
                 &registry,
                 &policies,
                 MODEL,
+                RoutingPool::HttpRegular,
                 &candidates,
                 PlacementInputs::default(),
             );
@@ -4943,6 +4961,7 @@ pub(crate) mod tests {
                 &registry,
                 &policies,
                 MODEL,
+                RoutingPool::HttpRegular,
                 &candidates,
                 PlacementInputs::default(),
             )
@@ -6622,11 +6641,14 @@ pub(crate) mod tests {
         assert_eq!(worker.load(), 0);
     }
 
-    /// Under the engine a list nobody names is placed over as it is handed:
-    /// an explicit candidate slice, and the part of a pool on a retry's
-    /// pinned wire. A pool none of whose workers is ready has no answer.
+    /// Under the engine a part of a pool is placed over the pool's own list,
+    /// held to the part by the request's rule: a caller's own slice, and
+    /// the part on a retry's pinned wire. Every worker of the part takes
+    /// requests and no other worker does. The list's turn is the pool's: a
+    /// part that is the whole pool gives each worker its exact turn. A pool
+    /// none of whose workers is ready has no answer.
     #[test]
-    fn the_engine_places_over_a_list_nobody_names() {
+    fn the_engine_places_a_part_of_a_pool_over_the_pools_own_list() {
         let registry = registry_with(&[
             ("http://s:1", ConnectionMode::Http, RuntimeType::Sglang),
             ("http://v:1", ConnectionMode::Http, RuntimeType::Vllm),
@@ -6634,6 +6656,7 @@ pub(crate) mod tests {
         ]);
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
         preset_on(&policies, "round_robin");
+        let pool = RoutingPool::HttpRegular;
 
         let two: Vec<Arc<dyn Worker>> = ["http://s:1", "http://v:2"]
             .iter()
@@ -6649,23 +6672,50 @@ pub(crate) mod tests {
         let mut on_wire = BTreeMap::new();
         let inputs = PlacementInputs::default();
         for _ in 0..16 {
-            let placed = select_from(&registry, &policies, MODEL, &two, inputs);
+            let placed = select_from(&registry, &policies, MODEL, pool, &two, inputs);
             let placed = placed.expect("a ready candidate");
             *from_slice.entry(placed.url().to_owned()).or_insert(0) += 1;
-            let pool = RoutingPool::HttpRegular;
             let placed = select_single(&registry, &policies, MODEL, pool, Some(pinned), inputs);
             let placed = placed.expect("a ready worker on the wire");
             *on_wire.entry(placed.url().to_owned()).or_insert(0) += 1;
         }
         let urls = |seen: BTreeMap<String, i32>| seen.into_keys().collect::<Vec<_>>();
-        assert!(urls(from_slice).iter().all(|url| url != "http://v:1"));
-        assert!(urls(on_wire).iter().all(|url| url != "http://s:1"));
+        assert_eq!(urls(from_slice), ["http://s:1", "http://v:2"]);
+        assert_eq!(urls(on_wire), ["http://v:1", "http://v:2"]);
+
+        let whole: Vec<Arc<dyn Worker>> = registry.get_routing_pool(MODEL, pool).to_vec();
+        let mut turns = BTreeMap::new();
+        for _ in 0..9 {
+            let placed = select_from(&registry, &policies, MODEL, pool, &whole, inputs);
+            let placed = placed.expect("a ready candidate");
+            *turns.entry(placed.url().to_owned()).or_insert(0) += 1;
+        }
+        assert_eq!(turns.into_values().collect::<Vec<_>>(), [3, 3, 3]);
 
         for worker in &registry.get_all() {
             worker.set_status(WorkerStatus::NotReady);
         }
-        let pool = RoutingPool::HttpRegular;
         assert!(select_single(&registry, &policies, MODEL, pool, None, inputs).is_none());
+    }
+
+    /// A part of one worker in a pool of sixteen is found at every request:
+    /// where the request's rule refuses the engine's own pick, the engine
+    /// asks the rule of the whole list and places within what it admits.
+    #[test]
+    fn the_engine_finds_a_part_of_one_worker_in_a_pool_of_sixteen() {
+        let urls: Vec<String> = (1..=16).map(|at| format!("http://h:{at}")).collect();
+        let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let registry = http_registry(&urls);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        preset_on(&policies, "round_robin");
+        let pool = RoutingPool::HttpRegular;
+        let one = [registry.get_by_url("http://h:11").expect("registered")];
+        for _ in 0..16 {
+            let inputs = PlacementInputs::default();
+            let placed = select_from(&registry, &policies, MODEL, pool, &one, inputs);
+            let placed = placed.expect("the part's one worker");
+            assert_eq!(placed.url(), "http://h:11");
+        }
     }
 
     /// The requests a ring places, each as the one header that keys it: the
@@ -6732,12 +6782,13 @@ pub(crate) mod tests {
         assert!(registry.get_routing_snapshot(MODEL).hash_ring_is_filled());
     }
 
-    /// The ring is the model's whatever list a request is placed over, as
-    /// it is for a classic ring policy: a caller's own slice in an order of
-    /// its own, and the part of a pool on a retry's pinned wire. A worker
-    /// of the ring that the list does not hold is passed over.
+    /// The ring is the model's whatever part of a pool a request is held
+    /// to, as it is for a classic ring policy over such a list: a caller's
+    /// own slice in an order of its own, and the part of a pool on a retry's
+    /// pinned wire. A worker of the ring that the part does not hold is
+    /// passed over.
     #[test]
-    fn the_engine_walks_the_models_ring_over_a_list_nobody_names() {
+    fn the_engine_walks_the_models_ring_over_a_part_of_a_pool() {
         let registry = registry_with(&[
             ("http://s:1", ConnectionMode::Http, RuntimeType::Sglang),
             ("http://v:1", ConnectionMode::Http, RuntimeType::Vllm),
@@ -6761,14 +6812,15 @@ pub(crate) mod tests {
         let (mut from_slice, mut on_wire) = (BTreeMap::new(), BTreeMap::new());
         for headers in ring_keyed() {
             let inputs = with_headers(&headers);
+            let pool = RoutingPool::HttpRegular;
             let of = |policies: &PolicyRegistry| {
-                select_from(&registry, policies, MODEL, &slice, inputs).expect("a ready candidate")
+                select_from(&registry, policies, MODEL, pool, &slice, inputs)
+                    .expect("a ready candidate")
             };
             let owner = of(&classic);
             assert_eq!(of(&engine).url(), owner.url(), "{headers:?}, a slice");
             *from_slice.entry(owner.url().to_owned()).or_insert(0) += 1;
 
-            let pool = RoutingPool::HttpRegular;
             let on = |policies: &PolicyRegistry| {
                 select_single(&registry, policies, MODEL, pool, Some(pinned), inputs)
                     .expect("a ready worker on the wire")
