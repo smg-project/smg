@@ -86,8 +86,8 @@ COPY --from=local_src /src /opt/smg
 # feed, the WebAssembly plugin host the crate turns on by default, and the
 # Kubernetes Lease elector. The stock binary elects its leader over a Lease
 # when a flag names one; the plugin host is compiled in for a controller of
-# your own that runs it. The stock binary requires the listeners and the
-# feed: without either feature cargo builds no binary and the install fails.
+# your own that runs it. The stock binary requires the listeners, which turn
+# on the feed: without them cargo builds no binary and the install fails.
 ARG PACKAGE=smg-policy-controller
 # A cross build names its Rust target, and cargo then writes the binary under
 # that name.

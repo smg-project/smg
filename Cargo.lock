@@ -5803,6 +5803,7 @@ dependencies = [
  "serde_yaml",
  "smg-grpc-client",
  "smg-policy-controller",
+ "smg-worker",
  "tikv-jemallocator",
  "tokio",
  "tonic",
