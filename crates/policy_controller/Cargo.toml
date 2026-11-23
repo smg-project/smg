@@ -72,6 +72,8 @@ smg-grpc-client = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 smg-worker = { workspace = true, optional = true }
 wfaas = { workspace = true, optional = true }
+# The header map a request's headers are read from (the `in-process` feature).
+http = { workspace = true, optional = true }
 # Worker discovery (the `discovery` feature): the discovery crate with its
 # four providers, each of which the controller's flags can select.
 smg-service-discovery = { workspace = true, features = ["consul", "file", "kubernetes", "slurm"], optional = true }
@@ -222,8 +224,16 @@ discovery = ["controller", "worker-host", "dep:smg-service-discovery"]
 # The engine in a gateway's own process: one front over the gateway's worker
 # objects, which reads a worker's health where the worker crate keeps it. It
 # names nothing of the store. Off by default: it brings the worker crate's
-# runtime.
-in-process = ["dep:smg-worker", "smg-worker/runtime"]
+# runtime. The engine's own task takes Tokio's timer, which that runtime
+# builds already.
+in-process = [
+    "dep:http",
+    "dep:smg-worker",
+    "dep:tokio",
+    "smg-worker/runtime",
+    "tokio/macros",
+    "tokio/time",
+]
 
 default = ["wasm"]
 # The WebAssembly plugin host over the committed `smg:policy` worlds.
@@ -293,10 +303,20 @@ mock-worker = { path = "../mock_worker" }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 rustix = { version = "1", default-features = false, features = ["pty"] }
 
+# The in-process bench's allocator: the gateway binary's, on the gateway's targets.
+[target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dev-dependencies]
+tikv-jemallocator = { workspace = true }
+
 [[bin]]
 name = "smg-policy-controller"
 path = "src/bin/smg-policy-controller.rs"
 required-features = ["controller", "worker-host"]
+
+# A program that decides in its own process: it starts the engine and
+# serves each request by the one call the engine has for a request.
+[[example]]
+name = "in_process"
+required-features = ["in-process"]
 
 [[test]]
 name = "binary"
@@ -313,6 +333,12 @@ required-features = ["controller", "worker-host"]
 [[test]]
 name = "spec_store"
 required-features = ["controller", "worker-host"]
+
+# The program of the `in_process` example, driven by cases: the example's
+# own module, taken in as it stands.
+[[test]]
+name = "caller"
+required-features = ["in-process"]
 
 # Replays recorded rows through the load report conversion under `ingest`.
 [[test]]

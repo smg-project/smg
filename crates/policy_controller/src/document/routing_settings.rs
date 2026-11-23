@@ -10,9 +10,9 @@ use crate::{
         Assignment, BestWithTemperatureParams, BindingSpec, BoundedLoadParams, BucketParams,
         ConsistentHashParams, IndexKind, IndexSpec, KeySourceSpec, KvPressureParams,
         LeastLoadParams, OverloadSpec, Pairing, PickStage, PolicySpec, PrefixAffinityParams,
-        ProfileSpec, RoutingKeySpec, ScoreSpec, ScoreStage, SessionsSpec, SpecError, SpillParams,
-        WarmupSliceParams, MANUAL_SESSION_HEADER, MAX_KEY_SOURCES, OVERLOAD_TOKEN_USAGE,
-        OVERLOAD_WAITING_REQUESTS,
+        ProfileSpec, Recovery, RoutingKeySpec, RulePlaced, ScoreSpec, ScoreStage, SessionsSpec,
+        SpecError, SpillParams, WarmupSliceParams, MANUAL_SESSION_HEADER, MAX_KEY_SOURCES,
+        OVERLOAD_TOKEN_USAGE, OVERLOAD_WAITING_REQUESTS,
     },
     engine::view::Phase,
     policies::{
@@ -67,6 +67,13 @@ use crate::{
 ///   them under `routing_key`. The manual policy names them in its session
 ///   rule while they are headers alone, and under `routing_key` once the
 ///   override adds the request's own id.
+/// - The sticky override lands as a session rule on the binding of
+///   `random`, `power_of_two`, `least_load`, `passthrough` and `bucket`
+///   (`override_places` says why these five):
+///   the override's own assignment and times, its two requests of a key a
+///   worker, and the configured headers then the request's own id under
+///   `routing_key`. The rule runs under the single plan alone, so it has a
+///   document in a gateway of one router that serves single requests.
 /// - A number that means never lands as the largest its place holds: a
 ///   balance threshold past the document's width, and the sweep interval of
 ///   an index the configuration never sweeps. The gateway's own policy
@@ -148,6 +155,40 @@ pub struct RoutingSettings {
     pub worker_overload_shed: bool,
 }
 
+impl Default for RoutingSettings {
+    /// The settings of a gateway that sets none: each setting at the value it
+    /// has where a configuration leaves it out. The document they mean is the
+    /// `random` preset.
+    ///
+    /// The warm-up numbers and the overload thresholds are the ones the
+    /// controller's stages run at when a document names none, so settings at
+    /// them write neither into a document.
+    fn default() -> Self {
+        Self {
+            mode: ModeSettings::Regular,
+            policy: PolicySettings::Random,
+            enable_igw: false,
+            policy_spec: None,
+            grouped_dp_sticky: None,
+            dp_minimum_tokens_scheduler: false,
+            pd_pairing_mode: Pairing::Lenient,
+            worker_warmup_secs: DEFAULT_WARMUP_SECS,
+            worker_warmup_share: DEFAULT_WARMUP_SHARE,
+            worker_warmup_blocks: DEFAULT_WARMUP_BLOCKS as usize,
+            worker_warmup_thin_ratio: DEFAULT_WARMUP_THIN_RATIO,
+            worker_warmup_divert_every: DEFAULT_WARMUP_DIVERT_EVERY,
+            routing_key_override: RoutingKeyOverrideSettings::default(),
+            worker_overload_protection: true,
+            worker_overload_waiting_requests: Some(OVERLOAD_WAITING_REQUESTS as usize),
+            // A configuration writes this usage as 0.8 in 64 bits. The
+            // controller's number is 32 bits wide: widened, it is another
+            // value.
+            worker_overload_token_usage: Some(0.8),
+            worker_overload_shed: false,
+        }
+    }
+}
+
 impl RoutingSettings {
     /// The provider's name, where every router of the gateway is that
     /// provider's: a provider mode of a gateway that does not run many routers.
@@ -162,7 +203,7 @@ impl RoutingSettings {
     }
 }
 
-/// The two settings of the sticky override this module reads.
+/// The settings of the sticky override this module reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutingKeyOverrideSettings {
     /// A request that carries a sticky key is placed by the sticky sessions'
@@ -170,6 +211,30 @@ pub struct RoutingKeyOverrideSettings {
     pub enabled: bool,
     /// The header names a request's routing key is read from, in order.
     pub headers: Vec<String>,
+    /// The seconds between two sweeps of the override's sessions. Zero here
+    /// or in `max_idle_secs` keeps every key pinned for ever.
+    pub eviction_interval_secs: u64,
+    /// The seconds with no request after which a key of the override leaves
+    /// at the next sweep. Zero here or in `eviction_interval_secs` keeps
+    /// every key pinned for ever.
+    pub max_idle_secs: u64,
+    /// How a key the override sees for the first time picks its worker.
+    pub assignment_mode: Assignment,
+}
+
+impl Default for RoutingKeyOverrideSettings {
+    /// The override of a gateway that sets none of it: off, with the header,
+    /// the two times and the assignment a configuration that leaves them out
+    /// gets.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            headers: vec![MANUAL_SESSION_HEADER.to_owned()],
+            eviction_interval_secs: 60,
+            max_idle_secs: 4 * 3600,
+            assignment_mode: Assignment::Delegate,
+        }
+    }
 }
 
 /// The kinds of worker a gateway routes to. A side names its own policy or
@@ -463,9 +528,10 @@ impl RoutingSettings {
     /// document, it is the one the routing settings mean. A supplied
     /// document takes effect if the settings describe the same document or
     /// the document of `defaults` for this mode. `defaults` are the
-    /// settings of a gateway that sets none: the gateway's own, since this crate
-    /// holds no default of a gateway's configuration. A conflict names the
-    /// first difference and the two values.
+    /// settings of a gateway that sets none: [`RoutingSettings::default`],
+    /// or the gateway's own where its configuration defaults a setting to
+    /// another value. A conflict names the first difference and the two
+    /// values.
     ///
     /// Both launchers refuse a routing setting beside a document before
     /// this runs, so the comparison judges a configuration built by hand.
@@ -741,6 +807,7 @@ fn written<'a>(
                 if let Some(sources) = key_sources(policy, config)? {
                     shared.bound.keys.push((policy.name(), sources));
                 }
+                shared.bound.overridden |= override_places(policy, config);
             }
         }
         bound.push((sides.len(), std::mem::take(&mut shared.bound)));
@@ -1063,6 +1130,23 @@ fn seconds(setting: &'static str, secs: u64) -> Result<u32, RoutingSettingsError
     })
 }
 
+/// A sticky map's idle time and sweep interval as a session rule's `ttl_s`
+/// and `sweep_s`, each with the name of its setting. The map sweeps nothing
+/// where either time is zero: a key stays pinned for ever, which the rule
+/// says with its largest number.
+fn pin_times(
+    (idle_setting, max_idle_secs): (&'static str, u64),
+    (sweep_setting, eviction_interval_secs): (&'static str, u64),
+) -> Result<(u32, u32), RoutingSettingsError> {
+    if max_idle_secs == 0 || eviction_interval_secs == 0 {
+        return Ok((u32::MAX, u32::MAX));
+    }
+    Ok((
+        seconds(idle_setting, max_idle_secs)?,
+        seconds(sweep_setting, eviction_interval_secs)?,
+    ))
+}
+
 /// What the sides of a document share. The document holds each once, so the
 /// first side to name one sets it, and a side that names another value is
 /// refused.
@@ -1082,6 +1166,9 @@ struct Bound {
     /// The manual policy's sweep interval, idle time and assignment.
     manual: Option<(u64, u64, Assignment)>,
     manual_sides: usize,
+    /// The sticky override places a side's keyed requests
+    /// ([`override_places`]).
+    overridden: bool,
     /// The sources each keyed side reads a request's key from, under the
     /// side's policy.
     keys: Vec<(&'static str, RoutingKeySpec)>,
@@ -1153,7 +1240,8 @@ impl Shared<'_> {
 
 impl Bound {
     /// Writes what the sides named into their binding, a plan of `sides`
-    /// profiles. The headers the manual policy reads are the view's too.
+    /// profiles. The headers the manual policy reads are the view's too,
+    /// and so are the headers of a key the sticky override places.
     fn write(
         self,
         config: &RoutingSettings,
@@ -1167,6 +1255,24 @@ impl Bound {
             let key = one_list(self.keys)?.filter(|key| !key.sources.is_empty());
             if let Some(key) = &key {
                 within_a_block(key, config)?;
+            }
+            if self.overridden {
+                if sides != 1 {
+                    return Err(unsupported(
+                        "routing_key_override.enabled",
+                        true,
+                        "the sticky sessions' rule places single requests alone, and this plan places a pair",
+                    ));
+                }
+                binding.sessions = Some(override_rule(config)?);
+                // The rule's cap counts a key's requests on a worker by
+                // the key's text, which a header hands where the view
+                // lists it.
+                *view_headers = key
+                    .iter()
+                    .flat_map(|key| &key.sources)
+                    .filter_map(|source| source.header.clone())
+                    .collect();
             }
             binding.routing_key = key;
             return Ok(());
@@ -1203,20 +1309,17 @@ impl Bound {
             .filter(|_| by_rule)
             .cloned()
             .unwrap_or_default();
-        // The manual policy sweeps nothing where either of its two times is
-        // zero: a key stays pinned for ever, which the rule says with its
-        // largest number.
-        let (ttl_s, sweep_s) = if max_idle_secs == 0 || eviction_interval_secs == 0 {
-            (u32::MAX, u32::MAX)
-        } else {
-            (
-                seconds("max_idle_secs", max_idle_secs)?,
-                seconds("eviction_interval_secs", eviction_interval_secs)?,
-            )
-        };
+        let (ttl_s, sweep_s) = pin_times(
+            ("max_idle_secs", max_idle_secs),
+            ("eviction_interval_secs", eviction_interval_secs),
+        )?;
         view_headers.clone_from(&headers);
         // A pair of presets names no rule: the manual preset's own is the
-        // one the settings are written into.
+        // one the settings are written into. It keeps the preset's word of
+        // a request the rule places, the profile's own: the gateway's
+        // `manual` policy places a keyed request itself
+        // (`model_gateway/src/policies/registry.rs:450`), and no stage
+        // counts under its picker.
         let preset = match binding.sessions.take() {
             Some(rule) => Some(rule),
             None => PolicySpec::preset("manual")?
@@ -1305,10 +1408,19 @@ const CLIENT_HEADERS: [&str; 2] = ["x-forwarded-for", "cookie"];
 ///   them. Under the override they read the request's own id behind that,
 ///   and every source loses its turn and retry suffixes.
 /// - `prefix_hash` reads the configured headers alone.
+/// - `random`, `power_of_two`, `least_load`, `passthrough` and `bucket`
+///   read no key themselves. Under the override they read one
+///   ([`override_places`]):
+///   the configured headers, then the request's own id, each without its
+///   turn and retry suffixes. The binding's session rule pins that key
+///   ([`override_rule`]).
 ///
-/// Two reads have no document yet and are refused by the setting's name.
-/// The override places every other policy's keyed requests by the sticky
-/// sessions' rule. And under the override the gateway reads the routing
+/// Five reads have no document yet and are refused by the setting's name.
+/// The gateway's override places a keyed request of `cache_aware`,
+/// `prefix_hash` and `round_robin` by its sticky map too, and
+/// [`unplaced`] says what each lacks. In a gateway of many routers the
+/// override's rule would plan single requests alone, beside pairs the
+/// gateway serves too. And under the override the gateway reads the routing
 /// key header as sent where no configured header names it, while a block
 /// strips every source or none.
 ///
@@ -1325,6 +1437,16 @@ fn key_sources(
     let hint = match policy {
         PolicySettings::Manual { .. } | PolicySettings::ConsistentHashing => true,
         PolicySettings::PrefixHash { .. } if !overridden => false,
+        _ if override_places(policy, config) => {
+            if config.enable_igw {
+                return Err(unsupported(
+                    "routing_key_override.enabled",
+                    true,
+                    "the sticky sessions' rule places single requests alone, and a gateway of many routers serves pairs beside them",
+                ));
+            }
+            false
+        }
         // Each kind is named: a new one builds once its answer is written.
         PolicySettings::PrefixHash { .. }
         | PolicySettings::Random
@@ -1338,7 +1460,7 @@ fn key_sources(
                 Err(unsupported(
                     "routing_key_override.enabled",
                     true,
-                    "the controller holds no recorded form of the sticky sessions' rule yet",
+                    unplaced(policy),
                 ))
             } else {
                 Ok(None)
@@ -1387,6 +1509,139 @@ fn key_sources(
     }))
 }
 
+/// Whether the binding's session rule places a keyed request of `policy`
+/// ([`override_rule`]): the sticky override is on, and the policy's own
+/// stages place a single request by nothing its key hands them. The
+/// gateway's sticky map places a keyed request of every policy but
+/// `manual` and `consistent_hashing`, which place by the key themselves.
+/// The three left out here are refused, each for what its answer still
+/// lacks ([`unplaced`]).
+///
+/// - `random` draws.
+/// - `power_of_two` and `least_load` compare workers by load. Both score
+///   a worker by its report and by the requests the policy placed on it
+///   since. A request the rule placed is none of those: the rule keeps it
+///   from the profile ([`override_rule`]), so in a gateway's own process
+///   no stage hears its dispatch (`lease_events::stages_hear`), as the
+///   gateway's policy hears of no request its sticky map placed
+///   (`model_gateway/src/policies/registry.rs:543-546`). Both read such a
+///   request in the count of requests the gateway holds on the worker. A
+///   host that tells a dispatch off a lease on file keeps no word of who
+///   placed it, and its stages count every dispatch it is told.
+/// - `passthrough` sends every request to the first worker that takes one.
+/// - `bucket` draws for a single request, and the rule plans single
+///   requests alone. Its stage places a prefill decision by the sizes it
+///   booked and draws for every other. The gateway's policy holds a bucket
+///   of sizes for the prefill workers of a pair alone, and draws among
+///   single workers (`model_gateway/src/policies/registry.rs:1215-1226`,
+///   `model_gateway/src/policies/bucket.rs:186-191`).
+fn override_places(policy: &PolicySettings, config: &RoutingSettings) -> bool {
+    let placed = matches!(
+        policy,
+        PolicySettings::Random
+            | PolicySettings::PowerOfTwo { .. }
+            | PolicySettings::LeastLoad { .. }
+            | PolicySettings::Passthrough
+            | PolicySettings::Bucket { .. }
+    );
+    config.routing_key_override.enabled && placed
+}
+
+/// Why the sticky override has no document yet under a policy whose keyed
+/// requests the gateway's sticky map places:
+///
+/// - `prefix_hash` hashes a key a header handed and no key the request's
+///   own id handed: the gateway places that request by its prompt. A
+///   binding has one key, and its ring places by it whatever its source.
+/// - `cache_aware` reads who was sent a prompt, and a host that keeps that
+///   record writes it behind each request its whole decision places. The
+///   gateway writes it only where the policy placed the request: not
+///   behind a pin its sticky map followed, nor a key the map's own
+///   assignment placed.
+/// - `round_robin` turns one rotation in the gateway, for a keyed request
+///   its sticky map hands the policy and for a request with no key
+///   (`model_gateway/src/policies/registry.rs:471` and `:581`). This
+///   crate's stage turns the pool's rotation for a request with no key in
+///   a list of sixteen workers or more, and the survivors' own for a key
+///   with no pin.
+///
+/// The kinds the rule or their own key places never reach this function:
+/// each is named, so a new kind builds once its sentence is written.
+fn unplaced(policy: &PolicySettings) -> &'static str {
+    match policy {
+        PolicySettings::PrefixHash { .. } => {
+            "under the override this policy's ring would place a key the request's own id handed, and the gateway places that request by its prompt"
+        }
+        PolicySettings::CacheAware { .. } => {
+            "under the override this policy's record of prompts would take a request the sticky sessions' rule placed, and the gateway's takes none"
+        }
+        PolicySettings::RoundRobin => {
+            "under the override this policy would turn one rotation for a key with no pin and another for a request with no key in a list of sixteen workers or more, and the gateway turns one for both"
+        }
+        PolicySettings::Manual { .. }
+        | PolicySettings::ConsistentHashing
+        | PolicySettings::Random
+        | PolicySettings::Passthrough
+        | PolicySettings::PowerOfTwo { .. }
+        | PolicySettings::LeastLoad { .. }
+        | PolicySettings::Bucket { .. } => {
+            "the sticky sessions' rule has no document under this policy yet"
+        }
+    }
+}
+
+/// The requests of one key a worker carries under the sticky override
+/// before the key's next request is placed again: the number of the
+/// gateway's own sticky map.
+const OVERRIDE_INFLIGHT_CAP: u16 = 2;
+
+/// The session rule the sticky override places a keyed request by, as the
+/// gateway's own sticky map keeps a key:
+///
+/// - A key's first request is placed by the override's assignment: the
+///   policy's own stages under `delegate`, its default.
+/// - A worker carries two requests of one key. The next is placed again,
+///   and the key's pin moves only to another worker under that count.
+/// - Where a key's worker stops taking requests, the worker placed next
+///   leads the key's pins under `delegate`. Under the map's own
+///   assignments it joins behind the first, which leads again once it
+///   takes requests.
+/// - An idle key is forgotten after the override's idle time, at its
+///   sweep, and never where either time is zero ([`pin_times`]): the
+///   override keeps its keys in the manual policy's own map.
+/// - A request the rule places alone is kept from the profile
+///   ([`RulePlaced::Untold`]): the gateway's policy hears of no request
+///   its sticky map placed
+///   (`model_gateway/src/policies/registry.rs:543-546`). No other rule
+///   these settings write says so.
+///
+/// The rule names no header: the binding's `routing_key` block lists the
+/// key's sources ([`key_sources`]).
+fn override_rule(config: &RoutingSettings) -> Result<SessionsSpec, RoutingSettingsError> {
+    let sticky = &config.routing_key_override;
+    let (ttl_s, sweep_s) = pin_times(
+        ("routing_key_override.max_idle_secs", sticky.max_idle_secs),
+        (
+            "routing_key_override.eviction_interval_secs",
+            sticky.eviction_interval_secs,
+        ),
+    )?;
+    Ok(SessionsSpec {
+        sticky_header: String::new(),
+        headers: Vec::new(),
+        ttl_s,
+        sweep_s,
+        assignment: sticky.assignment_mode,
+        inflight_cap: OVERRIDE_INFLIGHT_CAP,
+        issue_session_id: false,
+        recovery: match sticky.assignment_mode {
+            Assignment::Delegate => Recovery::Latest,
+            Assignment::Random | Assignment::MinLoad | Assignment::MinGroup => Recovery::Original,
+        },
+        rule_placed: RulePlaced::Untold,
+    })
+}
+
 /// The binding's overload block, or none where the configuration stands at
 /// the block's own defaults.
 fn overload(config: &RoutingSettings) -> Result<Option<OverloadSpec>, RoutingSettingsError> {
@@ -1426,33 +1681,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::document::spec::{AppliedSpec, PRESETS};
+    use crate::{
+        document::spec::{AppliedSpec, PRESETS},
+        engine::framework::{InTheWay, Place},
+    };
 
     /// The settings of a gateway that sets none, as its configuration
     /// defaults them. The document they mean is the `random` preset.
     fn defaults() -> RoutingSettings {
-        RoutingSettings {
-            mode: ModeSettings::Regular,
-            policy: PolicySettings::Random,
-            enable_igw: false,
-            policy_spec: None,
-            grouped_dp_sticky: None,
-            dp_minimum_tokens_scheduler: false,
-            pd_pairing_mode: Pairing::Lenient,
-            worker_warmup_secs: 60,
-            worker_warmup_share: 0.25,
-            worker_warmup_blocks: 1024,
-            worker_warmup_thin_ratio: 0.5,
-            worker_warmup_divert_every: 8,
-            routing_key_override: RoutingKeyOverrideSettings {
-                enabled: false,
-                headers: vec!["x-smg-routing-key".to_string()],
-            },
-            worker_overload_protection: true,
-            worker_overload_waiting_requests: Some(8),
-            worker_overload_token_usage: Some(0.8),
-            worker_overload_shed: false,
-        }
+        RoutingSettings::default()
     }
 
     /// The cache-aware policy with these five settings, and every other at
@@ -1707,6 +1944,16 @@ mod tests {
             }
             other => panic!("expected a setting refused by name, got {other:?}"),
         }
+    }
+
+    /// The settings a configuration leaves out are those of a gateway that
+    /// sets none: the `random` preset, with nothing written over it.
+    #[test]
+    fn the_settings_of_a_gateway_that_sets_none_mean_the_random_preset() {
+        assert_eq!(
+            RoutingSettings::default().policy_document(),
+            Ok(preset("random"))
+        );
     }
 
     #[test]
@@ -2189,7 +2436,8 @@ mod tests {
             }))
         );
 
-        // The override places every other policy's keyed requests itself.
+        // The override places every other policy's keyed requests itself,
+        // and under these three its rule has no document yet.
         for name in ["prefix_hash", "cache_aware", "round_robin"] {
             assert_eq!(
                 refusal(&overridden(name)),
@@ -2228,6 +2476,212 @@ mod tests {
                 .map(|key| key.sources.len())
         });
         assert_eq!(sources, Ok(Some(4)));
+    }
+
+    /// The policies under which the sticky override lands as a session
+    /// rule: each places a single request by nothing its key hands it. The
+    /// gateway's answers with the override are recorded under the first
+    /// two.
+    const PLACED: [&str; 5] = [
+        "random",
+        "power_of_two",
+        "least_load",
+        "passthrough",
+        "bucket",
+    ];
+
+    /// The policy of a preset's name at its flags' defaults, under the
+    /// sticky override.
+    fn sticky(policy: &str) -> RoutingSettings {
+        let mut sticky = config(at_flag_defaults(policy));
+        sticky.routing_key_override.enabled = true;
+        sticky
+    }
+
+    /// Beside a policy that reads no key the override lands as a session
+    /// rule on the policy's own binding: the gateway's sticky map in the
+    /// document's words. The key is the configured headers, then the
+    /// request's id, each without its turn and retry suffixes, and the view
+    /// lists the headers, so the rule's cap reads the key's text. The
+    /// controller's check takes the document, and its engine asks its host
+    /// for the count of a key's requests on a worker.
+    #[test]
+    fn the_override_lands_as_a_session_rule_beside_a_policy_that_reads_no_key() {
+        for name in PLACED {
+            let expected = edited(preset(name), |document| {
+                document["view"]["headers"] = json!(["x-smg-routing-key"]);
+                let binding = &mut document["bindings"][0];
+                binding["routing_key"] = json!({
+                    "sources": [{ "header": "x-smg-routing-key" }, { "rid": true }],
+                    "strip_lineage": true
+                });
+                binding["sessions"] = json!({
+                    "ttl_s": 14_400,
+                    "sweep_s": 60,
+                    "assignment": "delegate",
+                    "inflight_cap": 2,
+                    "recovery": "latest",
+                    "rule_placed": "untold"
+                });
+            });
+            assert_eq!(sticky(name).policy_document().as_ref(), Ok(&expected));
+            let applied = validated(&expected).expect("the controller takes the document");
+            assert!(applied.engine().needs().session_in_flight, "{name}");
+        }
+    }
+
+    /// The override's rule stands in the way of one pick. `passthrough`
+    /// picks alone, so the document's answer for its place is one pick
+    /// under the settings as they default. Under the override the answer
+    /// names the rule: no caller is told to pick by itself past a pinned
+    /// key.
+    #[test]
+    fn the_overrides_rule_keeps_a_place_from_one_pick() {
+        let place_of = |settings: RoutingSettings| {
+            let document = settings.policy_document().expect("a document");
+            let applied = validated(&document).expect("the controller takes the document");
+            let place = applied.engine().place_for("", Phase::Single);
+            let ruled = Place::NotAlone {
+                profile: "passthrough",
+                in_the_way: InTheWay::Sessions,
+            };
+            (matches!(place, Place::Alone(_)), place == ruled)
+        };
+        let plain = config(at_flag_defaults("passthrough"));
+        assert_eq!(place_of(plain), (true, false));
+        assert_eq!(place_of(sticky("passthrough")), (false, true));
+    }
+
+    /// The override's own settings land in its rule. A key's first worker
+    /// is drawn by the assignment, and the pins' order follows it: the
+    /// latest worker leads under `delegate`, the first under the sticky
+    /// map's own three. Either time at zero pins a key for ever. Each
+    /// configured header is a source, lowercase and once, ahead of the
+    /// request's id, and with none configured the id is the one source.
+    #[test]
+    fn the_overrides_settings_land_in_its_session_rule() {
+        let written = |set: &dyn Fn(&mut RoutingKeyOverrideSettings)| {
+            let mut sticky = sticky("random");
+            set(&mut sticky.routing_key_override);
+            let document = sticky.policy_document().expect("a document");
+            assert!(validated(&document).is_ok(), "{document:?}");
+            let binding = document.bindings.into_iter().next().expect("the binding");
+            let rule = binding.sessions.expect("the override's rule");
+            let key = binding.routing_key.expect("the key's sources");
+            (rule, key, document.view.headers)
+        };
+        for (assignment, recovery) in [
+            (Assignment::Delegate, Recovery::Latest),
+            (Assignment::Random, Recovery::Original),
+            (Assignment::MinLoad, Recovery::Original),
+            (Assignment::MinGroup, Recovery::Original),
+        ] {
+            let (rule, ..) = written(&|sticky| sticky.assignment_mode = assignment);
+            assert_eq!((rule.assignment, rule.recovery), (assignment, recovery));
+            // The rule reads nothing of the policy beside it.
+            let mut other = sticky("power_of_two");
+            other.routing_key_override.assignment_mode = assignment;
+            let document = other.policy_document().expect("a document");
+            assert!(validated(&document).is_ok(), "{document:?}");
+            let beside = document.bindings[0].sessions.as_ref();
+            assert_eq!(beside, Some(&rule), "{assignment:?} beside power_of_two");
+        }
+
+        let times = |idle, interval| {
+            let (rule, ..) = written(&|sticky| {
+                sticky.max_idle_secs = idle;
+                sticky.eviction_interval_secs = interval;
+            });
+            (rule.ttl_s, rule.sweep_s)
+        };
+        assert_eq!(times(600, 30), (600, 30));
+        assert_eq!(times(0, 30), (u32::MAX, u32::MAX));
+        assert_eq!(times(600, 0), (u32::MAX, u32::MAX));
+        assert_eq!(times(0, 0), (u32::MAX, u32::MAX));
+        let mut past = sticky("random");
+        past.routing_key_override.max_idle_secs = u64::from(u32::MAX);
+        assert_eq!(
+            refusal(&past),
+            ("routing_key_override.max_idle_secs", u32::MAX.to_string())
+        );
+        past.routing_key_override.max_idle_secs = 600;
+        past.routing_key_override.eviction_interval_secs = u64::from(u32::MAX);
+        assert_eq!(
+            refusal(&past).0,
+            "routing_key_override.eviction_interval_secs"
+        );
+
+        let sources = |headers: &[&str]| {
+            let (_, key, view) = written(&|sticky| {
+                sticky.headers = headers.iter().map(|name| (*name).to_string()).collect();
+            });
+            assert!(key.strip_lineage);
+            let read: Vec<&str> = key
+                .sources
+                .iter()
+                .map(|source| source.header.as_deref().unwrap_or("rid"))
+                .collect();
+            (read.join(" "), view.join(" "))
+        };
+        assert_eq!(
+            sources(&["X-Session-Id", "x-smg-routing-key", "x-session-id"]),
+            (
+                "x-session-id x-smg-routing-key rid".to_string(),
+                "x-session-id x-smg-routing-key".to_string()
+            )
+        );
+        assert_eq!(sources(&[]), ("rid".to_string(), String::new()));
+    }
+
+    /// The override's rule places single requests alone, beside a policy
+    /// that places one by nothing its key hands it. A pair plan, a gateway
+    /// of many routers and the three other policies whose keyed requests the
+    /// override places are each refused by the setting's name, in a
+    /// sentence that says which of the five it is.
+    #[test]
+    fn the_override_is_refused_where_its_rule_has_no_document() {
+        let why = |config: &RoutingSettings| match config.policy_document() {
+            Err(RoutingSettingsError::UnsupportedSetting {
+                setting: "routing_key_override.enabled",
+                reason,
+                ..
+            }) => reason,
+            other => panic!("expected the override refused by name, got {other:?}"),
+        };
+        for name in PLACED {
+            let pair = RoutingSettings {
+                mode: pair_mode(None, None),
+                ..sticky(name)
+            };
+            assert_eq!(
+                why(&pair),
+                "the sticky sessions' rule places single requests alone, and this plan places a \
+                 pair",
+                "{name}"
+            );
+            assert_eq!(
+                why(&many_routers(sticky(name))),
+                "the sticky sessions' rule places single requests alone, and a gateway of many \
+                 routers serves pairs beside them",
+                "{name}"
+            );
+        }
+        assert_eq!(
+            why(&sticky("prefix_hash")),
+            "under the override this policy's ring would place a key the request's own id \
+             handed, and the gateway places that request by its prompt"
+        );
+        assert_eq!(
+            why(&sticky("cache_aware")),
+            "under the override this policy's record of prompts would take a request the \
+             sticky sessions' rule placed, and the gateway's takes none"
+        );
+        assert_eq!(
+            why(&sticky("round_robin")),
+            "under the override this policy would turn one rotation for a key with no pin and \
+             another for a request with no key in a list of sixteen workers or more, and the \
+             gateway turns one for both"
+        );
     }
 
     #[test]
@@ -2306,7 +2760,7 @@ mod tests {
     #[test]
     fn a_setting_no_document_says_is_refused_by_its_name() {
         let round_robin = || config(PolicySettings::RoundRobin);
-        let mut sticky = round_robin();
+        let mut sticky = config(at_flag_defaults("prefix_hash"));
         sticky.routing_key_override.enabled = true;
         let mut selection = config(at_flag_defaults("cache_aware"));
         if let PolicySettings::CacheAware {

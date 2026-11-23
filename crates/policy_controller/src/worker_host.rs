@@ -45,7 +45,9 @@
 //! adapter does: the registry's subscribers hear the change, and a
 //! promotion comes back as any promotion does. The host's vetoes stand.
 //! The id and the revision stand beside the object in the
-//! holder ([`RowRevision`]). No credential and no connector is a row's fact. A
+//! holder ([`RowRevision`]), with every fact of the row the object does not
+//! hold as stated: inside the crate the two together state the row
+//! (`Objects::row_of`). No credential and no connector is a row's fact. A
 //! host hands the holder its connector ([`Objects::with_connector`]). It
 //! keeps its workers' credentials in [`Credentials`] and hands the keeper
 //! to the holder ([`Objects::with_credentials`]). A credential is bound to
@@ -75,6 +77,13 @@
 //!
 //! [`LoadAdapter`] writes load records and poll answers to the store. The
 //! store decides when the collector polls and keeps the overload verdict.
+//!
+//! [`load_monitor`] is the worker crate's own load monitor over the
+//! holder's registry, with no adapter under it. It publishes the workers'
+//! reports as its snapshot, which an engine that decides over its host's
+//! lists reads, and writes the overload verdict on the objects. A host
+//! runs it where its decisions read the snapshot, and writes no load to
+//! the store then.
 //!
 //! [`KvAdapter`] decodes the worker's KV events for the store's index, and
 //! [`KvHost`] gives each subscription its row in the store. Every replica
@@ -114,9 +123,13 @@ mod kv;
 mod kv_feed;
 mod lead;
 mod loads;
+mod members;
 mod membership_writer;
 mod object;
 mod objects;
+#[cfg(feature = "in-process")]
+pub(crate) mod reach;
+mod remainder;
 pub(crate) mod steps;
 
 pub use credentials::{Credentials, KeptCredential, RegistrationInFlight};
@@ -127,7 +140,10 @@ pub use health::HealthAdapter;
 pub use kv::{KvAdapter, KvHost, SkipReason, SkippedSubscriptions};
 pub use kv_feed::KvFeed;
 pub use lead::{Lead, SoleLead};
-pub use loads::LoadAdapter;
+pub use loads::{load_monitor, LoadAdapter};
+pub use members::Members;
+#[cfg(feature = "in-process")]
+pub use members::OpenAdmission;
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use membership_writer::tests::{
     check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
@@ -142,7 +158,7 @@ pub use membership_writer::{
     StoreMembershipWriter,
 };
 pub use object::object;
-pub use objects::{Members, Objects, RowRevision};
+pub use objects::{Objects, RowRevision};
 pub use steps::{
     registrant_of, registration_into_store, registration_into_store_keeping_credentials,
     removal_from_store, remover_of, DrainWorkersInStore, NoCredentials, RegistrantError,

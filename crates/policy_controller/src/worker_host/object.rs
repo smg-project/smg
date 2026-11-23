@@ -101,10 +101,10 @@ pub(super) fn unchecked(row: &WorkerRow) -> BasicWorkerBuilder {
 
 /// The row's own overload thresholds in the worker crate's form: what an
 /// object states where its host's load monitor judges overload by it
-/// ([`Objects::with_overload_thresholds`](super::Objects::with_overload_thresholds)),
-/// and what the line of a mirrored verdict says. The usage goes back from
-/// permille to the ratio an engine reports: the object's own registration
-/// reads it back as the same permille ([`facts`](super::facts)).
+/// ([`Objects::with_overload_thresholds`](super::Objects::with_overload_thresholds)).
+/// The usage goes back from permille to the ratio an engine reports: the
+/// object's own registration reads it back as the same permille
+/// ([`facts`](super::facts)).
 pub(super) fn thresholds(overload: &Overload) -> OverloadUpdate {
     OverloadUpdate {
         waiting_requests: overload
@@ -171,6 +171,17 @@ pub(super) fn status(status: WorkerStatus) -> ObjectStatus {
         WorkerStatus::NotReady => ObjectStatus::NotReady,
         WorkerStatus::Failed => ObjectStatus::Failed,
         WorkerStatus::Draining => ObjectStatus::Draining,
+    }
+}
+
+/// [`status`] read back: the store's status for an object's.
+pub(super) fn row_status(status: ObjectStatus) -> WorkerStatus {
+    match status {
+        ObjectStatus::Pending => WorkerStatus::Pending,
+        ObjectStatus::Ready => WorkerStatus::Ready,
+        ObjectStatus::NotReady => WorkerStatus::NotReady,
+        ObjectStatus::Failed => WorkerStatus::Failed,
+        ObjectStatus::Draining => WorkerStatus::Draining,
     }
 }
 

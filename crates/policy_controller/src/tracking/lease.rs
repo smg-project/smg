@@ -9,7 +9,7 @@
 //! calls the lifecycle once per side. Every stateful built-in keeps its state
 //! behind these events alone.
 
-use std::fmt;
+use std::{fmt, time::Instant};
 
 use crate::{
     engine::{
@@ -115,6 +115,33 @@ pub struct Outcome {
     pub duration_micros: u32,
 }
 
+impl Outcome {
+    /// An outcome that states how its request ended and nothing it
+    /// measured: the status and the class, with every measure zero, under
+    /// no side and no served worker. Its caller adds what it measured by
+    /// struct update.
+    ///
+    /// A placement that is told an end (`Placement::ended`, with the feature
+    /// `in-process`) writes the side and the served worker over: its caller
+    /// leaves both as made here. A guard's caller states both.
+    ///
+    /// The class has no default: it feeds a worker's health, and an end
+    /// whose caller forgot it must not read as [`TransportClass::Ok`].
+    #[must_use]
+    pub const fn reported(status: u16, class: TransportClass) -> Self {
+        Self {
+            side: Side::Single,
+            served: WorkerId(0),
+            status,
+            class,
+            ttft_micros: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            duration_micros: 0,
+        }
+    }
+}
+
 /// Why a lease was released before its completion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReleaseReason {
@@ -133,6 +160,33 @@ pub enum ReleaseReason {
     Expired,
     /// An immediate deregistration released the worker's leases.
     WorkerRemoved,
+}
+
+/// The time a gateway has to name a lease's dispatch: the design's default.
+/// A lease still issued past it is released as abandoned.
+pub(crate) const DISPATCH_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What a gateway's `Dispatched` report says beside its lease.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dispatch {
+    /// Which target of the pick the gateway dispatched to.
+    pub target_index: u8,
+    pub side: Side,
+    /// Decision to dispatch on the gateway's clock, in microseconds.
+    pub since_decision_micros: u32,
+}
+
+/// What a host says of a lease
+/// ([`DecisionEngine::say`](crate::engine::DecisionEngine::say)): a side's
+/// dispatch, a side's end, or a release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Said {
+    /// The dispatch the frame names, and the instant the frame was read.
+    Dispatched(Dispatch, Instant),
+    /// The outcome of the side that ended.
+    Completed(Outcome),
+    /// The side given up, where the frame names one, and the reason.
+    Released(Option<Side>, ReleaseReason),
 }
 
 /// A membership change the host reports. A host tells a join when it takes
@@ -378,5 +432,24 @@ mod tests {
         assert_ne!(prefill.side, decode.side);
         assert_eq!(prefill.target_index, decode.target_index);
         assert_eq!(decode.kind, LeaseKind::Reservation);
+    }
+
+    /// An outcome made by its constructor states the status and the class
+    /// it was given and nothing else: every measure is zero, and it names
+    /// no side and no served worker. It is the literal it stands for.
+    #[test]
+    fn an_outcome_reported_states_its_end_and_no_measure() {
+        let reported = Outcome::reported(503, TransportClass::ServerError);
+        let literal = Outcome {
+            side: Side::Single,
+            served: WorkerId(0),
+            status: 503,
+            class: TransportClass::ServerError,
+            ttft_micros: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            duration_micros: 0,
+        };
+        assert_eq!(reported, literal);
     }
 }

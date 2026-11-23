@@ -22,10 +22,12 @@
 //! num_tokens = (grid_t * grid_h * grid_w) / merge_size²
 //! ```
 
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::TryReserveError};
 
 use image::{imageops::FilterType, DynamicImage, GenericImageView};
-use ndarray::{Array2, Array3};
+use ndarray::Array2;
+#[cfg(test)]
+use ndarray::Array3;
 
 use crate::{
     buffer_pool,
@@ -839,15 +841,18 @@ impl QwenVLProcessorBase {
         (grid_t * grid_h * grid_w) / (self.config.merge_size * self.config.merge_size)
     }
 
-    /// Patchify tensor directly into an output buffer (avoids intermediate Vec allocation).
     /// Patchify a [C, H, W] tensor and append the patches to `output`.
+    ///
+    /// Test-only reference: the plain tensor form that the RGB-byte fast paths
+    /// (`preprocess`, `patchify_image_rgb_block_band`) are compared with bit for bit.
     ///
     /// Output layout per image:
     ///   `[grid_t, patch_rows, patch_cols, merge_h, merge_w, C, temporal, patch_h, patch_w]`
     ///
     /// Each "merged patch" covers a `(merge_size * patch_size)²` spatial region.
     /// Within it, `merge_size²` sub-patches are emitted, each containing all channels.
-    pub fn patchify_into(
+    #[cfg(test)]
+    fn patchify_into(
         &self,
         tensor: &Array3<f32>,
         grid_t: usize,
@@ -917,6 +922,7 @@ impl QwenVLProcessorBase {
     /// `[block_start, block_start + band.len()/block_out)` in (gt, pr, pc)
     /// row-major order. Pure gather/copy from `planes`; deterministic and
     /// independent per block (safe to call concurrently on disjoint bands).
+    #[cfg(test)]
     #[expect(
         clippy::too_many_arguments,
         reason = "block-band patchifier: planes + grid dims + output band"
@@ -964,10 +970,14 @@ impl QwenVLProcessorBase {
 
     /// Patchify a sequence of frame tensors into Qwen's video patch layout.
     ///
+    /// Test-only reference: the plain tensor form that the RGB-byte video path
+    /// (`preprocess_video`) is compared with bit for bit.
+    ///
     /// `tensors` must already be resized and normalized to the same spatial
     /// shape. If the frame count is not divisible by `temporal_patch_size`,
     /// the caller should pad by repeating the final frame before calling this.
-    pub fn patchify_video_into(
+    #[cfg(test)]
+    fn patchify_video_into(
         &self,
         tensors: &[Array3<f32>],
         grid_t: usize,
@@ -1334,6 +1344,14 @@ impl ImageBatchPlan {
 }
 
 impl QwenVLProcessorBase {
+    /// The request's error for a patch buffer the allocator refuses.
+    fn refused(&self, error: TryReserveError) -> TransformError {
+        TransformError::ShapeError(format!(
+            "cannot reserve {} patch output: {error}",
+            self.config.model_name
+        ))
+    }
+
     /// The plan of a batch: every image's target size, grid and patch count
     /// (checked against overflow), the batch totals, the filter and the
     /// normalization the patch bytes carry.
@@ -1424,7 +1442,10 @@ impl QwenVLProcessorBase {
         let wire_len = batch.total_patch_values * element_size;
         // A pooled buffer: its bytes are a previous request's until the
         // bands below, which cover it exactly, are written.
-        let mut wire: Vec<u8> = buffer_pool::take(wire_len);
+        let mut wire: Vec<u8> = match buffer_pool::try_take(wire_len) {
+            Ok(wire) => wire,
+            Err(error) => return Some(Err(self.refused(error))),
+        };
         let mut bands = Vec::with_capacity(images.len());
         let mut remaining = wire.as_mut_slice();
         for plan in &batch.plans {
@@ -1677,7 +1698,8 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         // resize and patchify in parallel. A pooled buffer: its bytes are a
         // previous request's until the bands, which cover it exactly, are
         // written.
-        let mut all_patches: Vec<u8> = buffer_pool::take(total_patch_values);
+        let mut all_patches: Vec<u8> =
+            buffer_pool::try_take(total_patch_values).map_err(|error| self.refused(error))?;
         let mut bands = Vec::with_capacity(images.len());
         let mut remaining = all_patches.as_mut_slice();
         for plan in image_plans {
@@ -1786,7 +1808,8 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         let plan = self.plan_video(frames.len(), width, height, clip)?;
         let temporal_patch_size = self.config.temporal_patch_size;
         // A pooled buffer, written end to end by the chunks below.
-        let mut all_patches = buffer_pool::take(plan.output_values);
+        let mut all_patches =
+            buffer_pool::try_take(plan.output_values).map_err(|error| self.refused(error))?;
         let mut out_idx = 0;
         let mut frame_rgbs = Vec::with_capacity(temporal_patch_size);
         for gt in 0..plan.grid_t {

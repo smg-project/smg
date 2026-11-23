@@ -1467,7 +1467,9 @@ impl Harness {
     }
 
     /// An operator's add of a one-rank engine. The answer is the row the
-    /// store holds: registered and pending, under the id a sink names it by.
+    /// store holds, under the id a sink names it by: registered and pending.
+    /// The call reads its answer behind its write, so a controller that
+    /// probes by itself may have readied the row by then.
     async fn add(&mut self, endpoint: &str, shape: &Shape) -> Result<WorkerId, String> {
         let mut request = Request::new(proto::RegisterWorkerRequest {
             spec: Some(proto::WorkerSpec {
@@ -1504,7 +1506,10 @@ impl Harness {
         })?
         .into_inner();
         match answer.event {
-            Some(Event::Registered(row)) if row.status() == proto::WorkerStatus::Pending => {
+            Some(Event::Registered(row))
+                if row.status() == proto::WorkerStatus::Pending
+                    || (PRODUCT_PROBES && row.status() == proto::WorkerStatus::Ready) =>
+            {
                 Ok(WorkerId(row.id))
             }
             other => Err(format!("the add of {endpoint} answered {other:?}")),

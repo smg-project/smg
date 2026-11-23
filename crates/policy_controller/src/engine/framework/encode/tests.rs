@@ -14,9 +14,10 @@ use crate::{
     engine::{
         framework::{self, PairTable},
         view::{Health, MediaCounts, Role, WorkerId},
-        Pick,
+        LiftedVeto, Pick,
     },
     load::signals::{SignalCell, SignalCells, SignalColumn},
+    policies::consistent_hashing::InOrder,
     tracking::in_flight::tests::Lent,
 };
 
@@ -285,6 +286,55 @@ fn a_request_without_items_reads_no_encoder_and_places_none() {
     assert_eq!(bed.placed(), ((0, 0), vec![], false));
 }
 
+/// A request with no item, asked over each shape of the encode pool that
+/// declines a request with one: an empty encode pool beside the bed's
+/// prefill, then each of the three columns of another length than its list
+/// (`a_column_of_another_length_and_a_binding_of_another_plan_decline`).
+/// Over each it takes the pair entry's pair, and no encoder is placed.
+fn a_request_without_items_takes_its_pair(decode_images: bool) {
+    let shapes: [fn(&mut Bed); 4] = [
+        |bed| {
+            bed.encoders.clear();
+            bed.facts.clear();
+            bed.prefill_classes.clear();
+        },
+        |bed| bed.facts.clear(),
+        |bed| bed.prefill_classes.push(1),
+        |bed| bed.encode_affinity = vec![AffinityFacts::default(); 3],
+    ];
+    for (at, shape) in shapes.iter().enumerate() {
+        let mut bed = Bed::new();
+        bed.keys.clear();
+        bed.decode_images = decode_images;
+        shape(&mut bed);
+        let (decision, placed) = bed.decide();
+        assert!(
+            matches!(decision, Decision::Pick(_)),
+            "shape {at}: {decision:?}"
+        );
+        assert_eq!(decision, bed.pair(&engine()), "shape {at}");
+        assert!(placed.encoders().is_empty(), "shape {at}");
+    }
+}
+
+/// A request with no item is answered whatever its host handed in the
+/// encode pool's columns. The classic router reads no encoder for such a
+/// request: each of its reads stands behind the test that the request has
+/// items
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2131`,
+/// `:2149`, `:2187` and `:2215` on main cbefc9565).
+#[test]
+fn a_request_without_items_is_answered_whatever_the_encode_pools_columns_hold() {
+    a_request_without_items_takes_its_pair(false);
+}
+
+/// So is one that asks images of its decode: the bed's decode takes them,
+/// and the pair is the pair entry's.
+#[test]
+fn a_request_without_items_that_asks_images_of_its_decode_reads_no_encode_column() {
+    a_request_without_items_takes_its_pair(true);
+}
+
 #[test]
 fn the_one_key_is_placed_under_a_class_that_pushes_and_under_no_other() {
     let mut bed = Bed::new();
@@ -405,7 +455,7 @@ fn overloaded(row: Candidate) -> Candidate {
 
 /// Encoders the overload veto left none of are a saturated fleet: the shed
 /// names the veto's stage and its reason is saturation, as a pair's side
-/// sheds its own rows. A stage ahead of the veto that leaves none is a
+/// sheds if its binding sheds. A stage ahead of the veto that leaves none is a
 /// missing endpoint as before, and so is one behind it that refuses an
 /// encoder the veto kept. An encoder that does not take the request is not
 /// counted, and under a veto its host lifted the encoders serve.
@@ -426,10 +476,13 @@ fn encoders_the_veto_left_none_of_shed_as_saturation() {
     // The veto is a stage of the encode profile, and the trace says so.
     assert_eq!(shed.trace().made_under(), encode_profile(&stock));
     assert!(shed.trace().made_under().is_some());
-    // A pair's side says the same of its own rows.
+    // A pair's decode side says the same of its own rows under a binding
+    // that sheds. One that steers picks among them.
+    let mut shedding = engine();
+    shedding.shed_when_all_vetoed(0);
     let mut side = Bed::new();
     side.decodes = vec![overloaded(row(0, Role::Decode, 1, 0))];
-    assert_eq!(shed_of(&side.pair(&stock)), saturated);
+    assert_eq!(shed_of(&side.pair(&shedding)), saturated);
     // The host lifted the veto on the encode side: the item is placed.
     let (facts, _) = bed.asked();
     let cx = Constraints::default();
@@ -552,7 +605,7 @@ fn the_pairs_own_answers_read_the_same_through_both_entries() {
         shed.pair(&engine)
     );
     assert!(
-        matches!(vetoed.pair(&engine), Decision::Shed(shed) if shed.reason == ShedReason::Saturated),
+        matches!(vetoed.pair(&engine), Decision::Pick(pick) if pick.trace.lifted == LiftedVeto::Overload),
         "{:?}",
         vetoed.pair(&engine)
     );
@@ -585,6 +638,51 @@ fn the_items_of_one_request_spread_over_a_tie_of_encoders() {
         encoders.iter().any(|&encoder| encoder != first),
         "six keys over a tie of eight follow one draw: {encoders:?}"
     );
+}
+
+/// An item is placed by its own key on the encode stage's own ring, also
+/// where its request's caller lends a ring: where the request stands on
+/// that ring places no item. The classic gateway keys an item's encoder by
+/// the item's content alone
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs`,
+/// lines 2308 to 2358 at f55a0a6bf), so one content keeps its encoder
+/// under every routing value.
+#[test]
+fn an_item_keeps_its_encoder_wherever_its_request_stands_on_a_lent_ring() {
+    let document = PolicySpec::epd_presets("consistent_hashing", "power_of_two", "power_of_two");
+    let engine = document.expect("the presets").validate();
+    let engine = engine.expect("the form validates");
+    let mut bed = Bed::new();
+    bed.encoders = (0..4).map(|at| row(at, Role::Encode, 0, 0)).collect();
+    bed.facts = vec![pushing(1); 4];
+    // Six keys far apart, as the hashes of six contents are.
+    let spread = |item: u64| Identity::hashed((item + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    bed.keys = (0..6).map(spread).collect();
+    let (facts, pool) = bed.asked();
+    let encoders = |facts: &RequestFacts<'_>| -> Vec<u32> {
+        let (_, placed) = bed.decide_asked(&engine, facts, &pool);
+        placed.encoders().iter().map(|t| t.position).collect()
+    };
+    // No ring lent: each item on the encoder its own key reaches.
+    let own = encoders(&facts);
+    assert_eq!(own.len(), 6);
+    let first = own[0];
+    assert!(
+        own.iter().any(|&encoder| encoder != first),
+        "six keys far apart on one encoder of four: {own:?}"
+    );
+    // A ring lent that holds no encoder: a key placed by the request's
+    // place would go to the encoder at that place modulo the four.
+    let ring = InOrder(vec!["grpc://prefill-0:9000".to_owned()]);
+    for place in 0..4 {
+        let places = [place];
+        let lent = RequestFacts {
+            ring: Some(&ring),
+            ring_positions: &places,
+            ..facts
+        };
+        assert_eq!(encoders(&lent), own, "the request stands at {place}");
+    }
 }
 
 /// References that carry images are attended to by the decode: the pair is

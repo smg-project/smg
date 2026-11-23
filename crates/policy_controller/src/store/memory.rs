@@ -25,10 +25,11 @@ use rustc_hash::FxHashMap;
 use crate::{
     document::spec::AppliedSpec,
     engine::{
+        decision_engine::DecodeRefused,
         prompt_hashes::{block_size_and_depth, HashSeeds, PromptHashes},
         view::{LoadRow, Role, Session, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS},
     },
-    load::signals::{SignalCell, SignalColumn},
+    load::signals::{in_range, SignalCell, SignalColumn},
     stages::lifecycle::Lifecycle,
     store::{
         health::{HealthSink, HealthWrite, LeaderBits, VetoWrite},
@@ -36,13 +37,13 @@ use crate::{
         journal::{Journal, JournalKinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{
-            DecodeMark, DecodeRefused, DecodeSide, Dispatch, InFlightCounts, LeaseRecord,
-            LeaseRefused, LeaseState, LeasesStore, Said, Sides, WorkerSlot, DISPATCH_TTL,
+            DecodeMark, DecodeSide, HostCount, InFlightCounts, LeaseRecord, LeaseRefused,
+            LeaseState, LeasesStore, Sides, WorkerSlot,
         },
         loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
         reservations::{ReservationKind, ReservationStore},
         sessions::{Pin, SessionTables, SessionsStore},
-        signals::{SignalSink, SignalWriteOutcome, Writes, VALUE_MAGNITUDE_LIMIT},
+        signals::{SignalSink, SignalWriteOutcome, Writes},
         snapshot::{
             left_models, micros, same_cache, same_offer, Classes, EncodePairBuffers, OnFile,
             OutsideLists, PairBuffers, StaleGeneration, StoreSnapshot, ViewBuffers, ViewFacts,
@@ -54,7 +55,10 @@ use crate::{
         },
         GatewayId,
     },
-    tracking::lease::{LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
+    tracking::lease::{
+        Dispatch, LeaseId, Membership, Outcome, ReleaseReason, Said, Side, TransportClass,
+        DISPATCH_TTL,
+    },
 };
 
 mod blocks;
@@ -556,7 +560,11 @@ impl MemoryStore {
         // The index is this replica's own: a row that left gives up its
         // lane, a row that stays keeps what was heard for it, and a row the
         // cut brings takes the lane its facts ask for.
-        // The rows the cut drops stay in hand.
+        // The rows the cut drops stay in hand. Each one's slot is given to
+        // no row again, so the count its host handed for it goes.
+        for held in previous.values() {
+            self.counts.left(held.slot);
+        }
         previous.retain(|id, _| !workers.rows.contains_key(id));
         for &id in previous.keys() {
             self.kv.forget(id);
@@ -694,7 +702,7 @@ impl MemoryStore {
                         .get(&old)
                         .is_some_and(|held| held.row.facts.key == row.facts.key) =>
             {
-                let left = workers.rows.remove(&old).map(|held| held.row);
+                let left = workers.rows.remove(&old).map(|held| self.row_left(held));
                 let same = |left: &WorkerRow| same_worker(&left.facts, &row.facts);
                 if left.as_ref().is_some_and(same) {
                     follows = Some((old, new));
@@ -713,7 +721,7 @@ impl MemoryStore {
                 };
                 workers.by_key.remove(&held.row.facts.key);
                 self.forget_worker(id);
-                (change, Some(held.row))
+                (change, Some(self.row_left(held)))
             }
             (MembershipChange::StatusChanged { id, from, to }, None) => {
                 let held = workers.rows.get_mut(&id);
@@ -2113,6 +2121,9 @@ impl WorkersStore for MemoryStore {
             // though a change of either starts another life: it is the same
             // reachable worker.
             let old = workers.rows.remove(&old_id);
+            if let Some(old) = &old {
+                self.counts.left(old.slot);
+            }
             let new_id = identity(&facts.key, facts.incarnation);
             // The same worker under a new life: its role, its models and
             // its wires stand. Its status and its session pins follow it.
@@ -2267,6 +2278,7 @@ impl WorkersStore for MemoryStore {
         let mut workers = self.writing();
         workers.guarded(id, revision)?;
         let row = workers.rows.remove(&id)?;
+        self.counts.left(row.slot);
         workers.by_key.remove(&row.row.facts.key);
         // The worker's tables leave with its row, under the workers lock
         // and before the removal is told: a veto, a completed dispatch or a
@@ -2322,6 +2334,15 @@ impl WorkersStore for MemoryStore {
 
     fn history(&self) -> u64 {
         self.workers.lock().history
+    }
+
+    /// Kept beside the cell of the row's slot in the counts, the one the
+    /// leases' doors book. Under the workers lock, as the write that takes
+    /// a row is: no count is kept for a row that left.
+    fn host_count(&self, id: WorkerId, count: Box<dyn HostCount>) -> bool {
+        let workers = self.workers.lock();
+        let slot = workers.rows.get(&id).map(|held| held.slot);
+        slot.is_some_and(|slot| self.counts.beside(slot, count))
     }
 
     fn all_rows(&self) -> (u64, Vec<WorkerRow>) {
@@ -3262,7 +3283,7 @@ impl MemoryStore {
             Ok(column) => column,
             Err(taken) => return taken,
         };
-        if !value.is_finite() || value.abs() > VALUE_MAGNITUDE_LIMIT {
+        if !in_range(value) {
             return SignalWriteOutcome::OutOfRange;
         }
         let mut loads = self.loads.lock();
@@ -3727,7 +3748,7 @@ struct Held {
 /// The decode side of a pair's lease on file, with the slot of the count
 /// it books until it ends.
 #[derive(Clone, Copy)]
-struct HeldDecode {
+struct FiledDecode {
     side: DecodeSide,
     booked: Option<WorkerSlot>,
     /// Whether the side started as chosen, kept after issue or dispatch.
@@ -3735,6 +3756,10 @@ struct HeldDecode {
     /// How many calls issued the side. An undo names the count it issued
     /// under, so it undoes its own issue alone.
     issues: u8,
+    /// The index of the pick's target the prefill's dispatch took: 0, the
+    /// pick's first, until that dispatch names another target the side's
+    /// pick holds ([`Self::taken_decode`]).
+    taken: u8,
 }
 
 /// One issue of a chosen decode side, for a caller that may undo it
@@ -3753,7 +3778,7 @@ pub(crate) struct DecodeIssue(u8);
 #[cfg(feature = "controller")]
 type Replaced = (DecodeSide, Instant);
 
-impl HeldDecode {
+impl FiledDecode {
     /// `side` as a door files it with `booked`, the slot of its worker's
     /// count. Only a live side books a count at filing.
     fn laid(side: DecodeSide, booked: Option<WorkerSlot>) -> Self {
@@ -3764,7 +3789,17 @@ impl HeldDecode {
             booked,
             filed_chosen,
             issues: 0,
+            taken: 0,
         }
+    }
+
+    /// The decode, with its rank, of the target the prefill's dispatch
+    /// took ([`Self::taken`]): the one a decode decided again behind that
+    /// prefill starts from. Every target of a pair's pick names the one
+    /// prefill, so the index its dispatch names says which decode its
+    /// host took.
+    fn taken_decode(&self) -> Option<(WorkerId, u16)> {
+        self.side.target_at(self.taken)
     }
 }
 
@@ -3775,7 +3810,7 @@ impl HeldDecode {
 /// the most pairs that stood at once, and it keeps its room.
 #[derive(Default)]
 struct Decodes {
-    places: Vec<Option<(Key, HeldDecode)>>,
+    places: Vec<Option<(Key, FiledDecode)>>,
     free: Vec<u32>,
     /// What the last issue of a chosen side replaced, by the side's place
     /// and under its lease's key. A decode call's issue alone lays one: the
@@ -3787,7 +3822,7 @@ struct Decodes {
 impl Decodes {
     /// Lays `decode` for the lease under `key` in a free place and names
     /// the place.
-    fn lay(&mut self, key: Key, decode: HeldDecode) -> u32 {
+    fn lay(&mut self, key: Key, decode: FiledDecode) -> u32 {
         let laid = Some((key, decode));
         if let Some(at) = self.free.pop() {
             if let Some(place) = self.places.get_mut(at as usize) {
@@ -3805,7 +3840,7 @@ impl Decodes {
 
     /// The decode side in the place `at`, where that place is the lease's
     /// under `key`.
-    fn get(&self, at: u32, key: &Key) -> Option<&HeldDecode> {
+    fn get(&self, at: u32, key: &Key) -> Option<&FiledDecode> {
         match self.places.get(at as usize)? {
             Some((owner, decode)) if owner == key => Some(decode),
             _ => None,
@@ -3813,7 +3848,7 @@ impl Decodes {
     }
 
     /// [`Self::get`], to write.
-    fn get_mut(&mut self, at: u32, key: &Key) -> Option<&mut HeldDecode> {
+    fn get_mut(&mut self, at: u32, key: &Key) -> Option<&mut FiledDecode> {
         match self.places.get_mut(at as usize)? {
             Some((owner, decode)) if owner == key => Some(decode),
             _ => None,
@@ -3822,7 +3857,7 @@ impl Decodes {
 
     /// Takes the decode side out of the place `at`, where that place is
     /// the lease's under `key`: the place is free.
-    fn take(&mut self, at: u32, key: &Key) -> Option<HeldDecode> {
+    fn take(&mut self, at: u32, key: &Key) -> Option<FiledDecode> {
         let place = self.places.get_mut(at as usize)?;
         let (_, decode) = place.take_if(|(owner, _)| *owner == *key)?;
         self.free.push(at);
@@ -3854,7 +3889,7 @@ impl Decodes {
         at: u32,
         key: &Key,
         issue: Option<DecodeIssue>,
-    ) -> Option<(&mut HeldDecode, Replaced)> {
+    ) -> Option<(&mut FiledDecode, Replaced)> {
         let (owner, decode) = self.places.get_mut(at as usize)?.as_mut()?;
         if owner != key
             || !decode.filed_chosen
@@ -3986,7 +4021,7 @@ impl Leases {
     ) {
         self.end(&key);
         let booked = marked(&mut record, booked, &pair);
-        let side = pair.map(|(side, booked)| HeldDecode::laid(side, booked));
+        let side = pair.map(|(side, booked)| FiledDecode::laid(side, booked));
         let decode = side.map_or(0, |side| self.decodes.lay(key, side));
         // A record filed whole says nothing of its decision: it counts
         // for its key wherever it has one.
@@ -4025,7 +4060,7 @@ impl Leases {
     /// ([`keyed_decode`]), and the lease's dispatch deadline is queued for
     /// it where the record's own filing queued none: a lease takes one
     /// place of the queue.
-    fn decode_laid(&mut self, key: Key, record: &LeaseRecord, decode: &HeldDecode, counts: bool) {
+    fn decode_laid(&mut self, key: Key, record: &LeaseRecord, decode: &FiledDecode, counts: bool) {
         if let Some(booked) = decode.booked {
             self.counts.book(booked);
         }
@@ -4042,7 +4077,7 @@ impl Leases {
     /// side whose count of issues is full is none: it is refused as one
     /// that stands, so no count repeats, an undo names one issue for the
     /// lease's life, and the first pick's dispatch still books the side.
-    fn chosen_decode(&mut self, key: &Key) -> Result<(&mut Held, &mut HeldDecode), DecodeRefused> {
+    fn chosen_decode(&mut self, key: &Key) -> Result<(&mut Held, &mut FiledDecode), DecodeRefused> {
         let held = self.records.get_mut(key).ok_or(DecodeRefused::NoLease)?;
         let found = held
             .record
@@ -4115,7 +4150,7 @@ impl Leases {
         let count = found.issues.wrapping_add(1);
         decode.state = LeaseState::issued(decode.state.session_ttl_micros());
         decode.target_index = 0;
-        let laid = HeldDecode {
+        let laid = FiledDecode {
             side: decode,
             booked,
             issues: count,
@@ -4308,13 +4343,19 @@ impl Leases {
         counts: &InFlightCounts,
         sessions: &SessionTables,
         held: &mut Held,
-        decode: &mut HeldDecode,
+        decode: &mut FiledDecode,
         dispatch: Dispatch,
         at: Instant,
     ) {
         match dispatch.side {
             Side::Prefill if held.record.state.is_issued() => {
                 held.record.state = LeaseState::Dispatched { at };
+                // The target the prefill went to stays with the decode
+                // side, for a decode decided again behind it. An index
+                // the pick holds no target at moves nothing.
+                if decode.side.target_at(dispatch.target_index).is_some() {
+                    decode.taken = dispatch.target_index;
+                }
             }
             Side::Decode if decode.side.state.is_issued() => {
                 let side = &mut decode.side;
@@ -4760,9 +4801,10 @@ impl MemoryStore {
     /// The pair of the lease a decode call names, where the lease still
     /// takes a decode side: its prefill is dispatched and held and its
     /// decode side is chosen. The prefill's worker comes first, then the
-    /// worker and the rank of the decode the lease's first decision chose.
-    /// The call reads this before it decides, and its issue tests the same
-    /// again under its own turn.
+    /// worker and the rank of the decode the lease's first decision chose
+    /// for the target the prefill's dispatch took: the pick's first
+    /// target, or the one that dispatch named. The call reads this before
+    /// it decides, and its issue tests the same again under its own turn.
     pub(crate) fn held_pair(
         &self,
         gateway: GatewayId,
@@ -4770,10 +4812,7 @@ impl MemoryStore {
     ) -> Result<(WorkerId, Option<(WorkerId, u16)>), DecodeRefused> {
         self.turn_of(self.file_of(lease))
             .chosen_decode(&(gateway, lease))
-            .map(|(held, decode)| {
-                let chosen = decode.side.target_at(decode.side.target_index);
-                (held.record.target, chosen)
-            })
+            .map(|(held, decode)| (held.record.target, decode.taken_decode()))
     }
 
     /// The one issue behind the doors: a single's lease with no `pair`,
@@ -4808,7 +4847,7 @@ impl MemoryStore {
             return Err(unminted);
         }
         let booked = marked(&mut record, booked, &pair);
-        let side = pair.map(|(side, booked)| HeldDecode::laid(side, booked));
+        let side = pair.map(|(side, booked)| FiledDecode::laid(side, booked));
         let on_file = &mut *leases;
         let key = loop {
             record.lease.id = on_file.mint(&self.blocks, file).ok_or(unminted)?;
@@ -5067,6 +5106,15 @@ impl MemoryStore {
         let slot = self.counts.claim();
         self.joined.lock().push((id, slot));
         slot
+    }
+
+    /// The row of a member that left the store, its slot told so: the
+    /// count its host handed for it gives up the leases that stand and
+    /// goes ([`InFlightCounts::left`]). Called under the workers lock, by
+    /// the write that takes the member's row.
+    fn row_left(&self, held: Row) -> WorkerRow {
+        self.counts.left(held.slot);
+        held.row
     }
 
     /// Empties the table of the members no world named. Called behind

@@ -367,6 +367,7 @@ mod tests {
             server_key: server_name.to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         }]
     }
 

@@ -46,8 +46,9 @@ use crate::vision::{
     processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
     transforms::{
         center_crop, crop_rgb, expand_to_square, extend_planes_by_table, mean_to_rgb, paste_rgb,
-        pil_to_filter, resize, resize_bicubic_torch_aa, resize_bicubic_torch_aa_cropped, rgb_bytes,
-        stack_batch, to_tensor_by_table, TransformError,
+        pil_to_filter, resize, resize_bicubic_torch_aa, resize_bicubic_torch_aa_cropped,
+        resize_bicubic_torch_aa_squared, rgb_bytes, stack_batch, to_tensor_by_table,
+        TransformError,
     },
 };
 
@@ -277,6 +278,18 @@ impl LlavaProcessor {
             ImageAspectRatio::Pad => {
                 // Pad mode: expand to square with mean color padding, then resize
                 let (w, h) = image.dimensions();
+                // On x86-64 the square of an RGB image is resized without
+                // the square: the same bytes.
+                if let (DynamicImage::ImageRgb8(rgb), true, FilterType::CatmullRom) =
+                    (image, transforms.do_resize, filter)
+                {
+                    let color = mean_to_rgb(&transforms.mean);
+                    if let Some(resized) = resize_bicubic_torch_aa_squared(rgb, color, target_size)
+                    {
+                        let resized = DynamicImage::ImageRgb8(resized);
+                        return to_tensor_by_table(&resized, &transforms.table);
+                    }
+                }
                 let squared = if w == h {
                     Cow::Borrowed(image)
                 } else {

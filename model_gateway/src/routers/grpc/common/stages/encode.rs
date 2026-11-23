@@ -762,6 +762,83 @@ mod tests {
         );
     }
 
+    /// A rendezvous plan's encode call ends with its request: once the
+    /// request has let go of the dispatch's watch, a call the encoder still
+    /// holds is cancelled there.
+    #[tokio::test]
+    async fn an_encode_call_ends_with_its_request() {
+        use std::{collections::HashMap, time::Duration};
+
+        use tokenspeed_encoder::token_speed_encoder_server::{
+            TokenSpeedEncoder, TokenSpeedEncoderServer,
+        };
+        use tokio::sync::{mpsc, oneshot};
+        use tonic::transport::Server;
+
+        use crate::routers::grpc::{
+            common::stages::request_execution::launch_encode_dispatch,
+            proto_wrapper::{TokenSpeedModality, TokenSpeedTensor},
+            test_engine::serve_on_loopback,
+        };
+
+        /// An encoder that holds every call, and hands out what closes when
+        /// the held call is dropped.
+        struct Encoder {
+            calls: mpsc::UnboundedSender<oneshot::Receiver<()>>,
+        }
+
+        #[tonic::async_trait]
+        impl TokenSpeedEncoder for Encoder {
+            async fn encode(
+                &self,
+                _request: tonic::Request<tokenspeed_encoder::EncodeRequest>,
+            ) -> std::result::Result<
+                tonic::Response<tokenspeed_encoder::EncodeResponse>,
+                tonic::Status,
+            > {
+                let (_held, dropped) = oneshot::channel();
+                let _ = self.calls.send(dropped);
+                std::future::pending().await
+            }
+        }
+
+        let (calls, mut held) = mpsc::unbounded_channel();
+        let service = TokenSpeedEncoderServer::new(Encoder { calls });
+        let (address, _server) = serve_on_loopback(Server::builder().add_service(service)).await;
+        let item = TokenSpeedMultimodalItem {
+            modality: TokenSpeedModality::Image,
+            encoder_input: TokenSpeedTensor::inline(vec![0u8; 4], vec![1], "float32".to_string()),
+            model_specific_tensors: HashMap::new(),
+            placeholder_token_id: None,
+            mm_placeholders: Vec::new(),
+            content_hash: Vec::new(),
+        };
+        let watch = launch_encode_dispatch(EncodeDispatchPlan::new(vec![PreparedEncodeJob {
+            item: PreparedEncodeItem::tokenspeed(item, false, 0),
+            target: EncodeTarget::Grpc(format!("http://{address}")),
+            bootstrap_room: 42,
+        }]));
+        let mut dropped = tokio::time::timeout(Duration::from_secs(5), held.recv())
+            .await
+            .expect("the encode send never reached the encoder")
+            .expect("the encoder holds the call");
+
+        // While the request holds the watch, its call stays open.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut dropped)
+                .await
+                .is_err(),
+            "the call was dropped while its request still held the watch"
+        );
+
+        // The request is over.
+        drop(watch);
+        tokio::time::timeout(Duration::from_secs(5), dropped)
+            .await
+            .expect("the encoder still holds the call of a request that is over")
+            .expect_err("a held call is dropped, never released");
+    }
+
     /// An encode send that fails names its worker with the address masked:
     /// its text is the line the dispatch's supervisor writes at error level.
     /// Every worker here is registered with a password and a token in its

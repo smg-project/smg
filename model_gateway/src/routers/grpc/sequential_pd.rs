@@ -48,8 +48,9 @@ use crate::{
                 ProtoInputLogProbs, ProtoResponseVariant, ProtoStream,
             },
             utils::{
-                account_pd_side_failure, mark_error_reason, stream_failure::UpstreamClass,
-                tonic_ext::TonicStatusExt,
+                account_pd_side_failure, mark_error_reason,
+                stream_failure::UpstreamClass,
+                tonic_ext::{is_the_engines_own_report, TonicStatusExt},
             },
         },
     },
@@ -573,7 +574,7 @@ impl SequentialPlan {
 /// What the drained prefill side hands on: its completed stream, the connector
 /// params and the processed media identity its Complete frame carried, the
 /// input logprobs and the prefix-cache hit, and the side's start and end.
-struct PrefillHarvest {
+pub(crate) struct PrefillHarvest {
     stream: ProtoStream,
     kv_params: Option<String>,
     media_identity: Option<vllm::MediaIdentity>,
@@ -621,8 +622,10 @@ pub(crate) async fn execute_sequential_pd(
         done: prefill_done,
     } = sequential_prefill_side(
         &sides,
-        prefill_request,
-        prefill_client.clone(),
+        Box::pin({
+            let mut client = prefill_client.clone();
+            async move { client.generate(prefill_request).await }
+        }),
         prefill_guard,
     )
     .await?;
@@ -689,15 +692,14 @@ pub(crate) async fn execute_sequential_pd(
 /// its admission slot is released once it is drained. A failure anywhere is
 /// the attempt's, where the retry layer can still take the request to another
 /// prefill worker.
-async fn sequential_prefill_side(
+pub(crate) async fn sequential_prefill_side(
     sides: &PdSides<'_>,
-    prefill_request: ProtoGenerateRequest,
-    mut prefill_client: BackendClient,
+    dispatch: SideDispatch,
     prefill_guard: PrefillLoadGuard,
 ) -> Result<PrefillHarvest, Response> {
     let workers = sides.workers;
     debug!(
-        request_id = %prefill_request.request_id(),
+        request_id = %sides.request_id,
         "vLLM PD: sending prefill request (max_tokens=1)"
     );
 
@@ -712,7 +714,7 @@ async fn sequential_prefill_side(
     let bound = prefill_worker
         .and_then(|worker| PrefillBound::at(worker, sides.prompt_tokens, prefill_start));
     if let Some(prefill) = prefill_worker {
-        WorkerMetrics::record_worker_request(prefill.url(), prefill.model_id());
+        WorkerMetrics::record_worker_request(prefill.as_ref());
     }
     // Booked before the call is polled, for the servicers that send their
     // headers with the first message (see `PrefillTicket::book`); the bound
@@ -724,7 +726,7 @@ async fn sequential_prefill_side(
             bound: bound.clone(),
             encode: None,
         },
-        Box::pin(async move { prefill_client.generate(prefill_request).await }),
+        dispatch,
         prefill_worker.cloned(),
         None,
         sides.prefill_label,
@@ -792,7 +794,12 @@ async fn sequential_prefill_side(
                 }
             }
             Err(e) => {
-                if let Some(status) = e.breaker_status() {
+                // A collected answer does not charge the engine's own report,
+                // as in the collector; a streamed answer charges it.
+                if let Some(status) = e
+                    .breaker_status()
+                    .filter(|_| sides.streaming || !is_the_engines_own_report(&e))
+                {
                     workers.record_outcome_prefill(sides.ledger, status);
                 }
                 UpstreamClass::account_dispatch_failure(
@@ -948,7 +955,7 @@ async fn sequential_decode_side(
     let workers = sides.workers;
     // Send request to decode
     if let Some(decode) = workers.decode_worker() {
-        WorkerMetrics::record_worker_request(decode.url(), decode.model_id());
+        WorkerMetrics::record_worker_request(decode.as_ref());
     }
     // The relay phase ends at the decode dispatch. Everything after this
     // instant, including the engines' KV transfer and the decode scheduling,

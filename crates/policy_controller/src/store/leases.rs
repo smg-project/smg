@@ -6,19 +6,19 @@ use std::time::Instant;
 /// The table of counts the leases on file book and a member's place in
 /// it, named here for the store's files that write it: their home is the
 /// counts' own module.
-pub(super) use crate::tracking::in_flight::{InFlightCounts, WorkerSlot};
+pub(super) use crate::tracking::in_flight::{HostCount, InFlightCounts, WorkerSlot};
 use crate::{
     engine::{
-        decision::{Targets, MAX_TARGETS},
+        decision::{
+            Decision, LiftedVeto, Pick, Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
+        },
+        decision_engine::{DecodeRefused, HeldDecision, HeldDecode},
+        sticky_sessions::SessionVerdict,
         view::{Session, WorkerId},
     },
     store::GatewayId,
-    tracking::lease::{Lease, LeaseId, Outcome, ReleaseReason, Side},
+    tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Said, Side},
 };
-
-/// The time a gateway has to name a lease's dispatch: the design's default.
-/// A lease still issued past it is released as abandoned.
-pub(crate) const DISPATCH_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The state of a single's lease or of one side of a pair's lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -324,30 +324,89 @@ impl Sides {
             told(lease);
         }
     }
+
+    /// Calls `told` with a single's lease as a host that held its decision
+    /// would lend it with `said` ([`HeldDecision`]): the view a request's
+    /// guard lends its engine, made from the record on file. `None`, and
+    /// no call, for a pair's lease, which is no single's, and for a
+    /// dispatch that names no target of the pick: it tells nothing of the
+    /// lease.
+    ///
+    /// The parts are read as they stood before the word:
+    ///
+    /// - **The lease** is the record's own as it stands: the lease as
+    ///   issued until a dispatch, and behind one the lease on the index and
+    ///   the worker the dispatch took, which every word behind a dispatch
+    ///   is told under.
+    /// - **The target** is the one the word is about. A dispatch names it
+    ///   by its frame's index. An end and a release name the one the lease
+    ///   books.
+    /// - **The pick** is one of no target: no word of a single carries its
+    ///   pick to a stage.
+    /// - **The decode side** is a single's, as a guard lends it: no
+    ///   session, the lease's own size, never chosen.
+    ///
+    /// The view is made in this call's frame and lent there: no part of it
+    /// is moved, and no pick is built.
+    #[inline]
+    pub fn with_held_single<R>(
+        &self,
+        said: Said,
+        told: impl FnOnce(&HeldDecision<'_>) -> R,
+    ) -> Option<R> {
+        if self.decode.is_some() {
+            return None;
+        }
+        let record = &self.record;
+        let own = record.lease.target_index;
+        let (index, (id, dp_rank)) = match said {
+            Said::Dispatched(dispatch, _) => {
+                let index = dispatch.target_index;
+                (index, record.target_at(index)?)
+            }
+            // An end is of the worker the lease books, whatever its index.
+            Said::Completed(_) | Said::Released(..) => {
+                let booked = record.target_at(own);
+                (own, booked.unwrap_or((record.target, 0)))
+            }
+        };
+        let lease = record.own();
+        let target = Target {
+            id,
+            dp_rank,
+            ..Target::default()
+        };
+        Some(told(&HeldDecision {
+            decision: &EMPTY_PICK,
+            lease: &lease,
+            index,
+            target: &target,
+            decode: HeldDecode {
+                session: Session::NONE,
+                tokens: lease.tokens,
+                chosen: false,
+            },
+        }))
+    }
 }
 
-/// What a gateway's `Dispatched` report says beside its lease.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Dispatch {
-    /// Which target of the pick the gateway dispatched to.
-    pub target_index: u8,
-    pub side: Side,
-    /// Decision to dispatch on the gateway's clock, in microseconds.
-    pub since_decision_micros: u32,
-}
-
-/// What is said of a lease, as a session hands a frame's word and a
-/// `Decide` stream a release to the leases' file
-/// ([`MemoryStore::hand`](super::MemoryStore::hand)).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Said {
-    /// The dispatch the frame names, and the instant the frame was read.
-    Dispatched(Dispatch, Instant),
-    /// The outcome of the side that ended.
-    Completed(Outcome),
-    /// The side given up, where the frame names one, and the reason.
-    Released(Option<Side>, ReleaseReason),
-}
+/// The pick lent with a single's lease ([`Sides::with_held_single`]): no
+/// target, under no trace. A file keeps of a single's pick the workers a
+/// dispatch names by its index, and lists none of them for a word: no word
+/// of a single carries its pick to a stage.
+static EMPTY_PICK: Decision = Decision::Pick(Pick {
+    targets: Targets::new(),
+    trace: Trace {
+        profile: Trace::NO_PROFILE,
+        survivors: Survivors::counted(0),
+        top: [(WorkerId(0), 0.0); TRACE_TOP],
+        top_len: 0,
+        seed: 0,
+        generation: 0,
+        lifted: LiftedVeto::None,
+    },
+    session_verdict: SessionVerdict::None,
+});
 
 /// Why a lease was not recorded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -370,21 +429,6 @@ pub enum LeaseRefused {
     /// same id is taken once a claim settles its file. A store of one
     /// file refuses none by it: there every id names that file.
     Unclaimed,
-}
-
-/// Why a call could not issue the decode side of a pair's lease.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DecodeRefused {
-    /// No lease of the gateway under that id.
-    NoLease,
-    /// The lease was filed without a chosen decode side.
-    NotChosen,
-    /// The prefill side is waiting for dispatch or has ended.
-    PrefillNotHeld,
-    /// The chosen side was already issued or dispatched, even if it has
-    /// ended, or its host gave it up, or it took as many calls as one
-    /// lease takes.
-    DecodeStands,
 }
 
 /// Where leases are recorded.

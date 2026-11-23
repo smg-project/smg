@@ -389,8 +389,13 @@ fails once the reason no longer holds.
 - `pair_index.json`: none. All 23 rows replay.
 - `encode_pair.json`: none is recorded yet. The module that replays it arrives with the crate's encoder lists
   and its rule for encode items; until then the replay owes this sheet.
-- `pair_select.json`: none is recorded yet. The module that replays it arrives with the crate's pair
-  decision; until then the replay owes this sheet.
+- `pair_select.json`: five rows are decided apart, each named by the replay with the answer the pair's decision
+  gives. Four run a prefill policy that weighs load against cache affinity itself (`cache_aware`): the gateway
+  lifts the overload veto for such a policy and lets it place, and no profile of the crate places over a lifted
+  veto yet. A prefill of such a profile that is only over its thresholds keeps its refusal. One is a refusal's
+  reason: where the only ready prefill's partners are all over their thresholds beside a free decode of another
+  transport, the gateway answers unavailable and the pair's decision names the overload veto. The other 35 rows
+  replay.
 - `overload.json`: six rows are decided apart, each by a rule of the crate's store that the replay names with the
   verdicts the store gives. The store holds a usage and its threshold in permille, so a usage within half a permille
   under the threshold reads at it (`a-usage-under-the-threshold-by-less-than-half-a-permille-is-under-it`). The
@@ -451,6 +456,8 @@ fails once the reason no longer holds.
   name, and the replay keeps the gateway's words for each: a model no worker serves and a wire no worker is on
   are no model, a pool over its thresholds on every worker of the wire is overloaded where shedding is on, and
   any other pool left nobody is unavailable. The `message` and `retry_after` are no part of a decision.
-- `media_refs.json`, `context_window.json`, `constraint_decider.json`, `rank_pin.json`: owed whole. Of a
-  request's hard demands the crate keeps the wire of a retry alone yet, so no module replays these sheets, and
-  the replay names each as owed until the change that keeps its demand brings its module.
+- `media_refs.json`, `context_window.json`: every row replays.
+- `constraint_decider.json`: owed whole. No module replays this sheet yet, and the replay names it as owed
+  until the change that brings its module.
+- `rank_pin.json`: every row replays, each worker stating whether it registered a rank (`rank_registered`) and
+  each request that no rank can be pinned for it.

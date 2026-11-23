@@ -419,8 +419,7 @@ impl Engine {
     /// (`decode-vision`). With an encoder registered and none open the stage
     /// is `encoders`. Where the overload veto is the stage that left none
     /// open, the encoders are saturated: the shed names `not-overloaded` and
-    /// its reason is saturation, as a pair's side sheds its own rows. This
-    /// entry does not enter the all-vetoed rule, as the pair entry does not.
+    /// its reason is saturation. No encoder enters the all-vetoed rule here.
     ///
     /// The items are placed by the binding's encode profile over the open
     /// encoders of the chosen prefill's class that take the media, each
@@ -430,8 +429,9 @@ impl Engine {
     /// reads no encoder and places none.
     ///
     /// What this side cannot read truly is declined. A request with items
-    /// under an encode profile that shows its rows to a plugin names
-    /// `encode-scope`: no scope is opened over the encoders offered to a
+    /// names `encode-column` when a column of the encode pool is not one
+    /// entry a row, and `encode-scope` under an encode profile that shows its
+    /// rows to a plugin: no scope is opened over the encoders offered to a
     /// key. A pair column of another length than its pool names
     /// `affinity-column` before a cut, as the pair entry names it. So does
     /// a column on the request, or rows named on it, before a stage of the
@@ -524,9 +524,13 @@ impl Engine {
         };
         let declined = |stage| turned_away(ShedReason::PolicyDeclined, stage, bare);
         let gap = |stage| turned_away(ShedReason::NoEndpoints, stage, bare);
-        if encode.facts.len() != encode.encoders.len()
-            || encode.prefill_classes.len() != pools.prefills.len()
-            || !column_fits(encode.affinity, encode.encoders)
+        // The encode pool's columns are read for a request's items alone: a
+        // request with none is answered whatever its host handed in them.
+        let needs = !items.keys.is_empty();
+        if needs
+            && (encode.facts.len() != encode.encoders.len()
+                || encode.prefill_classes.len() != pools.prefills.len()
+                || !column_fits(encode.affinity, encode.encoders))
         {
             return declined(ENCODE_COLUMN);
         }
@@ -550,7 +554,6 @@ impl Engine {
         // a short set, so past this line nothing says a host's wrong shape.
         debug_assert_cells(pools.prefill_signal_cells, pools.prefills);
         debug_assert_cells(pools.decode_signal_cells, pools.decodes);
-        let needs = !items.keys.is_empty();
         // A profile that shows its rows to a plugin answers inside a scope
         // opened over the rows of one decision. None is opened over the
         // encoders offered to a key, so no stage of such a profile is asked.
@@ -574,6 +577,11 @@ impl Engine {
             // The encoders' own cells: the request's would be read by
             // another pool's positions.
             signal_cells: encode.signal_cells,
+            // The place stated on a lent ring is the request's routing
+            // value's: an item is placed by its own key, so it takes no
+            // lent ring and the stage's own places it.
+            ring: None,
+            ring_positions: &[],
             ..*facts
         };
         let takes = |row: &Candidate, of: &EncoderFacts| takes_media(&items, images, row, of);
@@ -613,8 +621,7 @@ impl Engine {
             }
             if !any_open {
                 // Encoders the overload veto left none of are a saturated
-                // fleet, and the shed says so as a pair's side says it of
-                // its own rows.
+                // fleet, and the shed says so.
                 if let Some(stage) =
                     saturation(profile, &encode_facts, encode_cx, &encode, &items, images)
                 {

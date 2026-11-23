@@ -16,7 +16,7 @@
 //! hold the storage for the life of the thread without ever handing it out,
 //! so a give on such a thread is a plain drop.
 
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::TryReserveError};
 
 /// Max recycled buffers kept per thread per class; excess is dropped. The
 /// vision path holds at most a couple of live tensors per request, so a small
@@ -72,6 +72,14 @@ pub fn take_f32(len: usize) -> Vec<f32> {
     let mut v = take_f32_cap(len);
     v.resize(len, 0.0);
     v
+}
+
+/// [`take_f32_cap`] for a producer that reports a refused allocation.
+pub(crate) fn try_take_f32_cap(cap: usize) -> Result<Vec<f32>, TryReserveError> {
+    // The thread's kept buffer, or a new one: no room is asked for yet.
+    let mut v = take_f32_cap(0);
+    v.try_reserve(cap)?;
+    Ok(v)
 }
 
 #[cfg(test)]

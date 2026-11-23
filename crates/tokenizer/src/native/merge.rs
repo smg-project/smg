@@ -46,7 +46,12 @@
 //! the leftmost of equal ranks: equal ranks are one token, formed at two
 //! positions by the same or by different splits).
 
-use std::{borrow::Cow, cmp::Reverse, collections::BinaryHeap};
+use std::{
+    borrow::{Borrow, Cow},
+    cmp::Reverse,
+    collections::BinaryHeap,
+    hash::Hash,
+};
 
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
@@ -58,7 +63,7 @@ use tokenizers::{
 use crate::{
     encode_path::Declined,
     tiktoken::MAX_BYTE_LEVEL_TABLE_IDS,
-    word_cache::{entries_of, Listing, ReadBpe},
+    word_cache::{entries_of, Listing, ModelView, ReadBpe},
 };
 
 mod preformed;
@@ -281,6 +286,9 @@ pub(super) struct MergeTable {
     /// The model's `ignore_merges`: a piece that is a token is that token,
     /// looked up before any merge (by the caller, in the model's vocabulary).
     pub(super) ignore_merges: bool,
+    /// The calls of [`Self::read_through`], for the test of who reads.
+    #[cfg(test)]
+    pub(super) reads: super::AtomicUsize,
 }
 
 /// The model's `merges` field read back: `[[a, b], ...]` in rank order.
@@ -296,11 +304,14 @@ impl MergeTable {
     /// `read` is what the file's one-pass read saw of the model (its merges
     /// as ids, its largest id), so that neither is read back from the built
     /// model; `None` for a model built in memory.
-    pub(super) fn from_model(
-        model: &ModelWrapper,
+    pub(super) fn from_model<M: Model + ModelView>(
+        view: &M,
         tokens: ByteTokens,
         read: Option<&ReadBpe>,
     ) -> Result<Self, Declined> {
+        // The view answers for the byte tokens where the section's model was
+        // not built.
+        let model = view.wrapper();
         let ModelWrapper::BPE(bpe) = model else {
             return Err(Declined::from("the model is not BPE"));
         };
@@ -328,7 +339,7 @@ impl MergeTable {
             // here; the character symbols' table spells a byte only for a
             // character that is no token, and declines a missing byte that
             // could be reached (`CharSymbols::from_model`).
-            byte_ids[byte] = match model.token_to_id(&spelling) {
+            byte_ids[byte] = match view.token_to_id(&spelling) {
                 Some(id) => id,
                 None => {
                     missing.get_or_insert_with(|| Box::new([false; 256]))[byte] = true;
@@ -458,7 +469,9 @@ impl MergeTable {
     /// The table pre-forms characters as a model's does (see `preformed`):
     /// the tokens are raw bytes already, and an id's least operand rank is
     /// the least rank of a split that takes it as either half.
-    pub(super) fn from_ranks(ranks: &FxHashMap<Vec<u8>, u32>) -> Result<Self, Declined> {
+    pub(super) fn from_ranks<K: Borrow<[u8]> + Eq + Hash>(
+        ranks: &FxHashMap<K, u32>,
+    ) -> Result<Self, Declined> {
         let mut byte_ids = [0u32; 256];
         for (byte, id) in byte_ids.iter_mut().enumerate() {
             *id = ranks
@@ -486,6 +499,7 @@ impl MergeTable {
         let mut root = vec![UNSET; ranks_end];
         let mut splits = Vec::with_capacity(ranks.len() * 2);
         for (token, &rank) in ranks {
+            let token: &[u8] = token.borrow();
             if token.len() < 2 {
                 continue;
             }
@@ -577,6 +591,7 @@ impl MergeTable {
         }
         let mut ids = Vec::new();
         for (token, &rank) in ranks {
+            let token: &[u8] = token.borrow();
             if token.len() < 2 {
                 continue;
             }
@@ -612,7 +627,7 @@ impl MergeTable {
         // The tokens in rank order, placed and not sorted: the analysis
         // orders them by id, one pass where they come in order. A token
         // another of its rank displaces goes after the placed ones.
-        let mut by_rank: Vec<Option<&Vec<u8>>> = vec![None; ranks_end];
+        let mut by_rank: Vec<Option<&K>> = vec![None; ranks_end];
         let mut twice = Vec::new();
         for (token, &rank) in ranks {
             if let Some(first) = by_rank[rank as usize].replace(token) {
@@ -623,9 +638,12 @@ impl MergeTable {
             .iter()
             .enumerate()
             .filter_map(|(rank, token)| token.map(|token| (rank as u32, token)));
-        let mut raws = Raws::for_tokens(ranks.len(), ranks.keys().map(Vec::len).sum());
+        let mut raws = Raws::for_tokens(
+            ranks.len(),
+            ranks.keys().map(|token| token.borrow().len()).sum(),
+        );
         for (rank, token) in placed.chain(twice) {
-            raws.push(rank, token.iter().copied().map(Some), |_| true);
+            raws.push(rank, token.borrow().iter().copied().map(Some), |_| true);
         }
         table.preformed = Box::new(Preformed::analyse(&table, raws, &min_operand));
         Ok(table)
@@ -660,6 +678,8 @@ impl MergeTable {
             merges,
             preformed: Box::new(Preformed::empty()),
             ignore_merges,
+            #[cfg(test)]
+            reads: Default::default(),
         }
     }
 
@@ -804,10 +824,33 @@ impl MergeTable {
         }
     }
 
+    /// Every merge of a table without the grid, as its operands, in rank
+    /// order: what the model's own merge map holds, read back from the
+    /// buckets for a model that is built after the load.
+    pub(super) fn pairs_by_rank(&self) -> Vec<[u32; 2]> {
+        debug_assert!(
+            self.hot.is_empty(),
+            "a table with the grid keeps pairs there"
+        );
+        let mut ranked: Vec<(u32, u64)> = self
+            .buckets
+            .iter()
+            .flat_map(|bucket| bucket.0.iter())
+            .filter(|entry| entry.key != EMPTY_KEY)
+            .map(|entry| (entry.merge.rank(), entry.key))
+            .collect();
+        ranked.sort_unstable();
+        ranked
+            .into_iter()
+            .map(|(_, key)| [(key >> 32) as u32, key as u32])
+            .collect()
+    }
+
     /// Reads one word of every line of the table, the buckets first, then
     /// the grid and the filter (the small, hot tables last, so they stay in
-    /// the nearer caches), and keeps nothing: an early encode of a thread with
-    /// the encoder calls it so that the table's lines come in as one stream
+    /// the nearer caches), and keeps nothing: the end of a load
+    /// (`NativeEncoder::rehearse`) and an early encode of a thread with
+    /// the encoder call it so that the table's lines come in as one stream
     /// then rather than one dependent probe at a time during the first-sight
     /// pieces of the texts after it. In a fresh process the table was built
     /// at load and the rest of the load pushed it out; measured on the
@@ -815,11 +858,13 @@ impl MergeTable {
     /// memory per token against 0.16 from the last-level cache, and this read
     /// takes 10-20 % off those cells (16 % by median) and 8 % by median off
     /// the 2 KB ones, nothing measurable from 32 KB up, against a parent that
-    /// has the pair filter, for 0.3-0.5 ms once per thread per encoder on a
-    /// 128-151k-merge table.
+    /// has the pair filter, for 0.3-0.5 ms at the load and at most once per
+    /// thread per encoder on a 128-151k-merge table.
     #[inline(never)]
     pub(super) fn read_through(&self) {
         const GRID_STEP: usize = 64 / size_of::<Merge>();
+        #[cfg(test)]
+        self.reads.fetch_add(1, super::Ordering::Relaxed);
         let mut sum = 0u64;
         for bucket in &self.buckets {
             sum = sum.wrapping_add(bucket.0[0].key);

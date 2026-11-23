@@ -189,6 +189,60 @@ impl Inkling2ImageProcessor {
             std::array::from_fn(|value| level(value as f32, channel))
         });
         for image in images {
+            if let Some(rgba) = image.as_rgba8() {
+                // An RGBA image is read where it stands, by a walk of its own:
+                // the walk below keeps its shape for an RGB image.
+                let rgba = rgba.as_raw().as_chunks::<4>().0;
+                let (width, height) = (image.width() as usize, image.height() as usize);
+                let mut block = [[[0u8; 4]; PATCH_SIZE]; PATCH_SIZE];
+                for patch_y in 0..height.div_ceil(PATCH_SIZE) {
+                    for patch_x in 0..width.div_ceil(PATCH_SIZE) {
+                        let start = output.len();
+                        let columns = patch_x * PATCH_SIZE..((patch_x + 1) * PATCH_SIZE).min(width);
+                        let rows = patch_y * PATCH_SIZE..((patch_y + 1) * PATCH_SIZE).min(height);
+                        for (row, y) in block.iter_mut().zip(rows) {
+                            row[..columns.len()].copy_from_slice(
+                                &rgba[y * width + columns.start..y * width + columns.end],
+                            );
+                        }
+                        for y in patch_y * PATCH_SIZE..(patch_y + 1) * PATCH_SIZE {
+                            let copied = if y < height { columns.len() } else { 0 };
+                            let row = &block[y - patch_y * PATCH_SIZE][..copied];
+                            for (x, &[red, green, blue, alpha]) in columns.clone().zip(row) {
+                                // An opaque pixel composites to itself.
+                                let [red, green, blue] = if alpha == u8::MAX {
+                                    [red, green, blue]
+                                } else {
+                                    let alpha = u32::from(alpha);
+                                    let background =
+                                        if (x / 8 + y / 8) % 2 == 0 { 204 } else { 153 };
+                                    [red, green, blue].map(|value| {
+                                        ((u32::from(value) * alpha
+                                            + background * (255 - alpha)
+                                            + 127)
+                                            / 255) as u8
+                                    })
+                                };
+                                output.extend_from_slice(
+                                    [
+                                        table[0][usize::from(red)],
+                                        table[1][usize::from(green)],
+                                        table[2][usize::from(blue)],
+                                    ]
+                                    .as_flattened(),
+                                );
+                            }
+                            for _ in copied..PATCH_SIZE {
+                                output.extend_from_slice(padding.as_flattened());
+                            }
+                        }
+                        output.extend_from_within(
+                            start..start + N * PATCH_VALUES / TEMPORAL_PATCH_SIZE,
+                        );
+                    }
+                }
+                continue;
+            }
             // An RGB image is read where it stands: `to_rgba8` would copy it
             // whole at four bytes a pixel.
             let rgb = image.as_rgb8().map(|rgb| rgb.as_raw().as_chunks::<3>().0);
@@ -529,6 +583,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn inkling2_rgba_walk_agrees_with_the_rgb_walk_and_the_converted_copy() {
+        // Three patch rows with ragged edges. One pixel past the first patch
+        // row is partly transparent, where the checkerboard phase by the
+        // image's row and by the row inside the patch differ.
+        let rgb = pixels(81, 81, false);
+        let mut rgba = rgb.to_rgba8();
+        rgba.get_pixel_mut(9, 48).0[3] = 128;
+        let deep = image::ImageBuffer::from_fn(81, 81, |x, y| {
+            Rgba(rgba.get_pixel(x, y).0.map(|value| u16::from(value) * 257))
+        });
+        let bits = |image: DynamicImage| -> Vec<u32> {
+            let output = Inkling2ImageProcessor::new()
+                .preprocess(&[&image])
+                .expect("native image");
+            let data = output.encoder_input.flat_f32();
+            data.iter().map(|value| value.to_bits()).collect()
+        };
+        let mut expected = bits(rgb);
+        // (105, 172, 239) at alpha 128 over the background 153.
+        for (channel, value) in [129_u8, 163, 196].into_iter().enumerate() {
+            let level = ((f32::from(value) / 255.0_f32 - MEAN[channel]) / STD[channel]).to_bits();
+            let at = 3 * PATCH_VALUES + (8 * PATCH_SIZE + 9) * 3 + channel;
+            expected[at] = level;
+            expected[at + PATCH_VALUES / 2] = level;
+        }
+        let in_place = bits(DynamicImage::ImageRgba8(rgba));
+        assert_eq!(in_place, expected);
+        assert_eq!(bits(DynamicImage::ImageRgba16(deep)), in_place);
     }
 
     #[test]

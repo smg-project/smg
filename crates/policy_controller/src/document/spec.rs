@@ -35,6 +35,8 @@ use serde::{
 };
 use sha2::{Digest as _, Sha256};
 
+#[cfg(feature = "in-process")]
+use crate::engine::sticky_sessions::SessionTable;
 use crate::{
     document::routing_key::KeySources,
     engine::{
@@ -236,7 +238,8 @@ pub struct Needs {
     /// The stage reads the prefixes sent to each worker.
     #[serde(default)]
     pub sent_prefixes: bool,
-    /// A consistent-hash ring per model.
+    /// A consistent-hash ring per model. A host that keeps one lends it with
+    /// a request ([`RequestFacts::ring`](crate::engine::RequestFacts::ring)).
     pub ring: bool,
     /// Allow-listed headers in the view.
     pub headers: bool,
@@ -2117,6 +2120,21 @@ pub enum Recovery {
     Latest,
 }
 
+/// Whether a request a sessions rule placed alone is the profile's own: a
+/// pin of the request's key followed, or the rule's own assignment. No
+/// stage of the profile placed such a request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RulePlaced {
+    /// The profile's own: its stages hear the request's issue and its
+    /// dispatch, and it counts among the profile's sends.
+    #[default]
+    Told,
+    /// Kept from the profile, as a gateway's sticky map keeps a request it
+    /// places from the gateway's policy.
+    Untold,
+}
+
 /// Sticky sessions on the binding: a keyed request stays on the worker its
 /// key was first placed on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2132,13 +2150,18 @@ pub struct SessionsSpec {
     /// `view.headers`. Left out under `routing_key` too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<String>,
-    /// How long an idle key stays pinned, in seconds; above zero (default
-    /// 14400), `4294967295` for ever.
+    /// How long an idle key stays pinned, in seconds, before the rule's
+    /// next sweep forgets it; above zero (default 14400), `4294967295` for
+    /// ever. A host that keeps a record of the pins, as the controller's
+    /// own service does, forgets the key at `ttl_s` itself.
     #[serde(default = "default_ttl_s")]
     #[schemars(range(min = 1))]
     pub ttl_s: u32,
-    /// The sweep cadence of idle keys, in seconds; above zero (default 120),
-    /// `4294967295` for never, allowed under a `ttl_s` for ever alone.
+    /// The sweep cadence of idle keys, in seconds: a key idle for `ttl_s`
+    /// is forgotten at the next sweep, and one used again ahead of it stays
+    /// pinned. Above zero (default 120), `4294967295` for never, allowed
+    /// under a `ttl_s` for ever alone. Under a host that keeps a record of
+    /// the pins the sweep only reclaims.
     #[serde(default = "default_sweep_s")]
     #[schemars(range(min = 1))]
     pub sweep_s: u32,
@@ -2161,6 +2184,15 @@ pub struct SessionsSpec {
     /// `original`).
     #[serde(default)]
     pub recovery: Recovery,
+    /// Whether a request this rule placed alone is the profile's own
+    /// (default `told`). Under `untold` no stage hears that request's issue
+    /// or its dispatch, and it is none of the profile's sends. The session
+    /// table still hears its dispatch, and the stages its completion and
+    /// its release. A host that tells a lease's words off its file keeps
+    /// no such word of a pick: it takes the rule, and tells such a request
+    /// as it tells any other.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub rule_placed: RulePlaced,
 }
 
 fn default_ttl_s() -> u32 {
@@ -4715,6 +4747,7 @@ fn session_rule(
             u64::from(sessions.sweep_s) * 1_000_000
         },
         recovery: sessions.recovery,
+        rule_placed: sessions.rule_placed,
     })
 }
 
@@ -5265,6 +5298,9 @@ pub struct AppliedSpec {
     /// The document's `plans.pd-pair.decode`.
     decode_pick: DecodePick,
     lists: ViewLists,
+    /// The document's `view.headers`, in their order
+    /// ([`AppliedSpec::view_headers`]).
+    view_headers: Box<[Box<str>]>,
     /// Each binding's routing key sources, by the binding's place in the
     /// document; none where a binding names none
     /// ([`AppliedSpec::key_sources_for`]).
@@ -5342,6 +5378,12 @@ impl AppliedSpec {
             pairing: document.plans.pd_pair.pairing,
             decode_pick: document.plans.pd_pair.decode,
             lists: ViewLists::of(&document.view),
+            view_headers: document
+                .view
+                .headers
+                .iter()
+                .map(|name| name.as_str().into())
+                .collect(),
             key_sources: document
                 .bindings
                 .iter()
@@ -5369,6 +5411,7 @@ impl AppliedSpec {
             pairing: Pairing::default(),
             decode_pick: DecodePick::default(),
             lists: ViewLists::default(),
+            view_headers: Box::default(),
             key_sources: Box::default(),
             #[cfg(feature = "controller")]
             awaited: AtomicBool::new(false),
@@ -5427,6 +5470,14 @@ impl AppliedSpec {
     #[must_use]
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// The document's engine reads and writes `table` from here on
+    /// ([`Engine::share_sessions`]): the session table of an engine object
+    /// that outlives the document.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn share_sessions(&mut self, table: Arc<SessionTable>) {
+        self.engine.share_sessions(table);
     }
 
     /// The document's block size, in tokens: the size a request's blocks
@@ -5532,6 +5583,14 @@ impl AppliedSpec {
     #[must_use]
     pub fn lists(&self) -> &ViewLists {
         &self.lists
+    }
+
+    /// The request headers a stage may read (`view.headers`), in the
+    /// document's order. A host states each one a request carries as a
+    /// [`Header`](crate::engine::view::Header), which names its header by
+    /// its place here.
+    pub fn view_headers(&self) -> impl Iterator<Item = &str> {
+        self.view_headers.iter().map(|name| &**name)
     }
 }
 
@@ -6327,9 +6386,11 @@ mod tests {
             assert_eq!(engine.needs().token_hashes, hashes, "{name}");
             assert_eq!(engine.needs().text_hashes, hashes, "{name}");
             assert!(!engine.needs().text, "{name}");
-            // The request's size is counted where a stage places by it: a
-            // host that sends a request on unread reads it for that stage.
-            assert_eq!(engine.needs().prompt_size, name == "bucket", "{name}");
+            // The request's size is counted where a stage places by it or
+            // takes a share of it: a host that sends a request on unread
+            // reads it for that stage.
+            let sized = ["bucket", "cache_aware"].contains(&name);
+            assert_eq!(engine.needs().prompt_size, sized, "{name}");
             // The affinity stage's source is left out: it reads each worker
             // by what it has, its cache events or the prefixes sent to it.
             assert_eq!(engine.needs().events, name == "cache_aware", "{name}");
@@ -7750,6 +7811,7 @@ mod tests {
                 inflight_cap: u16::MAX,
                 issue_session_id: false,
                 recovery: Recovery::Original,
+                rule_placed: RulePlaced::Told,
             }
         );
         assert_eq!(spec.view.headers, ["x-smg-routing-key"]);

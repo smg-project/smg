@@ -126,6 +126,7 @@ fn candidate_record() -> &'static [&'static str] {
             host_local,
             active_sessions,
             key,
+            engine,
         }
     )
 }
@@ -179,7 +180,7 @@ fn request_record() -> &'static [&'static str] {
             signal_cells,
             client_key,
             ring,
-            ring_awaited,
+            ring_positions,
         }
     )
 }
@@ -234,6 +235,7 @@ fn pool_record() -> &'static [&'static str] {
             reach,
             reported,
             engines,
+            word,
         }
     )
 }
@@ -292,7 +294,8 @@ fn pair_record() -> &'static [&'static str] {
         Pair {
             decode_position,
             decode_id,
-            decode_dp_rank
+            decode_dp_rank,
+            decode_verdict
         }
     )
 }
@@ -559,7 +562,8 @@ struct ProtoMirror {
     /// Record fields the wire does not carry: a host instant, a host-local
     /// position, the in-process length of a fixed array, the trace the wire
     /// hoists into `Decision`, whether a report counts resident tokens, a
-    /// fingerprint the host carries of a name the wire carries.
+    /// fingerprint the host carries of a name the wire carries, the place
+    /// of a row's engine among the engines of its host's list.
     host_only: &'static [&'static str],
     /// Wire fields outside the record, in the wire's order: an event's key
     /// before it, controller facts, a wire-only input, the observability
@@ -614,7 +618,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Candidate",
             record: candidate_record(),
-            host_only: &["position", "load_sampled_at_micros"],
+            host_only: &["position", "load_sampled_at_micros", "engine"],
             wire_only: affinity_record(),
             wire: &[
                 ("id", Type::Fixed64),
@@ -664,7 +668,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "model_fingerprint",
                 "signal_cells",
                 "ring",
-                "ring_awaited",
+                "ring_positions",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -716,7 +720,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "PoolFacts",
             record: pool_record(),
-            host_only: &["reach", "reported", "engines"],
+            host_only: &["reach", "reported", "engines", "word"],
             wire_only: &[],
             wire: &[
                 ("pool_size", Type::Uint32),
@@ -758,7 +762,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Pair",
             record: pair_record(),
-            host_only: &["decode_position"],
+            host_only: &["decode_position", "decode_verdict"],
             wire_only: &[],
             wire: &[
                 ("decode_id", Type::Fixed64),
@@ -892,7 +896,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "candidate",
             crate_record: candidate_record(),
-            host_only: &["position", "load_sampled_at_micros"],
+            host_only: &["position", "load_sampled_at_micros", "engine"],
             before: &[],
             beside: affinity_record(),
         },
@@ -918,7 +922,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
                 "signal_cells",
                 "client_key",
                 "ring",
-                "ring_awaited",
+                "ring_positions",
             ],
             before: &[],
             beside: &[],
@@ -933,7 +937,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pool",
             crate_record: pool_record(),
-            host_only: &["reach", "reported", "engines"],
+            host_only: &["reach", "reported", "engines", "word"],
             before: &[],
             beside: &[],
         },
@@ -947,7 +951,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pair",
             crate_record: pair_record(),
-            host_only: &["decode_position"],
+            host_only: &["decode_position", "decode_verdict"],
             before: &[],
             beside: &[],
         },

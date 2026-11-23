@@ -356,6 +356,10 @@ impl<G: Generation> LoadSink for ClassicLoadSink<G> {
         self.load_consumer.needs_loads()
     }
 
+    fn polls(&self, worker: &dyn Worker) -> bool {
+        self.load_consumer.polls(worker)
+    }
+
     fn tick(&self, tick: &GroupTick<'_>) {
         // The overload predicate runs exactly here, once per report, never
         // on a request path, against the worker's effective thresholds

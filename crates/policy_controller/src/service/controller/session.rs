@@ -63,7 +63,8 @@ use super::{
 use crate::{
     engine::view::WorkerId,
     service::proto::{self, controller_frame, gateway_frame::Frame},
-    store::{leases::DISPATCH_TTL, Hand},
+    store::Hand,
+    tracking::lease::DISPATCH_TTL,
 };
 
 /// The stream rule's grace period (design 4.3): how long a gateway stays

@@ -34,12 +34,17 @@
 //! of one grouped worker was pinned to by its key. Two hashes place no key
 //! alike, so it must replay with the requests of one key on one rank, and
 //! a counted row count for count or share for share.
-//! A retry-wire row, a media row and a context-window row hold the
-//! gateway's answer to each request of one pool, a retry that stays on
-//! its wire, a request that carries media and a request of some size
-//! among them: the workers the request may be placed on, or its refusal.
-//! Each must replay answer for answer, a refusal by its status and its
-//! code.
+//! A retry-wire row, a media row, a context-window row and a rank-pin row
+//! hold the gateway's answer to each request of one pool, a retry that
+//! stays on its wire, a request that carries media, a request of some
+//! size and a request no rank can be pinned for among them: the workers
+//! the request may be placed on, or its refusal. Each must replay answer
+//! for answer, a refusal by its status and its code.
+//! A pair-select row holds the gateway's answers to the requests of a
+//! prefill pool and a decode pool: the pair, or no pair and why. It must
+//! replay answer for answer, and a drawn row pair for pair and share for
+//! share. The pair-select module holds five recorded rows the pair's
+//! decision answers apart to the answer each entry gives.
 //! No row is decided differently but where its module names it. The store
 //! judges an engine by rules of its own, and the overload module holds a
 //! recorded row they decide apart from the gateway to the verdicts its
@@ -77,8 +82,10 @@ mod classic {
     pub mod minimum_tokens;
     pub mod overload;
     pub mod pair_index;
+    pub mod pair_select;
     pub mod power_of_two;
     pub mod prefix_hash;
+    pub mod rank_pin;
     pub mod retry_wire;
     pub mod sticky_override;
     pub mod sticky_rank;
@@ -132,20 +139,10 @@ struct OwedSheet {
 
 /// The owed sheets: each was recorded before the change that replays it
 /// landed here.
-const OWED_SHEETS: &[OwedSheet] = &[
-    OwedSheet {
-        policy: "pair-select",
-        by: "the placement of a prefill and decode pair",
-    },
-    OwedSheet {
-        policy: "constraint-decider",
-        by: "a request's hard demands: the constraint's decider on a retry",
-    },
-    OwedSheet {
-        policy: "rank-pin",
-        by: "a request's hard demands: no worker that registered a rank where none is pinned",
-    },
-];
+const OWED_SHEETS: &[OwedSheet] = &[OwedSheet {
+    policy: "constraint-decider",
+    by: "a request's hard demands: the constraint's decider on a retry",
+}];
 
 /// The owed sheet of a policy, when one is owed.
 fn owed_sheet(policy: &str) -> Option<&'static OwedSheet> {
@@ -295,11 +292,12 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// An encode-pair row is replayed in its store part by its own module;
 /// its copied rows name no runtime either, and the pair index's rule
 /// holds them.
-/// A retry-wire row, a media row and a context-window row name the
-/// workers a request may take or its refusal, so each module brings its
-/// own replay too, over one bed; their copied rows name each runtime by
-/// a token, and the pair index's rule holds them as well.
-const MODULES: [Module; 15] = [
+/// A retry-wire row, a media row, a context-window row and a rank-pin
+/// row name the workers a request may take or its refusal, so each module
+/// brings its own replay too, over one bed; their copied rows name each
+/// runtime by a token, or name none, and the pair index's rule holds them
+/// as well.
+const MODULES: [Module; 17] = [
     module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
     module::<classic::bucket::Row>(classic::bucket::INLINE),
     module::<classic::cache_aware::Row>(classic::cache_aware::INLINE),
@@ -340,12 +338,24 @@ const MODULES: [Module; 15] = [
         replay: classic::pair_index::replay_rows,
         copied: classic::pair_index::copied_row_defects,
     },
+    Module {
+        policy: classic::pair_select::POLICY,
+        inline: classic::pair_select::INLINE,
+        replay: classic::pair_select::replay_rows,
+        copied: classic::overload::copied_row_defects,
+    },
     module::<classic::power_of_two::Row>(classic::power_of_two::INLINE),
     Module {
         policy: classic::prefix_hash::POLICY,
         inline: classic::prefix_hash::INLINE,
         replay: classic::prefix_hash::replay_rows,
         copied: copied_row_defects,
+    },
+    Module {
+        policy: classic::rank_pin::POLICY,
+        inline: classic::rank_pin::INLINE,
+        replay: classic::rank_pin::replay_rows,
+        copied: classic::pair_index::copied_row_defects,
     },
     Module {
         policy: classic::retry_wire::POLICY,
@@ -615,6 +625,20 @@ fn the_classic_all_vetoed_rows_replay_pick_for_pick_and_share_for_share() {
     assert!(defects.is_empty(), "{defects:#?}");
 }
 
+/// The ring rows of the all-vetoed sheet list their workers in their key's
+/// ring order. Each is replayed a second time on a ring the request's
+/// caller lends, built in that order, and holds its recorded answer.
+#[test]
+fn the_classic_ring_rows_replay_on_a_ring_their_caller_lends() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/classic/sheets");
+    let sheet = fs::read_to_string(dir.join("all_vetoed.json")).expect("the sheet is readable");
+    for (text, least) in [(classic::all_vetoed::INLINE, 8), (sheet.as_str(), 12)] {
+        let (rows, defects) = classic::all_vetoed::replay_on_a_lent_ring(text);
+        assert!(rows >= least, "{rows} ring rows, under {least}");
+        assert!(defects.is_empty(), "{defects:#?}");
+    }
+}
+
 #[test]
 fn the_classic_encode_pair_rows_replay_the_stores_part_list_for_list() {
     let (rows, defects) = replay_sheet(classic::encode_pair::INLINE, "the inline rows");
@@ -688,6 +712,13 @@ fn the_classic_context_window_rows_replay_answer_for_answer() {
 #[test]
 fn the_classic_retry_wire_rows_replay_answer_for_answer() {
     let (rows, defects) = replay_sheet(classic::retry_wire::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
+fn the_classic_rank_pin_rows_replay_answer_for_answer() {
+    let (rows, defects) = replay_sheet(classic::rank_pin::INLINE, "the inline rows");
     assert!(rows >= 8, "{rows} inline rows");
     assert!(defects.is_empty(), "{defects:#?}");
 }
@@ -1162,8 +1193,10 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
             "minimum_tokens.json",
             "overload.json",
             "pair-index.json",
+            "pair-select.json",
             "power_of_two.json",
             "prefix_hash.json",
+            "rank-pin.json",
             "retry-wire.json",
             "sticky_override.json",
             "sticky_rank.json",

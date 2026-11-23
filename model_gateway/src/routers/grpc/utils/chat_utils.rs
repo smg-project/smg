@@ -932,16 +932,80 @@ pub(crate) fn empty_content(content_format: ChatTemplateContentFormat) -> Value 
     }
 }
 
+/// Media text shorter than this stays in the template value: leaving it out
+/// takes a copy of the message, which costs more than a short text does.
+const MEDIA_TEXT_LEFT_OUT: usize = 64 << 10;
+
+/// A copy of `message` with the text of each media part (a URL, a `data:`
+/// URL, base64 audio) left empty, for a template value whose content
+/// transform drops that text: megabytes the value would otherwise copy.
+/// `None` where the media text is short, or shorter than the text the copy
+/// clones.
+fn without_media_text(message: &ChatMessage) -> Option<ChatMessage> {
+    let content = match message {
+        ChatMessage::System { content, .. }
+        | ChatMessage::User { content, .. }
+        | ChatMessage::Tool { content, .. }
+        | ChatMessage::Developer { content, .. }
+        | ChatMessage::Root { content, .. } => content,
+        ChatMessage::Assistant { .. } | ChatMessage::Function { .. } => return None,
+    };
+    let MessageContent::Parts(parts) = content else {
+        return None;
+    };
+    let (mut media, mut text) = (0, 0);
+    for part in parts {
+        match part {
+            ContentPart::ImageUrl { image_url } => media += image_url.url.len(),
+            ContentPart::AudioUrl { audio_url } => media += audio_url.url.len(),
+            ContentPart::VideoUrl { video_url } => media += video_url.url.len(),
+            ContentPart::InputAudio { input_audio } => media += input_audio.data.len(),
+            _ => text += part.text().map_or(0, str::len),
+        }
+    }
+    if media < MEDIA_TEXT_LEFT_OUT.max(text) {
+        return None;
+    }
+    let mut light = message.clone();
+    if let ChatMessage::System { content, .. }
+    | ChatMessage::User { content, .. }
+    | ChatMessage::Tool { content, .. }
+    | ChatMessage::Developer { content, .. }
+    | ChatMessage::Root { content, .. } = &mut light
+    {
+        if let MessageContent::Parts(parts) = content {
+            for part in parts {
+                match part {
+                    ContentPart::ImageUrl { image_url } => image_url.url = Arc::default(),
+                    ContentPart::AudioUrl { audio_url } => audio_url.url = Arc::default(),
+                    ContentPart::VideoUrl { video_url } => video_url.url = Arc::default(),
+                    ContentPart::InputAudio { input_audio } => input_audio.data = Arc::default(),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Some(light)
+}
+
 fn process_content_format_with_order(
     messages: &[ChatMessage],
     content_format: ChatTemplateContentFormat,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
 ) -> Result<Vec<Value>, PromptError> {
+    // The transform below writes a media part without its text under the
+    // OpenAI format, and under the string format wherever the template has
+    // placeholders: there the text stays out of the value from the start.
+    let drops_media_text =
+        matches!(content_format, ChatTemplateContentFormat::OpenAI) || placeholder_tokens.is_some();
     messages
         .iter()
         .map(|message| {
-            let mut message_json = serde_json::to_value(message)
+            let light = drops_media_text
+                .then(|| without_media_text(message))
+                .flatten();
+            let mut message_json = serde_json::to_value(light.as_ref().unwrap_or(message))
                 .map_err(|e| format!("Failed to serialize message: {e}"))?;
 
             if let Some(obj) = message_json.as_object_mut() {

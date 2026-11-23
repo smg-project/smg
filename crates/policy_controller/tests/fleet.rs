@@ -1344,6 +1344,11 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         // The KV events follow the fleet: the busy engine's held requests
         // stored blocks, its stream's batches reached its rank's cursor, and
         // its row's index holds every block the engine holds.
+        // The engine stores on while its requests are held, so the row moves
+        // for the whole case. The wait keeps the row it judged at rest and
+        // the asserts below read that row: a second read can meet the next
+        // batch between the two streams.
+        let mut at_rest = None;
         let stored = within(
             "the busy engine's blocks reach its row's index",
             PROBE_INTERVAL + ROOM,
@@ -1351,13 +1356,14 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
                 // The listener's stream and the store's own are two: they
                 // are read at rest, the cursor at the last sequence the
                 // listener heard and the index holding what it holds.
-                harness.heard(busy).first().is_some_and(|row| {
+                at_rest = harness.heard(busy).first().copied().filter(|row| {
                     row.indexed > 0
                         && row.indexed == row.held
                         && row
                             .cursor
                             .is_some_and(|cursor| cursor.applied >= 1 && cursor.applied == row.last)
-                })
+                });
+                at_rest.is_some()
             },
         )
         .await
@@ -1368,8 +1374,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             )
         })
         .expect("the KV events follow");
-        let heard = harness.heard(busy);
-        let fed = heard.first().expect("the busy engine's one rank");
+        let fed = at_rest.expect("the wait keeps the row it judged at rest");
         assert!(
             fed.last >= 1
                 && fed.cursor.is_some_and(|cursor| {

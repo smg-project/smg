@@ -95,6 +95,17 @@ impl TokenSpeedEncoderClient {
         Ok(client)
     }
 
+    /// Drops `endpoint`'s cached pool, for a worker that left: its
+    /// connections close once the calls in flight on them end. Nothing else
+    /// removes an entry, so a pool outlived its worker until the process
+    /// ended.
+    pub fn forget_cached(endpoint: &str) {
+        channel_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(endpoint);
+    }
+
     fn from_channel(channel: Channel) -> Self {
         Self {
             client:

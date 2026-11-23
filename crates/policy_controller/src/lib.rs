@@ -13,7 +13,8 @@
 //! - 4.1, the view ([`engine`]): [`RequestFacts`], [`Candidate`] rows with their
 //!   [`LoadRow`], the [`AffinityFacts`] column beside the rows, [`Constraints`]
 //!   and [`PoolFacts`]. Built once per decision by the host into a reused
-//!   buffer; no handle, no callback into the host. The values a report
+//!   buffer; no handle and no callback into the host, but for the hash
+//!   ring a host may lend with a request. The values a report
 //!   states under a name the document declares stand beside the rows too
 //!   ([`load`]): a stage reads one by its [`SignalColumn`].
 //! - 4.2, the decision ([`engine`]): an ordered [`Pick`] of up to

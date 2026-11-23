@@ -13,11 +13,13 @@ mod tests {
     use kv_index::compute_content_hash;
     use mock_worker::{config::Config as MockConfig, engine::EngineParams, grpc};
     use smg_grpc_client::{
+        engine_port::GrpcConnector,
         tokenspeed_proto::{GenerateRequest, SamplingParams, TokenizedInput},
         TokenSpeedSchedulerClient as SchedulerClient,
     };
     use smg_worker::{
-        kv_events::SubscriptionKind, load::monitor::WorkerMonitor, test_support::LoadReaders,
+        kv_events::SubscriptionKind, load::monitor::WorkerMonitor, registry::WorkerRegistry,
+        test_support::LoadReaders,
     };
     use tokio::{
         net::TcpListener,
@@ -78,6 +80,21 @@ mod tests {
         fn new() -> Self {
             let store = Arc::new(MemoryStore::new());
             let objects = WorkerObjects::new(Arc::clone(&store), ObjectsWake::default()).holder();
+            Self::over(store, objects)
+        }
+
+        /// [`Self::new`] over a holder whose objects state no overload
+        /// threshold, where the stock controller's state the program's
+        /// default.
+        fn unjudged() -> Self {
+            let registry = Arc::new(WorkerRegistry::new());
+            let objects = Objects::new(registry)
+                .with_connector(Arc::new(GrpcConnector))
+                .with_host_local_unchecked();
+            Self::over(Arc::new(MemoryStore::new()), Arc::new(objects))
+        }
+
+        fn over(store: Arc<MemoryStore>, objects: Arc<Objects<Members>>) -> Self {
             let feed = KvFeed::new(Arc::clone(&store), Arc::clone(&objects));
             Self {
                 store,
@@ -251,13 +268,26 @@ mod tests {
 
     /// A gRPC row that is not indexed streams its load records alone once
     /// the host hands a monitor that wants its loads, and has no stream
-    /// under a monitor that wants none.
+    /// under a monitor that wants none. A monitor that polls by need wants
+    /// the loads of a worker whose object states overload thresholds: it
+    /// judges the worker by them. Every object of the stock controller
+    /// states them, so there the row streams under such a monitor too.
     #[tokio::test]
     async fn a_row_that_is_not_indexed_streams_its_loads_where_the_monitor_wants_them() {
-        // Whether the monitor polls by need alone, and whether the row streams:
-        // a monitor with no reader of loads wants none of a worker's.
-        for (by_need, streams) in [(false, true), (true, false)] {
-            let f = Fixture::new();
+        // Whether the objects state thresholds, whether the monitor polls by
+        // need alone, and whether the row streams: a monitor with no reader
+        // of loads wants none of a worker that states no threshold.
+        let arms = [
+            (false, false, true),
+            (false, true, false),
+            (true, true, true),
+        ];
+        for (judged, by_need, streams) in arms {
+            let f = if judged {
+                Fixture::new()
+            } else {
+                Fixture::unjudged()
+            };
             let monitor = Arc::new(WorkerMonitor::new(
                 Arc::clone(f.objects.registry()),
                 Arc::new(LoadReaders::Blind),
@@ -271,7 +301,8 @@ mod tests {
                 f.lay(facts(SECOND, WireModes::GRPC, true));
                 f.new_slot(SECOND, None).await;
                 let (slot, _) = f.feed.collector().slot_ids(FIRST).await;
-                assert_eq!(slot.is_some(), streams, "by need: {by_need}");
+                let arm = format!("thresholds stated: {judged}, by need: {by_need}");
+                assert_eq!(slot.is_some(), streams, "{arm}");
             })
             .await
             .expect("the feed processes the indexed worker behind the other");

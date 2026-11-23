@@ -190,12 +190,13 @@ use super::{
 use crate::{
     engine::{
         decision::Decision,
+        decision_engine::DecodeRefused,
         decision_slot::DecisionSlot,
+        explain::{DecisionRecord, SampleCount, Samples},
         framework::{release, Engine},
         store_backed_engine::{
             decide_in, decider_of, decode_in, entry, issue, issue_decode, issue_pair, issuing,
-            pair_in, past_mark, summed, Buffers, DecisionCall, DecisionRecord, Entry, Part,
-            RequestForm, SampleCount, Samples, StorePins,
+            pair_in, past_mark, summed, Buffers, DecisionCall, Entry, Part, RequestForm, StorePins,
         },
         view::fingerprint,
     },
@@ -205,10 +206,9 @@ use crate::{
     },
     stages::lifecycle::Lifecycle,
     store::{
-        leases::DISPATCH_TTL, AtWork, DecodeIssue, DecodeRefused, GatewayId, LeaseRefused,
-        LookOutcome, MemoryStore, StoreSnapshot,
+        AtWork, DecodeIssue, GatewayId, LeaseRefused, LookOutcome, MemoryStore, StoreSnapshot,
     },
-    tracking::lease::{Lease, LeaseId, ReleaseReason},
+    tracking::lease::{Lease, LeaseId, ReleaseReason, DISPATCH_TTL},
 };
 
 /// What the deciders and the streams count on the controller's own side,
@@ -378,7 +378,8 @@ impl Shared {
                 Some(_) => engine.pair_position(request.model()),
                 None => engine.binding_position(request.model(), request.phase()),
             };
-            samples.push(answer.0, binding, taken, &answer.1, None, [None; 2]);
+            let asked = (taken.now, taken.gateway, request.id());
+            samples.push(answer.0, binding, asked, &answer.1, None, [None; 2]);
         }
         Ok(answer)
     }
@@ -1343,11 +1344,11 @@ pub(crate) mod tests {
         },
         stages::{lifecycle::Lifecycle, pickers::Best, registry::StageRegistry},
         store::{
-            leases::DISPATCH_TTL, DecodeIssue, Dispatch, GatewayId, HealthSink, LeaseState,
-            LeasesStore, MemoryStore, Said, StoreSnapshot, ViewBuffers, ViewFacts, ViewQuery,
-            WorkerFacts, WorkerStatus, WorkersStore,
+            DecodeIssue, GatewayId, HealthSink, LeaseState, LeasesStore, MemoryStore,
+            StoreSnapshot, ViewBuffers, ViewFacts, ViewQuery, WorkerFacts, WorkerStatus,
+            WorkersStore,
         },
-        tracking::lease::{Lease, LeaseId, ReleaseReason, Side},
+        tracking::lease::{Dispatch, Lease, LeaseId, ReleaseReason, Said, Side, DISPATCH_TTL},
     };
 
     /// How long a case waits for a decider before it fails.
@@ -3514,8 +3515,8 @@ pub(crate) mod tests {
     ) -> crate::store::AtWork {
         use crate::{
             engine::decision_slot::DecisionSlot,
-            store::{Hand, LookOutcome, Said},
-            tracking::lease::ReleaseReason,
+            store::{Hand, LookOutcome},
+            tracking::lease::{ReleaseReason, Said},
         };
 
         let now = Instant::now();
@@ -4167,6 +4168,25 @@ pub(crate) mod tests {
         assert!(bed.deciders.explain(1, GATEWAY, &[1]).is_none());
         assert!(bed.deciders.shared.samples.get().is_none());
         assert_eq!(bed.script.readers.lock().len(), 2);
+    }
+
+    /// A served decision that is kept is filed under the instant its
+    /// decider read its clock at, which is not the instant its frame was
+    /// received.
+    #[tokio::test]
+    async fn a_kept_served_decision_is_filed_under_its_deciders_instant() {
+        // Every read of the case's clock shows the take plus this much.
+        // The frame is received at the take.
+        const LATER: Duration = Duration::from_millis(250);
+        let mut document = PolicySpec::preset("random").expect("a preset");
+        document.generation = 1;
+        document.explain.sample = 1;
+        let mut bed = bed(Some(applied(&document)), true, (1, 8), [Step::At(LATER)]);
+        let answer = bed.ask(frame(1, 1)).await;
+        assert!(matches!(outcome(&answer), Outcome::Pick(_)));
+        let record = bed.deciders.explain(answer.term, GATEWAY, &[1]);
+        let record = record.expect("the kept decision");
+        assert_eq!(record.at, bed.script.taken + LATER);
     }
 
     #[test]

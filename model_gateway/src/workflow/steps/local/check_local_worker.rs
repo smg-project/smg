@@ -281,7 +281,8 @@ fn symphony_table_of(
 }
 
 /// Under `--parser symphony`, the registry's table reads a model it knows for every worker whose
-/// labels select no reader (none, or a reasoning name alone that no table answers to), whatever the
+/// labels select no reader (none, or a reasoning name alone that no table answers to or that gives
+/// way), whatever the
 /// gateway's `--tool-call-parser` and `--reasoning-parser` name (`regular::symphony::names::reads`). When
 /// they name another reader, the registration of the model's first worker says so: `Some(message)`
 /// while no worker of the model is registered, naming the model, both readers and the one used;

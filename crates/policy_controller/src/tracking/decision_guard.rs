@@ -74,14 +74,14 @@ use crate::{
     engine::{
         decision::{Decision, Target},
         decision_engine::{
-            DecideOutcome, DecisionEngine, DecisionRefused, HeldDecision, Leased, Request,
-            RequestMaker,
+            DecideOutcome, DecisionEngine, DecisionRefused, DecodeRefused, HeldDecision,
+            HeldDecode, Leased, Request, RequestMaker,
         },
         framework::{EncodeItems, EncodePlaced},
         view::WorkerId,
     },
-    store::{DecodeRefused, Dispatch, GatewayId, Said},
-    tracking::lease::{LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+    store::GatewayId,
+    tracking::lease::{Dispatch, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass},
 };
 
 /// Where a handle's decision came from, and where its reports go.
@@ -161,6 +161,10 @@ pub struct DecisionGuard<D: Deref<Target: DecisionEngine>> {
     /// chosen. A decode that owes a dispatch or an end was then picked by
     /// a decode call, and was issued with its prefill otherwise.
     later: bool,
+    /// The prompt size the decode side's words state: the lease's own, and
+    /// a decode call's from the call that picks the side. Nothing reads a
+    /// single's.
+    stated: u32,
     /// The target at that index.
     target: Target,
     owed: Owed,
@@ -282,11 +286,15 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         } else {
             Owed::Nothing
         };
+        // The size the decode side's words state until a decode call picks
+        // the side: the lease's own.
+        let stated = decided.lease.map_or(0, |leased| leased.lease.tokens);
         Self {
             arm,
             decided,
             index: 0,
             later,
+            stated,
             target,
             owed,
             decode,
@@ -301,10 +309,16 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         Some(HeldDecision {
             decision: &self.decided.decision,
             lease: &leased.lease,
-            decode_session: self.decided.decode_session,
             index: self.index,
             target: &self.target,
-            decode_chosen: matches!(self.decode, Owed::Later { .. }),
+            // Lent as the handle keeps them, with no test of the lease's
+            // side: a single's answer names no decode session, its size is
+            // the lease's own and its decode side never stands chosen.
+            decode: HeldDecode {
+                session: self.decided.decode_session,
+                tokens: self.stated,
+                chosen: matches!(self.decode, Owed::Later { .. }),
+            },
         })
     }
 
@@ -369,6 +383,22 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
             &HeldDecision<'_>,
         ) -> Result<DecideOutcome, DecisionRefused>,
     ) -> Result<&Decision, DecisionRefused> {
+        self.decode_asked(call)?;
+        Ok(self.decision())
+    }
+
+    /// Asks the handle's door by `call` for the decode side of its pair's
+    /// lease. A pick is taken, its first target with it, and the answer is
+    /// `None`. Where the door picked nothing the handle stands as it was,
+    /// and the answer is the door's own: its shed, or its queue.
+    fn decode_asked(
+        &mut self,
+        call: impl FnOnce(
+            &D::Target,
+            GatewayId,
+            &HeldDecision<'_>,
+        ) -> Result<DecideOutcome, DecisionRefused>,
+    ) -> Result<Option<Decision>, DecisionRefused> {
         let refused = |refused| Err(DecisionRefused::Decode(refused));
         if self.decided.lease.is_none() {
             return refused(DecodeRefused::NoLease);
@@ -385,8 +415,10 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         // decode call picked it already, or it was issued with its
         // prefill. A decode that stands chosen is decided once its prefill
         // is held: dispatched, and not ended. A file also counts a side's
-        // issues and refuses a call past the count's end. A handle sees
-        // one issue of a side at the most, and leaves that count to the
+        // issues and refuses a call past the count's end. A handle holds
+        // one issue of a side at a time: a placement's call that takes no
+        // decode releases the side it issued before the handle asks again
+        // ([`Self::decode_placed_under`]). It leaves that count to the
         // file.
         match (self.decided.pair(), self.owed, self.decode) {
             (false, ..) => return refused(DecodeRefused::NotChosen),
@@ -417,13 +449,67 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         if let Some((leased, target)) = answer.lease.zip(first) {
             self.decided.decision = answer.decision;
             self.decided.decode_session = answer.decode_session;
+            // The call issued the side under the size it stated.
+            self.stated = leased.lease.tokens;
             (self.index, self.target) = (0, *target);
             self.decode = self.decode.sent_later();
             if let Some(held) = &mut self.decided.lease {
                 held.due = leased.due;
             }
+            return Ok(None);
         }
-        Ok(self.decision())
+        Ok(Some(answer.decision))
+    }
+
+    /// [`Self::decide_decode_under`] for a placement, which takes a decode
+    /// itself and answers its host a shed by name
+    /// ([`Placement::decode_again`](super::Placement::decode_again)).
+    ///
+    /// `sendable` is asked of the targets of the call's pick, best first,
+    /// and the first it admits is taken ([`Self::take_decode`]): the
+    /// answer is then `None`. Otherwise the answer is the decision the
+    /// call made, and the handle stands as it stood before the call, on
+    /// the first decision's target with its decode chosen and booked
+    /// nowhere, so its host may ask again. That decision is the door's own
+    /// shed or queue, or a pick none of whose targets `sendable` admits:
+    /// the side such a pick issued is released by name
+    /// ([`ReleaseReason::CommitFailed`]).
+    ///
+    /// What stands again is the handle's own note of the pair. The engine
+    /// of a gateway's own process keeps no other, and a placement is held
+    /// by no other door: a door that keeps a file of leases answers a
+    /// second ask by its file.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::decide_decode`].
+    #[cfg(feature = "in-process")]
+    pub(crate) fn decode_placed_under(
+        &mut self,
+        maker: &impl RequestMaker,
+        now: Instant,
+        mut sendable: impl FnMut(&Target) -> bool,
+    ) -> Result<Option<Decision>, DecisionRefused> {
+        let (decision, lease) = (self.decided.decision, self.decided.lease);
+        let before = (self.decided.decode_session, self.stated, self.index);
+        let (target, chosen) = (self.target, self.decode);
+        let asked = self.decode_asked(|door, gateway, held| {
+            door.decide_decode_under(gateway, maker, held, now)
+        })?;
+        if asked.is_some() {
+            return Ok(asked);
+        }
+        let pick = self.decided.decision.pick();
+        let first = pick.and_then(|pick| pick.targets.iter().position(&mut sendable));
+        if first.and_then(|index| self.take_decode(index)).is_some() {
+            return Ok(None);
+        }
+        self.released_decode(ReleaseReason::CommitFailed, now);
+        let unsent = self.decided.decision;
+        (self.decided.decision, self.decided.lease) = (decision, lease);
+        (self.decided.decode_session, self.stated, self.index) = before;
+        (self.target, self.decode) = (target, chosen);
+        Ok(Some(unsent))
     }
 
     /// Whether the pair's decode side stands chosen: its request stated a
@@ -443,6 +529,51 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     #[must_use]
     pub fn lease(&self) -> Option<&Leased> {
         self.decided.lease.as_ref()
+    }
+
+    /// Whether the handle still owes its lease a word on some side: a
+    /// dispatch, an end, or the release in their place. A handle that
+    /// owes nothing says nothing at its drop.
+    #[must_use]
+    pub(crate) fn owes(&self) -> bool {
+        !matches!((self.owed, self.decode), (Owed::Nothing, Owed::Nothing))
+    }
+
+    /// Whether the handle is of a pair that asked its decode later and owes
+    /// nothing on either side any more: both sides ended, or the prefill
+    /// ended with the decode still chosen, which left with it. A decode's
+    /// send said then meets no side.
+    #[cfg(feature = "in-process")]
+    #[must_use]
+    pub(crate) fn later_ended(&self) -> bool {
+        self.later && !self.owes()
+    }
+
+    /// The engine of this process the handle decides by. `None` for a
+    /// handle over a link.
+    #[cfg(feature = "in-process")]
+    #[cfg_attr(
+        not(feature = "client"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "a handle over a link alone has no engine"
+        )
+    )]
+    #[must_use]
+    pub(crate) fn door(&self) -> Option<&D> {
+        match &self.arm {
+            Arm::Engine { door, .. } => Some(door),
+            #[cfg(feature = "client")]
+            Arm::Link(_) => None,
+        }
+    }
+
+    /// The target the handle names at its dispatch: the pick's first, or
+    /// the one a take moved to. A pair's decode is in it.
+    #[cfg(feature = "in-process")]
+    #[must_use]
+    pub(crate) fn target(&self) -> &Target {
+        &self.target
     }
 
     /// Takes the target at `index` of the pick, best first: the one the
@@ -648,6 +779,29 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         self.decode = self.release(self.decode, reason, now);
     }
 
+    /// Gives up the prefill side alone, a single's one side, as
+    /// [`Self::released_decode`] gives up the decode's. A sent prefill
+    /// completes as cancelled on the worker it was sent to, with the span
+    /// from its dispatch to `now`. An issued prefill is released by name
+    /// under `reason`. A decode that still stands chosen leaves with it,
+    /// as it leaves with the prefill's end ([`Self::completed`]).
+    #[cfg(feature = "in-process")]
+    pub(crate) fn released_prefill(&mut self, reason: ReleaseReason, now: Instant) {
+        self.owed = self.release(self.owed, reason, now);
+        if self.decode_chosen() {
+            self.decode = Owed::Nothing;
+        }
+    }
+
+    /// Whether the prefill's end would take the pair's decode with it: the
+    /// prefill went out, and the decode still stands chosen
+    /// ([`Self::decode_chosen`]).
+    #[cfg(feature = "in-process")]
+    #[must_use]
+    pub(crate) fn end_takes_decode(&self) -> bool {
+        matches!(self.owed, Owed::Completion { .. }) && self.decode_chosen()
+    }
+
     fn release(&self, owed: Owed, reason: ReleaseReason, now: Instant) -> Owed {
         match owed {
             Owed::Nothing | Owed::Later { .. } => {}
@@ -664,12 +818,8 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
                 let cancelled = Outcome {
                     side,
                     served: worker,
-                    status: 0,
-                    class: TransportClass::Cancelled,
-                    ttft_micros: 0,
-                    tokens_in: 0,
-                    tokens_out: 0,
                     duration_micros: micros(now.saturating_duration_since(sent)),
+                    ..Outcome::reported(0, TransportClass::Cancelled)
                 };
                 self.say(lease, side, Said::Completed(cancelled), now);
             }
@@ -748,7 +898,7 @@ impl<D: Deref<Target: DecisionEngine>> Drop for DecisionGuard<D> {
     /// handle that owes nothing says nothing and reads no clock.
     fn drop(&mut self) {
         // The common drop: the request completed, on every side.
-        if matches!((self.owed, self.decode), (Owed::Nothing, Owed::Nothing)) {
+        if !self.owes() {
             return;
         }
         self.released(ReleaseReason::Abandoned, Instant::now());
@@ -785,8 +935,8 @@ mod tests {
         engine::{
             decision::{Decision, ShadowKind, Target, Targets},
             decision_engine::{
-                DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Request,
-                RequestMaker, SweepOutcome,
+                DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused,
+                HeldDecision, Request, RequestMaker, SweepOutcome,
             },
             framework::{EncodeItems, EncodePlaced, Picker, TieBand},
             prompt_hashes::{HashSeeds, PromptHashes},
@@ -798,15 +948,14 @@ mod tests {
                 },
                 StoreBackedEngine,
             },
-            view::{Candidate, Identity, RequestFacts, WireModes, WorkerId},
+            view::{Candidate, Identity, RequestFacts, Session, WorkerId},
         },
         policies::random::Random,
         stages::lifecycle::Lifecycle,
-        store::{
-            pairing::Refusal, DecodeRefused, Dispatch, GatewayId, HealthSink, LeaseState,
-            LeasesStore, MemoryStore, Said, WorkersStore,
+        store::{GatewayId, HealthSink, LeaseState, LeasesStore, MemoryStore, WorkersStore},
+        tracking::lease::{
+            Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass,
         },
-        tracking::lease::{Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
     };
 
     /// What a stage heard of a lease.
@@ -927,6 +1076,11 @@ mod tests {
         const HELD: usize = 488;
         assert_eq!(size_of::<DecisionGuard<Arc<StoreBackedEngine>>>(), HELD);
         assert_eq!(size_of::<DecisionGuard<&StoreBackedEngine>>(), HELD);
+        // A placement is the handle and what its host reads of the answer:
+        // two worker pointers, the routing key, the profile's label and the
+        // label of a pair's decode side.
+        #[cfg(feature = "in-process")]
+        assert_eq!(size_of::<crate::tracking::Placement<'_>>(), HELD + 80);
     }
 
     /// A request that is served: its lease is booked at the issue, moves
@@ -1701,7 +1855,8 @@ mod tests {
     }
 
     /// What a handle lent with a word or a decode call: the word, the
-    /// index of the target taken, and whether the decode stood chosen.
+    /// index of the target taken, and whether the decode side it lent stood
+    /// chosen.
     type Lent = Mutex<Vec<(&'static str, u8, bool)>>;
 
     /// A door that keeps what each word and each decode call was lent.
@@ -1724,8 +1879,8 @@ mod tests {
             held: &HeldDecision<'_>,
             now: Instant,
         ) -> Result<DecideOutcome, DecisionRefused> {
-            let lent = ("decode call", held.index, held.decode_chosen);
-            self.1.lock().push(lent);
+            let chosen = held.decode.chosen;
+            self.1.lock().push(("decode call", held.index, chosen));
             DecisionEngine::decide_decode_under(self.0, gateway, maker, held, now)
         }
 
@@ -1748,7 +1903,8 @@ mod tests {
                 Said::Completed(_) => "ended",
                 Said::Released(..) => "released",
             };
-            self.1.lock().push((word, held.index, held.decode_chosen));
+            let chosen = held.decode.chosen;
+            self.1.lock().push((word, held.index, chosen));
             DecisionEngine::say(self.0, gateway, held, said, now);
         }
 
@@ -1770,10 +1926,6 @@ mod tests {
             DecisionEngine::prompt_hashes(self.0, model, tokens, text, seeds)
         }
 
-        fn pair_refusal(&self, model: &str, wires: WireModes) -> Option<Refusal> {
-            DecisionEngine::pair_refusal(self.0, model, wires)
-        }
-
         fn faults(&self) -> u64 {
             DecisionEngine::faults(self.0)
         }
@@ -1787,7 +1939,9 @@ mod tests {
     /// handle. An engine with no file of its leases tells its stages from
     /// it: the index names the target taken at an end too, where the word
     /// carries none, and a decode that stood chosen is known at its
-    /// dispatch, which is its issue.
+    /// dispatch, which is its issue. A handle lends its decode side with
+    /// every word: a single's lends no session and a side that never stood
+    /// chosen.
     #[test]
     fn a_handle_lends_the_index_taken_and_whether_the_decode_stood_chosen() {
         let door = pair_door(1, 2).expect("a pair door");
@@ -1844,6 +1998,20 @@ mod tests {
             ]
         );
         let _ = words();
+        // A single's handle lends no session and a side that never stood
+        // chosen: its words carry nothing of a pair's.
+        let (door, _) = bed();
+        let lends = Lends(&door, Lent::default());
+        let mut handle =
+            DecisionGuard::decide(&lends, GATEWAY, &request(b"single", 7), now).expect("a handle");
+        let lent = handle.held().expect("a leased decision").decode;
+        assert_eq!((lent.session, lent.chosen), (Session::NONE, false));
+        handle.dispatched(now);
+        drop(handle);
+        assert_eq!(
+            mem::take(&mut *lends.1.lock()),
+            [("sent", 0, false), ("ended", 0, false)]
+        );
     }
 
     /// A decode side given up while it stood chosen takes no call. The

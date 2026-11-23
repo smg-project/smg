@@ -1,17 +1,13 @@
 //! The holder of a replica's worker objects: it follows the store's
 //! membership and writes the registry. A host can also ask it to follow
-//! the rows' status, to write the store's overload verdicts on the
-//! objects, or to build each object with the thresholds its own load
-//! monitor judges overload by.
+//! the rows' status, or to build each object with the thresholds its own
+//! load monitor judges overload by.
 
 use std::{
     collections::{HashMap, HashSet},
     fmt,
     sync::{
-        atomic::{
-            AtomicBool, AtomicU64,
-            Ordering::{Acquire, Relaxed, Release},
-        },
+        atomic::{AtomicU64, Ordering::Relaxed},
         Arc,
     },
 };
@@ -19,40 +15,35 @@ use std::{
 use parking_lot::{Mutex, RwLock};
 use smg_worker::{
     connection::engine::EngineConnector,
-    health::overload::{log_overload_edge, OverloadReading, OverloadThresholds},
+    health::overload::OverloadThresholds,
     identity::{basic::Worker, endpoint::Endpoint},
     registry::{Generation, WorkerId as ObjectId, WorkerRegistry},
 };
 use tracing::warn;
 
+#[cfg(feature = "in-process")]
+use super::members::{Members, Stated};
+#[cfg(feature = "in-process")]
+use super::reach::{ListReach, Reach};
 use super::{
     credentials::Credentials,
     found::facts,
     membership_writer::{MembershipWriteOutcome, MembershipWriteRefused},
     object::{builder, dial_address, status, thresholds, unchecked},
+    remainder::RowRemainder,
+};
+#[cfg(feature = "in-process")]
+use crate::{
+    document::spec::Pairing,
+    engine::{FixedFacts, LentList, PartnerClasses, Role},
+    store::pairing::{Member, PairClasses},
 };
 use crate::{
-    engine::view::{LoadRow, WorkerId},
-    store::{
-        MembershipChange, MembershipTail, MemoryStore, Overload, Reachability, WorkerFacts,
-        WorkerRow, WorkersStore,
-    },
+    engine::view::WorkerId,
+    store::{MembershipChange, MembershipTail, Reachability, WorkerFacts, WorkerRow, WorkersStore},
 };
 
-/// What a host keeps of a registry's generation when it derives nothing
-/// from one: the members.
-#[derive(Debug)]
-pub struct Members(Arc<[Arc<dyn Worker>]>);
-
-impl Generation for Members {
-    fn of(members: Arc<[Arc<dyn Worker>]>) -> Self {
-        Self(members)
-    }
-
-    fn members(&self) -> &Arc<[Arc<dyn Worker>]> {
-        &self.0
-    }
-}
+mod host_count;
 
 /// The row an object stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,7 +67,9 @@ struct Place {
 
 /// A row and the object that stands for it.
 struct Laid {
-    standing: RowRevision,
+    /// What of the row the object does not hold as stated, with the row's
+    /// id and the revision the object was built from.
+    remainder: Arc<RowRemainder>,
     object: Arc<dyn Worker>,
     /// Whether a registration handed the object in. The holder built it
     /// from the row otherwise.
@@ -260,18 +253,21 @@ pub struct Objects<G> {
     handing: Mutex<()>,
     /// How many lays found no object handed in where the host hands them.
     unhanded: AtomicU64,
-    /// The epoch of the store's overload verdicts the objects were last
-    /// held against ([`Self::mirror_overload`]). Held through a walk: one
-    /// mirrors at a time.
-    mirrored: Mutex<Option<u64>>,
-    /// Whether the registry took an object since the last walk began. Its
-    /// replacement releases a verdict and a new object starts with none,
-    /// so the next mirror walks whatever the epoch says.
-    mirror_owed: AtomicBool,
     /// Where the last read ended. Held through a read: one follows at a
     /// time.
     read_to: Mutex<Place>,
     held: RwLock<Held>,
+    /// How many times a kept object's entry moved in place in what a
+    /// generation's pair classes are derived from: the row's wires, its
+    /// engine kind or its pairing descriptor. Stepped under the entry's
+    /// write lock, and read by an ask with no lock
+    /// ([`Self::pair_classes`]).
+    #[cfg(feature = "in-process")]
+    moved_in_place: AtomicU64,
+    /// How many members of a generation the holder held no row's object
+    /// for when it cut the generation's lists ([`Self::unstated`]).
+    #[cfg(feature = "in-process")]
+    unstated: AtomicU64,
 }
 
 impl<G> fmt::Debug for Objects<G> {
@@ -333,17 +329,16 @@ impl<G> Objects<G> {
     /// the object states, at each load report of its worker.
     ///
     /// Without it an object built from a row states no threshold, and a
-    /// load monitor writes no verdict on it: the store's verdict is the one
-    /// such a host mirrors ([`Self::mirror_overload`]). An object has one
-    /// judge: a host that builds its objects with thresholds does not also
-    /// mirror the store's verdict on them.
+    /// load monitor writes no verdict on it: the store alone judges such a
+    /// worker, for its own decisions, and the holder does not copy its
+    /// verdict onto the object's flag.
     ///
-    /// The two judges do not read the same thresholds. A policy document's
-    /// binding thresholds, which the store reads under a row that names
-    /// none, are not read here: `defaults` stands in their place, and with
-    /// no signal in `defaults` a row that names none has no judge at all.
-    /// The store judges an engine's ranks together, and the monitor judges
-    /// each object by its own report.
+    /// The monitor and the store do not read the same thresholds. A policy
+    /// document's binding thresholds, which the store reads for each signal
+    /// a row names none for, are not read here: `defaults` stands in their
+    /// place, and with no signal in `defaults` the monitor does not judge a
+    /// row that names none. The store judges an engine's ranks together, and
+    /// the monitor judges each object by its own report.
     #[must_use]
     pub fn with_overload_thresholds(mut self, defaults: OverloadThresholds) -> Self {
         self.overload_defaults = Some(defaults);
@@ -367,10 +362,12 @@ impl<G: Generation> Objects<G> {
             offered: Mutex::new(Vec::new()),
             handing: Mutex::new(()),
             unhanded: AtomicU64::new(0),
-            mirrored: Mutex::new(None),
-            mirror_owed: AtomicBool::new(false),
             read_to: Mutex::new(Place::default()),
             held: RwLock::new(Held::default()),
+            #[cfg(feature = "in-process")]
+            moved_in_place: AtomicU64::new(0),
+            #[cfg(feature = "in-process")]
+            unstated: AtomicU64::new(0),
         }
     }
 
@@ -434,12 +431,14 @@ impl<G: Generation> Objects<G> {
                 .values()
                 .filter(|laid| {
                     held.facts
-                        .get(&laid.standing.row)
+                        .get(&laid.remainder.standing.row)
                         .is_some_and(|dialing| dial_address(dialing) == address)
-                        && credentials.of(address, laid.standing.row).as_ref()
+                        && credentials
+                            .of(address, laid.remainder.standing.row)
+                            .as_ref()
                             != laid.object.api_key()
                 })
-                .map(|laid| laid.standing.row)
+                .map(|laid| laid.remainder.standing.row)
                 .collect()
         };
         let mut laid = 0;
@@ -576,71 +575,6 @@ impl<G: Generation> Objects<G> {
         self.unhanded.load(Relaxed)
     }
 
-    /// Write the overload verdicts `store` publishes on the objects. An
-    /// object reads overloaded where any row of its worker is published
-    /// under a verdict, and clear where none is. The holder judges
-    /// nothing. The registry makes each write
-    /// ([`WorkerRegistry::set_worker_overloaded`]), so its counters and its
-    /// gauge move once an edge. An edge is said in the worker crate's one
-    /// line ([`log_overload_edge`]), under the source `policy store`.
-    ///
-    /// A host calls it behind each publication it makes. It walks the
-    /// objects only where the world's verdicts moved since the last walk
-    /// ([`StoreSnapshot::overload_epoch`](crate::store::StoreSnapshot::overload_epoch)),
-    /// or the registry took an object since. Return how many flags moved.
-    ///
-    /// Calls run one at a time, and each reads the world of its instant
-    /// inside that turn. A late caller so cannot write an older world's
-    /// verdicts over a newer one's, and a host needs no turn of its own
-    /// around the call. What the walk needs of the world is taken inside
-    /// its load, which is let go ahead of the registry's writes and the
-    /// edges' lines.
-    ///
-    /// The flag follows the world that shows a verdict by one call: a
-    /// world that a decision's own build published is mirrored at the
-    /// host's next.
-    ///
-    /// The line states the worker's published figures and the thresholds
-    /// its row names for itself. They need not explain the verdict. The
-    /// store judges an engine's ranks together, and under the pool's
-    /// thresholds where the row names none.
-    pub fn mirror_overload(&self, store: &MemoryStore) -> usize {
-        let mut mirrored = self.mirrored.lock();
-        // The objects whose flag is not their rows' verdict, each with the
-        // verdict and what its edge's line states.
-        let stale = store.with_snapshot(|world| {
-            let owed = self.mirror_owed.swap(false, Acquire);
-            let epoch = world.overload_epoch();
-            if !owed && *mirrored == Some(epoch) {
-                return Vec::new();
-            }
-            *mirrored = Some(epoch);
-            let mut over: Vec<WorkerId> = world.overloaded().map(|row| row.id).collect();
-            over.sort_unstable();
-            let held = self.held.read();
-            let stale = held.rows.values().filter_map(|laid| {
-                let row = laid.standing.row;
-                let verdict = over.binary_search(&row).is_ok();
-                if laid.object.is_overloaded() == verdict {
-                    return None;
-                }
-                let own = held.facts.get(&row).map(|facts| facts.overload);
-                let load = world.first_row_of(row).and_then(|row| row.load);
-                let figures = reading(load, own.unwrap_or_default());
-                Some((Arc::clone(&laid.object), verdict, figures))
-            });
-            stale.collect::<Vec<_>>()
-        });
-        let mut edges = 0;
-        for (object, verdict, figures) in stale {
-            if self.registry.set_worker_overloaded(&object, verdict) {
-                edges += 1;
-                log_overload_edge(object.as_ref(), verdict, &figures, MIRRORED_FROM);
-            }
-        }
-        edges
-    }
-
     /// The registry the objects stand in.
     pub fn registry(&self) -> &Arc<WorkerRegistry<G>> {
         &self.registry
@@ -650,7 +584,50 @@ impl<G: Generation> Objects<G> {
     /// was built from; `None` for an id the holder laid no object under, or
     /// one whose row went.
     pub fn standing(&self, object: &ObjectId) -> Option<RowRevision> {
-        self.held.read().rows.get(object).map(|laid| laid.standing)
+        let held = self.held.read();
+        held.rows.get(object).map(|laid| laid.remainder.standing)
+    }
+
+    /// What the row of the object under `object` states and the object
+    /// does not hold as stated: the facts a decision reads of the row
+    /// alone among them. `None` as [`Self::standing`] answers it. The
+    /// remainder is shared with the entry: a row laid again gets another.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the controller's service reads it once its worker objects lead"
+        )
+    )]
+    pub(crate) fn remainder(&self, object: &ObjectId) -> Option<Arc<RowRemainder>> {
+        let held = self.held.read();
+        held.rows
+            .get(object)
+            .map(|laid| Arc::clone(&laid.remainder))
+    }
+
+    /// The row the object under `object` stands for, read back from the
+    /// object and what the holder keeps beside it, the two as one turn
+    /// of the entry holds them. It is the row the object was laid from,
+    /// with the object's own status: no table of rows is read. `None`
+    /// as [`Self::standing`] answers it.
+    ///
+    /// A kept object whose row moved with no hand-in
+    /// ([`Self::unhanded`]) states its key, role, models, labels, cache
+    /// block size and bootstrap port as it was handed in, and as the
+    /// engine the address it dials, where the moved row names one.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the controller's service reads it once its worker objects lead"
+        )
+    )]
+    pub(crate) fn row_of(&self, object: &ObjectId) -> Option<WorkerRow> {
+        let held = self.held.read();
+        held.rows
+            .get(object)
+            .map(|laid| laid.remainder.row(laid.object.as_ref()))
     }
 
     /// The row and revision the holder built this object from. A writer
@@ -661,7 +638,7 @@ impl<G: Generation> Objects<G> {
             .rows
             .get(id)
             .filter(|laid| Arc::ptr_eq(&laid.object, object))
-            .map(|laid| laid.standing)
+            .map(|laid| laid.remainder.standing)
     }
 
     /// The registry's id of the object that stands for `row`.
@@ -828,7 +805,9 @@ impl<G: Generation> Objects<G> {
     /// that does not stand as its object was built is laid again. No
     /// revision held is trusted alone here: behind a gap of the tail, as in
     /// another history, a row under a held id and revision may be another
-    /// life with other facts. The facts are compared beside it.
+    /// life with other facts. The facts are compared beside it. A row that
+    /// stands so may still be another life, made by another or admitted at
+    /// another time: its object stays, and its entry is stated again.
     ///
     /// A row that went leaves its object's place to the life that took its
     /// URL, where a registration has that life's object on offer: the
@@ -851,7 +830,13 @@ impl<G: Generation> Objects<G> {
         }
         for row in rows {
             if self.stands(row) {
+                if self.remade(row) {
+                    self.restate(row);
+                }
                 self.follow_status(store, row.id);
+                // The store may have given the row a new place in its
+                // counts, which holds no count yet: a lay hands its own.
+                self.counted(store, row.id);
             } else {
                 self.lay(store, row);
             }
@@ -883,7 +868,19 @@ impl<G: Generation> Objects<G> {
                 .objects
                 .get(&row.id)
                 .and_then(|object| held.rows.get(object))
-                .is_some_and(|laid| laid.standing.revision == row.revision)
+                .is_some_and(|laid| laid.remainder.standing.revision == row.revision)
+    }
+
+    /// Whether the entry kept for `row` names another maker of the row, or
+    /// another time it was admitted at, than the row states.
+    fn remade(&self, row: &WorkerRow) -> bool {
+        let held = self.held.read();
+        held.objects
+            .get(&row.id)
+            .and_then(|object| held.rows.get(object))
+            .is_some_and(|laid| {
+                laid.remainder.maker != row.maker || laid.remainder.admitted_at != row.admitted_at
+            })
     }
 
     /// Settle the object of `id` against the row as the store holds it. A
@@ -962,6 +959,9 @@ impl<G: Generation> Objects<G> {
             self.missed(row, "the object that stands is kept");
             self.restate(row);
             self.follow_status(store, row.id);
+            // No object is put: the one kept is the row's count still,
+            // at whatever place the store gives the row now.
+            self.counted(store, row.id);
             return;
         }
         if self.built_kept {
@@ -999,7 +999,17 @@ impl<G: Generation> Objects<G> {
         let Some(laid) = entry.and_then(|id| held.rows.get_mut(id)) else {
             return;
         };
-        laid.standing.revision = row.revision;
+        let remainder = RowRemainder::of(row);
+        // What a generation's pair classes are derived from moves here with
+        // no publish: the next ask derives them again.
+        #[cfg(feature = "in-process")]
+        if remainder.wire_modes != laid.remainder.wire_modes
+            || remainder.engine_kind != laid.remainder.engine_kind
+            || remainder.pairing != laid.remainder.pairing
+        {
+            self.moved_in_place.fetch_add(1, Relaxed);
+        }
+        laid.remainder = Arc::new(remainder);
         held.state(row);
     }
 
@@ -1033,6 +1043,8 @@ impl<G: Generation> Objects<G> {
         if stands {
             self.restate(row);
             self.copy_status(store, row.id);
+            // As for an object that is kept: no put hands the count.
+            self.counted(store, row.id);
             return;
         }
         let at = status(row.status);
@@ -1149,20 +1161,17 @@ impl<G: Generation> Objects<G> {
             entries.rows.insert(
                 id,
                 Laid {
-                    standing: RowRevision {
-                        row: row.id,
-                        revision: row.revision,
-                    },
+                    remainder: Arc::new(RowRemainder::of(row)),
                     object: Arc::clone(&object),
                     handed,
                 },
             );
         }
         self.registry.register_or_replace(object);
-        // Behind the registry's write, and released to the mirror that
-        // takes it: a mirror that reads the mark finds the object in its
-        // place.
-        self.mirror_owed.store(true, Release);
+        // Behind the registry's write: an object laid in another's place
+        // takes the standing object's running state there, and with it the
+        // leases the store counted on that object.
+        self.counted(store, row.id);
         if handed {
             self.copy_status(store, row.id);
         } else {
@@ -1171,18 +1180,187 @@ impl<G: Generation> Objects<G> {
     }
 }
 
-/// Who judged a verdict the holder mirrors, as the edge's line says it.
-const MIRRORED_FROM: &str = "policy store";
+#[cfg(feature = "in-process")]
+impl Objects<Members> {
+    /// `generation`'s workers of `role`, in the registry's order, lent with
+    /// the cell beside them and with what the holder's rows say of each
+    /// ([`FixedFacts`]): for a host that decides over the registry's worker
+    /// lists. A single request's list is the workers of [`Role::Single`]
+    /// alone. A host takes a model's generation from the registry
+    /// ([`WorkerRegistry::model_generation`]).
+    ///
+    /// A generation's lists are cut at its first ask, once, by one pass
+    /// over its members and one read of the holder's rows, whoever
+    /// published it: the holder's own write, or another writer of the
+    /// registry. Asks that meet there wait for that one pass. Every later
+    /// ask is one read. A generation keeps what its first ask read for as
+    /// long as it stands, and a membership change publishes another.
+    ///
+    /// A fact these lists carry does not move within a row's life: every
+    /// registration path starts another life where the image bit differs,
+    /// which publishes. A raw store write that moves the bit in place is
+    /// not published where the holder keeps a handed-in object: the object
+    /// stands as it was handed in, and a generation keeps the bit its
+    /// first ask read. One first asked before the holder follows the write
+    /// lends the old bit until the model's next membership change. One
+    /// first asked after that lends the row's new bit.
+    ///
+    /// A member the holder holds no row's object for is left out of the
+    /// lists and counted ([`Self::unstated`]). So every worker lent states
+    /// its row's id, and a decision's target names a worker by that id and
+    /// by its place in the list lent, not among the generation's members.
+    ///
+    /// The first ask of a generation reads the registry's id of each
+    /// member, and then the holder's entry once, under its read lock and
+    /// with no other lock taken under it. The holder asks no list and
+    /// calls nothing of the engine while it writes its entry. So an ask
+    /// and a membership change can wait on each other for the length of
+    /// the entry's lock, and never in a cycle: neither holds a lock while
+    /// it takes the other's.
+    #[must_use]
+    pub fn lent<'a>(&self, generation: &'a Members, role: Role) -> LentList<'a> {
+        generation.lent(role, |members| self.fixed_facts(members))
+    }
 
-/// What the line of a mirrored edge states: the figures the worker's
-/// published row carries, zero where it has none, and the thresholds its
-/// row names for itself.
-fn reading(load: Option<LoadRow>, own: Overload) -> OverloadReading {
-    OverloadReading {
-        waiting_requests: load.map_or(0, |load| i64::from(load.queued)),
-        kv_pressure: load.map_or(0.0, |load| f64::from(load.active_kv_permille) / 1_000.0),
-        // The row's own, with no default under them.
-        thresholds: OverloadThresholds::resolve(&thresholds(&own), OverloadThresholds::default()),
+    /// Who can dial each worker of the list [`Self::lent`] lends for
+    /// `role`: the wires the worker's row states and the gateways that
+    /// dial it, at the worker's place in that list. A host that decides
+    /// for one gateway reads it for the places that gateway may take.
+    ///
+    /// The reach is cut with the generation's lists, by the same pass and
+    /// the same read of the holder's rows, at the generation's first ask
+    /// of either. So it holds as many workers as the list lent, in the
+    /// list's order, and a decision that takes both of one generation
+    /// reads the two as one pass saw them.
+    ///
+    /// Who dials a worker moves within a row's life. Where the holder
+    /// keeps a handed-in object that move publishes nothing, and the
+    /// generation's reach stands as it was cut until the model's next
+    /// membership change, as its lists do.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "a controller's deciding thread asks it once it decides by the engine over worker lists"
+        )
+    )]
+    pub(crate) fn reach<'a>(&self, generation: &'a Members, role: Role) -> &'a ListReach {
+        generation.reach(role, |members| self.fixed_facts(members))
+    }
+
+    /// How many members were left out of the lists so far: a worker
+    /// another writer registered, or one whose row's object was replaced
+    /// or dropped between its generation's publish and that generation's
+    /// first ask.
+    pub fn unstated(&self) -> u64 {
+        self.unstated.load(Relaxed)
+    }
+
+    /// What the holder's rows say of each of `members`, in their order:
+    /// whether the worker takes images, the row's id, and who can dial the
+    /// worker. `None` for a member the holder holds no row's object for,
+    /// which is counted.
+    fn fixed_facts(&self, members: &[Arc<dyn Worker>]) -> Box<[Option<Stated>]> {
+        // The registry's ids first: the entry's lock is not held across a
+        // read of the registry.
+        let id_of = |member: &Arc<dyn Worker>| self.registry.get_id_by_url(member.url());
+        let ids: Vec<Option<ObjectId>> = members.iter().map(id_of).collect();
+        let held = self.held.read();
+        let stated = members.iter().zip(ids).map(|(member, id)| {
+            let laid = id.and_then(|id| held.rows.get(&id));
+            let laid = laid.filter(|laid| Arc::ptr_eq(&laid.object, member));
+            if laid.is_none() {
+                self.unstated.fetch_add(1, Relaxed);
+            }
+            laid.map(|laid| Stated {
+                facts: FixedFacts {
+                    vision: laid.remainder.vision,
+                    id: Some(laid.remainder.standing.row),
+                    ..FixedFacts::default()
+                },
+                reach: Reach::of(&laid.remainder),
+            })
+        });
+        stated.collect()
+    }
+}
+
+#[cfg(feature = "in-process")]
+impl Objects<Members> {
+    /// The pair classes of `generation`'s prefill and decode lists under
+    /// the pairing mode `mode`: each worker's class by its place in the
+    /// list AS LENT ([`Self::lent`]), and the table of the classes that
+    /// pair. A member the lists leave out has no place and no class: a
+    /// caller numbers nothing by the generation's own members.
+    ///
+    /// The verdicts are the store's own pairing rule and no other
+    /// ([`PairClasses::derive`]), over one member for each lent worker,
+    /// made of what the worker's row states: its wires, its engine kind and
+    /// its pairing descriptor. A lent worker whose row's object was
+    /// replaced or ended before a set is derived pairs with nobody in that
+    /// set: class `0`. A set that stands is not derived again for a worker
+    /// that goes later. The generation is the registry's old one by then,
+    /// and its classes stand as its lists do.
+    ///
+    /// A write that hands no object in leaves a kept object standing, and
+    /// publishes nothing. Such a write can move the row's engine kind and
+    /// its descriptor in place, and a raw store write its wires too: every
+    /// registration path starts another life where the wires differ. So
+    /// the holder counts those moves, of any model's row, and a generation
+    /// keeps each set of classes under its mode and the count its ask
+    /// read. An ask reads the count with one atomic load. Where a set
+    /// stands under it, the ask is a walk of the sets made before it, one
+    /// step each, and takes no lock. Where none stands, the ask derives
+    /// one: behind the cut of the lists, it reads the holder's entry once,
+    /// under its read lock, and runs the rule with that lock let go. Its
+    /// work grows with the two lists and with the pairs of offers that
+    /// differ among them. The sets made before stay where they are until
+    /// the generation falls: one for each such move a later ask saw, and
+    /// for each mode asked. A decision under way keeps the set it read.
+    ///
+    /// The holder calls nothing of the engine while it writes its entry,
+    /// and an ask holds no lock while it takes the entry's.
+    #[must_use]
+    pub fn pair_classes<'a>(&self, generation: &'a Members, mode: Pairing) -> &'a PartnerClasses {
+        // Read ahead of the entry: a set kept under this count is derived
+        // from an entry at least as new, since the count steps under the
+        // entry's write lock.
+        let moved = self.moved_in_place.load(Relaxed);
+        generation.pair_classes((moved, mode), || self.derive_pairs(generation, mode))
+    }
+
+    /// The classes of `generation`'s two lists as lent, derived now.
+    fn derive_pairs(&self, generation: &Members, mode: Pairing) -> PartnerClasses {
+        /// A row as the rule reads it.
+        fn member(row: &Arc<RowRemainder>) -> Member<'_> {
+            let descriptor = row.pairing.as_deref();
+            Member::new(
+                row.standing.row,
+                row.wire_modes,
+                &row.engine_kind,
+                descriptor,
+            )
+        }
+        let lists = [Role::Prefill, Role::Decode].map(|role| self.lent(generation, role));
+        // What the row of each lent worker states, where the row's object
+        // still stands for it: read under the entry's lock, which is let
+        // go before the rule runs.
+        let stated = {
+            let held = self.held.read();
+            lists.map(|list| -> Vec<Option<Arc<RowRemainder>>> {
+                let facts = list.facts.unwrap_or_default();
+                let row = |(worker, fact): (&Arc<dyn Worker>, &FixedFacts)| {
+                    let laid = held.rows.get(held.objects.get(&fact.id?)?)?;
+                    Arc::ptr_eq(&laid.object, worker).then(|| Arc::clone(&laid.remainder))
+                };
+                list.workers.iter().zip(facts).map(row).collect()
+            })
+        };
+        let members = [&stated[0], &stated[1]]
+            .map(|side| side.iter().flatten().map(member).collect::<Vec<_>>());
+        let derived = PairClasses::derive(&members[0], &members[1], mode);
+        let stands = |side: usize| stated[side].iter().map(Option::is_some);
+        derived.by_place(stands(0), stands(1))
     }
 }
 
@@ -1193,7 +1371,7 @@ mod tests {
         collections::BTreeMap,
         sync::{mpsc, Barrier},
         thread,
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     use smg_worker::{
@@ -1211,17 +1389,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        document::{
-            spec::{BindingSpec, Match, OverloadSpec},
-            AppliedSpec, PolicySpec,
-        },
         store::{
-            GatewayId, HealthSink, JournalKinds, LoadSink as _, LoadSource, MemoryStore,
-            Registrant, WorkerFacts, WorkerPatch, WorkerStatus,
+            GatewayId, HealthSink, JournalKinds, MemoryStore, Overload, Registrant, WorkerFacts,
+            WorkerPatch, WorkerStatus,
         },
         worker_host::{
-            facts as stated, object, HealthAdapter, KeptCredential, MembershipWriter, Over,
-            Precondition, SoleLead, StoreMembershipWriter,
+            facts as stated, object, HealthAdapter, KeptCredential, Members, MembershipWriter,
+            Over, Precondition, SoleLead, StoreMembershipWriter,
         },
     };
 
@@ -1543,6 +1717,152 @@ mod tests {
         }
     }
 
+    /// The named limit of the lists a holder lends. A kept object's row
+    /// whose image bit a raw store write moves in place is restated with
+    /// no publish: the object stands as it was handed in, and its
+    /// generation keeps the bit its first ask read. One first asked before
+    /// the holder follows the write lends the old bit, and one first asked
+    /// after that lends the row's new bit. No registration path writes so:
+    /// each starts another life where the bit differs. The model's next
+    /// membership change publishes a generation that reads the row as it
+    /// stands.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_kept_objects_bit_moved_in_place_is_lent_as_its_generations_first_ask_read_it() {
+        use crate::engine::Role;
+
+        // Where the generation's first ask falls: ahead of the write, between
+        // the write and the holder's follow, or behind the follow.
+        for first_ask in [
+            "ahead of the write",
+            "ahead of the follow",
+            "behind the follow",
+        ] {
+            let (replica, door) = handing();
+            let first = built(A, KEY_A);
+            registered(&replica, &door, &first, Precondition::Any).expect("the first write");
+            let registry = replica.objects.registry();
+            let generation = || {
+                registry
+                    .model_generation("m")
+                    .expect("the model's generation")
+            };
+            let bit = |generation: &Members| {
+                let list = replica.objects.lent(generation, Role::Single);
+                list.facts.expect("the holder lends facts")[0].vision
+            };
+            let before = generation();
+            if first_ask == "ahead of the write" {
+                assert!(!bit(&before));
+            }
+
+            let mut facts = replica.row(A).facts;
+            facts.vision = true;
+            let change = replica.store.upsert(facts);
+            assert!(matches!(change, MembershipChange::Relabelled { .. }));
+            if first_ask == "ahead of the follow" {
+                assert!(!bit(&before));
+            }
+            replica.follow();
+            assert!(Arc::ptr_eq(&replica.at(A), &first), "the object is kept");
+            assert!(Arc::ptr_eq(&before, &generation()), "nothing is published");
+            let new = first_ask == "behind the follow";
+            assert_eq!(bit(&before), new, "a first ask {first_ask}");
+
+            let second = built(B, KEY_B);
+            registered(&replica, &door, &second, Precondition::Any).expect("a join");
+            let after = generation();
+            assert!(!Arc::ptr_eq(&before, &after), "a join publishes");
+            assert!(bit(&after), "the next generation reads the row");
+        }
+    }
+
+    /// What the pairing rule reads of a kept object's row moves in place
+    /// where a writer hands nothing in: its pairing descriptor, its engine
+    /// kind, and by a raw store write its wires. The object stands and
+    /// nothing is published. The generation's pair classes follow all the
+    /// same: the next ask derives them again from the rows as they stand,
+    /// and an ask under way keeps the set it read. A move of what the rule
+    /// does not read derives nothing.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_kept_objects_pairing_facts_moved_in_place_move_the_next_asks_pair_classes() {
+        use std::ptr;
+
+        use crate::{
+            document::spec::Pairing,
+            engine::{PartnerClasses, WireModes},
+            store::pairing::PairingDescriptor,
+        };
+
+        let (replica, door) = handing();
+        let side = |url: &str, role: WorkerType| -> Arc<dyn Worker> {
+            let worker = <BasicWorkerBuilder>::new(url).model(ModelCard::new("m"));
+            Arc::new(worker.worker_type(role).build())
+        };
+        let (prefill, decode) = (side(A, WorkerType::Prefill), side(B, WorkerType::Decode));
+        for built in [&prefill, &decode] {
+            registered(&replica, &door, built, Precondition::Any).expect("a registration");
+        }
+        // A write of `url`'s row that hands nothing in.
+        let write = |url: &str, change: &dyn Fn(&mut WorkerFacts)| {
+            let mut facts = replica.row(url).facts;
+            change(&mut facts);
+            let change = replica.store.upsert(facts);
+            assert!(matches!(change, MembershipChange::Relabelled { .. }));
+            replica.follow();
+        };
+        let over = |transport: &str| {
+            Some(Arc::new(PairingDescriptor {
+                transport: Some(transport.to_string()),
+                ..PairingDescriptor::default()
+            }))
+        };
+        for url in [A, B] {
+            write(url, &|facts| {
+                facts.wire_modes = WireModes::HTTP;
+                facts.engine_kind = "one".to_string();
+                facts.pairing = over("one");
+            });
+        }
+        let registry = replica.objects.registry();
+        let generation = || {
+            registry
+                .model_generation("m")
+                .expect("the model's generation")
+        };
+        let stands = generation();
+        let ask = || replica.objects.pair_classes(&stands, Pairing::Lenient);
+        let classes = |set: &PartnerClasses| (set.prefills().to_vec(), set.decodes().to_vec());
+        let (paired, apart) = ((vec![1], vec![1]), (vec![0], vec![0]));
+        let under_way = ask();
+        assert_eq!(classes(under_way), paired, "one kind over one transport");
+
+        write(A, &|facts| facts.pairing = over("another"));
+        assert!(Arc::ptr_eq(&replica.at(A), &prefill), "the object is kept");
+        assert!(Arc::ptr_eq(&stands, &generation()), "nothing is published");
+        let next = ask();
+        assert_eq!(classes(next), apart, "two transports");
+        assert_eq!(classes(under_way), paired, "an ask under way keeps its own");
+        assert!(ptr::eq(next, ask()), "a set that stands is derived once");
+
+        write(A, &|facts| facts.pairing = over("one"));
+        assert_eq!(classes(ask()), paired, "one transport again");
+        write(A, &|facts| facts.engine_kind = "another".to_string());
+        assert_eq!(classes(ask()), apart, "two engine kinds");
+        write(A, &|facts| facts.engine_kind = "one".to_string());
+        assert_eq!(classes(ask()), paired, "one engine kind again");
+        write(A, &|facts| facts.wire_modes = WireModes::GRPC);
+        let last = ask();
+        assert_eq!(classes(last), apart, "the HTTP wire alone beside another");
+
+        // A label is no fact of the rule: its move derives nothing.
+        replica.patch(A, labels("gold"));
+        replica.follow();
+        assert!(ptr::eq(last, ask()));
+        assert!(Arc::ptr_eq(&stands, &generation()), "nothing was published");
+    }
+
     /// A row moved by a writer that hands nothing in keeps its handed
     /// object. Its entry moves to the row, the registry is not written,
     /// and the holder counts the lay. An offer a refused write left is
@@ -1571,6 +1891,19 @@ mod tests {
         assert!(Arc::ptr_eq(&replica.at(A), &first));
         assert!(entry_stands(&replica, A));
         assert_eq!(replica.objects.unhanded(), 2);
+
+        // The entry's remainder is the moved row's. The kept object
+        // states what it holds as it was handed in: no label.
+        let stands = replica.row(A);
+        let read = replica.objects.row_of(&replica.id(A));
+        let read = read.expect("the row read back");
+        assert!(read.facts.labels.is_empty());
+        let labels = stands.facts.labels.clone();
+        let facts = WorkerFacts {
+            labels,
+            ..read.facts
+        };
+        assert_eq!(WorkerRow { facts, ..read }, stands);
     }
 
     /// An object is taken only where it states the row its write left. One
@@ -3592,203 +3925,5 @@ mod tests {
         // The kept object stands for the row still, which stands at rank 0
         // no longer: a feed's open reads the second.
         assert_eq!(replica.objects.rank_row(row.id, 0), None);
-    }
-
-    // ---------------------------------------------- the overload mirror
-
-    /// A replica whose store shows each load write at once.
-    fn judging() -> Replica {
-        let mut replica = Replica::new();
-        replica.store = Arc::new(MemoryStore::with_publish_window(Duration::ZERO));
-        replica
-    }
-
-    /// [`facts`] of a worker that names a queue of two for itself.
-    fn bounded(key: &str) -> WorkerFacts {
-        WorkerFacts {
-            overload: Overload {
-                waiting_requests: Some(2),
-                kv_usage_permille: None,
-            },
-            ..facts(key, 1)
-        }
-    }
-
-    /// A generation that hands the pools of `model` a queue of two, and
-    /// every other pool no threshold.
-    fn bound(model: &str) -> AppliedSpec {
-        let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
-        document.generation = 1;
-        let profiles = &document.profiles;
-        let profile = profiles.keys().next().expect("the preset's profile");
-        let binding = |model: &str, overload| BindingSpec {
-            matcher: Match {
-                model: model.to_string(),
-                ..Match::default()
-            },
-            profile: Some(profile.clone()),
-            overload: Some(overload),
-            ..BindingSpec::default()
-        };
-        let two = OverloadSpec {
-            waiting_requests: Some(2),
-            ..OverloadSpec::default()
-        };
-        let off = OverloadSpec {
-            enabled: false,
-            ..OverloadSpec::default()
-        };
-        document.bindings = vec![binding(model, two), binding("*", off)];
-        AppliedSpec::validate(&document).expect("the document validates")
-    }
-
-    impl Replica {
-        /// A registered row with its object, and its build paid.
-        fn stand(&self, facts: WorkerFacts) -> WorkerId {
-            let row = self.register(facts, None);
-            self.follow();
-            self.store.publish_now();
-            row
-        }
-
-        /// A pushed record of `row`'s rank zero with `queued` requests
-        /// waiting.
-        fn push(&self, row: WorkerId, queued: u32) {
-            let load = LoadRow {
-                queued,
-                ..LoadRow::default()
-            };
-            self.store
-                .record(row, 0, load, Instant::now(), LoadSource::Stream);
-        }
-
-        fn mirror(&self) -> usize {
-            self.objects.mirror_overload(self.store.as_ref())
-        }
-
-        /// How many workers of the model the registry counts overloaded.
-        fn counted(&self) -> usize {
-            self.objects.registry().overloaded_worker_count("m")
-        }
-    }
-
-    #[test]
-    fn a_published_overload_verdict_is_written_on_the_object_once_an_edge() {
-        let replica = judging();
-        let row = replica.stand(bounded(A));
-        let worker = replica.at(A);
-        // Over the row's own count. The store judges and shows the verdict,
-        // and no flag moves until the host mirrors.
-        replica.push(row, 3);
-        assert!(!worker.is_overloaded());
-        assert_eq!(replica.mirror(), 1);
-        assert!(worker.is_overloaded());
-        assert_eq!(replica.counted(), 1);
-        // The verdict stands: nothing moves, and the count is moved once.
-        replica.push(row, 4);
-        assert_eq!(replica.mirror(), 0);
-        assert_eq!(replica.counted(), 1);
-        // The queue drains, and the next mirror clears the flag.
-        replica.push(row, 1);
-        assert_eq!(replica.mirror(), 1);
-        assert!(!worker.is_overloaded());
-        assert_eq!(replica.counted(), 0);
-    }
-
-    #[test]
-    fn a_world_of_the_same_verdicts_is_not_walked_again() {
-        let replica = judging();
-        let row = replica.stand(bounded(A));
-        let worker = replica.at(A);
-        replica.push(row, 3);
-        assert_eq!(replica.mirror(), 1);
-        // A flag moved behind the mirror shows whether a call walked.
-        let registry = replica.objects.registry();
-        assert!(registry.set_worker_overloaded(&worker, false));
-        // Another publication of the same verdicts is not walked.
-        replica.push(row, 4);
-        assert_eq!(replica.mirror(), 0);
-        assert!(!worker.is_overloaded());
-        // The verdict moves and moves back, and the walk writes the flag.
-        replica.push(row, 1);
-        assert_eq!(replica.mirror(), 0);
-        replica.push(row, 3);
-        assert_eq!(replica.mirror(), 1);
-        assert!(worker.is_overloaded());
-    }
-
-    #[test]
-    fn an_object_put_in_the_registry_owes_a_mirror_whatever_the_epoch() {
-        let replica = judging();
-        let row = replica.stand(bounded(A));
-        replica.push(row, 3);
-        assert_eq!(replica.mirror(), 1);
-        let first = replica.at(A);
-        // The row's labels move, and the holder replaces its object. The
-        // registry releases the verdict the first object carried. The
-        // build the write owes is not paid, so the world stands.
-        replica.patch(A, labels("gold"));
-        replica.follow();
-        let second = replica.at(A);
-        assert!(!Arc::ptr_eq(&first, &second));
-        assert!(!second.is_overloaded());
-        assert_eq!(replica.counted(), 0);
-        // The mirror walks for the object, though no verdict moved.
-        assert_eq!(replica.mirror(), 1);
-        assert!(second.is_overloaded());
-        assert_eq!(replica.counted(), 1);
-    }
-
-    #[test]
-    fn a_worker_of_two_pools_reads_overloaded_where_one_of_its_rows_is() {
-        let replica = judging();
-        replica.store.apply(bound("m")).expect("applied");
-        let row = replica.stand(WorkerFacts {
-            models: vec!["m".to_string(), "n".to_string()],
-            ..facts(A, 1)
-        });
-        replica.push(row, 3);
-        let over = replica
-            .store
-            .with_snapshot(|world| world.overloaded().count());
-        assert_eq!(over, 1, "one of the worker's two rows is under a verdict");
-        assert_eq!(replica.mirror(), 1);
-        assert!(replica.at(A).is_overloaded());
-    }
-
-    #[test]
-    fn a_mirrored_edge_is_said_in_the_worker_crates_line_under_the_stores_name() {
-        use tracing::{subscriber, Level};
-
-        let log = tempfile::NamedTempFile::new().expect("a file for this case");
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(Level::INFO)
-            .with_ansi(false)
-            .without_time()
-            .with_writer(log.reopen().expect("the log writer"))
-            .finish();
-        let replica = judging();
-        let row = replica.stand(bounded(A));
-        let _kept = subscriber::set_default(subscriber);
-        replica.push(row, 3);
-        assert_eq!(replica.mirror(), 1);
-        replica.push(row, 1);
-        assert_eq!(replica.mirror(), 1);
-        let log = std::fs::read_to_string(log.path()).expect("the log text");
-        let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 2, "{log}");
-        for (line, verdict, queued) in [(lines[0], "set", 3), (lines[1], "cleared", 1)] {
-            assert!(line.contains("smg_worker::load::monitor"), "{line}");
-            assert!(
-                line.contains(&format!("Worker overload veto {verdict}")),
-                "{line}"
-            );
-            assert!(
-                line.contains(&format!("waiting_requests={queued} ")),
-                "{line}"
-            );
-            assert!(line.contains("waiting_threshold=Some(2)"), "{line}");
-            assert!(line.contains(r#"source="policy store""#), "{line}");
-        }
     }
 }

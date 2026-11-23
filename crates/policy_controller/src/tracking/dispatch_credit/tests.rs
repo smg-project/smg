@@ -12,12 +12,13 @@ use crate::{
     },
     stages::{pickers, Lifecycle, StageRegistry},
     store::{
-        Dispatch, GatewayId, LeaseState, LeasesStore, MemoryStore, Said, StaleGeneration,
-        WorkerFacts, WorkerStatus, WorkersStore,
+        GatewayId, LeaseState, LeasesStore, MemoryStore, StaleGeneration, WorkerFacts,
+        WorkerStatus, WorkersStore,
     },
     tracking::{
-        decision_guard::DecisionGuard, CreditedDispatches, DispatchCounts, DispatchCredit, Lease,
-        Membership, Side,
+        decision_guard::DecisionGuard,
+        lease::{Dispatch, Said},
+        CreditedDispatches, DispatchCounts, DispatchCredit, Lease, Membership, Side,
     },
 };
 

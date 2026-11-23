@@ -32,7 +32,7 @@ use smg_policy_controller::{
 };
 
 #[global_allocator]
-static GLOBAL: Counting = Counting;
+static GLOBAL: Counting = Counting(std::alloc::System);
 
 fn encoders(n: u32) -> Vec<Candidate> {
     (0..n)

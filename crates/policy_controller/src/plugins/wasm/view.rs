@@ -336,7 +336,7 @@ impl Records {
 /// change to the table changes these numbers and the test that pins them.
 pub mod layout {
     /// One candidate row, with the five affinity facts in it. The fields of
-    /// the engine's own row take 103 bytes WITHOUT them: the two numbers
+    /// the engine's own row take 107 bytes WITHOUT them: the two numbers
     /// are near by accident, each pinned in its own file, and nothing ties
     /// one to the other.
     pub const ROW: usize = 104;
@@ -1087,6 +1087,7 @@ mod tests {
             host_local: true,
             active_sessions: 24,
             key: 25,
+            engine: 27,
         }
     }
 
@@ -1569,7 +1570,7 @@ mod tests {
             signal_cells: None,
             client_key: 0,
             ring: None,
-            ring_awaited: false,
+            ring_positions: &[],
         };
         let exposure = Exposure {
             tenant: Reveal::Plain,

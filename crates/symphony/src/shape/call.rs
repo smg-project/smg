@@ -59,7 +59,8 @@
 use super::params::Params;
 use crate::{
     event::{
-        drop_carried, release_between, runs, DropReason, Event, Events, MalformedReason, Text,
+        drop_carried, release_between, runs, CallEnd, DropReason, Event, Events, MalformedReason,
+        Text,
     },
     format::CallId,
     json::{self, arguments::Strings},
@@ -421,6 +422,7 @@ impl Assembler {
         out.push(Event::ToolCallEnd {
             index: self.index,
             source: Text::uncounted(format!("{trailer}{terminal}")),
+            ended: CallEnd::Closed,
         });
         true
     }
@@ -453,6 +455,7 @@ impl Assembler {
             out.push(Event::ToolCallEnd {
                 index: self.index,
                 source: Text::default(),
+                ended: CallEnd::Closed,
             });
         }
     }
@@ -929,6 +932,16 @@ mod tests {
         Event::ToolCallEnd {
             index: 0,
             source: Text::uncounted(source.to_owned()),
+            ended: CallEnd::Closed,
+        }
+    }
+
+    /// The end, of no bytes, of a call the output's end found open: by the stop or by a cut.
+    fn left_open(ended: CallEnd) -> Event<'static> {
+        Event::ToolCallEnd {
+            index: 0,
+            source: Text::uncounted(String::new()),
+            ended,
         }
     }
 
@@ -1022,7 +1035,7 @@ mod tests {
                     text: Text::default(),
                     why: MalformedReason::UnterminatedRegion,
                 },
-                end(""),
+                left_open(CallEnd::Cut),
                 Event::Finish {
                     reason: crate::event::FinishReason::Length,
                     tool_calls: 1,
@@ -1256,7 +1269,7 @@ mod tests {
                     text: Text::uncounted("</c>"),
                     why: MalformedReason::UnterminatedRegion,
                 },
-                end(""),
+                left_open(CallEnd::Cut),
                 Event::Finish {
                     reason: crate::event::FinishReason::Length,
                     tool_calls: 1,
@@ -1454,7 +1467,7 @@ mod tests {
                 wrapper("<c>"),
                 start("f", "<n=f>"),
                 arguments("{}"),
-                end(""),
+                left_open(CallEnd::Stop),
                 finish(1),
             ],
             "with no trailer the stop does not close the call, which is cut"
@@ -1772,7 +1785,7 @@ mod tests {
                 start("f", ""),
                 member("{\"a\": 1}", "<k=a>1</k>  "),
                 malformed("<k=b>2"),
-                end(""),
+                left_open(CallEnd::Cut),
                 length.clone(),
             ],
             "the parameter whose end waited for more whitespace is whole at the end, the object \
@@ -1786,7 +1799,7 @@ mod tests {
                 start("f", ""),
                 member("{}", ""),
                 malformed("<k=b>2"),
-                end(""),
+                left_open(CallEnd::Cut),
                 length.clone(),
             ],
             "a call cut before any parameter finished closes with no arguments and says the cut"
@@ -1798,7 +1811,7 @@ mod tests {
                 start("f", ""),
                 member("{\"a\": 1}", "<k=a>1</k>\n"),
                 malformed("<k"),
-                end(""),
+                left_open(CallEnd::Cut),
                 length.clone(),
             ],
             "a start of the trigger the cut left unfinished is the cut's marker, not wrapping"
@@ -1810,7 +1823,7 @@ mod tests {
                 start("f", ""),
                 member("{\"a\": 1}", "<k=a>1</k>\n"),
                 malformed(""),
-                end(""),
+                left_open(CallEnd::Cut),
                 length,
             ],
             "a cut between parameters is said with a marker of no bytes, as the tagged syntax says it"
@@ -1914,7 +1927,7 @@ mod tests {
             ],
             "a parameter the stop came inside is no parameter, as at the end of the text"
         );
-        let cut = |reason| {
+        let cut = |reason, ended| {
             vec![
                 wrapper("<c>"),
                 start("f", ""),
@@ -1922,7 +1935,7 @@ mod tests {
                 wrapper("\n</c>"),
                 closed(),
                 malformed(""),
-                end(""),
+                left_open(ended),
                 Event::Finish {
                     reason,
                     tool_calls: 1,
@@ -1935,13 +1948,13 @@ mod tests {
                 &table(tagged(closed_by_tag(), closing_f())),
                 "<c><k=a>1</k>\n</c>"
             ),
-            cut(crate::event::FinishReason::Stop),
+            cut(crate::event::FinishReason::Stop, CallEnd::Stop),
             "without the row the stop does not close the region, which is cut and closes as at \
              the end of the text, saying the cut once before its end"
         );
         assert_eq!(
             run_after(&format, "", "<c><k=a>1</k>\n</c>", EngineFinish::Length),
-            cut(crate::event::FinishReason::Length),
+            cut(crate::event::FinishReason::Length, CallEnd::Cut),
             "a stream cut for length closes the call as at the end of the text"
         );
     }

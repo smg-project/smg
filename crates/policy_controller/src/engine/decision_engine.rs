@@ -30,9 +30,9 @@
 //!   table, the dispatch credit, a pool's turn) moves under an atomic or a
 //!   lock no decision holds across its stages.
 
-#[cfg(feature = "in-process")]
-use std::sync::Arc;
 use std::time::Instant;
+#[cfg(feature = "in-process")]
+use std::{borrow::Cow, fmt, sync::Arc};
 
 #[cfg(feature = "in-process")]
 use smg_worker::load::state::LoadSnapshot;
@@ -46,8 +46,8 @@ use super::{
 };
 use crate::{
     document::AppliedSpec,
-    store::{pairing::Refusal, DecodeRefused, GatewayId, Said},
-    tracking::lease::{Lease, Side},
+    store::GatewayId,
+    tracking::lease::{Lease, Said, Side},
 };
 
 /// A request its host makes under the document a decision is made under.
@@ -75,10 +75,12 @@ pub trait RequestMaker {
     /// every other request, and from a maker that does not say.
     ///
     /// An engine that decides over its host's lists asks this ahead of
-    /// [`RequestMaker::make`]. A place one pick of a picker decides reads
-    /// no fact of a request, so a plain request of such a place is decided
-    /// with none made: its routing key is not derived and no seed is drawn
-    /// for it. The answer is cheap: it reads the document nowhere.
+    /// [`RequestMaker::make`], at its entry that issues a pick's lease. A
+    /// place one pick of a picker decides reads no fact of a request, so a
+    /// plain request of such a place is decided with none made: its routing
+    /// key is not derived and no seed is drawn for it. The answer is cheap:
+    /// it reads the document nowhere. That engine's entry that issues no
+    /// lease never asks: it makes every request.
     ///
     /// A request held to places of its list
     /// ([`Constraints::places`](super::view::Constraints::places)) is not
@@ -104,10 +106,33 @@ pub trait RequestMaker {
     /// that decides over its host's lists reads each worker's report there,
     /// and every record of one decision in the one snapshot. A host hands
     /// it where the document reads reports
-    /// ([`Needs::loads`](crate::document::spec::Needs::loads)); under no
-    /// snapshot a record carries no report.
+    /// ([`Needs::loads`](crate::document::spec::Needs::loads)) or a named
+    /// signal
+    /// ([`Needs::signal_cells`](crate::document::spec::Needs::signal_cells)),
+    /// whose values the same reports state. Where it hands none, a decision
+    /// reads the newest snapshot the engine's own task keeps at hand
+    /// ([`PolicyEngine::run`](super::policy_engine::PolicyEngine::run));
+    /// under no snapshot a record carries no report and a signal reads no
+    /// value.
     #[cfg(feature = "in-process")]
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
+        None
+    }
+
+    /// The entry of the request's prompt in the host's token tree of sent
+    /// prefixes ([`CacheIndexes::token_tree`]), as its host names it
+    /// ([`TokenKey`]): `None` from a host that holds no token ids of the
+    /// prompt, and from a maker that does not say. `page` is the tree's
+    /// page in tokens, which the marker of a cache partition fills whole.
+    ///
+    /// Asked at most once a decision, and only where the host lends the
+    /// request's place such a tree: never by a place one pick decides, and
+    /// never by an engine that reads its own rows.
+    ///
+    /// [`CacheIndexes::token_tree`]: crate::engine::CacheIndexes::token_tree
+    #[cfg(feature = "in-process")]
+    fn token_key(&self, page: usize) -> Option<TokenKey<'_>> {
+        let _ = page;
         None
     }
 }
@@ -178,6 +203,48 @@ pub enum WorkerLists<'a> {
     /// A pair's two lists, its prefills and its decodes, with the pair
     /// classes of their workers and the host's reads of its admission.
     Pair(super::policy_engine::pair::PairLists<'a>),
+    /// An encode request's three lists: its pair's two and its encoders,
+    /// with what the encode side reads of the workers beside their records
+    /// ([`PolicyEngine::decide_encode_at`](super::policy_engine::PolicyEngine::decide_encode_at)).
+    /// The engine's other entries take no items: through them the three
+    /// are the pair's two, for a request with no item and for a decode
+    /// asked again. Such a decision does not read whether a decode takes
+    /// images, so the encode entry declines a request that asks images of
+    /// its decode and states the later decode. A request whose items are
+    /// references and that states images only prefers such a decode: it is
+    /// decided, and its decode asked again is held to no image fact.
+    Encode(super::policy_engine::encode::EncodeLists<'a>),
+}
+
+/// The entry of a request's prompt in its host's token tree of sent
+/// prefixes, named by the request's host ([`RequestMaker::token_key`]).
+///
+/// The naming is the host's, as it is for a prompt's hashes
+/// ([`HashSeeds`]). A host that partitions its workers' caches hands the
+/// prompt's ids behind a marker of the partition, so two partitions part
+/// within the marker, and says how long the marker is. The engine keeps two
+/// partitions apart exactly as well as these ids do.
+///
+/// It is never a field of a request's facts: no stage, trace or kept
+/// sample holds a client's tokens. Its `Debug` prints sizes alone.
+#[cfg(feature = "in-process")]
+pub struct TokenKey<'a> {
+    /// The ids the tree is matched and written by: the prompt's token ids,
+    /// behind the partition's marker where the request has one.
+    pub tokens: Cow<'a, [u32]>,
+    /// How many of the leading ids are the marker and no part of the
+    /// prompt: a match's length has them taken off. Zero with no partition.
+    pub marker: usize,
+}
+
+#[cfg(feature = "in-process")]
+impl fmt::Debug for TokenKey<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenKey")
+            .field("tokens", &self.tokens.len())
+            .field("marker", &self.marker)
+            .finish()
+    }
 }
 
 /// What a guard holds of its decision, lent to its engine for one word
@@ -192,8 +259,9 @@ pub enum WorkerLists<'a> {
 /// here is a single's or the prefill side's. The decode side's differs
 /// from it in its side, in the worker it books (the decode of the pick's
 /// first target where the side was issued with its prefill, the decode of
-/// the target taken where it stood chosen) and in its session
-/// ([`Self::decode_session`]). A decode issued later is dated at its
+/// the target taken where it stood chosen), in its session
+/// ([`HeldDecode::session`]) and, behind a decode call, in its size
+/// ([`HeldDecode::tokens`]). A decode issued later is dated at its
 /// issue, the decode call's instant or its dispatch's, and its later words
 /// bear the first decision's instant, which is this lease's
 /// ([`Lifecycle::on_decision_issued`](crate::stages::Lifecycle::on_decision_issued)).
@@ -205,10 +273,6 @@ pub struct HeldDecision<'a> {
     /// The lease as its decision issued it: a single's, or the prefill
     /// side's of a pair.
     pub lease: &'a Lease,
-    /// A pair's session under the decode phase
-    /// ([`DecideOutcome::decode_session`]): the one value of the decode
-    /// side's lease that the prefill side's does not give.
-    pub decode_session: Session,
     /// The place in the pick of the target taken. An end and a release
     /// carry no index of their own. Behind a decode call that picked, it is
     /// the place in that call's pick, for the prefill's later words too:
@@ -218,11 +282,32 @@ pub struct HeldDecision<'a> {
     /// The target its host took: the pick's first, or the one a take moved
     /// to. A pair's decode is in it.
     pub target: &'a Target,
-    /// A pair's decode side stood chosen until this word: its request
-    /// stated the later decode, no decode call picked it, and nothing was
-    /// issued for it. The side's dispatch said under this is its issue
-    /// too, dated at the word's instant.
-    pub decode_chosen: bool,
+    /// A pair's decode side, read under a pair's lease alone
+    /// ([`Lease::side`] is [`Side::Prefill`]). A single's lease has none:
+    /// its handle lends no session, the lease's own size and a side that
+    /// never stood chosen, and no reader takes them.
+    pub decode: HeldDecode,
+}
+
+/// What a guard holds of a pair's decode side ([`HeldDecision::decode`]):
+/// what that side's lease does not share with the prefill side's, and
+/// where the side stands as the word finds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeldDecode {
+    /// The pair's session under the decode phase
+    /// ([`DecideOutcome::decode_session`]): a value of the decode side's
+    /// lease that the prefill side's does not give.
+    pub session: Session,
+    /// The prompt size the side's words state ([`Lease::tokens`]): the size
+    /// the side was issued under. That is the first decision's where the
+    /// side was issued with its prefill or goes out with no call, and a
+    /// decode call's own once one picked the side.
+    pub tokens: u32,
+    /// The side stood chosen until this word: its request stated the later
+    /// decode, no decode call picked it, and nothing was issued for it.
+    /// The side's dispatch said under this is its issue too, dated at the
+    /// word's instant.
+    pub chosen: bool,
 }
 
 /// What the one entry answers its host ([`DecisionEngine::decide_under`]).
@@ -408,7 +493,7 @@ pub trait DecisionEngine {
     /// end, or a release. `held` is the guard's view of the decision at the
     /// word. The word names its side. Whoever applies the word tells the
     /// stages of the engine that issued the lease, once. A decode that
-    /// stood chosen ([`HeldDecision::decode_chosen`]) goes out with no
+    /// stood chosen ([`HeldDecode::chosen`]) goes out with no
     /// decode call: its dispatch tells the side's issue first.
     fn say(&self, gateway: GatewayId, held: &HeldDecision<'_>, said: Said, now: Instant);
 
@@ -431,11 +516,6 @@ pub trait DecisionEngine {
         text: Option<&str>,
         seeds: HashSeeds,
     ) -> PromptHashes;
-
-    /// Why no prefill of `model` pairs with a decode of it, among the
-    /// workers on the side of `wires`. `None` where a pair can be made,
-    /// and where a pool holds no worker on that side.
-    fn pair_refusal(&self, model: &str, wires: WireModes) -> Option<Refusal>;
 
     /// How many decisions panicked, a shadow's beside a live decision that
     /// stood among them.
@@ -526,4 +606,19 @@ pub enum DecisionRefused {
     /// The store takes no decode side under the lease a decode call
     /// named, for the reason it carries.
     Decode(DecodeRefused),
+}
+
+/// Why a call could not issue the decode side of a pair's lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeRefused {
+    /// No lease of the gateway under that id.
+    NoLease,
+    /// The lease was filed without a chosen decode side.
+    NotChosen,
+    /// The prefill side is waiting for dispatch or has ended.
+    PrefillNotHeld,
+    /// The chosen side was already issued or dispatched, even if it has
+    /// ended, or its host gave it up, or it took as many calls as one
+    /// lease takes.
+    DecodeStands,
 }

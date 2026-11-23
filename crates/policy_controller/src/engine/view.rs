@@ -7,12 +7,34 @@
 //! into the spec's declared lists (zones, engine kinds, connectors, labels,
 //! headers) are the same positions here.
 
-use crate::{load::signals, policies::consistent_hashing::PoolRing, tracking::in_flight};
+use std::sync::atomic::AtomicU64;
 
-/// The stable identity of a candidate: a hash of the registration key and the
-/// incarnation, never a URL. A same-URL replacement is a new id.
+use super::demands::DemandFacts;
+use crate::{load::signals, policies::consistent_hashing::LentRing, tracking::in_flight};
+
+/// The identity of a candidate, as its host states it. A controller's
+/// membership states a hash of the registration key and the incarnation
+/// ([`identity`](crate::store::identity)): a same-URL replacement is a new
+/// id. A gateway's worker list states the fingerprint of the worker's
+/// address ([`WorkerId::from_address`]), one id for a worker and the one
+/// that replaces it there, unless its program states ids of its own
+/// ([`FixedFacts::id`]). A hash ring a caller lends finds a worker's row
+/// by the address's fingerprint alone.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WorkerId(pub u64);
+
+impl WorkerId {
+    /// The id a gateway's worker list states for the worker registered at
+    /// `address`: the address's fingerprint, the same for every worker
+    /// object registered there. A hash ring a caller lends names its
+    /// workers by address ([`LentRing`]), and a decision finds a named
+    /// worker's row by this: the ring serves rows whose ids are stated
+    /// this way.
+    #[must_use]
+    pub fn from_address(address: &str) -> Self {
+        Self(fingerprint(address.as_bytes()))
+    }
+}
 
 /// A worker's role in the fleet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -88,16 +110,21 @@ pub enum HashKind {
 /// size in tokens is its bytes over this.
 pub const TEXT_BYTES_PER_TOKEN: u32 = 4;
 
+/// The first `tokens` tokens of a request hashed in `kind`, in the unit its
+/// blocks are sized in: tokens, and under the text kind their bytes.
+pub(crate) fn units_within(tokens: u32, kind: HashKind) -> u32 {
+    match kind {
+        HashKind::Token => tokens,
+        HashKind::Text => tokens.saturating_mul(TEXT_BYTES_PER_TOKEN),
+    }
+}
+
 /// How many whole blocks of `block_size` lie within the first `tokens`
 /// tokens of a request hashed in `kind`: the tokens over the block size,
 /// under the text kind their bytes over the window's size in bytes. A
 /// block size is one at least.
 pub(crate) fn blocks_within(tokens: u32, kind: HashKind, block_size: u32) -> u32 {
-    let units = match kind {
-        HashKind::Token => tokens,
-        HashKind::Text => tokens.saturating_mul(TEXT_BYTES_PER_TOKEN),
-    };
-    units / block_size
+    units_within(tokens, kind) / block_size
 }
 
 /// Where a candidate's load row came from.
@@ -694,7 +721,7 @@ impl Reads<'_> {
 }
 
 /// One candidate row: a worker, or one DP rank of a data-parallel worker:
-/// what every decision reads. Its fields take 103 bytes, and the row is
+/// what every decision reads. Its fields take 107 bytes, and the row is
 /// aligned to a 64-byte cache line: 128 bytes in memory, every row on a
 /// line's start.
 ///
@@ -806,6 +833,70 @@ pub struct Candidate {
     /// Zero when the host carries none. After the contract's first cut (the
     /// wire numbers its fields in the record's order).
     pub key: u32,
+    /// The place of the row's engine among the engines of its list, in the
+    /// order each engine's first row stands in the list: the rows that
+    /// state one place are the ranks of one data-parallel engine, and a
+    /// worker that stands alone states a place no other row states. Where
+    /// the list lists its engines ([`Engines`]) it is the place
+    /// [`Engines::rows`] takes. The number holds within one generation of
+    /// one list and is no id beyond it.
+    ///
+    /// The engine in a gateway's own process writes it, once a list, where
+    /// it finds the list's engines. The engine over the policy store and a
+    /// default record leave `0` on every row, which would read as one
+    /// engine: a stage reads the field under the engine in a gateway's own
+    /// process alone, until that engine is the one engine. In-process
+    /// only: no wire form carries it. After the contract's first cut (the
+    /// wire numbers its fields in the record's order).
+    pub engine: u32,
+}
+
+/// What a program says of a worker for the half of its record that no
+/// request changes, where the worker object holds no such fact: whether
+/// the worker takes images, the id the program knows the worker by where
+/// it keeps ids of its own, and what the worker states for a request's
+/// hard demands. A host that keeps such a fact beside its workers tells it
+/// to what writes the workers' records, once a list: a gateway of its own
+/// registrations, a controller of the stored worker an object stands for.
+/// The default says nothing. Further facts add their fields, so a host
+/// starts from the default and sets what it knows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FixedFacts {
+    /// Whether the worker takes images ([`Candidate::vision`]).
+    pub vision: bool,
+    /// The id the program knows the worker by ([`Candidate::id`]): a
+    /// controller's id of the stored worker an object stands for. A
+    /// decision's targets name the worker by it, and so does every state
+    /// the engine writes from a decision. `None` for the fingerprint of
+    /// the worker's address, which a gateway's own process names a worker
+    /// by. A program states an id for every worker of its lists or for
+    /// none: one id space a program. A stated id is never `WorkerId(0)`:
+    /// zero reads as absent wherever an id travels (a lease, a trace, a
+    /// session's pins), so a zero stated here states none. A program that
+    /// states ids lends no hash ring ([`RequestFacts::ring`]): a lent ring
+    /// finds a worker's row by the fingerprint of its address, so it would
+    /// find none and every key would go by its position alone.
+    pub id: Option<WorkerId>,
+    /// What the worker states for a request's hard demands: its entry of
+    /// the column beside the records. Whether the worker registered a
+    /// rank ([`DemandFacts::ranked`]) is not said here: the worker's
+    /// object holds it, and the records read it there.
+    pub demands: DemandFacts,
+}
+
+impl FixedFacts {
+    /// The id the engine knows the worker by: the one stated
+    /// ([`Self::id`]), or `address`, the fingerprint of the worker's
+    /// address, where none is stated or the one stated is zero. A list's
+    /// records are written by it, so no record carries zero for an id.
+    #[must_use]
+    pub fn id_or(&self, address: WorkerId) -> WorkerId {
+        match self.id {
+            Some(id) if id != WorkerId(0) => id,
+            _ => address,
+        }
+    }
 }
 
 /// How far back the store's decision clock starts.
@@ -1055,7 +1146,10 @@ pub struct RequestFacts<'a> {
     /// The signal cells beside the rows of this decision, by the row's
     /// position: handed by a host for a profile whose stages read a signal
     /// ([`Needs::signal_cells`](crate::document::Needs::signal_cells)), and for no
-    /// other. `None` reads as no value for every row. A pair decision takes
+    /// other. The engine over worker lists takes none from its host: it
+    /// makes a list's cells from the load snapshot its decision holds, and
+    /// cells a caller put here are not read by a single request's decision.
+    /// `None` reads as no value for every row. A pair decision takes
     /// each side's cells from its pool ([`PairPools`](crate::engine::PairPools)),
     /// and an encode pair its encoders' from theirs: cells here are not
     /// read there. One word for every signal the document declares: a
@@ -1069,25 +1163,35 @@ pub struct RequestFacts<'a> {
     /// The wire's request facts carry it to a controller, and a plugin's
     /// frame keeps `0` under every exposure.
     pub client_key: u64,
-    /// The hash ring of the list the candidates are, where the host keeps
-    /// one a list ([`PoolRing`]): a stage that places by a ring reads this
-    /// one, with no lock, and its own ring learns nothing of the decision.
-    /// `None` where the host keeps none: such a stage then places by its
-    /// own ring, which learns its members from the candidates. A host
-    /// lends the ring of the list it hands as the candidates and never the
-    /// ring of another list: a ring of another length than the candidates
-    /// is its caller's error, which a debug build stops at and any other
-    /// build passes over, placing by the stage's own ring. A pair takes
-    /// none: each side is a list of its own. In-process only.
-    pub ring: Option<&'a PoolRing>,
-    /// The host keeps a ring for the candidates' list and that ring is not
-    /// built yet, so [`Self::ring`] is `None`. Such a host builds a list's
-    /// ring off the path of a request, and a request that comes first
-    /// neither builds it nor waits for it. A stage that places by a ring
-    /// places such a request as one that carries no key, by its profile's
-    /// draw, and neither reads its own ring nor teaches it. In-process
-    /// only.
-    pub ring_awaited: bool,
+    /// The hash ring the request's caller keeps of the model's workers,
+    /// lent to this decision ([`LentRing`]): the plain ring stage with no
+    /// bounded-load rule places the request's key where this ring's walk
+    /// reaches, and its own ring learns nothing of the decision. The rows
+    /// of such a decision carry the ids of their workers' addresses
+    /// ([`WorkerId::from_address`]): a program that states ids of its own
+    /// lends none ([`FixedFacts::id`]). A caller that keeps rings lends one
+    /// with every such request, an empty one for a model whose ring it
+    /// has not built: a key its walk hands to no kept worker goes to the
+    /// kept worker at the key's position modulo their count. `None` from a
+    /// caller that keeps no ring, as a controller: the stage places by its
+    /// own. Both sides of a pair take the one ring, each over its own
+    /// list: a side takes a worker of the ring only where its list keeps
+    /// that worker, and a key no kept worker of the side takes goes to the
+    /// side's kept worker at the key's position modulo their count. An
+    /// encode request's items take none: the place stated is the request's
+    /// routing value's, and an item is placed by its own key on the stage's
+    /// ring. In-process only.
+    pub ring: Option<&'a dyn LentRing>,
+    /// Where the request stands on the lent ring, as its caller states it:
+    /// the position of the value it is placed by ([`LentRing::position`]).
+    /// A routing value gives one entry. Empty where the request states
+    /// nothing to place by, and the lent ring is then not asked. A caller
+    /// states a key's position with every ring it lends, an empty ring
+    /// too. The list stands as long as the request does: a caller that
+    /// finds a position while it makes the request, with the request's
+    /// keys ([`KeySources::derive_keys`](crate::document::KeySources::derive_keys)),
+    /// keeps it beside the request. In-process only: no frame carries it.
+    pub ring_positions: &'a [u64],
 }
 
 /// The multiplier that spreads a session's model and phase over its key.
@@ -1309,6 +1413,13 @@ pub struct Constraints<'a> {
     /// publication's own rows hands them here, and a reader of a row's
     /// stalled bit asks both ([`Constraints::masks`]). Empty where the rows
     /// were written for the decision. In-process only.
+    ///
+    /// They are positions of the one list a set is opened over, as
+    /// [`Self::places`] are. A pair's host states each side's beside its
+    /// two lists, with the rows a hold stands on. A pair's request that
+    /// states either of its own, and an encode request's, is declined by
+    /// the engine over worker lists, by name, as one that states places
+    /// of its own is.
     pub stalled: &'a [u32],
     /// The rows of [`Self::stalled`] a hold of this host stands on, in
     /// order, each once: a veto no rule lifts, as an open breaker's is. The
@@ -1321,7 +1432,9 @@ pub struct Constraints<'a> {
     /// engine's ([`PinSource`]): a sessions rule asks it for a key its own
     /// table holds no pin of, and no other stage reads it. `None` where
     /// the engine's table is the only one, as in a host that embeds the
-    /// engine. In-process only.
+    /// engine. In-process only. A decision lent them ends a key with its
+    /// idle time in the engine's table too, as the record counts no sweep.
+    /// The engine over worker lists reads none.
     pub pins: Option<&'a dyn PinSource>,
     /// The places of the pool's list the request may take, ascending, each
     /// once, where its host holds it to a part of the pool: the workers a
@@ -1331,12 +1444,13 @@ pub struct Constraints<'a> {
     /// The request's own fact and no veto of a worker: no stage reads it,
     /// and a profile that lists no filter is held to it like any other. A
     /// decision's staged pass opens its set with these places and hands no
-    /// target outside them. A pass that draws from the pool and a keyed
-    /// request's reads by place do not ask them yet: until they do, the
-    /// engine over worker lists declines a request that states places,
-    /// by name. They are places of the one list a single request is
-    /// decided over, and one set of places cannot hold a pair's two
-    /// lists: a pair that states any is declined the same way, and the
+    /// target outside them. A pass that draws from the pool leaves such a
+    /// request to it, and so does a keyed request's read of a row by its
+    /// place. They are places of the one list a set is opened over: a
+    /// single request's, or one side's of a pair, whose entry takes one
+    /// set of constraints a side. A pair's host states each side's places
+    /// beside its two lists. A pair's request that states places of its
+    /// own is declined by the engine over worker lists, by name, and the
     /// served controller states none.
     ///
     /// A request held to places whose every worker it already tried is
@@ -1480,6 +1594,16 @@ pub struct PoolFacts<'a> {
     /// candidates are then the rows the list's positions name. Empty by
     /// default, and every decision then reads rows alone.
     pub engines: Engines<'a>,
+    /// The pool's own word, where the host keeps one beside the list of
+    /// workers the candidates are and lends it to the decision: the word a
+    /// pick over that list alone counts its turns in
+    /// ([`PoolWord::word`](crate::engine::PoolWord::word)). A picker that
+    /// takes turns counts a draw's turn in it too, and looks no rotation up
+    /// by the pool's name. That pick and that draw over one list then turn
+    /// one rotation, and two lists turn two, whatever else they share. `None`:
+    /// such a picker finds its rotation by the pool's name, with
+    /// [`Self::reach`] in it. In-process only.
+    pub word: Option<&'a AtomicU64>,
 }
 
 #[cfg(test)]
@@ -1548,17 +1672,18 @@ mod tests {
 
     /// A request's facts are copied where a decision narrows or resumes
     /// them, so their size is a cost of those decisions: the pin is exact.
-    /// The signal cells are one word, for every signal, the client's key
-    /// is one word more and the lent ring another: a field the facts gain
+    /// The signal cells are one word, for every signal, and the client's
+    /// key is one word more. The ring a caller lends is two words, and
+    /// where the request stands on it two more. A field the facts gain
     /// moves this number and carries the decision bench's cells that copy
     /// the facts (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
-        assert_eq!(size_of::<RequestFacts<'_>>(), 304);
+        assert_eq!(size_of::<RequestFacts<'_>>(), 328);
     }
 
     #[test]
-    fn a_candidate_rows_fields_take_103_bytes() {
+    fn a_candidate_rows_fields_take_107_bytes() {
         // The row is written once per candidate per decision, so what its
         // fields take is a cost every policy pays. The alignment leaves
         // spare bytes, so the row's size no longer says it, and a field
@@ -1602,8 +1727,9 @@ mod tests {
             host_local,
             active_sessions,
             key,
+            engine,
         );
-        assert_eq!(ends.into_iter().max(), Some(103));
+        assert_eq!(ends.into_iter().max(), Some(107));
     }
 
     #[test]

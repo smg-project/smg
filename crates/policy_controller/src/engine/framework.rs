@@ -51,7 +51,7 @@ pub use alone::{AloneProfile, InTheWay, NotAlone, Place};
 pub use encode::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
 use engines::{run_engines, run_owned};
 pub use keyed::PoolRows;
-use vetoed::AllVetoed;
+use vetoed::{AllVetoed, Half};
 
 /// Drops candidates before scoring. A `soft` filter steps aside when it would
 /// leave nothing: the engines a retry already tried step aside while another
@@ -310,29 +310,6 @@ pub trait Scorer: Lifecycle + Debug {
         false
     }
 
-    /// [`Self::own`] for a host that reads a row when it is asked about
-    /// one, and writes none ahead of the decision: the scorer names the
-    /// rows it meets by their places in the pool, which holds `rows` of
-    /// them, asks `keep` about each, once, and writes to `out` the places
-    /// of the rows it hands out, the pick first and its alternates behind
-    /// it, each one kept by `keep` and none twice. Returns how many it
-    /// wrote. They are the rows [`Self::own`] hands out over the same
-    /// pool, in its order. `0` where it places nothing by itself, as
-    /// [`Self::own`] says `false`: the profile's run over the whole pool
-    /// decides. A scorer that places by a ring walks the ring its host
-    /// lent ([`RequestFacts::ring`]) and places nothing where none is
-    /// lent. It reads no value of the seed's stream. The default places
-    /// nothing.
-    fn own_by_place(
-        &self,
-        _facts: &RequestFacts<'_>,
-        _rows: usize,
-        _keep: &mut dyn FnMut(u32) -> bool,
-        _out: &mut [u32; MAX_TARGETS],
-    ) -> usize {
-        0
-    }
-
     /// How this scorer's values lie ([`ScoreSpread`]), asked once when the
     /// engine is built. A scorer that writes levels is a rank where its weight
     /// outweighs every stage behind it: a plain decision then asks those stages
@@ -417,6 +394,18 @@ pub trait Scorer: Lifecycle + Debug {
     /// As [`Filter::refuses_by_reports`], for a scorer.
     fn refuses_by_reports(&self) -> bool {
         true
+    }
+
+    /// Whether the stage places a request at the place its caller states
+    /// for the routing value's own text on a ring the caller lends
+    /// ([`RequestFacts::ring`]): the hash ring that is keyed by no prefix.
+    /// What makes a request for its caller states that place under such a
+    /// stage and lends the ring to no other
+    /// ([`Engine::states_key_place`]): another form of the ring is asked for
+    /// another text. A stage that reads a ring ([`Scorer::needs`]) and
+    /// answers `false` here is taken for such a form.
+    fn places_by_key_text(&self) -> bool {
+        false
     }
 
     /// The warm-up ruling this stage applies, where it applies one: what a
@@ -675,21 +664,35 @@ pub trait Picker: Lifecycle + Debug {
     /// health on the worker and holds every other rule of a placement
     /// itself asks such a picker for one pick and nothing else of a
     /// decision ([`Engine::place_for`]). The default is no. The engine reads
-    /// it where such a caller asks for a place's profile, and at one
-    /// decision: a pair's decode decided again, handed the decode of the
-    /// pair's first decision ([`Profile::keeps_its_pick`]).
+    /// it where such a caller asks for a place's profile, not at a
+    /// decision.
     fn picks_alone(&self) -> bool {
+        false
+    }
+
+    /// Whether each pick takes the next turn of an order the picker keeps,
+    /// as a rotation's does: a second pick for one request spends a turn
+    /// that serves no request. Such a picker's draw ([`Picker::draw_first`])
+    /// must read no value of the seed's stream: the engine hands it the
+    /// request's own seed and asserts in a debug build that none was read.
+    /// The default is no. The engine reads it at two decisions: a pair's
+    /// decode decided again, handed the decode of the pair's first decision
+    /// ([`Profile::keeps_its_pick`]), and a session a sessions rule leaves
+    /// to the profile ([`Assignment::Delegate`]), which takes the pool's
+    /// turn.
+    fn takes_turns(&self) -> bool {
         false
     }
 
     /// One pick over `pool` by the picker's own rule alone
     /// ([`Picker::picks_alone`]). `keep` asks the caller's test of the
     /// worker at a position of the pool: one read of that worker. `Some`
-    /// is the position picked, which `keep` kept. `None` where the rule's
-    /// own bound ran out before a worker was kept, as a rotation's turns
-    /// past a refused worker do: the caller then reads the pool whole and
-    /// asks [`Picker::pick_among`] of the workers that pass. The default
-    /// picks nobody.
+    /// is the position picked, which `keep` kept. `None` where the rule
+    /// kept no worker. A rule whose own bound ran out first, as a
+    /// rotation's turns past a refused worker do, leaves the pool to its
+    /// caller, which reads it whole and asks [`Picker::pick_among`] of the
+    /// workers that pass. A rule that asked every worker settles it
+    /// ([`Picker::asks_every_worker`]). The default picks nobody.
     fn pick_alone(
         &self,
         pool: &PoolWord<'_>,
@@ -697,6 +700,15 @@ pub trait Picker: Lifecycle + Debug {
     ) -> Option<usize> {
         let _ = (pool, keep);
         None
+    }
+
+    /// Whether [`Picker::pick_alone`] asks `keep` of every worker of the
+    /// pool before it picks nobody, as a scan in the pool's order does and
+    /// a rotation's bounded turns do not. Its `None` then says that no
+    /// worker of the pool passes, and the caller does not read the pool a
+    /// second time to learn it. The default is no.
+    fn asks_every_worker(&self) -> bool {
+        false
     }
 
     /// The pick among the `passed` workers a whole pass left, as a place in
@@ -764,14 +776,15 @@ pub struct Profile {
 
 impl Profile {
     /// Whether a pick of this profile stands while its worker does: the
-    /// profile holds no scorer, and its picker's own rule is its whole pick
-    /// ([`Picker::picks_alone`]), which reads no row, no score and no
-    /// count. Decided again over the same workers, such a profile would
-    /// pick by nothing that moved since. So a pair's decode decided again
-    /// keeps the decode of its first decision ([`Engine::decide_decode`]).
+    /// profile holds no scorer, and each pick of its picker takes a turn
+    /// ([`Picker::takes_turns`]). Decided again, such a profile would spend
+    /// a second turn for one request, and move the request by nothing its
+    /// workers show. So a pair's decode decided again keeps the decode of
+    /// its first decision ([`Engine::decide_decode`]). Every other profile
+    /// decides again, on the workers as they stand at that call.
     #[must_use]
     pub fn keeps_its_pick(&self) -> bool {
-        self.scorers.is_empty() && self.picker.picks_alone()
+        self.scorers.is_empty() && self.picker.takes_turns()
     }
 
     /// What this profile's stages read from the host beyond the facts every
@@ -1106,12 +1119,20 @@ struct Buffers {
     scores: Vec<f32>,
     stage: Vec<f32>,
     before_soft: Vec<u32>,
-    /// The rows as they read with no doubt, for the all-vetoed rule's pass
-    /// that lifts the liveness veto ([`vetoed::emptied`]). The first such
-    /// pass sizes it, and no other decision touches it.
+    /// The rows as they read with no doubt, for a pass that lifts the
+    /// liveness veto over rows that carry one: the all-vetoed rule's
+    /// ([`vetoed::emptied`]) and the pair default's ([`vetoed::paired`]).
+    /// The first such pass sizes it, and no other decision writes it.
     undoubted: Vec<Candidate>,
-    /// The veto the rule lifted for the rows it kept ([`vetoed::emptied`]):
-    /// the mark of its pick's trace ([`vetoed::steered`]).
+    /// The veto lifted for the rows a pass kept: the mark of its pick's
+    /// trace ([`vetoed::steered`]). The all-vetoed rule writes it where it
+    /// keeps rows ([`vetoed::emptied`]), and a pair's default writes its
+    /// tier on both sides' buffers ([`vetoed::paired`]). No other pass
+    /// clears it, so a decision that reads it clears it first: a keyed
+    /// request's ([`Engine::keep`]), and a pair's for the prefill's buffer
+    /// ([`Engine::decide_pair`]). There the default alone writes it again,
+    /// and the prefill's shadow reads it to know the default made the pair
+    /// ([`Engine::shadow_side`]).
     lifted: LiftedVeto,
     /// The pool size every buffer holds room for ([`Buffers::reserve`]).
     room: usize,
@@ -1770,9 +1791,9 @@ fn only(classes: &[u32]) -> Option<u32> {
 /// 4.2: a shed names it): a pool with no candidate was emptied by no stage,
 /// a prefill whose classes hold no decode by the partners.
 ///
-/// A set no class narrows opens with the places the request is held to,
-/// where its host holds it to any, and with no other row ([`places`]):
-/// what a filter then keeps is among them, under any profile.
+/// A set opens with the places the request is held to, where its host holds
+/// it to any, and with no other row ([`places`]): what a class or a filter
+/// then keeps is among them, under any profile.
 ///
 /// A pool a hard filter empties is put to the set's all-vetoed rule before
 /// its stage is returned ([`vetoed::emptied`]). Where the rule steers, the
@@ -1796,6 +1817,15 @@ fn filter(
     let kept = &mut buf.kept;
     kept.clear();
     match class {
+        // A side held to places opens with those of them its classes keep:
+        // a class opens no row outside them.
+        Some(classes) if places::stated(cx) => {
+            places::open(kept, candidates.len(), cx);
+            kept.retain(|&i| classed(classes, candidates[i as usize].pair_class));
+            if kept.is_empty() {
+                return Some("partners");
+            }
+        }
         Some(classes) => {
             let rows = 0..candidates.len() as u32;
             match only(classes) {
@@ -1881,8 +1911,8 @@ fn single_survivors(
 /// left the rows it kept in `buf.kept` ([`vetoed::steered`]). Every path of
 /// the plan ends here when a stage leaves nobody, a plain request
 /// ([`run_single`]) and the two a sessions rule or an assignment places
-/// ([`single_survivors`]): what the plan asks of an emptied pool has this
-/// one home.
+/// ([`single_survivors`]), and so does a side of a pair ([`run_side`]):
+/// what a plan asks of an emptied pool has this one home.
 ///
 /// Cold and out of line, its arguments in the order the shed takes them: a
 /// pass that keeps a row sets up nothing for this call.
@@ -2148,8 +2178,10 @@ impl<'a> Set<'a> {
 
     /// One side of a pair: `candidates` narrowed by the classes a chosen
     /// prefill pairs with or by the partnered list. A side is put to no rule
-    /// ([`AllVetoed::Unasked`]): the pair plan does not enter the all-vetoed
-    /// rule, and a pool a veto empties there is shed.
+    /// ([`AllVetoed::Unasked`]) until its caller says its binding's word
+    /// ([`Self::ruled`]), as a live decode side does. A prefill side says
+    /// none, nor does a pass that only names a shed's stage, a shadow's run
+    /// or an encode item's: a pool a veto empties there is shed.
     const fn side(
         candidates: &'a [Candidate],
         class: Option<&'a [u32]>,
@@ -2175,6 +2207,14 @@ impl<'a> Set<'a> {
             vetoed: AllVetoed::Unasked,
             ..self
         }
+    }
+
+    /// The same rows put to their binding's all-vetoed rule by its word
+    /// (`vetoed`): a pair's live decode side. Where a soft veto leaves such
+    /// a side nobody, the rule steers it or sheds it as it does the single
+    /// plan's pool ([`vetoed::emptied`]), over the side's own rows.
+    const fn ruled(self, vetoed: AllVetoed) -> Self {
+        Self { vetoed, ..self }
     }
 }
 
@@ -2228,6 +2268,10 @@ fn score_survivors(
 /// One profile over one side of a pair: the filter half of its run, then
 /// the scoring half. The pair plans run their sides through here; the single
 /// plan runs the same two halves from its own opening ([`run_single`]).
+/// A side its filters emptied ends where the single plan's pool does
+/// ([`single_emptied`]): in the all-vetoed rule's pick where the side's set
+/// carries its binding's word ([`Set::ruled`]) and the rule kept rows, else
+/// in the shed that names the stage.
 fn run_profile(
     profile: &Profile,
     index: u16,
@@ -2262,11 +2306,7 @@ fn run_side(
 ) -> Decision {
     let candidates = set.candidates;
     if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
-        return shed(
-            reason_of(emptied_by),
-            emptied_by,
-            trace_of(index, facts, pool, candidates, &[], &[]),
-        );
+        return single_emptied(index, facts, pool, candidates, emptied_by, buf);
     }
     score_survivors(profile, index, facts, pool, candidates, buf, first)
 }
@@ -2529,7 +2569,8 @@ fn order_joined(
 /// before the scorers run ([`order_joined`]). A draw that keeps nobody says
 /// nothing of the pool: the decision widens to the whole pass
 /// ([`run_whole`]), whose stages alone shed, name a stage and ask the
-/// all-vetoed rule.
+/// all-vetoed rule. Nothing is drawn for a request its host holds to places
+/// ([`places`]): the whole pass decides it.
 ///
 /// Where the build folded the profile's filters into one test of a row
 /// (`row_tests`), a row is asked about in that one test, and about the host's
@@ -2568,6 +2609,9 @@ fn run_drawn(
             .draw_first(facts, pool, candidates, ask, &mut buf.kept, &mut draw)
     };
     let drew = match rows {
+        // A request held to places is the whole pass's, which opens its
+        // set with them: nothing is drawn, and the pass below decides.
+        _ if places::stated(cx) => false,
         Some(tests) if tests.masked(cx) => {
             draw_by(&mut |c| tests.keeps(facts, c, cx) && !cx.masks(c.position))
         }
@@ -2747,7 +2791,9 @@ fn run_drawn_written(
     buf.kept.clear();
     let mut draw = Draw::new(facts.seed);
     let masked = tests.is_some_and(|tests| tests.masked(cx));
-    let drew = {
+    // A request held to places is the whole pass's, which opens its set
+    // with them: nothing is drawn, and every row is written below.
+    let drew = !places::stated(cx) && {
         // The row a draw lands on, written at its place: the written
         // record is the one the filters are asked about.
         let mut ask = |fixed: &Candidate| {
@@ -3322,12 +3368,15 @@ pub struct Engine {
     /// indexed by [`slot`].
     phase_needs: [Needs; PHASES.len()],
     /// Per phase, whether a binding that covers it under the single plan
-    /// pins a key or reads a ring: the phases whose requests the keyed
-    /// decision over rows read one at a time answers or lends a ring
-    /// ([`Self::decide_keyed`]), indexed by [`slot`]. Every other phase's
-    /// request is turned away there by this one read.
+    /// pins a key: the phases whose requests the keyed decision over rows
+    /// read one at a time answers ([`Self::decide_keyed`]), indexed by
+    /// [`slot`]. Every other phase's request is turned away there by this
+    /// one read.
     keyed: [bool; PHASES.len()],
-    sessions: SessionTable,
+    /// The session table this engine's decisions read and write: its own,
+    /// made with it, or the one its host keeps across documents
+    /// ([`Self::share_sessions`]).
+    sessions: Arc<SessionTable>,
     assignment: AssignmentStages,
     /// Per profile, what its stages ask of a decision beyond the profile's
     /// own run ([`Marks`]).
@@ -3593,6 +3642,15 @@ impl Marks {
     /// it: the decision's host does, by its one lookup
     /// ([`Engine::reads_for`]).
     const BY_REPORTS: u16 = 1 << 9;
+    /// A scorer places a request at the place stated for its routing
+    /// value's own text on a lent ring ([`Scorer::places_by_key_text`]).
+    /// The engine's run reads nothing of it: what makes the request does,
+    /// by its one lookup ([`Engine::states_key_place`]).
+    const KEY_PLACE: u16 = 1 << 10;
+    /// A scorer reads a ring ([`Needs::ring`](crate::document::spec::Needs::ring))
+    /// and places by another text than the routing value's own: the place
+    /// stated for that text is not its place. Read by the same lookup.
+    const OTHER_PLACE: u16 = 1 << 11;
 
     fn of(profile: &Profile, order: Order) -> Self {
         let scoped = if profile.scoped() { Self::SCOPED } else { 0 };
@@ -3643,7 +3701,23 @@ impl Marks {
         } else {
             0
         };
-        Self(scoped | by_assignment | draws_first | joined | ranked | engines | owns | by_reports)
+        let by_key_text = |stage: &WeightedScorer| stage.scorer.places_by_key_text();
+        let key_place = if profile.scorers.iter().any(by_key_text) {
+            Self::KEY_PLACE
+        } else {
+            0
+        };
+        let by_other_text = |stage: &WeightedScorer| {
+            stage.scorer.needs().ring && !stage.scorer.places_by_key_text()
+        };
+        let other_place = if profile.scorers.iter().any(by_other_text) {
+            Self::OTHER_PLACE
+        } else {
+            0
+        };
+        // The three marks no run of the engine reads.
+        let for_hosts = by_reports | key_place | other_place;
+        Self(scoped | by_assignment | draws_first | joined | ranked | engines | owns | for_hosts)
     }
 
     /// Whether no stage asks anything before the profile's run: no scope
@@ -3660,6 +3734,16 @@ impl Marks {
     /// A stage that may refuse by a report of leases.
     const fn by_reports(self) -> bool {
         self.0 & Self::BY_REPORTS != 0
+    }
+
+    /// A scorer that places by the place stated for a key's own text.
+    const fn key_place(self) -> bool {
+        self.0 & Self::KEY_PLACE != 0
+    }
+
+    /// A ring scorer that places by another text than the key's own.
+    const fn other_place(self) -> bool {
+        self.0 & Self::OTHER_PLACE != 0
     }
 
     /// A scope to open and no key's mark: the opening's first arm.
@@ -3835,6 +3919,18 @@ fn absence(bindings: &[Binding]) -> u64 {
     let rules = bindings.iter().filter_map(|b| b.sessions.as_ref());
     let longest = rules.map(|rule| rule.ttl_micros.unwrap_or(stated));
     longest.max().unwrap_or(stated)
+}
+
+/// The rule a decision reads the session table under: its binding's, with
+/// no sweep interval where the host lends pins of record
+/// ([`Constraints::pins`]). Such a record ends a pin with its idle time, so
+/// the table ends the key there too and the two never disagree.
+fn read_under(rule: &SessionRule, cx: &Constraints<'_>) -> SessionRule {
+    let sweep_micros = cx.pins.map_or(rule.sweep_micros, |_| 0);
+    SessionRule {
+        sweep_micros,
+        ..*rule
+    }
 }
 
 /// The stages a sessions rule places a key by when its binding's profile does
@@ -4400,12 +4496,10 @@ impl Engine {
                         .and_then(|i| profile_needs.get(usize::from(i)))
                         .copied()
                         .unwrap_or_default();
-                    // A rule that pins a key, or a stage that places by a
-                    // ring, the profile's or its shadow's: what a keyed
-                    // decision answers for, or lends a ring for.
-                    let reads_ring = own.ring || shadow.ring;
+                    // A rule that pins a key: what a keyed decision
+                    // answers for.
                     keyed[slot(phase)] |=
-                        binding.plan == Plan::Single && (binding.sessions.is_some() || reads_ring);
+                        binding.plan == Plan::Single && binding.sessions.is_some();
                     phase_needs[slot(phase)] = phase_needs[slot(phase)]
                         .or(own)
                         .or(shadow)
@@ -4446,6 +4540,7 @@ impl Engine {
         let sessions = SessionTable::new(shortest_sweep(&bindings))
             .with_absence(absence(&bindings))
             .with_shards(session_shards(&bindings));
+        let sessions = Arc::new(sessions);
         let orders: Vec<Order> = profiles.iter().map(Order::of).collect();
         let marks: Vec<Marks> = profiles
             .iter()
@@ -4638,6 +4733,23 @@ impl Engine {
         &self.sessions
     }
 
+    /// This engine reads and writes `table` from here on: the table a host
+    /// keeps for its life, where it keeps one engine object and gives it
+    /// documents. The table takes this document's two times
+    /// ([`SessionTable::set_times`]) and keeps its keys, its shards and the
+    /// workers it holds as absent. The table this engine was made with is
+    /// let go, and a pin it held would go with it: its host calls this
+    /// before the engine takes a decision, which a debug build checks.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn share_sessions(&mut self, table: Arc<SessionTable>) {
+        debug_assert!(
+            self.sessions.is_empty(),
+            "the engine placed a key ahead of the hand-over of its session table"
+        );
+        table.set_times(self.sessions.sweep_micros(), self.sessions.absence_micros());
+        self.sessions = table;
+    }
+
     /// A worker that left membership stands again as `new`: its key was
     /// registered again, and a registration makes a new id. The session
     /// pins of `old` are `new`'s from here, so a key's recovery rules over
@@ -4786,6 +4898,31 @@ impl Engine {
         })
     }
 
+    /// Whether what makes a request of `phase` for `model` states where
+    /// the routing value's own text stands on a ring its caller lends: a
+    /// scorer of the profile that decides it places by that
+    /// ([`Scorer::places_by_key_text`]), or, for a pair asked at its
+    /// prefill, a scorer of its decode profile does. And no scorer of
+    /// either reads a ring by another text: a pair's two sides are handed
+    /// one ring and one place, so a side of another ring form would take
+    /// that place for its own. `false` where no binding matches. One
+    /// lookup, which only a request that lends a ring pays. A caller that
+    /// writes a request's facts itself asks it before it takes the place
+    /// with the request's keys
+    /// ([`KeySources::derive_keys`](crate::document::KeySources::derive_keys)).
+    #[must_use]
+    pub fn states_key_place(&self, model: &str, phase: Phase) -> bool {
+        let own = self.resolve(model, phase);
+        let own = own.map(|(_, index, _)| self.marks[usize::from(index)]);
+        let own = own.unwrap_or_default();
+        let decode = if phase == Phase::Prefill {
+            self.pair_decode_marks(model)
+        } else {
+            Marks::default()
+        };
+        (own.key_place() || decode.key_place()) && !(own.other_place() || decode.other_place())
+    }
+
     /// The marks of the decode profile of `model`'s pair binding, none
     /// where the model has no such binding.
     fn pair_decode_marks(&self, model: &str) -> Marks {
@@ -4824,8 +4961,15 @@ impl Engine {
     /// of a pair decision run under it ([`Self::decide_pair`]), whatever
     /// binding covers the decode phase first.
     fn pair_binding(&self, model: &str) -> Option<&Binding> {
-        self.binding(model, Phase::Prefill)
-            .filter(|b| matches!(b.plan, Plan::PdPair | Plan::Epd { .. }))
+        self.pair_entry(model).map(|entry| &entry.binding)
+    }
+
+    /// [`Self::pair_binding`] as the engine holds it: the binding beside
+    /// its word for a pool a soft veto empties, which a pair's decode side
+    /// is put to the all-vetoed rule by. Its prefill side is put to none.
+    fn pair_entry(&self, model: &str) -> Option<&Entry> {
+        self.entry(model, Phase::Prefill)
+            .filter(|entry| matches!(entry.binding.plan, Plan::PdPair | Plan::Epd { .. }))
     }
 
     /// The binding a `phase` pool of `model` is decided under, whose
@@ -4844,7 +4988,10 @@ impl Engine {
 
     /// What some decision of `phase` may read, over every binding that
     /// covers the phase: the host's answer to "does any regular placement
-    /// read the request text" and its kin, read at apply.
+    /// read the request text" and its kin, read at apply. A single decision
+    /// over a host's worker lists skips its list's affinity table on this
+    /// answer alone, so it never says less than [`Self::needs_for`] says of
+    /// a request of the phase.
     pub fn needs_for_phase(&self, phase: Phase) -> Needs {
         self.phase_needs[slot(phase)]
     }
@@ -4948,6 +5095,10 @@ impl Engine {
     /// the shadow profile's needs to the live one's: a host that skips a
     /// shadow, or names it rows of its own ([`ShadowRows`]), fills the
     /// live decision's column by this word.
+    #[expect(
+        dead_code,
+        reason = "no host names a shadow rows of its own until the engine over worker lists does"
+    )]
     pub(crate) fn live_column_at(&self, at: u32, phase: Phase) -> bool {
         self.bindings
             .get(at as usize)
@@ -4961,6 +5112,13 @@ impl Engine {
     /// own, as [`Self::affinity_rows_cap`] says a live profile's. `0` where the
     /// binding names no shadow. A host asks it where it names such rows,
     /// and for no other decision.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no host names a shadow rows of its own until the engine over worker lists does"
+        )
+    )]
     pub(crate) fn shadow_cap_at(&self, at: u32) -> u32 {
         self.bindings
             .get(at as usize)
@@ -4977,6 +5135,13 @@ impl Engine {
     /// reads that call's shadow word ([`Self::shadow_at`]) and names its
     /// sampled record by this position. `None` where the prefill lookup
     /// finds no pair.
+    #[cfg_attr(
+        not(feature = "controller"),
+        expect(
+            dead_code,
+            reason = "the served controller names a decode call's sampled record by it"
+        )
+    )]
     pub(crate) fn pair_position(&self, model: &str) -> Option<u32> {
         let at = self.binding_position(model, Phase::Prefill)?;
         let pairs = matches!(self.binding_at(at)?.plan, Plan::PdPair | Plan::Epd { .. });
@@ -5152,6 +5317,10 @@ impl Engine {
     /// that names the shadow rows of its own ([`ShadowRows::Own`]) holds
     /// a naming that fills its cap to it. `None` too where the binding
     /// names no shadow.
+    #[expect(
+        dead_code,
+        reason = "no host names a shadow rows of its own until the engine over worker lists does"
+    )]
     pub(crate) fn shadow_keeps_at<'a>(
         &'a self,
         at: u32,
@@ -5618,7 +5787,9 @@ impl Engine {
 
     /// Make the binding's decision with its shadow profile on the same
     /// rows. The run only updates the shadow's stages and scratch. It
-    /// claims and renews no session pin.
+    /// claims and renews no session pin, and it is lent no word of the pool
+    /// ([`PoolFacts::word`]): the live decision alone turns the list's
+    /// rotation.
     ///
     /// Make the request's live decision through [`Self::decide_keeping`]
     /// and hand this call its scratch, before the scratch decides again.
@@ -5675,6 +5846,12 @@ impl Engine {
             };
             return Some(shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, trace));
         }
+        // The pool's own word counts the live decision's turns alone: a
+        // shadow is lent none, and its picker turns a rotation of its own.
+        let pool = &PoolFacts {
+            word: None,
+            ..*pool
+        };
         let set = Set {
             candidates,
             class: None,
@@ -5838,8 +6015,10 @@ impl Engine {
             !handed || scratch.kept_last,
             "the shadow takes a reading behind a plain decision"
         );
+        // The table is read under the rule as this host reads it.
+        let read = read_under(rule, cx);
         let mut pins = if WRITE_SESSIONS {
-            self.sessions.lookup(key, facts.now_micros, rule)
+            self.sessions.lookup(key, facts.now_micros, &read)
         } else if handed {
             found.pins
         } else {
@@ -5929,7 +6108,7 @@ impl Engine {
                 // At the cap: the stages place the request again, over every
                 // candidate the filters kept.
                 if let Some(respilled) = self.respill(
-                    profile, index, rule, placing, facts, pool, candidates, buf, c.id,
+                    profile, index, rule, placing, facts, pool, candidates, cx, buf, c.id,
                 ) {
                     return respilled;
                 }
@@ -5941,6 +6120,8 @@ impl Engine {
                 dp_rank: c.dp_rank,
                 pair: None,
             });
+            // The rule's pin placed the request: no stage was asked.
+            targets.by_rule(rule.rule_placed);
             let mut trace = Trace {
                 profile: index,
                 survivors: Survivors::counted(buf.kept.len() as u32),
@@ -5994,8 +6175,13 @@ impl Engine {
                 }
             }
         }
-        let mut decision = self.place(profile, index, placing, facts, pool, candidates, buf);
+        let mut decision = self.place(profile, index, placing, facts, pool, candidates, cx, buf);
         if let Decision::Pick(pick) = &mut decision {
+            // Under any assignment but `delegate` the rule's own stage
+            // placed the key: no stage of the profile was asked.
+            if placing != Assignment::Delegate {
+                pick.targets.by_rule(rule.rule_placed);
+            }
             if WRITE_SESSIONS {
                 pick.session_verdict = SessionVerdict::Pinned;
             }
@@ -6141,7 +6327,7 @@ impl Engine {
         if let Some(answer) = single_survivors(profile, index, facts, pool, set, cx, buf) {
             return answer;
         }
-        self.place(profile, index, assignment, facts, pool, candidates, buf)
+        self.place(profile, index, assignment, facts, pool, candidates, cx, buf)
     }
 
     /// Whether a pin carries its rule's in-flight cap of the key's requests,
@@ -6205,14 +6391,19 @@ impl Engine {
         facts: &RequestFacts<'_>,
         pool: &PoolFacts<'_>,
         candidates: &[Candidate],
+        cx: &Constraints<'_>,
         buf: &mut Buffers,
         pin: WorkerId,
     ) -> Option<Decision> {
         if buf.kept.is_empty() {
             return None;
         }
-        let mut decision = self.place(profile, index, placing, facts, pool, candidates, buf);
+        let mut decision = self.place(profile, index, placing, facts, pool, candidates, cx, buf);
         if let Decision::Pick(pick) = &mut decision {
+            // As a key with no pin: the rule's own stage placed it.
+            if placing != Assignment::Delegate {
+                pick.targets.by_rule(rule.rule_placed);
+            }
             let taken = pick.targets.first().map(|target| target.id);
             let under_the_cap = |id: WorkerId| {
                 buf.kept.iter().any(|&k| {
@@ -6284,14 +6475,14 @@ impl Engine {
         let candidates = set.candidates;
         if !KEPT {
             return self.respill(
-                profile, index, rule, placing, facts, pool, candidates, buf, pin,
+                profile, index, rule, placing, facts, pool, candidates, cx, buf, pin,
             );
         }
         // The veto as it stands: that pass's survivors decide. The pass is
         // put to no rule.
         if !all_vetoed && filter(profile, facts, cx, buf, set.shedding()).is_none() {
             if let Some(respilled) = self.respill(
-                profile, index, rule, placing, facts, pool, candidates, buf, pin,
+                profile, index, rule, placing, facts, pool, candidates, cx, buf, pin,
             ) {
                 return Some(respilled);
             }
@@ -6300,7 +6491,7 @@ impl Engine {
         // says the lift.
         if vetoed::lifted(profile, index, facts, pool, set, cx, buf).is_none() {
             if let Some(mut respilled) = self.respill(
-                profile, index, rule, placing, facts, pool, candidates, buf, pin,
+                profile, index, rule, placing, facts, pool, candidates, cx, buf, pin,
             ) {
                 if let Decision::Pick(pick) = &mut respilled {
                     pick.trace.lifted = LiftedVeto::Overload;
@@ -6311,12 +6502,110 @@ impl Engine {
         None
     }
 
+    /// The pool's own turn for a request a sessions rule leaves to the
+    /// profile, where the profile's picker takes turns
+    /// ([`Picker::takes_turns`]): the draw a request with no session value
+    /// is decided by ([`run_drawn`]), each row asked that draw's own test,
+    /// every filter of the profile, hard and soft alike, and taken where it
+    /// is one of the survivors in `buf.kept` too. A new session and a
+    /// session at its cap so take the next turn of the rotation such a
+    /// request turns, and none of the survivors' own. `None` where the
+    /// profile's plain request is not the draw's, or the draw keeps nobody:
+    /// the stages decide ([`score_and_pick`]), as the whole pass does behind
+    /// that draw. So where a soft filter refuses every row, both kinds of
+    /// request are refused at the draw and fall to the survivors' one
+    /// rotation.
+    ///
+    /// The rows drawn stand in `buf.before_soft`, which nothing reads behind
+    /// the filters: `buf.kept` stays the survivors, which the callers read.
+    /// A picker that takes turns draws by its rotation and reads no value of
+    /// the seed's stream, so the stages are handed the request's own seed.
+    /// The profile is read here, by the index, as [`run_drawn`] reads it.
+    fn pool_turn(
+        &self,
+        index: u16,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        cx: &Constraints<'_>,
+        buf: &mut Buffers,
+    ) -> Option<Decision> {
+        // The plain path's own test of a draw, the pool's size asked
+        // first: `DRAW_FROM` rows or more, a profile that draws for every
+        // request, and a request its host holds to no places.
+        let at = usize::from(index);
+        let draws = candidates.len() >= DRAW_FROM && self.marks[at].ahead() == Marks::DRAWS_FIRST;
+        if !(draws && !places::stated(cx) && self.profiles[at].picker.takes_turns()) {
+            return None;
+        }
+        let (profile, tests) = (&self.profiles[at], self.row_tests[at]);
+        let Buffers {
+            kept,
+            scores,
+            stage,
+            before_soft: drawn,
+            ..
+        } = buf;
+        drawn.clear();
+        // A row the draw takes passes two tests, and neither says the other.
+        // The draw's own, as a request with no session value is asked it:
+        // the profile's fold where the build made one, else a call a
+        // filter. Where the pass put back the rows a soft filter refused
+        // together, or a kept session's pass ran again with the overload
+        // veto lifted, every survivor fails it: the draw keeps none, as
+        // that request's does, and the stages place over the survivors.
+        // And the row is one of the survivors. A filter may read what
+        // another decision moves, so a row the pass refused can pass the
+        // first test here, and the session's cap is read of the survivors
+        // alone ([`Self::respill`]). The host's mask, which that request's
+        // draw asks beside a fold that holds the health filter, is not
+        // asked again beside the fold: that filter asked it in the pass,
+        // under these constraints, and no row it kept is under the mask.
+        // The survivors name a row once, so as many as the rows is every row.
+        let all = kept.len() == candidates.len();
+        let mut keeps = |row: &Candidate| {
+            let passes = match tests {
+                Some(tests) => tests.keeps(facts, row, cx),
+                None => profile.filters.iter().all(|f| f.keep(facts, row, cx)),
+            };
+            let at = candidates.element_offset(row);
+            passes && (all || at.is_some_and(|at| kept.contains(&(at as u32))))
+        };
+        let mut draw = Draw::new(facts.seed);
+        let picker = &profile.picker;
+        let drew = picker.draw_first(facts, pool, candidates, &mut keeps, drawn, &mut draw);
+        // Asked on both arms: the stages behind a draw that keeps nobody are
+        // handed the request's own seed too.
+        debug_assert_eq!(draw.state(), facts.seed, "a turn reads no drawn value");
+        if !drew {
+            return None;
+        }
+        let mut targets = Targets::new();
+        let band = combine(profile, facts, candidates, drawn, scores, stage);
+        picker.order_drawn(facts, candidates, drawn, scores, band, &mut targets);
+        if targets.is_empty() {
+            return None;
+        }
+        // The pass ran before the draw: its survivors are counted.
+        let mut trace = trace_drawn(index, facts, pool, candidates, drawn, scores);
+        trace.survivors = Survivors::counted(kept.len() as u32);
+        Some(Decision::Pick(Pick {
+            targets,
+            trace,
+            session_verdict: SessionVerdict::None,
+        }))
+    }
+
     /// The stages of an assignment over the survivors in `buf.kept`: the
     /// profile's own scorers and picker under `delegate`, else the
-    /// assignment's stage over the same survivors. The assignment is the
+    /// assignment's stage over the same survivors. Under `delegate` a
+    /// picker that takes turns is asked for the pool's turn first
+    /// ([`Self::pool_turn`]). The assignment is the
     /// one that places ([`placed_by`]): every caller hands the binding's
     /// placing assignment, which the engine's build wrote for a binding
-    /// under a rule and for one under none.
+    /// under a rule and for one under none. Who placed the pick
+    /// ([`Targets::by_rule`]) is its caller's word: a rule's, for its key
+    /// alone.
     #[expect(
         clippy::too_many_arguments,
         reason = "the profile run's inputs, as run_profile takes them"
@@ -6329,12 +6618,16 @@ impl Engine {
         facts: &RequestFacts<'_>,
         pool: &PoolFacts<'_>,
         candidates: &[Candidate],
+        cx: &Constraints<'_>,
         buf: &mut Buffers,
     ) -> Decision {
         let mut targets = Targets::new();
         let picker: &dyn Picker = match assignment {
             // The profile's own stages, through the profile run's one home.
             Assignment::Delegate => {
+                if let Some(turned) = self.pool_turn(index, facts, pool, candidates, cx, buf) {
+                    return turned;
+                }
                 score_and_pick(profile, facts, candidates, buf, &mut targets);
                 profile.picker.as_ref()
             }
@@ -6402,6 +6695,26 @@ impl Engine {
     /// side's rows ([`Constraints::stalled`]) is declined under the stage
     /// name `written-rows` before either scope opens, as [`Self::decide`]
     /// declines it. A pair side carries no pin.
+    ///
+    /// The decode side is put to its binding's all-vetoed rule for the
+    /// overload veto, as the pool of a single request is ([`Self::decide`]).
+    /// Where no decode is open and some are over their thresholds alone, the
+    /// rule lifts that veto once for the pool, and every decode the hard
+    /// filters then keep opens its prefills. A prefill is chosen among them
+    /// by its own profile, its partners go to the one of them that holds the
+    /// fewest requests, and the pair's trace says the lifted veto
+    /// ([`LiftedVeto::Overload`]). On a retry the profile's soft filter keeps
+    /// that pick to the partners the request has not tried while one is
+    /// left. Under a binding that sheds, such a pool is shed as saturated.
+    /// The prefill side's own run is put to no rule.
+    ///
+    /// Where that run sheds, a pool whose every usable worker is vetoed
+    /// goes to the pair's default: the usable prefill and partner of the
+    /// least load, the pairs the overload veto alone refuses first, with the
+    /// admission limit asked of the prefill taken. A prefill pool refused
+    /// whole pairs so, and so does a decode pool the liveness veto refuses
+    /// on every worker. Each side's workers are those at the places its
+    /// host states.
     pub fn decide_pair(
         &self,
         facts: &RequestFacts<'_>,
@@ -6432,9 +6745,12 @@ impl Engine {
         // One binding for both sides: the prefill's lookup, whose decode
         // profile is the pair's decode side. A binding of the single plan
         // declines a pair decision: the host and the spec disagree.
-        let Some(binding) = self.pair_binding(facts.model) else {
+        let Some(entry) = self.pair_entry(facts.model) else {
             return shed(ShedReason::PolicyDeclined, "binding", bare);
         };
+        // The binding's word for a pool a soft veto empties: the live
+        // decode side is put to the all-vetoed rule by it ([`Set::ruled`]).
+        let (binding, vetoed) = (&entry.binding, entry.vetoed);
         let decode_index = binding.decode_profile.unwrap_or(binding.profile);
         let (Some(prefill_profile), Some(decode_profile)) = (
             self.profiles.get(usize::from(binding.profile)),
@@ -6480,8 +6796,8 @@ impl Engine {
                 .validate()
                 .map_or_else(|clause| clause.to_string(), |()| String::new())
         );
-        let open = decodes
-            .iter()
+        // A decode outside its side's places partners nobody.
+        let open = places::rows(decodes, decode_cx)
             .filter(|d| {
                 d.pair_class != 0
                     && decode_profile
@@ -6494,6 +6810,49 @@ impl Engine {
         pools
             .table
             .partnered(open, &mut scratch.classes, &mut scratch.marks);
+        // No prefill class has an open decode. The decode pool is put to
+        // the binding's all-vetoed rule once. Where the overload veto alone
+        // left it nobody, every decode the hard filters keep with that veto
+        // lifted opens its prefills. A soft filter of that pass hides no
+        // class: a room narrows a prefill's partners, not the prefills. The
+        // decode run of the chosen prefill then meets its partners emptied
+        // the same way, and the rule picks among them. Decodes the rule
+        // keeps past a doubt open no prefill: the prefill side sheds, and
+        // that pool goes to the pair's default below.
+        if scratch.classes.is_empty() {
+            let whole = Set::side(decodes, None, None).ruled(vetoed);
+            let buf = &mut scratch.decode;
+            let emptied = filter(decode_profile, &decode_facts, decode_cx, buf, whole);
+            let lifted = !buf.kept.is_empty() && buf.lifted == LiftedVeto::Overload;
+            if emptied.is_some() && lifted {
+                // The facts and the constraints of the rule's own pass
+                // ([`vetoed::emptied`]).
+                let all = RequestFacts {
+                    tried: &[],
+                    ..decode_facts
+                };
+                let pass = Constraints {
+                    overload_lifted: true,
+                    ..*decode_cx
+                };
+                let hard = || decode_profile.filters.iter().filter(|f| !f.soft());
+                // Here too a decode outside its side's places partners
+                // nobody: the rule's pass above opened with those places.
+                // So does a decode of class 0.
+                let kept = places::rows(decodes, decode_cx)
+                    .filter(|d| d.pair_class != 0 && hard().all(|f| f.keep(&all, d, &pass)));
+                pools.table.partnered(
+                    kept.map(|d| d.pair_class),
+                    &mut scratch.classes,
+                    &mut scratch.marks,
+                );
+            }
+        }
+        // The prefill buffer's mark of a lifted veto is cleared for this
+        // decision. The pair's default alone writes it again
+        // ([`vetoed::paired`]), and the prefill's shadow reads it
+        // ([`Self::shadow_side`]).
+        scratch.single.lifted = LiftedVeto::None;
         let prefill = run_profile(
             prefill_profile,
             binding.profile,
@@ -6516,9 +6875,25 @@ impl Engine {
             // decline passes through.
             if let Decision::Shed(prefill_shed) = &prefill {
                 if prefill_shed.reason != ShedReason::PolicyDeclined {
+                    // A refused pool vetoed on every usable worker goes to
+                    // the pair of the least load ([`vetoed::paired`]). The
+                    // default reads the classes with an open partner, so it
+                    // is asked before they are written over.
+                    let (first, second) = (binding.profile, decode_index);
+                    let sides = [
+                        Half::new(prefill_profile, first, &prefill_facts, prefills, cx),
+                        Half::new(decode_profile, second, &decode_facts, decodes, decode_cx),
+                    ];
+                    let weighs = self.profile_needs[usize::from(first)].affinity;
+                    let words = (vetoed == AllVetoed::Steer, weighs);
+                    if let Some(pair) = vetoed::paired(sides, &pools.table, words, pool, scratch) {
+                        return pair;
+                    }
                     let mut routable = 0usize;
                     scratch.classes.clear();
-                    for c in prefills.iter().filter(|c| {
+                    // Of the prefills the request may take: one outside
+                    // its side's places is no routable prefill of it.
+                    for c in places::rows(prefills, cx).filter(|c| {
                         prefill_profile
                             .filters
                             .iter()
@@ -6585,7 +6960,7 @@ impl Engine {
                 decode_index,
                 &decode_facts,
                 pool,
-                Set::side(decodes, Some(pools.table.of(&class)), None),
+                Set::side(decodes, Some(pools.table.of(&class)), None).ruled(vetoed),
                 decode_cx,
                 &mut scratch.decode,
             );
@@ -6603,7 +6978,11 @@ impl Engine {
                         session_verdict,
                     } = paired;
                     targets.pair_under(prefill_target);
+                    // The pair's trace is the prefill's, with the mark of
+                    // the veto the rule lifted for the decode side.
+                    let lifted = trace.lifted;
                     *trace = prefill_pick.trace;
+                    trace.lifted = lifted;
                     *session_verdict = SessionVerdict::None;
                     return decision;
                 }
@@ -6649,10 +7028,25 @@ impl Engine {
     /// `None` where the binding names no shadow for the side, where the
     /// build did not find that profile free to run beside the live one
     /// ([`side_shadows`]), and where it would be handed another column
-    /// than the live side's pool carries ([`Self::side_apart`]).
+    /// than the live side's pool carries ([`Self::side_apart`]). `None`
+    /// too beside a pair a lifted veto placed: a shadow's run is put to no
+    /// rule, so it sheds a pool its live side was steered in, and decides
+    /// by its profile where the live side was taken by load. The decode's
+    /// shadow says none beside a pair whose trace names a lifted veto, by
+    /// the binding's all-vetoed rule or by the pair's default
+    /// ([`vetoed::paired`]). The prefill's shadow says none beside a pair
+    /// the default made, which the mark on the prefill's buffer says: it
+    /// speaks beside a pair whose decode side alone the rule steered.
     #[expect(
         clippy::too_many_arguments,
         reason = "the pair's entry and its inputs, beside the side and the live pick"
+    )]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no host asks a pair's shadows until the engine over worker lists does"
+        )
     )]
     pub(crate) fn shadow_side(
         &self,
@@ -6675,6 +7069,9 @@ impl Engine {
         let (decodes, decode_facts) = pools.side(PairSide::Decode, facts)?;
         Some(match side {
             PairSide::Prefill => {
+                if scratch.single.lifted != LiftedVeto::None {
+                    return None;
+                }
                 // The prefills the live prefill profile was shown: the
                 // classes with a partner stand in the scratch as the
                 // pair's decision left them ([`Self::decide_pair`]). No
@@ -6692,6 +7089,9 @@ impl Engine {
                 )
             }
             PairSide::Decode => {
+                if live.trace.lifted != LiftedVeto::None {
+                    return None;
+                }
                 // The partners of the live pair's prefill.
                 let prefill = live.targets.first()?;
                 let class = prefills.get(prefill.position as usize)?.pair_class;
@@ -6717,10 +7117,19 @@ impl Engine {
     /// nothing a commit reads.
     ///
     /// `None` where [`Self::shadow_side`] says none for the decode side,
-    /// and where the held prefill left the rows.
+    /// and where the held prefill left the rows. The same beside a decode
+    /// the binding's all-vetoed rule placed, which the trace of `live`,
+    /// that call's pick, says.
     #[expect(
         clippy::too_many_arguments,
         reason = "the decode entry and its inputs, beside the binding"
+    )]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no host asks a later decode's shadow until the engine over worker lists does"
+        )
     )]
     pub(crate) fn shadow_decode_later(
         &self,
@@ -6729,12 +7138,13 @@ impl Engine {
         pool: &PoolFacts<'_>,
         pools: PairPools<'_>,
         prefill: WorkerId,
+        live: &Pick,
         decode_cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Option<Decision> {
         let side = PairSide::Decode;
         let index = self.shadow_sides.get(at as usize)?[side.index()]?;
-        if self.side_apart(at, side) {
+        if self.side_apart(at, side) || live.trace.lifted != LiftedVeto::None {
             return None;
         }
         let profile = self.profiles.get(usize::from(index))?;
@@ -6756,9 +7166,22 @@ impl Engine {
     /// Decides the decode side for a held prefill. The model's pair binding
     /// runs its decode profile over that prefill's partners in `pools`.
     /// Each picked target names the held prefill and one of those decodes.
-    /// A missing prefill is shed under `prefill-gone`. A shed made once the
-    /// decode profile resolves names that profile. `pool` holds the facts
-    /// of the decode pool, where the profile places.
+    /// A missing prefill is shed under `prefill-gone`, whatever the call's
+    /// constraints state: it is looked for before they are read. A shed
+    /// made once the decode profile resolves names that profile. `pool`
+    /// holds the facts of the decode pool, where the profile places. The
+    /// decodes are held to the places `decode_cx` states. The held
+    /// prefill is found by its id, in or outside any places. Partners that
+    /// are all over their thresholds, or doubted, are put to the binding's
+    /// all-vetoed rule, both its tiers: the rule picks afresh among them,
+    /// whatever decode the first decision named. Over partners all over
+    /// their thresholds the profile's soft filter keeps that pick to the
+    /// ones the request has not tried while one is left, as the rule's
+    /// pick in a first decision does. A pair's first decision lifts the
+    /// overload veto alone by the rule, and a pool it still refuses goes to
+    /// the pair's default, which asks no soft filter
+    /// ([`Self::decide_pair`]). Here the prefill has run, and a refusal
+    /// fails its request.
     ///
     /// `first_decode` is the worker and the rank of the decode the pair's
     /// first decision named, where the caller holds them. Under a decode
@@ -6795,17 +7218,16 @@ impl Engine {
         let Some((decodes, mut decode_facts)) = pools.side(PairSide::Decode, facts) else {
             return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
         };
-        let Some(binding) = self.pair_binding(facts.model) else {
+        let Some(entry) = self.pair_entry(facts.model) else {
             return shed(ShedReason::PolicyDeclined, "binding", bare);
         };
+        let binding = &entry.binding;
         let index = binding.decode_profile.unwrap_or(binding.profile);
         let Some(profile) = self.profiles.get(usize::from(index)) else {
             return shed(ShedReason::PolicyDeclined, "binding", bare);
         };
-        let shown = self.marks[usize::from(index)].scoped();
-        if shown && !decode_cx.stalled.is_empty() {
-            return rows_not_written(bare, index);
-        }
+        // The held prefill is looked for before any constraint is read: a
+        // call whose prefill left the lists says so, whatever it states.
         let Some(prefill) = pools.prefills.iter().find(|row| row.id == prefill) else {
             // The decode profile is resolved, so the shed names it.
             let under = Trace {
@@ -6814,15 +7236,22 @@ impl Engine {
             };
             return shed(ShedReason::NoEndpoints, "prefill-gone", under);
         };
+        let shown = self.marks[usize::from(index)].scoped();
+        if shown && !decode_cx.stalled.is_empty() {
+            return rows_not_written(bare, index);
+        }
         // This call has one draw sequence, seeded by its own request.
         decode_facts.seed = facts.seed;
         let _opened = shown.then(|| profile.open(&decode_facts, decodes, pool));
+        // The held prefill's partners are put to the binding's all-vetoed
+        // rule, its liveness tier included.
+        let partners = Set::side(decodes, Some(pools.table.of(&prefill.pair_class)), None);
         let mut decision = run_side(
             profile,
             index,
             &decode_facts,
             pool,
-            Set::side(decodes, Some(pools.table.of(&prefill.pair_class)), None),
+            partners.ruled(entry.vetoed),
             decode_cx,
             &mut scratch.decode,
             first_decode.filter(|_| profile.keeps_its_pick()),
@@ -6945,6 +7374,25 @@ impl Engine {
             }
         }
     }
+
+    /// The stages' part of a change of membership
+    /// ([`Lifecycle::on_membership`]): the tallies of sends and each
+    /// profile's scorers and its picker hear it, and the session table does
+    /// not. The engine over a host's worker lists tells this part alone: a
+    /// leave there takes no pin away. A session's pin stands on a worker
+    /// that is gone until the session's idle time or two other workers end
+    /// it, and is a routable pin again once a worker stands under its id.
+    pub(crate) fn membership_stages(&self, change: &Membership<'_>) {
+        for credit in &self.sent_credits {
+            credit.membership(change);
+        }
+        for profile in &self.profiles {
+            for w in &profile.scorers {
+                w.scorer.on_membership(change);
+            }
+            profile.picker.on_membership(change);
+        }
+    }
 }
 
 impl Lifecycle for Engine {
@@ -7005,15 +7453,7 @@ impl Lifecycle for Engine {
             Membership::Snapshot(workers) => self.sessions.returned_all(workers),
             _ => {}
         }
-        for credit in &self.sent_credits {
-            credit.membership(change);
-        }
-        for profile in &self.profiles {
-            for w in &profile.scorers {
-                w.scorer.on_membership(change);
-            }
-            profile.picker.on_membership(change);
-        }
+        self.membership_stages(change);
     }
 
     fn on_signal(&self, signal: &Signal) {
@@ -7055,7 +7495,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        document::spec::{self, PolicySpec, PrefixAffinityParams, Recovery, SpillParams},
+        document::spec::{
+            self, PolicySpec, PrefixAffinityParams, Recovery, RulePlaced, SpillParams,
+        },
         engine::{
             decision::{self, Pair},
             view::{self, Health, Identity, MediaCounts, Role, Session, WorkerId},
@@ -7069,7 +7511,7 @@ mod tests {
             round_robin::RoundRobin,
         },
         stages::{
-            filters::{Healthy, NotOverloaded, NotTried},
+            filters::{HasRoom, Healthy, NotOverloaded, NotTried},
             pickers::{self, Best, CountFirst},
             scorers::{self, LeastRequests},
         },
@@ -7216,6 +7658,42 @@ mod tests {
             engine.shadow(&malformed, &pool, &rows, &cx, &mut scratch),
             Some(engine.decide(&malformed, &pool, &rows, &cx, &mut scratch))
         );
+    }
+
+    /// A shadow is lent no word of the pool. Where the live profile and its
+    /// shadow both rotate, the live decisions take the list's rows one after
+    /// the other, and the word counts them alone, whatever the shadows
+    /// between them take.
+    #[test]
+    fn a_shadow_turns_no_rotation_of_the_live_list() {
+        use std::sync::atomic::Ordering;
+
+        let engine = Engine::new(
+            vec![round_robin_profile(), round_robin_profile()],
+            vec![Binding {
+                shadow: Some(1),
+                ..single_binding()
+            }],
+            23,
+            Needs::default(),
+        );
+        let rows = pool_of(DRAW_FROM as u32, |_| false);
+        let word = AtomicU64::new(3);
+        let pool = PoolFacts {
+            word: Some(&word),
+            ..PoolFacts::default()
+        };
+        let (facts, cx) = (request(0), Constraints::default());
+        let mut scratch = Scratch::new();
+        let mut lives = Vec::new();
+        for _ in 0..6 {
+            let live = engine.decide(&facts, &pool, &rows, &cx, &mut scratch);
+            lives.push(positions(&live)[0]);
+            let shadow = engine.shadow(&facts, &pool, &rows, &cx, &mut scratch);
+            assert!(shadow.expect("a shadow decision").pick().is_some());
+        }
+        assert_eq!(lives, [3, 4, 5, 6, 7, 8]);
+        assert_eq!(word.load(Ordering::Relaxed), 9);
     }
 
     #[test]
@@ -8515,7 +8993,8 @@ mod tests {
         );
         assert_eq!(engine.sessions().held(key), pinned);
 
-        facts.now_micros += 31;
+        // Idle until 112: the rule's next sweep is at 121.
+        facts.now_micros += 33;
         let expired = engine
             .shadow(&facts, &pool, &rows, &cx, &mut scratch)
             .expect("an expired pin leaves a fresh placement");
@@ -10735,12 +11214,13 @@ mod tests {
 
     #[test]
     fn a_saturated_decode_fleet_sheds_as_saturated() {
-        let engine = Engine::new(
+        let mut engine = Engine::new(
             vec![strict_profile()],
             vec![pair_binding()],
             1,
             Needs::default(),
         );
+        engine.shed_when_all_vetoed(0);
         let mut prefills = [candidate(0, 0)];
         prefills[0].pair_class = 7;
         let mut decodes = [candidate(0, 0), candidate(1, 0)];
@@ -12203,6 +12683,28 @@ mod tests {
         assert_eq!((first, again[0]), (0, 1));
     }
 
+    /// `passthrough` takes no turn, so it decides again whatever it is
+    /// handed: the first healthy decode of the list as it stands at the
+    /// second call, with the healthy decodes behind it in the list's order.
+    /// The first decode of the list is not healthy at the pair's first
+    /// decision, which names the second, and is healthy by the second call.
+    #[test]
+    fn a_decode_decided_again_under_passthrough_is_the_lists_first() {
+        type Held = fn((WorkerId, u16)) -> Option<(WorkerId, u16)>;
+        let handed: [Held; 2] = [Some, |_| None];
+        for held in handed {
+            let engine = pair_engine(Profile {
+                picker: Box::new(Passthrough),
+                ..round_robin_profile()
+            });
+            let mut decodes = classed_rows(&[1, 1, 1]);
+            decodes[0].health.healthy = false;
+            let ahead = |rows: &mut [Candidate], _: usize| rows[0].health.healthy = true;
+            let (first, again) = decided_twice(&engine, &mut decodes, held, ahead);
+            assert_eq!((first, again), (1, vec![0, 1, 2]));
+        }
+    }
+
     #[test]
     fn a_prefill_that_left_is_shed_by_name() {
         let engine = strict_pair_engine();
@@ -12368,6 +12870,24 @@ mod tests {
             let under = (stage == "written-rows").then_some(0);
             assert_eq!(decision.trace().made_under(), under, "{stage}");
         }
+        // A call whose prefill left the lists says so ahead of its mask: the
+        // prefill is looked for before a constraint is read. The gateway's
+        // classic router asks no decode again
+        // (`model_gateway/src/routers/common/placement.rs:1227-1275`, at
+        // main `c738c8d3b`).
+        let left = engine.decide_decode(
+            &facts,
+            &PoolFacts::default(),
+            pools,
+            WorkerId(u64::MAX),
+            None,
+            &mask,
+            &mut Scratch::new(),
+        );
+        assert_eq!(
+            shed_of(&left),
+            Some((ShedReason::NoEndpoints, "prefill-gone"))
+        );
         assert!(phases.lock().expect("the phases shown").is_empty());
         assert!(decide(&engine, &facts, pools, &cx).pick().is_some());
         assert_eq!(*phases.lock().expect("the phases shown"), [Phase::Decode]);
@@ -12698,7 +13218,10 @@ mod tests {
             Some((ShedReason::Saturated, "not-overloaded"))
         );
         // By number the routable prefill's partner is the decode of its own
-        // class, whatever the number: an overloaded one is saturation.
+        // class, whatever the number: an overloaded one is saturation under
+        // a binding that sheds.
+        let mut engine = engine;
+        engine.shed_when_all_vetoed(0);
         let prefills = classed_rows(&[100]);
         let mut decodes = classed_rows(&[100]);
         decodes[0].health.overloaded = true;
@@ -12887,7 +13410,7 @@ mod tests {
         };
         let mut later = |engine: &Engine, held: WorkerId| {
             let shadow =
-                engine.shadow_decode_later(0, &call, &pool, pools, held, &cx, &mut scratch);
+                engine.shadow_decode_later(0, &call, &pool, pools, held, pick, &cx, &mut scratch);
             shadow.map(|shadow| lead(&shadow))
         };
         assert_eq!(later(&both, prefills[0].id), Some(Some(1)));
@@ -13597,12 +14120,18 @@ mod tests {
         ttl_micros: None,
         sweep_micros: 0,
         recovery: Recovery::Latest,
+        rule_placed: RulePlaced::Told,
     };
 
     /// The least-requests profile under a sessions rule.
     fn session_engine(rule: SessionRule) -> Engine {
+        session_engine_of(least_requests_profile(), rule)
+    }
+
+    /// `profile` under a sessions rule.
+    fn session_engine_of(profile: Profile, rule: SessionRule) -> Engine {
         Engine::new(
-            vec![least_requests_profile()],
+            vec![profile],
             vec![Binding {
                 model: "*".into(),
                 phases: vec![],
@@ -13982,6 +14511,40 @@ mod tests {
             1,
             "the respill moved the pin"
         );
+    }
+
+    /// Who placed a keyed request's pick, at each place the whole decision
+    /// answers under a sessions rule. A key with no pin and a pin at its cap
+    /// are placed by the profile's stages under `delegate` and by the rule's
+    /// own stage under its own assignment. A pin followed is the rule's
+    /// under both.
+    #[test]
+    fn a_keyed_pick_says_who_placed_it() {
+        use decision::PlacedBy;
+        for (assignment, placed) in [
+            (Assignment::Delegate, PlacedBy::Stages),
+            (Assignment::MinLoad, PlacedBy::Rule),
+        ] {
+            let engine = session_engine(SessionRule {
+                assignment,
+                ..SESSIONS
+            });
+            let mut pool = vec![candidate(0, 0), candidate(1, 3), candidate(2, 3)];
+            let by = |decision: &Decision| decision.pick().expect("a pick").placed_by();
+            let new = decide_keyed(&engine, &pool, 7, 10);
+            assert_eq!(by(&new), placed, "{assignment:?}: a key with no pin");
+            assert_eq!(place_keyed(&engine, &pool, 7, 10).position, 0);
+            let pinned = decide_keyed(&engine, &pool, 7, 20);
+            assert_eq!(by(&pinned), PlacedBy::Rule, "{assignment:?}: a pin");
+            // The pin at its cap and the busiest: the request is placed
+            // again, on a worker under the cap.
+            pool[0].session_in_flight = 2;
+            pool[0].in_flight = 9;
+            let again = decide_keyed(&engine, &pool, 7, 30);
+            let pick = again.pick().expect("the respill places");
+            assert_eq!(pick.session_verdict, SessionVerdict::Respill);
+            assert_eq!(by(&again), placed, "{assignment:?}: a pin at its cap");
+        }
     }
 
     /// A respill's commit fronts the worker it lands on, the first target or
@@ -14626,6 +15189,7 @@ mod tests {
             ttl_micros,
             sweep_micros,
             recovery: Recovery::Original,
+            rule_placed: RulePlaced::Told,
         };
         let bound = |model: &str, sessions| Binding {
             model: model.into(),
@@ -15572,6 +16136,343 @@ mod tests {
             } else {
                 assert!((22..=23).contains(&n), "row {row}: {picks:?}");
             }
+        }
+    }
+
+    /// Under a sessions rule that leaves a new session to the profile
+    /// (`delegate`), round robin turns one rotation for every request it
+    /// places. A request with no session value, a new session and a session
+    /// at its cap take the pool's rows one after the other: under the
+    /// draw's floor, at it and above it, and under a profile whose plain
+    /// request is not the draw's, since its scorer reads the rows together.
+    /// A session's pass counted its survivors, and a turn that lands on a
+    /// refused row is left to the stages. So is a request its host holds to
+    /// places, as its plain request draws nothing. Where a soft filter
+    /// refuses every row and steps aside, the draw keeps nobody for either
+    /// kind of request, and both take the survivors' rotation. On a fresh
+    /// engine each, a new session is decided as a request with no session
+    /// value is: by the draw where the turn's row is kept, its trace the
+    /// draw's with the pass's count, and by the stages where a filter, a
+    /// host's filter or the host's veto refuses that row. A row the pass
+    /// refused is not taken at the turn, whatever its filter says of it
+    /// there. A host's picker that takes turns and orders nothing of its
+    /// draw is the stages' too.
+    /// `random` takes no turn: the stages alone place its new session.
+    ///
+    /// The classic router asks one function for all three kinds of request,
+    /// and so steps the same counters
+    /// (`model_gateway/src/policies/round_robin.rs:142-167`): for a request
+    /// with no session value at `model_gateway/src/policies/registry.rs:471`,
+    /// for a new session at `:581` and for a session over its cap at `:552`.
+    #[test]
+    fn round_robin_under_delegate_turns_one_rotation_for_every_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let scored = || Profile {
+            scorers: vec![WeightedScorer {
+                scorer: Box::new(LeastRequests),
+                weight: 1.0,
+            }],
+            ..round_robin_profile()
+        };
+        assert!(draws_first(&round_robin_profile()) && !draws_first(&scored()));
+        let sizes = [DRAW_FROM - 1, DRAW_FROM, 64].map(|rows| (rows, false));
+        for profile in [round_robin_profile as fn() -> Profile, scored] {
+            // The last pool is held to its every place.
+            for (rows, held) in sizes.into_iter().chain([(DRAW_FROM, true)]) {
+                let engine = session_engine_of(profile(), SESSIONS);
+                let pool = pool_of(rows as u32, |_| false);
+                let every: Vec<u32> = (0..rows as u32).collect();
+                let mut scratch = Scratch::new();
+                let mut turn = |pool: &[Candidate], key: Option<u64>| {
+                    let mut facts = request(0);
+                    if let Some(key) = key {
+                        facts.session_key = Identity::hashed(key);
+                    }
+                    let shared = PoolFacts::default();
+                    let cx = Constraints {
+                        places: held.then_some(&every[..]),
+                        ..Constraints::default()
+                    };
+                    let decision = engine.decide(&facts, &shared, pool, &cx, &mut scratch);
+                    let pick = decision.pick().expect("a pick");
+                    let target = *pick.targets.first().expect("a target");
+                    if key.is_some() {
+                        assert!(!pick.trace.drew_first(), "a session's pass counted");
+                        let lease = Lease {
+                            session: facts.session(),
+                            session_verdict: pick.session_verdict,
+                            ..Lease::default()
+                        };
+                        engine.on_dispatched(&lease, &target, Side::Single, 0);
+                    }
+                    target.position as usize
+                };
+                let first = turn(&pool, None);
+                let pinned = turn(&pool, Some(1));
+                let mut places = vec![first, pinned, turn(&pool, None)];
+                // The session's worker carries the rule's cap of its requests.
+                let mut capped = pool.clone();
+                capped[pinned].session_in_flight = SESSIONS.inflight_cap;
+                places.push(turn(&capped, Some(1)));
+                places.push(turn(&pool, None));
+                places.push(turn(&pool, Some(2)));
+                let in_turn: Vec<usize> = (0..6).map(|step| (first + step) % rows).collect();
+                assert_eq!(places, in_turn, "{rows} rows, held {held}");
+                // A turn that lands on a refused row is left to the stages,
+                // and every other turn of the pool is taken where it is asked.
+                let ailing = pool_of(rows as u32, |row| row == 3);
+                let keys = 10..10 + rows as u64;
+                let lands: Vec<usize> = keys.map(|key| turn(&ailing, Some(key))).collect();
+                assert!(!lands.contains(&3), "{rows} rows, held {held}: {lands:?}");
+                let asked = draws_first(&profile()) && rows >= DRAW_FROM && !held;
+                let taken = |(step, &row): (usize, &usize)| {
+                    !asked || [3, row].contains(&((first + 6 + step) % rows))
+                };
+                assert!(lands.iter().enumerate().all(taken), "{rows}: {lands:?}");
+            }
+        }
+        // A soft filter that refuses every row steps aside, and the pass
+        // keeps them all. A request with no session value is refused at its
+        // draw there, which asks every filter of the row it lands on, and
+        // falls to the survivors' rotation. A new session falls to it too.
+        let roomless = || Profile {
+            filters: vec![Box::new(Healthy), Box::new(HasRoom)],
+            ..round_robin_profile()
+        };
+        assert!(draws_first(&roomless()));
+        let engine = session_engine_of(roomless(), SESSIONS);
+        let pool = pool_of(DRAW_FROM as u32, |_| false);
+        let mut scratch = Scratch::new();
+        let mut turn = |key: Option<u64>| {
+            let mut facts = request(0);
+            if let Some(key) = key {
+                facts.session_key = Identity::hashed(key);
+            }
+            let (shared, cx) = (PoolFacts::default(), Constraints::default());
+            let decision = engine.decide(&facts, &shared, &pool, &cx, &mut scratch);
+            positions(&decision)[0] as usize
+        };
+        let first = turn(None);
+        let keyed = |step: u64| (step % 2 == 1).then_some(step);
+        let places: Vec<usize> = (1..6).map(|step| turn(keyed(step))).collect();
+        let in_turn: Vec<usize> = (1..6).map(|step| (first + step) % DRAW_FROM).collect();
+        assert_eq!(places, in_turn, "a soft filter refuses every row");
+        // A fresh engine's request with no session value and a fresh
+        // engine's new session are decided alike. Where the turn's row is
+        // kept, the session's targets are that request's draw, and its
+        // trace is the draw's with the count of the session's own pass.
+        // Where the turn's row is refused, the stages place both on the same
+        // rows: by a filter of the fold, by a host's filter, by the host's
+        // veto, with every row by a soft filter of the fold or of a host,
+        // and with every row under the host's veto, which the rule lifts.
+        let hosted = || Profile {
+            filters: vec![Box::new(Hosted(Box::new(Healthy)))],
+            ..round_robin_profile()
+        };
+        let hosted_roomless = || Profile {
+            filters: vec![
+                Box::new(Hosted(Box::new(Healthy))),
+                Box::new(Hosted(Box::new(HasRoom))),
+            ],
+            ..round_robin_profile()
+        };
+        assert!(draws_first(&hosted()) && draws_first(&hosted_roomless()));
+        // A host's filter whose answer moves between two asks of one row, as
+        // a filter that reads what another decision moves can: it refuses
+        // `row` the first time it is asked of it, and keeps it after.
+        #[derive(Debug)]
+        struct Flips {
+            row: u32,
+            asked: AtomicBool,
+        }
+        impl Filter for Flips {
+            fn name(&self) -> &'static str {
+                "flips"
+            }
+
+            fn row_wise(&self) -> bool {
+                true
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
+                c.position != self.row || self.asked.swap(true, Ordering::Relaxed)
+            }
+        }
+        let shared = PoolFacts {
+            generation: 7,
+            ..PoolFacts::default()
+        };
+        let decide = |profile: Profile, pool: &[Candidate], cx: &Constraints<'_>, keyed: bool| {
+            let engine = session_engine_of(profile, SESSIONS);
+            let mut facts = request(5);
+            if keyed {
+                facts.session_key = Identity::hashed(1);
+            }
+            let decision = engine.decide(&facts, &shared, pool, cx, &mut Scratch::new());
+            (positions(&decision), *decision.trace())
+        };
+        let free = Constraints::default();
+        for rows in [DRAW_FROM as u32, 64] {
+            let full = pool_of(rows, |_| false);
+            let turn = decide(round_robin_profile(), &full, &free, false).0[0];
+            // The turn's row kept, by the fold's test and by a host's filter.
+            let apart = pool_of(rows, |row| row == (turn + 8) % rows);
+            for profile in [round_robin_profile as fn() -> Profile, hosted] {
+                let (plain, drew) = decide(profile(), &apart, &free, false);
+                let (keyed, counted) = decide(profile(), &apart, &free, true);
+                assert!(drew.drew_first() && plain[0] == turn, "{rows}: {plain:?}");
+                assert_eq!(
+                    (drew.made_under(), drew.seed, drew.generation),
+                    (Some(0), request(5).seed, 7)
+                );
+                let pass = Trace {
+                    survivors: Survivors::counted(rows - 1),
+                    ..drew
+                };
+                assert_eq!((keyed, counted), (plain, pass), "{rows} rows");
+            }
+            let ailing = pool_of(rows, |row| row == turn);
+            let stalled = [turn];
+            let vetoed = Constraints {
+                stalled: &stalled,
+                ..Constraints::default()
+            };
+            let every: Vec<u32> = (0..rows).collect();
+            let doubted = Constraints {
+                stalled: &every,
+                ..Constraints::default()
+            };
+            // A profile, its pool and what the host holds the request to.
+            type State<'a> = (fn() -> Profile, &'a [Candidate], &'a Constraints<'a>);
+            let refused: [State<'_>; 6] = [
+                (round_robin_profile, &ailing, &free),
+                (hosted, &ailing, &free),
+                (round_robin_profile, &full, &vetoed),
+                (roomless, &full, &free),
+                (hosted_roomless, &full, &free),
+                (round_robin_profile, &full, &doubted),
+            ];
+            for (state, (profile, pool, cx)) in refused.into_iter().enumerate() {
+                let (plain, whole) = decide(profile(), pool, cx, false);
+                let (keyed, session) = decide(profile(), pool, cx, true);
+                assert!(!whole.drew_first(), "{rows} rows, state {state}");
+                assert!(!plain.is_empty(), "{rows} rows, state {state}: a pick");
+                assert_eq!(keyed, plain, "{rows} rows, state {state}");
+                // The stages place both requests, by one trace: it says the
+                // lift where every row is under the host's veto.
+                let lifted = if state == 5 {
+                    LiftedVeto::Liveness
+                } else {
+                    LiftedVeto::None
+                };
+                assert_eq!(whole.lifted, lifted, "{rows} rows, state {state}");
+                assert_eq!(session, whole, "{rows} rows, state {state}");
+            }
+            // The row a filter refused at the pass is no survivor, whatever
+            // the filter says of it at the turn: the turn does not take it.
+            let flips = Profile {
+                filters: vec![Box::new(Flips {
+                    row: turn,
+                    asked: AtomicBool::new(false),
+                })],
+                ..round_robin_profile()
+            };
+            let (keyed, counted) = decide(flips, &full, &free, true);
+            assert!(!keyed.contains(&turn), "{rows} rows: {keyed:?}");
+            assert_eq!(counted.survivors.get(), Some(rows - 1), "{rows} rows");
+        }
+        // A host's picker that takes turns and hands out nothing of the
+        // row it drew: the stages place its new session, as they place its
+        // request with no session value.
+        #[derive(Debug)]
+        struct Mute;
+        impl Lifecycle for Mute {}
+        impl Picker for Mute {
+            fn name(&self) -> &'static str {
+                "mute"
+            }
+
+            fn pick(
+                &self,
+                _: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                kept: &[u32],
+                _: &[f32],
+                _: TieBand,
+                out: &mut Targets,
+            ) {
+                if let Some(&row) = kept.last() {
+                    out.push(target_of(&candidates[row as usize]));
+                }
+            }
+
+            fn draws_first(&self) -> bool {
+                true
+            }
+
+            fn takes_turns(&self) -> bool {
+                true
+            }
+
+            fn draw_first(
+                &self,
+                _: &RequestFacts<'_>,
+                _: &PoolFacts<'_>,
+                candidates: &[Candidate],
+                keep: &mut dyn FnMut(&Candidate) -> bool,
+                kept: &mut Vec<u32>,
+                _: &mut Draw,
+            ) -> bool {
+                kept.extend(
+                    candidates
+                        .iter()
+                        .find(|row| keep(row))
+                        .map(|row| row.position),
+                );
+                !kept.is_empty()
+            }
+
+            fn order_drawn(
+                &self,
+                _: &RequestFacts<'_>,
+                _: &[Candidate],
+                _: &[u32],
+                _: &[f32],
+                _: TieBand,
+                _: &mut Targets,
+            ) {
+            }
+        }
+        let mute = || Profile {
+            picker: Box::new(Mute),
+            ..round_robin_profile()
+        };
+        assert!(draws_first(&mute()));
+        let full = pool_of(DRAW_FROM as u32, |_| false);
+        let last = vec![DRAW_FROM as u32 - 1];
+        assert_eq!(decide(mute(), &full, &free, false).0, last);
+        assert_eq!(decide(mute(), &full, &free, true).0, last);
+        // `random` takes no turn. Over a pool with a row refused its draw and
+        // its pick over the survivors name other rows for one seed, and its
+        // new session lands where the stages alone put it: on the picker's
+        // own pick over the survivors, by the request's seed.
+        let random = || Profile {
+            picker: Box::new(Random),
+            ..round_robin_profile()
+        };
+        let ailing = pool_of(DRAW_FROM as u32, |row| row == 3);
+        let survivors: Vec<u32> = (0..DRAW_FROM as u32).filter(|row| *row != 3).collect();
+        for seed in 0..8 {
+            let facts = RequestFacts {
+                session_key: Identity::hashed(1),
+                ..request(seed)
+            };
+            let placed = drawn(&session_engine_of(random(), SESSIONS), &facts, &ailing);
+            let mut alone = Targets::new();
+            Random.pick(&facts, &ailing, &survivors, &[], TieBand(0.0), &mut alone);
+            let alone: Vec<u32> = alone.iter().map(|target| target.position).collect();
+            assert_eq!(positions(&placed), alone, "seed {seed}");
         }
     }
 

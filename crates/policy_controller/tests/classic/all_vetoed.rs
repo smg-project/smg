@@ -8,7 +8,9 @@
 //! hash ring. Two rings put one key on different workers, so such a row
 //! lists its workers in the key's ring order and every number in it counts
 //! in that order: `0` is the key's own worker and `1` the ring's next
-//! member, on whatever ring replays the row.
+//! member, on whatever ring replays the row. Such a row is replayed twice:
+//! on this crate's own ring, and on a ring the request's caller lends,
+//! built in the row's order ([`replay_on_a_lent_ring`]).
 
 use serde::Deserialize;
 use smg_policy_controller::{
@@ -17,11 +19,12 @@ use smg_policy_controller::{
         Candidate, Constraints, Decision, Engine, Health, Identity, PoolFacts, RequestFacts,
         Scratch, ShedReason, WorkerId,
     },
+    policies::consistent_hashing::LentRing,
     stages::Lifecycle,
     tracking::{Lease, Side},
 };
 
-use crate::{Outcome, Recorded, Replayed};
+use crate::{verdict, Outcome, Recorded, Replayed, Rows};
 
 /// What a sheet's head names these rows: the rule they record, under every
 /// policy.
@@ -121,6 +124,27 @@ fn id(i: usize) -> WorkerId {
     WorkerId(1_000 + i as u64)
 }
 
+/// The address of the worker a ring row lists at `i`, under a lent ring.
+fn address(i: usize) -> String {
+    format!("worker-{i}")
+}
+
+/// A caller's hash ring over a ring row's workers, as many as it counts:
+/// it reaches them in the row's own order from wherever a key stands, the
+/// order the recorder found for the row's key on the gateway's ring.
+#[derive(Debug)]
+struct InRowOrder(usize);
+
+impl LentRing for InRowOrder {
+    fn position(&self, _: &str) -> u64 {
+        1
+    }
+
+    fn walk(&self, _: u64, take: &mut dyn FnMut(&str) -> bool) {
+        let _ = (0..self.0).any(|i| take(&address(i)));
+    }
+}
+
 /// The engine of the row's policy over the row's pool in its starting state,
 /// with the host's side of a dispatch.
 struct Bed {
@@ -129,6 +153,9 @@ struct Bed {
     /// Where each worker of the row stands in the pool: the row's own
     /// order, or the key's ring order on this crate's ring for a ring row.
     places: Vec<usize>,
+    /// The ring the row's requests are lent, built in the row's order:
+    /// the pool's rows then carry their addresses' ids.
+    lent: Option<InRowOrder>,
     scratch: Scratch,
     /// The host's clock, microseconds: each request has its own instant.
     clock: u64,
@@ -136,17 +163,22 @@ struct Bed {
 
 impl Bed {
     /// The bed, or the validator's words when this crate does not build the
-    /// row's policy.
-    fn new(row: &Row) -> Result<Self, String> {
+    /// row's policy. Under `lent` its requests are lent a ring built in the
+    /// row's order.
+    fn new(row: &Row, lent: bool) -> Result<Self, String> {
         let engine = row.spec()?.validate().map_err(|err| err.to_string())?;
         let places = match &row.ring_key {
-            Some(key) => ring_order(row, key)?,
-            None => (0..row.workers.len()).collect(),
+            Some(key) if !lent => ring_order(row, key)?,
+            _ => (0..row.workers.len()).collect(),
         };
         let mut pool: Vec<Candidate> = (0..row.workers.len())
             .map(|place| Candidate {
                 position: place as u32,
-                id: id(place),
+                id: if lent {
+                    WorkerId::from_address(&address(place))
+                } else {
+                    id(place)
+                },
                 key: 1_000 + place as u32,
                 ..Candidate::default()
             })
@@ -159,6 +191,7 @@ impl Bed {
             engine,
             pool,
             places,
+            lent: lent.then_some(InRowOrder(row.workers.len())),
             scratch: Scratch::new(),
             clock: 1_000,
         })
@@ -170,7 +203,12 @@ impl Bed {
     /// workers for a shed as saturated, the count plus one for any other.
     fn pick(&mut self, key: Option<&str>, tried: &[usize], seed: u64) -> usize {
         self.clock += 1_000;
-        let tried: Vec<WorkerId> = tried.iter().map(|&i| id(self.places[i])).collect();
+        let tried: Vec<WorkerId> = tried
+            .iter()
+            .map(|&i| self.pool[self.places[i]].id)
+            .collect();
+        let ring = self.lent.as_ref().map(|ring| ring as &dyn LentRing);
+        let at = ring.zip(key).map(|(ring, key)| ring.position(key));
         let facts = RequestFacts {
             model: "m",
             session_key: key.map_or(Identity::NONE, Identity::plain),
@@ -178,6 +216,8 @@ impl Bed {
             tried: &tried,
             seed,
             now_micros: self.clock,
+            ring,
+            ring_positions: at.as_slice(),
             ..RequestFacts::default()
         };
         let pool_facts = PoolFacts {
@@ -259,7 +299,7 @@ fn ring_order(row: &Row, key: &str) -> Result<Vec<usize>, String> {
             steps: Vec::new(),
             outcome: Outcome::Sequence(Vec::new()),
         };
-        let next = Bed::new(&probe)?.pick(Some(key), &[], 1);
+        let next = Bed::new(&probe, false)?.pick(Some(key), &[], 1);
         if next >= workers || order.contains(&next) {
             return Err(format!(
                 "the ring's order of {key}: the next member is a worker not yet placed, got {next}"
@@ -273,8 +313,8 @@ fn ring_order(row: &Row, key: &str) -> Result<Vec<usize>, String> {
 /// The row run once from a fresh engine: where each request was placed, or
 /// the validator's words. `draw` separates the seeds of a drawn row's runs;
 /// a sequence row is run `0`.
-fn run(row: &Row, draw: u64) -> Result<Vec<usize>, String> {
-    let mut bed = Bed::new(row)?;
+fn run(row: &Row, draw: u64, lent: bool) -> Result<Vec<usize>, String> {
+    let mut bed = Bed::new(row, lent)?;
     Ok(row
         .steps
         .iter()
@@ -285,9 +325,9 @@ fn run(row: &Row, draw: u64) -> Result<Vec<usize>, String> {
 
 /// This crate's outcome for the row, in the shape of the recorded one, or
 /// its refusal of the row's policy.
-fn replay(row: &Row) -> Replayed {
+fn replay(row: &Row, lent: bool) -> Replayed {
     match &row.outcome {
-        Outcome::Sequence(_) => match run(row, 0) {
+        Outcome::Sequence(_) => match run(row, 0, lent) {
             Ok(picked) => Replayed::Ran(Outcome::Sequence(picked)),
             Err(why) => Replayed::Refused(why),
         },
@@ -297,7 +337,7 @@ fn replay(row: &Row) -> Replayed {
             // counted; a drawn row places every request.
             let mut counts = vec![0u32; row.workers.len()];
             for draw in 1..=u64::from(*draws) {
-                match run(row, draw) {
+                match run(row, draw, lent) {
                     Ok(picked) => {
                         let last = *picked.last().expect("a drawn row ends with a request");
                         match counts.get_mut(last) {
@@ -330,8 +370,20 @@ impl Recorded for Row {
     }
 
     fn replay(&self) -> Replayed {
-        replay(self)
+        replay(self, false)
     }
+}
+
+/// The ring rows of a sheet replayed on a ring their requests' caller
+/// lends, built in each row's order: how many they are, and each one whose
+/// answer is not the recorded one.
+pub fn replay_on_a_lent_ring(text: &str) -> (usize, Vec<String>) {
+    let sheet: Rows<Row> = serde_json::from_str(text).expect("a sheet of these rows");
+    let ring_rows = sheet.rows.iter().filter(|row| row.ring_key.is_some());
+    let verdicts: Vec<Option<String>> = ring_rows
+        .map(|row| verdict(&row.name, &row.outcome, &replay(row, true)))
+        .collect();
+    (verdicts.len(), verdicts.into_iter().flatten().collect())
 }
 
 /// Rows copied from the recorded sheet: the rule under the policies that

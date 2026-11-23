@@ -1,14 +1,22 @@
 //! A seat's holder counts picks and sheds before it takes the ring lock.
 //! The lock holds a push or a scan of the seat's recent decisions.
 
+#![cfg_attr(
+    not(feature = "controller"),
+    expect(
+        dead_code,
+        reason = "Only the served controller keeps sampled records."
+    )
+)]
+
 use std::{collections::VecDeque, time::Instant};
 
-use super::{DecisionCall, RequestForm, Shadowed};
 use crate::{
     document::spec::PlanName,
     engine::{
         decision::{Decision, ShadowKind},
         framework::{Engine, Plan},
+        shadow::Shadowed,
         view::{fingerprint, WorkerId},
     },
     store::GatewayId,
@@ -59,15 +67,6 @@ pub struct DecisionNames {
     pub scorers: Vec<String>,
 }
 
-/// A sampled decision with the names that can still be read for it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DecisionExplanation {
-    /// The sampled decision.
-    pub record: DecisionRecord,
-    /// `None` when the decision's generation or binding is unavailable.
-    pub names: Option<DecisionNames>,
-}
-
 impl DecisionRecord {
     /// Reads names if `engine` has the recorded generation number and binding.
     #[must_use]
@@ -111,7 +110,7 @@ impl DecisionRecord {
 }
 
 /// A decider's count toward its next sample, kept under one term and
-/// generation. A door in process uses term zero throughout.
+/// generation.
 #[derive(Default)]
 pub(crate) struct SampleCount {
     term: u64,
@@ -141,11 +140,6 @@ impl SampleCount {
         self.count = 0;
         true
     }
-
-    #[cfg(test)]
-    pub(super) fn counted(&self) -> u32 {
-        self.count
-    }
 }
 
 /// A seat's recent decisions. The seat's holder counts separately and
@@ -159,13 +153,14 @@ pub(crate) struct Samples {
 impl Samples {
     /// Pushes one record, allocating the ring on its first write. A new
     /// lead starts with an empty ring. `binding` is the position of the
-    /// binding the decision ran under.
+    /// binding the decision ran under. `taken` is the instant the request
+    /// was taken, the gateway that asked and the request's id as stated.
     #[cold]
-    pub(crate) fn push<A: RequestForm>(
+    pub(crate) fn push(
         &mut self,
         term: u64,
         binding: Option<u32>,
-        taken: &DecisionCall<'_, A>,
+        (at, gateway, id): (Instant, GatewayId, &[u8]),
         decision: &Decision,
         shadow: Option<Shadowed>,
         sides: [Option<Shadowed>; 2],
@@ -191,13 +186,13 @@ impl Samples {
         self.records.push_back(DecisionRecord {
             decision: *decision,
             binding,
-            at: taken.now,
+            at,
             shadow: shadow.or(prefill).map(|said| said.kind),
             shadow_target: shadow.or(prefill).and_then(|said| said.first),
             decode_shadow: decode.map(|said| said.kind),
             decode_shadow_target: decode.and_then(|said| said.first),
-            gateway: taken.gateway,
-            request: fingerprint(taken.request.id()),
+            gateway,
+            request: fingerprint(id),
         });
     }
 
@@ -217,11 +212,6 @@ impl Samples {
             .find(|record| record.gateway == gateway && record.request == request)
             .copied()
     }
-
-    #[cfg(test)]
-    pub(super) fn slots(&self) -> usize {
-        self.records.capacity()
-    }
 }
 
 #[cfg(test)]
@@ -232,7 +222,6 @@ mod tests {
         engine::{
             decision::{Queue, Shed, ShedReason, Trace},
             framework::{Binding, Profile, WeightedScorer},
-            store_backed_engine::tests::GATEWAY,
         },
         stages::{
             filters::{Healthy, NotTried},
@@ -300,7 +289,7 @@ mod tests {
             shadow_target: None,
             decode_shadow: None,
             decode_shadow_target: None,
-            gateway: GATEWAY,
+            gateway: GatewayId(11),
             request: fingerprint(b"shed"),
         }
     }

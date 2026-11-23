@@ -124,6 +124,11 @@ managed_sources() {
         {
             rest = $0
             output = ""
+            # deb822 permits the first URI immediately after its field colon.
+            if (match(rest, /^[[:space:]]*[Uu][Rr][Ii][Ss]:/)) {
+                output = substr(rest, 1, RLENGTH)
+                rest = substr(rest, RLENGTH + 1)
+            }
             while (match(rest, /[^[:space:]]+/)) {
                 prefix = substr(rest, 1, RSTART - 1)
                 token = substr(rest, RSTART, RLENGTH)
@@ -134,7 +139,10 @@ managed_sources() {
                 # x86 mirrors must never rewrite arm64 Ubuntu ports sources.
                 if (origin ~ /^https?:\/\/ports\.ubuntu\.com\//) managed = 0
                 if (managed && mode == "origins") print origin
-                if (managed && mode == "rewrite") token = ENVIRON["CI_APT_CHOSEN"] "/"
+                if (managed && mode == "rewrite") {
+                    token = ENVIRON["CI_APT_CHOSEN"]
+                    if (token !~ /\/$/) token = token "/"
+                }
                 output = output prefix token
             }
             if (mode == "rewrite") print output rest

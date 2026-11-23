@@ -17,9 +17,12 @@ pub(crate) mod decision;
 pub(crate) mod decision_engine;
 pub(crate) mod decision_slot;
 pub(crate) mod demands;
+pub(crate) mod explain;
 pub(crate) mod framework;
 #[cfg(feature = "in-process")]
 pub(crate) mod lease_events;
+#[cfg(feature = "in-process")]
+pub(crate) mod list_cell;
 pub(crate) mod pair_classes;
 #[cfg(feature = "in-process")]
 pub(crate) mod policy_engine;
@@ -27,23 +30,25 @@ pub(crate) mod prefix_pass;
 pub(crate) mod prompt_hashes;
 #[cfg(feature = "in-process")]
 pub(crate) mod records;
+pub(crate) mod shadow;
 pub(crate) mod sticky_sessions;
 pub(crate) mod store_backed_engine;
 pub(crate) mod view;
 pub(crate) mod warm_up;
 
 pub use decision::{
-    Decision, LiftedVeto, Overlap, OverlapSource, Pair, Pick, Queue, ShadowKind, Shed, ShedReason,
-    Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
+    Decision, LiftedVeto, Overlap, OverlapSource, Pair, Pick, PlacedBy, Queue, ShadowKind, Shed,
+    ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
+};
+pub use decision_engine::{
+    AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused,
+    HeldDecision, HeldDecode, Leased, Plain, Request, RequestMaker, SweepOutcome,
 };
 #[cfg(feature = "in-process")]
-pub use decision_engine::WorkerLists;
-pub use decision_engine::{
-    AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Leased,
-    Plain, Request, RequestMaker, SweepOutcome,
-};
+pub use decision_engine::{TokenKey, WorkerLists};
 pub use decision_slot::{DecisionSlot, DecisionSlotGuard};
 pub use demands::{DemandFacts, Demands, References, UnmetDemand};
+pub use explain::{DecisionNames, DecisionRecord};
 pub use framework::{
     AloneProfile, Binding, DecisionScope, DrawUnit, EncodeItems, EncodePlaced, EncodePool,
     EncoderFacts, Engine, Filter, InTheWay, NotAlone, OverloadThresholds, PairPools, PairSide,
@@ -51,7 +56,13 @@ pub use framework::{
     ScoreSpread, Scorer, Scratch, Shortlist, TieBand, WeightedScorer, DRAW_BOUND, DRAW_FROM,
     RANK_FROM,
 };
+#[cfg(feature = "in-process")]
+pub use list_cell::{LentList, ListCell, ModelLists};
 pub use pair_classes::PartnerClasses;
+#[cfg(feature = "in-process")]
+pub use policy_engine::encode::EncodeLists;
+#[cfg(feature = "in-process")]
+pub use policy_engine::membership::Members;
 #[cfg(feature = "in-process")]
 pub use policy_engine::overlap::{
     self, Affinity, CacheIndex, CacheIndexes, PoolAffinity, PrefixRead,
@@ -59,21 +70,22 @@ pub use policy_engine::overlap::{
 #[cfg(feature = "in-process")]
 pub use policy_engine::pair::{prefills_full, PairAdmission, PairLists};
 #[cfg(feature = "in-process")]
+pub use policy_engine::place::{HeaderRead, PlaceRequest, Prompt, Unplaced, WorkerRule};
+#[cfg(feature = "in-process")]
 pub use policy_engine::{PolicyEngine, PoolMembers};
 pub use prompt_hashes::{HashSeeds, PromptHashes};
 #[cfg(feature = "in-process")]
 pub use records::{decide, worker_id, worker_rank, DecisionClock, Live, PoolRecords};
+pub use shadow::SHADOW_ROWS;
 pub use sticky_sessions::{
-    SessionExpiry, SessionPins, SessionRule, SessionTable, SessionVerdict,
+    DecodeVerdict, SessionExpiry, SessionPins, SessionRule, SessionTable, SessionVerdict,
     ABSENT_WORKER_PIN_TTL_MICROS,
 };
-pub use store_backed_engine::{
-    DecisionExplanation, DecisionNames, DecisionRecord, StoreBackedEngine, SHADOW_ROWS,
-};
+pub use store_backed_engine::StoreBackedEngine;
 pub use view::{
     fingerprint, key_of_session, permille, AffinityFacts, AffinityHolder, AffinityRows, Candidate,
-    Constraints, Engines, HashKind, Header, Health, Identity, KeyedRow, LoadRow, MediaCounts,
-    ModelFingerprint, OverloadRegime, Phase, PinSource, PoolFacts, RequestFacts, Role, Session,
-    SignalSource, WireModes, WorkerId, ZoneCapacity, TEXT_BYTES_PER_TOKEN,
+    Constraints, Engines, FixedFacts, HashKind, Header, Health, Identity, KeyedRow, LoadRow,
+    MediaCounts, ModelFingerprint, OverloadRegime, Phase, PinSource, PoolFacts, RequestFacts, Role,
+    Session, SignalSource, WireModes, WorkerId, ZoneCapacity, TEXT_BYTES_PER_TOKEN,
 };
 pub use warm_up::{WarmUpRule, WarmUpState};

@@ -24,8 +24,7 @@ use crate::{
             released::{Reason, What},
         },
     },
-    store::Said,
-    tracking::lease::{self, Lease, LeaseId, LeaseKind, Side},
+    tracking::lease::{self, Lease, LeaseId, LeaseKind, Said, Side},
 };
 
 /// A request as the wire carries it, and the block hashes left out of the
@@ -186,12 +185,12 @@ fn targets(told: &[proto::Target]) -> Result<Targets, Unread> {
             .pair
             .map(|pair| {
                 Ok(Pair {
-                    decode_position: 0,
                     decode_id: WorkerId(pair.decode_id),
                     decode_dp_rank: narrow(
                         pair.decode_dp_rank,
                         "pick.targets.pair.decode_dp_rank",
                     )?,
+                    ..Pair::default()
                 })
             })
             .transpose()?;
@@ -386,10 +385,9 @@ mod tests {
                 identity::Form,
             },
         },
-        store::Said,
         tracking::{
             lease,
-            lease::{Lease, LeaseId, ReleaseReason, Side, TransportClass},
+            lease::{Lease, LeaseId, ReleaseReason, Said, Side, TransportClass},
         },
     };
 
@@ -988,7 +986,7 @@ mod tests {
             (Side::Encode, proto::Side::Encode),
         ] {
             let dispatch = Said::Dispatched(
-                crate::store::Dispatch {
+                lease::Dispatch {
                     target_index: 2,
                     side,
                     since_decision_micros: 250,

@@ -70,7 +70,7 @@ use crate::{
         operator::{DryRun, EnforceOutcome, EnforceRefused, NeedsRow, SerialTurn},
         spec::Digest,
     },
-    engine::{framework::Engine, store_backed_engine::DecisionRecord},
+    engine::{explain::DecisionRecord, framework::Engine},
     service::{
         elector::{Elector, Fence},
         proto::{

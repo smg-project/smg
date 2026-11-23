@@ -1336,7 +1336,7 @@ impl Router {
             worker.api_key(),
         );
 
-        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker);
         match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => Ok(res),
             Err(e) => {
@@ -1423,7 +1423,7 @@ impl Router {
             api_key.as_ref(),
         );
 
-        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker);
         let res = match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => res,
             Err(e) => {
@@ -1570,7 +1570,7 @@ impl Router {
             api_key.as_ref(),
         );
 
-        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker);
         let send = send_with_stale_conn_retry(request_builder);
         tokio::pin!(send);
         let sent = tokio::select! {
@@ -1655,13 +1655,24 @@ impl Router {
     /// body cut short in transit a 502 `read_response_body_failed` and one in
     /// no rerank shape a 502 `call_upstream_decode_error`, the relay's own codes
     /// for a worker body it could not read and one it could not decode.
-    async fn build_rerank_response(
+    pub(super) async fn build_rerank_response(
         req: RerankResponseSpec,
         canonical_model: Option<&str>,
         response: Response,
         max_body_bytes: usize,
     ) -> Response {
         let (parts, response_body) = response.into_parts();
+        // Each answer built here replaces the dispatch's one and keeps the
+        // worker named on it, for the client and the access log.
+        let keep_worker = |mut answer: Response| {
+            if let Some(worker) = parts.headers.get(&header_utils::HEADER_ROUTED_WORKER_ID) {
+                answer.headers_mut().insert(
+                    header_utils::HEADER_ROUTED_WORKER_ID.clone(),
+                    worker.clone(),
+                );
+            }
+            answer
+        };
         let body_bytes = match to_bytes(response_body, max_body_bytes).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1673,16 +1684,16 @@ impl Router {
                         limit = max_body_bytes,
                         "Rerank worker response exceeded the body limit"
                     );
-                    return error::bad_gateway(
+                    return keep_worker(error::bad_gateway(
                         "upstream_response_too_large",
                         format!("Rerank response from worker exceeded {max_body_bytes} bytes"),
-                    );
+                    ));
                 }
                 error!("Failed to read rerank worker response: {e}");
-                return error::bad_gateway(
+                return keep_worker(error::bad_gateway(
                     "read_response_body_failed",
                     format!("Failed to get response body: {e}"),
-                );
+                ));
             }
         };
         let worker = match serde_json::from_slice::<RerankWorkerResponse>(&body_bytes) {
@@ -1695,12 +1706,12 @@ impl Router {
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or("no content type");
                 warn!(%status, content_type, "Rerank worker response is in no rerank shape: {e}");
-                return error::bad_gateway(
+                return keep_worker(error::bad_gateway(
                     "call_upstream_decode_error",
                     format!(
                         "Rerank response from worker ({status}, {content_type}) is not a rerank answer: {e}"
                     ),
-                );
+                ));
             }
         };
         let model = canonical_model.map_or(req.model, ToOwned::to_owned);
@@ -1715,13 +1726,13 @@ impl Router {
         if !req.return_documents {
             rerank_response.drop_documents();
         }
-        Json(rerank_response).into_response()
+        keep_worker(Json(rerank_response).into_response())
     }
 }
 
 /// Post-dispatch inputs for the rerank response builder; the request itself
 /// (documents included) is released at dispatch.
-struct RerankResponseSpec {
+pub(super) struct RerankResponseSpec {
     model: String,
     rid: Option<openai_protocol::common::StringOrArray>,
     top_k: Option<usize>,
@@ -2689,7 +2700,20 @@ impl RouterTrait for Router {
         _tenant_meta: &TenantRequestMeta,
         response_id: &str,
     ) -> Response {
-        let endpoint = format!("v1/responses/{response_id}/cancel");
+        // A URL reads `.` and `..` as steps of the path, percent-coded or
+        // not, so neither can be a segment: no worker is asked for them.
+        if matches!(response_id, "." | "..") {
+            return error::not_found(
+                "response_not_found",
+                format!("Response with id '{response_id}' not found"),
+            );
+        }
+        // The id is the client's text and goes out as one path segment. The
+        // form encoder writes a space as `+`, which a path reads as a plus.
+        let id = url::form_urlencoded::byte_serialize(response_id.as_bytes())
+            .collect::<String>()
+            .replace('+', "%20");
+        let endpoint = format!("v1/responses/{id}/cancel");
         self.route_simple_request(headers, &endpoint, Method::POST)
             .await
     }
@@ -3183,6 +3207,44 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(seen.lock().unwrap().as_slice(), ["/get_server_info"]);
+    }
+
+    /// The id of a cancel call is the client's text. The worker reads it as
+    /// one segment of the cancel route; `.` and `..`, which a URL reads as
+    /// steps of the path, are an unknown id and reach no worker.
+    #[tokio::test]
+    async fn a_cancel_id_reaches_the_worker_as_one_path_segment() {
+        use axum::http::Uri;
+
+        // The stub answers every request with the target it read.
+        let app = axum::Router::new().fallback(|uri: Uri| async move { uri.to_string() });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let worker = plain_worker(&format!("http://{addr}"));
+        let router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, vec![worker]);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let response = router
+            .cancel_response(None, &tenant, "a/b\\c?d#e%f g")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let target = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(target, "/v1/responses/a%2Fb%5Cc%3Fd%23e%25f%20g/cancel");
+
+        for id in [".", ".."] {
+            let response = router.cancel_response(None, &tenant, id).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{id}");
+        }
     }
 
     /// smg-lab #288: the `model` label of the request families is bounded by
@@ -3915,10 +3977,11 @@ mod tests {
     #[tokio::test]
     async fn a_worker_body_cut_short_in_transit_is_a_502_read_failure() {
         let req = rerank_request();
-        let upstream = Response::new(Body::from_stream(stream::iter([
+        let mut upstream = Response::new(Body::from_stream(stream::iter([
             Ok::<_, std::io::Error>(Bytes::from_static(b"[{\"index\": 0, \"score\": 0.9}")),
             Err(std::io::Error::other("connection cut")),
         ])));
+        header_utils::insert_routed_worker_id(upstream.headers_mut(), "http://worker");
         let response = Router::build_rerank_response(
             RerankResponseSpec::from(&req),
             None,
@@ -3927,6 +3990,10 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers()["x-smg-routed-worker-id"],
+            "http://worker"
+        );
         assert_eq!(
             extract_error_code_from_response(&response),
             "read_response_body_failed"

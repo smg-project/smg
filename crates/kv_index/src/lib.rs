@@ -10,6 +10,8 @@
 //! - Multi-tenant prefix tracking with LRU eviction
 //! - Concurrent access via DashMap and RwLock
 //! - Efficient prefix matching with match counts
+//!
+//! [`ModelTrees`] keeps one tree of each kind per model.
 
 mod block;
 pub mod chain_index;
@@ -20,6 +22,7 @@ mod common;
 pub mod groups;
 mod lane_map;
 pub mod lane_pool;
+mod model_trees;
 mod path_hash;
 mod prefetch;
 pub mod reference;
@@ -40,6 +43,7 @@ pub use lane_map::ChainBlockMap;
 pub use lane_pool::{
     Claimed, Control, LaneHooks, LanePool, LanePoolConfig, PoolMetrics, QueueFull,
 };
+pub use model_trees::ModelTrees;
 pub use path_hash::{hash_node_path, hash_token_path, GLOBAL_EVICTION_HASH};
 pub use reference::{request_prefix_hashes, ReferenceIndexer};
 pub use sharded::{ShardedChainIndex, SHARD_SHIFT};

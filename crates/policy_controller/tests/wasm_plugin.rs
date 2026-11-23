@@ -8631,59 +8631,107 @@ fn a_named_pair_decision_keeps_its_instance_to_the_plugins_last_close() {
 /// call there and no instance; each decider's instance hears it before its
 /// next decision, one call a change. An instance made after a telling hears
 /// the list as it stands first.
+///
+/// The second decider's instance is made by its first decision: a lazy
+/// `init`, on the wall clock. A runner that holds that thread for the init
+/// frame has the host end the `init`. The decision then falls back, to the
+/// very worker the plugin names there, and the instance the decider's next
+/// decision makes hears the changes told so far as one snapshot: one call
+/// fewer, on one instance more. A destructor's time costs an instance the
+/// same way, and the close rebuilds it. So a try that counts another
+/// instance than the two the case makes, where a decision's thread was off
+/// the CPU half the init frame, says so and is made again ([`tried`]). Each
+/// try reads its picks and its counts before it asserts any, and a try no
+/// hold reached asserts what it read.
 #[test]
 fn a_membership_told_once_reaches_every_deciders_instance_before_it_decides() {
     use smg_policy_controller::tracking::Membership;
+    const CASE: &str = "a_membership_told_once_reaches_every_deciders_instance_before_it_decides";
     let runtime = runtime();
-    let plugin = load(&runtime, "fed", guest::record_guest(), mode::COUNT_MEMBERS);
-    let engine = plugin_engine(&plugin);
-    // The guest's pick names the row at the count of members its instance
-    // heard: on a thread of its own, acting as the decider of that number.
-    let acting = |number: u8| {
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    let _turn = DecisionSlot::new(number).enter();
-                    pick_ids(&decide(&engine, &pool(4), 1)).first().copied()
-                })
-                .join()
-                .expect("the acting thread")
-        })
-    };
-    // Told on a thread that names no decider and never decides.
-    let tell = |change: Membership<'_>| {
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| engine.on_membership(&change))
-                .join()
-                .expect("the telling thread");
-        });
-    };
-    assert_eq!(acting(0), Some(100), "no member told yet");
-    tell(Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
-    let told = plugin.stats();
-    assert_eq!(
-        (told.observed, told.instantiations, told.events_dropped),
-        (0, 1, 0),
-        "a telling calls no guest, makes no instance and drops nothing: {told:?}"
-    );
-    assert_eq!(acting(0), Some(102), "the first decider's instance heard");
-    assert_eq!(
-        acting(1),
-        Some(102),
-        "an instance made after the telling hears the list as it stands"
-    );
-    tell(Membership::Added(WorkerId(102)));
-    assert_eq!((acting(1), acting(0)), (Some(103), Some(103)));
-    tell(Membership::Removed(WorkerId(100)));
-    tell(Membership::Removed(WorkerId(101)));
-    assert_eq!((acting(0), acting(1)), (Some(101), Some(101)));
-    let stats = plugin.stats();
-    assert_eq!(
-        (stats.observed, stats.instantiations),
-        (8, 2),
-        "one call a decider a change, the snapshot among them: {stats:?}"
-    );
+    tried(|made| {
+        let plugin = load(&runtime, "fed", guest::record_guest(), mode::COUNT_MEMBERS);
+        let engine = plugin_engine(&plugin);
+        // The guest's pick names the row at the count of members its
+        // instance heard: on a thread of its own, acting as the decider of
+        // that number. The longest any such thread was off the CPU is kept.
+        let worst = std::cell::Cell::new(std::time::Duration::ZERO);
+        let acting = |number: u8| {
+            let (pick, held) = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+                        let pick = {
+                            let _turn = DecisionSlot::new(number).enter();
+                            pick_ids(&decide(&engine, &pool(4), 1)).first().copied()
+                        };
+                        (pick, off_cpu_since(wall, cpu))
+                    })
+                    .join()
+                    .expect("the acting thread")
+            });
+            worst.set(worst.get().max(held));
+            pick
+        };
+        // Told on a thread that names no decider and never decides.
+        let tell = |change: Membership<'_>| {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| engine.on_membership(&change))
+                    .join()
+                    .expect("the telling thread");
+            });
+        };
+        let untold = acting(0);
+        tell(Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
+        let told = plugin.stats();
+        let heard = acting(0);
+        // The second decider's first decision, and the instances made
+        // lazily by its end: its own.
+        let late = (acting(1), plugin.stats().lazy_instantiations);
+        tell(Membership::Added(WorkerId(102)));
+        let added = (acting(1), acting(0));
+        tell(Membership::Removed(WorkerId(100)));
+        tell(Membership::Removed(WorkerId(101)));
+        let removed = (acting(0), acting(1));
+        let stats = plugin.stats();
+        // The witness: the load's instance and the second decider's are the
+        // two a try makes. Another one, made or only begun, in a try where
+        // a decision's thread was off the CPU half the init frame, is the
+        // host's answer to that hold. With no such hold it is the host's
+        // own, and the try asserts.
+        let another = (stats.instantiations, stats.lazy_instantiations) != (2, 1);
+        if another && worst.get() >= INIT_FRAME / 2 && made < TRIES {
+            made_again(
+                CASE,
+                "a decision's thread was off the CPU half the init frame, the bound of a lazy init and of a close's rebuild",
+            );
+            return false;
+        }
+        assert_eq!(untold, Some(100), "no member told yet");
+        assert_eq!(
+            (told.observed, told.instantiations, told.events_dropped),
+            (0, 1, 0),
+            "a telling calls no guest, makes no instance and drops nothing: {told:?}"
+        );
+        assert_eq!(heard, Some(102), "the first decider's instance heard");
+        assert_eq!(
+            late,
+            (Some(102), 1),
+            "an instance made after the telling, by its decider's first decision, hears the list as it stands"
+        );
+        assert_eq!(added, (Some(103), Some(103)));
+        assert_eq!(removed, (Some(101), Some(101)));
+        assert_eq!(
+            (
+                stats.observed,
+                stats.instantiations,
+                stats.lazy_instantiations
+            ),
+            (8, 2, 1),
+            "one call a decider a change, the snapshot among them, on the two instances: {stats:?}"
+        );
+        true
+    });
 }
 
 /// An instance new to the feed hears the membership as it stands, as one

@@ -52,8 +52,8 @@ use crate::{
         completed::Class,
         released::{Reason, What},
     },
-    store::{Dispatch, GatewayId, Hand, MemoryStore, Said, Sides, StoreSnapshot},
-    tracking::lease::{LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+    store::{GatewayId, Hand, MemoryStore, Sides, StoreSnapshot},
+    tracking::lease::{Dispatch, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass},
 };
 
 /// A `Dispatched` frame: the gateway's lease moves to dispatched at `now`.
@@ -258,6 +258,11 @@ fn past(field: &'static str, number: u32, most: u32) -> Status {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    // The rule a guard's lease is told by builds with the engine over
+    // worker lists.
+    #[cfg(feature = "in-process")]
+    mod lease_on_file;
+
     use std::{
         cell::RefCell,
         sync::Arc,
@@ -271,7 +276,7 @@ pub(crate) mod tests {
         class, completed, dispatch, dispatched, open, outcome, reason, release, released, side,
     };
     use crate::{
-        document::spec::{AppliedSpec, Assignment, PolicySpec, Recovery},
+        document::spec::{AppliedSpec, Assignment, PolicySpec, Recovery, RulePlaced},
         engine::{
             decision::{Pair, Target, Targets},
             framework::{Picker, TieBand},
@@ -290,10 +295,10 @@ pub(crate) mod tests {
         },
         stages::{lifecycle::Lifecycle, registry::StageRegistry},
         store::{
-            DecodeSide, Dispatch, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore,
-            MemoryStore, PickRecord, SessionsStore, WorkerFacts, WorkersStore,
+            DecodeSide, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore,
+            PickRecord, SessionsStore, WorkerFacts, WorkersStore,
         },
-        tracking::lease::{Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+        tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
     };
 
     const A: GatewayId = GatewayId(11);
@@ -931,6 +936,7 @@ pub(crate) mod tests {
             ttl_micros,
             sweep_micros: 0,
             recovery: Recovery::Original,
+            rule_placed: RulePlaced::Told,
         };
         store.with_snapshot(|world| {
             let table = world.spec().engine().sessions();

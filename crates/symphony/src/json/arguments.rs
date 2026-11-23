@@ -264,6 +264,20 @@ impl Arguments {
         self.whole.is_some()
     }
 
+    /// Whether the value is whole where its bytes end so far: whole already, or a number or a
+    /// literal the bytes end on, which no later byte of its own closes and the end of the bytes
+    /// does. What [`Self::finish`] finds once the end came, asked without ending the value.
+    pub fn whole_at_the_end(&self) -> bool {
+        self.whole.is_some() || (self.started && self.invalid_from.is_none() && self.prefix.whole())
+    }
+
+    /// Whether the value is a number: the one value more bytes can continue once it reads
+    /// whole, so that where its bytes were cut it may be the start of another number.
+    pub fn is_a_number(&self) -> bool {
+        self.value
+            .starts_with(|c: char| c == '-' || c.is_ascii_digit())
+    }
+
     /// Append the next bytes, push the events they complete, holding the string values `strings`
     /// holds, and return how many of them the value took: all of them before its end, up to its
     /// end in the piece that carries it, and none once it is whole.
@@ -357,11 +371,7 @@ impl Arguments {
     /// finished, and a call whose value never began is not handed over as a whole one with an
     /// empty string for its arguments. Returns whether the value is whole.
     pub fn finish(&mut self, out: &mut Events) -> bool {
-        if self.whole.is_none()
-            && self.started
-            && self.invalid_from.is_none()
-            && self.prefix.whole()
-        {
+        if self.whole.is_none() && self.whole_at_the_end() {
             self.whole = Some(self.value.len());
         }
         let end = self.value.len();

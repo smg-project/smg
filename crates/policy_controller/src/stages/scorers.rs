@@ -460,8 +460,56 @@ impl Default for Told {
     }
 }
 
-/// A lane's dispatches: the instant and the token-work of each, oldest first.
-type Dispatches = VecDeque<(u64, u32)>;
+/// A lane's dispatches: the instant and the token-work of each, oldest
+/// first. The one type that holds them: a record holds a dispatch here, and
+/// a release and a retirement let the oldest go. Its lane's lock guards it.
+#[derive(Debug, Default)]
+struct Dispatches(VecDeque<(u64, u32)>);
+
+impl Dispatches {
+    /// Holds one dispatch of `tokens` made at `at_micros`, and says whether
+    /// it is the oldest held now.
+    ///
+    /// It lands at its instant's place: a dispatch that waited for a
+    /// retirement on a shared lane, or one a stepped clock dated earlier,
+    /// lands behind a later one, and the release and the retirement read a
+    /// lane from its oldest. Instants mostly rise, so the newest is asked
+    /// first: a dispatch no older than it is a push, and the place is
+    /// searched for the one that is.
+    fn hold(&mut self, at_micros: u64, tokens: u32) -> bool {
+        let newest = self.0.back().map(|&(held_at, _)| held_at);
+        if newest.is_some_and(|newest| newest > at_micros) {
+            let at = self.0.partition_point(|&(held_at, _)| held_at <= at_micros);
+            self.0.insert(at, (at_micros, tokens));
+            at == 0
+        } else {
+            self.0.push_back((at_micros, tokens));
+            newest.is_none()
+        }
+    }
+
+    /// The instant of the oldest dispatch held.
+    fn oldest(&self) -> Option<u64> {
+        self.0.front().map(|&(at, _)| at)
+    }
+
+    /// Lets the oldest dispatch go where it was made at or before
+    /// `through_micros`, and hands back its token-work. A retirement lets
+    /// it go whenever it was made.
+    fn let_go(&mut self, through_micros: u64) -> Option<u32> {
+        let &(at, tokens) = self.0.front()?;
+        if at > through_micros {
+            return None;
+        }
+        self.0.pop_front();
+        Some(tokens)
+    }
+
+    /// How many dispatches it holds.
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
 
 /// One lane of a row's dispatches, on a cache line of its own: the threads
 /// mapped to it append here, and its traffic never invalidates another lane.
@@ -563,7 +611,7 @@ pub(crate) fn take_lane(lane: usize) {
 impl Default for DispatchLane {
     fn default() -> Self {
         Self {
-            dispatches: Mutex::new(Dispatches::new()),
+            dispatches: Mutex::default(),
             oldest_micros: AtomicU64::new(u64::MAX),
         }
     }
@@ -571,7 +619,7 @@ impl Default for DispatchLane {
 
 impl DispatchLane {
     fn publish_oldest(&self, dispatches: &Dispatches) {
-        let oldest = dispatches.front().map_or(u64::MAX, |&(at, _)| at);
+        let oldest = dispatches.oldest().unwrap_or(u64::MAX);
         self.oldest_micros.store(oldest, Ordering::Release);
     }
 }
@@ -607,22 +655,8 @@ impl RankCredit {
         }
         let lane = &self.lanes[lane_of_this_thread()];
         let mut dispatches = lane.dispatches.lock();
-        // At its instant's place: a dispatch that waited for a retirement
-        // on a shared lane, or one a stepped clock dated earlier, lands
-        // behind a later one, and the release and the retirement read a
-        // lane from its oldest. Instants mostly rise, so the lane's newest
-        // is asked first: a dispatch no older than it is a push, and the
-        // place is searched for the one that is. The lane's front moves
-        // only where the dispatch lands there.
-        let newest = dispatches.back().map(|&(held_at, _)| held_at);
-        let front = if newest.is_some_and(|newest| newest > at_micros) {
-            let at = dispatches.partition_point(|&(held_at, _)| held_at <= at_micros);
-            dispatches.insert(at, (at_micros, tokens));
-            at == 0
-        } else {
-            dispatches.push_back((at_micros, tokens));
-            newest.is_none()
-        };
+        // The lane's front moves only where the dispatch lands there.
+        let front = dispatches.hold(at_micros, tokens);
         self.held.fetch_add(Self::weight(tokens), Ordering::Relaxed);
         if tokens == 0 {
             self.unsized_held.fetch_add(1, Ordering::Relaxed);
@@ -638,14 +672,12 @@ impl RankCredit {
         }
     }
 
-    /// Takes a lane's oldest dispatch out of the held word. The
-    /// subtraction is a `Release`: a read that loads the word with
+    /// Takes a dispatch of `tokens` its lane let go out of the held word.
+    /// The subtraction is a `Release`: a read that loads the word with
     /// `Acquire` finds every write made ahead of it, the count of the
     /// dispatches of no tokens among them ([`Self::sent_through`]).
-    fn pop_oldest(&self, dispatches: &mut Dispatches) {
-        if let Some((_, tokens)) = dispatches.pop_front() {
-            self.held.fetch_sub(Self::weight(tokens), Ordering::Release);
-        }
+    fn take_out(&self, tokens: u32) {
+        self.held.fetch_sub(Self::weight(tokens), Ordering::Release);
     }
 
     /// Every lane's dispatches under their locks, taken in lane order: the
@@ -696,19 +728,19 @@ impl RankCredit {
             let oldest = held_lanes
                 .iter()
                 .enumerate()
-                .filter_map(|(i, dispatches)| dispatches.front().map(|&(at, _)| (at, i)))
+                .filter_map(|(i, dispatches)| dispatches.oldest().map(|at| (at, i)))
                 .min();
             let Some((_, i)) = oldest else {
                 break;
             };
-            if let Some((_, tokens)) = held_lanes[i].pop_front() {
+            if let Some(tokens) = held_lanes[i].let_go(u64::MAX) {
                 retired += Self::weight(tokens);
                 unsized_retired += u16::from(tokens == 0);
             }
         }
         self.unsized_held
             .fetch_sub(unsized_retired, Ordering::Relaxed);
-        // A `Release`, as a release's subtraction is: see `pop_oldest`.
+        // A `Release`, as a release's subtraction is: see `take_out`.
         self.held.fetch_sub(retired, Ordering::Release);
         for (dispatches, lane) in held_lanes.iter().zip(&self.lanes) {
             lane.publish_oldest(dispatches);
@@ -799,11 +831,8 @@ impl RankCredit {
             self.release_marked(&mut held_lanes, sampled_at_micros);
         } else {
             for (dispatches, lane) in held_lanes.iter_mut().zip(&self.lanes) {
-                while dispatches
-                    .front()
-                    .is_some_and(|&(at, _)| at <= sampled_at_micros)
-                {
-                    self.pop_oldest(dispatches);
+                while let Some(tokens) = dispatches.let_go(sampled_at_micros) {
+                    self.take_out(tokens);
                 }
                 lane.publish_oldest(dispatches);
             }
@@ -833,14 +862,11 @@ impl RankCredit {
         sampled_at_micros: u64,
     ) {
         for (dispatches, lane) in held_lanes.iter_mut().zip(&self.lanes) {
-            while let Some(&(at, tokens)) = dispatches.front() {
-                if at > sampled_at_micros {
-                    break;
-                }
+            while let Some(tokens) = dispatches.let_go(sampled_at_micros) {
                 if tokens == 0 {
                     self.unsized_held.fetch_sub(1, Ordering::Relaxed);
                 }
-                self.pop_oldest(dispatches);
+                self.take_out(tokens);
             }
             lane.publish_oldest(dispatches);
         }
@@ -2982,6 +3008,34 @@ pub(crate) mod tests {
             "the score reads no credit of that rank"
         );
         assert_eq!(rw.held_at(pool[0].id, 0), 0);
+    }
+
+    /// A lane's dispatches are held by instant and let go through one: one
+    /// dated earlier lands in front, one made at a held instant behind it,
+    /// and the oldest goes where it was made at or before the instant.
+    #[test]
+    fn a_lanes_dispatches_are_held_by_instant_and_let_go_through_one() {
+        let mut dispatches = Dispatches::default();
+        assert_eq!(dispatches.oldest(), None);
+        // The first held is the oldest. A later one is not.
+        assert!(dispatches.hold(20, 2));
+        assert!(!dispatches.hold(30, 3));
+        // One dated earlier is the oldest now.
+        assert!(dispatches.hold(10, 1));
+        // One dated between lands between, one at a held instant behind it.
+        assert!(!dispatches.hold(25, 4));
+        assert!(!dispatches.hold(20, 5));
+        assert_eq!((dispatches.oldest(), dispatches.len()), (Some(10), 5));
+        // The oldest stays while the instant is before it and goes at its
+        // own instant. The next stays one microsecond short of its own.
+        assert_eq!(dispatches.let_go(9), None);
+        assert_eq!(dispatches.let_go(10), Some(1));
+        assert_eq!(dispatches.let_go(19), None);
+        assert_eq!(dispatches.oldest(), Some(20));
+        // Oldest first, and of one instant the earlier held first.
+        let gone: Vec<u32> = std::iter::from_fn(|| dispatches.let_go(u64::MAX)).collect();
+        assert_eq!(gone, [2, 5, 4, 3]);
+        assert_eq!((dispatches.oldest(), dispatches.len()), (None, 0));
     }
 
     /// A credit is its rank's: a dispatch to rank 1 of a worker prices that

@@ -16,12 +16,6 @@
 //! `RequestForm`): a frame as the served controller checked it, or the facts a
 //! host in process holds ([`Request`]).
 //!
-//! With sampling on, a seat counts picks and sheds under its decision
-//! lock. Only a decision that keeps a record also takes the ring lock.
-//! [`StoreBackedEngine::explain`] reads by gateway and request id under the
-//! ring lock. [`StoreBackedEngine::explained`] also reads the names when their
-//! generation stands.
-//!
 //! A host with encode items can place them through
 //! [`StoreBackedEngine::decide_encode_pair`]. The pair's prefill and decode are
 //! the sides that hold leases.
@@ -32,7 +26,7 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
-        Arc, OnceLock,
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -48,15 +42,12 @@ use crate::{
             SUBSET_HINT, WIRES,
         },
         decision_engine::{
-            DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Leased, Request,
-            RequestMaker, SweepOutcome,
+            DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused, HeldDecision,
+            Leased, Request, RequestMaker, SweepOutcome,
         },
         decision_slot::DecisionSlot,
         demands::{self, DemandFacts, Demands},
-        framework::{
-            release, EncodeItems, EncodePlaced, Engine, PairSide, Plan, Scratch, ShadowRows,
-            KEEPS_SLOT_STATE, SAMPLES_DECISIONS, SHADOWS,
-        },
+        framework::{release, EncodeItems, EncodePlaced, Engine, Plan, Scratch, KEEPS_SLOT_STATE},
         prompt_hashes::{HashSeeds, PromptHashes},
         sticky_sessions::{SessionExpiry, SessionVerdict},
         view::{
@@ -66,22 +57,16 @@ use crate::{
     },
     stages::lifecycle::Lifecycle,
     store::{
-        leases::DISPATCH_TTL, pairing::Refusal, AffinityQuery, AffinityRowsBuffers, AtWork,
-        DecodeIssue, DecodeRefused, DecodeSide, Dispatch, EncodePairBuffers, GatewayId, Hand,
-        HealthSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, MemoryStore, PairBuffers,
-        PickRecord, Pin, Said, SessionsStore, Sides, StoreSnapshot, ViewBuffers, ViewFacts,
-        ViewQuery,
+        AffinityQuery, AffinityRowsBuffers, AtWork, DecodeIssue, DecodeSide, EncodePairBuffers,
+        GatewayId, Hand, HealthSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore,
+        MemoryStore, PairBuffers, PickRecord, Pin, SessionsStore, Sides, StoreSnapshot,
+        ViewBuffers, ViewFacts, ViewQuery,
     },
     tracking::{
         in_flight::WorkerSlot,
-        lease::{Lease, LeaseId, LeaseKind, Outcome, Side},
+        lease::{Dispatch, Lease, LeaseId, LeaseKind, Outcome, Said, Side, DISPATCH_TTL},
     },
 };
-
-mod explain;
-
-pub use explain::{DecisionExplanation, DecisionNames, DecisionRecord};
-pub(crate) use explain::{SampleCount, Samples};
 
 /// A request as the store-backed engine reads it: what the rows' narrowing,
 /// the engine's request and the lease take of it, in whatever form it was
@@ -141,11 +126,6 @@ pub(crate) fn unnamed(_: &RequestFacts<'_>, _: &Constraints<'_>) -> Option<Affin
     None
 }
 
-/// How many of a generation's bindings count their shadows in a row of
-/// their own ([`StoreBackedEngine::shadowed`]). The bindings behind them count
-/// in the last row. A host that shows the counts walks this many rows.
-pub const SHADOW_ROWS: usize = 16;
-
 /// One decider's part of the counts that every decision can move, on cache
 /// lines of its own. Where a fleet's gateways speak fewer wires than its
 /// members, each decision counts the candidates it lost; where a host
@@ -160,62 +140,6 @@ pub(crate) struct Part {
     /// Requests that carried more block hashes than their generation
     /// reads of them.
     pub(crate) hashes_cut: AtomicU64,
-    /// The shadows of this decider's decisions ([`Part::shadowed`]),
-    /// laid at its first: the part of a decider that shadows nothing
-    /// stays its one pair of lines.
-    shadowed: OnceLock<Box<ShadowCounts>>,
-}
-
-/// One decider's counts of its shadows, on lines of their own: a row a
-/// binding by its position in its generation, a count a kind. A table
-/// for each place a shadow is asked ([`Counted`]).
-#[derive(Debug, Default)]
-#[repr(align(128))]
-struct ShadowCounts([[[AtomicU64; ShadowKind::COUNT]; SHADOW_ROWS]; 4]);
-
-impl ShadowCounts {
-    fn of(&self, binding: u32, table: Counted, kind: ShadowKind) -> &AtomicU64 {
-        let table = match table {
-            Counted::Single => 0,
-            Counted::Side(side) => 1 + side.index(),
-            Counted::Later => 3,
-        };
-        let row = (binding as usize).min(SHADOW_ROWS - 1);
-        &self.0[table][row][kind.index()]
-    }
-}
-
-/// Where a shadow was asked: the table it is counted in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Counted {
-    /// Beside a single's decision.
-    Single,
-    /// Beside this side of a pair, at the pair's decision.
-    Side(PairSide),
-    /// Beside a decode decided after its prefill, at that second
-    /// decision. The pair's first decision counted its decode side
-    /// beside the decode it named first: the two are never one count.
-    Later,
-}
-
-impl Part {
-    /// The count of the shadows that said `kind` beside a decision of
-    /// the binding at position `binding`, for the decider that counts
-    /// one: its counts are laid here at its first. `at` says where the
-    /// shadow was asked.
-    pub(crate) fn shadowed(&self, binding: u32, at: Counted, kind: ShadowKind) -> &AtomicU64 {
-        let counts = self.shadowed.get_or_init(Box::default);
-        counts.of(binding, at, kind)
-    }
-
-    /// That count as it stands, for a reader: none where the decider
-    /// has counted no shadow.
-    pub(crate) fn shadowed_so_far(&self, binding: u32, at: Counted, kind: ShadowKind) -> u64 {
-        let counts = self.shadowed.get();
-        counts.map_or(0, |counts| {
-            counts.of(binding, at, kind).load(Ordering::Relaxed)
-        })
-    }
 }
 
 /// One of the parts' counts, summed over `parts`.
@@ -489,12 +413,9 @@ fn entry_and_plan<A: RequestForm>(
 /// lease takes of its request. Over rows the store named it is made at the
 /// entry that states what the pick's first target holds of them
 /// ([`Engine::decide_stated`]), and over any other view at the plain entry.
-/// Under `KEEPS` each is the entry's keeping form, which keeps what the
-/// decision read of its session key for the request's shadow
-/// ([`Engine::decide_keeping`]).
-struct ByEngine<'a, const KEEPS: bool>(&'a Engine);
+struct ByEngine<'a>(&'a Engine);
 
-impl<const KEEPS: bool> ByEngine<'_, KEEPS> {
+impl ByEngine<'_> {
     // Forced into each form's one call: out of line the plain form would
     // pay a call the closure it stands for never made.
     #[inline(always)]
@@ -507,13 +428,10 @@ impl<const KEEPS: bool> ByEngine<'_, KEEPS> {
         scratch: &mut Scratch,
     ) -> (Decision, Option<Booking>) {
         let engine = self.0;
-        let decision = match (STATED, KEEPS) {
-            (false, false) => engine.decide(facts, pool, candidates, constraints, scratch),
-            (true, false) => engine.decide_stated(facts, pool, candidates, constraints, scratch),
-            (false, true) => engine.decide_keeping(facts, pool, candidates, constraints, scratch),
-            (true, true) => {
-                engine.decide_stated_keeping(facts, pool, candidates, constraints, scratch)
-            }
+        let decision = if STATED {
+            engine.decide_stated(facts, pool, candidates, constraints, scratch)
+        } else {
+            engine.decide(facts, pool, candidates, constraints, scratch)
         };
         // What a pick's lease takes of its request, read where the
         // request stands as the engine read it.
@@ -542,7 +460,7 @@ impl<const KEEPS: bool> ByEngine<'_, KEEPS> {
     }
 }
 
-impl Decides<(Decision, Option<Booking>)> for ByEngine<'_, false> {
+impl Decides<(Decision, Option<Booking>)> for ByEngine<'_> {
     fn over(
         self,
         facts: &RequestFacts<'_>,
@@ -597,440 +515,12 @@ pub(crate) fn decide_in<A: RequestForm>(
     if taken.request.hashes() > taken.request.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
     }
-    let plain = ByEngine::<false>(engine);
+    let plain = ByEngine(engine);
     let ((decision, booking), built) = hand(world, taken, buffers, &own.undialed, plain);
     (
         decision,
         booking.map(|booking| Booking { built, ..booking }),
     )
-}
-
-/// What a request's budget must still hold at the end of its live
-/// decision for its shadow to be asked. A shadow asked with less could
-/// take a served answer past its budget, where the decider's last read
-/// refuses it.
-pub(crate) const SHADOW_FLOOR: Duration = Duration::from_millis(1);
-
-/// What a decision's shadow said beside it, where one was due.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Shadowed {
-    /// The position of the request's binding in its generation.
-    pub(crate) binding: u32,
-    /// The shadow's decision beside the live one, and
-    /// [`ShadowKind::Skipped`] where the shadow was due and not asked.
-    pub(crate) kind: ShadowKind,
-    /// The first target of the shadow's pick.
-    pub(crate) first: Option<WorkerId>,
-}
-
-/// What became of a decision's shadow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Shadow {
-    /// None was due: the request's binding asks none, or the door made
-    /// the decision itself over a view its gateway left no row.
-    NotDue,
-    /// One was due: what it said, or that it was not asked.
-    Said(Shadowed),
-    /// The shadow panicked, and the panic was held where it was asked.
-    Faulted,
-}
-
-/// [`ByEngine`] under a generation that shadows. The live decision is
-/// made at the engine's keeping entries and taken with its booking as
-/// values. Then the binding's shadow is asked over the same view
-/// ([`Engine::shadow`]), ahead of the commit: the rows and the counts are
-/// those the live decision read, and no stage has heard of its lease.
-/// The shadow writes the scratch and its own stages, and nothing the
-/// commit reads.
-///
-/// A shadow that is due is not asked in two places, and is said as
-/// skipped. A request with less than [`SHADOW_FLOOR`] of its budget left
-/// keeps that for its answer. And the rows the live decision was handed
-/// are not the shadow profile's where that profile would be handed
-/// others ([`ShadowRows::Apart`]). A shadow profile that reads no column
-/// is asked without the rows named for the live one
-/// ([`ShadowRows::Unnamed`]). One that is named rows of its own is asked
-/// over rows the door names again for it ([`ShadowRows::Own`],
-/// [`OwnRows`]), behind the live decision and the floor.
-///
-/// A shadow that panics is held here, inside the catch its host keeps
-/// round the decision: the live decision stands as decided.
-///
-/// A decider is built for one way of asking its shadow ([`ShadowAsk`]):
-/// one whose shadow reads the live decision's rows carries nothing of a
-/// naming.
-struct Shadowing<'a, L, R> {
-    engine: &'a Engine,
-    /// The request's binding and how its shadow reads the live
-    /// decision's rows, as the seat read them ahead of the order
-    /// ([`Engine::shadow_for`]).
-    due: (u32, ShadowRows),
-    /// What the request's budget still holds at the end of the live
-    /// decision: asked there, and only where a shadow is due.
-    left: L,
-    /// How the shadow is asked.
-    ask: R,
-}
-
-/// How a [`Shadowing`] decider asks its shadow, by the rows the shadow
-/// profile reads: those of its live decision ([`LiveRows`]), or none of
-/// them ([`OwnRows`]).
-trait ShadowAsk {
-    /// Whether the live decision reads the affinity column its needs
-    /// declare ([`Decides::reads_column`]).
-    fn reads_column(&self) -> bool;
-
-    /// The shadow's decision over the live decision's view, by `rows`.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the engine's shadow entry and its inputs, beside the rows' word"
-    )]
-    fn shadow(
-        self,
-        engine: &Engine,
-        rows: ShadowRows,
-        facts: &RequestFacts<'_>,
-        pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
-        constraints: &Constraints<'_>,
-        scratch: &mut Scratch,
-    ) -> Option<Decision>;
-}
-
-/// The asking of a shadow that reads the rows its live decision was
-/// handed ([`ShadowRows::Same`]), or the view without the rows named for
-/// the live profile ([`ShadowRows::Unnamed`]).
-struct LiveRows;
-
-impl ShadowAsk for LiveRows {
-    fn reads_column(&self) -> bool {
-        true
-    }
-
-    // Forced into the decider's one call: the asking stands in line
-    // there, as it did where the decider held no other.
-    #[inline(always)]
-    fn shadow(
-        self,
-        engine: &Engine,
-        rows: ShadowRows,
-        facts: &RequestFacts<'_>,
-        pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
-        constraints: &Constraints<'_>,
-        scratch: &mut Scratch,
-    ) -> Option<Decision> {
-        match rows {
-            // A profile that reads no column is named no row, live or
-            // as a shadow: the names would turn its pick to a draw.
-            ShadowRows::Unnamed => {
-                let unnamed = RequestFacts {
-                    named: None,
-                    ..*facts
-                };
-                engine.shadow(&unnamed, pool, candidates, constraints, scratch)
-            }
-            _ => engine.shadow(facts, pool, candidates, constraints, scratch),
-        }
-    }
-}
-
-/// The asking of a shadow that reads none of its live decision's rows:
-/// one that is named rows of its own ([`ShadowRows::Own`]), and one that
-/// is skipped ([`ShadowRows::Apart`]). It holds what the door names such
-/// rows by, beside the request: the world of the decision's one load,
-/// the gateway and the wires its view was built and narrowed for,
-/// whether a demand may have taken a row of it, and the buffer the rows
-/// are written on.
-struct OwnRows<'a> {
-    world: &'a StoreSnapshot,
-    gateway: GatewayId,
-    wires: Option<WireModes>,
-    cut: bool,
-    named: &'a mut AffinityRowsBuffers,
-    /// Whether the live profile reads the affinity column by its own
-    /// stages: no column is filled for such a shadow's sake.
-    column: bool,
-    /// The binding's position: its shadow's rows are named under that
-    /// shadow profile's own cap ([`Engine::shadow_cap_at`]).
-    binding: u32,
-}
-
-impl ShadowAsk for OwnRows<'_> {
-    fn reads_column(&self) -> bool {
-        self.column
-    }
-
-    fn shadow(
-        self,
-        engine: &Engine,
-        rows: ShadowRows,
-        facts: &RequestFacts<'_>,
-        pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
-        constraints: &Constraints<'_>,
-        scratch: &mut Scratch,
-    ) -> Option<Decision> {
-        // A shadow that is skipped is asked nothing: its decider stops
-        // ahead of the asking.
-        if rows != ShadowRows::Own {
-            return None;
-        }
-        // A profile that is named rows of its own reads them in the
-        // column's place, as it does live.
-        let cap = engine.shadow_cap_at(self.binding);
-        let named = self.name(engine, cap, facts, candidates, constraints);
-        let own = RequestFacts {
-            named: Some(named.affinity()),
-            affinity: &[],
-            ..*facts
-        };
-        engine.shadow(&own, pool, candidates, constraints, scratch)
-    }
-}
-
-impl<'a> OwnRows<'a> {
-    /// The rows of `candidates` named for the shadow of `facts`' request
-    /// under `cap`, as [`hand`] names a live profile's: by the request's
-    /// block hashes as the engine reads them, on the decision's seed, at
-    /// the instant its view was built. A cap full of holders the shadow
-    /// profile's pass refuses is read past as a live profile's is
-    /// ([`StoreSnapshot::name_kept`]), by the shadow profile's own test of a
-    /// row ([`Engine::shadow_keeps_at`]).
-    fn name(
-        self,
-        engine: &Engine,
-        cap: u32,
-        facts: &RequestFacts<'_>,
-        candidates: &[Candidate],
-        constraints: &Constraints<'_>,
-    ) -> &'a AffinityRowsBuffers {
-        let Self {
-            world,
-            gateway,
-            wires,
-            cut,
-            named,
-            binding,
-            ..
-        } = self;
-        let role = role_of(facts.phase);
-        let naming = AffinityQuery {
-            gateway,
-            block_hashes: facts.block_hashes,
-            namespace_seed: facts.namespace_seed,
-            seed: facts.seed,
-            cap,
-            wires,
-            now_micros: facts.now_micros,
-        };
-        let (model, kind) = (facts.model, facts.hash_kind);
-        if cut {
-            world.name_in::<true>(model, role, &naming, candidates, kind, named);
-        } else {
-            world.name_in::<false>(model, role, &naming, candidates, kind, named);
-        }
-        world.name_kept(model, role, &naming, candidates, named, || {
-            let test = engine.shadow_keeps_at(binding, facts, constraints)?;
-            Some(move |row: &Candidate| test.keeps(row))
-        });
-        named
-    }
-}
-
-impl<L: FnOnce() -> Duration, R: ShadowAsk> Shadowing<'_, L, R> {
-    // Forced into each form's one call, as the plain decider's is.
-    #[inline(always)]
-    fn decided<const STATED: bool>(
-        self,
-        facts: &RequestFacts<'_>,
-        pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
-        constraints: &Constraints<'_>,
-        scratch: &mut Scratch,
-    ) -> ((Decision, Option<Booking>), Shadow) {
-        let engine = self.engine;
-        let keeping = ByEngine::<true>(engine);
-        let live = keeping.decided::<STATED>(facts, pool, candidates, constraints, scratch);
-        let (binding, rows) = self.due;
-        let said = |kind, first| {
-            Shadow::Said(Shadowed {
-                binding,
-                kind,
-                first,
-            })
-        };
-        // Rows the shadow profile would not be handed, in either form.
-        if rows == ShadowRows::Apart || (self.left)() < SHADOW_FLOOR {
-            return (live, said(ShadowKind::Skipped, None));
-        }
-        #[cfg(test)]
-        if let Some(asking) = ON_SHADOW.take() {
-            asking();
-        }
-        let ask = self.ask;
-        let asked = catch_unwind(AssertUnwindSafe(|| {
-            ask.shadow(engine, rows, facts, pool, candidates, constraints, scratch)
-        }));
-        let shadow = match asked {
-            Ok(Some(shadow)) => {
-                let first = shadow.pick().and_then(|pick| pick.targets.first());
-                said(
-                    ShadowKind::of(&live.0, &shadow),
-                    first.map(|target| target.id),
-                )
-            }
-            Ok(None) => Shadow::NotDue,
-            Err(payload) => {
-                // A payload's own drop can panic: the engine's helper
-                // frees it under a catch of its own.
-                release(payload);
-                Shadow::Faulted
-            }
-        };
-        (live, shadow)
-    }
-}
-
-impl<L: FnOnce() -> Duration, R: ShadowAsk> Decides<((Decision, Option<Booking>), Shadow)>
-    for Shadowing<'_, L, R>
-{
-    fn over(
-        self,
-        facts: &RequestFacts<'_>,
-        pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
-        constraints: &Constraints<'_>,
-        scratch: &mut Scratch,
-    ) -> ((Decision, Option<Booking>), Shadow) {
-        self.decided::<false>(facts, pool, candidates, constraints, scratch)
-    }
-
-    fn over_named(
-        self,
-        facts: &RequestFacts<'_>,
-        pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
-        constraints: &Constraints<'_>,
-        scratch: &mut Scratch,
-    ) -> ((Decision, Option<Booking>), Shadow) {
-        self.decided::<true>(facts, pool, candidates, constraints, scratch)
-    }
-
-    /// The door's own shed over a view with no row, under the name of
-    /// the stage that took the last of them: no profile decided it, so
-    /// no shadow is set beside it.
-    fn emptied(
-        self,
-        facts: &RequestFacts<'_>,
-        pool: &PoolFacts<'_>,
-        constraints: &Constraints<'_>,
-        scratch: &mut Scratch,
-        stage: &'static str,
-    ) -> ((Decision, Option<Booking>), Shadow) {
-        let plain = ByEngine::<false>(self.engine);
-        let none = plain.emptied(facts, pool, constraints, scratch, stage);
-        (none, Shadow::NotDue)
-    }
-
-    fn reads_column(&self) -> bool {
-        self.ask.reads_column()
-    }
-}
-
-/// [`decide_in`] for a request whose binding names a shadow: the live
-/// decision with its booking, and what became of that shadow
-/// ([`Shadowing`]). `due` is the engine's word of the binding
-/// ([`Engine::shadow_for`]), read once ahead of the decision. `left` says
-/// what the request's budget still holds at the end of the live decision,
-/// by its host's own clock. The shadow is asked over the rows its live
-/// decision was handed ([`LiveRows`]): one that reads none of them is
-/// decided by [`decide_own_in`].
-pub(crate) fn decide_shadowed_in<A: RequestForm>(
-    world: &StoreSnapshot,
-    taken: &DecisionCall<'_, A>,
-    buffers: &mut Buffers<A::Lists>,
-    own: &Part,
-    due: (u32, ShadowRows),
-    left: impl FnOnce() -> Duration,
-) -> ((Decision, Option<Booking>), Shadow) {
-    // Rows of the shadow's own have an asking of their own
-    // ([`decide_own_in`]), and a pair's sides an order of their own
-    // ([`pair_shadowed_in`]): a caller that hands either here would have
-    // the shadow asked over the live profile's rows. The stop stands
-    // ahead of the shadow's catch: a debug build stops at it, where a
-    // stop inside the catch would be counted as the shadow's fault.
-    debug_assert!(
-        !matches!(due.1, ShadowRows::Own | ShadowRows::Sides),
-        "a shadow that reads rows of its own is asked by its own order"
-    );
-    shadowed_by(world, taken, buffers, own, due, left, LiveRows)
-}
-
-/// [`decide_shadowed_in`] for a shadow that reads none of its live
-/// decision's rows: one that is named rows of its own, or one that is
-/// skipped ([`OwnRows`]). No column is filled for such a shadow's sake:
-/// the live decision's is filled where its own profile reads it.
-///
-/// `named` is the buffer the shadow's rows are named on. Its host keeps
-/// it beside `buffers`, which the hand holds while the shadow is named.
-/// It is left with no record to write where no shadow was named: a
-/// naming an earlier decision left is no word of this one's issue.
-pub(crate) fn decide_own_in<A: RequestForm>(
-    world: &StoreSnapshot,
-    taken: &DecisionCall<'_, A>,
-    buffers: &mut Buffers<A::Lists>,
-    own: &Part,
-    due: (u32, ShadowRows),
-    named: &mut AffinityRowsBuffers,
-    left: impl FnOnce() -> Duration,
-) -> ((Decision, Option<Booking>), Shadow) {
-    let engine = world.spec().engine();
-    named.clear_sent();
-    let ask = OwnRows {
-        world,
-        gateway: taken.gateway,
-        wires: taken.request.wires(),
-        cut: !taken
-            .request
-            .demands()
-            .held_by(role_of(taken.request.phase()))
-            .is_none(),
-        named,
-        column: engine.live_column_at(due.0, taken.request.phase()),
-        binding: due.0,
-    };
-    shadowed_by(world, taken, buffers, own, due, left, ask)
-}
-
-/// The hand of a shadowed decision by one way of asking its shadow
-/// ([`ShadowAsk`]): the live decision with its booking, and what became
-/// of that shadow.
-#[inline(always)]
-fn shadowed_by<A: RequestForm, R: ShadowAsk>(
-    world: &StoreSnapshot,
-    taken: &DecisionCall<'_, A>,
-    buffers: &mut Buffers<A::Lists>,
-    own: &Part,
-    due: (u32, ShadowRows),
-    left: impl FnOnce() -> Duration,
-    ask: R,
-) -> ((Decision, Option<Booking>), Shadow) {
-    let spec = world.spec();
-    let engine = spec.engine();
-    if taken.request.hashes() > taken.request.hashes_read(spec) {
-        own.hashes_cut.fetch_add(1, Ordering::Relaxed);
-    }
-    let shadowing = Shadowing {
-        engine,
-        due,
-        left,
-        ask,
-    };
-    let (((decision, booking), shadow), built) =
-        hand(world, taken, buffers, &own.undialed, shadowing);
-    let booking = booking.map(|booking| Booking { built, ..booking });
-    ((decision, booking), shadow)
 }
 
 /// The engine's pair decision over the world of one load, for the request
@@ -1079,139 +569,8 @@ pub(crate) fn pair_in<A: RequestForm>(
             |facts, decision, built, scratch| {
                 pair_booking(world, facts, decision, built, scratch, later)
             },
-            no_shadow,
         ),
     )
-}
-
-/// What became of each side's shadow of a pair, the prefill's then the
-/// decode's.
-pub(crate) type SideShadows = [Shadow; 2];
-
-/// [`pair_in`] for a request whose pair binding names a shadow for a
-/// side (`binding`, [`Engine::shadow_for`]): the live pair with its
-/// booking, and what became of each side's shadow. A named side is
-/// decided once more by its shadow profile over the rows the live side
-/// decided over ([`Engine::shadow_side`]), behind the pair's booking and
-/// ahead of its commit: no stage has heard of the pair's leases. A side
-/// is compared with its own: the live prefill with the prefill shadow's
-/// first target, the live decode with the decode shadow's.
-///
-/// A shadow is asked beside a pair that picked: a pair that was shed or
-/// queued has no live side to set one beside. A request with less than
-/// [`SHADOW_FLOOR`] of its budget left keeps that for its answer, and
-/// each named side is said as skipped. So is a side whose shadow
-/// profile would be handed another column than its live side's pool
-/// carries ([`Engine::side_apart`]). A shadow that panics is held
-/// here, the live pair stands as decided, and the side behind it is not
-/// asked over the scratch it left.
-pub(crate) fn pair_shadowed_in<A: RequestForm>(
-    world: &StoreSnapshot,
-    taken: &DecisionCall<'_, A>,
-    buffers: &mut Buffers<A::Lists>,
-    own: &Part,
-    binding: u32,
-) -> ((Decision, Option<PairBooking>), SideShadows) {
-    let Buffers {
-        pair,
-        scratch,
-        lists,
-        ..
-    } = buffers;
-    let later = taken.request.decode_later();
-    let left = taken.left;
-    let mut sides = [Shadow::NotDue; 2];
-    let answer = pair_with::<false, _, _, _>(
-        world,
-        taken,
-        own,
-        pair,
-        (lists, scratch),
-        |pair, _, model, ask, wires, subset| {
-            let built = world.build_pair(model, &ask, pair)?;
-            world.count_pair_in_flight(&built, &ask, pair);
-            Some((built, pair.narrow(wires, subset, &built)))
-        },
-        (
-            |engine, pair, facts, pool, cx, scratch| {
-                engine.decide_pair(facts, pool, pair.pools(), cx, cx, scratch)
-            },
-            |facts, decision, built, scratch| {
-                pair_booking(world, facts, decision, built, scratch, later)
-            },
-            |engine, pair, facts, pool, cx, decision, scratch| {
-                let Some(live) = decision.pick() else {
-                    return;
-                };
-                for side in PairSide::BOTH {
-                    let pools = pair.pools();
-                    let said = side_shadow(engine, (binding, side), live, left, || {
-                        engine.shadow_side(binding, side, facts, pool, pools, cx, cx, live, scratch)
-                    });
-                    sides[side.index()] = said;
-                    if said == Shadow::Faulted {
-                        break;
-                    }
-                }
-            },
-        ),
-    );
-    (answer, sides)
-}
-
-/// One side's shadow beside a decision that picked `live`: a pair's
-/// ([`pair_shadowed_in`]), or the decode of a pair decided after its
-/// prefill ([`StoreBackedEngine::decode_shadowed`]). `ask` decides the side
-/// once more by the engine's entry for that decision, and `left` is what the
-/// request's budget still holds.
-fn side_shadow(
-    engine: &Engine,
-    (binding, side): (u32, PairSide),
-    live: &Pick,
-    left: Duration,
-    ask: impl FnOnce() -> Option<Decision>,
-) -> Shadow {
-    if !engine.shadows_side(binding, side) {
-        return Shadow::NotDue;
-    }
-    let said = |kind, first| {
-        Shadow::Said(Shadowed {
-            binding,
-            kind,
-            first,
-        })
-    };
-    // A column the shadow profile would not be handed, or a budget
-    // kept for the answer.
-    if engine.side_apart(binding, side) || left < SHADOW_FLOOR {
-        return said(ShadowKind::Skipped, None);
-    }
-    let asked = catch_unwind(AssertUnwindSafe(ask));
-    match asked {
-        Ok(Some(shadow)) => {
-            let first = shadow.pick().and_then(|pick| pick.targets.first());
-            let first = first.map(|target| target.id);
-            // A pair's first target names its prefill, with the decode
-            // beside it.
-            let own = live.targets.first().and_then(|target| match side {
-                PairSide::Prefill => Some(target.id),
-                PairSide::Decode => target.pair.map(|pair| pair.decode_id),
-            });
-            let kind = match first {
-                Some(_) if first == own => ShadowKind::Agreed,
-                Some(_) => ShadowKind::OtherTarget,
-                None => ShadowKind::OtherOutcome,
-            };
-            said(kind, first)
-        }
-        Ok(None) => Shadow::NotDue,
-        Err(payload) => {
-            // A payload's own drop can panic: the engine's helper
-            // frees it under a catch of its own.
-            release(payload);
-            Shadow::Faulted
-        }
-    }
 }
 
 /// Decides a request's pair and places its encode items over one world.
@@ -1266,7 +625,6 @@ pub(crate) fn encode_pair_in<A: RequestForm>(
             |facts, decision, built, scratch| {
                 pair_booking(world, facts, decision, built, scratch, later)
             },
-            no_shadow,
         ),
     );
     // A subset or wire cut can shed before the engine's entry clears what
@@ -1277,25 +635,10 @@ pub(crate) fn encode_pair_in<A: RequestForm>(
     answer
 }
 
-/// What a pair's plain order asks behind its booking ([`pair_with`]):
-/// nothing.
-fn no_shadow<R>(
-    _: &Engine,
-    _: &R,
-    _: &RequestFacts<'_>,
-    _: &PoolFacts<'_>,
-    _: &Constraints<'_>,
-    _: &Decision,
-    _: &mut Scratch,
-) {
-}
-
 /// Reads a built pair, decides over it, and takes what `book` files of the
 /// decision. The decision is shown the facts of the pool it places in
 /// first: the prefills', or under `DECODE` the decodes', where a decode
-/// call places in that pool alone. `behind` runs last, over the same
-/// rows: a pair's shadows ([`pair_shadowed_in`]), or nothing
-/// ([`no_shadow`]).
+/// call places in that pool alone.
 fn pair_with<const DECODE: bool, A: RequestForm, R, B>(
     world: &StoreSnapshot,
     taken: &DecisionCall<'_, A>,
@@ -1310,7 +653,7 @@ fn pair_with<const DECODE: bool, A: RequestForm, R, B>(
         Option<WireModes>,
         Option<u32>,
     ) -> Option<((ViewFacts, ViewFacts), (u64, bool))>,
-    (decide, book, behind): (
+    (decide, book): (
         impl FnOnce(
             &Engine,
             &R,
@@ -1320,15 +663,6 @@ fn pair_with<const DECODE: bool, A: RequestForm, R, B>(
             &mut Scratch,
         ) -> Decision,
         impl FnOnce(&RequestFacts<'_>, &Decision, Option<(ViewFacts, ViewFacts)>, &Scratch) -> Option<B>,
-        impl FnOnce(
-            &Engine,
-            &R,
-            &RequestFacts<'_>,
-            &PoolFacts<'_>,
-            &Constraints<'_>,
-            &Decision,
-            &mut Scratch,
-        ),
     ),
 ) -> (Decision, Option<B>) {
     let DecisionCall {
@@ -1425,10 +759,6 @@ fn pair_with<const DECODE: bool, A: RequestForm, R, B>(
         }
         let decision = decide(engine, rows, facts, &pool, constraints, scratch);
         let booking = book(facts, &decision, built, scratch);
-        // What the order asks behind the pair's booking, over the same
-        // rows: the booking is a value by now, and the step may write
-        // the scratch.
-        behind(engine, rows, facts, &pool, constraints, &decision, scratch);
         (decision, booking)
     })
 }
@@ -1636,38 +966,6 @@ pub(crate) fn decode_in<A: RequestForm>(
     buffers: &mut Buffers<A::Lists>,
     own: &Part,
 ) -> Result<(Decision, Option<DecodeBooking>), DecodeRefused> {
-    decode_with(world, store, taken, lease, buffers, own, |_| no_shadow)
-}
-
-/// [`decode_in`] with the step its order asks behind the side's booking
-/// ([`pair_with`]): `behind` makes it for the held prefill. The plain
-/// order's step is none ([`no_shadow`]), and a door's shadowed order
-/// asks the decode side's shadow there
-/// ([`StoreBackedEngine::decode_shadowed`]).
-///
-/// # Errors
-///
-/// [`DecodeRefused`]: as [`decode_in`] refuses.
-fn decode_with<A: RequestForm, B>(
-    world: &StoreSnapshot,
-    store: &MemoryStore,
-    taken: &DecisionCall<'_, A>,
-    lease: LeaseId,
-    buffers: &mut Buffers<A::Lists>,
-    own: &Part,
-    behind: impl FnOnce(WorkerId) -> B,
-) -> Result<(Decision, Option<DecodeBooking>), DecodeRefused>
-where
-    B: FnOnce(
-        &Engine,
-        &PairBuffers,
-        &RequestFacts<'_>,
-        &PoolFacts<'_>,
-        &Constraints<'_>,
-        &Decision,
-        &mut Scratch,
-    ),
-{
     let (prefill, first_decode) = store.held_pair(taken.gateway, lease)?;
     let Buffers {
         pair,
@@ -1712,7 +1010,6 @@ where
                 };
                 Some((side, world.booked(&decodes, side.target)))
             },
-            behind(prefill),
         ),
     ))
 }
@@ -1848,16 +1145,6 @@ pub(crate) trait Decides<R> {
     {
         self.over(facts, pool, &[], constraints, scratch)
     }
-
-    /// Whether the affinity column the decision's needs declare has a
-    /// reader over the rows this decider is handed. The needs join a
-    /// shadow profile's to the live one's
-    /// ([`Engine::reads_for`](crate::engine::framework::Engine::reads_for)). A
-    /// decider says no where the shadow alone declared the column and
-    /// reads none of the live decision's rows: [`hand`] then fills none.
-    fn reads_column(&self) -> bool {
-        true
-    }
 }
 
 impl<R, F> Decides<R> for F
@@ -1969,10 +1256,9 @@ pub(crate) fn hand<A: RequestForm, R>(
     // is named no row and keeps its column. The deciding profile answers
     // for itself: the needs are merged over a pair's two phases and a
     // sessions rule, so they say only where to ask, and no other decision
-    // pays the second walk. They join a shadow profile's too: a column
-    // that the shadow alone declared, and reads none of, is not filled
-    // ([`Decides::reads_column`]).
-    let column = needs.affinity && decide.reads_column();
+    // pays the second walk. They join a shadow profile's too
+    // ([`Engine::reads_for`](crate::engine::framework::Engine::reads_for)).
+    let column = needs.affinity;
     let cap = if column {
         engine.affinity_rows_cap(model, phase)
     } else {
@@ -2217,7 +1503,7 @@ fn emptied<R>(
 }
 
 /// The role whose pool decides a request of `phase`: the pool [`hand`]
-/// reads its rows of, and the one a shadow's own rows are named in.
+/// reads its rows of.
 const fn role_of(phase: Phase) -> Role {
     match phase {
         Phase::Single => Role::Single,
@@ -2995,21 +2281,6 @@ pub struct StoreBackedEngine {
     faults: AtomicU64,
     /// What the reports left beside a full ring, a list a file.
     kept: Box<[Kept]>,
-    /// The rows named again for a decision's shadow, a buffer a seat
-    /// ([`OwnNamed`]).
-    own_named: Box<[OwnNamed]>,
-}
-
-/// The buffer a seat's holder names a shadow's own rows on, where the
-/// shadow profile is named rows of its own ([`ShadowRows::Own`]). It
-/// stands beside its seat, on lines of its own, and not in it: a seat
-/// keeps its size, and no decision reaches the buffer but one whose
-/// shadow is named such rows. Its holder is the seat's, so its lock is
-/// never waited for. It grows at the seat's first such shadow.
-#[derive(Default)]
-#[repr(align(128))]
-struct OwnNamed {
-    named: Mutex<AffinityRowsBuffers>,
 }
 
 /// What the door keeps for one file while its ring is full
@@ -3045,23 +2316,17 @@ impl Drop for Handed<'_> {
 #[derive(Default)]
 #[repr(align(128))]
 struct SlotState {
-    /// The seat's state across decisions, including its sample count.
-    /// Only decisions take this lock.
+    /// The seat's state across decisions. Only decisions take this lock.
     slot: Mutex<SlotBuffers>,
-    /// The seat's recent decisions. A read or a decision that keeps a
-    /// record takes this lock.
-    samples: Mutex<Samples>,
 }
 
-/// What a decision slot's holder keeps under the decision lock, including the
-/// count toward its next sample.
+/// What a decision slot's holder keeps under the decision lock.
 #[derive(Default)]
 struct SlotBuffers {
     buffers: Buffers<()>,
     /// The holder's place at the seat's file, taken at the seat's first
     /// decision.
     at_file: Option<AtWork>,
-    sample_count: SampleCount,
 }
 
 thread_local! {
@@ -3069,13 +2334,6 @@ thread_local! {
     /// is the thread's number among the threads that have called one, so
     /// threads start at slots of their own.
     static LAST_SLOT: Cell<usize> = Cell::new(CALLERS.fetch_add(1, Ordering::Relaxed));
-}
-
-#[cfg(test)]
-thread_local! {
-    static ON_SAMPLE_READ: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
-    /// Called once between a live decision and its shadow.
-    static ON_SHADOW: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
 }
 
 /// The threads that have called a door so far.
@@ -3123,7 +2381,6 @@ impl StoreBackedEngine {
             seat_flags: AtomicU8::new(0),
             parts: (0..deciders).map(|_| Part::default()).collect(),
             kept: (0..deciders).map(|_| Kept::default()).collect(),
-            own_named: (0..deciders).map(|_| OwnNamed::default()).collect(),
             store,
             term,
             faults: AtomicU64::new(0),
@@ -3141,10 +2398,7 @@ impl StoreBackedEngine {
         &self.store
     }
 
-    /// How many decisions panicked, and how many shadows did beside a
-    /// decision that stood: a shadow's panic refuses no request, and its
-    /// live answer is issued. A decision made again behind a lease the
-    /// store refused counts each panic of its shadow.
+    /// How many decisions panicked.
     #[must_use]
     pub fn faults(&self) -> u64 {
         self.faults.load(Ordering::Relaxed)
@@ -3162,44 +2416,6 @@ impl StoreBackedEngine {
     #[must_use]
     pub fn hashes_cut(&self) -> u64 {
         summed(&self.parts, |part| &part.hashes_cut)
-    }
-
-    /// How many decisions made here had a shadow that said `kind`
-    /// beside them ([`ShadowKind`]), for the binding at position
-    /// `binding` of its generation. A shadow is counted behind its
-    /// decision's commit, and a decision the door refused counts none.
-    /// The count is a position's: a later generation's binding at the
-    /// same position counts on, and a binding past the sixteenth
-    /// counts with the sixteenth.
-    #[must_use]
-    pub fn shadowed(&self, binding: u32, kind: ShadowKind) -> u64 {
-        let parts = self.parts.iter();
-        let counts = parts.map(|part| part.shadowed_so_far(binding, Counted::Single, kind));
-        counts.sum()
-    }
-
-    /// [`Self::shadowed`] for one side of a pair's binding: how many
-    /// pairs decided here had a shadow of `side` that said `kind` beside
-    /// that side of them. A pair's binding counts by its sides, and
-    /// nothing under [`Self::shadowed`].
-    #[must_use]
-    pub fn shadowed_side(&self, binding: u32, side: PairSide, kind: ShadowKind) -> u64 {
-        let parts = self.parts.iter();
-        let counts = parts.map(|part| part.shadowed_so_far(binding, Counted::Side(side), kind));
-        counts.sum()
-    }
-
-    /// [`Self::shadowed_side`] for a decode decided after its prefill
-    /// ([`Self::decide_decode`]): how many such calls had a shadow of
-    /// the decode side that said `kind` beside the decode the call
-    /// picked. The count is its own. The pair's first decision counts
-    /// its decode side under [`Self::shadowed_side`], beside the decode
-    /// it named first.
-    #[must_use]
-    pub fn shadowed_later(&self, binding: u32, kind: ShadowKind) -> u64 {
-        let parts = self.parts.iter();
-        let counts = parts.map(|part| part.shadowed_so_far(binding, Counted::Later, kind));
-        counts.sum()
     }
 
     /// One decision for `gateway`'s `request` at `now`, on the calling
@@ -3353,36 +2569,6 @@ impl StoreBackedEngine {
         self.at_a_seat(term, gateway, &called, now, DecodeCall(self, lease))
     }
 
-    /// Finds a sampled decision by gateway and request id. A read holds
-    /// only the ring lock at each seat, for one scan of up to 1,024 records.
-    #[must_use]
-    pub fn explain(&self, gateway: GatewayId, request_id: &[u8]) -> Option<DecisionRecord> {
-        let key = fingerprint(request_id);
-        self.seats
-            .iter()
-            .filter_map(|seat| {
-                let samples = seat.samples.lock();
-                #[cfg(test)]
-                if let Some(reading) = ON_SAMPLE_READ.take() {
-                    reading();
-                }
-                samples.find(0, gateway, key)
-            })
-            .max_by_key(|record| record.at)
-    }
-
-    /// [`StoreBackedEngine::explain`] with names from one read of the store's
-    /// world. The record is copied and each ring lock released before that
-    /// read.
-    #[must_use]
-    pub fn explained(&self, gateway: GatewayId, request_id: &[u8]) -> Option<DecisionExplanation> {
-        let record = self.explain(gateway, request_id)?;
-        let names = self
-            .store
-            .deciding(|world| record.names(world.spec().engine()));
-        Some(DecisionExplanation { record, names })
-    }
-
     /// What `gateway` says of `lease`: a dispatch, a completion or a
     /// release, on whichever thread the host says it. The thread is never
     /// held for a decision: it stands at most behind one hold of the
@@ -3478,8 +2664,7 @@ impl StoreBackedEngine {
 
     /// Takes the seat the last generation called for and checks it
     /// against the world loaded there. If an apply changed which seat
-    /// the request belongs at, it takes that seat and loads again. The
-    /// same world governs the decision, its shadow and its sampling. A call
+    /// the request belongs at, it takes that seat and loads again. A call
     /// that names its lease's seat and decides at its model's applies what
     /// waits at the lease's file first ([`StoreBackedEngine::stand_at`]).
     fn at_a_seat(
@@ -3511,11 +2696,7 @@ impl StoreBackedEngine {
             // The store lays at most one file for each byte-sized name.
             debug_assert!(at < DecisionSlot::COUNT);
             let _acting = DecisionSlot::new(at as u8).enter();
-            let SlotBuffers {
-                buffers,
-                at_file,
-                sample_count,
-            } = &mut *slot;
+            let SlotBuffers { buffers, at_file } = &mut *slot;
             let at_file = at_file.get_or_insert_with(|| self.store.at_work());
             // The thread works at the seat's file for this decision: what
             // was handed is applied as it takes up the work.
@@ -3538,7 +2719,7 @@ impl StoreBackedEngine {
             }
             let pins = StorePins { store, now };
             // The request is taken up under this load: one its host makes
-            // is made here, of the world its decision and its sample read.
+            // is made here, of the world its decision reads.
             let taken_up = |request: &Request<'_>| {
                 let taken = DecisionCall {
                     request,
@@ -3557,45 +2738,6 @@ impl StoreBackedEngine {
                     // decider's at work is.
                     place: None,
                 };
-                // One test for a generation that neither shadows nor
-                // samples: its order is the plain one, which stands last.
-                if flags & (SAMPLES_DECISIONS | SHADOWS) != 0 {
-                    // The request's shadow is asked for first, by one
-                    // lookup of the binding its order decides under. A
-                    // request whose binding names none is ordered as a
-                    // generation that shadows nowhere orders it.
-                    let due = match flags & SHADOWS {
-                        0 => None,
-                        _ => {
-                            let under = order.binding(engine, &request.facts);
-                            under.and_then(|under| engine.shadow_at(under))
-                        }
-                    };
-                    // Each order's answer is built in its own place:
-                    // two that met in one would cost a copy of it.
-                    let Some((binding, rows)) = due else {
-                        let decided = order.plain(&world, at, term, &taken, buffers);
-                        if flags & SAMPLES_DECISIONS != 0 {
-                            // A kept record names that binding: it is
-                            // looked up for a kept decision alone.
-                            let said = || (order.binding(engine, &request.facts), None, [None; 2]);
-                            self.sampled(at, engine, &taken, &decided, said, sample_count);
-                        }
-                        return decided;
-                    };
-                    let mut due = Due {
-                        binding,
-                        rows,
-                        said: None,
-                        sides: [None; 2],
-                    };
-                    let decided = order.shadowed(&world, at, term, &taken, buffers, &mut due);
-                    if flags & SAMPLES_DECISIONS != 0 {
-                        let said = || (Some(binding), due.said, due.sides);
-                        self.sampled(at, engine, &taken, &decided, said, sample_count);
-                    }
-                    return decided;
-                }
                 order.plain(&world, at, term, &taken, buffers)
             };
             let decided = catch_unwind(AssertUnwindSafe(|| request.under(&world, taken_up)));
@@ -3637,29 +2779,6 @@ impl StoreBackedEngine {
         let at_file = slot.at_file.get_or_insert_with(|| self.store.at_work());
         at_file.work();
         self.leave(at, at_file);
-    }
-
-    /// Keeps a made decision in the seat's samples where its turn to be
-    /// sampled came, with the binding its order decided under and what
-    /// its shadow said (`said`, asked for a kept decision alone).
-    // Forced into each order's tail: the sampling stands in line there,
-    // as it did where one order ran.
-    #[inline(always)]
-    fn sampled(
-        &self,
-        at: usize,
-        engine: &Engine,
-        taken: &DecisionCall<'_, Request<'_>>,
-        decided: &Result<DecideOutcome, DecisionRefused>,
-        said: impl FnOnce() -> (Option<u32>, Option<Shadowed>, [Option<Shadowed>; 2]),
-        count: &mut SampleCount,
-    ) {
-        let Ok(answer) = decided else { return };
-        if count.keeps(0, engine, &answer.decision) {
-            let (binding, said, sides) = said();
-            let mut samples = self.seats[at].samples.lock();
-            samples.push(0, binding, taken, &answer.decision, said, sides);
-        }
     }
 
     /// Takes the seat of `model`'s decider and waits for it: a model's
@@ -3783,8 +2902,7 @@ impl StoreBackedEngine {
         match entry {
             Entry::Single => {
                 let (decision, booking) = decide_in(world, taken, buffers, &self.parts[at]);
-                let lease =
-                    self.file::<PLAIN>(world, term, taken, &buffers.named, &decision, booking)?;
+                let lease = self.file(world, term, taken, &buffers.named, &decision, booking)?;
                 Ok(DecideOutcome {
                     decision,
                     lease,
@@ -3796,20 +2914,12 @@ impl StoreBackedEngine {
         }
     }
 
-    /// What stands behind a single's decision, in each of its orders
-    /// ([`Self::order`], [`Self::order_shadowed`], [`Self::order_own`]):
-    /// a pick's lease is issued, the engine that decided is told of it,
-    /// and the record of sent prefixes takes the prefix of `named`
-    /// ([`issue`]). `named` is the live decision's naming, or the
-    /// naming of a shadow its pool keeps the record for
-    /// ([`Self::shadowed_order`]). A step that joins a single's commit
-    /// is written here, once, and stands in every order.
-    ///
-    /// Each order builds a copy of its own (`ORDER`), with a telling of
-    /// its own: the store builds its issue for each telling, so no
-    /// order's issue moves where another's is built.
+    /// What stands behind a single's decision ([`Self::order`]): a pick's
+    /// lease is issued, the engine that decided is told of it, and the
+    /// record of sent prefixes takes the prefix of `named`, the decision's
+    /// naming ([`issue`]).
     #[inline(always)]
-    fn file<const ORDER: u8>(
+    fn file(
         &self,
         world: &StoreSnapshot,
         term: u64,
@@ -3830,162 +2940,6 @@ impl StoreBackedEngine {
             lease,
             due: taken.due(),
         }))
-    }
-
-    /// [`Self::order`] for a request whose binding names a shadow
-    /// (`due`, [`Engine::shadow_for`]). A pair's binding that names one
-    /// for a side takes an order of its own ([`Self::order_sides`]). A
-    /// single's decision is made
-    /// at the engine's keeping entries, and the shadow is asked over the
-    /// same view ahead of the commit ([`decide_shadowed_in`]). The commit
-    /// is the plain order's ([`Self::file`]). What the shadow said comes
-    /// back counted, behind a commit that held: a decision whose lease
-    /// the store refused counts none. A shadow that panicked is counted
-    /// with the door's faults and the scratch it left is dropped, both
-    /// behind the commit: the live decision is issued as decided. The
-    /// budget is the one its host stated at the decision's instant: in
-    /// process the door reads no clock.
-    ///
-    /// A shadow that reads none of its live decision's rows takes an
-    /// order of its own ([`Self::order_own`]): this one pays one test
-    /// for it and runs no part of a naming.
-    fn order_shadowed(
-        &self,
-        world: &StoreSnapshot,
-        at: usize,
-        term: u64,
-        taken: &DecisionCall<'_, Request<'_>>,
-        buffers: &mut Buffers<()>,
-        due: &mut Due,
-    ) -> Result<DecideOutcome, DecisionRefused> {
-        if matches!(
-            due.rows,
-            ShadowRows::Own | ShadowRows::Apart | ShadowRows::Sides
-        ) {
-            return self.order_own(world, at, term, taken, buffers, due);
-        }
-        self.shadowed_order::<SHADOWED>(world, at, term, taken, buffers, due)
-    }
-
-    /// [`Self::order_shadowed`] for a shadow that reads none of its live
-    /// decision's rows: one that is named rows of its own, or one that
-    /// is skipped ([`decide_own_in`]). Out of line, with a copy of the
-    /// commit of its own: no other order runs a part of it.
-    #[inline(never)]
-    fn order_own(
-        &self,
-        world: &StoreSnapshot,
-        at: usize,
-        term: u64,
-        taken: &DecisionCall<'_, Request<'_>>,
-        buffers: &mut Buffers<()>,
-        due: &mut Due,
-    ) -> Result<DecideOutcome, DecisionRefused> {
-        if due.rows == ShadowRows::Sides {
-            return self.order_sides(world, at, term, taken, buffers, due);
-        }
-        self.shadowed_order::<OWN_ROWS>(world, at, term, taken, buffers, due)
-    }
-
-    /// [`Self::order_shadowed`] for a request whose binding is a pair's
-    /// and names a shadow for a side ([`ShadowRows::Sides`]). The request
-    /// that enters the pair at its prefill is decided with its sides'
-    /// shadows ([`pair_shadowed_in`]) and committed as any pair
-    /// ([`Self::file_pair`]). What each side's shadow said is counted by
-    /// its side, behind a commit that held. A shadow that panicked is
-    /// counted with the door's faults and the scratch it left is
-    /// dropped, both behind the commit: the live pair is issued as
-    /// decided. Any other request under the binding takes its plain
-    /// order here. A decode decided after its prefill asks its shadow at
-    /// its own call ([`Self::decode_shadowed`]).
-    fn order_sides(
-        &self,
-        world: &StoreSnapshot,
-        at: usize,
-        term: u64,
-        taken: &DecisionCall<'_, Request<'_>>,
-        buffers: &mut Buffers<()>,
-        due: &mut Due,
-    ) -> Result<DecideOutcome, DecisionRefused> {
-        let entry = entry(world, taken);
-        if !matches!(entry, Entry::Pair) {
-            return self.order(world, at, term, taken, buffers, entry);
-        }
-        let own = &self.parts[at];
-        let ((decision, booking), sides) =
-            pair_shadowed_in(world, taken, buffers, own, due.binding);
-        let decided = self.file_pair(world, term, taken, decision, booking);
-        if sides.contains(&Shadow::Faulted) {
-            // The next decision reads nothing a shadow left.
-            buffers.scratch = Scratch::default();
-            self.faults.fetch_add(1, Ordering::Relaxed);
-        }
-        let decided = decided?;
-        for (side, shadow) in PairSide::BOTH.into_iter().zip(sides) {
-            if let Shadow::Said(said) = shadow {
-                let count = own.shadowed(said.binding, Counted::Side(side), said.kind);
-                count.fetch_add(1, Ordering::Relaxed);
-                due.sides[side.index()] = Some(said);
-            }
-        }
-        Ok(decided)
-    }
-
-    /// The body of the two shadowed orders, built once for each
-    /// ([`Self::order_shadowed`], [`Self::order_own`]): the decision
-    /// with its shadow, the commit ([`Self::file`]), then what the
-    /// shadow said or its fault.
-    ///
-    /// The record of sent prefixes takes the live decision's naming.
-    /// Where the live profile is named no row, its pool keeps the
-    /// record for a shadow that is named rows of its own
-    /// ([`Engine::pool_record_for`]). The issue then writes the prefixes
-    /// that shadow's naming folded, on the live decision's worker: the
-    /// shadow reads where the requests went. A shadow that was not
-    /// asked named nothing, and its decision writes no record.
-    #[inline(always)]
-    fn shadowed_order<const ORDER: u8>(
-        &self,
-        world: &StoreSnapshot,
-        at: usize,
-        term: u64,
-        taken: &DecisionCall<'_, Request<'_>>,
-        buffers: &mut Buffers<()>,
-        due: &mut Due,
-    ) -> Result<DecideOutcome, DecisionRefused> {
-        let own = &self.parts[at];
-        let word = (due.binding, due.rows);
-        // The order of a shadow's own rows holds its seat's buffer for
-        // them through the commit: the issue may write from it.
-        let mut lent = match ORDER {
-            OWN_ROWS => Some(self.own_named[at].named.lock()),
-            _ => None,
-        };
-        let ((decision, booking), shadow) = match lent.as_deref_mut() {
-            Some(named) => decide_own_in(world, taken, buffers, own, word, named, || taken.left),
-            None => decide_shadowed_in(world, taken, buffers, own, word, || taken.left),
-        };
-        let named = match lent.as_deref() {
-            Some(own_named) if buffers.named.sent_pool().is_none() => own_named,
-            _ => &buffers.named,
-        };
-        let filed = self.file::<ORDER>(world, term, taken, named, &decision, booking);
-        if shadow == Shadow::Faulted {
-            // The next decision reads nothing the shadow left.
-            buffers.scratch = Scratch::default();
-            self.faults.fetch_add(1, Ordering::Relaxed);
-        }
-        let lease = filed?;
-        if let Shadow::Said(shadow) = shadow {
-            let count = own.shadowed(shadow.binding, Counted::Single, shadow.kind);
-            count.fetch_add(1, Ordering::Relaxed);
-            due.said = Some(shadow);
-        }
-        Ok(DecideOutcome {
-            decision,
-            lease,
-            decode_session: Session::NONE,
-        })
     }
 
     /// A pair's order: decided for both sides and, for a pick, issued a
@@ -4046,70 +3000,8 @@ impl StoreBackedEngine {
         self.file_decode(world, taken, lease, decided)
     }
 
-    /// [`Self::decode`] for a call whose pair binding names a shadow for
-    /// a side. The decode side is decided once more by its shadow
-    /// profile, behind the side's booking and ahead of its issue, over
-    /// the rows the call decided over
-    /// ([`Engine::shadow_decode_later`]). It is compared with the decode
-    /// this call picked and counted on its own
-    /// ([`StoreBackedEngine::shadowed_later`]), behind an issue that held. A
-    /// shadow that panicked is counted with the door's faults and the scratch
-    /// it left is dropped: the call answers as decided. Out of line: the plain
-    /// call runs no part of it.
-    #[inline(never)]
-    fn decode_shadowed(
-        &self,
-        world: &StoreSnapshot,
-        at: usize,
-        taken: &DecisionCall<'_, Request<'_>>,
-        buffers: &mut Buffers<()>,
-        lease: LeaseId,
-        due: &mut Due,
-    ) -> Result<DecideOutcome, DecisionRefused> {
-        let (binding, left) = (due.binding, taken.left);
-        let mut said = Shadow::NotDue;
-        let (store, own) = (&*self.store, &self.parts[at]);
-        let decided = decode_with(world, store, taken, lease, buffers, own, |prefill| {
-            let said = &mut said;
-            move |engine: &Engine,
-                  pair: &PairBuffers,
-                  facts: &RequestFacts<'_>,
-                  pool: &PoolFacts<'_>,
-                  cx: &Constraints<'_>,
-                  decision: &Decision,
-                  scratch: &mut Scratch| {
-                let Some(live) = decision.pick() else {
-                    return;
-                };
-                // The call's facts, as its live decode read them.
-                let facts = RequestFacts {
-                    phase: Phase::Decode,
-                    ..*facts
-                };
-                let pools = pair.pools();
-                *said = side_shadow(engine, (binding, PairSide::Decode), live, left, || {
-                    engine.shadow_decode_later(binding, &facts, pool, pools, prefill, cx, scratch)
-                });
-            }
-        });
-        let decided = self.file_decode(world, taken, lease, decided);
-        if said == Shadow::Faulted {
-            // The next decision reads nothing the shadow left.
-            buffers.scratch = Scratch::default();
-            self.faults.fetch_add(1, Ordering::Relaxed);
-        }
-        let decided = decided?;
-        if let Shadow::Said(said) = said {
-            let count = own.shadowed(said.binding, Counted::Later, said.kind);
-            count.fetch_add(1, Ordering::Relaxed);
-            due.sides[PairSide::Decode.index()] = Some(said);
-        }
-        Ok(decided)
-    }
-
-    /// Files what a decode call decided, for its two orders
-    /// ([`Self::decode`], [`Self::decode_shadowed`]): for a pick, the
-    /// side's issue under the lease's id ([`issue_decode`]).
+    /// Files what a decode call decided ([`Self::decode`]): for a pick,
+    /// the side's issue under the lease's id ([`issue_decode`]).
     #[inline(always)]
     fn file_decode(
         &self,
@@ -4228,58 +3120,19 @@ impl DecisionEngine for StoreBackedEngine {
         self.store().prompt_hashes(model, tokens, text, seeds)
     }
 
-    fn pair_refusal(&self, model: &str, wires: WireModes) -> Option<Refusal> {
-        self.store()
-            .with_snapshot(|world| world.pairs(model)?.refusal(wires).cloned())
-    }
-
     fn faults(&self) -> u64 {
         Self::faults(self)
     }
 
-    fn shadowed(&self, binding: u32, kind: ShadowKind) -> u64 {
-        Self::shadowed(self, binding, kind)
+    // This engine asks no shadow: none is counted.
+    fn shadowed(&self, _: u32, _: ShadowKind) -> u64 {
+        0
     }
 }
 
-/// The plain order's copy of a single's commit ([`StoreBackedEngine::file`]).
-const PLAIN: u8 = 0;
-/// The copy of the order whose shadow reads its live decision's rows.
-const SHADOWED: u8 = 1;
-/// The copy of the order whose shadow reads none of them.
-const OWN_ROWS: u8 = 2;
-
-/// A decision's shadow at its seat: what the seat read of the request's
-/// binding ahead of the order ([`Engine::shadow_at`]), and what the
-/// order leaves of the shadow.
-struct Due {
-    /// The binding's position in its generation.
-    binding: u32,
-    /// How its shadow reads the rows of the live decision.
-    rows: ShadowRows,
-    /// What the shadow said, behind a commit that held.
-    said: Option<Shadowed>,
-    /// What each side's shadow of a pair said, the prefill's then the
-    /// decode's, behind a commit that held.
-    sides: [Option<Shadowed>; 2],
-}
-
-/// The order of one decision at its seat, in the two forms a seat runs
-/// it in. A generation that neither shadows nor samples runs the plain
-/// form and no part of the other. Under one that shadows, a request
-/// whose binding names no shadow runs the plain form too.
+/// The order of one decision at its seat. A binding's shadow is asked by
+/// no order: a request whose binding names one is decided as any other.
 trait Orders {
-    /// The position of the binding the order's live decision runs
-    /// under: the one the request's own phase resolves to
-    /// ([`Engine::binding_position`]). An order whose live decision runs
-    /// under another binding answers that one. The seat reads the
-    /// request's shadow word ([`Engine::shadow_at`]) and names its
-    /// sampled record by this one answer.
-    #[inline(always)]
-    fn binding(&self, engine: &Engine, facts: &RequestFacts<'_>) -> Option<u32> {
-        engine.binding_position(facts.model, facts.phase)
-    }
-
     /// Decides the request and, for a pick, issues its lease.
     fn plain(
         &mut self,
@@ -4289,31 +3142,12 @@ trait Orders {
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
     ) -> Result<DecideOutcome, DecisionRefused>;
-
-    /// [`Self::plain`] for a request whose binding names a shadow
-    /// ([`StoreBackedEngine::order_shadowed`]). What the shadow said is left in
-    /// `due`: the answer is built where it is returned, and is not
-    /// carried beside a second value.
-    fn shadowed(
-        &mut self,
-        world: &StoreSnapshot,
-        at: usize,
-        term: u64,
-        taken: &DecisionCall<'_, Request<'_>>,
-        buffers: &mut Buffers<()>,
-        due: &mut Due,
-    ) -> Result<DecideOutcome, DecisionRefused>;
 }
 
 /// An order lent to a run. A decision whose lease the store refused runs
 /// its order twice: the first run borrows it and the second takes it, so
 /// each run is an instance of its own, as each closure's was.
 impl<O: Orders> Orders for &mut O {
-    #[inline(always)]
-    fn binding(&self, engine: &Engine, facts: &RequestFacts<'_>) -> Option<u32> {
-        (**self).binding(engine, facts)
-    }
-
     #[inline(always)]
     fn plain(
         &mut self,
@@ -4324,19 +3158,6 @@ impl<O: Orders> Orders for &mut O {
         buffers: &mut Buffers<()>,
     ) -> Result<DecideOutcome, DecisionRefused> {
         (**self).plain(world, at, term, taken, buffers)
-    }
-
-    #[inline(always)]
-    fn shadowed(
-        &mut self,
-        world: &StoreSnapshot,
-        at: usize,
-        term: u64,
-        taken: &DecisionCall<'_, Request<'_>>,
-        buffers: &mut Buffers<()>,
-        due: &mut Due,
-    ) -> Result<DecideOutcome, DecisionRefused> {
-        (**self).shadowed(world, at, term, taken, buffers, due)
     }
 }
 
@@ -4359,18 +3180,6 @@ impl Orders for Whole<'_> {
     ) -> Result<DecideOutcome, DecisionRefused> {
         let entry = entry(world, taken);
         self.0.order(world, at, term, taken, buffers, entry)
-    }
-
-    fn shadowed(
-        &mut self,
-        world: &StoreSnapshot,
-        at: usize,
-        term: u64,
-        taken: &DecisionCall<'_, Request<'_>>,
-        buffers: &mut Buffers<()>,
-        due: &mut Due,
-    ) -> Result<DecideOutcome, DecisionRefused> {
-        self.0.order_shadowed(world, at, term, taken, buffers, due)
     }
 }
 
@@ -4395,35 +3204,13 @@ impl Orders for WholeStated<'_, '_> {
         *self.later = taken.request.decode_later();
         Whole(self.door).plain(world, at, term, taken, buffers)
     }
-
-    fn shadowed(
-        &mut self,
-        world: &StoreSnapshot,
-        at: usize,
-        term: u64,
-        taken: &DecisionCall<'_, Request<'_>>,
-        buffers: &mut Buffers<()>,
-        due: &mut Due,
-    ) -> Result<DecideOutcome, DecisionRefused> {
-        *self.later = taken.request.decode_later();
-        Whole(self.door).shadowed(world, at, term, taken, buffers, due)
-    }
 }
 
 /// The order of [`StoreBackedEngine::decide_decode`]: the decode side of the
-/// pair's lease on file ([`StoreBackedEngine::decode`]). Where the pair's
-/// binding names a shadow for a side, the decode side's is asked beside the
-/// call ([`StoreBackedEngine::decode_shadowed`]). The call decides under the
-/// pair binding its model's prefill lookup resolves to, whatever phase it
-/// states ([`Engine::pair_position`]): its shadow word and its sampled record
-/// are that binding's.
+/// pair's lease on file ([`StoreBackedEngine::decode`]).
 struct DecodeCall<'d>(&'d StoreBackedEngine, LeaseId);
 
 impl Orders for DecodeCall<'_> {
-    fn binding(&self, engine: &Engine, facts: &RequestFacts<'_>) -> Option<u32> {
-        engine.pair_position(facts.model)
-    }
-
     #[inline(always)]
     fn plain(
         &mut self,
@@ -4434,21 +3221,6 @@ impl Orders for DecodeCall<'_> {
         buffers: &mut Buffers<()>,
     ) -> Result<DecideOutcome, DecisionRefused> {
         self.0.decode(world, at, taken, buffers, self.1)
-    }
-
-    fn shadowed(
-        &mut self,
-        world: &StoreSnapshot,
-        at: usize,
-        _: u64,
-        taken: &DecisionCall<'_, Request<'_>>,
-        buffers: &mut Buffers<()>,
-        due: &mut Due,
-    ) -> Result<DecideOutcome, DecisionRefused> {
-        // The word is a pair binding's that names a shadow for a side
-        // ([`Self::binding`]).
-        self.0
-            .decode_shadowed(world, at, taken, buffers, self.1, due)
     }
 }
 
@@ -4500,31 +3272,6 @@ impl Orders for WithEncode<'_, '_, '_> {
             Err(entry) => self.door.order(world, at, term, taken, buffers, entry),
         }
     }
-
-    fn shadowed(
-        &mut self,
-        world: &StoreSnapshot,
-        at: usize,
-        term: u64,
-        taken: &DecisionCall<'_, Request<'_>>,
-        buffers: &mut Buffers<()>,
-        due: &mut Due,
-    ) -> Result<DecideOutcome, DecisionRefused> {
-        // An `epd` pair is decided with its encode items and asks no
-        // shadow of its sides. Any other request is ordered as
-        // [`StoreBackedEngine::decide`] orders it, with `placed` cleared: a
-        // pair of another plan asks its sides' shadows, and a binding of one
-        // profile enters no pair.
-        if due.rows == ShadowRows::Sides {
-            if let Ok(decided) = self.pair(world, at, term, taken, buffers) {
-                return decided;
-            }
-        } else {
-            self.placed.clear();
-        }
-        self.door
-            .order_shadowed(world, at, term, taken, buffers, due)
-    }
 }
 
 #[cfg(test)]
@@ -4547,34 +3294,35 @@ pub(crate) mod tests {
 
     use super::{
         decider_of, pinned, DecisionRefused, Request, RequestMaker, StoreBackedEngine,
-        SweepOutcome, DISPATCH_TTL, LAST_SLOT, ON_SAMPLE_READ, TERM_MARK,
+        SweepOutcome, DISPATCH_TTL, LAST_SLOT, TERM_MARK,
     };
     use crate::{
         document::spec::{AppliedSpec, Needs, PolicySpec},
         engine::{
             decision::{Decision, LiftedVeto, ShedReason, Target, Targets},
+            decision_engine::DecodeRefused,
             decision_slot::DecisionSlot,
             demands::{DemandFacts, Demands},
             framework::{self, DecisionScope, EncodeItems, EncodePlaced, Filter, Picker, TieBand},
-            sticky_sessions::SessionVerdict,
+            sticky_sessions::{SessionExpiry, SessionVerdict},
             view::{
                 Candidate, Constraints, Identity, KeyedRow, LoadRow, Phase, PoolFacts,
                 RequestFacts, Role, Session, WireModes, WorkerId,
             },
-            DecisionRecord, References, UnmetDemand,
+            References, UnmetDemand,
         },
         policies::random::Random,
         stages::{lifecycle::Lifecycle, pickers::Best, registry::StageRegistry},
         store::{
-            DecodeMark, DecodeRefused, Dispatch, EncodeHandoff, EncodeOffer, GatewayId, HealthSink,
-            HealthWrite, LeaderBits, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource,
-            MemoryStore, PickRecord, Said, SessionsStore, VetoWrite, ViewBuffers, ViewQuery,
-            WorkerFacts, WorkerStatus, WorkersStore,
+            DecodeMark, EncodeHandoff, EncodeOffer, GatewayId, HealthSink, HealthWrite, LeaderBits,
+            LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore, PickRecord,
+            SessionsStore, VetoWrite, ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus,
+            WorkersStore,
         },
-        tracking::lease::{Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+        tracking::lease::{
+            Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass,
+        },
     };
-
-    mod shadow;
 
     pub(crate) const MODEL: &str = "model-a";
     pub(crate) const GATEWAY: GatewayId = GatewayId(11);
@@ -4927,262 +3675,6 @@ pub(crate) mod tests {
         Said::Released(None, ReleaseReason::ClientGone)
     }
 
-    fn sampling(store: &MemoryStore, generation: u64, sample: u32) {
-        let mut document = PolicySpec::preset("random").expect("a preset");
-        document.generation = generation;
-        document.explain.sample = sample;
-        store
-            .apply(AppliedSpec::validate(&document).expect("a valid document"))
-            .expect("a later generation");
-    }
-
-    /// Holds a read at the first seat until the returned sender drops.
-    fn hold_read<'scope>(
-        scope: &'scope thread::Scope<'scope, '_>,
-        door: &'scope StoreBackedEngine,
-    ) -> Result<mpsc::Sender<()>, mpsc::RecvTimeoutError> {
-        let (held, entered) = mpsc::channel();
-        let (release, resume) = mpsc::channel();
-        scope.spawn(move || {
-            ON_SAMPLE_READ.set(Some(Box::new(move || {
-                let _ = held.send(());
-                let _ = resume.recv();
-            })));
-            let _ = door.explain(GATEWAY, b"read");
-        });
-        entered.recv_timeout(PATIENCE)?;
-        Ok(release)
-    }
-
-    #[test]
-    fn a_decision_that_keeps_no_record_waits_on_no_read() {
-        for sample in [0, 2] {
-            let store = fleet(2);
-            sampling(&store, 2, sample);
-            let door = &StoreBackedEngine::new(store);
-            thread::scope(|scope| {
-                let _read = hold_read(scope, door).expect("the read holds the first ring");
-                let (answer, answered) = mpsc::channel();
-                scope.spawn(move || {
-                    seated(0);
-                    let (lease, _) = leased(door, b"caller", 7);
-                    let _ = answer.send((door.store().file_of(lease), LAST_SLOT.get()));
-                });
-                assert_eq!(
-                    answered.recv_timeout(PATIENCE),
-                    Ok((0, 0)),
-                    "sample {sample}"
-                );
-            });
-            assert!(door.explain(GATEWAY, b"caller").is_none());
-        }
-    }
-
-    #[test]
-    fn a_read_of_a_ring_holds_no_decision_of_its_model() {
-        let store = fleet(1);
-        picking(&store, 2, "scoped", || Box::new(Scoped));
-        let door = &StoreBackedEngine::new(store);
-        let _ = leased(door, b"warm", 7);
-        thread::scope(|scope| {
-            let _read = hold_read(scope, door).expect("the read holds the model's ring");
-            let (answer, answered) = mpsc::channel();
-            scope.spawn(move || {
-                let (lease, _) = leased(door, b"home", 7);
-                let _ = answer.send(door.store().file_of(lease));
-            });
-            assert_eq!(answered.recv_timeout(PATIENCE), Ok(0));
-        });
-    }
-
-    #[test]
-    fn a_kept_record_waits_for_a_read_and_is_found() {
-        let store = fleet(1);
-        sampling(&store, 2, 1);
-        let door = &StoreBackedEngine::new(store);
-        let id = b"kept";
-        let decision = thread::scope(|scope| {
-            let read = hold_read(scope, door).expect("the read holds the ring");
-            let (answer, answered) = mpsc::channel();
-            scope.spawn(move || {
-                let decided = door
-                    .decide(GATEWAY, &request(id, 7), Instant::now())
-                    .expect("a decision");
-                let _ = answer.send(decided.decision);
-            });
-            let due = Instant::now() + PATIENCE;
-            while LeasesStore::live(&**door.store(), GATEWAY) == 0 {
-                assert!(Instant::now() < due, "the decision files its lease");
-                thread::yield_now();
-            }
-            assert_eq!(
-                answered.recv_timeout(Duration::from_millis(100)),
-                Err(mpsc::RecvTimeoutError::Timeout),
-                "a decision that keeps a record waits for the read"
-            );
-            assert!(door.seats[0].slot.is_locked());
-            drop(read);
-            answered
-                .recv_timeout(PATIENCE)
-                .expect("the decision returns after the read")
-        });
-        let record = door.explain(GATEWAY, id).expect("the kept record");
-        assert_eq!(record.decision, decision);
-    }
-
-    #[test]
-    fn sampling_off_allocates_no_slots_and_explains_nothing() {
-        let door = StoreBackedEngine::new(fleet(1));
-        let _ = leased(&door, b"off", 1);
-        assert!(door.explain(GATEWAY, b"off").is_none());
-        assert_eq!(door.seats[0].samples.lock().slots(), 0);
-        assert_eq!(door.seats[0].slot.lock().sample_count.counted(), 0);
-    }
-
-    #[test]
-    fn sample_one_keeps_the_answer_and_instant_of_each_pick_and_shed() {
-        let store = fleet(1);
-        sampling(&store, 2, 1);
-        let door = StoreBackedEngine::new(store);
-        let now = Instant::now();
-        for (id, model) in [(b"pick", MODEL), (b"shed", "empty")] {
-            let mut ask = request(id, 7);
-            ask.facts.model = model;
-            let answer = door.decide(GATEWAY, &ask, now).expect("a decision");
-            assert_eq!(answer.decision.pick().is_some(), model == MODEL);
-            let record = door.explain(GATEWAY, id).expect("the sampled decision");
-            assert_eq!(record.decision, answer.decision);
-            assert_eq!(record.binding, Some(0));
-            assert_eq!(record.at, now);
-            assert!(door.explain(GatewayId::LOCAL, id).is_none());
-        }
-    }
-
-    #[test]
-    fn the_door_explains_a_sampled_decision_with_its_names() {
-        use crate::engine::{DecisionExplanation, DecisionNames};
-
-        let store = fleet(1);
-        sampling(&store, 2, 1);
-        let door = StoreBackedEngine::new(Arc::clone(&store));
-        let id = b"named";
-        assert!(door.explained(GATEWAY, id).is_none());
-
-        let now = Instant::now();
-        let answer = door
-            .decide(GATEWAY, &request(id, 7), now)
-            .expect("a decision");
-        let record = door.explain(GATEWAY, id).expect("a sample");
-        assert_eq!(record.decision, answer.decision);
-        assert_eq!(record.at, now);
-        assert!(door.explained(GatewayId::LOCAL, id).is_none());
-        assert_eq!(
-            door.explained(GATEWAY, id),
-            Some(DecisionExplanation {
-                record,
-                names: Some(DecisionNames {
-                    plan: "single",
-                    profile: "random".into(),
-                    picker: "random".into(),
-                    filters: vec![
-                        "healthy".into(),
-                        "not-overloaded".into(),
-                        "not-tried".into()
-                    ],
-                    scorers: vec![],
-                }),
-            })
-        );
-
-        sampling(&store, 3, 0);
-        assert_eq!(
-            door.explained(GATEWAY, id),
-            Some(DecisionExplanation {
-                record,
-                names: None
-            })
-        );
-    }
-
-    #[test]
-    fn the_door_sheds_before_the_first_profile_and_names_the_plan_alone() {
-        let store = fleet(1);
-        sampling(&store, 2, 1);
-        let door = StoreBackedEngine::new(store);
-
-        let id = b"narrowed";
-        let mut ask = request(id, 7);
-        ask.constraints.subset_hint = Some(0);
-        let answer = door.decide(GATEWAY, &ask, Instant::now()).expect("a shed");
-        let Decision::Shed(shed) = answer.decision else {
-            panic!("the subset left no candidate");
-        };
-        assert_eq!(shed.emptied_by, super::SUBSET_HINT);
-        let explained = door.explained(GATEWAY, id).expect("the sampled shed");
-        assert_eq!(explained.record.binding, Some(0));
-        assert_eq!(
-            explained.names,
-            Some(crate::engine::DecisionNames {
-                plan: "single",
-                ..crate::engine::DecisionNames::default()
-            }),
-        );
-        assert_eq!(shed.trace.made_under(), None);
-    }
-
-    #[test]
-    fn each_seat_keeps_every_nth_answer_by_its_own_count() {
-        let store = fleet(2);
-        sampling(&store, 2, 3);
-        let door = StoreBackedEngine::new(store);
-        for n in 1..=6 {
-            for seat in [0_u8, 1] {
-                let at = usize::from(seat);
-                seated(at);
-                let id = [seat, n];
-                let (lease, _) = leased(&door, &id, u64::from(n));
-                assert_eq!(door.store().file_of(lease), at);
-                door.report(GATEWAY, lease, gone());
-                if n < 3 {
-                    assert_eq!(door.seats[at].samples.lock().slots(), 0);
-                }
-            }
-        }
-        for seat in [0, 1] {
-            for n in 1..=6 {
-                assert_eq!(door.explain(GATEWAY, &[seat, n]).is_some(), n % 3 == 0);
-            }
-        }
-    }
-
-    #[test]
-    fn the_ring_wraps_at_1024_records_and_loses_the_oldest() {
-        use std::io::{self, Write as _};
-
-        let store = fleet(1);
-        sampling(&store, 2, 1);
-        let door = StoreBackedEngine::new(store);
-        for n in 0_u32..1_025 {
-            let id = n.to_le_bytes();
-            let mut ask = request(&id, u64::from(n));
-            ask.facts.model = "empty";
-            let answer = door.decide(GATEWAY, &ask, Instant::now()).expect("a shed");
-            assert!(matches!(answer.decision, Decision::Shed(_)));
-        }
-        assert!(door.explain(GATEWAY, &0_u32.to_le_bytes()).is_none());
-        assert!(door.explain(GATEWAY, &1_u32.to_le_bytes()).is_some());
-        assert!(door.explain(GATEWAY, &1_024_u32.to_le_bytes()).is_some());
-        let slots = door.seats[0].samples.lock().slots();
-        assert_eq!(slots, 1_024);
-        let bytes = size_of::<DecisionRecord>();
-        writeln!(
-            io::stdout(),
-            "record_bytes={bytes} ring_bytes={}",
-            slots * bytes
-        )
-        .expect("stdout");
-    }
-
     /// A maker that says the generation it was handed, and applies another
     /// before its request is back at the door where it is told one.
     struct Reads<'t> {
@@ -5234,25 +3726,6 @@ pub(crate) mod tests {
             (next.handed.get(), decided.decision.trace().generation),
             (2, 2)
         );
-    }
-
-    #[test]
-    fn an_apply_turns_sampling_on_and_off_and_starts_the_count_over() {
-        let store = fleet(1);
-        let door = StoreBackedEngine::new(Arc::clone(&store));
-        let _ = leased(&door, b"off-1", 1);
-        sampling(&store, 2, 2);
-        let _ = leased(&door, b"first", 2);
-        sampling(&store, 3, 2);
-        let _ = leased(&door, b"first-again", 3);
-        let _ = leased(&door, b"kept", 4);
-        sampling(&store, 4, 0);
-        let _ = leased(&door, b"off-2", 5);
-        for id in ["off-1", "first", "first-again", "off-2"] {
-            assert!(door.explain(GATEWAY, id.as_bytes()).is_none(), "{id}");
-        }
-        let kept = door.explain(GATEWAY, b"kept").expect("the old sample");
-        assert_eq!(kept.decision.trace().generation, 3);
     }
 
     /// A dispatch to a pick's first target.
@@ -5572,6 +4045,97 @@ pub(crate) mod tests {
         }
         let to_one = sent.iter().filter(|&&decode| decode == sent[0]).count();
         assert_eq!(to_one, 4, "{sent:?}");
+    }
+
+    /// One prefill and three decodes under round robin, and their engine.
+    fn three_decodes() -> (Arc<MemoryStore>, StoreBackedEngine) {
+        let store = MemoryStore::new();
+        for (name, role) in [
+            ("p0", Role::Prefill),
+            ("d0", Role::Decode),
+            ("d1", Role::Decode),
+            ("d2", Role::Decode),
+        ] {
+            member(&store, name, role);
+        }
+        let document = PolicySpec::pair_presets("round_robin", "round_robin").expect("a spec");
+        apply_pair_document(&store, document).expect("the document applies");
+        let store = Arc::new(store);
+        let door = StoreBackedEngine::new(Arc::clone(&store));
+        (store, door)
+    }
+
+    /// A pair decided with its decode left for later, and its prefill
+    /// dispatched under the index `named`: the lease, and the decode of
+    /// each target of the pick, best first.
+    fn prefill_sent_to(
+        door: &StoreBackedEngine,
+        asked: &Request<'_>,
+        named: u8,
+        now: Instant,
+    ) -> (LeaseId, Vec<WorkerId>) {
+        let answer = door.decide(GATEWAY, asked, now).expect("the pair");
+        let lease = answer.lease.expect("a lease").lease.id;
+        let pick = answer.decision.pick().expect("a pick");
+        let pairs = pick.targets.iter().filter_map(|target| target.pair);
+        let decodes: Vec<WorkerId> = pairs.map(|pair| pair.decode_id).collect();
+        assert_eq!(decodes.len(), 3, "a target for each decode");
+        let sent = Dispatch {
+            side: Side::Prefill,
+            target_index: named,
+            since_decision_micros: 0,
+        };
+        door.report(GATEWAY, lease, Said::Dispatched(sent, now));
+        (lease, decodes)
+    }
+
+    /// The decode a decode call books for `lease`.
+    fn decode_again(
+        door: &StoreBackedEngine,
+        asked: &Request<'_>,
+        lease: LeaseId,
+        now: Instant,
+    ) -> WorkerId {
+        let again = door.decide_decode(GATEWAY, asked, lease, now);
+        let decode = again.expect("a decode decision").lease;
+        decode.expect("the decode's lease").lease.booked
+    }
+
+    /// A pair's prefill dispatched to another target of its pick than the
+    /// first: the decode decided again behind it is that target's decode,
+    /// the one its host took, as over a host's own lists
+    /// (`the_guards_decode_call_keeps_the_decode_its_host_took`). The file
+    /// keeps the index the prefill's dispatch names. A dispatch that names
+    /// no target of the pick moves nothing: the first target's decode
+    /// stands.
+    #[test]
+    fn a_decode_decided_again_is_the_decode_of_the_target_its_prefill_took() {
+        let (_, door) = three_decodes();
+        let (asked, now) = (later_request(b"pair"), Instant::now());
+        // The index the prefill's dispatch names, and the target whose
+        // decode the call starts from.
+        for (named, taken) in [(1, 1), (2, 2), (0, 0), (3, 0)] {
+            let (lease, decodes) = prefill_sent_to(&door, &asked, named, now);
+            let booked = decode_again(&door, &asked, lease, now);
+            assert_eq!(booked, decodes[taken], "the dispatch named {named}");
+            let gone = Said::Released(None, ReleaseReason::ClientGone);
+            door.report(GATEWAY, lease, gone);
+        }
+    }
+
+    /// The index outlives a decode call's issue. An issue taken back
+    /// leaves the side chosen with the first pick's targets, and the next
+    /// call starts again from the decode of the target the prefill went
+    /// to.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn a_decode_issue_taken_back_keeps_the_target_its_prefill_took() {
+        let (store, door) = three_decodes();
+        let (asked, now) = (later_request(b"pair"), Instant::now());
+        let (lease, decodes) = prefill_sent_to(&door, &asked, 1, now);
+        assert_eq!(decode_again(&door, &asked, lease, now), decodes[1]);
+        assert!(store.take_back_decode(GATEWAY, lease, ReleaseReason::Abandoned));
+        assert_eq!(decode_again(&door, &asked, lease, now), decodes[1]);
     }
 
     #[test]
@@ -6952,6 +5516,42 @@ pub(crate) mod tests {
         assert_eq!(door.undialed(), 0);
     }
 
+    /// A retry whose constraint was decided a way no member of its pool
+    /// states is left nobody: it is shed with no endpoint under the stage
+    /// `decoding`, beside a member that states no way too. A member that
+    /// states the retry's number takes it.
+    #[test]
+    fn a_constraint_no_member_decides_alike_is_shed_under_its_own_stage() {
+        let decides = |decoding: u8| {
+            let stated = DemandFacts {
+                decoding,
+                ..DemandFacts::default()
+            };
+            (false, stated)
+        };
+        let (store, ids) = stating_facts(&[decides(5), decides(0)]);
+        let door = StoreBackedEngine::new(Arc::clone(&store));
+        let decided = |decoding: u8| {
+            let mut asked = request(b"r-1", 7);
+            asked.constraints.demands = Demands {
+                decoding,
+                ..Demands::default()
+            };
+            let decided = door.decide(GATEWAY, &asked, Instant::now());
+            decided.expect("a decision").decision
+        };
+        match decided(7) {
+            Decision::Shed(shed) => assert_eq!(
+                (shed.reason, shed.emptied_by),
+                (ShedReason::NoEndpoints, "decoding")
+            ),
+            other => panic!("a member took it: {other:?}"),
+        }
+        let alike = decided(5);
+        let pick = alike.pick().expect("a member decides alike");
+        assert_eq!(pick.targets.first().map(|target| target.id), Some(ids[0]));
+    }
+
     /// A prefill-phase request of a model no pair plan binds is decided
     /// as a single over its prefill pool. Its rows are held to the input
     /// alone: the completion's bound is a decode's to hold, and a host
@@ -8231,6 +6831,43 @@ pub(crate) mod tests {
         assert_eq!(sessions.len(), 0);
     }
 
+    /// Under a rule that sweeps, a key ends with its idle time here, in the
+    /// engine's table and of record: the door lends its decisions the pins
+    /// of record, whose ends count no sweep. A lease dispatched behind a
+    /// reload writes that end too. Idle time 60 s, a sweep every 3,600 s.
+    #[test]
+    fn a_key_ends_with_its_idle_time_in_the_table_and_of_record() {
+        let store = fleet(1);
+        let door = StoreBackedEngine::new(Arc::clone(&store));
+        let ruled = |generation: u64| {
+            let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+            document.generation = generation;
+            let rule = document.bindings[0].sessions.as_mut();
+            let rule = rule.expect("the preset's rule");
+            (rule.ttl_s, rule.sweep_s) = (60, 3_600);
+            AppliedSpec::validate(&document).expect("the document validates")
+        };
+        store.apply(ruled(2)).expect("a later generation");
+        let now = Instant::now();
+        // A keyed decision's key, its lease and the end of its idle time.
+        let decide = |id: &[u8], key: u64| {
+            let decided = door.decide(GATEWAY, &keyed(id, key, 7), now);
+            let lease = decided.expect("a decision").lease;
+            let lease = lease.expect("a pick's lease").lease;
+            (lease.session, lease.id, lease.issued_micros + 60_000_000)
+        };
+        let of_record = |key: Session| SessionsStore::lookup(&*store, key.get())?.ends;
+        let (key, lease, idle_end) = decide(b"r-1", 7);
+        let held = store.snapshot().spec().engine().sessions().held(key);
+        assert_eq!(held.map(|(_, end)| end), Some(SessionExpiry::At(idle_end)));
+        report(&door, lease, dispatched());
+        assert_eq!(of_record(key), Some(idle_end), "behind a dispatch");
+        let (key, lease, idle_end) = decide(b"r-2", 8);
+        store.apply(ruled(3)).expect("a reload");
+        report(&door, lease, dispatched());
+        assert_eq!(of_record(key), Some(idle_end), "behind a reload");
+    }
+
     /// A request for [`MODEL`] under the session key `key`.
     fn keyed(id: &[u8], key: u64, seed: u64) -> Request<'_> {
         let mut request = request(id, seed);
@@ -9023,75 +7660,6 @@ pub(crate) mod tests {
             assert_eq!(decided.pick, Some((shallow, 2)));
         }
 
-        /// A shadow's rows are held to its own profile's test of a row,
-        /// not to its live profile's. Under a cap of one, a live profile
-        /// that refuses the rows a request tried is named the holder
-        /// behind the tried one. Its shadow holds no such filter: it is
-        /// named the deep holder, which its own pass keeps, and takes it.
-        /// The other way about the live profile keeps the deep holder,
-        /// and its shadow is named the one behind it.
-        #[test]
-        fn a_shadow_of_other_filters_is_named_by_its_own_test_of_a_row() {
-            use std::sync::Arc;
-
-            use crate::{
-                document::spec::ShadowSpec,
-                engine::{decision::ShadowKind, store_backed_engine::StoreBackedEngine},
-            };
-
-            // A retry of the deep holder, where the live profile or else
-            // its shadow refuses the rows a request tried: the live
-            // answer, what the shadow said with its first target, and
-            // the depths of the holders named for the shadow alone.
-            let retried = |shadow_refuses: bool| {
-                let mut document =
-                    PolicySpec::preset("cache_aware").expect("a preset of this build");
-                document.explain.sample = 1;
-                let live = document.profiles.get_mut("cache_aware");
-                let live = live.expect("the preset's profile");
-                live.pick = PickStage::Best(BestParams { sample: 1 }).into();
-                let mut twin = live.clone();
-                // The preset's last filter refuses the rows a request
-                // tried: one of the two profiles goes without it.
-                let loose = if shadow_refuses { live } else { &mut twin };
-                loose.filter.pop();
-                document.profiles.insert("twin".into(), twin);
-                document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
-                let store = MemoryStore::with_publish_window(Duration::ZERO).with_decision_slots(1);
-                let spec = AppliedSpec::validate(&document).expect("the document validates");
-                store.apply(spec).expect("above the unbound start");
-                let deep = holder(&store, "deep", 3);
-                let shallow = holder(&store, "shallow", 2);
-                holder(&store, "idle", 0);
-                let door = StoreBackedEngine::new(Arc::new(store));
-                let tried = [deep];
-                let mut asked = request(b"retry", 7);
-                asked.facts.block_hashes = &BLOCKS;
-                asked.facts.tried = &tried;
-                let decided = door.decide(GATEWAY, &asked, Instant::now());
-                let decided = decided.expect("a decision");
-                let live = decided
-                    .decision
-                    .pick()
-                    .and_then(|pick| pick.targets.first());
-                let live = live.map(|target| target.id);
-                let record = door.explain(GATEWAY, b"retry");
-                let record = record.expect("the sampled decision");
-                let named = door.own_named[0].named.lock();
-                let depths = named.holders.iter().map(|holder| holder.overlap_blocks);
-                let depths: Vec<u32> = depths.collect();
-                let shadow = (record.shadow, record.shadow_target);
-                ((live, shadow, depths), (deep, shallow))
-            };
-            let other = Some(ShadowKind::OtherTarget);
-            let ((live, shadow, depths), (deep, shallow)) = retried(false);
-            assert_eq!(live, Some(shallow));
-            assert_eq!((shadow, depths), ((other, Some(deep)), vec![3]));
-            let ((live, shadow, depths), (deep, shallow)) = retried(true);
-            assert_eq!(live, Some(deep));
-            assert_eq!((shadow, depths), ((other, Some(shallow)), vec![2]));
-        }
-
         /// A hot prefix: the two workers that hold it whole read over
         /// their thresholds and would fill a cap of two. Other rows stand
         /// under theirs, so no veto is lifted, and the holder under its
@@ -9569,26 +8137,6 @@ pub(crate) mod tests {
         fn scope(&self) -> Option<&dyn DecisionScope> {
             Some(self)
         }
-    }
-
-    #[test]
-    fn sampling_keeps_a_plain_generations_callers_at_their_seats() {
-        let files = (2..=8)
-            .find(|&files| decider_of(MODEL, files) != 0)
-            .expect("the model names a later file");
-        let store = fleet(files);
-        let door = StoreBackedEngine::new(Arc::clone(&store));
-        seated(0);
-        picking(&store, 2, "scoped", || Box::new(Scoped));
-        let (scoped, _) = leased(&door, b"scoped", 7);
-        assert_eq!(store.file_of(scoped), decider_of(MODEL, files));
-        sampling(&store, 3, 1);
-        for id in [b"one", b"two"] {
-            let (lease, _) = leased(&door, id, 8);
-            assert_eq!(store.file_of(lease), 0);
-            assert!(door.explain(GATEWAY, id).is_some());
-        }
-        assert_eq!(LAST_SLOT.get(), 0);
     }
 
     /// The seat follows who owns what a decision reads and what hears its

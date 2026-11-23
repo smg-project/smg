@@ -9,27 +9,33 @@ use std::{
 
 use super::{
     identity, identity_of,
-    leases::{InFlightCounts, WorkerSlot, DISPATCH_TTL},
-    AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeRefused, DecodeSide, Dispatch,
-    GatewayId, Hand, HealthSink, HealthWrite, Journal, JournalKinds, KvEvent, KvEventSink,
-    LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSample, LoadSink, LoadSource,
-    LookOutcome, MembershipChange, MembershipTail, MemoryStore, PickRecord, Pin, PollMode,
-    Position, Reachability, ReservationKind, ReservationStore, ResyncReason, Said, SequenceHash,
-    SessionsStore, Sides, Signals, SnapshotChunk, StoreSnapshot, StoredBlock, VetoWrite,
-    ViewBuffers, ViewQuery, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+    leases::{InFlightCounts, WorkerSlot},
+    AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeSide, GatewayId, Hand,
+    HealthSink, HealthWrite, Journal, JournalKinds, KvEvent, KvEventSink, LeaseRecord,
+    LeaseRefused, LeaseState, LeasesStore, LoadSample, LoadSink, LoadSource, LookOutcome,
+    MembershipChange, MembershipTail, MemoryStore, PickRecord, Pin, PollMode, Position,
+    Reachability, ReservationKind, ReservationStore, ResyncReason, SequenceHash, SessionsStore,
+    Sides, Signals, SnapshotChunk, StoreSnapshot, StoredBlock, VetoWrite, ViewBuffers, ViewQuery,
+    WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
 };
 use crate::{
     document::spec,
     engine::{
         decision::{self, Target, Targets},
+        decision_engine::DecodeRefused,
         decision_slot::DecisionSlot,
         demands::DemandFacts,
         sticky_sessions::{self, SessionVerdict},
         view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
     },
     service::replication::Log,
-    tracking::lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
+    tracking::lease::{
+        Dispatch, Lease, LeaseId, Membership, Outcome, ReleaseReason, Said, Side, TransportClass,
+        DISPATCH_TTL,
+    },
 };
+
+mod host_count;
 
 fn facts(key: &str, incarnation: u64) -> WorkerFacts {
     WorkerFacts {

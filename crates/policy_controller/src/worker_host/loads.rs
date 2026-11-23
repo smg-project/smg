@@ -1,4 +1,9 @@
-//! The worker load sink over the store.
+//! A host's worker loads: the worker crate's own load monitor, for an
+//! engine that decides over its host's lists ([`load_monitor`]), and the
+//! worker load sink over the store ([`LoadAdapter`]). A host runs one of
+//! the two at a time.
+//!
+//! # The sink's locks
 //!
 //! The collector holds its reports lock at a record, a poll's report or a
 //! forget, so a later object's first sample never lands between an
@@ -25,7 +30,10 @@ use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 use smg_worker::{
     identity::basic::Worker,
-    load::port::{LoadSink, PollMode, PolledMember, PolledRanks},
+    load::{
+        monitor::{LoadConsumer, WorkerMonitor},
+        port::{LoadSink, PollMode, PolledMember, PolledRanks},
+    },
     registry::{Generation, WorkerId as ObjectId},
     worker::{ConnectionMode, WorkerLoadResponse, WorkerStatus as ObjectStatus},
 };
@@ -535,12 +543,66 @@ where
     }
 }
 
+/// The readers of a [`load_monitor`]'s loads: the decisions of an engine
+/// over the host's lists, which read the snapshot the monitor publishes.
+struct SnapshotReaders;
+
+impl LoadConsumer for SnapshotReaders {
+    /// Always. The host holds the monitor only while a decision reads its
+    /// snapshot, and drops it for the rest. The monitor asks under polling
+    /// by need alone, which [`load_monitor`] leaves off.
+    fn needs_loads(&self) -> bool {
+        true
+    }
+
+    /// Nothing is trimmed. A decision books its dispatch in the engine's
+    /// own stages, which are told the request's end, and none books through
+    /// the monitor.
+    fn reconcile_in_flight(&self, _worker: &dyn Worker) {}
+}
+
+/// The worker crate's own load monitor over the holder's registry, for a
+/// host whose decisions read the monitor's snapshot.
+///
+/// It polls every `Ready` object each `every`, cut to whole seconds: the
+/// monitor takes one second for less. It publishes the reports as one
+/// snapshot ([`WorkerMonitor::subscribe`]), which the host hands its
+/// decisions. Its own sink judges each worker's overload by the thresholds
+/// its object states ([`Objects::with_overload_thresholds`]) and writes
+/// the verdict on the object. It writes no store and polls every group,
+/// whatever its objects state. Each report also feeds the worker crate's
+/// engine gauges, as under every monitor.
+///
+/// It is built stopped. The host starts it
+/// ([`WorkerMonitor::start_event_loop`]) where its decisions read the
+/// snapshot, and drops it where they do not. The drop ends the monitor's
+/// tasks and its channel, whose last snapshot a reader still holds, and
+/// says nothing to the sink: the verdicts stand on the objects until the
+/// host takes them off ([`clear_all_overload_flags`]). Where its decisions
+/// read a snapshot again the host builds another monitor: its snapshot
+/// starts empty, and its start fails every verdict open.
+///
+/// [`clear_all_overload_flags`]: smg_worker::registry::WorkerRegistry::clear_all_overload_flags
+pub fn load_monitor<G: Generation>(objects: &Objects<G>, every: Duration) -> Arc<WorkerMonitor<G>> {
+    Arc::new(WorkerMonitor::new(
+        Arc::clone(objects.registry()),
+        Arc::new(SnapshotReaders),
+        every.as_secs(),
+        // No poll is forced for the gauges' sake and none is left out by
+        // need: every group is polled.
+        false,
+        false,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::slice;
 
     use parking_lot::Mutex;
     use smg_worker::{
+        common_proto::EngineLoad,
+        health::overload::OverloadThresholds,
         load::port::GroupTick,
         registry::WorkerRegistry,
         worker::{LoadTelemetry, NamedValue, SchedulerLoadSnapshot, WorkerStatus as ObjectStatus},
@@ -2086,5 +2148,104 @@ mod tests {
         assert_eq!(members.len(), 2);
         let one_rank = |kept: &KeptMember| matches!(*kept.shown.lock(), Shown::OneRank(_));
         assert!(members.values().all(one_rank));
+    }
+
+    /// A host's load monitor judges a worker where its report lands, by the
+    /// thresholds the holder built the object with, and the verdict is the
+    /// object's. A usage of 0.8 as an engine reports it is over a threshold
+    /// of 0.8. Its reports stand in the snapshot its channel publishes.
+    /// Its drop says nothing to the objects: the verdicts stand until the
+    /// host takes them off or another monitor starts, and a reader still
+    /// holds the last snapshot. Another monitor's snapshot starts empty.
+    /// It takes the host's period, and it wants the loads of every worker:
+    /// of one that states no threshold too.
+    ///
+    /// The reports are handed as a stream's records, the shortest way to
+    /// the monitor's sink: it judges a poll's answer by the same rule.
+    #[tokio::test]
+    async fn a_hosts_load_monitor_judges_by_the_objects_thresholds_and_publishes_its_reports() {
+        const OTHER: &str = "http://loads-b:8000";
+        let mut replica = Replica::new();
+        let defaults = OverloadThresholds {
+            waiting_requests: Some(8),
+            token_usage: Some(0.8),
+        };
+        replica.objects = Arc::new(
+            Objects::new(Arc::new(WorkerRegistry::new())).with_overload_thresholds(defaults),
+        );
+        let (_, strict) = replica.add(WorkerFacts {
+            overload: Overload {
+                waiting_requests: Some(2),
+                ..Default::default()
+            },
+            ..facts(URL)
+        });
+        let (_, plain) = replica.add(facts(OTHER));
+        let monitor = load_monitor(&replica.objects, PERIOD);
+        let published = monitor.subscribe();
+        // The host's period reaches the monitor, whose debug text alone
+        // shows its interval.
+        let period = format!("default_interval: {PERIOD:?}");
+        assert!(format!("{monitor:?}").contains(&period), "{monitor:?}");
+        // Every group is polled, whatever its objects state: the loads of a
+        // worker that states no threshold are wanted too.
+        let bare = Replica::new();
+        let (_, unjudged) = bare.add(facts(URL));
+        let unjudging = load_monitor(&bare.objects, PERIOD);
+        assert!(unjudging.loads_wanted(slice::from_ref(&unjudged)));
+
+        let waiting = |waiting_requests| EngineLoad {
+            waiting_requests,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        // Three wait: over the first row's own two, under the host's eight.
+        monitor.apply_pushed_load(&strict, 0, &waiting(3), now);
+        monitor.apply_pushed_load(&plain, 0, &waiting(3), now);
+        assert!(strict.is_overloaded());
+        assert!(!plain.is_overloaded());
+        // Nine wait: over the host's eight, for the row that names none.
+        monitor.apply_pushed_load(&plain, 0, &waiting(9), now);
+        assert!(plain.is_overloaded());
+        // The first row's queue is empty again, and its usage moves.
+        let used = |token_usage| EngineLoad {
+            token_usage,
+            ..Default::default()
+        };
+        monitor.apply_pushed_load(&strict, 0, &used(0.79), now);
+        assert!(!strict.is_overloaded());
+        monitor.apply_pushed_load(&strict, 0, &used(0.8), now);
+        assert!(strict.is_overloaded());
+        monitor.apply_pushed_load(&strict, 0, &waiting(3), now);
+
+        monitor.flush_pushed_for_test();
+        let waits = |url| {
+            let snapshot = published.borrow();
+            snapshot
+                .get(url)
+                .map(WorkerLoadResponse::total_waiting_reqs)
+        };
+        assert_eq!((waits(URL), waits(OTHER)), (Some(3), Some(9)));
+
+        drop(monitor);
+        assert!(strict.is_overloaded() && plain.is_overloaded());
+        assert_eq!((waits(URL), waits(OTHER)), (Some(3), Some(9)));
+
+        // Another monitor over the same objects starts with an empty
+        // snapshot, and its start fails every standing verdict open.
+        let next = load_monitor(&replica.objects, PERIOD);
+        let again = next.subscribe();
+        let empty = |url| again.borrow().get(url).is_none();
+        assert!(empty(URL) && empty(OTHER));
+        next.start_event_loop();
+        assert!(!strict.is_overloaded() && !plain.is_overloaded());
+        // Its own verdict stands behind its drop, until the host takes it
+        // off.
+        next.apply_pushed_load(&plain, 0, &waiting(9), now);
+        drop(next);
+        assert!(plain.is_overloaded());
+        let registry = replica.objects.registry();
+        assert_eq!(registry.clear_all_overload_flags(), 1);
+        assert!(!plain.is_overloaded());
     }
 }

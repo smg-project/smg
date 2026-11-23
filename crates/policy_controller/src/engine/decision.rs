@@ -6,9 +6,15 @@
 
 use std::fmt;
 
-use crate::engine::{sticky_sessions::SessionVerdict, view::WorkerId};
 #[cfg(feature = "controller")]
 use crate::service::proto;
+use crate::{
+    document::spec::RulePlaced,
+    engine::{
+        sticky_sessions::{DecodeVerdict, SessionVerdict},
+        view::WorkerId,
+    },
+};
 
 /// Targets a decision carries at most: the pick and its alternates.
 pub const MAX_TARGETS: usize = 4;
@@ -35,6 +41,11 @@ pub struct Pair {
     pub decode_position: u32,
     pub decode_id: WorkerId,
     pub decode_dp_rank: u16,
+    /// What the decision did with the decode side's session key, as the
+    /// pair of a pick's first target states it: a claim names that pair's
+    /// decode. The pick's own verdict ([`Pick::session_verdict`]) is the
+    /// prefill side's. It is one byte the pair had spare.
+    pub decode_verdict: DecodeVerdict,
 }
 
 /// The ordered targets of a pick: the best first. For a pair the list reads
@@ -44,17 +55,23 @@ pub struct Pair {
 pub struct Targets {
     items: [Target; MAX_TARGETS],
     len: u8,
+    /// Who placed the pick ([`Pick::placed_by`]) and, of a rule's pick,
+    /// whether the rule keeps it from the profile (`Pick::untold`), in
+    /// the byte the count and the overlap left spare between them.
+    placing: Placing,
     /// What the profile's prefix stage says of the first target
     /// ([`Pick::overlap`]), in the bytes the count left spare.
     overlap: Overlap,
 }
 
-/// Two lists are equal where their targets and what they state of the first
-/// are. The entries past a count are no part of a list:
+/// Two lists are equal where their targets, what they state of the first
+/// and who placed them are. The entries past a count are no part of a list:
 /// [`Targets::clear`] leaves them as they stood.
 impl PartialEq for Targets {
     fn eq(&self, other: &Self) -> bool {
-        self.overlap == other.overlap && self.as_slice() == other.as_slice()
+        self.placing == other.placing
+            && self.overlap == other.overlap
+            && self.as_slice() == other.as_slice()
     }
 }
 
@@ -66,6 +83,7 @@ impl fmt::Debug for Targets {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Targets")
             .field("items", &self.as_slice())
+            .field("placing", &self.placing)
             .field("overlap", &self.overlap)
             .finish()
     }
@@ -81,6 +99,7 @@ impl Targets {
                 pair: None,
             }; MAX_TARGETS],
             len: 0,
+            placing: Placing::Stages,
             overlap: Overlap::NONE,
         }
     }
@@ -89,6 +108,18 @@ impl Targets {
     /// ([`Self::lead`]) says nothing of its new first target.
     pub(crate) fn state(&mut self, overlap: Overlap) {
         self.overlap = overlap;
+    }
+
+    /// States that the binding's sessions rule placed the pick, with no
+    /// stage of the profile asked ([`PlacedBy::Rule`]), and whether that
+    /// rule keeps what it places from the profile (`kept`, the rule's own
+    /// word). Both are the decision's: a list led anew, emptied or turned
+    /// into a pair's keeps them.
+    pub(crate) fn by_rule(&mut self, kept: RulePlaced) {
+        self.placing = match kept {
+            RulePlaced::Told => Placing::Rule,
+            RulePlaced::Untold => Placing::RuleUntold,
+        };
     }
 
     /// Append a target; a list already full keeps what it has.
@@ -101,9 +132,10 @@ impl Targets {
 
     /// Turns a decode side's targets into a pair's where they stand: each
     /// names `prefill` with the decode it held, in the order they had.
-    /// Nothing is stated of a pair's first target ([`Pick::overlap`]). The
-    /// entries past the count are not rewritten, as [`Self::clear`] leaves
-    /// them. No accessor goes past the count.
+    /// Nothing is stated of a pair's first target ([`Pick::overlap`]), and
+    /// no pair states a verdict of its decode side. The entries past the
+    /// count are not rewritten, as [`Self::clear`] leaves them. No accessor
+    /// goes past the count.
     pub(crate) fn pair_under(&mut self, prefill: &Target) {
         for target in &mut self.items[..usize::from(self.len)] {
             *target = Target {
@@ -114,6 +146,7 @@ impl Targets {
                     decode_position: target.position,
                     decode_id: target.id,
                     decode_dp_rank: target.dp_rank,
+                    decode_verdict: DecodeVerdict::NONE,
                 }),
             };
         }
@@ -132,6 +165,7 @@ impl Targets {
     /// list is full.
     pub fn lead(&mut self, target: Target) {
         let mut led = Self::new();
+        led.placing = self.placing;
         led.push(target);
         for t in self.as_slice() {
             if *t != target {
@@ -414,6 +448,54 @@ impl Overlap {
     };
 }
 
+/// Who placed a pick's first target. It answers one question: did the
+/// binding's sessions rule place it alone? The rule does, with no stage of
+/// the profile asked, where it follows a pin of the request's key, and
+/// where its own assignment places the key.
+///
+/// Two readers stand in a host that keeps what a profile's stages did
+/// with a request: the write of the record of sent prompts, and the store of
+/// a prompt in a lent token tree. Neither keeps anything behind a pick the
+/// rule placed, as a gateway's sticky map keeps a request it places from the
+/// gateway's policy.
+///
+/// A third tells a single request's lease to the stages in a gateway's own
+/// process (`lease_events::stages_hear`). It reads the rule's own word
+/// beside this one ([`RulePlaced`]): under `untold` no stage hears the
+/// issue or the dispatch of a pick the rule placed, and under `told`, the
+/// default, the stages hear both. The session table hears the dispatch
+/// under either.
+///
+/// The word does not cross the crate's frame: no wire message carries it,
+/// since the record is written where the decision is made.
+///
+/// It shares one byte with the rule's word (`Pick::untold`), the one a
+/// pick's targets had spare between their count and what is stated of the
+/// first: a pick is no larger for it ([`Pick::placed_by`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PlacedBy {
+    /// The profile's stages. Every pick no sessions rule placed reads this:
+    /// a request with no key is never the rule's, whoever placed it.
+    #[default]
+    Stages,
+    /// The binding's sessions rule alone: a pin of the key followed, or the
+    /// rule's own assignment.
+    Rule,
+}
+
+/// A pick's one byte of its placing: who placed it ([`PlacedBy`]), and of
+/// a pick the binding's sessions rule placed, whether that rule keeps it
+/// from the profile ([`RulePlaced::Untold`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+enum Placing {
+    #[default]
+    Stages,
+    Rule,
+    RuleUntold,
+}
+
 /// A pick: ordered targets, the trace, and what a sessions rule did with
 /// the request's key (`None` without one). The host copies that verdict
 /// onto the lease it commits, and fills the lease's session from the
@@ -431,6 +513,24 @@ impl Pick {
     /// ([`Overlap`]); nothing where no stage said.
     pub const fn overlap(&self) -> Overlap {
         self.targets.overlap
+    }
+
+    /// Who placed the pick ([`PlacedBy`]): the profile's stages, unless the
+    /// binding's sessions rule placed it alone.
+    pub const fn placed_by(&self) -> PlacedBy {
+        match self.targets.placing {
+            Placing::Stages => PlacedBy::Stages,
+            Placing::Rule | Placing::RuleUntold => PlacedBy::Rule,
+        }
+    }
+
+    /// Whether the pick is kept from the profile: the binding's sessions
+    /// rule placed it alone, and the rule says such a request is none of
+    /// the profile's own ([`RulePlaced::Untold`]). Its one reader tells a
+    /// lease's words in a gateway's own process.
+    #[cfg(any(test, feature = "in-process"))]
+    pub(crate) const fn untold(&self) -> bool {
+        matches!(self.targets.placing, Placing::RuleUntold)
     }
 }
 
@@ -747,6 +847,59 @@ mod tests {
         assert_eq!(pick.overlap(), Overlap::NONE);
     }
 
+    /// The word of who placed a pick costs the pick no byte: it sits in the
+    /// one a list's count and overlap left spare between them, with the
+    /// rule's own word of a pick it placed. A pick no rule placed reads the
+    /// stages, and is not kept from them. Both words are the decision's: a
+    /// list led anew, turned into a pair's or emptied keeps them.
+    #[test]
+    fn the_word_of_who_placed_a_pick_costs_the_pick_no_byte() {
+        assert_eq!(size_of::<Placing>(), 1);
+        assert_eq!(size_of::<Targets>(), MAX_TARGETS * size_of::<Target>() + 8);
+        assert_eq!(size_of::<Pick>(), 256);
+        assert_eq!(Pick::default().placed_by(), PlacedBy::Stages);
+        let target = |position: u32| Target {
+            position,
+            id: WorkerId(u64::from(position) + 1),
+            dp_rank: 0,
+            pair: None,
+        };
+        let mut pick = Pick::default();
+        pick.targets.push(target(0));
+        pick.targets.push(target(1));
+        let by_stages = pick;
+        assert!(!by_stages.untold());
+        for kept in [RulePlaced::Told, RulePlaced::Untold] {
+            let untold = kept == RulePlaced::Untold;
+            let mut pick = by_stages;
+            pick.targets.by_rule(kept);
+            assert_eq!((pick.placed_by(), pick.untold()), (PlacedBy::Rule, untold));
+            assert_ne!(pick, by_stages);
+            pick.targets.lead(target(1));
+            assert_eq!((pick.placed_by(), pick.untold()), (PlacedBy::Rule, untold));
+            pick.targets.pair_under(&target(2));
+            assert_eq!((pick.placed_by(), pick.untold()), (PlacedBy::Rule, untold));
+            pick.targets.clear();
+            assert_eq!((pick.placed_by(), pick.untold()), (PlacedBy::Rule, untold));
+        }
+        // The two words of a rule's pick are two picks.
+        let (mut told, mut kept) = (by_stages, by_stages);
+        told.targets.by_rule(RulePlaced::Told);
+        kept.targets.by_rule(RulePlaced::Untold);
+        assert_ne!(told, kept);
+    }
+
+    /// The decode side's verdict costs a pair no byte: it sits in one the
+    /// pair had spare. A target and a pick are the size they were, and a
+    /// pair no decision spoke of reads none.
+    #[test]
+    fn the_decode_sides_verdict_costs_the_pair_no_byte() {
+        assert_eq!(size_of::<DecodeVerdict>(), 1);
+        assert_eq!((size_of::<Pair>(), size_of::<Target>()), (16, 40));
+        assert_eq!(size_of::<Pick>(), 256);
+        assert_eq!(Pair::default().decode_verdict, DecodeVerdict::NONE);
+    }
+
     #[test]
     fn targets_keep_order_and_refuse_a_fifth() {
         let mut targets = Targets::new();
@@ -915,6 +1068,7 @@ mod tests {
                     decode_position: position,
                     decode_id: decode(position).id,
                     decode_dp_rank: decode(position).dp_rank,
+                    ..Pair::default()
                 }),
                 ..prefill
             });

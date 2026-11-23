@@ -39,12 +39,14 @@
 //!
 //! Each group runs a single `tokio::time::interval` loop. Every tick:
 //!
-//! 1. Fetch the group's `Ready` workers. Polling is unconditional by
+//! 1. Fetch the group's `Ready` workers, less those the routing side asks
+//!    for no load ([`LoadConsumer::polls`]). Polling is unconditional by
 //!    default; with `--disable-load-monitoring` the tick is skipped
 //!    unless a load-aware policy, engine-metrics re-export, or overload
 //!    protection on a group member needs the data (the original
 //!    conditional gate — never "never poll").
-//! 2. Fetch loads concurrently from every `Ready` worker in the group.
+//! 2. Fetch loads concurrently from each of them that its load stream
+//!    does not serve.
 //! 3. Update load-aware policies and the DP cache.
 //! 4. Atomically clear stale entries for the group from the watch
 //!    channel and merge in the fresh loads.
@@ -347,6 +349,23 @@ pub trait LoadConsumer: Send + Sync {
     /// Trim what the readers booked on `worker` to the requests the router
     /// still holds there.
     fn reconcile_in_flight(&self, worker: &dyn Worker);
+
+    /// Whether the monitor asks `worker` for its load. A worker the routing
+    /// side says no of is no member of a tick: no poll goes to it, no load
+    /// stream is wanted for it, and a tick judges and trims nothing on it.
+    /// Yes by default. A host that cannot dial every worker of its registry
+    /// says which it can. A record pushed for a worker it says no of is
+    /// still taken and judged: the push asks nothing here.
+    ///
+    /// The answer is read at each tick. A worker whose answer turns from
+    /// yes to no keeps its last published report and its last verdict: a
+    /// tick prunes and judges its members alone. Both stand until the
+    /// monitor evicts the worker's loads, as at its removal, or resets. A
+    /// host that answers by a fact of the worker's life leaves neither
+    /// behind.
+    fn polls(&self, _worker: &dyn Worker) -> bool {
+        true
+    }
 }
 
 /// A worker's pushed report on file, with the incarnation whose record
@@ -384,9 +403,9 @@ impl PushedFile {
     /// through the lock of the reports alone, so every live write of a
     /// pusher's series is made under that lock, where the sentinel is
     /// written too ([`WorkerMonitor::clear_series`]).
-    fn write_rank_series(&self, at: usize, url: &str, model_id: &str) {
+    fn write_rank_series(&self, at: usize, model_id: &str) {
         Metrics::record_engine_rank_load(
-            url,
+            self.pusher.as_ref(),
             model_id,
             registered_engine_role(*self.pusher.worker_type()),
             &self.report.loads[at],
@@ -802,7 +821,7 @@ impl<G: Generation> WorkerMonitor<G> {
         // there leaves no load that reads as live. Its file is marked, and
         // the flush that finds the worker `Ready` writes the held series.
         if ready {
-            file.write_rank_series(at, url, worker.model_id());
+            file.write_rank_series(at, worker.model_id());
         } else {
             file.series_held = true;
         }
@@ -825,14 +844,24 @@ impl<G: Generation> WorkerMonitor<G> {
     /// Whether `workers`, the members of one group, are to have live load
     /// state: always by default; under `--disable-load-monitoring` only when
     /// a load-aware or dp-rank policy, the engine-metrics export or overload
-    /// protection on a member needs it. The poll tick and the decision to
-    /// open a worker's load stream read the same answer.
+    /// protection on a member needs it. Never where the host asks none of
+    /// them for its load ([`LoadConsumer::polls`]), and a member it leaves
+    /// out counts for nothing: its overload protection asks for no load.
+    /// The poll tick and the decision to open a worker's load stream read
+    /// the same answer.
     pub fn loads_wanted(&self, workers: &[Arc<dyn Worker>]) -> bool {
+        let mut asked = workers
+            .iter()
+            .filter(|worker| self.sink.polls(worker.as_ref()))
+            .peekable();
+        if !workers.is_empty() && asked.peek().is_none() {
+            return false;
+        }
         if !self.conditional_polling {
             return true;
         }
         let routing_needs_load = self.sink.needs_loads();
-        let overload_needs_load = workers.iter().any(|w| w.metadata().overload.is_enabled());
+        let overload_needs_load = asked.any(|w| w.metadata().overload.is_enabled());
         routing_needs_load || self.engine_metrics || overload_needs_load
     }
 
@@ -981,7 +1010,7 @@ impl<G: Generation> WorkerMonitor<G> {
         for (worker, load, _) in &group_loads {
             if self.load_state.is_current_incarnation(worker) {
                 Metrics::record_engine_load(
-                    worker.url(),
+                    worker.as_ref(),
                     model_id,
                     registered_engine_role(*worker.worker_type()),
                     load,
@@ -1155,7 +1184,7 @@ impl<G: Generation> WorkerMonitor<G> {
         let notify = Arc::clone(&self.pushed_notify);
         #[expect(
             clippy::disallowed_methods,
-            reason = "ends when the monitor is dropped; nothing waits on it at shutdown"
+            reason = "ends when the monitor is stopped or dropped; the stop alone waits on it"
         )]
         let handle = tokio::spawn(async move {
             loop {
@@ -1210,7 +1239,7 @@ impl<G: Generation> WorkerMonitor<G> {
                     continue;
                 }
                 for at in 0..file.report.loads.len() {
-                    file.write_rank_series(at, worker.url(), worker.model_id());
+                    file.write_rank_series(at, worker.model_id());
                 }
                 file.series_held = false;
             }
@@ -1278,6 +1307,13 @@ impl<G: Generation> WorkerMonitor<G> {
     /// is already in the snapshot (because it ran on this thread) or
     /// arrives as a `Registered` event that the loop applies on top of
     /// the snapshot.
+    ///
+    /// A start ends what it replaces. Where a slot still holds the handle
+    /// of an earlier start's event task or liveness sweep, that task is
+    /// told to end and the new task's handle takes the slot. The groups'
+    /// loops end at the rebuild from the registry. An eviction flusher
+    /// that still stands is kept: it may have taken the wakeup of an
+    /// eviction it has not applied yet.
     pub fn start_event_loop(self: &Arc<Self>) {
         // Capture the receiver before reconciling so events that fire
         // during reconcile are buffered, not lost.
@@ -1297,40 +1333,123 @@ impl<G: Generation> WorkerMonitor<G> {
         let monitor = Arc::downgrade(self);
         #[expect(
             clippy::disallowed_methods,
-            reason = "WorkerMonitor event loop runs for the lifetime of the registry; the JoinHandle is stored on the monitor and aborted in Drop"
+            reason = "WorkerMonitor event loop runs for the lifetime of the registry; the JoinHandle is stored on the monitor and aborted at its stop or in Drop"
         )]
         let handle = tokio::spawn(async move {
             run_event_loop(monitor, events_rx).await;
         });
 
-        *self.event_task.lock() = Some(handle);
+        replace(&self.event_task, handle);
 
         // The debounced eviction flusher: holds the load state strongly (it
         // is cheap and monitor-independent) and the monitor weakly, for the
-        // same cycle-breaking reason as the event loop.
-        let load_state = Arc::clone(&self.load_state);
-        let monitor = Arc::downgrade(self);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "eviction flusher runs for the monitor's lifetime; the JoinHandle is stored on the monitor and aborted in Drop"
-        )]
-        let flush_handle = tokio::spawn(async move {
-            eviction_flush_loop(load_state, monitor).await;
-        });
-
-        *self.eviction_flush_task.lock() = Some(flush_handle);
+        // same cycle-breaking reason as the event loop. One that still
+        // stands is kept, by the rule of the pushed flusher's start: it
+        // holds nothing a start changes, and ended in its debounce it
+        // would leave the eviction that woke it queued.
+        let mut flusher = self.eviction_flush_task.lock();
+        if flusher.as_ref().is_none_or(JoinHandle::is_finished) {
+            let load_state = Arc::clone(&self.load_state);
+            let monitor = Arc::downgrade(self);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "eviction flusher runs for the monitor's lifetime; the JoinHandle is stored on the monitor and aborted at its stop or in Drop"
+            )]
+            let flush_handle = tokio::spawn(async move {
+                eviction_flush_loop(load_state, monitor).await;
+            });
+            *flusher = Some(flush_handle);
+        }
+        drop(flusher);
 
         // The liveness sweep: vetoes a worker that stayed silent for the stall
         // threshold after a transport failure (see `health::liveness::sweep`).
         let monitor = Arc::downgrade(self);
         #[expect(
             clippy::disallowed_methods,
-            reason = "liveness sweep runs for the monitor's lifetime; the JoinHandle is stored on the monitor and aborted in Drop"
+            reason = "liveness sweep runs for the monitor's lifetime; the JoinHandle is stored on the monitor and aborted at its stop or in Drop"
         )]
         let sweep_handle = tokio::spawn(async move {
             liveness_sweep_loop(monitor).await;
         });
-        *self.liveness_sweep_task.lock() = Some(sweep_handle);
+        replace(&self.liveness_sweep_task, sweep_handle);
+    }
+
+    /// End what [`Self::start_event_loop`] started, for a host that reads
+    /// its workers' loads for a part of its life alone. The event task ends
+    /// first, so no group starts behind this call. Then every group's
+    /// polling loop, the eviction flusher, the liveness sweep and the
+    /// publisher of pushed reports end. Each task's end is awaited, so no
+    /// tick of a loop that stands publishes behind the reset, and none
+    /// writes a verdict there. One kind of loop is not awaited: that of a
+    /// group that ended, changed its interval or had another loop spawned
+    /// over it ahead of the call. It was
+    /// told to end there, and a tick of it that is past its fetch can
+    /// still publish. Last the
+    /// monitor resets as its rebuild from the registry does: the shared
+    /// snapshot is published empty, the probe memo goes, and the sink is
+    /// told the reset ([`LoadSink::reset`]). The monitor's own sink takes
+    /// every overload veto off the registry's workers there.
+    ///
+    /// The monitor then runs no task: its snapshot is empty, its probe memo
+    /// is gone and its sink was told the reset. A pusher that is still the
+    /// registry's `Ready` worker at its URL keeps its report on file, and
+    /// the sink its receipts. The receivers stay subscribed and read the
+    /// empty snapshot, and [`Self::start_event_loop`] starts the monitor
+    /// again over the registry as it stands at that call.
+    ///
+    /// A drop is no such end. A group's loop holds the monitor across its
+    /// poll, so a monitor its host dropped lives until no poll is in
+    /// flight. Where the polls of two groups each outlast the period, each
+    /// loop takes the monitor again while the other's poll holds it, and
+    /// the monitor polls on with no host.
+    ///
+    /// A stopped monitor still takes a pushed record
+    /// ([`Self::apply_pushed_load`]), as one that was never started does.
+    /// So a worker whose stream pushes can carry an overload veto with no
+    /// poll behind it, until the next start: its rebuild from the registry
+    /// tells the sink the reset.
+    ///
+    /// A stop dropped at its first wait puts the event task's handle back.
+    /// That task was told to end, and a poll of it that still runs can
+    /// start a group: the next stop waits for the task's end ahead of the
+    /// groups it takes. A stop dropped at a later wait has told every other
+    /// task to end. It has reset nothing: a later stop does.
+    ///
+    /// A host makes its stops and starts in turn. A start behind a stop
+    /// that was dropped ends the event task and the liveness sweep that
+    /// stop left standing, and keeps its eviction flusher
+    /// ([`Self::start_event_loop`]): no task is left with no handle. A
+    /// start beside a stop that still waits is no turn: that stop ends the
+    /// start's other tasks and leaves its event task, with its handle in
+    /// the slot.
+    ///
+    /// Called by no task of the monitor: the call waits for each of them.
+    pub async fn stop(&self) {
+        Awaited::out_of(&self.event_task).ended().await;
+        // No group starts behind the event task's end, so the tasks taken
+        // here are every task that stands.
+        let mut ending: Vec<JoinHandle<()>> = Vec::new();
+        for task in [
+            &self.eviction_flush_task,
+            &self.liveness_sweep_task,
+            &self.pushed_flush_task,
+        ] {
+            ending.extend(task.lock().take());
+        }
+        {
+            let mut handles = self.group_handles.lock();
+            ending.extend(handles.drain().map(|(_, state)| state.handle));
+        }
+        // Each is told to end ahead of the first wait: a stop dropped there
+        // drops handles of tasks that are ending.
+        for task in &ending {
+            task.abort();
+        }
+        for mut task in ending {
+            ended(&mut task).await;
+        }
+        self.stop_all_groups();
     }
 
     /// Stop every per-group polling loop, evict every pusher that is no longer
@@ -1340,12 +1459,13 @@ impl<G: Generation> WorkerMonitor<G> {
     /// monitor's own drops its DP-rank cache and fails every overload veto
     /// open.
     ///
-    /// Called from the rebuild from the registry alone, which is the
-    /// bootstrap reconcile path and the `RecvError::Lagged` rebuild. The
-    /// monitor's drop does not call it: the drop aborts the tasks and
-    /// says nothing to the sink. Always clears, even when no groups were
-    /// running, so a lag-recovery rebuild cannot inherit stale per-rank
-    /// loads from a previous incarnation. Idempotent.
+    /// Called from the rebuild from the registry, which is the bootstrap
+    /// reconcile path and the `RecvError::Lagged` rebuild, and from
+    /// [`Self::stop`] behind the end of every task. The monitor's drop does
+    /// not call it: the drop aborts the tasks and says nothing to the sink.
+    /// Always clears, even when no groups were running, so a lag-recovery
+    /// rebuild cannot inherit stale per-rank loads from a previous
+    /// incarnation. Idempotent.
     pub(crate) fn stop_all_groups(&self) {
         let drained: Vec<(WorkerGroupKey, GroupState)> = {
             let mut handles = self.group_handles.lock();
@@ -1651,7 +1771,8 @@ impl<G: Generation> WorkerMonitor<G> {
         });
     }
 
-    /// Spawn the polling loop for a single group.
+    /// Spawn the polling loop for a single group. A loop of the group
+    /// that still stands is told to end: its handle is written over.
     fn spawn_group_loop(self: &Arc<Self>, key: WorkerGroupKey, interval: Duration) {
         info!("Starting load monitor for group {key} with interval {interval:?}");
 
@@ -1663,14 +1784,19 @@ impl<G: Generation> WorkerMonitor<G> {
 
         #[expect(
             clippy::disallowed_methods,
-            reason = "Group polling loop runs for the lifetime of the group; the JoinHandle is stored in group_handles and aborted on group removal or monitor drop"
+            reason = "Group polling loop runs for the lifetime of the group; the JoinHandle is stored in group_handles and aborted on group removal, or at the monitor's stop or drop"
         )]
         let handle = tokio::spawn(async move {
             group_monitor_loop(monitor, group_key, interval).await;
         });
 
         let mut handles = self.group_handles.lock();
-        handles.insert(key, GroupState { handle, interval });
+        // Two reconciles of one group can each find no loop and each spawn
+        // one: the loop written over is told to end, so none polls on
+        // with no handle.
+        if let Some(replaced) = handles.insert(key, GroupState { handle, interval }) {
+            replaced.handle.abort();
+        }
     }
 
     /// Fetch load over HTTP, preferring a native load endpoint over the
@@ -2094,6 +2220,58 @@ impl<G> Drop for WorkerMonitor<G> {
     }
 }
 
+/// A task's handle, out of its slot while [`WorkerMonitor::stop`] waits for
+/// the task's end. Dropped ahead of that end, it puts the handle back: the
+/// stop behind a dropped one waits for the task too. It puts it back into
+/// an empty slot alone. A handle a start wrote there meanwhile stays: that
+/// start's task is the one a later stop ends.
+struct Awaited<'a> {
+    slot: &'a Mutex<Option<JoinHandle<()>>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl<'a> Awaited<'a> {
+    fn out_of(slot: &'a Mutex<Option<JoinHandle<()>>>) -> Self {
+        let handle = slot.lock().take();
+        Self { slot, handle }
+    }
+
+    /// Tell the task to end and wait for its end ([`ended`]).
+    async fn ended(mut self) {
+        if let Some(handle) = &mut self.handle {
+            ended(handle).await;
+        }
+        self.handle = None;
+    }
+}
+
+impl Drop for Awaited<'_> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let mut slot = self.slot.lock();
+            if slot.is_none() {
+                *slot = Some(handle);
+            }
+        }
+    }
+}
+
+/// Write a task's handle into its slot, and tell the task the slot still
+/// held to end: a start ends the event task and the liveness sweep it
+/// replaces ([`WorkerMonitor::start_event_loop`]).
+fn replace(slot: &Mutex<Option<JoinHandle<()>>>, handle: JoinHandle<()>) {
+    if let Some(replaced) = slot.lock().replace(handle) {
+        replaced.abort();
+    }
+}
+
+/// Abort a task of the monitor and wait for its end ([`WorkerMonitor::stop`]).
+/// An aborted task ends at its next wait, and a cancelled join is its end.
+async fn ended(handle: &mut JoinHandle<()>) {
+    handle.abort();
+    let _ = handle.await;
+}
+
 /// Debounced eviction flusher: waits for the first queued eviction, lets a
 /// gradual removal stream accumulate for [`EVICTION_DEBOUNCE`], then applies
 /// the whole backlog in one snapshot rebuild.
@@ -2329,7 +2507,8 @@ async fn poll_group_once<G: Generation>(
     now: Instant,
 ) {
     // Only poll Ready workers — Pending/NotReady/Failed do not
-    // serve traffic and should not contribute load samples.
+    // serve traffic and should not contribute load samples. A worker its
+    // host asks for no load is no member of the tick.
     let workers: Vec<Arc<dyn Worker>> = monitor
         .worker_registry
         .get_workers_filtered(
@@ -2340,7 +2519,7 @@ async fn poll_group_once<G: Generation>(
             false,
         )
         .into_iter()
-        .filter(|w| w.status() == WorkerStatus::Ready)
+        .filter(|w| w.status() == WorkerStatus::Ready && monitor.sink.polls(w.as_ref()))
         .collect();
 
     if workers.is_empty() {
@@ -3318,23 +3497,185 @@ mod native_loads_tests {
         }
     }
 
-    /// A gRPC worker whose connect never returns stalls no poll. Its engine
-    /// has a missing report for the tick and holds no connection, and an
-    /// engine fetched beside it has its report.
-    #[tokio::test(start_paused = true)]
-    async fn a_connect_that_never_returns_is_a_missing_report_and_stalls_no_other_engine() {
-        let silent: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://engine-a.invalid:50051")
+    /// A gRPC worker of `model` whose connect never returns.
+    fn silent_worker(url: &str, model: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
                 .worker_type(WorkerType::Regular)
                 .connection_mode(ConnectionMode::Grpc)
-                .model(ModelCard::new("a"))
+                .model(ModelCard::new(model))
                 .engine_connector(Arc::new(SilentConnect))
                 .health_config(HealthCheckConfig {
                     disable_health_check: true,
                     ..Default::default()
                 })
                 .build(),
+        )
+    }
+
+    /// A drop alone does not end a monitor whose polls outlast its period.
+    /// Each of two groups polls a worker whose connect never returns, so
+    /// each poll lasts the poll's deadline, three periods. Each group's
+    /// loop takes the monitor again while the other's poll holds it, and
+    /// the monitor polls on with no host. A stop ends every loop, and the
+    /// monitor then ends with its host's handle.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_ends_a_monitor_that_its_own_polls_keep_past_its_drop() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        for (url, model) in [
+            ("grpc://engine-a.invalid:50051", "a"),
+            ("grpc://engine-b.invalid:50051", "b"),
+        ] {
+            registry.register(silent_worker(url, model)).unwrap();
+        }
+        monitor.start_event_loop();
+        // Each group's first poll is out.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        let dropped = Arc::downgrade(&monitor);
+        drop(monitor);
+        tokio::time::sleep(LOAD_POLL_DEADLINE * 4).await;
+        let monitor = dropped
+            .upgrade()
+            .expect("the dropped monitor's own polls keep it");
+
+        monitor.stop().await;
+        drop(monitor);
+        assert!(
+            dropped.upgrade().is_none(),
+            "a stopped monitor outlived its host's handle"
         );
+    }
+
+    /// A stop dropped at a wait leaves no task of the monitor running: each
+    /// was told to end ahead of that wait. Each group's poll is in flight
+    /// and holds the monitor. The stop is polled until it has taken the
+    /// groups' loops, and is dropped at its wait for the tasks' ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_dropped_at_a_wait_leaves_no_task_running() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        for (url, model) in [
+            ("grpc://engine-a.invalid:50051", "a"),
+            ("grpc://engine-b.invalid:50051", "b"),
+        ] {
+            registry.register(silent_worker(url, model)).unwrap();
+        }
+        monitor.start_event_loop();
+        // Each group's first poll is out, and holds the monitor.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(Arc::strong_count(&monitor) > 1);
+
+        {
+            let stop = monitor.stop();
+            tokio::pin!(stop);
+            while !monitor.group_handles.lock().is_empty() {
+                let ended = tokio::select! {
+                    biased;
+                    () = &mut stop => true,
+                    () = tokio::task::yield_now() => false,
+                };
+                assert!(!ended, "the stop ended ahead of its drop");
+            }
+        }
+        // A task told to end is gone at its next turn.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            Arc::weak_count(&monitor),
+            0,
+            "a task of the monitor runs on"
+        );
+        assert_eq!(
+            Arc::strong_count(&monitor),
+            1,
+            "a loop's poll still holds the monitor"
+        );
+    }
+
+    /// A routing side that asks the worker at one URL for no load, and reads
+    /// no load itself.
+    #[derive(Debug)]
+    struct LeavesOut(String);
+
+    impl LoadConsumer for LeavesOut {
+        fn needs_loads(&self) -> bool {
+            false
+        }
+
+        fn reconcile_in_flight(&self, _worker: &dyn Worker) {}
+
+        fn polls(&self, worker: &dyn Worker) -> bool {
+            worker.url() != self.0
+        }
+    }
+
+    /// A worker its host asks for no load is no member of a tick: no poll
+    /// goes to it, it has no published report, and no load stream is
+    /// wanted for it. The group's other worker is polled as before. Under
+    /// polling by need its overload protection asks for no load of its
+    /// group.
+    #[tokio::test]
+    async fn a_worker_its_host_leaves_out_is_asked_for_no_load() {
+        let asked = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let left_out = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let monitor = Arc::new(WorkerMonitor::new(
+            Arc::clone(&registry),
+            Arc::new(LeavesOut(left_out.url.clone())),
+            1,
+            false,
+            false,
+        ));
+        let workers = [gauge_worker(&asked.url), gauge_worker(&left_out.url)];
+        for worker in &workers {
+            registry.register(Arc::clone(worker)).unwrap();
+        }
+        let key = WorkerGroupKey {
+            model_id: "a".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+        };
+        poll_group_once(&monitor, &key, Duration::from_secs(1), Instant::now()).await;
+
+        assert_eq!(asked.probes.load(Ordering::SeqCst), 1);
+        assert_eq!(left_out.probes.load(Ordering::SeqCst), 0);
+        assert_eq!(left_out.gateway_probes.load(Ordering::SeqCst), 0);
+        let snapshot = monitor.load_state.snapshot();
+        assert!(snapshot.get(&asked.url).is_some());
+        assert!(snapshot.get(&left_out.url).is_none());
+        assert!(monitor.loads_wanted(&workers[..1]));
+        assert!(
+            !monitor.loads_wanted(&workers[1..]),
+            "a load stream is wanted for a worker left out"
+        );
+        assert!(monitor.loads_wanted(&workers));
+
+        // Under polling by need a member left out counts for nothing: its
+        // overload protection asks for no load of its group. Asked, it does.
+        let guarded = gauge_worker_with_overload(
+            &left_out.url,
+            OverloadUpdate {
+                waiting_requests: Some(5),
+                token_usage: None,
+            },
+        );
+        let group = [Arc::clone(&workers[0]), guarded];
+        let by_need = |leaves_out: &str| {
+            let routing = Arc::new(LeavesOut(leaves_out.to_string()));
+            WorkerMonitor::new(Arc::clone(&registry), routing, 1, false, true)
+        };
+        assert!(
+            !by_need(&left_out.url).loads_wanted(&group),
+            "a member left out asks for its group's loads"
+        );
+        assert!(by_need("").loads_wanted(&group));
+    }
+
+    /// A gRPC worker whose connect never returns stalls no poll. Its engine
+    /// has a missing report for the tick and holds no connection, and an
+    /// engine fetched beside it has its report.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_never_returns_is_a_missing_report_and_stalls_no_other_engine() {
+        let silent = silent_worker("grpc://engine-a.invalid:50051", "a");
         let prompt = SourceConnector::keeping(Some(host_answer(1)));
         let beside = hosted_worker("http://engine-b.invalid:8000", &prompt, None);
         let memo = DashMap::new();

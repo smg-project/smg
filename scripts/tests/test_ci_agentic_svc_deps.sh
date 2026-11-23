@@ -86,9 +86,11 @@ test_postgres_apt_case() (
     export GITHUB_RUN_ID=43966383110 GITHUB_RUN_ATTEMPT=1 CI_POSTGRES_NAME_RANDOM=AABBCC
     export GITHUB_ENV="$temporary/github-env"
     : > "$GITHUB_ENV"
+    export FORBIDDEN_LOG="$temporary/forbidden"
+    : > "$FORBIDDEN_LOG"
     unset TEST_DB CI_POSTGRES_TEST_DB DATA_CONNECTOR_TEST_POSTGRES_URL
     mkdir -p "$temporary/scripts" "$temporary/bin" "$temporary/apt/sources.list.d"
-    # Exercise main's actual three-attempt central install/update/retry code.
+    # Exercise the actual three-attempt central install/update/retry code.
     # Only mirror/network and apt executables are private mocks. Persistent
     # files count across the real subprocess boundaries, not exported funcs.
     cp "$REPO_ROOT/scripts/ci_agentic_svc_deps.sh" "$temporary/scripts/"
@@ -131,7 +133,8 @@ case "$1" in
         [ "$*" = 'install -y -qq postgresql-client' ] || exit 97
         printf 'call\n' >> "$PG_APT_COUNTS/installs"
         [ "$PG_APT_SCENARIO" != second_install_fail ] || exit 100
-        if [ "$PG_APT_SCENARIO" != success ] && [ "$(wc -l < "$PG_APT_COUNTS/installs")" -eq 1 ]; then exit 100; fi
+        if [ "$PG_APT_SCENARIO" != success ] && [ "$PG_APT_SCENARIO" != psql_fail ] \
+            && [ "$(wc -l < "$PG_APT_COUNTS/installs")" -eq 1 ]; then exit 100; fi
         ;;
     *) echo 'forbidden apt operation' >> "$FORBIDDEN_LOG"; exit 97 ;;
 esac
@@ -150,6 +153,7 @@ EOF
         assert_eq ON_ERROR_STOP=1 "$3"
         assert_eq -c "$4"
         assert_eq 'CREATE DATABASE "smg_ci_test_3966383110_1_aabbcc";' "$5"
+        [ "$PG_APT_SCENARIO" != psql_fail ] || return 2
     }
     # A function called in an if-condition must propagate failure explicitly.
     if cmd_create_postgres_db postgres-db; then status=0; else status=$?; fi
@@ -162,9 +166,10 @@ EOF
         assert_eq 1 "$ddl"
         assert_eq $'CI_POSTGRES_TEST_DB=smg_ci_test_3966383110_1_aabbcc\nDATA_CONNECTOR_TEST_POSTGRES_URL=postgresql://postgres:postgres@postgres-db:5432/smg_ci_test_3966383110_1_aabbcc' "$(cat "$GITHUB_ENV")"
     else
-        assert_eq 0 "$ddl"
+        if [ "$scenario" = psql_fail ]; then assert_eq 1 "$ddl"; else assert_eq 0 "$ddl"; fi
         assert_eq '' "$(cat "$GITHUB_ENV")"
     fi
+    assert_eq '' "$(cat "$FORBIDDEN_LOG")"
     echo "PASS postgres_apt_$scenario"
 )
 
@@ -359,5 +364,8 @@ test_custom_mirror_reprobe_case custom_none
 test_mirror_current_origin_case ordinary_https_main
 test_mirror_current_origin_case ordinary_mixed
 test_mirror_current_origin_case reprobe_main_fallback_mixed
+
+# A failed CREATE must not publish a database that does not exist.
+test_postgres_apt_case psql_fail 2 1 1 1 0
 
 echo "ci_agentic_svc_deps tests passed"

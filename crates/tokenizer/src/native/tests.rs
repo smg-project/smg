@@ -4520,11 +4520,12 @@ fn a_thread_keeps_a_quarter_of_its_share_once_enough_threads_call() {
     );
 }
 
-/// Only a miss that waits asks the learned table, so where misses do not
-/// wait (the sentencepiece path, and a byte-level table that lacks a byte's
-/// token) the threads share nothing however many of them call: a thread
-/// keeps its whole share, one that has cleared merges for itself and
-/// encodes as it did, and no learned table is made.
+/// Only a miss that waits asks the learned table. The sentencepiece path
+/// waits by its own rule on a far seed with `misses_wait` off, so its threads
+/// do not share; a byte-level table that lacks a byte's token does not wait.
+/// However many threads call, each keeps its whole share, one that has
+/// cleared merges for itself and encodes as it did, and no learned table is
+/// made.
 #[test]
 fn a_thread_keeps_its_whole_share_where_no_miss_asks_the_learned_table() {
     let mut state = 0x5EED_5EED_5EED_5EEDu64;
@@ -4565,6 +4566,40 @@ fn a_thread_keeps_its_whole_share_where_no_miss_asks_the_learned_table() {
             .expect("ids");
         assert_eq!(many, few);
         assert!(native.learned.get().is_none(), "no table is made");
+    }
+}
+
+/// A long text has the thread's table read back only when the one before
+/// it started longer ago than that one is given to encode, and within the
+/// band: not the first, not one that follows at once, not one after a rest.
+/// A long text is noted for the next one only while more threads are
+/// inside a long text than there are processors, and it leaves the count
+/// when it returns.
+#[test]
+fn a_long_text_reads_the_table_back_after_a_lost_processor() {
+    let mut cache = PieceCache::with_share(1);
+    let bytes = 8192;
+    let given = READ_BACK_BASE + READ_BACK_PER_BYTE * 8192;
+    let first = Instant::now();
+    assert!(!cache.reads_back(first, bytes), "none before it");
+    let at_once = first + given;
+    assert!(!cache.reads_back(at_once, bytes), "it follows at once");
+    let waited = at_once + given + Duration::from_micros(1);
+    assert!(cache.reads_back(waited, bytes), "the thread waited");
+    let rested = waited + READ_BACK_WITHIN;
+    assert!(!cache.reads_back(rested, bytes), "the thread rested");
+
+    let (tokenizer, mut native) = waiting_fixture();
+    native.processors = 1;
+    let text = "xy ".repeat(READ_BACK_MIN_BYTES);
+    for (others, noted) in [(1, true), (0, false)] {
+        native.inside.store(others, Ordering::Relaxed);
+        native
+            .encode(Some(tokenizer.get_model()), &text, false)
+            .expect("ids");
+        let last_long = native.thread_piece_cache().borrow().last_long;
+        assert_eq!(last_long.is_some(), noted, "{others} more inside");
+        assert_eq!(native.inside.load(Ordering::Relaxed), others);
     }
 }
 
@@ -5071,6 +5106,38 @@ fn a_thread_reads_the_merge_table_at_its_second_call_or_before_a_long_first_text
     let on_a_new_thread =
         std::thread::scope(|scope| scope.spawn(|| left_after(&long)).join().expect("a thread"));
     assert_eq!(on_a_new_thread, 0, "a long first text has the read first");
+}
+
+/// A load's rehearsal encodes on a cache of its own (the loading thread,
+/// which may never encode, counts toward no thread's share), and its read
+/// of the merge table stands in for the loading thread's own while it is
+/// fresh, and for no other thread's.
+#[test]
+fn a_rehearsal_reads_for_the_loading_thread_and_makes_no_cache_of_it() {
+    let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+    let tokenizer = tokenizer_of(&shapes()[0], &mut state);
+    let model = tokenizer.get_model();
+    let mut native = seeded(&tokenizer);
+    native.rehearse(Some(model));
+    assert_eq!(native.threads.load(Ordering::Relaxed), 0);
+    // The load's stamp an hour ahead: fresh whatever the pace of the test.
+    let (loader, read_at) = native.load_read.take().expect("the load's stamp");
+    let fresh = read_at + Duration::from_secs(3600);
+    native.load_read = OnceLock::from((loader, fresh));
+    assert!(!native.load_read_holds(fresh + LOAD_READ_HOLDS), "later");
+    let reads_after_two_calls = || {
+        for _ in 0..2 {
+            native
+                .encode_with(Some(model), " one more piece", false, false)
+                .expect("ids");
+        }
+        let merges = native.merges.as_ref().expect("a merge table");
+        merges.reads.load(Ordering::Relaxed)
+    };
+    assert_eq!(reads_after_two_calls(), 1, "the load's read stands in");
+    let elsewhere =
+        std::thread::scope(|scope| scope.spawn(reads_after_two_calls).join().expect("a thread"));
+    assert_eq!(elsewhere, 2, "another thread reads the table itself");
 }
 
 /// A thread whose share fell (threads joined) since it last read it is
@@ -6803,6 +6870,53 @@ fn ids_match_tokenizers_on_random_text_for_every_sentencepiece_shape() {
             }
         }
     }
+}
+
+/// A sentencepiece miss of a young thread close behind another waits only on
+/// a far seed (`NEAR_SEED_SLOTS`): there it takes a hole and is answered from
+/// its character symbols; on the near seed it is answered where it is met.
+#[test]
+fn a_sentencepiece_miss_waits_only_on_a_far_seed() {
+    let mut state = 0x5EA7_ED0F_A125_EED5u64;
+    let tokenizer = sentencepiece_tokenizer(&sentencepiece_shapes()[0], &mut state);
+    let model = tokenizer.get_model();
+    let mut far = seeded(&tokenizer);
+    assert!(far.seed.slots() <= NEAR_SEED_SLOTS);
+    // A test vocabulary's seed is near: an empty table of far size stands in.
+    far.seed = ShortPieceTable::for_entries(NEAR_SEED_SLOTS);
+    let mut cache = far.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    let key = ShortPieceKey::of(b" zq").expect("a short piece");
+    let vacancy = cache.packed.lookup(key, &mut ids).expect("a miss");
+    assert!(
+        far.seeded_raw(vacancy, &mut ids, &mut cache),
+        "far: it waits"
+    );
+    assert_eq!(ids, [7, 0]);
+    assert_eq!(cache.waiting.len(), 1);
+    far.answer_waiting(&mut ids, &mut cache);
+    let mut expected = vec![7];
+    expected.extend(
+        model
+            .tokenize(&format!("{WORD_MARKER}zq"))
+            .expect("the model tokenizes")
+            .iter()
+            .map(|token| token.id),
+    );
+    assert_eq!(ids, expected, "the character-symbol merge answers");
+
+    let near = seeded(&tokenizer);
+    let mut cache = near.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    let vacancy = cache.packed.lookup(key, &mut ids).expect("a miss");
+    assert!(
+        !near.seeded_raw(vacancy, &mut ids, &mut cache),
+        "near: it answers in place"
+    );
+    assert_eq!(ids, [7]);
+    assert!(cache.waiting.is_empty());
 }
 
 #[test]

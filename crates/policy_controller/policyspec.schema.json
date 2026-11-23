@@ -1678,14 +1678,14 @@
           }
         },
         "ttl_s": {
-          "description": "How long an idle key stays pinned, in seconds; above zero (default\n14400), `4294967295` for ever.",
+          "description": "How long an idle key stays pinned, in seconds, before the rule's\nnext sweep forgets it; above zero (default 14400), `4294967295` for\never. A host that keeps a record of the pins, as the controller's\nown service does, forgets the key at `ttl_s` itself.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
           "default": 14400
         },
         "sweep_s": {
-          "description": "The sweep cadence of idle keys, in seconds; above zero (default 120),\n`4294967295` for never, allowed under a `ttl_s` for ever alone.",
+          "description": "The sweep cadence of idle keys, in seconds: a key idle for `ttl_s`\nis forgotten at the next sweep, and one used again ahead of it stays\npinned. Above zero (default 120), `4294967295` for never, allowed\nunder a `ttl_s` for ever alone. Under a host that keeps a record of\nthe pins the sweep only reclaims.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
@@ -1713,6 +1713,10 @@
           "description": "Which pin leads once both of a key's pins are routable (default\n`original`).",
           "$ref": "#/$defs/Recovery",
           "default": "original"
+        },
+        "rule_placed": {
+          "description": "Whether a request this rule placed alone is the profile's own\n(default `told`). Under `untold` no stage hears that request's issue\nor its dispatch, and it is none of the profile's sends. The session\ntable still hears its dispatch, and the stages its completion and\nits release. A host that tells a lease's words off its file keeps\nno such word of a pick: it takes the rule, and tells such a request\nas it tells any other.",
+          "$ref": "#/$defs/RulePlaced"
         }
       },
       "additionalProperties": false
@@ -1748,6 +1752,21 @@
       "enum": [
         "original",
         "latest"
+      ]
+    },
+    "RulePlaced": {
+      "description": "Whether a request a sessions rule placed alone is the profile's own: a\npin of the request's key followed, or the rule's own assignment. No\nstage of the profile placed such a request.",
+      "oneOf": [
+        {
+          "description": "The profile's own: its stages hear the request's issue and its\ndispatch, and it counts among the profile's sends.",
+          "type": "string",
+          "const": "told"
+        },
+        {
+          "description": "Kept from the profile, as a gateway's sticky map keeps a request it\nplaces from the gateway's policy.",
+          "type": "string",
+          "const": "untold"
+        }
       ]
     },
     "ShadowSpec": {
