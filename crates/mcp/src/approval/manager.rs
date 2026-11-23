@@ -191,7 +191,7 @@ impl ApprovalManager {
         let key = ApprovalKey::new(params.request_id, params.server_key, params.elicitation_id);
 
         if self.pending.contains_key(&key) {
-            return Err(ApprovalError::AlreadyPending(key.to_string()).into());
+            return Err(ApprovalError::AlreadyPending(key.elicitation_id).into());
         }
 
         let (tx, rx) = oneshot::channel();
@@ -457,7 +457,10 @@ mod tests {
         let result = manager
             .handle_approval(ApprovalMode::Interactive, params2)
             .await;
-        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Approval error: Approval already pending: elicit-1"
+        );
     }
 
     #[test]
