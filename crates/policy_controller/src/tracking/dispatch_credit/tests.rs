@@ -686,6 +686,23 @@ fn removing_a_worker_clears_its_ranks_sends() {
     assert_eq!(reads.of(&b), one(TOKENS));
 }
 
+#[test]
+fn a_join_drops_the_sends_told_behind_its_ids_removal() {
+    let (engine, sent) = built(None);
+    let a = row(139, 3);
+    let b = row(149, 3);
+    engine.on_membership(&Membership::Removed(a.id));
+    // A request placed ahead of the removal tells its dispatch behind it.
+    for candidate in [&a, &b] {
+        send(&engine, candidate, START, TOKENS);
+    }
+    engine.on_membership(&Membership::Added(a.id));
+    let facts = clock(0);
+    let reads = sent.pass(&facts);
+    assert_eq!(reads.of(&a), CreditedDispatches::default());
+    assert_eq!(reads.of(&b), one(TOKENS));
+}
+
 #[cfg_attr(
     not(feature = "in-process"),
     expect(

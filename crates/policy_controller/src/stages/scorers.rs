@@ -1049,7 +1049,8 @@ impl Credits {
     /// A rank the tally does not know is entered only where `present`
     /// says its row still stands, so a late dispatch enters no rank
     /// behind a removal. A rank the tally knows takes the dispatch
-    /// unasked: a removal forgets the worker's entries.
+    /// unasked: a removal forgets the worker's entries, and a join of the
+    /// id forgets what entered under it since.
     pub(crate) fn dispatched(
         &self,
         lease: &Lease,
@@ -1085,8 +1086,9 @@ impl Credits {
         }
     }
 
-    /// Drops the ranks a membership change takes away, each entry that
-    /// goes shown to `dropped` first.
+    /// Drops the ranks a membership change takes away, and at a join the
+    /// ranks held under the joining id, each entry that goes shown to
+    /// `dropped` first.
     pub(crate) fn membership(&self, change: &Membership<'_>, dropped: impl FnMut(&RankCredit)) {
         match change {
             // Every rank of the worker goes with it. A resized worker's ranks
@@ -1097,6 +1099,16 @@ impl Credits {
             | Membership::Replaced { old: id, .. }
             | Membership::Resized(id) => {
                 self.forget(|(worker, _)| worker == id, dropped);
+            }
+            // A join drops what a dispatch told behind the id's removal
+            // entered: the worker that joins took none of those sends. A
+            // send to the joining worker told ahead of this word goes with
+            // them: an id alone does not tell the two apart. A join that
+            // finds no rank of its id copies no map.
+            Membership::Added(id) => {
+                if self.tally.load().keys().any(|(worker, _)| worker == id) {
+                    self.forget(|(worker, _)| worker == id, dropped);
+                }
             }
             // A snapshot (every worker of every pool, after a resync) stands
             // for removals that may never have arrived: only its ids keep a
@@ -1109,7 +1121,7 @@ impl Credits {
                     dropped,
                 );
             }
-            Membership::Added(_) | Membership::Relabelled(_) | Membership::Left { .. } => {}
+            Membership::Relabelled(_) | Membership::Left { .. } => {}
         }
     }
 }
