@@ -17,11 +17,13 @@
 //! The lock is one request's own: its two sides alone take it, each for
 //! the time of one call or of its drop, and no other request ever waits
 //! on it. The decode side holds it through its second decision
-//! ([`PlacementSide::decode_again`]), so a route's rule for that decision
-//! ([`PlaceRequest::admits`]) is asked under it. Such a rule must leave
-//! the pair's sides alone: the send or the drop of one, from inside the
-//! rule, would wait on the lock the rule is asked under and never
-//! return. A single request's side owns its placement and takes no lock.
+//! ([`PlacementSide::decode_again`]), so whatever the request lends that
+//! decision is asked under it: its route's rule
+//! ([`PlaceRequest::admits`]), its headers ([`PlaceRequest::headers`]),
+//! its ring ([`PlaceRequest::ring`]) and its lists' admission. None of
+//! them may send or drop a side of the pair: it would wait on the lock it
+//! is asked under and never return. A single request's side owns its
+//! placement and takes no lock.
 //!
 //! **The order of a pair's words** is kept here, in whatever order its
 //! host lets the two sides go. A decode that still stands chosen leaves
@@ -186,9 +188,9 @@ impl PlacementSide {
     /// decode there, and says this side's [`Self::sent`] at that send.
     ///
     /// `request` states the request again, as [`Placement::decode_again`]
-    /// reads it. Its rule ([`PlaceRequest::admits`]) is asked under the
-    /// pair's lock and must leave the pair's sides alone (the module's
-    /// words on the lock).
+    /// reads it. What it lends the decision (its rule, its headers, its
+    /// ring and its lists' admission) is asked under the pair's lock and
+    /// must leave the pair's sides alone (the module's words on the lock).
     ///
     /// **The order.** The call is made once the prefill side's send was
     /// said. Its host may let the prefill side go before the call or
@@ -213,16 +215,7 @@ impl PlacementSide {
             return Err(Unplaced::Refused(refused));
         };
         let mut pair = pair.lock();
-        pair.placement.decode_again(request)?;
-        // The call wrote the decode it took. It is read ahead of the held
-        // end: had the call written none, it took no decode, and that end
-        // still waits.
-        let decode = pair.placement.decode.clone();
-        debug_assert!(
-            decode.is_some(),
-            "a decode decided again is written into its placement"
-        );
-        let decode = decode.ok_or(Unplaced::NoWorkers)?;
+        let decode = pair.placement.decode_taken(request)?;
         // The decode no longer stands chosen: a prefill's end that waited
         // for this side's word is said behind the decode the call took.
         pair.end_held_prefill();
