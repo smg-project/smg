@@ -416,15 +416,16 @@ impl PolicyRegistry {
 
     /// The registry of a gateway of `config`: the classic one
     /// ([`Self::with_override`]), or the one that makes no classic policy
-    /// where the configuration runs the policy controller
-    /// ([`Self::for_policy_engine`]), under the pairing mode in force
+    /// where the policy engine places the gateway's requests
+    /// (`RouterConfig::policy_engine_decides`, [`Self::for_policy_engine`]),
+    /// under the pairing mode in force
     /// (`RouterConfig::pd_pairing_in_force`): a supplied document's own
     /// where the policy controller runs one, else the configuration's. The
     /// one place that reads the option for the registry.
     pub fn of_config(config: &RouterConfig) -> Self {
         let (policy, routing_key_override) =
             (config.policy.clone(), config.routing_key_override.clone());
-        let registry = if config.policy_controller {
+        let registry = if config.policy_engine_decides() {
             Self::for_policy_engine(policy, routing_key_override)
         } else {
             Self::with_override(policy, routing_key_override)
