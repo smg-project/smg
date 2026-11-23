@@ -150,7 +150,9 @@ const NONE: u32 = u32::MAX;
 /// One merge as the table stores it, in one word: the rank in the high half
 /// and the id the merge produces in the low half, so that a pair's lookup
 /// answers both with the one load. [`Merge::NONE`] stands for a pair that is
-/// no merge; its rank reads [`NO_RANK`].
+/// no merge; its rank reads [`NO_RANK`]. A table gives one rank one product:
+/// a short merge's key orders by both before the position (see
+/// [`SHORT_KEY_BITS`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Merge(u64);
 
@@ -1345,6 +1347,8 @@ impl<const N: usize> ShortMerge<N> {
     }
 }
 
+/// The least of eight keys, as a tree of minima three deep rather than a
+/// chain of seven: the next merge waits on it (see [`SHORT_KEY_BITS`]).
 #[inline(always)]
 fn least_of_eight(keys: &[u64; 8]) -> u64 {
     let [a, b, c, d, e, f, g, h] = *keys;
