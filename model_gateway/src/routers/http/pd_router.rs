@@ -103,8 +103,8 @@ use crate::{
             route_to_endpoint,
         },
         http::router::{
-            read_body_capped, send_with_stale_conn_retry, worker_body_too_large, BodyReadError,
-            RerankResponseSpec, Router,
+            convert_reqwest_error, read_body_capped, send_with_stale_conn_retry,
+            worker_body_too_large, BodyReadError, RerankResponseSpec, Router,
         },
         prefill_queue_full, prefill_queue_timeout, RouterTrait, PD_PREFILL_QUEUE_FULL,
         PD_PREFILL_QUEUE_TIMEOUT,
@@ -433,13 +433,14 @@ impl PDRouter {
         }
 
         match send_with_stale_conn_retry(request_builder).await {
-            Ok(res) if res.status().is_success() => {
+            Ok(res) => {
+                let status = res.status();
                 let response_headers = header_utils::preserve_response_headers(res.headers());
 
                 match read_body_capped(res.bytes_stream(), max_payload_size).await {
                     Ok(body) => {
                         let mut response = Response::new(Body::from(body));
-                        *response.status_mut() = StatusCode::OK;
+                        *response.status_mut() = status;
                         *response.headers_mut() = response_headers;
                         response
                     }
@@ -474,46 +475,13 @@ impl PDRouter {
                     }
                 }
             }
-            Ok(res) => {
-                let status = res.status();
-                // Use the status code to determine which error function to use
-                match status {
-                    StatusCode::BAD_REQUEST => error::bad_request(
-                        "server_bad_request",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                    StatusCode::NOT_FOUND => error::not_found(
-                        "server_not_found",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                    StatusCode::INTERNAL_SERVER_ERROR => error::internal_error(
-                        "server_internal_error",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                    StatusCode::SERVICE_UNAVAILABLE => error::service_unavailable(
-                        "server_unavailable",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                    StatusCode::BAD_GATEWAY => error::bad_gateway(
-                        "server_bad_gateway",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                    _ => error::internal_error(
-                        "server_error",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                }
-            }
             Err(e) => {
                 error!(
                     worker = Endpoint::redacted_str(worker.url()),
                     "Failed to proxy request server: {}",
                     cause(&e)
                 );
-                error::internal_error(
-                    "proxy_request_failed",
-                    format!("Failed to proxy request: {}", cause(&e)),
-                )
+                convert_reqwest_error(e)
             }
         }
     }
@@ -4260,6 +4228,31 @@ mod tests {
         );
     }
 
+    /// A worker's refusal goes back as the worker sent it (its status, its
+    /// body, its `Retry-After`), as the regular router's proxied GET relays
+    /// it, not as an error object of the gateway's own.
+    #[tokio::test]
+    async fn a_proxied_get_relays_the_workers_refusal() {
+        let app = axum::Router::new().fallback(axum::routing::any(|| async {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(RETRY_AFTER, "7")],
+                r#"{"error":"busy"}"#,
+            )
+        }));
+        let worker = ready_prefill_worker(spawn_stub(app).await);
+
+        let response =
+            PDRouter::proxy_to_worker(&worker, "get_server_info", None, usize::MAX).await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[RETRY_AFTER], "7");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], br#"{"error":"busy"}"#);
+    }
+
     /// A worker that closes the connection after its head, before the body
     /// it announced, failed below HTTP: the proxied GET answers a bad gateway
     /// under the read's code, as the typed routes' buffered reads do, not a
@@ -4681,7 +4674,7 @@ mod tests {
                 "Failed to proxy request server",
                 ProxiedGet,
                 Unreachable,
-                StatusCode::INTERNAL_SERVER_ERROR,
+                BAD_GATEWAY,
             ),
             ("Failed to read response body", ProxiedGet, Cut, BAD_GATEWAY),
             (
