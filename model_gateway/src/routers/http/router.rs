@@ -1142,7 +1142,10 @@ impl Router {
     /// its dispatch-time overload re-check, the form's send and the relay of
     /// the worker's answer. Separate from `route_typed_request` because the
     /// endpoint is not JSON-bodied: the form is sent once (no retry could
-    /// replay it) and never passes through `prepare_request`.
+    /// replay it) and never passes through `prepare_request`. So the form
+    /// names no data-parallel rank: a rank's worker is sent the request with
+    /// none, at its engine's own address, and the engine places it among its
+    /// ranks.
     async fn route_multipart_transcription(
         &self,
         headers: Option<&HeaderMap>,
@@ -1227,13 +1230,14 @@ impl Router {
     }
 
     /// The worker of a transcription, or the refusal this router answers.
-    /// Multipart transcription can't route through `worker.prepare_request`,
-    /// which is the hook that injects `data_parallel_rank` for DP-aware
-    /// workers: DP-aware workers are pre-filtered out of the candidate pool
-    /// so the policy can pick a non-DP worker when one exists, and the
-    /// request falls back to model_not_found / 400 only when the pool is
-    /// empty or every candidate is DP-aware. The verdict on a policy that
-    /// returns no worker is judged from the same pool.
+    /// The placement is handed the model's HTTP pool whole: a worker that
+    /// registered a data-parallel rank takes a transcription like a plain
+    /// one. Multipart transcription can't route through
+    /// `worker.prepare_request`, the hook that injects `data_parallel_rank`
+    /// for a DP-aware worker, so no worker is sent a rank and the two are
+    /// the same send. An empty pool is answered model_not_found, and the
+    /// verdict on a placement that returns no worker is judged from the
+    /// same pool.
     fn select_transcription_worker(
         &self,
         headers: Option<&HeaderMap>,
@@ -1251,23 +1255,12 @@ impl Router {
                 error::model_not_found(model_id),
             ));
         }
-        let non_dp_workers: Vec<Arc<dyn Worker>> = all_workers
-            .iter()
-            .filter(|w| !w.is_dp_aware())
-            .cloned()
-            .collect();
-        if non_dp_workers.is_empty() {
-            return Err(error::bad_request(
-                "dp_aware_not_supported",
-                "/v1/audio/transcriptions does not yet support DP-aware workers",
-            ));
-        }
         let Some(placed) = placement::select_from(
             &self.worker_registry,
             &self.policy_registry,
             model_id,
             RoutingPool::HttpRegular,
-            &non_dp_workers,
+            &all_workers,
             PlacementInputs {
                 text: routing.text.as_deref(),
                 tokens: routing.tokens.as_deref(),
@@ -1283,7 +1276,7 @@ impl Router {
             // or a self-filtering policy missed on an all-overloaded pool, so
             // a shed keeps its Retry-After, retryability and metric.
             let resp = match placement::failure_from(
-                &non_dp_workers,
+                &all_workers,
                 model_id,
                 self.worker_registry.overload_shed_enabled(),
             ) {
@@ -1295,7 +1288,7 @@ impl Router {
                 | PlacementFailure::PrefillAtCapacity => {
                     // The verdict cannot tell a policy miss from a drained
                     // pool; the pool can.
-                    let message = if non_dp_workers.iter().any(|w| w.is_available()) {
+                    let message = if all_workers.iter().any(|w| w.is_available()) {
                         "Policy returned no eligible worker"
                     } else {
                         "All workers are unavailable (circuit breaker open or unhealthy)"
@@ -1874,8 +1867,8 @@ struct RouteOutcome<'a> {
 
 impl RouteOutcome<'_> {
     /// Finalize router metrics for an early error that never reached an
-    /// upstream worker (model_not_found, dp_aware_not_supported, no
-    /// available workers, build failure). Without this, pre-send failures
+    /// upstream worker (model_not_found, no available workers, build
+    /// failure). Without this, pre-send failures
     /// silently disappear from router_upstream_responses / router_error.
     fn pre_send_error(&self, response: &Response) {
         let rstatus = response.status();
@@ -3035,6 +3028,8 @@ mod tests {
         server::{http_client, http_client_builder},
         tenant::TenantKey,
     };
+
+    mod transcription;
 
     /// Accepts `kill_first` connections and closes them before any response
     /// bytes, then serves a minimal 200 on every later connection. Returns
@@ -7573,7 +7568,3 @@ mod upstream_span_tests {
         );
     }
 }
-
-#[cfg(test)]
-#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
-mod classic_rank_rows;
