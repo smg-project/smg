@@ -836,13 +836,19 @@ mod in_process {
     use smg_policy_controller::{
         document::{AppliedSpec, PolicySpec, ScoreSpec},
         engine::{
-            Candidate, Decision, LentList, ListCell, PlaceRequest, PolicyEngine, RequestFacts,
-            Scorer, Target, TieBand, WorkerLists,
+            Candidate, Decision, LentList, ListCell, PairAdmission, PairLists, PartnerClasses,
+            PlaceRequest, PolicyEngine, RequestFacts, Scorer, Target, TieBand, WorkerLists,
         },
         stages::{Lifecycle, StageRegistry},
-        tracking::{EventSet, Lease, Outcome, ReleaseReason, Side, TransportClass},
+        tracking::{
+            EventKind, EventSet, Lease, Outcome, PlacementSide, ReleaseReason, Side, TransportClass,
+        },
     };
-    use smg_worker::{identity::basic::Worker, test_support::ready_worker};
+    use smg_worker::{
+        identity::{basic::Worker, builder::BasicWorkerBuilder},
+        test_support::{no_health_check, ready_worker},
+        worker::{WorkerSpec, WorkerStatus, WorkerType},
+    };
 
     use super::allocations_during;
 
@@ -872,14 +878,14 @@ mod in_process {
         }
     }
 
-    /// A scorer that scores every worker alike and takes every word of a
-    /// lease. It counts each word and allocates nothing.
+    /// A scorer that scores every worker alike and takes the words of a
+    /// lease it is made to take. It counts each word and allocates nothing.
     #[derive(Debug)]
-    struct Hears(Arc<Told>);
+    struct Hears(Arc<Told>, EventSet);
 
     impl Lifecycle for Hears {
         fn hears(&self) -> EventSet {
-            EventSet::LEASE
+            self.1
         }
 
         fn on_decision_issued(&self, _: &Lease, _: &Decision) {
@@ -917,17 +923,29 @@ mod in_process {
     }
 
     /// The engine of the `round_robin` preset, for the life of the process:
-    /// the preset as it stands, or with [`Hears`] among its scorers where
-    /// `told` is handed.
+    /// the preset as it stands, or with a [`Hears`] that takes every word of
+    /// a lease among its scorers where `told` is handed.
     fn engine_of(told: Option<&Arc<Told>>) -> &'static PolicyEngine {
-        let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+        let document = PolicySpec::preset("round_robin").expect("a preset of this build");
+        let hears = told.map(|told| (told, EventSet::LEASE));
+        engine_under(document, "round_robin", hears)
+    }
+
+    /// The engine of `document`, for the life of the process: the document
+    /// as it stands, or with a [`Hears`] among the scorers of its `profile`
+    /// where `hears` hands that stage's counts and the words it takes.
+    fn engine_under(
+        mut document: PolicySpec,
+        profile: &str,
+        hears: Option<(&Arc<Told>, EventSet)>,
+    ) -> &'static PolicyEngine {
         let mut stages = StageRegistry::builtin();
-        if let Some(told) = told {
+        if let Some((told, takes)) = hears {
             let kept = Arc::clone(told);
-            let added = stages.scorer("hears", move || Box::new(Hears(Arc::clone(&kept))));
+            let added = stages.scorer("hears", move || Box::new(Hears(Arc::clone(&kept), takes)));
             added.expect("a free name");
-            let profile = document.profiles.get_mut("round_robin");
-            let scorers = &mut profile.expect("the preset's profile").score;
+            let profile = document.profiles.get_mut(profile);
+            let scorers = &mut profile.expect("the document's profile").score;
             scorers.push(ScoreSpec::from("hears"));
         }
         let spec = AppliedSpec::validate_in(&document, &stages, &[]);
@@ -979,6 +997,140 @@ mod in_process {
                 let since = [0, 1, 2, 3].map(|word| after[word] - before[word]);
                 assert_eq!(since, [each, each, each, 0], "{n} workers");
             }
+        }
+    }
+
+    /// A ready worker of `worker_type` at `url`, with no health checker
+    /// behind it.
+    fn typed(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
+        let spec = WorkerSpec {
+            worker_type,
+            ..WorkerSpec::new(url.to_owned())
+        };
+        let worker = <BasicWorkerBuilder>::from_spec(spec)
+            .health_config(no_health_check())
+            .build();
+        worker.set_status(WorkerStatus::Ready);
+        Arc::new(worker)
+    }
+
+    /// A pair's host that admits every worker.
+    #[derive(Debug)]
+    struct Open;
+
+    impl PairAdmission for Open {
+        fn has_capacity(&self, _: usize) -> bool {
+            true
+        }
+
+        fn has_room(&self, _: usize) -> bool {
+            true
+        }
+    }
+
+    /// What the sides a host keeps with its sends allocate, counted from
+    /// the split of a kept placement to the last drop: each side's send, a
+    /// handle on its end, a report through the handle, and both drops.
+    /// Under a stage that takes a dispatch and no end, a single request's
+    /// side allocates nothing and a pair's two sides the one value they
+    /// share: a handle is empty, and its report is told to nobody. Under a
+    /// stage that takes an end each side allocates once more, for what it
+    /// shares with its handles, and the stage hears each reported end.
+    #[test]
+    fn a_side_allocates_nothing_for_an_end_no_stage_takes() {
+        let no_end = EventSet::NONE.with(EventKind::Dispatched);
+        let report = |side: &PlacementSide, empty: bool| {
+            let end = side.side_end();
+            assert_eq!(end.is_empty(), empty);
+            end.reported(Outcome::reported(200, TransportClass::Ok));
+        };
+        for (takes, a_side) in [(no_end, 0), (EventSet::LEASE, 1)] {
+            let empty = a_side == 0;
+            let told = Arc::new(Told::default());
+            let document = PolicySpec::preset("round_robin").expect("a preset of this build");
+            let engine = engine_under(document, "round_robin", Some((&told, takes)));
+            let list: Arc<[Arc<dyn Worker>]> = (0..8)
+                .map(|at| ready_worker(&format!("http://w{at}:8000"), MODEL))
+                .collect();
+            let cell = ListCell::default();
+            let lent = LentList {
+                workers: &list,
+                cell: &cell,
+                facts: None,
+            };
+            let request = PlaceRequest::of(MODEL, WorkerLists::Single(lent));
+            let serve = || {
+                let placement = engine.place(&request).expect("a worker of the list");
+                assert!(placement.owes_events(), "a stage takes its dispatch");
+                let placement = placement.kept();
+                let ((), allocations) = allocations_during(|| {
+                    let (mut side, none) = placement.sides();
+                    assert!(none.is_none());
+                    side.sent();
+                    report(&side, empty);
+                });
+                allocations
+            };
+            for _ in 0..16 {
+                serve();
+            }
+            let before = told.read();
+            let allocations: usize = (0..256).map(|_| serve()).sum();
+            assert_eq!(allocations, 256 * a_side, "a single request's side");
+            let after = told.read();
+            let since = [0, 1, 2, 3].map(|word| after[word] - before[word]);
+            let each = 256 * a_side;
+            assert_eq!(since, [each, 256, each, 0], "the words the stage takes");
+
+            let told = Arc::new(Told::default());
+            let document = PolicySpec::pair_presets("round_robin", "round_robin");
+            let document = document.expect("the pair presets");
+            let engine = engine_under(document, "decode", Some((&told, takes)));
+            let prefills: Arc<[Arc<dyn Worker>]> =
+                Arc::from([typed("grpc://prefill:9000", WorkerType::Prefill)]);
+            let decodes: Arc<[Arc<dyn Worker>]> =
+                Arc::from([typed("grpc://decode:9000", WorkerType::Decode)]);
+            let (prefill_cell, decode_cell) = (ListCell::default(), ListCell::default());
+            let classes = PartnerClasses::number(1, [&[0_u32][..]]);
+            let lists = PairLists {
+                prefill: LentList {
+                    workers: &prefills,
+                    cell: &prefill_cell,
+                    facts: None,
+                },
+                decode: LentList {
+                    workers: &decodes,
+                    cell: &decode_cell,
+                    facts: None,
+                },
+                classes: &classes,
+                admission: &Open,
+                prefill_places: None,
+                decode_places: None,
+                prefill_stalled: &[],
+                prefill_held: &[],
+                decode_stalled: &[],
+                decode_held: &[],
+            };
+            let request = PlaceRequest::of(MODEL, WorkerLists::Pair(lists));
+            let serve = || {
+                let placement = engine.place(&request).expect("a pair of the lists");
+                let placement = placement.kept();
+                let ((), allocations) = allocations_during(|| {
+                    let (mut prefill, decode) = placement.sides();
+                    let mut decode = decode.expect("a pair's decode side");
+                    prefill.sent();
+                    decode.sent();
+                    report(&prefill, empty);
+                    report(&decode, empty);
+                });
+                allocations
+            };
+            for _ in 0..16 {
+                serve();
+            }
+            let allocations: usize = (0..256).map(|_| serve()).sum();
+            assert_eq!(allocations, 256 * (1 + 2 * a_side), "a pair's two sides");
         }
     }
 }
