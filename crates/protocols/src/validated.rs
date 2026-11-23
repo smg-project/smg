@@ -762,7 +762,7 @@ fn json_rejection(err: JsonRejection) -> Response {
 #[cfg(feature = "axum")]
 impl<S, T> FromRequest<S> for ValidatedJson<T>
 where
-    T: DeserializeOwned + Validate + Normalizable + Send,
+    T: DeserializeOwned + Validate + Normalizable + Send + 'static,
     S: Send + Sync,
 {
     type Rejection = Response;
@@ -790,9 +790,9 @@ where
                 .map_err(|err| json_rejection(JsonRejection::from(err)))?;
             // The body is checked as text once, as a whole: a parse from bytes
             // checks every key and every string on its own.
-            let direct = std::str::from_utf8(&bytes)
-                .ok()
-                .and_then(|text| serde_json::from_str::<T>(text).ok());
+            let direct = std::str::from_utf8(&bytes).ok().and_then(|text| {
+                crate::message_read::direct::<T, _>(|| serde_json::from_str::<T>(text)).ok()
+            });
             match direct {
                 Some(data) => Json(data),
                 None => Json::<T>::from_bytes(&bytes).map_err(json_rejection)?,
@@ -1654,7 +1654,7 @@ mod tests {
     /// The status and body of a rejected body of type `T`.
     async fn rejected<T>(body: &str) -> (StatusCode, Value)
     where
-        T: DeserializeOwned + Validate + Normalizable + Send,
+        T: DeserializeOwned + Validate + Normalizable + Send + 'static,
     {
         let request = Request::builder()
             .method("POST")

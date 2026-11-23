@@ -374,6 +374,7 @@ impl MessageContent {
 pub struct ChatCompletionRequest {
     /// A list of messages comprising the conversation so far
     #[validate(custom(function = "validate_messages"))]
+    #[serde(deserialize_with = "crate::message_read::read")]
     pub messages: Vec<ChatMessage>,
 
     /// ID of the model to use
