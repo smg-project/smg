@@ -347,10 +347,11 @@ impl DeepseekV41Processor {
         let plans = self.plans(images);
         let total_patches: usize = plans.iter().map(|plan| plan.n_vit_h * plan.n_vit_w).sum();
         let p = self.patch_size;
-        let patch_bytes = 3 * p * p * writer.element_size();
+        let patch_bytes = output_len(&[3, p, p, writer.element_size()])?;
         // A pooled buffer: its bytes are a previous request's until the
         // bands are written, and the bands cover it.
-        let mut wire = buffer_pool::take(total_patches * patch_bytes);
+        let mut wire =
+            buffer_pool::try_take(output_len(&[total_patches, patch_bytes])?).map_err(refused)?;
         let mut written = 0;
         for (image, plan) in images.iter().zip(&plans) {
             let transformed = self.transform(image, plan)?;
@@ -368,6 +369,22 @@ impl DeepseekV41Processor {
                 .map_err(TransformError::ShapeError)?;
         Ok(with_spans(images, &plans, encoder_input))
     }
+}
+
+/// The request's error for a patch output that cannot be reserved.
+fn refused(reason: impl std::fmt::Display) -> TransformError {
+    TransformError::ShapeError(format!(
+        "cannot reserve DeepSeek-V4.1 patch output: {reason}"
+    ))
+}
+
+/// The product of `factors`, the size of a patch output, or the request's
+/// error when `usize` cannot count it.
+fn output_len(factors: &[usize]) -> Result<usize, TransformError> {
+    factors
+        .iter()
+        .try_fold(1usize, |n, &d| n.checked_mul(d))
+        .ok_or_else(|| refused("its size overflows usize"))
 }
 
 /// The `f32` every pixel byte normalizes to, in the reference's own `f32`
@@ -467,10 +484,12 @@ impl VisionPreProcessor for DeepseekV41Processor {
         let plans = self.plans(images);
         let total_patches: usize = plans.iter().map(|plan| plan.n_vit_h * plan.n_vit_w).sum();
         let p = self.patch_size;
-        let patch_len = 3 * p * p;
         // Every image's patches land in the one buffer the engine reads, in
         // order; no per-image copy.
-        let mut encoder_input = Vec::with_capacity(total_patches * patch_len);
+        let mut encoder_input = Vec::new();
+        encoder_input
+            .try_reserve_exact(output_len(&[total_patches, 3, p, p])?)
+            .map_err(refused)?;
         let table = value_table();
         for (image, plan) in images.iter().zip(&plans) {
             let transformed = self.transform(image, plan)?;
@@ -825,5 +844,36 @@ mod tests {
             processor.preprocess_wire(&[], EncoderDtype::BFloat16),
             Some(Err(TransformError::EmptyBatch))
         ));
+    }
+
+    /// A patch too large for any allocation, and a batch of them too large
+    /// for `usize` to count: the request reads an error in both forms of the
+    /// output.
+    #[test]
+    fn a_patch_output_that_cannot_be_reserved_is_an_error() {
+        let processor = DeepseekV41Processor {
+            patch_size: 1 << 30,
+            ..DeepseekV41Processor::new()
+        };
+        let image = gradient(1, 1, 1);
+        let wire = |images: &[&DynamicImage]| {
+            processor
+                .preprocess_wire(images, EncoderDtype::BFloat16)
+                .expect("a narrow wire")
+        };
+
+        for result in [
+            wire(&[&image]),
+            wire(&[&image; 3]),
+            processor.preprocess(&[&image]),
+        ] {
+            assert!(
+                matches!(&result, Err(TransformError::ShapeError(message))
+                    if message
+                        .strip_prefix("cannot reserve DeepSeek-V4.1 patch output: ")
+                        .is_some_and(|cause| !cause.is_empty())),
+                "{result:?}"
+            );
+        }
     }
 }
