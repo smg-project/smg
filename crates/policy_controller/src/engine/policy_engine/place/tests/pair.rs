@@ -184,8 +184,8 @@ impl Lists {
 /// A pair's targets are asked best first, and the first both of whose
 /// workers can be sent to is taken: a target whose decode cannot is passed
 /// over whole. The placement names the prefill as its worker and the decode
-/// beside it, each by its own id, and a side's dispatch is said on the
-/// target taken.
+/// beside it, each by its own id and each side's profile by its label, and
+/// a side's dispatch is said on the target taken.
 ///
 /// The classic router hands no pair with a side that does not hold either:
 /// a decode counts as a prefill's partner only while it is eligible
@@ -215,6 +215,8 @@ fn a_pair_is_placed_on_the_first_target_both_of_whose_workers_can_be_sent_to() {
             (placement.id(), placement.decode_id()),
             (lists.prefill_id(0), Some(lists.decode_id(down)))
         );
+        let labels = (placement.profile, placement.decode_profile);
+        assert_eq!(labels, ("prefill", Some("decode")));
         assert!(placement.owes_events());
         placement.sent(Side::Prefill);
         placement.sent(Side::Decode);

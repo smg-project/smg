@@ -20,15 +20,28 @@ use crate::{
         decision_engine::Decided,
         policy_engine::{PolicyEngine, PoolMembers},
         prefills_full,
-        view::WorkerId,
+        view::{Phase, WorkerId},
         PairLists,
     },
     tracking::Placement,
 };
 
+/// The label of the profile that picks a pair's decode side under the
+/// engine's document: the decode profile of the binding `model` resolves
+/// to, and that binding's one profile where it names no other. The empty
+/// label where no binding matches.
+fn decode_label(engine: &PolicyEngine, model: &str) -> &'static str {
+    let binding = engine.spec().engine().binding(model, Phase::Prefill);
+    let position = binding.map(|binding| binding.decode_profile.unwrap_or(binding.profile));
+    position.map_or("", |position| engine.label_at(position))
+}
+
 /// One ask for a pair over `lists`, the two lists its caller handed with
 /// their pair classes: one decision told to leave `missed` out, and the
 /// first of its targets both of whose workers can be sent to.
+///
+/// The placement names the request's routing value, and the profile of its
+/// decode side by its label ([`decode_label`]).
 ///
 /// `None` where no target holds. The decision is then given up by name,
 /// and each side that could not be sent to joins `missed` by its own id: a
@@ -77,6 +90,7 @@ pub(super) fn ask<'a>(
     })?;
     Ok(placement.map(|mut placement| {
         placement.routing_key = key;
+        placement.decode_profile = Some(decode_label(engine, request.model));
         placement
     }))
 }
