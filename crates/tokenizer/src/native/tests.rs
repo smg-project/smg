@@ -6953,6 +6953,9 @@ fn fixed_texts_match_tokenizers_for_every_sentencepiece_shape() {
             "a\u{0}b\u{7F}c",
             "the\u{2581}",
             "\u{2581}\u{2581}the",
+            // A unit with no cut (the byte token `<0x11>` bridges `1` to `1`),
+            // long enough for the walk that encodes the marker's piece first.
+            &"1".repeat(257),
         ] {
             for special in [false, true] {
                 let expected = tokenizer
