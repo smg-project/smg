@@ -358,7 +358,9 @@ interface plugin {
 ///   alike, and none for a plugin whose row declares neither token hashes
 ///   nor text hashes among its needs), header-count by the allow-list (at
 ///   most 256 names), tried-count by the attempt counter (u8) times the four
-///   targets of a decision. A hash cap above 8,190 is refused at apply, and a
+///   targets of a decision, each counted with the other workers of its
+///   engine where a list holds several, as the ranks of a data-parallel
+///   engine are. A hash cap above 8,190 is refused at apply, and a
 ///   longer list is cut to its first 8,190. The string lengths are u16 as
 ///   well: a request whose model name, header value or plain identity
 ///   exceeds 65,535 bytes is not packed; the host skips the packed plugin

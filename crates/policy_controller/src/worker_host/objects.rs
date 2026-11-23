@@ -1805,23 +1805,21 @@ mod tests {
         }
     }
 
-    /// The holder lends what each stored worker states for a request's hard
-    /// demands, and a decision over its list reads it. A retry that demands
-    /// a runtime lands on the worker that states that runtime, whichever
-    /// request it is, and one that demands a runtime no worker states is
-    /// shed under the stage `wires`. The classic router holds a retry to
-    /// its first plan's runtime and transport by one test of each worker
-    /// (`model_gateway/src/routers/common/placement.rs:84-93`).
+    /// The decision of a retry that demands `runtime`, made by `engine`
+    /// over the list a holder lends.
     #[cfg(feature = "in-process")]
-    #[test]
-    fn a_stored_workers_demand_facts_are_lent_and_hold_a_retry_to_its_runtime() {
+    fn retry_demanding(
+        engine: &crate::engine::PolicyEngine,
+        lent: LentList<'_>,
+        id: &'static [u8],
+        runtime: u32,
+    ) -> crate::engine::Decision {
         use std::time::Instant;
 
         use crate::{
-            document::spec::{AppliedSpec, PolicySpec},
+            document::spec::AppliedSpec,
             engine::{
-                Constraints, Decided, Decision, DemandFacts, Demands, PolicyEngine, Request,
-                RequestFacts, RequestMaker, Role, ShedReason, WorkerLists,
+                Constraints, Decided, Demands, Request, RequestFacts, RequestMaker, WorkerLists,
             },
         };
 
@@ -1841,6 +1839,43 @@ mod tests {
                 self.1
             }
         }
+
+        let asked = Request {
+            id,
+            facts: RequestFacts {
+                model: "m",
+                seed: 7,
+                ..RequestFacts::default()
+            },
+            constraints: Constraints {
+                demands: Demands {
+                    runtime,
+                    ..Demands::default()
+                },
+                ..Constraints::default()
+            },
+        };
+        let asks = Asks(asked, WorkerLists::Single(lent));
+        match engine.decide_at(&asks, Instant::now).expect("an answer") {
+            Decided::Whole(decided, _) => decided.decision,
+            Decided::Alone(_) => panic!("a place for a request that states a demand"),
+        }
+    }
+
+    /// The holder lends what each stored worker states for a request's hard
+    /// demands, and a decision over its list reads it. A retry that demands
+    /// a runtime lands on the worker that states that runtime, whichever
+    /// request it is, and one that demands a runtime no worker states is
+    /// shed under the stage `wires`. The classic router holds a retry to
+    /// its first plan's runtime and transport by one test of each worker
+    /// (`model_gateway/src/routers/common/placement.rs:84-93`).
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_stored_workers_demand_facts_are_lent_and_hold_a_retry_to_its_runtime() {
+        use crate::{
+            document::spec::{AppliedSpec, PolicySpec},
+            engine::{Decision, DemandFacts, PolicyEngine, Role, ShedReason},
+        };
 
         let mut replica = Replica::new();
         replica.objects = replica.objects.with_status_followed();
@@ -1891,28 +1926,7 @@ mod tests {
         let applied = AppliedSpec::validate(&document).expect("the document validates");
         let engine = PolicyEngine::new(applied);
         // A retry that demands `runtime`, decided over the list lent.
-        let decide = |id: &'static [u8], runtime: u32| {
-            let asked = Request {
-                id,
-                facts: RequestFacts {
-                    model: "m",
-                    seed: 7,
-                    ..RequestFacts::default()
-                },
-                constraints: Constraints {
-                    demands: Demands {
-                        runtime,
-                        ..Demands::default()
-                    },
-                    ..Constraints::default()
-                },
-            };
-            let asks = Asks(asked, WorkerLists::Single(lent));
-            match engine.decide_at(&asks, Instant::now).expect("an answer") {
-                Decided::Whole(decided, _) => decided.decision,
-                Decided::Alone(_) => panic!("a place for a request that states a demand"),
-            }
-        };
+        let decide = |id: &'static [u8], runtime: u32| retry_demanding(&engine, lent, id, runtime);
         let landed = |id: &'static [u8], runtime: u32| match decide(id, runtime) {
             Decision::Pick(pick) => pick.targets.first().map(|target| target.id),
             other => panic!("a worker states runtime {runtime}: {other:?}"),
@@ -1930,6 +1944,95 @@ mod tests {
             }
             other => panic!("no worker states runtime 5: {other:?}"),
         }
+    }
+
+    /// A registration that changes the runtime a stored worker states is
+    /// read by the decisions behind it. The door starts another life for
+    /// the worker, and one follow later the holder lends the new life's
+    /// statement under its id: a retry that demands the new runtime lands
+    /// on the new life, and one that demands the old runtime is shed under
+    /// the stage `wires`, as no worker states it any more.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_registration_that_changes_a_runtime_moves_the_retries_that_demand_it() {
+        use crate::{
+            document::spec::{AppliedSpec, PolicySpec},
+            engine::{Decision, DemandFacts, PolicyEngine, Role, ShedReason},
+        };
+
+        let mut replica = Replica::new();
+        replica.objects = replica.objects.with_status_followed();
+        let door = StoreMembershipWriter::new(Arc::clone(&replica.store));
+        // The registration of the worker at `A` as one that states `runtime`.
+        let registers = |runtime: u32| {
+            let stating = |_: Option<&WorkerFacts>| WorkerFacts {
+                demand_facts: DemandFacts {
+                    runtime,
+                    ..DemandFacts::default()
+                },
+                ..facts(A, 1)
+            };
+            door.found(&Registrant::Control, Precondition::Any, A, &stating)
+        };
+        // What the holder lends of the model's workers as they stand: each
+        // worker's id and the runtime it states.
+        let lends = |replica: &Replica| {
+            let registry = replica.objects.registry();
+            let generation = registry
+                .model_generation("m")
+                .expect("the model's generation");
+            let lent = replica.objects.lent(&generation, Role::Single);
+            let stated: Vec<(Option<WorkerId>, u32)> = lent
+                .facts
+                .expect("the holder lends facts")
+                .iter()
+                .map(|facts| (facts.id, facts.demands.runtime))
+                .collect();
+            (generation, stated)
+        };
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        document.generation = 1;
+        let applied = AppliedSpec::validate(&document).expect("the document validates");
+        let engine = PolicyEngine::new(applied);
+        // Where a retry that demands `runtime` lands over the list the
+        // holder lends now, or the stage it is shed under.
+        let retry = |replica: &Replica, runtime: u32| {
+            let (generation, _) = lends(replica);
+            let lent = replica.objects.lent(&generation, Role::Single);
+            match retry_demanding(&engine, lent, b"again", runtime) {
+                Decision::Pick(pick) => Ok(pick.targets.first().map(|target| target.id)),
+                Decision::Shed(shed) => Err((shed.reason, shed.emptied_by)),
+                other @ Decision::Queue(_) => panic!("neither a pick nor a shed: {other:?}"),
+            }
+        };
+        let unstated = Err((ShedReason::NoEndpoints, "wires"));
+
+        let wrote = registers(7);
+        let Ok(MembershipWriteOutcome::Registered(first)) = wrote else {
+            panic!("the first registration is a join: {wrote:?}");
+        };
+        // Its checks are on: a check's word makes the first life ready.
+        let row = replica.store.get(first).expect("the registered row");
+        let ready = replica
+            .store
+            .set_status(first, WorkerStatus::Ready, row.revision);
+        ready.expect("ready");
+        replica.follow();
+        assert_eq!(lends(&replica).1, [(Some(first), 7)]);
+        assert_eq!(retry(&replica, 7), Ok(Some(first)));
+        assert_eq!(retry(&replica, 9), unstated);
+
+        // The same worker registers again and states another runtime: the
+        // store hands the first life's status on to the next.
+        let wrote = registers(9);
+        let Ok(MembershipWriteOutcome::Another { old, new }) = wrote else {
+            panic!("a changed runtime is another life: {wrote:?}");
+        };
+        assert_eq!(old, first);
+        replica.follow();
+        assert_eq!(lends(&replica).1, [(Some(new), 9)], "under the new id");
+        assert_eq!(retry(&replica, 9), Ok(Some(new)));
+        assert_eq!(retry(&replica, 7), unstated);
     }
 
     /// What the pairing rule reads of a kept object's row moves in place

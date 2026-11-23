@@ -803,7 +803,8 @@ workers of one engine, the ranks of a data-parallel engine, the engine over work
 every worker of a tried worker's engine as tried before the key's pin is read and the filters
 run. So `not-tried` passes the whole engine over while another worker is left, and hands it
 again where none is. A tried worker the list no longer holds names itself alone: the list does
-not say which engine it was a rank of. A pair's two lists are not widened.
+not say which engine it was a rank of. A pair's retry is widened the same way, each of its two
+lists by its own engines.
 
 A decision that panics is caught, counted and answered as refused. It never takes the host down.
 
