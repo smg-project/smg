@@ -28,6 +28,14 @@
 //! behind another writes under the term of its own minute, or is refused as
 //! a follower's is, and never under a term read before the wait.
 //!
+//! **A call that wrote leaves the replica's worker objects holding its
+//! write.** The service hands the door the holder of those objects, which
+//! its decisions read. Behind a write that answered, the door follows the
+//! store into them before the call answers: a decision made behind an
+//! acknowledged registration, drain or removal reads the fleet the call
+//! left. A standby's applied rows reach the objects by the holder's own
+//! task.
+//!
 //! **A registration that states several ranks is one write.** Each rank's
 //! facts are read by the call's own rules, a rank at a time. The host
 //! door's routine then checks the group, takes the engine's rows the
@@ -84,9 +92,9 @@ use crate::{
         WorkerStatus, WorkersStore,
     },
     worker_host::{
-        drain, lay, lay_one, lay_ready, refresh, stated, stating, take, MembershipWriteOutcome,
-        MembershipWriteRefused, MembershipWriter, Over, Precondition, Ready, Remover, RowRevision,
-        Stated, Turn,
+        drain, lay, lay_one, lay_ready, refresh, stated, stating, take, Members,
+        MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Objects, Over,
+        Precondition, Ready, Remover, RowRevision, Stated, Turn,
     },
 };
 
@@ -104,6 +112,10 @@ pub(crate) struct MembershipCalls {
     log: Arc<Log>,
     /// One call at a time, from its read to its read back.
     turn: Mutex<()>,
+    /// The replica's worker objects, where the door was handed them: a call
+    /// that wrote follows the store into them before it answers
+    /// ([`Self::following`]).
+    objects: Option<Arc<Objects<Members>>>,
 }
 
 fn invalid(refused: Refused) -> Status {
@@ -155,6 +167,27 @@ impl MembershipCalls {
             base,
             log,
             turn: Mutex::new(()),
+            objects: None,
+        }
+    }
+
+    /// The door whose calls leave `objects` holding their write: the holder
+    /// of the replica's worker objects, which its decisions read. A door
+    /// handed none follows nothing.
+    #[must_use]
+    pub(crate) fn following(mut self, objects: Arc<Objects<Members>>) -> Self {
+        self.objects = Some(objects);
+        self
+    }
+
+    /// Reads the store to its end into the worker objects the door was
+    /// handed, where it was handed any. Its caller holds neither the door's
+    /// turn nor a lock of the store: the holder's follows run one at a time
+    /// by its own lock, and never inside a notification of the store
+    /// ([`Objects::follow`]).
+    fn followed(&self) {
+        if let Some(objects) = &self.objects {
+            objects.follow(&*self.store);
         }
     }
 
@@ -196,6 +229,13 @@ impl MembershipCalls {
     /// Every call leaves a line with its caller (design 5.2): a write's is
     /// [`told`]'s, a refusal's says its code and its words, which hold no
     /// URL.
+    ///
+    /// The replica's worker objects hold the write when the call answers.
+    /// Behind a write that answered, with the turn let go and no lock of
+    /// the store held, the door follows the store into them
+    /// ([`Self::followed`]). A decision reads those objects, so none made
+    /// behind an acknowledged registration, drain or removal reads the
+    /// fleet as it stood before the call. A refused call follows nothing.
     fn call(
         &self,
         call: &'static str,
@@ -206,6 +246,9 @@ impl MembershipCalls {
         let turn = self.turn.lock();
         let answer = leading().and_then(write);
         drop(turn);
+        if answer.is_ok() {
+            self.followed();
+        }
         if let Err(refusal) = &answer {
             audit_refusal(call, by, refusal.code(), refusal.message(), None);
         }
@@ -743,7 +786,13 @@ impl ReplicaMembershipWriter {
             }
         };
         match write(term) {
-            Ok(answer) => Ok(answer),
+            Ok(answer) => {
+                // The worker objects hold the write when the call answers,
+                // as behind a control call's ([`MembershipCalls::call`]).
+                drop(turn);
+                self.door.followed();
+                Ok(answer)
+            }
             Err(refusal) => {
                 drop(turn);
                 let status = refused(&refusal);
@@ -1088,6 +1137,76 @@ pub(crate) mod tests {
             Event::Replaced(replaced) => replaced.new.expect("the new row"),
             other => panic!("no row in {other:?}"),
         }
+    }
+
+    /// The replica's worker objects hold a call's write when the call
+    /// answers. No task follows the store here, and a decision follows
+    /// nothing: each is the in-process front's over the list the holder
+    /// lends as the door's last call left it. A worker registered through
+    /// the door is named by a decision behind the call. One whose
+    /// deregistration was acknowledged is named by none behind it, and
+    /// neither is one whose drain was acknowledged. The replica's own
+    /// writer shares the door's turn and its follow: a worker it removes is
+    /// named by none behind its answer.
+    #[tokio::test]
+    async fn a_decision_behind_an_acknowledged_call_reads_the_fleet_the_call_left() {
+        use std::collections::BTreeSet;
+
+        use crate::service::controller::{
+            decision_slots::tests::{frame, lent_pick, preset},
+            worker_objects::{ObjectsWake, WorkerObjects},
+        };
+
+        let (store, door) = door();
+        let objects = WorkerObjects::new(Arc::clone(&store), ObjectsWake::default()).holder();
+        let door = Arc::new(door.following(Arc::clone(&objects)));
+        store
+            .apply(preset("round_robin", 1))
+            .expect("above the unbound start");
+        // The workers twelve decisions name, with no follow of the case's.
+        let named = || -> BTreeSet<WorkerId> {
+            (1..=12)
+                .filter_map(|seed| lent_pick(&store, &objects, frame(seed, u64::from(seed))))
+                .collect()
+        };
+        let ids: Vec<WorkerId> = ["w0", "w1", "w2"]
+            .iter()
+            .map(|name| {
+                let asked = ask(unchecked(&format!("grpc://{name}:8000")), Mode::Add);
+                let told = door
+                    .register(&operator(), under(TERM), &asked)
+                    .expect("the door takes the worker");
+                WorkerId(row_of(&told).id)
+            })
+            .collect();
+        assert_eq!(named(), ids.iter().copied().collect());
+        let leave = |id: WorkerId, drain: bool| {
+            let row = WorkersStore::get(&*store, id).expect("the row stands");
+            let request = proto::DeregisterWorkerRequest {
+                worker_id: id.0,
+                revision: row.revision,
+                drain,
+            };
+            door.deregister(&operator(), under(TERM), &request)
+                .expect("the door acknowledges");
+        };
+        // An acknowledged deregistration: no decision behind it names the
+        // worker.
+        leave(ids[0], false);
+        assert_eq!(named(), BTreeSet::from([ids[1], ids[2]]));
+        // And an acknowledged drain.
+        leave(ids[1], true);
+        assert_eq!(named(), BTreeSet::from([ids[2]]));
+        // The last worker leaves through the replica's own writer, over the
+        // same door: no decision behind its answer names a worker.
+        let hosted = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM));
+        let last = WorkersStore::get(&*store, ids[2]).expect("the row stands");
+        let by = Remover::Registrant(&last.maker);
+        assert_eq!(
+            hosted.gone(by, "grpc://w2:8000", standing(&last)),
+            Ok(MembershipWriteOutcome::Removed(ids[2]))
+        );
+        assert_eq!(named(), BTreeSet::new());
     }
 
     #[test]

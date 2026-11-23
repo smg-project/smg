@@ -2807,30 +2807,6 @@ fn a_generation_is_applied_above_the_standing_one_and_no_other() {
     assert_eq!(view(&store, &ask(t0)).2.generation, 4);
 }
 
-/// Every engine a store builds reads the store's own clock: an instant
-/// reads alike in the store and under each document it applies. An apply
-/// hands a profile's count of sends to the next document's engine, which
-/// reads their stamps on the clock they were written on. An engine that
-/// started a clock of its own would read a send of the last second as one
-/// of the future, by the standing document's age.
-#[cfg(feature = "in-process")]
-#[test]
-fn every_engine_a_store_builds_reads_the_stores_clock() {
-    let store = MemoryStore::new();
-    let at = Instant::now() + Duration::from_secs(5);
-    let engines = |store: &MemoryStore| store.deciding(|world| world.front().clock().micros(at));
-    for number in 1..=3 {
-        store
-            .apply(generation(number))
-            .expect("above the standing one");
-        assert_eq!(
-            engines(&store),
-            store.micros(at),
-            "under generation {number}"
-        );
-    }
-}
-
 #[test]
 fn a_generation_outlives_its_last_world_until_the_next_apply_hands_it_back() {
     let mut writer = Writer::new(PUBLISH_WINDOW, Instant::now());

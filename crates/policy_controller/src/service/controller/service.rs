@@ -249,7 +249,7 @@ impl Shared {
             decision_slots::QUEUE_DEPTH,
             &Reads {
                 store: Arc::clone(&store),
-                objects,
+                objects: Arc::clone(&objects),
                 fence: elector.fence(),
                 standing: standing.clone(),
                 clock: Arc::new(Instant::now),
@@ -264,7 +264,10 @@ impl Shared {
             fence: elector.fence(),
             standing,
             generations: Arc::clone(&generations),
-            door: MembershipCalls::new(Arc::clone(&store), Arc::clone(&feed.log)),
+            // The door leaves the worker objects its deciding threads read
+            // holding each call's write.
+            door: MembershipCalls::new(Arc::clone(&store), Arc::clone(&feed.log))
+                .following(objects),
             replication: Replication::new(
                 Arc::clone(&store),
                 Arc::clone(&feed.log),
