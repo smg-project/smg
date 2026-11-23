@@ -1618,7 +1618,9 @@ struct ModelArgs {
     /// symphony, a worker's labels decide for its model, else Symphony's
     /// registry for a model it knows, and this flag for the models the
     /// registry does not know (for every model, before the registry, under
-    /// --parser-flags-over-registry): a Symphony table's name here (and in
+    /// --parser-flags-over-registry, except a name here alone that a table
+    /// answers to, which still leaves a model the registry knows to the
+    /// registry): a Symphony table's name here (and in
     /// --tool-call-parser, or there alone) reads them with that table, and
     /// so does a legacy parser's name whose format a table reads (the
     /// table's aliases); `hf` reads each with the table its tokenizer's
@@ -1645,7 +1647,9 @@ struct ModelArgs {
     /// Symphony, a model's worker labels decide, else Symphony's registry
     /// for a model it knows, else --tool-call-parser and
     /// --reasoning-parser (before the registry under
-    /// --parser-flags-over-registry): a Symphony table's name reads with that table,
+    /// --parser-flags-over-registry, except a reasoning name alone that a
+    /// table answers to, which leaves a model the registry knows to the
+    /// registry): a Symphony table's name reads with that table,
     /// and so does a legacy parser's name whose format a table reads (qwen
     /// for qwen3, qwen_xml for qwen3_tagged: the table's aliases, so
     /// existing flags keep a working parser); any other legacy parser's

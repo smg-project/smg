@@ -2800,7 +2800,8 @@ class RouterArgs:
             help="Specify the parser for reasoning models (e.g., deepseek_r1, qwen3). Under --parser symphony, "
             "a worker's labels decide for its model, else Symphony's registry for a model it knows, and this "
             "flag for the models the registry does not know (for every model, before the registry, under "
-            "--parser-flags-over-registry): a Symphony table's name here (and in "
+            "--parser-flags-over-registry, except a name here alone that a table answers to, which still "
+            "leaves a model the registry knows to the registry): a Symphony table's name here (and in "
             "--tool-call-parser, or here alone) reads them with that table, and so does a legacy parser's "
             "name whose format a table reads (the table's aliases); any other legacy parser's name keeps "
             "the legacy parsers for them",
