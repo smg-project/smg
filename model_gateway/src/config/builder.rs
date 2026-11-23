@@ -762,6 +762,8 @@ impl RouterConfigBuilder {
     // ==================== Boolean Setters ====================
     // Accept bool parameters to conditionally set flags without if statements
 
+    /// Deprecated, accepted and ignored: every registration reads an
+    /// engine's data-parallel size and registers one worker per rank.
     pub fn dp_aware(mut self, enable: bool) -> Self {
         self.config.dp_aware = enable;
         self

@@ -791,11 +791,11 @@ impl WorkerService {
         validate_spec(&config)?;
         Self::require_provider_router(&config)?;
 
-        // A data-parallel router expands one spec into one worker per rank,
-        // each registered under a rank-suffixed URL. Re-running registration
-        // for a single ID cannot express that, so refuse here instead of
-        // answering 202 and failing in the background.
-        if self.router_config.dp_aware {
+        // A data-parallel engine registers as one worker per rank, each
+        // under a rank-suffixed URL. Re-running registration for the ID of
+        // one rank cannot express that, so refuse here instead of answering
+        // 202 and failing in the background.
+        if existing.is_dp_aware() {
             return Err(WorkerServiceError::BadRequest {
                 message: format!(
                     "Worker '{url}' belongs to a data-parallel group. \
@@ -1712,6 +1712,49 @@ mod tests {
             retry_after.as_deref(),
             Some("7"),
             "Retry-After carries the drain window"
+        );
+    }
+
+    /// A PUT re-runs one registration under one id, which a rank of a
+    /// data-parallel engine cannot be: the PUT of a rank worker is refused by
+    /// name, on a gateway given no setting for it. The PUT of a plain worker
+    /// passes that test: here it stops at the next thing it needs, the job
+    /// queue this service was given none of.
+    #[tokio::test]
+    async fn a_put_is_refused_for_a_rank_worker_and_for_no_other() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let service = make_service(Arc::clone(&registry));
+        let plain_url = "http://10.0.0.9:8000";
+        register_worker(&registry, plain_url, Some("m"));
+        let plain = registry.get_id_by_url(plain_url).expect("the plain worker");
+        let engine = "http://10.0.0.10:8000";
+        let rank = registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new(engine)
+                    .worker_type(WorkerType::Regular)
+                    .model(ModelCard::new("m"))
+                    .dp_config(1, 2)
+                    .build(),
+            ))
+            .expect("a rank registers");
+
+        let refused = service
+            .replace_worker(rank.as_str(), worker_spec(engine))
+            .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(WorkerServiceError::BadRequest { message })
+                    if message.contains("belongs to a data-parallel group")
+            ),
+            "a rank worker's PUT was not refused as one: {refused:?}"
+        );
+        let passed = service
+            .replace_worker(plain.as_str(), worker_spec(plain_url))
+            .await;
+        assert!(
+            matches!(&passed, Err(WorkerServiceError::QueueNotInitialized)),
+            "a plain worker's PUT stopped short of the queue: {passed:?}"
         );
     }
 

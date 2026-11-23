@@ -357,12 +357,15 @@ class Router:
             cache-aware routing (chars for HTTP, tokens for gRPC), shared across
             all workers; eviction keeps every tree at or under this bound.
             Default: 2^26
-        dp_aware: Enable data parallelism aware schedule. Default: False
+        dp_aware: Deprecated, accepted and ignored: every registration reads an
+            engine's data-parallel size and registers one worker per rank (warned at
+            start-up). Default: False
         dp_minimum_tokens_scheduler: Choose a data-parallel rank per request from the
             ranks' reported token loads: the HTTP prefill-decode router, for an engine
-            registered as one worker. Under dp_aware the engine's ranks are workers and
-            the policy's pick among them is the rank choice, so this chooses nothing
-            there (warned at start-up). Default: False
+            registered as one worker. An engine that reports its data-parallel size
+            registers as one worker per rank and the policy's pick among them is the
+            rank choice, so this chooses nothing there (warned at start-up).
+            Default: False
         upstream_http2: Speak HTTP/2 to workers via prior knowledge (h2c on
             cleartext), multiplexing every request to a worker over one
             connection. Negotiated per worker at registration: a worker that
@@ -370,8 +373,7 @@ class Router:
         enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When
             enabled, the router can manage multiple models simultaneously with per-model
             load balancing policies. Default: False
-        api_key: The api key used for the authorization with the worker. Useful when
-            the dp aware scheduling strategy is enabled. Default: None
+        api_key: The api key used for the authorization with the worker. Default: None
         log_dir: Directory to store log files. If None, logs are only output to
             console. Default: None
         log_level: Logging level. Options: 'debug', 'info', 'warn', 'error'.

@@ -36,7 +36,7 @@ fn ordinary_host() -> Arc<ProbingHost> {
 
 #[tokio::test]
 async fn a_host_with_no_gateway_type_creates_a_worker() {
-    let host = ProbingHost::reading_dp(ScriptedConnector::default());
+    let host = ordinary_host();
     let mut spec = WorkerSpec::new("worker-a:9000");
     spec.labels = labels_of(&[("tier", "configured")]);
     let mut data = local_data(spec, ConnectionMode::Grpc, Arc::clone(&host));
@@ -45,7 +45,7 @@ async fn a_host_with_no_gateway_type_creates_a_worker() {
         ("tier", "reported"),
         ("dp_size", "2"),
     ]);
-    data.dp_info = Some(dp_info_from_labels(&data.discovered_labels).unwrap());
+    data.dp_info = dp_info_from_labels(&data.discovered_labels).unwrap();
     let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
 
     assert_eq!(
@@ -285,26 +285,22 @@ async fn a_config_label_equal_to_the_engines_value_is_not_recorded_as_discovered
     );
 }
 
-/// A dp-aware registration of one model under the DP label, as a local
-/// HTTP worker before the engine's report is set on it.
-fn dp_aware_local_http_data() -> Data {
+/// A registration of one model under the DP label, as a local HTTP worker
+/// before the engine's report is set on it.
+fn ranked_local_http_data() -> Data {
     let mut spec = WorkerSpec::new("http://worker:8000");
     spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
     spec.labels = HashMap::from([("enable_dp_attention".to_string(), "true".to_string())]);
-    local_data(
-        spec,
-        ConnectionMode::Http,
-        ProbingHost::reading_dp(ScriptedConnector::default()),
-    )
+    local_data(spec, ConnectionMode::Http, ordinary_host())
 }
 
-/// On a dp-aware registration the engine's report is mapped to the rank's
-/// space before the config's keys leave it: a DP label the config also
+/// On a registration of several ranks the engine's report is mapped to the
+/// rank's space before the config's keys leave it: a DP label the config also
 /// names still sizes the window share the record carries, so a later
 /// refresh reads that share, not the whole engine window, as the engine's.
 #[tokio::test]
 async fn a_dp_label_the_config_also_sets_still_sizes_the_recorded_window_share() {
-    let mut data = dp_aware_local_http_data();
+    let mut data = ranked_local_http_data();
     data.discovered_labels = HashMap::from([
         ("enable_dp_attention".to_string(), "true".to_string()),
         ("max_running_requests".to_string(), "256".to_string()),
@@ -338,7 +334,7 @@ async fn a_dp_label_the_config_also_sets_still_sizes_the_recorded_window_share()
 /// the record, so a refresh reads the share as the engine's.
 #[tokio::test]
 async fn a_dp_flag_only_the_config_sets_sizes_the_recorded_window_share_too() {
-    let mut data = dp_aware_local_http_data();
+    let mut data = ranked_local_http_data();
     data.discovered_labels =
         HashMap::from([("max_running_requests".to_string(), "256".to_string())]);
     data.dp_info = Some(DpInfo {
@@ -764,20 +760,16 @@ fn zmq_disaggregated_workers_are_rejected_as_a_create_worker_failure() {
     }
 }
 
-/// A ZMQ engine group registered dp-aware becomes one worker per rank, as a
-/// gRPC engine does, and the rank workers hold one connection slot: the
-/// group's engines dial one socket set.
+/// A ZMQ engine group given a count becomes one worker per rank, as a gRPC
+/// engine does, on a host whose settings name nothing of it, and the rank
+/// workers hold one connection slot: the group's engines dial one socket set.
 #[tokio::test]
-async fn a_dp_aware_zmq_group_becomes_rank_workers_sharing_one_connection() {
+async fn a_zmq_group_given_a_count_becomes_rank_workers_sharing_one_connection() {
     let mut spec = WorkerSpec::new("ipc:///tmp/smg-zmq/ts0.ipc");
     spec.runtime_type = RuntimeType::TokenSpeed;
     spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
     spec.dp_size = Some(3);
-    let mut data = local_data(
-        spec,
-        ConnectionMode::Zmq,
-        ProbingHost::reading_dp(ScriptedConnector::default()),
-    );
+    let mut data = local_data(spec, ConnectionMode::Zmq, ordinary_host());
     data.dp_info = Some(DpInfo {
         dp_size: 3,
         model_id: "m".to_string(),
@@ -818,7 +810,7 @@ async fn a_dp_aware_zmq_group_becomes_rank_workers_sharing_one_connection() {
 #[tokio::test]
 async fn create_only_refuses_a_group_whose_rank_workers_are_registered() {
     let base = "ipc:///tmp/smg-zmq/ts0.ipc";
-    let host = ProbingHost::reading_dp(ScriptedConnector::default());
+    let host = ordinary_host();
     let group = |host: Arc<ProbingHost>| {
         let mut spec = WorkerSpec::new(base);
         spec.runtime_type = RuntimeType::TokenSpeed;

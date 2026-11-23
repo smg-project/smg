@@ -2030,8 +2030,8 @@ impl<G: Generation> WorkerMonitor<G> {
 
     /// Fetch load via the backend client's `GetLoads` (gRPC RPC or the ZMQ
     /// engine's pushed scheduler stats) for the workers of one engine: one
-    /// worker, or the rank workers of a data-parallel engine under
-    /// `--dp-aware` (one address, one answer naming every rank). The first
+    /// worker, or the rank workers of a data-parallel engine (one address,
+    /// one answer naming every rank). The first
     /// member asks; the outcome is every member's, as each one's own poll
     /// would have had it: the whole answer (the caller scopes it to each
     /// member's rank), the contact that ends an unreachable veto, a
@@ -2129,8 +2129,8 @@ impl<G: Generation> WorkerMonitor<G> {
     }
 
     /// One tick's fetch for the polled workers of one engine: one worker, or
-    /// the rank workers of a data-parallel engine under `--dp-aware`, which
-    /// share it. The engine answers once; each member's report is that
+    /// the rank workers of a data-parallel engine, which share it. The
+    /// engine answers once; each member's report is that
     /// answer scoped to its own rank, as its own poll would have had it (a
     /// rank the answer omits is an empty report). A report's ranks and its
     /// named values stand under the report's bounds, and the values that
@@ -2347,8 +2347,8 @@ async fn eviction_flush_loop<G: Generation>(
 }
 
 /// The polled workers as the fetches of one tick: one per worker, except the
-/// rank workers of one data-parallel engine, which share one. Under
-/// `--dp-aware` an engine of N ranks is N workers at one address, and each
+/// rank workers of one data-parallel engine, which share one. An engine
+/// of N ranks is N workers at one address, and each
 /// one's poll asked the engine for the same answer (N `GetLoads`, or N reads
 /// of the native load route, per engine per tick) and kept its own rank of
 /// it. One member asks, the lowest rank, so the native-route memo of an

@@ -860,7 +860,6 @@ mod tests {
                     startup_timeout_secs: 67,
                     startup_delay_secs: 11,
                     startup_check_interval_secs: 7,
-                    dp_aware: false,
                     model_path: None,
                     model_aliases: Default::default(),
                     retry: Default::default(),
