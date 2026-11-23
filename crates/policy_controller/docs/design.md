@@ -568,7 +568,8 @@ request goes to.
   worker's state is read, and its route's rule asked, once a decision. So the tree names the
   worker the prompt went to. A worker that stops being ready behind that read is still sent to,
   as under classic, which also stores its selection ahead of the send. The hash table is written
-  for a pick's first target, as before.
+  by the same answer: for the first target its caller sends to, and for none where it sends to
+  none.
 - **[planned]** A request given as text is decided the same way in the host's string tree.
 - **[planned]** The hash table leaves the single decision. Until then a model with an index of
   cache events reads the index and the hash table together, as today.
@@ -1200,7 +1201,7 @@ pub trait RequestMaker {
     fn workers(&self) -> WorkerLists<'_>;             // the worker list, a pair's two lists, or an encode request's three
     fn loads(&self) -> Option<&Arc<LoadSnapshot>>;    // a request's snapshot of the host's own; without one the engine reads its own
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>>; // the prompt's entry in the host's token tree, where the host lends one
-    fn sends_to(&self, target: &Target) -> bool;      // whether its caller sends to this target of a pick: the tree stores the first such
+    fn sends_to(&self, target: &Target) -> bool;      // whether its caller sends to this target of a pick: the prompt is stored for the first such
 }
 
 pub enum WorkerLists<'a> {

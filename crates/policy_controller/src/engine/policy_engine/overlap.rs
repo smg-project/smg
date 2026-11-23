@@ -1169,8 +1169,9 @@ struct Asked<'a> {
 /// It names the request's rows from the host's own data, hands them to
 /// `decide` in the request's facts ([`RequestFacts::named`]) and returns
 /// what `decide` answers. Where that is a pick and the record of sent
-/// prefixes speaks for the first target, the request's prefix is written
-/// for it: the record says where a prefix was decided to go.
+/// prefixes speaks for the target the request goes to, the first one its
+/// caller sends to (`sends_to`), the request's prefix is written for it:
+/// the record says where a prefix was sent.
 ///
 /// `workers` is the list the decision is made over and `pool` what the
 /// engine keeps beside that list. `ids` holds the workers' ids by their
@@ -1199,8 +1200,9 @@ struct Asked<'a> {
 ///
 /// `sends_to` says whether the request's caller sends it to a target of the
 /// pick ([`RequestMaker::sends_to`]). A decision made inside the tree's
-/// match asks it of the pick's targets, best first, and the tree stores the
-/// request's pages for the first one it takes. No other decision asks it.
+/// match, and one the record is written behind, asks it of the pick's
+/// targets, best first: the tree stores the request's pages, and the record
+/// its prefix, for the first one it takes. No other decision asks it.
 ///
 /// A pick states what its first target holds of the request ([`Overlap`]),
 /// from the rows its decision was given: the rows named here, the column
@@ -1349,11 +1351,12 @@ fn state(decision: &mut Decision, feed: Feed<'_>, facts: &RequestFacts<'_>, bloc
     }
 }
 
-/// The worker a decision sent its request to, where the profile is told of
-/// the request: the pick's first target, and none for a pick the binding's
-/// sessions rule placed alone and keeps from the profile
-/// ([`lease_events::stages_hear`]). The one test in front of every write
-/// that keeps where a prompt went.
+/// Whether the profile is told of a decision's pick: the pick's first
+/// target where it is, and none for a decision that picked nobody and for
+/// a pick the binding's sessions rule placed alone and keeps from the
+/// profile ([`lease_events::stages_hear`]). The one test in front of every
+/// write that keeps where a prompt went. A single's writes name the worker
+/// the request goes to ([`sent_target`]), which may be a later target.
 ///
 /// The rule's word is read through that one function at five places: the
 /// words of a single's lease, the record's two writes here, the store of a
@@ -1374,7 +1377,8 @@ pub(super) fn told_target(decision: &Decision) -> Option<&Target> {
 /// Behind a pick made over a column ([`column()`]): records the request's
 /// prefix as sent to the picked worker `id`, where the record of sent
 /// prefixes speaks for that worker. The record says where a prefix was
-/// decided to go.
+/// sent, and this write has no `sends_to` to ask: `id` is the worker its
+/// caller says the request goes to.
 ///
 /// `pool`, `phase` and `facts` are the ones the column was filled with, and
 /// `read` is what that fill returned. A worker the index speaks for, a
@@ -1440,21 +1444,27 @@ impl PoolAffinity {
     }
 }
 
-/// The address of the worker a decision's request goes to, in the list it
-/// was made over: the first target of a pick the profile is told of
-/// ([`told_target`]) that the request's caller sends to (`sends_to`),
-/// asked best first. It is the worker a tree's match writes the request's
-/// prefix for. `None` where the decision picked nobody, the binding's
-/// sessions rule keeps the request from the profile, or the caller sends
-/// to none of the pick's targets, and the tree stores nothing.
+/// The target a decision's request goes to: the first target of a pick the
+/// profile is told of ([`told_target`]) that the request's caller sends to
+/// (`sends_to`), asked best first. It is the worker a tree's match and the
+/// record's two writes keep the request's prefix for. `None` where the
+/// decision picked nobody, the binding's sessions rule keeps the request
+/// from the profile, or the caller sends to none of the pick's targets:
+/// nothing is stored.
+fn sent_target(decision: &Decision, sends_to: impl Fn(&Target) -> bool) -> Option<&Target> {
+    told_target(decision)?;
+    let mut targets = decision.pick()?.targets.iter();
+    targets.find(|target| sends_to(target))
+}
+
+/// The address of the worker a decision's request goes to
+/// ([`sent_target`]), in the list it was made over.
 fn sent_address<'w>(
     workers: &'w [Arc<dyn Worker>],
     decision: &Decision,
     sends_to: impl Fn(&Target) -> bool,
 ) -> Option<&'w str> {
-    told_target(decision)?;
-    let mut targets = decision.pick()?.targets.iter();
-    let target = targets.find(|target| sends_to(target))?;
+    let target = sent_target(decision, sends_to)?;
     Some(workers.get(target.position as usize)?.url())
 }
 
@@ -1476,7 +1486,7 @@ impl Table {
             return decide(facts);
         }
         if self.cap == 0 {
-            return self.decide_by_column(facts, buffers, decide);
+            return self.decide_by_column(facts, buffers, sends_to, decide);
         }
         // The entry is asked for where the host lends the place a tree,
         // once, by the tree's own page.
@@ -1504,7 +1514,8 @@ impl Table {
         };
         // The index speaks for a worker whose cache events are heard: the
         // record takes no entry for it.
-        let Some(target) = told_target(&decision).filter(|to| !self.heard(to.position)) else {
+        let sent = sent_target(&decision, sends_to);
+        let Some(target) = sent.filter(|to| !self.heard(to.position)) else {
             return decision;
         };
         let held = buffers.deepest.contains(&target.id);
@@ -1577,6 +1588,7 @@ impl Table {
         &self,
         facts: &RequestFacts<'_>,
         buffers: &mut Buffers,
+        sends_to: impl Fn(&Target) -> bool,
         decide: impl FnOnce(&mut RequestFacts<'_>) -> Decision,
     ) -> Decision {
         // The column leaves the buffers while the fill writes the others.
@@ -1593,7 +1605,8 @@ impl Table {
         let (Some(read), Some(record)) = (read, self.record.as_deref()) else {
             return decision;
         };
-        let Some(target) = told_target(&decision).filter(|to| !self.heard(to.position)) else {
+        let sent = sent_target(&decision, sends_to);
+        let Some(target) = sent.filter(|to| !self.heard(to.position)) else {
             return decision;
         };
         let held = read.deepest.contains(&target.position);
