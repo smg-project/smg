@@ -111,9 +111,6 @@ pub struct StopRules {
     /// gateway's per-request context, which holds a decoder, one allocator
     /// class up.
     matcher: Option<Arc<Matcher>>,
-    /// True when there are no string stop sequences (only token-level stops).
-    /// In this mode the jail buffer is bypassed entirely for lower overhead.
-    token_only: bool,
     /// The config's hidden stop token ids, sorted: every token is checked
     /// against them, and a search of a few sorted ids costs no hashing.
     hidden_stop_ids: StopIds,
@@ -174,7 +171,6 @@ impl StopRules {
         });
 
         Self {
-            token_only: matcher.is_none(),
             visible_boundary_idx,
             matcher,
             hidden_stop_ids: StopIds::new(&stop_tokens),
@@ -317,7 +313,7 @@ impl StopSequenceDecoder {
     /// to a buffer of the caller's instead.
     pub fn process_token(&mut self, token_id: TokenIdType) -> Result<SequenceDecoderOutput> {
         if !self.stopped
-            && self.rules.token_only
+            && self.rules.matcher.is_none()
             && !self.rules.hidden_stop_ids.contains(token_id)
             && !self.rules.visible_stop_ids.contains(token_id)
         {
@@ -376,7 +372,7 @@ impl StopSequenceDecoder {
 
         let hidden_stop = self.rules.hidden_stop_ids.contains(token_id);
         let visible_stop = self.rules.visible_stop_ids.contains(token_id);
-        if self.rules.token_only && !hidden_stop && !visible_stop {
+        if self.rules.matcher.is_none() && !hidden_stop && !visible_stop {
             // The common path: no string stops and not a stop token, so the
             // decoded text goes out as it is, with no jail to run.
             let before = out.len();
@@ -482,7 +478,7 @@ impl StopSequenceDecoder {
     /// longest suffix that is still a partial stop sequence.
     fn release(&mut self, out: &mut String) -> SequenceDecoderStep {
         // Token-only fast path: no string stops means no jail is needed.
-        if self.rules.token_only {
+        if self.rules.matcher.is_none() {
             if self.jail_buffer.is_empty() {
                 return SequenceDecoderStep::Held;
             }
