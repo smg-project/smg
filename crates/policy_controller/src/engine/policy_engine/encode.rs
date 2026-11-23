@@ -20,15 +20,13 @@ use super::{
     single::{self, PLACES},
     PolicyEngine, PoolMembers,
 };
-use crate::{
-    document::spec::AppliedSpec,
-    engine::{
-        decision::{shed, Decision, ShedReason, WIRES},
-        decision_engine::{DecideOutcome, DecisionRefused, Request, RequestMaker, WorkerLists},
-        framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools},
-        records::{DecisionClock, Live},
-        view::Phase,
-    },
+use crate::engine::{
+    decision::{shed, Decision, ShedReason, WIRES},
+    decision_engine::{DecideOutcome, DecisionRefused, Request, RequestMaker, WorkerLists},
+    framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools},
+    list_cell::LentList,
+    records::Live,
+    view::Phase,
 };
 
 #[cfg(test)]
@@ -39,9 +37,9 @@ mod tests;
 /// nothing there holds it to a decode that takes images.
 const DECODE_LATER: &str = "decode-later";
 
-/// An encode request's three lists as their host holds them for one
-/// decision: the pair's two lists, the encoders, and what the encode side
-/// reads of the workers beside their records. A decision names each placed
+/// An encode request's three lists as their host lends them for one
+/// decision: the pair's two lists, the encoders with their cell, and what
+/// the encode side reads of the workers beside their records. A decision names each placed
 /// key's encoder by its place in the encoder list, so the host finds it
 /// with no lookup by id.
 ///
@@ -56,7 +54,7 @@ pub struct EncodeLists<'a> {
     /// of its admission.
     pub pair: PairLists<'a>,
     /// The encoders.
-    pub encoders: &'a PoolMembers,
+    pub encoders: LentList<'a>,
     /// What the encode side reads of each encoder beside its record, by its
     /// place in the encoder list
     /// ([`EncodeClasses::encoder_facts`](crate::store::EncodeClasses::encoder_facts)).
@@ -74,11 +72,16 @@ impl EncodeLists<'_> {
     /// the workers stand at the call, with `loads` as a pair's decision
     /// reads them; the pair's records are stamped as a pair's
     /// ([`PairLists::decide`]). Whether an encoder or a decode takes images
-    /// is on its record as its host said when it handed the list
-    /// ([`PolicyEngine::pool_members_with_fixed_facts`](super::PolicyEngine::pool_members_with_fixed_facts)).
+    /// is on its record as its host lends it with the list
+    /// ([`LentList::facts`]).
+    ///
+    /// `engine` decides it: under its document, on its clock, and over its
+    /// own value of each of the three lists, which it asks of the list's
+    /// cell.
     ///
     /// `request` is the pair's, as its host made it for the prefill phase.
-    /// This call's instant is written into its facts: `now` on `clock`.
+    /// This call's instant is written into its facts: `now` on the engine's
+    /// clock.
     ///
     /// A request that states no budget is decided with the widest one
     /// written into its facts too, as a pair's is ([`PairLists::decide`]).
@@ -112,24 +115,54 @@ impl EncodeLists<'_> {
     /// ([`PolicyEngine::decide_encode_at`](super::PolicyEngine::decide_encode_at)).
     /// A request held to wires is not declined here: that entry tests the
     /// lists' wires ahead of this call.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a pair's inputs and the encode side's"
-    )]
     pub fn decide(
         &self,
-        spec: &AppliedSpec,
+        engine: &PolicyEngine,
         loads: Option<&Arc<LoadSnapshot>>,
-        clock: &DecisionClock,
         now: Instant,
         request: &mut Request<'_>,
         items: EncodeItems<'_>,
         placed: &mut EncodePlaced,
     ) -> Decision {
+        let sides = self.asked(engine);
+        self.decide_over(engine, sides, None, loads, now, request, items, placed)
+    }
+
+    /// The engine's own value of each of the pair's two lists, asked of
+    /// the list's cell: the prefills', the decodes'.
+    fn asked(&self, engine: &PolicyEngine) -> (&PoolMembers, &PoolMembers) {
+        let pair = &self.pair;
+        (
+            engine.members_of(pair.prefill),
+            engine.members_of(pair.decode),
+        )
+    }
+
+    /// [`Self::decide`] over the engine's values of the pair's two lists,
+    /// which its caller asked of their cells, and of the encoders' where
+    /// its caller read it. The encoders' cell is else asked here, behind
+    /// every answer that reads no row of an encoder: a cell no decision
+    /// reads is not filled.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a pair's inputs and the encode side's"
+    )]
+    fn decide_over(
+        &self,
+        engine: &PolicyEngine,
+        (prefill, decode): (&PoolMembers, &PoolMembers),
+        encoders: Option<&PoolMembers>,
+        loads: Option<&Arc<LoadSnapshot>>,
+        now: Instant,
+        request: &mut Request<'_>,
+        items: EncodeItems<'_>,
+        placed: &mut EncodePlaced,
+    ) -> Decision {
+        let (spec, clock) = (&engine.spec, &engine.clock);
         let pair = &self.pair;
         if not_decided(&request.constraints).is_some() {
             placed.clear();
-            return pair.decide(spec, loads, clock, now, request, None);
+            return pair.decide_over(engine, (prefill, decode), loads, now, request, None);
         }
         // One value for the three lists' records, as a pair's decision
         // takes one for its two.
@@ -147,14 +180,15 @@ impl EncodeLists<'_> {
         }
         let (facts, cx) = (&request.facts, &request.constraints);
         let [prefill_cx, decode_cx] = pair.masked(cx);
+        let encoders = encoders.unwrap_or_else(|| engine.members_of(self.encoders));
         let mut decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;
-            let (workers, records) = (pair.prefill.workers(), pair.prefill.records(spec, clock));
+            let (workers, records) = (prefill.workers(), prefill.records(spec, clock));
             let (prefills, pool) = records.write(workers, &live, prefills);
-            let (workers, records) = (pair.decode.workers(), pair.decode.records(spec, clock));
+            let (workers, records) = (decode.workers(), decode.records(spec, clock));
             let (decodes, _) = records.write(workers, &live, decodes);
             stamp(prefills, decodes, pair.classes, pair.admission);
-            let (workers, records) = (self.encoders.workers(), self.encoders.records(spec, clock));
+            let (workers, records) = (encoders.workers(), encoders.records(spec, clock));
             let (encoders, _) = records.write(workers, &live, &mut buffers.encoders);
             let pools = PairPools {
                 prefills,
@@ -324,14 +358,21 @@ pub(super) fn decide(
     placed: &mut EncodePlaced,
     now: Instant,
 ) -> Decision {
-    let (wires, pair) = (request.constraints.wire_modes, &lists.pair);
+    // The engine's own value of each of the pair's lists, asked of the
+    // list's cell once. The encoders' is asked where it is read: here
+    // for the wires of a request with items, and else where their rows
+    // are written.
+    let sides = lists.asked(own);
+    let mut encoders = None;
+    let wires = request.constraints.wire_modes;
     if !wires.is_empty() {
-        let dialed = pair.prefill.wires().union(pair.decode.wires());
-        let dialed = if items.keys.is_empty() {
-            dialed
-        } else {
-            dialed.union(lists.encoders.wires())
-        };
+        let (prefill, decode) = sides;
+        let mut dialed = prefill.wires().union(decode.wires());
+        if !items.keys.is_empty() {
+            let asked = own.members_of(lists.encoders);
+            dialed = dialed.union(asked.wires());
+            encoders = Some(asked);
+        }
         if !wires.contains(dialed) {
             placed.clear();
             return single::declined(own, request, WIRES);
@@ -341,7 +382,7 @@ pub(super) fn decide(
         placed.clear();
         return single::declined(own, request, DECODE_LATER);
     }
-    lists.decide(&own.spec, loads, &own.clock, now, request, items, placed)
+    lists.decide_over(own, sides, encoders, loads, now, request, items, placed)
 }
 
 /// One decision of an encode request by `own`, the engine of a gateway's

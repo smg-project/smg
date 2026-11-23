@@ -20,8 +20,8 @@ use std::{cell::OnceCell, ops::Deref, sync::Arc, time::Instant};
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
     engine::{
-        Decided, PairAdmission, PairLists, PartnerClasses, Phase, Plain, PolicyEngine, PoolMembers,
-        Request, RequestMaker, WorkerLists,
+        Decided, PairAdmission, PairLists, PartnerClasses, Phase, Plain, PolicyEngine, Request,
+        RequestMaker, WorkerLists,
     },
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Side, TransportClass},
@@ -34,7 +34,7 @@ use smg_worker::{
 };
 use tokio::runtime::Builder;
 
-use super::{measure, plain, reports, Cell, Host, Run, Shadowed, Stated, MODEL};
+use super::{measure, plain, reports, Cell, Host, Published, Run, Shadowed, Stated, MODEL};
 
 /// The pair document of the preset `name` on both sides.
 pub(super) fn of(name: &str) -> PolicySpec {
@@ -88,7 +88,7 @@ impl PairAdmission for Open {
 /// A pair's decodes as its host keeps them beside its prefills (the host's
 /// own list), with every worker's pair class.
 struct Decodes {
-    members: PoolMembers,
+    list: Published,
     classes: PartnerClasses,
 }
 
@@ -114,8 +114,8 @@ impl RequestMaker for StatedPair<'_> {
 
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::Pair(PairLists {
-            prefill: &self.stated.host.members,
-            decode: &self.decodes.members,
+            prefill: self.stated.host.list.lent(),
+            decode: self.decodes.list.lent(),
             classes: &self.decodes.classes,
             admission: &Open,
             prefill_places: None,
@@ -246,7 +246,7 @@ pub(super) fn runs(run: &Run) -> bool {
     let every = (0..prefills.len()).map(|_| partners.as_slice());
     let decode_side = Decodes {
         classes: PartnerClasses::number(decodes.len(), every),
-        members: engine.pool_members(&decodes),
+        list: Published::of(&decodes),
     };
     let mut receiver = None;
     let feed = TestFeed::attached_to(|loads| receiver = loads);
@@ -267,12 +267,12 @@ pub(super) fn runs(run: &Run) -> bool {
     upkeep.spawn(engine.run());
     let host = Host {
         engine,
-        members: engine.pool_members(&prefills),
+        list: Published::of(&prefills),
         request,
         plain: request(0).plain(),
     };
     // A pair's reports are converted a list: its two lists' counts together.
-    let converted = || host.members.conversions() + decode_side.members.conversions();
+    let converted = || host.conversions() + engine.conversions(decode_side.list.lent());
     measure(
         run,
         &host,

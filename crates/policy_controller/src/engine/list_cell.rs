@@ -38,7 +38,7 @@ use super::{
 };
 
 /// The cell beside one worker list: empty when the list is published, and
-/// from the list's first ask on the engine's value of it ([`PoolMembers`]).
+/// from the list's first ask on the engine's value of it.
 ///
 /// A program keeps one beside each list it publishes, in its value of a
 /// membership generation. It makes the cell empty where it builds that
@@ -49,10 +49,20 @@ use super::{
 ///
 /// A value is made under one applied document, by the engine that decides
 /// under it, and an engine reads the value made under its own document and
-/// no other ([`PolicyEngine::members_of`]). So a cell holds one value for
+/// no other. So a cell holds one value for
 /// each applied document that asked its list, of one engine or of several,
 /// until the list is published again. A value is neither freed nor moved
 /// while its list stands: a decision under way keeps the one it read.
+///
+/// The engine asks a cell inside the decision or the pick that is lent
+/// its list ([`WorkerLists`](super::decision_engine::WorkerLists),
+/// [`PolicyEngine::pick`]), where it decides over the list. The first ask
+/// under a document fills the cell: it reads each worker's registration
+/// and writes the list's records, so its cost grows with the list, and
+/// the request that asks first pays it. Every later ask is one read and
+/// one compare of the document's number, and one more of both for each
+/// value made before the asker's. A program asks the engine for no value
+/// of a list.
 ///
 /// The cell is two words in the program's value, filled or empty. Each
 /// value stands in an allocation of its own: it is aligned to cache lines
@@ -127,11 +137,15 @@ pub struct LentList<'a> {
     /// registry makes the program's value of a generation under its own
     /// guard, the program makes them behind that, at the list's first
     /// lending or by what ordered the membership change: no member is read
-    /// under the guard. They are read where the list's cell is filled, and
-    /// at no decision.
+    /// under the guard. They are read where the list's cell is filled,
+    /// inside the first decision or pick that asks it, and nowhere else.
     ///
-    /// Facts of another count than the list are refused where the list's
-    /// value is made, in every build, at every ask of the list lent so.
+    /// Facts of another count than the list are an error of the program,
+    /// refused where the list's value is made, in every build, and the cell
+    /// takes no value, so every later ask of the list lent so is refused
+    /// again. A pick that asks first panics ([`PolicyEngine::pick`]). A
+    /// decision that asks first is answered `DecisionRefused::Faulted` and
+    /// counted with the engine's faults: its entry catches the panic.
     pub facts: Option<&'a [FixedFacts]>,
 }
 
@@ -150,11 +164,13 @@ pub trait ModelLists: fmt::Debug + Send + Sync + 'static {
     ///
     /// A program that builds a derived list at its first use hands the lists
     /// built so far. A list built later is not lost: its cell is filled at
-    /// the list's first ask ([`PolicyEngine::members_of`]).
+    /// the list's first ask.
     ///
-    /// Each list is lent for the length of one call of `hand`. What fills a
-    /// model's cells ahead of the model's requests asks each handed list's
-    /// value there, off the path of a request. No decision calls this.
+    /// Each list is lent for the length of one call of `hand`. It is for
+    /// a fill of a model's cells ahead of the model's requests, off the
+    /// path of a request, by the engine's own task. That fill is not
+    /// built: nothing of the engine calls this yet, and a cell is filled
+    /// inside the first decision that asks it. No decision calls this.
     fn lists_of(&self, model: &str, hand: &mut dyn FnMut(LentList<'_>));
 }
 
@@ -164,7 +180,8 @@ impl PolicyEngine {
     /// the cell holds none under that document.
     ///
     /// A value the cell took first costs one read and one compare of the
-    /// document's number, and each value made before it one more of both.
+    /// document's number, in the caller's own code. One made behind it is
+    /// found out of line, at one more of both for each value before it.
     /// Where the cell holds none under the engine's document, the value is
     /// made here, as [`Self::pool_members_with_fixed_facts`] makes it, of
     /// the facts lent with the list, each worker's at its place, and of the
@@ -177,28 +194,30 @@ impl PolicyEngine {
     /// one, where it stood: a cell asked under a second document, or by a
     /// second engine, holds a value for each.
     ///
-    /// The fill writes the list's records, so its cost grows with the list,
-    /// once for each document the list is asked under. A list whose value
-    /// is asked ahead of its requests ([`ModelLists::lists_of`]) leaves
-    /// each request the read. A request that asks first pays the fill.
+    /// The fill reads each worker's registration and writes the list's
+    /// records, so its cost grows with the list, once for each document the
+    /// list is asked under. The request that asks first pays it: nothing
+    /// fills a cell ahead of its list's requests yet
+    /// ([`ModelLists::lists_of`]).
     ///
     /// # Panics
     ///
     /// Facts of another count than the list's workers are an error of the
     /// program, refused in every build where the value is made: the ask
     /// panics and the cell takes no value, so each later ask of the list
-    /// lent so is refused again, and the list lent right is filled. The
+    /// lent so is refused again, and the list lent right is filled. A
+    /// decision's entry catches the panic and answers a fault. The
     /// check stands in the fill and costs a read nothing: a cell that
     /// holds the value is read with no look at the facts.
-    pub fn members_of<'a>(&self, lent: LentList<'a>) -> &'a PoolMembers {
-        let (number, mut cell) = (self.applied(), lent.cell);
-        let members = loop {
-            let make = || Box::new(Made::of(self, lent, number));
-            let made = cell.0.get_or_init(make);
-            if made.under == number {
-                break &made.members;
-            }
-            cell = &made.next;
+    #[inline]
+    pub(crate) fn members_of<'a>(&self, lent: LentList<'a>) -> &'a PoolMembers {
+        let number = self.applied();
+        let members = match lent.cell.0.get() {
+            // The value the cell took first is read here, in the caller.
+            Some(made) if made.under == number => &made.members,
+            // One made behind it is found out of line, and one the cell
+            // does not hold is made there.
+            _ => self.found_or_made(lent.workers, lent.cell, lent.facts, number),
         };
         debug_assert!(
             Arc::ptr_eq(members.workers(), lent.workers),
@@ -206,10 +225,57 @@ impl PolicyEngine {
         );
         members
     }
+
+    /// [`Self::members_of`] out of line: the value of a lent list under
+    /// the document `number`, found along the cell's chain, or made where
+    /// the chain holds none. Several may come here at once for one empty
+    /// cell: one of them makes the value and the others wait for it. It
+    /// takes the lent list's three parts: its caller writes no copy of the
+    /// list for a call it does not make.
+    #[cold]
+    #[inline(never)]
+    fn found_or_made<'a>(
+        &self,
+        workers: &'a Arc<[Arc<dyn Worker>]>,
+        mut cell: &'a ListCell,
+        facts: Option<&'a [FixedFacts]>,
+        number: u64,
+    ) -> &'a PoolMembers {
+        let lent = LentList {
+            workers,
+            cell,
+            facts,
+        };
+        loop {
+            let made = cell
+                .0
+                .get_or_init(|| Box::new(Made::of(self, lent, number)));
+            if made.under == number {
+                return &made.members;
+            }
+            cell = &made.next;
+        }
+    }
+
+    /// The bench's count: how many times the reports of `lent`'s list were
+    /// converted under this engine's document so far. It makes no value: a
+    /// list the engine made no value of counts zero.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn conversions(&self, lent: LentList<'_>) -> u64 {
+        let (number, mut cell) = (self.applied(), lent.cell);
+        while let Some(made) = cell.0.get() {
+            if made.under == number {
+                return made.members.conversions();
+            }
+            cell = &made.next;
+        }
+        0
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         panic::{catch_unwind, AssertUnwindSafe},
         ptr,
@@ -225,6 +291,60 @@ mod tests {
 
     use super::*;
     use crate::document::spec::{AppliedSpec, PolicySpec};
+
+    /// A worker list as a case publishes it: the list, the cell beside it,
+    /// and what the case states of its workers. What the crate's cases hold
+    /// where a program holds its own value of a membership generation.
+    #[derive(Debug)]
+    pub(crate) struct PublishedList {
+        workers: Arc<[Arc<dyn Worker>]>,
+        facts: Option<Box<[FixedFacts]>>,
+        cell: ListCell,
+    }
+
+    impl PublishedList {
+        /// A list whose workers state nothing.
+        pub(crate) fn new(workers: Arc<[Arc<dyn Worker>]>) -> Self {
+            Self {
+                workers,
+                facts: None,
+                cell: ListCell::default(),
+            }
+        }
+
+        /// A list with what `facts_of` states of each worker: asked once a
+        /// worker, in the list's order.
+        pub(crate) fn with_facts(
+            workers: Arc<[Arc<dyn Worker>]>,
+            facts_of: impl FnMut(&Arc<dyn Worker>) -> FixedFacts,
+        ) -> Self {
+            let facts = workers.iter().map(facts_of).collect();
+            Self {
+                workers,
+                facts: Some(facts),
+                cell: ListCell::default(),
+            }
+        }
+
+        /// The list, lent with its cell and its facts.
+        pub(crate) fn lent(&self) -> LentList<'_> {
+            LentList {
+                workers: &self.workers,
+                cell: &self.cell,
+                facts: self.facts.as_deref(),
+            }
+        }
+
+        /// The list.
+        pub(crate) fn workers(&self) -> &Arc<[Arc<dyn Worker>]> {
+            &self.workers
+        }
+
+        /// Whether the cell holds a value: whether any decision asked it.
+        pub(crate) fn filled(&self) -> bool {
+            self.cell.0.get().is_some()
+        }
+    }
 
     const MODEL: &str = "model-a";
 
@@ -462,7 +582,9 @@ mod tests {
     /// is filled, each worker's at its place: the workers the program names
     /// take images and no other does. One list lent beside two cells keeps
     /// each cell's own facts, and a list lent with none says of no worker
-    /// that it takes images.
+    /// that it takes images. The facts are read at the fill alone: a list
+    /// lent again with none, beside its filled cell, answers as the cell
+    /// was filled.
     #[test]
     fn the_facts_lent_with_a_list_are_in_its_records_by_place() {
         let (engine, (list, facts)) = (engine(), stated_list((0..5).map(regular).collect()));
@@ -485,6 +607,16 @@ mod tests {
         assert_eq!(take_images(&engine, engine.members_of(silent)), [false; 5]);
         let again = engine.members_of(told);
         assert_eq!(take_images(&engine, again), named, "each cell its own");
+        let unsaid = LentList {
+            facts: None,
+            ..told
+        };
+        let filled = engine.members_of(unsaid);
+        assert_eq!(
+            take_images(&engine, filled),
+            named,
+            "read at the fill alone"
+        );
     }
 
     /// A cell asked by a second engine holds a value for each. The first

@@ -102,12 +102,13 @@ pub(super) const PLACES: &str = "places";
 /// The crate's word, in a shed's `emptied_by`, for a pool no stage emptied.
 const NO_STAGE: &str = "none";
 
-/// The short path: the place in `members`, the list its host handed, of
-/// the worker picked for a plain single request of `model`, and the profile
-/// whose picker picked it ([`AlonePick`]). `None` where the request takes
-/// the whole pass ([`decide`]): it is no single request, its place is not
+/// The short path: the place in `members`, the engine's value of the list
+/// its host lent, of the worker picked for a plain single request of
+/// `model`, and the profile whose picker picked it ([`AlonePick`]). `None`
+/// where the request takes the whole pass ([`decide`]): its place is not
 /// decided by one pick of a picker, a worker of the list is not dialed on a
-/// wire it states, or the picker's rule finds no eligible worker.
+/// wire it states, or the picker's rule finds no eligible worker. Its
+/// caller asks no list's value for a request of another phase.
 ///
 /// It ends in the place picked. It reads no fact of a request, so none is
 /// made ahead of it, and nothing a host is handed of a pick is built here.
@@ -119,15 +120,13 @@ pub(super) fn alone(
     plain: Plain,
     members: &PoolMembers,
 ) -> Option<AlonePick> {
-    if plain.phase != Phase::Single {
-        return None;
-    }
+    debug_assert_eq!(plain.phase, Phase::Single, "a single request's");
     // The whole pass declines such a list by name.
     if !plain.wires.is_empty() && !plain.wires.contains(members.wires()) {
         return None;
     }
     let profile = members.alone(&own.spec, model)?;
-    let position = own.pick(profile, members, |state: RoutingState| state.eligible())?;
+    let position = own.pick_over(profile, members, |state: RoutingState| state.eligible())?;
     Some(AlonePick {
         place: u32::try_from(position).ok()?,
         profile: profile.0,
@@ -541,6 +540,7 @@ pub(crate) mod tests {
             decision_engine::{Decided, DecisionEngine, DecisionRefused, TokenKey, WorkerLists},
             demands::{DemandFacts, Demands},
             framework::{Picker, Place, PoolWord, TieBand, DRAW_FROM},
+            list_cell::tests::PublishedList,
             prompt_hashes::HashSeeds,
             records::worker_id,
             view::{
@@ -663,7 +663,7 @@ pub(crate) mod tests {
     /// many times the engine made it.
     pub(crate) struct Asks<'a> {
         pub(crate) request: Request<'a>,
-        pub(crate) members: Option<&'a PoolMembers>,
+        pub(crate) members: Option<&'a PublishedList>,
         pub(crate) loads: Option<Arc<LoadSnapshot>>,
         pub(crate) made: Cell<u32>,
         /// The token ids the host names as the request's entry in a token
@@ -673,7 +673,7 @@ pub(crate) mod tests {
     }
 
     impl<'a> Asks<'a> {
-        pub(crate) fn of(request: Request<'a>, members: Option<&'a PoolMembers>) -> Self {
+        pub(crate) fn of(request: Request<'a>, members: Option<&'a PublishedList>) -> Self {
             Self {
                 request,
                 members,
@@ -700,7 +700,10 @@ pub(crate) mod tests {
         }
 
         fn workers(&self) -> WorkerLists<'_> {
-            self.members.map_or(WorkerLists::None, WorkerLists::Single)
+            match self.members {
+                Some(list) => WorkerLists::Single(list.lent()),
+                None => WorkerLists::None,
+            }
         }
 
         fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
@@ -742,7 +745,7 @@ pub(crate) mod tests {
     fn round_robin_is_one_turn_of_the_list_answered_as_a_place() {
         let engine = preset("round_robin");
         let list = pool(4);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let mut sized = request();
         sized.facts.prompt_tokens = 321;
         sized.facts.session_key = Identity::plain("a-key");
@@ -781,7 +784,7 @@ pub(crate) mod tests {
         let engine = preset("passthrough");
         for workers in [1, 2, 8, 64] {
             let list = pool(workers);
-            let members = engine.pool_members(&list);
+            let members = PublishedList::new(Arc::clone(&list));
             let asks = Asks::of(request(), Some(&members));
             for refused in 0..workers.min(12) {
                 // Classic's rule, asked of the same worker objects.
@@ -823,7 +826,7 @@ pub(crate) mod tests {
         let place = engine.place_for(MODEL, Phase::Single);
         assert!(matches!(place, Place::Alone(_)), "{place:?}");
         let list = pool(4);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let mut sized = request();
         sized.facts.prompt_tokens = 321;
         sized.facts.session_key = Identity::plain("a-key");
@@ -863,7 +866,7 @@ pub(crate) mod tests {
     fn a_request_the_one_pick_does_not_decide_is_made_once() {
         let engine = preset("round_robin");
         let list = pool(4);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
 
         // A retry is not plain: it is made, once a decision.
         let tried = [worker_id(list[0].as_ref())];
@@ -901,11 +904,13 @@ pub(crate) mod tests {
         let engine = preset("round_robin");
         let list = pool(4);
         let place = |worker: &Arc<dyn Worker>| list.iter().position(|one| Arc::ptr_eq(one, worker));
-        let members = engine.pool_members_with_fixed_facts(&list, |worker| FixedFacts {
+        let members = PublishedList::with_facts(Arc::clone(&list), |worker| FixedFacts {
             id: place(worker).map(|at| wide(at as u64)),
             ..FixedFacts::default()
         });
-        let records = members.records(&engine.spec, &engine.clock);
+        let records = engine
+            .members_of(members.lent())
+            .records(&engine.spec, &engine.clock);
         let stated: Vec<WorkerId> = (0..4).map(wide).collect();
         assert_eq!(records.ids(), stated);
         for (row, worker) in records.fixed().iter().zip(list.iter()) {
@@ -929,11 +934,12 @@ pub(crate) mod tests {
         }
         assert_eq!(seen, [true, false, true, true], "the tried one is passed");
 
-        let unsaid = engine.pool_members(&list);
+        let unsaid = PublishedList::new(Arc::clone(&list));
         let prints: Vec<WorkerId> = list
             .iter()
             .map(|worker| worker_id(worker.as_ref()))
             .collect();
+        let unsaid = engine.members_of(unsaid.lent());
         let records = unsaid.records(&engine.spec, &engine.clock);
         assert_eq!(records.ids(), prints);
     }
@@ -949,7 +955,7 @@ pub(crate) mod tests {
 
         let engine = preset("manual");
         let list = pool(4);
-        let members = engine.pool_members_with_fixed_facts(&list, |_| FixedFacts {
+        let members = PublishedList::with_facts(Arc::clone(&list), |_| FixedFacts {
             id: Some(WorkerId(0)),
             ..FixedFacts::default()
         });
@@ -957,7 +963,9 @@ pub(crate) mod tests {
             .iter()
             .map(|worker| worker_id(worker.as_ref()))
             .collect();
-        let records = members.records(&engine.spec, &engine.clock);
+        let records = engine
+            .members_of(members.lent())
+            .records(&engine.spec, &engine.clock);
         assert_eq!(records.ids(), prints);
 
         // The stock sessions rule: a key's first request is placed and
@@ -984,7 +992,7 @@ pub(crate) mod tests {
         let list = pool(4);
         let tried = [worker_id(list[0].as_ref())];
         let read = |engine: &PolicyEngine, retried: bool| {
-            let members = engine.pool_members(&list);
+            let members = PublishedList::new(Arc::clone(&list));
             let mut stated = request();
             if retried {
                 stated.facts.tried = &tried;
@@ -1011,7 +1019,7 @@ pub(crate) mod tests {
     fn a_place_that_scores_makes_its_request() {
         let engine = preset("least_load");
         let list = pool(4);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let asks = Asks::of(request(), Some(&members));
         for made in 1..=3 {
             assert!(decided(&engine, &asks).decision.pick().is_some());
@@ -1027,7 +1035,7 @@ pub(crate) mod tests {
     fn a_place_that_scores_by_load_reads_the_reports_its_host_hands() {
         let engine = preset("least_load");
         let list = pool(4);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let reports = (0..4)
             .map(|at| {
                 let queued = if at == 2 { 0 } else { 90_000 };
@@ -1106,7 +1114,7 @@ pub(crate) mod tests {
     fn a_retry_and_a_pool_no_turn_admits_are_put_to_the_whole_pass() {
         let engine = preset("round_robin");
         let list = pool(4);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let tried = [worker_id(list[0].as_ref())];
         let mut retry = request();
         retry.facts.tried = &tried;
@@ -1149,7 +1157,7 @@ pub(crate) mod tests {
             let spec = AppliedSpec::validate(&document).expect("the document validates");
             let engine = PolicyEngine::new(spec);
             let list = pool(workers);
-            let members = engine.pool_members(&list);
+            let members = PublishedList::new(Arc::clone(&list));
             let mut places = Vec::new();
             for turn in 0..12_usize {
                 let mut ask = request();
@@ -1196,8 +1204,11 @@ pub(crate) mod tests {
                 panic!("one pick of round robin decides the place");
             };
             let (one, other) = (pool(workers), pool(workers));
-            let lists = [engine.pool_members(&one), engine.pool_members(&other)];
-            let mut whole = |members: &PoolMembers, keyed: bool| {
+            let lists = [
+                PublishedList::new(Arc::clone(&one)),
+                PublishedList::new(Arc::clone(&other)),
+            ];
+            let mut whole = |members: &PublishedList, keyed: bool| {
                 let mut ask = request();
                 if keyed {
                     ask.facts.session_key = Identity::plain(keys.next().expect("a key"));
@@ -1222,7 +1233,7 @@ pub(crate) mod tests {
             let mut shared = Vec::new();
             for turn in 0..8 {
                 shared.push(if turn % 2 == 0 {
-                    let alone = engine.pick(profile, &lists[0], RoutingState::eligible);
+                    let alone = engine.pick(profile, lists[0].lent(), RoutingState::eligible);
                     alone.expect("a worker")
                 } else {
                     whole(&lists[0], true)
@@ -1294,7 +1305,7 @@ pub(crate) mod tests {
                 "manual",
             ] {
                 let engine = preset(name);
-                let members = engine.pool_members(&list);
+                let members = PublishedList::new(Arc::clone(&list));
                 let mut landed = BTreeSet::new();
                 for seed in 0..64 {
                     let mut retry = request();
@@ -1333,7 +1344,7 @@ pub(crate) mod tests {
     fn a_retry_over_one_engine_is_handed_its_ranks_again() {
         let engine = preset("random");
         let (list, _) = engines(&[4]);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let tried = [worker_id(list[1].as_ref())];
         let mut firsts = BTreeSet::new();
         for seed in 0..64 {
@@ -1362,7 +1373,7 @@ pub(crate) mod tests {
         // The stock sessions rule: its binding pins a key.
         let engine = preset("manual");
         let (list, engine_of) = engines(&[4, 4]);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         // One request of `key` that tried `tried`, served by its first
         // target: that target's place.
         let sent = |key: u64, tried: &[WorkerId]| {
@@ -1396,9 +1407,9 @@ pub(crate) mod tests {
     fn only_a_retry_over_ranks_takes_the_threads_list_and_it_grows_once() {
         let engine = preset("random");
         let (ranks, _) = engines(&[4, 4]);
-        let ranked = engine.pool_members(&ranks);
+        let ranked = PublishedList::new(Arc::clone(&ranks));
         let alone = pool(8);
-        let unranked = engine.pool_members(&alone);
+        let unranked = PublishedList::new(Arc::clone(&alone));
         // Where the thread's list stands and what it holds room for.
         let kept = || {
             let list = TRIED.take();
@@ -1406,7 +1417,7 @@ pub(crate) mod tests {
             TRIED.set(list);
             stands
         };
-        let asked = |members: &PoolMembers, tried: &[WorkerId]| {
+        let asked = |members: &PublishedList, tried: &[WorkerId]| {
             let mut asked = request();
             asked.facts.tried = tried;
             let asks = Asks::of(asked, Some(members));
@@ -1432,7 +1443,7 @@ pub(crate) mod tests {
         // The stock sessions rule takes a word on a lease.
         let engine = preset("manual");
         let (list, _) = engines(&[4, 4]);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let now = Instant::now() + Duration::from_secs(2);
         let dated = |tried: &[WorkerId]| {
             let mut keyed = request();
@@ -1464,7 +1475,7 @@ pub(crate) mod tests {
         // The first engine's first rank was tried, and has left the list.
         let tried = [worker_id(whole[0].as_ref())];
         let list: Arc<[Arc<dyn Worker>]> = whole[1..].iter().cloned().collect();
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let mut firsts = BTreeSet::new();
         for seed in 0..64 {
             let mut retry = request();
@@ -1493,8 +1504,8 @@ pub(crate) mod tests {
     fn what_no_stage_runs_is_answered_by_name() {
         let engine = preset("round_robin");
         let list = pool(2);
-        let members = engine.pool_members(&list);
-        let shed = |request: Request<'_>, members: Option<&PoolMembers>| {
+        let members = PublishedList::new(Arc::clone(&list));
+        let shed = |request: Request<'_>, members: Option<&PublishedList>| {
             let asks = Asks::of(request, members);
             match decided(&engine, &asks).decision {
                 Decision::Shed(shed) => (shed.reason, shed.emptied_by),
@@ -1529,6 +1540,104 @@ pub(crate) mod tests {
         );
     }
 
+    /// A list's cell is asked where the engine decides over the list, and
+    /// nowhere else. A request the engine refuses by its phase asks no
+    /// cell, plain or not, at either entry: its list's cell stays empty. A
+    /// maker that names its list while it makes the request is decided over
+    /// that list. So is a plain maker that lends one list ahead of its
+    /// making and another behind it: the pick ahead of the making found no
+    /// ready worker in the first, and the value it asked there is not the
+    /// one the request is decided over.
+    #[test]
+    fn a_cell_is_asked_where_its_list_is_decided_over() {
+        /// A maker that names its list while it makes the request.
+        struct Late<'a>(Request<'a>, &'a PublishedList, Cell<bool>);
+
+        impl RequestMaker for Late<'_> {
+            fn model(&self) -> &str {
+                self.0.facts.model
+            }
+
+            fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
+                self.2.set(true);
+                self.0
+            }
+
+            fn workers(&self) -> WorkerLists<'_> {
+                if self.2.get() {
+                    WorkerLists::Single(self.1.lent())
+                } else {
+                    WorkerLists::None
+                }
+            }
+        }
+
+        /// A plain maker that lends its first list ahead of its making
+        /// and its second behind it.
+        struct Moved<'a>(Request<'a>, [&'a PublishedList; 2], Cell<bool>);
+
+        impl RequestMaker for Moved<'_> {
+            fn model(&self) -> &str {
+                self.0.facts.model
+            }
+
+            fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
+                self.2.set(true);
+                self.0
+            }
+
+            fn plain(&self) -> Option<Plain> {
+                self.0.plain()
+            }
+
+            fn workers(&self) -> WorkerLists<'_> {
+                WorkerLists::Single(self.1[usize::from(self.2.get())].lent())
+            }
+        }
+
+        let engine = preset("round_robin");
+        let list = pool(2);
+        let members = PublishedList::new(Arc::clone(&list));
+        let now = Instant::now();
+        for phase in [Phase::Decode, Phase::Encode] {
+            let mut side = request();
+            side.facts.phase = phase;
+            // A plain request, and the same one from a maker that does not
+            // say so.
+            let plain = Asks::of(side, Some(&members));
+            assert!(plain.plain().is_some());
+            let leased = engine.decide_under(GatewayId::LOCAL, &plain, now);
+            assert_eq!(leased.err(), Some(DecisionRefused::PairSide), "{phase:?}");
+            let whole = Whole(Asks::of(side, Some(&members)));
+            let leased = engine.decide_under(GatewayId::LOCAL, &whole, now);
+            assert_eq!(leased.err(), Some(DecisionRefused::PairSide), "{phase:?}");
+            let bare = engine.decide_without_lease(&whole, now);
+            assert_eq!(bare.err(), Some(DecisionRefused::PairSide), "{phase:?}");
+        }
+        assert_eq!(engine.values_made(), 0, "no cell was asked");
+
+        let late = Late(request(), &members, Cell::new(false));
+        let leased = engine.decide_under(GatewayId::LOCAL, &late, now);
+        let (whole, _) = leased.expect("an answer").whole().expect("no place");
+        assert!(whole.decision.pick().is_some(), "over the list it named");
+        let late = Late(request(), &members, Cell::new(false));
+        let (bare, _) = engine.decide_without_lease(&late, now).expect("an answer");
+        assert!(bare.pick().is_some(), "over the list it named");
+        assert_eq!(engine.values_made(), 1, "one value of the one list");
+
+        let idle = pool(2);
+        for worker in idle.iter() {
+            worker.set_status(WorkerStatus::NotReady);
+        }
+        let ahead = PublishedList::new(Arc::clone(&idle));
+        let moved = Moved(request(), [&ahead, &members], Cell::new(false));
+        assert!(moved.plain().is_some());
+        let leased = engine.decide_under(GatewayId::LOCAL, &moved, now);
+        let (whole, _) = leased.expect("an answer").whole().expect("no place");
+        assert!(whole.decision.pick().is_some(), "over the list lent behind");
+        assert!(moved.2.get() && ahead.filled(), "the pick asked the first");
+    }
+
     /// A request its host holds to places of its list is made and decided
     /// over the list's own records: every target stands at one of the
     /// places, and each of them takes requests. Under a rotation, two draws
@@ -1541,7 +1650,7 @@ pub(crate) mod tests {
                 let engine = if bare { unfiltered(name) } else { preset(name) };
                 for workers in [8, 32] {
                     let list = pool(workers);
-                    let members = engine.pool_members(&list);
+                    let members = PublishedList::new(Arc::clone(&list));
                     let mut asks = Asks::of(request(), Some(&members));
                     asks.request.constraints.places = Some(&[3, 6]);
                     let mut first = [0_u32; 8];
@@ -1573,7 +1682,7 @@ pub(crate) mod tests {
             unfiltered("consistent_hashing"),
         ] {
             let list = pool(16);
-            let members = engine.pool_members(&list);
+            let members = PublishedList::new(Arc::clone(&list));
             let places = |decided: &DecideOutcome| -> Vec<u32> {
                 let pick = decided.decision.pick().expect("a pick");
                 pick.targets.iter().map(|target| target.position).collect()
@@ -1605,7 +1714,7 @@ pub(crate) mod tests {
         for workers in [8_u32, 32] {
             let engine = preset("cache_aware");
             let list = pool(workers as usize);
-            let members = engine.pool_members(&list);
+            let members = PublishedList::new(Arc::clone(&list));
             let tokens: Vec<u32> = (0..1_024).collect();
             let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
             let sent = |places: Option<&[u32]>, seed: u64, prompted: bool| {
@@ -1645,7 +1754,7 @@ pub(crate) mod tests {
     fn a_held_request_over_its_thresholds_everywhere_is_steered_among_its_places() {
         let engine = preset("round_robin");
         let list = pool(4);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         list[1].set_overloaded(true);
         let mut held = request();
         held.constraints.places = Some(&[1]);
@@ -1664,7 +1773,7 @@ pub(crate) mod tests {
     fn the_default_policy_sends_a_prompt_back_to_the_worker_it_was_sent_to() {
         let engine = preset("cache_aware");
         let list = pool(8);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let prompt = |first: u32| (first..first + 1_024).collect::<Vec<u32>>();
         let sent = |tokens: &[u32], seed: u64| {
             let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
@@ -1712,7 +1821,7 @@ pub(crate) mod tests {
             PolicyEngine::new(AppliedSpec::validate(&document).expect("the document validates"))
         };
         let list = pool(4);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         // One request under the key, sent to its first target and served
         // there: the place it went to, and whether the engine made it.
         let sent = || {
@@ -1771,7 +1880,7 @@ pub(crate) mod tests {
             PolicyEngine::new(AppliedSpec::validate(&document).expect("the document validates"))
         };
         let list = pool(8);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let prompt = |first: u32| (first..first + 1_024).collect::<Vec<u32>>();
         // One request of `tokens` under the session key `key`, with no key
         // where it is `0`, sent to its first target and served there: the
@@ -1889,7 +1998,7 @@ pub(crate) mod tests {
         let place = engine.place_for(MODEL, Phase::Single);
         assert!(matches!(place, Place::Alone(_)), "{place:?}");
         let list = pool(4);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let asks = Asks::of(request(), Some(&members));
         assert!(asks.plain().is_some(), "a plain request");
         let mut last = None;
@@ -1957,7 +2066,10 @@ pub(crate) mod tests {
             for loads in [None, Some(Arc::clone(&snapshot))] {
                 let (leasing, bare) = (preset(policy), preset(policy));
                 let list = pool(8);
-                let (theirs, ours) = (leasing.pool_members(&list), bare.pool_members(&list));
+                let (theirs, ours) = (
+                    PublishedList::new(Arc::clone(&list)),
+                    PublishedList::new(Arc::clone(&list)),
+                );
                 for seed in 0..16 {
                     let asked = |members| {
                         let mut seeded = request();
@@ -2006,7 +2118,10 @@ pub(crate) mod tests {
 
         let (engine, twin) = (preset("manual"), preset("manual"));
         let list = pool(16);
-        let (members, others) = (engine.pool_members(&list), twin.pool_members(&list));
+        let (members, others) = (
+            PublishedList::new(Arc::clone(&list)),
+            PublishedList::new(Arc::clone(&list)),
+        );
         let keyed = || {
             let mut keyed = request();
             keyed.facts.seed = 41;
@@ -2037,7 +2152,7 @@ pub(crate) mod tests {
     fn a_decision_without_a_lease_over_no_list_names_no_worker() {
         let engine = preset("round_robin");
         let list = pool(2);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let stating = |phase, members| {
             let mut stated = request();
             stated.facts.phase = phase;
@@ -2130,7 +2245,7 @@ pub(crate) mod tests {
                 PolicyEngine::new(applied)
             };
             let list = pool(8);
-            let members = engine.pool_members(&list);
+            let members = PublishedList::new(Arc::clone(&list));
             let prompt = |first: u32| (first..first + 1_024).collect::<Vec<u32>>();
             // One request sent to its first target and served there: the
             // place it went to, and who placed it.
@@ -2210,7 +2325,7 @@ pub(crate) mod tests {
                 PolicyEngine::new(applied)
             };
             let list = pool(8);
-            let members = engine.pool_members(&list);
+            let members = PublishedList::new(Arc::clone(&list));
             let placed_by = |key: u64| {
                 let mut asked = request();
                 asked.facts.seed = 7;
@@ -2247,7 +2362,7 @@ pub(crate) mod tests {
         for also in [Also::Nothing, Also::Shadow, Also::Signal] {
             let (engine, tree) = lent("cache_aware", also);
             let list = pool(8);
-            let members = engine.pool_members(&list);
+            let members = PublishedList::new(Arc::clone(&list));
             let sent = |tokens: &[u32], seed: u64| {
                 let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
                 let mut asked = request();
@@ -2295,7 +2410,7 @@ pub(crate) mod tests {
                 preset(name)
             };
             let list = pool(4);
-            let members = engine.pool_members(&list);
+            let members = PublishedList::new(Arc::clone(&list));
             let asks = Asks {
                 key: Some(&tokens),
                 ..Asks::of(request(), Some(&members))
@@ -2319,7 +2434,7 @@ pub(crate) mod tests {
     fn a_retry_over_ranks_is_decided_inside_the_lent_tree() {
         let (engine, _tree) = lent("cache_aware", Also::Nothing);
         let (list, engine_of) = engines(&[2, 2]);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let tokens: Vec<u32> = (0..256).collect();
         let sent = |tried: &[WorkerId]| {
             let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
@@ -2542,7 +2657,7 @@ pub(crate) mod tests {
     /// sent to its first target and completed, and one given up unsent.
     fn told(engine: &PolicyEngine, heard: &Heard) -> Vec<&'static str> {
         let list = pool(4);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let asks = Asks::of(request(), Some(&members));
         let now = Instant::now();
         let mut handle =
@@ -2580,7 +2695,7 @@ pub(crate) mod tests {
     fn the_stages_hear_a_singles_words_from_what_its_guard_lends() {
         let (engine, heard) = hearing(false);
         let list = pool(4);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let asks = Asks::of(request(), Some(&members));
         let now = Instant::now();
         let mut handle =
@@ -2634,7 +2749,7 @@ pub(crate) mod tests {
         let (engine, heard) = hearing(false);
         let engine: &'static PolicyEngine = Box::leak(Box::new(engine));
         let list = pool(4);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let asks = Asks::of(request(), Some(&members));
         let ended = |side: Side, served: WorkerId| Outcome {
             side,
@@ -2820,7 +2935,7 @@ pub(crate) mod tests {
     fn a_single_requests_placement_is_sent_under_the_side_its_host_names() {
         let (engine, heard, ends) = hearing_ends();
         let list = pool(4);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let words = || std::mem::take(&mut *heard.lock());
         for side in [Side::Decode, Side::Prefill, Side::Single] {
             let asks = Asks::of(request(), Some(&members));
@@ -2869,7 +2984,7 @@ pub(crate) mod tests {
         });
         let engine: &'static PolicyEngine = Box::leak(Box::new(engine));
         let list = pool(4);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let asks = Asks::of(request(), Some(&members));
         let (decided, later) = answered(engine, &asks).whole().expect("a whole decision");
         let first = decided
@@ -2935,7 +3050,7 @@ pub(crate) mod tests {
         let spec = AppliedSpec::validate(&document).expect("the document validates");
         let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(spec)));
         let list = pool(4);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let ended = Outcome {
             side: Side::Single,
             served: WorkerId(0),
@@ -3046,7 +3161,7 @@ pub(crate) mod tests {
         });
         let engine: &'static PolicyEngine = Box::leak(Box::new(engine));
         let list = pool(4);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let asks = Asks::of(request(), Some(&members));
         let (decided, later) = answered(engine, &asks).whole().expect("a whole decision");
         let first = decided
@@ -3077,7 +3192,7 @@ pub(crate) mod tests {
     fn a_placement_ends_under_an_outcome_that_names_no_worker() {
         let (engine, _, ends) = hearing_ends();
         let list = pool(4);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let asks = Asks::of(request(), Some(&members));
         let (decided, later) = answered(engine, &asks).whole().expect("a whole decision");
         let picked = decided.decision.pick().expect("a pick");
@@ -3147,7 +3262,7 @@ pub(crate) mod tests {
     fn a_decision_that_panics_is_refused_and_counted() {
         let (engine, heard) = hearing(true);
         let list = pool(2);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let asks = Asks::of(request(), Some(&members));
         for faults in 1..=2 {
             assert_eq!(
@@ -3215,7 +3330,7 @@ pub(crate) mod tests {
         let absence = Duration::from_micros(engine.spec.engine().pins_absence_micros());
         // The key's request over `list` in quarter `turn`: its worker.
         let sent = |list: &Arc<[Arc<dyn Worker>]>, turn: u32| {
-            let members = engine.pool_members(list);
+            let members = PublishedList::new(Arc::clone(list));
             let mut keyed = request();
             keyed.facts.session_key = Identity::hashed(1);
             let asks = Asks::of(keyed, Some(&members));
@@ -3236,7 +3351,7 @@ pub(crate) mod tests {
     /// target, or what the request is shed for.
     fn places_named(
         engine: &PolicyEngine,
-        members: &PoolMembers,
+        members: &PublishedList,
         demands: Demands,
     ) -> Result<BTreeSet<u32>, (ShedReason, &'static str)> {
         places_named_among(engine, members, demands, None)
@@ -3245,7 +3360,7 @@ pub(crate) mod tests {
     /// [`places_named`], for a request its host holds to `among`.
     fn places_named_among(
         engine: &PolicyEngine,
-        members: &PoolMembers,
+        members: &PublishedList,
         demands: Demands,
         among: Option<&[u32]>,
     ) -> Result<BTreeSet<u32>, (ShedReason, &'static str)> {
@@ -3270,7 +3385,7 @@ pub(crate) mod tests {
 
     /// A request that states a hard demand is decided among the workers of
     /// its list that meet it, by what the list's host said of each worker
-    /// when it made the list's value, once a worker and at no decision:
+    /// when it published the list:
     /// every pick lands on one of them, and each of them takes its turn. A
     /// demand no worker meets sheds the list with no endpoint, under that
     /// demand's stage. Of a list its host said nothing of, no worker takes
@@ -3282,9 +3397,7 @@ pub(crate) mod tests {
         // The second and the fourth worker take images; the fourth states
         // a window, each of the others a runtime.
         let (sees, bounded) = (Arc::clone(&list[1]), Arc::clone(&list[3]));
-        let answers = Cell::new(0);
-        let said = engine.pool_members_with_fixed_facts(&list, |worker| {
-            answers.set(answers.get() + 1);
+        let said = PublishedList::with_facts(Arc::clone(&list), |worker| {
             let bounded = Arc::ptr_eq(worker, &bounded);
             // Each fact behind the rest of the type: a further fact of a
             // worker adds its field.
@@ -3301,7 +3414,7 @@ pub(crate) mod tests {
                 ..seeing
             }
         });
-        let silent = engine.pool_members(&list);
+        let silent = PublishedList::new(Arc::clone(&list));
         let asked = |members, demands| places_named(&engine, members, demands);
         let pixels = Demands {
             vision: true,
@@ -3338,7 +3451,7 @@ pub(crate) mod tests {
         // too small, and the others take none. The list is shed under the
         // later of the two demands in a host's order, which is neither
         // the first worker's failure nor the last one's.
-        let narrow = engine.pool_members_with_fixed_facts(&list, |worker| {
+        let narrow = PublishedList::with_facts(Arc::clone(&list), |worker| {
             let small = Arc::ptr_eq(worker, &sees);
             let seeing = FixedFacts {
                 vision: small,
@@ -3361,7 +3474,6 @@ pub(crate) mod tests {
         // worker when it makes the list's value.
         assert_eq!(asked(&silent, long), Ok(BTreeSet::from([0, 1, 2, 3])));
         assert_eq!(asked(&silent, pixels), blind);
-        assert_eq!(answers.get(), 4, "once a worker, and at no decision");
     }
 
     /// Over a worker list a worker's rank is read off its object, whatever
@@ -3400,8 +3512,8 @@ pub(crate) mod tests {
         };
         // A list nothing is said of, and one whose host says the opposite
         // of each worker's rank: both read the objects.
-        let silent = engine.pool_members(&list);
-        let said = engine.pool_members_with_fixed_facts(&list, |worker| FixedFacts {
+        let silent = PublishedList::new(Arc::clone(&list));
+        let said = PublishedList::with_facts(Arc::clone(&list), |worker| FixedFacts {
             demands: DemandFacts {
                 ranked: !worker.is_dp_aware(),
                 ..DemandFacts::default()
@@ -3415,7 +3527,7 @@ pub(crate) mod tests {
             assert_eq!(any, Ok(BTreeSet::from([0, 1, 2, 3])));
         }
         let ranks: Arc<[Arc<dyn Worker>]> = Arc::from(vec![ranked(0, 0, 2), ranked(1, 1, 2)]);
-        let ranks = engine.pool_members(&ranks);
+        let ranks = PublishedList::new(Arc::clone(&ranks));
         let shed = places_named(&engine, &ranks, unpinned);
         assert_eq!(shed, Err((ShedReason::NoEndpoints, "rank")));
     }
@@ -3436,7 +3548,7 @@ pub(crate) mod tests {
             let list = pool(32);
             // Every fourth worker takes images.
             let sees: Vec<_> = list.iter().step_by(4).cloned().collect();
-            let members = engine.pool_members_with_fixed_facts(&list, |worker| FixedFacts {
+            let members = PublishedList::with_facts(Arc::clone(&list), |worker| FixedFacts {
                 vision: sees.iter().any(|seeing| Arc::ptr_eq(seeing, worker)),
                 ..FixedFacts::default()
             });
@@ -3484,7 +3596,7 @@ pub(crate) mod tests {
         let list = pool(8);
         // Every other worker takes images.
         let sees: Vec<_> = list.iter().step_by(2).cloned().collect();
-        let members = engine.pool_members_with_fixed_facts(&list, |worker| FixedFacts {
+        let members = PublishedList::with_facts(Arc::clone(&list), |worker| FixedFacts {
             vision: sees.iter().any(|seeing| Arc::ptr_eq(seeing, worker)),
             ..FixedFacts::default()
         });

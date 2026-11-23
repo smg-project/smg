@@ -96,7 +96,8 @@ mod tests {
             decision::{Decision, ShadowKind, ShedReason},
             decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
             framework::{DecisionScope, Filter},
-            policy_engine::{PolicyEngine, PoolMembers},
+            list_cell::tests::PublishedList,
+            policy_engine::PolicyEngine,
             shadow::Shadow,
             view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts},
         },
@@ -202,7 +203,7 @@ mod tests {
     }
 
     /// A request stated ahead, with the one list its host hands for it.
-    struct Hands<'a>(Request<'a>, &'a PoolMembers);
+    struct Hands<'a>(Request<'a>, &'a PublishedList);
 
     impl RequestMaker for Hands<'_> {
         fn model(&self) -> &str {
@@ -214,7 +215,7 @@ mod tests {
         }
 
         fn workers(&self) -> WorkerLists<'_> {
-            WorkerLists::Single(self.1)
+            WorkerLists::Single(self.1.lent())
         }
     }
 
@@ -370,7 +371,7 @@ mod tests {
         let (_, shown, seen) = with_a_shown_stage(preset("random"));
         let engine = PolicyEngine::new(shown);
         let list: Arc<[Arc<dyn Worker>]> = fleet(4).into();
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let declined = (ShedReason::PolicyDeclined, "written-rows");
         for seed in 0..16 {
             let stated = Request {

@@ -51,6 +51,7 @@ mod tests {
         engine::{
             decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
             framework::{DecisionScope, Filter},
+            list_cell::tests::PublishedList,
             view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts},
             EncodeItems, EncodeLists, EncodePlaced, PairAdmission, PairLists, PartnerClasses,
             PlaceRequest, PolicyEngine,
@@ -212,11 +213,11 @@ mod tests {
         let preset = PolicySpec::preset("random").expect("a built-in preset");
         let (engine, noted) = noting(preset);
         let list = fleet(3);
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         for (stated, shown) in [(0, u32::MAX), (STATED, STATED)] {
             let asks = Hands(
                 stating(Phase::Single, stated),
-                WorkerLists::Single(&members),
+                WorkerLists::Single(members.lent()),
             );
             let now = Instant::now();
             let bare = engine.decide_without_lease(&asks, now);
@@ -242,13 +243,13 @@ mod tests {
         let prefills = side("prefill", WorkerType::Prefill);
         let decodes = side("decode", WorkerType::Decode);
         let members = [
-            engine.pool_members(&prefills),
-            engine.pool_members(&decodes),
+            PublishedList::new(Arc::clone(&prefills)),
+            PublishedList::new(Arc::clone(&decodes)),
         ];
         let classes = PartnerClasses::number(2, [&[0u32, 1][..], &[0, 1][..]]);
         let lists = PairLists {
-            prefill: &members[0],
-            decode: &members[1],
+            prefill: members[0].lent(),
+            decode: members[1].lent(),
             classes: &classes,
             admission: &Open,
             prefill_places: None,
@@ -293,12 +294,12 @@ mod tests {
         let members = [0, 1, 2].map(|list| {
             let ready = |at| ready_worker(&format!("http://list-{list}-worker-{at}:8000"), MODEL);
             let workers: Arc<[Arc<dyn Worker>]> = (0..2).map(ready).collect();
-            engine.pool_members(&workers)
+            PublishedList::new(workers)
         });
         let classes = PartnerClasses::number(2, [&[0u32, 1][..], &[0, 1][..]]);
         let pair = PairLists {
-            prefill: &members[0],
-            decode: &members[1],
+            prefill: members[0].lent(),
+            decode: members[1].lent(),
             classes: &classes,
             admission: &Open,
             prefill_places: None,
@@ -310,21 +311,21 @@ mod tests {
         };
         let lists = EncodeLists {
             pair,
-            encoders: &members[2],
+            encoders: members[2].lent(),
             facts: &[],
             prefill_classes: &[],
         };
-        let (spec, clock, now) = (engine.spec(), engine.clock(), Instant::now());
+        let now = Instant::now();
         for (stated, shown) in [(0, u32::MAX), (STATED, STATED)] {
             let mut theirs = stating(Phase::Prefill, stated);
-            let decision = pair.decide(spec, None, clock, now, &mut theirs, None);
+            let decision = pair.decide(&engine, None, now, &mut theirs, None);
             assert!(decision.pick().is_some(), "no pick: {decision:?}");
             all_shown(&noted, shown, "a pair's lists");
             assert_eq!(theirs.facts.budget_micros, shown);
 
             let mut theirs = stating(Phase::Prefill, stated);
             let (none, mut placed) = (EncodeItems::default(), EncodePlaced::new());
-            let decision = lists.decide(spec, None, clock, now, &mut theirs, none, &mut placed);
+            let decision = lists.decide(&engine, None, now, &mut theirs, none, &mut placed);
             assert!(decision.pick().is_some(), "no pick: {decision:?}");
             all_shown(&noted, shown, "an encode request's lists");
             assert_eq!(theirs.facts.budget_micros, shown);
@@ -340,8 +341,8 @@ mod tests {
         let (engine, noted) = noting(preset);
         let engine: &'static PolicyEngine = Box::leak(Box::new(engine));
         let list = fleet(3);
-        let members = engine.pool_members(&list);
-        let mut request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+        let members = PublishedList::new(Arc::clone(&list));
+        let mut request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
         assert_eq!(request.budget_micros, 0);
         drop(engine.place(&request).expect("a placement"));
         all_shown(&noted, u32::MAX, "a place, no budget");

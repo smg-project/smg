@@ -108,7 +108,7 @@ fn a_decode_decided_again_is_picked_on_the_records_of_its_own_call() {
     document.generation = 1;
     document.plans.pd_pair.decode = DecodePick::AfterPrefill;
     let engine = hosted(engine_of(&document));
-    let lists = Lists::of(engine, 2, 2);
+    let lists = Lists::of(2, 2);
     let classes = lists.every();
     let request = later(lists.under(&classes, &Open));
     for first in [0, 1] {
@@ -139,7 +139,7 @@ fn a_decode_decided_again_is_picked_on_the_records_of_its_own_call() {
 fn a_decode_decided_again_passes_over_a_decode_that_cannot_be_sent_to() {
     for by_breaker in [false, true] {
         let (engine, heard) = asked_again();
-        let lists = Lists::of(engine, 1, 3);
+        let lists = Lists::of(1, 3);
         let classes = lists.every();
         let request = later(lists.under(&classes, &Open));
         let mut placement = engine.place(&request).expect("a placement");
@@ -186,7 +186,7 @@ fn a_decode_decided_again_passes_over_a_decode_that_cannot_be_sent_to() {
 #[test]
 fn a_decode_call_none_of_whose_decodes_holds_gives_its_side_up_and_may_be_asked_again() {
     let (engine, heard) = asked_again();
-    let lists = Lists::of(engine, 1, 2);
+    let lists = Lists::of(1, 2);
     let classes = lists.every();
     let request = later(lists.under(&classes, &Open));
     let (prefill, lead, chosen) = (lists.prefill_id(0), lists.decode_id(0), lists.decode_id(1));
@@ -276,7 +276,7 @@ fn a_decode_call_that_takes_no_decode_leaves_the_first_calls_size_stated() {
     let spec = AppliedSpec::validate_in(&document, &stages, &[]);
     let engine = hosted(PolicyEngine::new(spec.expect("the stages hold the picker")));
 
-    let lists = Lists::of(engine, 1, 1);
+    let lists = Lists::of(1, 1);
     let classes = lists.every();
     let sized = |tokens: &'static [u32]| PlaceRequest {
         prompt: Prompt {
@@ -311,7 +311,7 @@ fn a_decode_call_that_takes_no_decode_leaves_the_first_calls_size_stated() {
 #[test]
 fn a_decode_call_that_sheds_is_answered_by_name_and_leaves_the_first_decode_chosen() {
     let (engine, heard) = asked_again();
-    let lists = Lists::of(engine, 1, 1);
+    let lists = Lists::of(1, 1);
     let classes = lists.every();
     let request = later(lists.under(&classes, &Open));
     let mut placement = engine.place(&request).expect("a placement");
@@ -361,7 +361,7 @@ fn a_decode_call_that_sheds_is_answered_by_name_and_leaves_the_first_decode_chos
 #[test]
 fn a_decode_call_out_of_turn_is_refused_by_name_and_says_nothing() {
     let (engine, heard) = asked_again();
-    let lists = Lists::of(engine, 1, 2);
+    let lists = Lists::of(1, 2);
     let classes = lists.every();
     let request = later(lists.under(&classes, &Open));
     let refused = |placement: &mut Placement<'_>, why: DecodeRefused| {
@@ -409,7 +409,7 @@ fn a_decode_call_out_of_turn_is_refused_by_name_and_says_nothing() {
 #[test]
 fn the_stages_hear_a_decode_decided_again_at_its_call_its_send_and_its_end() {
     let (engine, heard) = asked_again();
-    let lists = Lists::of(engine, 1, 2);
+    let lists = Lists::of(1, 2);
     let classes = lists.every();
     let request = later(lists.under(&classes, &Open));
     let (prefill, lead, taken) = (lists.prefill_id(0), lists.decode_id(0), lists.decode_id(1));
@@ -480,7 +480,7 @@ fn a_decode_that_never_stood_chosen_takes_no_decode_call() {
         (DecodePick::WithPrefill, true),
     ] {
         let (engine, heard) = paired_picking(false, pick);
-        let lists = Lists::of(engine, 1, 2);
+        let lists = Lists::of(1, 2);
         let classes = lists.every();
         let pair = lists.under(&classes, &Open);
         let first = PlaceRequest {
@@ -511,10 +511,10 @@ fn a_decode_that_never_stood_chosen_takes_no_decode_call() {
         (hosted(preset("round_robin")), false),
     ];
     for (engine, leased) in engines {
-        let members = engine.pool_members(&workers);
+        let members = PublishedList::new(Arc::clone(&workers));
         let single = PlaceRequest {
             decode_again: true,
-            ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
         };
         let mut placement = engine.place(&single).expect("a placement");
         placement.sent(Side::Single);
@@ -533,7 +533,7 @@ fn a_decode_that_never_stood_chosen_takes_no_decode_call() {
 fn a_decode_decided_again_reads_what_its_request_tried() {
     for tries in [false, true] {
         let (engine, _) = asked_again();
-        let lists = Lists::of(engine, 1, 2);
+        let lists = Lists::of(1, 2);
         let classes = lists.every();
         let request = later(lists.under(&classes, &Open));
         let mut placement = engine.place(&request).expect("a placement");
@@ -556,17 +556,17 @@ fn a_decode_decided_again_reads_what_its_request_tried() {
 #[test]
 fn a_decode_decided_again_over_an_encode_requests_lists_reads_its_pairs_decodes() {
     let (engine, _) = asked_again();
-    let lists = Lists::of(engine, 1, 2);
+    let lists = Lists::of(1, 2);
     let classes = lists.every();
     let pair = lists.under(&classes, &Open);
     let mut placement = engine.place(&later(pair)).expect("a placement");
     assert_eq!(lists.places(&placement), (0, 0));
     placement.sent(Side::Prefill);
     lists.decodes[0].set_status(WorkerStatus::NotReady);
-    let encoders = engine.pool_members(&pool(0));
+    let encoders = PublishedList::new(pool(0));
     let three = EncodeLists {
         pair,
-        encoders: &encoders,
+        encoders: encoders.lent(),
         facts: &[],
         prefill_classes: &[],
     };
@@ -586,7 +586,7 @@ fn a_decode_decided_again_over_an_encode_requests_lists_reads_its_pairs_decodes(
 #[should_panic(expected = "sent behind the end of both its sides")]
 fn a_chosen_decode_sent_behind_its_prefills_end_stops_a_debug_build() {
     let (engine, _) = asked_again();
-    let lists = Lists::of(engine, 1, 1);
+    let lists = Lists::of(1, 1);
     let classes = lists.every();
     let request = later(lists.under(&classes, &Open));
     let mut placement = engine.place(&request).expect("a placement");
@@ -606,7 +606,7 @@ fn a_decode_send_said_again_behind_both_ends_of_a_pair_booked_whole_says_nothing
         (DecodePick::WithPrefill, true),
     ] {
         let (engine, heard) = paired_picking(false, pick);
-        let lists = Lists::of(engine, 1, 1);
+        let lists = Lists::of(1, 1);
         let classes = lists.every();
         let request = PlaceRequest {
             decode_again: asks,
@@ -633,17 +633,17 @@ fn a_decode_send_said_again_behind_both_ends_of_a_pair_booked_whole_says_nothing
 #[should_panic(expected = "the decode stands at the target's position")]
 fn a_decode_list_that_states_worker_ids_is_told_at_its_decode_call_in_a_debug_build() {
     let (engine, _) = asked_again();
-    let lists = Lists::of(engine, 1, 1);
+    let lists = Lists::of(1, 1);
     let classes = lists.every();
     let request = later(lists.under(&classes, &Open));
     let mut placement = engine.place(&request).expect("a placement");
     placement.sent(Side::Prefill);
-    let stated = engine.pool_members_with_fixed_facts(&lists.decodes, |_| FixedFacts {
+    let stated = PublishedList::with_facts(Arc::clone(&lists.decodes), |_| FixedFacts {
         id: Some(WorkerId(7)),
         ..FixedFacts::default()
     });
     let again = later(PairLists {
-        decode: &stated,
+        decode: stated.lent(),
         ..lists.under(&classes, &Open)
     });
     let _ = placement.decode_again(&again);

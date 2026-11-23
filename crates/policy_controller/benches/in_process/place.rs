@@ -64,7 +64,7 @@ pub(super) fn one(host: &Host, rule: bool) -> Option<u32> {
             ..Prompt::NONE
         },
         admits: ruled::admits(rule),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&host.members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(host.list.lent()))
     };
     let mut answer = host.engine.place(&request);
     let placement = answer.as_mut().ok()?;

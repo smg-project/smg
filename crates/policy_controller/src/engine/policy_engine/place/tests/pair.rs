@@ -109,15 +109,16 @@ fn trip(worker: &Arc<dyn Worker>) {
     assert!(worker.routing_state().healthy && !ready(worker.as_ref()));
 }
 
-/// A caller's two lists of ready workers, and the engine's value of each.
+/// A caller's two lists of ready workers as it publishes them, each with
+/// its cell.
 struct Lists {
     prefills: Arc<[Arc<dyn Worker>]>,
     decodes: Arc<[Arc<dyn Worker>]>,
-    members: [PoolMembers; 2],
+    published: [PublishedList; 2],
 }
 
 impl Lists {
-    fn of(engine: &PolicyEngine, prefills: usize, decodes: usize) -> Self {
+    fn of(prefills: usize, decodes: usize) -> Self {
         let side = |name: &str, worker_type, count| -> Arc<[Arc<dyn Worker>]> {
             let ready = |at: usize| -> Arc<dyn Worker> {
                 let worker = <BasicWorkerBuilder>::from_spec(WorkerSpec {
@@ -133,14 +134,11 @@ impl Lists {
         };
         let prefills = side("prefill", WorkerType::Prefill, prefills);
         let decodes = side("decode", WorkerType::Decode, decodes);
-        let members = [
-            engine.pool_members(&prefills),
-            engine.pool_members(&decodes),
-        ];
+        let published = [&prefills, &decodes].map(|list| PublishedList::new(Arc::clone(list)));
         Self {
             prefills,
             decodes,
-            members,
+            published,
         }
     }
 
@@ -150,9 +148,9 @@ impl Lists {
         classes: &'a PartnerClasses,
         admission: &'a dyn PairAdmission,
     ) -> PairLists<'a> {
-        let [prefill, decode] = &self.members;
+        let [prefill, decode] = &self.published;
         PairLists {
-            decode,
+            decode: decode.lent(),
             admission,
             ..pair_of(prefill, classes)
         }
@@ -203,7 +201,7 @@ fn a_pair_is_placed_on_the_first_target_both_of_whose_workers_can_be_sent_to() {
     // The second is held back by its circuit breaker alone.
     for down in 1..MAX_TARGETS {
         let (engine, heard) = paired(false);
-        let lists = Lists::of(engine, 2, MAX_TARGETS);
+        let lists = Lists::of(2, MAX_TARGETS);
         let classes = lists.every();
         for (at, decode) in lists.decodes[..down].iter().enumerate() {
             if at == 1 {
@@ -240,7 +238,7 @@ fn a_pair_is_placed_on_the_first_target_both_of_whose_workers_can_be_sent_to() {
 
     // A prefill held back by its circuit breaker alone holds no target.
     let (engine, _) = paired(false);
-    let lists = Lists::of(engine, 1, 1);
+    let lists = Lists::of(1, 1);
     let classes = lists.every();
     trip(&lists.prefills[0]);
     let pair = lists.under(&classes, &Open);
@@ -263,7 +261,7 @@ fn a_pair_is_placed_on_the_first_target_both_of_whose_workers_can_be_sent_to() {
 #[test]
 fn a_side_that_cannot_be_sent_to_is_left_out_of_the_next_ask_by_its_own_id() {
     let (engine, heard) = paired(false);
-    let lists = Lists::of(engine, 2, 2);
+    let lists = Lists::of(2, 2);
     let classes = lists.every();
     lists.prefills[0].set_status(WorkerStatus::NotReady);
     let pair = lists.under(&classes, &Open);
@@ -346,7 +344,7 @@ fn no_pair_crosses_the_classes_its_caller_states() {
     let mut document = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
     document.generation = 1;
     let engine = hosted(engine_of(&document));
-    let lists = Lists::of(engine, 2, 2);
+    let lists = Lists::of(2, 2);
     // Prefill 0 pairs with decode 0 alone, and prefill 1 with decode 1.
     let classes = PartnerClasses::number(2, [&[0_u32][..], &[1][..]]);
     let pair = lists.under(&classes, &Open);
@@ -370,7 +368,7 @@ fn no_pair_crosses_the_classes_its_caller_states() {
     }
 
     let (keeps, _) = paired(false);
-    let lists = Lists::of(keeps, 2, 2);
+    let lists = Lists::of(2, 2);
     let pair = lists.under(&classes, &Open);
     let request = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
     lists.decodes[0].set_status(WorkerStatus::NotReady);
@@ -394,7 +392,7 @@ fn no_pair_crosses_the_classes_its_caller_states() {
 #[test]
 fn prefills_all_at_their_limit_answer_the_word_their_caller_waits_on() {
     let (engine, heard) = paired(false);
-    let lists = Lists::of(engine, 2, 2);
+    let lists = Lists::of(2, 2);
     let classes = lists.every();
     let full = Gates(|_| false, |_| true);
     let pair = lists.under(&classes, &full);
@@ -438,7 +436,7 @@ fn a_pairs_shed_is_answered_by_its_name() {
 
     // No decode is ready.
     let engine = stock();
-    let lists = Lists::of(engine, 2, 2);
+    let lists = Lists::of(2, 2);
     let classes = lists.every();
     for decode in lists.decodes.iter() {
         decode.set_status(WorkerStatus::NotReady);
@@ -450,7 +448,7 @@ fn a_pairs_shed_is_answered_by_its_name() {
 
     // One prefill at its limit, whose one partner is not ready.
     let engine = stock();
-    let lists = Lists::of(engine, 1, 1);
+    let lists = Lists::of(1, 1);
     let classes = lists.every();
     lists.decodes[0].set_status(WorkerStatus::NotReady);
     let full = Gates(|_| false, |_| true);
@@ -461,7 +459,7 @@ fn a_pairs_shed_is_answered_by_its_name() {
     // Two classes: the first prefill is at its limit, and the second's
     // decode is not ready.
     let engine = stock();
-    let lists = Lists::of(engine, 2, 2);
+    let lists = Lists::of(2, 2);
     let classes = PartnerClasses::number(2, [&[0_u32][..], &[1][..]]);
     lists.decodes[1].set_status(WorkerStatus::NotReady);
     let first = Gates(|prefill| prefill != 0, |_| true);
@@ -476,7 +474,7 @@ fn a_pairs_shed_is_answered_by_its_name() {
 #[test]
 fn a_pairs_placement_names_the_routing_value_its_document_derived() {
     let (engine, _) = paired(true);
-    let lists = Lists::of(engine, 1, 1);
+    let lists = Lists::of(1, 1);
     let classes = lists.every();
     let pair = lists.under(&classes, &Open);
     let request = PlaceRequest {
@@ -488,7 +486,7 @@ fn a_pairs_placement_names_the_routing_value_its_document_derived() {
 
     // Under a document that derives none the request's id is not one.
     let (engine, _) = paired(false);
-    let lists = Lists::of(engine, 1, 1);
+    let lists = Lists::of(1, 1);
     let classes = lists.every();
     let pair = lists.under(&classes, &Open);
     let request = PlaceRequest {
@@ -519,7 +517,7 @@ fn a_pair_whose_caller_asks_its_decode_again_books_its_prefill_alone() {
         (DecodePick::WithPrefill, false),
     ] {
         let (engine, heard) = paired_picking(false, pick);
-        let lists = Lists::of(engine, 1, 2);
+        let lists = Lists::of(1, 2);
         let classes = lists.every();
         let pair = lists.under(&classes, &Open);
         let request = PlaceRequest {
@@ -552,7 +550,7 @@ fn a_pair_whose_caller_asks_its_decode_again_books_its_prefill_alone() {
         // call makes three such decisions over lists that hold no other
         // worker.
         let (engine, heard) = paired_picking(false, pick);
-        let lists = Lists::of(engine, 1, 2);
+        let lists = Lists::of(1, 2);
         let classes = lists.every();
         for decode in lists.decodes.iter() {
             decode.set_status(WorkerStatus::NotReady);
@@ -586,7 +584,7 @@ fn a_pair_whose_caller_asks_its_decode_again_books_its_prefill_alone() {
 #[test]
 fn a_pairs_decision_that_panics_is_refused() {
     let (engine, _) = paired(false);
-    let lists = Lists::of(engine, 1, 1);
+    let lists = Lists::of(1, 1);
     let classes = lists.every();
     let failing = Gates(|_| panic!("the caller's admission failed"), |_| true);
     let pair = lists.under(&classes, &failing);
@@ -617,7 +615,7 @@ fn a_pairs_decision_that_panics_is_refused() {
 #[test]
 fn the_routes_rule_is_asked_of_both_workers_of_a_pairs_target() {
     let (engine, _) = paired(false);
-    let lists = Lists::of(engine, 2, 3);
+    let lists = Lists::of(2, 3);
     let classes = lists.every();
     let pair = lists.under(&classes, &Open);
     // The first decode is not ready, and the rule refuses the second: the
@@ -667,7 +665,7 @@ fn the_routes_rule_is_asked_of_both_workers_of_a_pairs_target() {
 #[test]
 fn a_pairs_call_makes_three_decisions_at_most() {
     let (engine, heard) = paired(false);
-    let lists = Lists::of(engine, 4, 1);
+    let lists = Lists::of(4, 1);
     let classes = lists.every();
     for prefill in &lists.prefills[..3] {
         prefill.set_status(WorkerStatus::NotReady);
@@ -702,7 +700,7 @@ fn a_rule_that_panics_loses_no_lease() {
     let passed = |placed: &dyn Fn() -> bool| catch_unwind(AssertUnwindSafe(placed)).is_err();
 
     let (engine, heard) = paired(false);
-    let lists = Lists::of(engine, 1, 1);
+    let lists = Lists::of(1, 1);
     let classes = lists.every();
     let pair = lists.under(&classes, &Open);
     let request = PlaceRequest {
@@ -724,10 +722,10 @@ fn a_rule_that_panics_loses_no_lease() {
 
     let (engine, heard) = in_order(false);
     let list = pool(2);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let request = PlaceRequest {
         admits: Some(&failing),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(&members))
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     assert!(passed(&|| engine.place(&request).is_ok()));
     let first = worker_id(list[0].as_ref());
@@ -745,7 +743,7 @@ fn a_rule_that_panics_loses_no_lease() {
 #[test]
 fn a_decode_decided_again_is_asked_the_routes_rule() {
     let (engine, _) = paired_picking(false, DecodePick::AfterPrefill);
-    let lists = Lists::of(engine, 1, 3);
+    let lists = Lists::of(1, 3);
     let classes = lists.every();
     let refused = Cell::new(None);
     let admits = |worker: &dyn Worker| Some(worker_id(worker)) != refused.get();
@@ -771,7 +769,7 @@ fn a_decode_decided_again_is_asked_the_routes_rule() {
 fn a_pair_that_lends_its_ring_has_each_side_placed_where_its_walk_reaches() {
     let document = PolicySpec::pair_presets("consistent_hashing", "consistent_hashing");
     let engine = hosted(engine_of(&document.expect("the pair presets")));
-    let lists = Lists::of(engine, 3, 3);
+    let lists = Lists::of(3, 3);
     let classes = lists.every();
     // The ring names the six workers, the two lists mixed: a prefill or a
     // decode, by its place in its list.

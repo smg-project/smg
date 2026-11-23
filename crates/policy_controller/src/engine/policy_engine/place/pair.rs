@@ -21,7 +21,8 @@ use super::{decide, sendable, walk, Call, Made, PlaceRequest, Unplaced};
 use crate::{
     engine::{
         decision_engine::{Decided, DecisionRefused},
-        policy_engine::{PolicyEngine, PoolMembers},
+        list_cell::LentList,
+        policy_engine::PolicyEngine,
         prefills_full,
         view::Phase,
         PairLists,
@@ -78,8 +79,8 @@ pub(super) fn ask<'a>(
         return Err(Unplaced::PrefillsFull);
     }
     let now = dated.unwrap_or_else(Instant::now);
-    let side = |list: &PoolMembers, place: u32| {
-        let worker = list.workers().get(place as usize)?;
+    let side = |list: LentList<'_>, place: u32| {
+        let worker = list.workers.get(place as usize)?;
         sendable(request, worker.as_ref()).then(|| Arc::clone(worker))
     };
     let placement = walk(engine, decided, later, now, &mut call.missed, |target| {

@@ -56,7 +56,7 @@ use std::{
 
 use smg_worker::identity::basic::Worker;
 
-use super::{PolicyEngine, PoolMembers};
+use super::PolicyEngine;
 use crate::{
     document::{
         spec::{AppliedSpec, DecodePick},
@@ -70,6 +70,7 @@ use crate::{
         },
         demands::Demands,
         framework::EncodeItems,
+        list_cell::LentList,
         prompt_hashes::{prompt_tokens_of, HashSeeds, PromptHashes},
         records::worker_id,
         view::{
@@ -743,7 +744,7 @@ pub(super) fn give_up(
 }
 
 /// Holds the later asks of `call` to the workers of the list its route's
-/// rule takes. The rule is asked of every worker of `members`, ready or
+/// rule takes. The rule is asked of every worker of `list`, ready or
 /// not, in the list's order, and the places it takes are kept, ascending,
 /// each once ([`Call::admitted`]). It is asked of the list once a call:
 /// behind the first decision none of whose targets can be sent to, where
@@ -772,13 +773,13 @@ pub(super) fn give_up(
 #[inline(never)]
 fn hold_to_rule(
     request: &PlaceRequest<'_>,
-    members: Option<&PoolMembers>,
+    list: Option<LentList<'_>>,
     call: &mut Call,
 ) -> Result<(), Unplaced> {
     if call.admitted.is_some() {
         return Ok(());
     }
-    let workers = members.map_or(&[][..], |list| &list.workers()[..]);
+    let workers = list.map_or(&[][..], |list| &list.workers[..]);
     let places: Vec<u32> = (0..)
         .zip(workers)
         .filter_map(|(place, worker)| admitted(request, worker.as_ref()).then_some(place))
@@ -883,16 +884,18 @@ impl Call {
     }
 }
 
-/// The id the list's records name the worker at `place` by
-/// ([`PoolMembers::records`]): the id a decision's filters compare. A list
-/// no decision made records of yet gets them here, once a list, as the
-/// call's next decision would make them.
-fn named(engine: &PolicyEngine, members: Option<&PoolMembers>, place: u32) -> Option<WorkerId> {
-    let records = members?.records(&engine.spec, &engine.clock);
+/// The id the list's records name the worker at `place` by: the id a
+/// decision's filters compare. The engine's value of the list holds the
+/// records, and the ask's decision filled the list's cell, so this ask of
+/// the cell fills nothing.
+fn named(engine: &PolicyEngine, list: Option<LentList<'_>>, place: u32) -> Option<WorkerId> {
+    let records = engine
+        .members_of(list?)
+        .records(&engine.spec, &engine.clock);
     records.ids().get(place as usize).copied()
 }
 
-/// One ask for a single request over `members`, the list its caller handed:
+/// One ask for a single request over `list`, the list its caller lent:
 /// one decision, and the first of its targets that can be sent to
 /// ([`walk`]): ready ([`ready`]) and admitted by its route's rule. At a
 /// pick the rule is asked of a worker that is ready, and of no other.
@@ -904,7 +907,7 @@ fn named(engine: &PolicyEngine, members: Option<&PoolMembers>, place: u32) -> Op
 fn single<'a>(
     engine: &'static PolicyEngine,
     request: &PlaceRequest<'a>,
-    members: Option<&PoolMembers>,
+    list: Option<LentList<'_>>,
     call: &mut Call,
 ) -> Result<Placement<'a>, Unplaced> {
     let made = Made {
@@ -913,7 +916,7 @@ fn single<'a>(
     };
     let (decided, dated) = decide(engine, &made).map_err(Unplaced::Refused)?;
     let key = made.key();
-    let at = |place: u32| members?.workers().get(place as usize);
+    let at = |place: u32| list?.workers.get(place as usize);
     // Each arm answers its own placement: a place's holds no decision, and
     // is written without the room of one.
     match decided {
@@ -924,19 +927,20 @@ fn single<'a>(
             let worker = at(pick.place).ok_or(Unplaced::NoWorkers)?;
             // A caller of this call states no worker id of its own: where
             // its list's records stand, they name the worker by its
-            // address, as the placement of a place does.
-            let stated = members.and_then(|list| list.records.get());
+            // address, as the placement of a place does. The decision
+            // filled the list's cell, so a debug build's ask fills nothing.
             debug_assert!(
-                stated.is_none_or(|rows| rows.ids()[pick.place as usize] == worker_id(&**worker)),
+                list.and_then(|list| engine.members_of(list).records.get())
+                    .is_none_or(|rows| rows.ids()[pick.place as usize] == worker_id(&**worker)),
                 "a caller of `place` states no worker id of its own"
             );
             if !admitted(request, worker.as_ref()) {
-                let id = named(engine, members, pick.place).ok_or(Unplaced::NoWorkers)?;
+                let id = named(engine, list, pick.place).ok_or(Unplaced::NoWorkers)?;
                 call.missed.push(id);
                 // The pick read the worker ready, and a place holds no
                 // decision: the rule is asked of the list at once.
-                hold_to_rule(request, members, call)?;
-                return call.again(|call| single(engine, request, members, call));
+                hold_to_rule(request, list, call)?;
+                return call.again(|call| single(engine, request, list, call));
             }
             let mut placement = Placement::alone(Arc::clone(worker), engine.label_at(pick.profile));
             placement.routing_key = key;
@@ -968,9 +972,9 @@ fn single<'a>(
                 // The walk gave the decision up: the rule is asked of the
                 // list while the call holds none.
                 if refused.get() {
-                    hold_to_rule(request, members, call)?;
+                    hold_to_rule(request, list, call)?;
                 }
-                return call.again(|call| single(engine, request, members, call));
+                return call.again(|call| single(engine, request, list, call));
             };
             placement.routing_key = key;
             Ok(placement)
@@ -1070,8 +1074,8 @@ impl PolicyEngine {
     /// carries ([`AppliedSpec::view_headers`]), each named by its place in
     /// that list.
     ///
-    /// Its caller still asks the engine's value of the list it lends
-    /// ([`PolicyEngine::members_of`]). It lends no load snapshot: a
+    /// Its caller lends each list with the cell beside it and asks the
+    /// engine for no value of a list. It lends no load snapshot: a
     /// decision that reads load reports reads the newest snapshot the
     /// engine's own task keeps at hand ([`PolicyEngine::run`]), of the
     /// channel its host handed ([`PolicyEngine::set_loads`]), and no report
@@ -1103,9 +1107,7 @@ impl PolicyEngine {
         }
         match request.lists {
             WorkerLists::Pair(lists) => pair::place(self, request, &lists, &mut Call::default()),
-            WorkerLists::Single(members) => {
-                single(self, request, Some(members), &mut Call::default())
-            }
+            WorkerLists::Single(list) => single(self, request, Some(list), &mut Call::default()),
             WorkerLists::None => single(self, request, None, &mut Call::default()),
             WorkerLists::Encode(_) => Err(declined(ENCODE_LISTS)),
         }

@@ -26,7 +26,8 @@ use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
         decision_engine::{DecisionEngine, Request, RequestMaker, SweepOutcome, WorkerLists},
-        policy_engine::{PolicyEngine, PoolMembers},
+        list_cell::tests::PublishedList,
+        policy_engine::PolicyEngine,
         view::{Constraints, Identity, RequestFacts, WorkerId},
         PlaceRequest,
     },
@@ -89,7 +90,7 @@ pub(in crate::engine::policy_engine) fn monitor(
 /// it, where it gives one.
 pub(in crate::engine::policy_engine) struct Asks<'a> {
     pub(in crate::engine::policy_engine) request: Request<'a>,
-    members: &'a PoolMembers,
+    members: &'a PublishedList,
     loads: Option<Arc<LoadSnapshot>>,
 }
 
@@ -103,7 +104,7 @@ impl RequestMaker for Asks<'_> {
     }
 
     fn workers(&self) -> WorkerLists<'_> {
-        WorkerLists::Single(self.members)
+        WorkerLists::Single(self.members.lent())
     }
 
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
@@ -114,7 +115,7 @@ impl RequestMaker for Asks<'_> {
 /// A request of `seed` over `members` that gives `loads`.
 pub(in crate::engine::policy_engine) fn asks(
     seed: u64,
-    members: &PoolMembers,
+    members: &PublishedList,
     loads: Option<Arc<LoadSnapshot>>,
 ) -> Asks<'_> {
     let facts = RequestFacts {
@@ -176,7 +177,7 @@ async fn running(engine: &Arc<PolicyEngine>) -> JoinHandle<()> {
 async fn the_task_keeps_the_newest_snapshot_for_a_request_that_gives_none() {
     let engine = preset("least_load");
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let (feed, channel) = monitor(&reports(4, 2));
     engine.set_loads(channel);
     let mut unread = [0_u32; 4];
@@ -211,7 +212,7 @@ async fn the_task_keeps_the_newest_snapshot_for_a_request_that_gives_none() {
 async fn the_task_finds_a_channel_handed_after_its_start() {
     let engine = preset("least_load");
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let task = running(&engine).await;
     let (_feed, channel) = monitor(&reports(4, 2));
     engine.set_loads(channel);
@@ -230,7 +231,7 @@ async fn the_task_finds_a_channel_handed_after_its_start() {
 async fn a_later_hand_over_replaces_the_channel() {
     let engine = preset("least_load");
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let (first, channel) = monitor(&reports(4, 2));
     engine.set_loads(channel);
     let task = running(&engine).await;
@@ -256,7 +257,7 @@ async fn a_later_hand_over_replaces_the_channel() {
 async fn a_requests_own_snapshot_is_read_ahead_of_the_engines() {
     let engine = preset("least_load");
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let (_feed, channel) = monitor(&reports(4, 2));
     engine.set_loads(channel);
     let task = running(&engine).await;
@@ -277,7 +278,7 @@ async fn a_requests_own_snapshot_is_read_ahead_of_the_engines() {
 async fn an_engine_whose_document_reads_no_report_keeps_no_snapshot() {
     let engine = preset("random");
     let list = pool(32);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let (_feed, channel) = monitor(&reports(32, 2));
     engine.set_loads(channel);
     let task = running(&engine).await;
@@ -285,7 +286,8 @@ async fn an_engine_whose_document_reads_no_report_keeps_no_snapshot() {
     for seed in 0..256 {
         let _ = picked(&engine, &asks(seed, &members, None));
     }
-    assert_eq!(members.conversions(), 0, "no report was looked up");
+    let converted = engine.conversions(members.lent());
+    assert_eq!(converted, 0, "no report was looked up");
     task.abort();
 }
 
@@ -331,7 +333,7 @@ fn rooms(workers: usize, roomy: usize) -> HashMap<String, WorkerLoadResponse> {
 async fn an_engine_whose_document_reads_a_signal_keeps_the_channel() {
     let engine = by_signals_alone();
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let (feed, channel) = monitor(&rooms(4, 2));
     engine.set_loads(channel);
     let task = running(&engine).await;
@@ -360,11 +362,11 @@ async fn an_engine_whose_document_reads_a_signal_keeps_the_channel() {
 async fn a_request_placed_with_one_call_reads_the_signals_the_task_keeps() {
     let engine: &'static Arc<PolicyEngine> = Box::leak(Box::new(by_signals_alone()));
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let (feed, channel) = monitor(&rooms(4, 2));
     engine.set_loads(channel);
     let task = running(engine).await;
-    let request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
     for turn in 0..32 {
         let placement = engine.place(&request).expect("a placement");
         assert!(Arc::ptr_eq(&placement.worker, &list[2]), "turn {turn}");
@@ -398,7 +400,7 @@ fn served(worker: WorkerId) -> Outcome {
 async fn the_task_runs_the_upkeep_with_no_call_of_its_host() {
     let engine = preset("manual");
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let task = running(&engine).await;
     let mut keyed = asks(51, &members, None);
     keyed.request.facts.session_key = Identity::hashed(51);
@@ -428,7 +430,7 @@ async fn the_task_runs_the_upkeep_with_no_call_of_its_host() {
 async fn a_panic_in_the_upkeep_is_counted_and_the_task_goes_on() {
     let engine = preset("least_load");
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let (feed, channel) = monitor(&reports(4, 2));
     engine.set_loads(channel);
     let step = Arc::clone(&engine);
@@ -481,7 +483,7 @@ async fn the_upkeep_runs_once_for_the_seconds_a_stall_missed() {
 async fn the_task_outlives_its_monitor_and_reads_the_next_one() {
     let engine = preset("least_load");
     let list = pool(4);
-    let members = engine.pool_members(&list);
+    let members = PublishedList::new(Arc::clone(&list));
     let (first, channel) = monitor(&reports(4, 2));
     engine.set_loads(channel);
     let runs = Arc::new(AtomicU64::new(0));

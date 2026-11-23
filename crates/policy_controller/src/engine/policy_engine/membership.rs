@@ -105,9 +105,9 @@ pub trait Members: Send + Sync {
     /// own id of it.
     fn standing(&self) -> Vec<(ObjectId, Arc<dyn Worker>)>;
 
-    /// What the host says of `worker` beside its object: what it says
-    /// where a list's records are written
-    /// ([`PolicyEngine::pool_members_with_fixed_facts`]). The follow reads
+    /// What the host says of `worker` beside its object: what it lends
+    /// of the worker with each list that holds it
+    /// ([`LentList::facts`](crate::engine::LentList::facts)). The follow reads
     /// the worker's id of it ([`FixedFacts::id_or`]), so the stages are
     /// told a worker under the id its lists name it by. The default says
     /// nothing: the id is the fingerprint of the worker's address. An id

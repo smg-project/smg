@@ -477,7 +477,7 @@ impl PoolRecords {
 
     /// [`Self::new`], with what the program says of each worker beside its
     /// object ([`FixedFacts`]): `facts_of` is asked once a worker, here, and
-    /// never at a decision. Whether a worker takes images goes into its
+    /// nowhere else. Whether a worker takes images goes into its
     /// record, and so does the id its program states, in place of the
     /// fingerprint of its address ([`worker_id`]). What it states for a
     /// request's hard demands goes into a column beside the records

@@ -19,7 +19,8 @@ use crate::{
         decision::{Decision, PlacedBy, Target, Targets},
         decision_engine::{Request, RequestMaker, WorkerLists},
         framework::{Picker, TieBand},
-        policy_engine::{PolicyEngine, PoolMembers},
+        list_cell::tests::PublishedList,
+        policy_engine::PolicyEngine,
         view::{Candidate, Constraints, Identity, RequestFacts},
     },
     policies::{power_of_two::PowerOfTwoMetric, random::Random},
@@ -119,7 +120,7 @@ fn hearing(assignment: Assignment, kept: RulePlaced, heard: &Arc<Heard>) -> Poli
 /// A request stated ahead, with the list its host hands for it.
 struct Asks<'a> {
     request: Request<'a>,
-    members: &'a PoolMembers,
+    members: &'a PublishedList,
 }
 
 impl RequestMaker for Asks<'_> {
@@ -132,7 +133,7 @@ impl RequestMaker for Asks<'_> {
     }
 
     fn workers(&self) -> WorkerLists<'_> {
-        WorkerLists::Single(self.members)
+        WorkerLists::Single(self.members.lent())
     }
 }
 
@@ -146,7 +147,7 @@ type Held<'e> = Vec<DecisionGuard<&'e PolicyEngine>>;
 fn sent<'e>(
     engine: &'e PolicyEngine,
     list: &[Arc<dyn Worker>],
-    members: &PoolMembers,
+    members: &PublishedList,
     (key, take): (&'static str, usize),
     held: &mut Held<'e>,
 ) -> (usize, PlacedBy) {
@@ -211,7 +212,7 @@ fn a_stage_hears_no_issue_and_no_dispatch_of_a_request_its_rule_keeps_from_it() 
         let heard = Arc::new(Heard::default());
         let engine = hearing(assignment, kept, &heard);
         let list = three_workers();
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let mut held = Held::new();
         // What the stage has heard by now: a request it placed, and under
         // the rule's default word every request.
@@ -289,7 +290,7 @@ fn the_end_of_a_request_kept_from_the_profile_moves_no_count_of_a_stock_stage() 
         let spec = AppliedSpec::validate(&document).expect("the document validates");
         let engine = PolicyEngine::new(spec);
         let list = three_workers();
-        let members = engine.pool_members(&list);
+        let members = PublishedList::new(Arc::clone(&list));
         let mut held = Held::new();
         // What every stage and every tally of the engine holds, with the
         // session table: a request with no key leaves the table alone.
