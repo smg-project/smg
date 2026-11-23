@@ -1974,10 +1974,75 @@ async fn a_take_whose_word_folded_over_a_loss_starts_the_polls_anew() {
     assert_eq!(*probe.forgotten.lock(), ["grpc://w:1"]);
 }
 
+/// A replica that loses the lead drops every load row it holds, with the
+/// overload verdict the row made and the receipt that would hold a poll
+/// back. No restore stands between: the store is the one its lead wrote.
+/// A follower is sent no load row, so a row left standing would be read at
+/// the next take, as old as the whole follow. The take comes inside one
+/// poll interval of the lost lead's last record: its poll goes out at once
+/// and writes the row anew.
+#[tokio::test(start_paused = true)]
+async fn a_lost_lead_drops_every_load_row_with_its_verdict_and_its_receipt() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let own = ready(&store, "grpc://w:1", "grpc://w:1", 0, 1, WireModes::GRPC, 0);
+    store.apply(vetoing_at(5)).expect("applied");
+    let figures = |waiting| Figures {
+        running: 0,
+        waiting,
+        usage: 0.0,
+    };
+    probe.answers("grpc://w:1", &[figures(5)]);
+    let driver = Arc::new(driver(&store, &probe, TEN));
+    let (_stop, stopped) = watch::channel(false);
+    let (leads, polls) = watch::channel(Some(1));
+    let mut tasks = JoinSet::new();
+    let running = Arc::clone(&driver);
+    tasks.spawn(async move { running.run_while(stopped, polls).await });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(probe.polls_of("grpc://w:1"), 1);
+    // The rank's own record behind the poll: its receipt holds the next
+    // poll back for an interval.
+    let pushed = LoadRow {
+        queued: 5,
+        ..LoadRow::default()
+    };
+    store.record(own, 0, pushed, now(), LoadSource::Stream);
+    assert_eq!(vetoed(&store), [true]);
+    // The loss: the row and its verdict are gone at the word.
+    leads.send_replace(None);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        row(&store, own, 0).is_none(),
+        "a follower holds its lead's row"
+    );
+    assert_eq!(vetoed(&store), [false]);
+    // The take, two seconds behind the record: no receipt of the lost lead
+    // holds its poll back, and the row is what the engine answers now.
+    probe.answers("grpc://w:1", &[figures(1)]);
+    leads.send_replace(Some(2));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(probe.polls_of("grpc://w:1"), 2);
+    assert_eq!(row(&store, own, 0).map(|(row, _)| row.queued), Some(1));
+    assert_eq!(vetoed(&store), [false]);
+    // A loss and the take after it, read as one word: the row of the lead
+    // that ended is gone all the same, ahead of the next lead's first
+    // poll, which fails here and writes none.
+    probe.failing.lock().insert("grpc://w:1".to_owned());
+    leads.send_replace(None);
+    leads.send_replace(Some(3));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(probe.polls_of("grpc://w:1"), 3);
+    assert!(
+        row(&store, own, 0).is_none(),
+        "a lead read the row of the lead before it"
+    );
+}
+
 /// On a replica that follows, the loop polls no engine and pays the store's
-/// publications all the same: a followed registration and a followed load
-/// row reach the published world with no decision asked and no poll made,
-/// and at the take the first tick polls the worker that joined meanwhile.
+/// publications all the same: a followed registration reaches the published
+/// world with no decision asked and no poll made, and at the take the first
+/// tick polls the worker that joined meanwhile.
 #[tokio::test(start_paused = true)]
 async fn a_followers_loop_pays_the_stores_publications_and_polls_no_engine() {
     let store = Arc::new(MemoryStore::new());
@@ -2030,20 +2095,6 @@ async fn a_followers_loop_pays_the_stores_publications_and_polls_no_engine() {
     let paid = tokio::time::Instant::from_std(due) + Duration::from_millis(1);
     tokio::time::sleep_until(paid).await;
     assert_eq!(seen(id), Some(None), "a followed registration");
-    // The window that build opened ends. Two followed load rows then, the
-    // leader's polls: the first opens the store's window and shows by
-    // itself, the second lands inside it and waits for the payer.
-    tokio::time::sleep(PUBLISH_WINDOW + Duration::from_millis(1)).await;
-    let load = |running| LoadRow {
-        running,
-        ..LoadRow::default()
-    };
-    store.record(id, 0, load(4), now(), LoadSource::Poll);
-    tokio::time::sleep(Duration::from_millis(1)).await;
-    store.record(id, 0, load(7), now(), LoadSource::Poll);
-    assert_eq!(seen(id), Some(Some(4)));
-    tokio::time::sleep(Duration::from_millis(100) + PUBLISH_WINDOW).await;
-    assert_eq!(seen(id), Some(Some(7)), "a followed load row");
     assert!(probe.polls().is_empty(), "a follower polled");
     // The take: the first tick polls the worker that joined meanwhile.
     leads.send_replace(Some(1));

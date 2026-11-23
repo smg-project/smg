@@ -43,6 +43,9 @@ pub enum Event {
     /// watched kinds. It changes nothing a standby holds; it is why the
     /// head of a store that leads is never under term `0`, and how a
     /// follower of the log learns the term before the leader's next write.
+    /// A standby journals it too at the place of a load row an older
+    /// leader tells it: the row is kept nowhere, and its place stays
+    /// counted.
     Term,
     /// A generation applied, by its number: one of the watched kinds, and
     /// told to no watch. The document it runs from is its door's to hold,
@@ -225,6 +228,8 @@ struct Ring {
     /// Whether the store leads the log's term: from its take until it
     /// follows another history.
     leads: bool,
+    /// Whether no standby can follow the log ([`Log::kept_alone`]).
+    alone: bool,
     /// The highest number the log took under no term. No term names the
     /// store's own line of writes, and a restart may set the head below a
     /// number that line took: a place under no term is numbered past it
@@ -398,6 +403,7 @@ impl Log {
                 adopting: None,
                 adoptions: 0,
                 leads: false,
+                alone: false,
                 unnamed: 0,
                 first: Position::default(),
             }),
@@ -435,6 +441,20 @@ impl Log {
     pub fn starting_after(mut self, first: u64) -> Self {
         self.ring.get_mut().start_after(first);
         self
+    }
+
+    /// The log of a replica whose lease lives in its own process. No other
+    /// replica can see that lease, so no standby follows the log
+    /// ([`Log::alone`]).
+    #[must_use]
+    pub fn kept_alone(mut self) -> Self {
+        self.ring.get_mut().alone = true;
+        self
+    }
+
+    /// Whether no standby can follow the log ([`Log::kept_alone`]).
+    pub fn alone(&self) -> bool {
+        self.ring.lock().alone
     }
 
     /// The last write of `kinds`, with its term; the default before any.
@@ -908,8 +928,9 @@ impl AdoptionGuard<'_> {
 
     /// Applies a leader's event that writes nothing to this store, the
     /// first position of a term: the place alone is journaled, and the next
-    /// event follows it. The listener is told at its end, under no lock of
-    /// the log.
+    /// event follows it. A standby marks the place of a load row too: its
+    /// store keeps no load row of its leader's. The listener is told at
+    /// its end, under no lock of the log.
     pub fn mark(&self) {
         let mut ring = self.log.ring.lock();
         if let Some(at) = self.pending(&mut ring) {

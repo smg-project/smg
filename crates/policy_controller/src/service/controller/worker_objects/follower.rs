@@ -250,14 +250,14 @@ mod tests {
         let now = Instant::now();
         let mut place = match follower.place() {
             nothing if nothing == Position::default() => leader
-                .first(JournalKinds::All)
+                .first(JournalKinds::Watched)
                 .expect("every write is retained"),
             place => place,
         };
         let mut entries = Vec::new();
         loop {
             leader
-                .read(JournalKinds::All, place, 64, &mut entries)
+                .read(JournalKinds::Watched, place, 64, &mut entries)
                 .expect("the place is held");
             let Some(last) = entries.last() else {
                 return;

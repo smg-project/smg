@@ -16,8 +16,9 @@
 //! the write's own critical section: a membership or status write with its
 //! row, a load row, an applied generation by its number
 //! ([`Event::Generation`]), and the store's take of a term, which is a
-//! position of its own ([`Event::Term`]). A worker's load rows stand between its
-//! registration and its leaving. Every other entry of the store stands on one
+//! position of its own ([`Event::Term`]). A standby journals that event too
+//! at the place of a load row an older leader tells it. A worker's load rows
+//! stand between its registration and its leaving. Every other entry of the store stands on one
 //! list with what rebuilds it on a standby ([`ENTRIES`]): a gateway's own
 //! facts return in its hello, each replica hears the engines' cache events
 //! itself, and a decision's writes (pins, reservations, lease ends) are not
@@ -26,14 +27,14 @@
 //! event joins them.
 //!
 //! Two readers follow the log, and each asks for its kinds
-//! ([`JournalKinds`](crate::store::JournalKinds)): a standby reads every kind,
-//! a watcher of the rows the watched kinds alone (membership, status, a term's
-//! start). The log keeps the watched kinds apart from the load rows, in a ring
-//! of their own in the one order of positions, so the load rows' churn lets no
-//! membership event go, and it tells one listener when the watched kinds grew,
-//! once the store that wrote has let its locks go ([`Log::on_watched`]). A log
-//! may carry the watched kinds alone: where no standby is served, a load write
-//! tells nothing.
+//! ([`JournalKinds`](crate::store::JournalKinds)): the controller's standby
+//! and a watcher of the rows both read the watched kinds alone (membership,
+//! status, a term's start). The log keeps the watched kinds apart from the
+//! load rows, in a ring of their own in the one order of positions, so the
+//! load rows' churn lets no membership event go, and it tells one listener
+//! when the watched kinds grew, once the store that wrote has let its locks
+//! go ([`Log::on_watched`]). A log may carry the watched kinds alone, as
+//! every log the controller builds does: a load write tells nothing there.
 //!
 //! What is here: the bounded log ([`Log`]) and the reads made of it
 //! ([`Log::holds`] for the place a reader brings from another connection or

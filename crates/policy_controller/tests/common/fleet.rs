@@ -1292,11 +1292,17 @@ impl Harness {
         Ok((client, operator))
     }
 
-    /// How many of the fleet's ranks `standby`'s own store holds ready
-    /// with a load row beside them: what a controller that follows has of
-    /// its leader's log. A row no registration made is an error.
+    /// How many of the fleet's ranks `standby`'s own store holds ready:
+    /// what a controller that follows has of its leader's log. A row no
+    /// registration made is an error, and so is a load row: a leader sends
+    /// a standby none, and a standby polls nobody.
     pub fn followed(&self, standby: &Replica) -> Result<usize, String> {
         let cut = standby.store.checkpoint(JournalKinds::All);
+        if let Some((id, rank, _)) = cut.loads.first() {
+            return Err(format!(
+                "the standby holds a load row: {id:?} at rank {rank}"
+            ));
+        }
         let mut held = 0;
         for row in &cut.rows {
             if !self.members.contains_key(&row.id) {
@@ -1305,8 +1311,7 @@ impl Harness {
                     row.id
                 ));
             }
-            let loaded = cut.loads.iter().any(|(id, _, _)| *id == row.id);
-            if row.status == WorkerStatus::Ready && loaded {
+            if row.status == WorkerStatus::Ready {
                 held += 1;
             }
         }
