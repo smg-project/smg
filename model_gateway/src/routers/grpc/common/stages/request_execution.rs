@@ -406,11 +406,32 @@ pub(crate) async fn execute_plan(
     let dispatched_at = tokio::time::Instant::now();
     let deadline =
         request_timeout.map(|timeout| RequestDeadline::after_from(dispatched_at, timeout));
+    // One answer for the attempt, asked before its calls are sent, for a
+    // single worker's generation: its result, the deadline included, is
+    // recorded with it. A pair and an embedding keep the charge rule.
+    let trial = matches!(
+        execution_plan,
+        ExecutionPlan::Single(ProtoRequest::Generate(_))
+            | ExecutionPlan::Batch {
+                kind: ExecutionPlanKind::Single,
+                ..
+            }
+    ) && workers
+        .single()
+        .is_some_and(|worker| ledger.is_trial(worker.as_ref()));
     let dispatch = async {
         match execution_plan {
             ExecutionPlan::Single(request) => match request {
                 ProtoRequest::Generate(req) => {
-                    execute_single(req, clients, workers, ledger, dispatched_at.into_std()).await
+                    execute_single(
+                        req,
+                        clients,
+                        workers,
+                        ledger,
+                        dispatched_at.into_std(),
+                        trial,
+                    )
+                    .await
                 }
                 ProtoRequest::Embed(req) => {
                     execute_embed(vec![req], clients, workers, ledger).await
@@ -475,6 +496,7 @@ pub(crate) async fn execute_plan(
                     prefill_guard,
                     ledger,
                     dispatched_at.into_std(),
+                    trial,
                 )
                 .await
             }
@@ -491,7 +513,9 @@ pub(crate) async fn execute_plan(
                 // The timeout is the decode's that was waited on: the one a
                 // second ask moved the pair to, where it moved.
                 let waited_on = moved.as_ref().unwrap_or(workers);
-                Err(dispatch_timed_out(deadline, waited_on, ledger, request_id))
+                Err(dispatch_timed_out(
+                    deadline, waited_on, ledger, request_id, trial,
+                ))
             }
         },
         None => dispatch.await,
@@ -549,6 +573,7 @@ fn dispatch_timed_out(
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
     request_id: &str,
+    trial: bool,
 ) -> Response {
     let status = deadline.status();
     let urls: Vec<&str> = workers
@@ -563,7 +588,7 @@ fn dispatch_timed_out(
     );
     if let Some(worker) = workers.decode_worker().or_else(|| workers.single()) {
         if let Some(sample) = status.breaker_status() {
-            ledger.record_outcome(worker.as_ref(), sample);
+            ledger.record_sent_outcome(worker.as_ref(), sample, trial);
         }
         UpstreamClass::account_dispatch_failure(
             worker.worker_type().as_metric_label(),
@@ -1028,6 +1053,7 @@ async fn execute_batch_dispatch(
     prefill_guard: Option<PrefillLoadGuard>,
     ledger: &AttemptLedger,
     dispatched_at: Instant,
+    trial: bool,
 ) -> Result<ExecutionResult, Response> {
     // One Prefill handle per PD sub-request, all on the one admission slot.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
@@ -1048,7 +1074,8 @@ async fn execute_batch_dispatch(
             async move {
                 match kind {
                     ExecutionPlanKind::Single => {
-                        execute_single(request, &mut clients, workers, ledger, dispatched_at).await
+                        execute_single(request, &mut clients, workers, ledger, dispatched_at, trial)
+                            .await
                     }
                     // Completion EPD carries no encode jobs; sub-requests dispatch as PD,
                     // each with the room it was minted (no sticky prefill rank).
@@ -1234,6 +1261,7 @@ async fn execute_single(
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
     dispatched_at: Instant,
+    trial: bool,
 ) -> Result<ExecutionResult, Response> {
     let client = clients.single_or_mismatch("execute_single")?;
 
@@ -1259,7 +1287,10 @@ async fn execute_single(
     )
     .await;
     if let Some(status) = result.breaker_status() {
-        workers.record_outcome(ledger, status);
+        match worker {
+            Some(worker) => ledger.record_sent_outcome(worker.as_ref(), status, trial),
+            None => workers.record_outcome(ledger, status),
+        }
     }
 
     let stream = result.map_err(|e| {

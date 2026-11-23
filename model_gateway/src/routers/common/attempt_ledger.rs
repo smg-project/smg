@@ -8,7 +8,13 @@
 //!   many attempts the request made on it. `cb_failure_threshold` counts
 //!   failed requests, and its meaning no longer moves with
 //!   `retry_max_retries` (five retries used to turn two failed requests into
-//!   the ten failures the default threshold needs).
+//!   the ten failures the default threshold needs). One failure more is
+//!   told on the regular routes: that of an attempt sent to a worker the
+//!   request already charged while its breaker read half-open, a trial that
+//!   opens the breaker again. A disaggregated pair's routes and the gRPC
+//!   embeddings dispatch keep the charge rule: one failed pair attempt is
+//!   charged to both sides, so a trial read there would let the partner's
+//!   failure reopen a worker that answered.
 //! - An answer the worker itself produced for the request (an upstream 500
 //!   with its body on the HTTP wire, a gRPC `INTERNAL` status) is definitive
 //!   for that payload: a replay on the same worker costs the same work for
@@ -29,7 +35,10 @@ use std::sync::{Arc, OnceLock};
 
 use axum::{http::StatusCode, response::Response};
 use parking_lot::Mutex;
-use smg_worker::identity::basic::{Worker, WorkerType};
+use smg_worker::{
+    health::circuit_breaker::CircuitState,
+    identity::basic::{Worker, WorkerType},
+};
 
 use crate::routers::common::{placement::CandidateFilter, retry::mark_non_retryable};
 
@@ -143,6 +152,39 @@ impl AttemptLedger {
             self.charges().record_outcome(worker, status_code);
         } else {
             worker.record_outcome(status_code);
+        }
+    }
+
+    /// Whether an attempt about to be sent to `worker` is a half-open trial:
+    /// the request already charged the worker and its breaker reads
+    /// half-open. Asked once for an attempt, before it is sent, and kept by
+    /// the dispatch for that attempt's result ([`Self::record_sent_outcome`]).
+    #[must_use]
+    pub(crate) fn is_trial(&self, worker: &dyn Worker) -> bool {
+        // Nothing charged yet, as on every first attempt: no lock, no read.
+        let Some(charges) = self.charges.get() else {
+            return false;
+        };
+        let charged = charges.0.lock().iter().any(|url| url == worker.url());
+        charged && worker.circuit_breaker_state() == CircuitState::HalfOpen
+    }
+
+    /// [`Self::record_outcome`] for an attempt's own result (its answer, its
+    /// failed send, its deadline), with what [`Self::is_trial`] answered
+    /// before it was sent: a failed trial is told to the breaker, which
+    /// opens again, unless the circuit has closed since. A failure with no
+    /// attempt of its own (an earlier attempt's task reporting late, a
+    /// stream's pending charge) is no trial and is dropped as before.
+    pub(crate) fn record_sent_outcome(&self, worker: &dyn Worker, status_code: u16, trial: bool) {
+        // A circuit that closed since the trial was sent has started a new
+        // streak: back to the request's charge rule.
+        if trial
+            && worker.is_breaker_failure(status_code)
+            && worker.circuit_breaker_state() != CircuitState::Closed
+        {
+            worker.record_outcome(status_code);
+        } else {
+            self.record_outcome(worker, status_code);
         }
     }
 
@@ -284,6 +326,47 @@ mod tests {
         // The next request is a new observation: the threshold counts requests.
         AttemptLedger::default().record_outcome(worker.as_ref(), 503);
         assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn a_failed_half_open_trial_opens_the_circuit_of_a_worker_the_request_charged() {
+        let worker = worker("http://w1:8080", 2);
+        let (request, other) = (AttemptLedger::default(), AttemptLedger::default());
+
+        // The request fails on the worker and sends two more attempts there:
+        // one while the circuit is closed, one after another request's
+        // failure opened it and the worker was readmitted.
+        request.record_outcome(worker.as_ref(), 503);
+        let sent_closed = request.is_trial(worker.as_ref());
+        other.record_outcome(worker.as_ref(), 503);
+        assert!(worker.readmit_circuit_breaker());
+        let sent_half_open = request.is_trial(worker.as_ref());
+
+        request.record_sent_outcome(worker.as_ref(), 503, sent_closed);
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::HalfOpen,
+            "a late answer is no trial"
+        );
+        request.record_sent_outcome(worker.as_ref(), 503, sent_half_open);
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Open,
+            "the failed trial"
+        );
+
+        // A batch's calls share the trial: one succeeds and closes the
+        // circuit, and its failed siblings fall under the request's charge.
+        assert!(worker.readmit_circuit_breaker());
+        request.record_sent_outcome(worker.as_ref(), 200, sent_half_open);
+        for _ in 0..2 {
+            request.record_sent_outcome(worker.as_ref(), 503, sent_half_open);
+        }
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Closed,
+            "failed siblings after the circuit closed"
+        );
     }
 
     #[test]

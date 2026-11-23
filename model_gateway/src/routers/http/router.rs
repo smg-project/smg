@@ -728,6 +728,9 @@ impl Router {
                 Err(response) => return response,
             };
 
+        // Asked once for the attempt, before it is sent: one more send on a
+        // new connection or a redirect the client follows is the same attempt.
+        let trial = attempt.ledger.is_trial(worker.as_ref());
         let response = self
             .dispatch_attempt(attempt, &placed, &mut decision_adapter)
             .await;
@@ -749,7 +752,7 @@ impl Router {
 
         events::RequestReceivedEvent {}.emit();
 
-        self.account_attempt_outcome(attempt, worker, response, head_success_recorded)
+        self.account_attempt_outcome(attempt, worker, response, head_success_recorded, trial)
     }
 
     /// The worker of one attempt, as the placement answered it: selected
@@ -960,21 +963,23 @@ impl Router {
 
     /// The attempt's answer on the request's ledger: the worker's breaker
     /// outcome, unless a streamed head already recorded a success that the
-    /// verdict kept; the retry window settled on a definitive answer; the
-    /// engine on the tried list after a replayable failure; the worker error
-    /// metric on a server error.
+    /// verdict kept, and a failed half-open `trial` told to the breaker; the
+    /// retry window settled on a definitive answer; the engine on the tried
+    /// list after a replayable failure; the worker error metric on a server
+    /// error.
     fn account_attempt_outcome<T>(
         &self,
         attempt: &TypedAttempt<'_, T>,
         worker: &Arc<dyn Worker>,
         mut response: Response,
         head_success_recorded: bool,
+        trial: bool,
     ) -> Response {
         let model_id = attempt.model_id;
         let ledger = attempt.ledger;
         let status = response.status();
         if !head_success_recorded || !status.is_success() {
-            ledger.record_outcome(worker.as_ref(), status.as_u16());
+            ledger.record_sent_outcome(worker.as_ref(), status.as_u16(), trial);
         }
         // A definitive answer closes the retry window on this worker: the next
         // attempt goes to another available worker, or the answer stands.
@@ -3704,6 +3709,29 @@ mod tests {
             worker.circuit_breaker_state(),
             CircuitState::Open,
             "the second failed request reaches the threshold"
+        );
+    }
+
+    /// The route asks whether an attempt is a half-open trial and hands the
+    /// answer to its accounting: on a worker whose circuit reads half-open at
+    /// every send, each replay's failure is told to the breaker.
+    #[tokio::test]
+    async fn a_replay_that_is_a_half_open_trial_tells_its_failure_to_the_breaker() {
+        let (url, hits) =
+            fixed_status_upstream(&["/generate"], StatusCode::SERVICE_UNAVAILABLE).await;
+        let worker = Arc::new(half_open_worker(&url));
+        let router = breaker_router(&[], fast_retry_config(3), 1);
+        router.worker_registry.register_or_replace(worker.clone());
+        let told = worker.circuit_breaker.load().total_failures();
+
+        generate(&router, "trial").await;
+
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 3);
+        // A total, not the state: a read of the state moves an open circuit.
+        assert_eq!(
+            worker.circuit_breaker.load().total_failures() - told,
+            3,
+            "the request's charge, then each failed trial"
         );
     }
 
