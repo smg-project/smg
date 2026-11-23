@@ -29,9 +29,7 @@ use crate::{
     fanout::fan_out_n,
     pin_yield::PinYieldNote,
     sglang_encode::EncodeMediaRefs,
-    sglang_v41_items::{
-        deepseek_v41_items, is_v41_batch, V41Vision, MARKER as V41_MARKER, PREFIX as V41_PREFIX,
-    },
+    sglang_v41_items::PerImageItems,
     stream::{
         finish, map_slim_output, matched_stop_of, poll_mapped, FinishParts, MappedGenerateStream,
         StreamState,
@@ -404,32 +402,49 @@ pub(crate) fn fan_out_sglang_requests(
     })
 }
 
+/// What the translation of a request reads of its connection: the facts of
+/// the handshakes and what the servicer that launched the engine noted.
+pub(crate) struct SglangConnection<'a> {
+    /// The bound the prompt admission applies ([`admit_prompt`]): the context
+    /// window the scheduler reported at the handshake, where an empty prompt,
+    /// or one that fills the window, is refused before it reaches the
+    /// scheduler; `0` bounds no prompt from above (a scheduler that reported
+    /// no window, or one that cuts a long prompt down itself).
+    pub(crate) max_model_len: u64,
+    /// How many scheduler ranks are connected.
+    pub(crate) ranks: usize,
+    /// How a request is placed among them ([`RankPlacement`]): by its
+    /// data-parallel pin, as the engine's own frontend places it
+    /// ([`routed_dp_rank`]), or, on the prefill side of a disaggregated pair,
+    /// by its room's residue ([`room_residue_rank`]).
+    pub(crate) placement: RankPlacement,
+    /// The connection's note of a pin's yield to the room, logged at WARN
+    /// once and at DEBUG after.
+    pub(crate) yields: &'a PinYieldNote,
+    /// What the ranks declared of a batch that goes on as one item an image
+    /// ([`PerImageItems`]).
+    pub(crate) per_image: PerImageItems,
+}
+
 /// Translate an SGLang proto `GenerateRequest` into the scheduler's
-/// `TokenizedGenerateReqInput`. ZMQ mode requires pre-tokenized input (SMG
-/// tokenizes upstream). The slim output carries sampled and prompt logprobs
-/// with their ranked and selected candidates, and the hidden states a request
-/// asks for. Multimodal inputs become the scheduler's processor output
-/// ([`translate_sglang_multimodal`]), and a disaggregated request's
-/// bootstrap fields ride the scheduler's own slots, as the Python servicer
-/// forwards them. `max_model_len` is the context window the scheduler
-/// reported at the handshake: an empty prompt, or one that fills the window,
-/// is refused before it reaches the scheduler ([`admit_prompt`]). `ranks` is
-/// how many scheduler ranks are connected and `placement` how a request is
-/// placed among them ([`RankPlacement`]): by its data-parallel pin, as the
-/// engine's own frontend places it ([`routed_dp_rank`]), or, on the prefill
-/// side of a disaggregated pair, by its room's residue
-/// ([`room_residue_rank`]), a pin's yield to the room logged on `yields`, the
-/// connection's note, at WARN once and at DEBUG after. `v41_vision` is the
-/// served DeepSeek-V4.1 model's patch geometry, when every scheduler rank
-/// declared the same one.
+/// `TokenizedGenerateReqInput`, as its `connection` takes it. ZMQ mode
+/// requires pre-tokenized input (SMG tokenizes upstream). The slim output
+/// carries sampled and prompt logprobs with their ranked and selected
+/// candidates, and the hidden states a request asks for. Multimodal inputs
+/// become the scheduler's processor output ([`translate_sglang_multimodal`]),
+/// and a disaggregated request's bootstrap fields ride the scheduler's own
+/// slots, as the Python servicer forwards them.
 pub(crate) fn translate_request_sglang(
     req: sglang_proto::GenerateRequest,
-    max_model_len: u64,
-    ranks: usize,
-    placement: RankPlacement,
-    yields: &PinYieldNote,
-    v41_vision: Option<V41Vision>,
+    connection: &SglangConnection<'_>,
 ) -> Result<TokenizedGenerateReqInput, String> {
+    let &SglangConnection {
+        max_model_len,
+        ranks,
+        placement,
+        yields,
+        per_image,
+    } = connection;
     let tokenized = req
         .tokenized
         .ok_or_else(|| "ZMQ mode requires pre-tokenized input; no input provided".to_string())?;
@@ -461,7 +476,7 @@ pub(crate) fn translate_request_sglang(
                 *mm,
                 req.extra_mm_inputs,
                 input_ids.len(),
-                v41_vision,
+                per_image,
             )?),
             None,
         ),
@@ -533,13 +548,13 @@ pub(crate) fn translate_request_sglang(
 /// worker, see [`crate::sglang_encode`]). A payload carrying tensors takes the
 /// processor-output path whatever references ride beside them (the engine's
 /// frontend processes such a request locally); one naming nothing is not a
-/// dispatch. Nor is a payload that carries `vit_grid`, the DeepSeek-V4.1 grid,
-/// which describes pixels: without them it takes the tensor path, which
-/// refuses it, as the Python servicer does. A borrowing test: the
-/// translation's guard, free of copies.
+/// dispatch. Nor is a payload whose model tensors lay its images out one by
+/// one ([`PerImageItems::claims`]): they describe pixels, and without them
+/// the payload takes the tensor path, which refuses it, as the Python
+/// servicer does. A borrowing test: the translation's guard, free of copies.
 pub(crate) fn names_encode_refs(mm: &sglang_proto::MultimodalInputs) -> bool {
     mm.pixel_values.is_none()
-        && !mm.model_specific_tensors.contains_key(V41_MARKER)
+        && !PerImageItems::claims(mm)
         && !(mm.image_urls.is_empty() && mm.video_urls.is_empty() && mm.audio_urls.is_empty())
 }
 
@@ -564,11 +579,11 @@ pub(crate) fn translate_sglang_multimodal(
     mm: sglang_proto::MultimodalInputs,
     extras: Vec<sglang_proto::MultimodalInputs>,
     prompt_len: usize,
-    v41_vision: Option<V41Vision>,
+    per_image: PerImageItems,
 ) -> Result<SglangWireMmInputs, String> {
-    let mut output = translate_sglang_batch(mm, prompt_len, v41_vision)?;
+    let mut output = translate_sglang_batch(mm, prompt_len, per_image)?;
     for batch in extras {
-        let translated = translate_sglang_batch(batch, prompt_len, v41_vision)?;
+        let translated = translate_sglang_batch(batch, prompt_len, per_image)?;
         if output
             .mm_items
             .iter()
@@ -587,12 +602,12 @@ pub(crate) fn translate_sglang_multimodal(
 }
 
 /// Translate one modality with its own tensor storage and absolute prompt offsets.
-/// A DeepSeek-V4.1 image batch becomes one item per image, the shape SGLang's
-/// own processor builds ([`deepseek_v41_items`]).
+/// The batch goes on as one item, or, where its model's scheduler reads one
+/// item an image, as those items ([`PerImageItems::cut`]).
 fn translate_sglang_batch(
     mm: sglang_proto::MultimodalInputs,
     prompt_len: usize,
-    v41_vision: Option<V41Vision>,
+    per_image: PerImageItems,
 ) -> Result<SglangWireMmInputs, String> {
     let modality = if mm.modalities.iter().all(|name| name == "image") {
         // Empty metadata and repeated image labels are accepted by the
@@ -662,34 +677,18 @@ fn translate_sglang_batch(
     } else {
         Some(offsets)
     };
-    // Only an image batch is cut into V4.1 items. Under the video label the
-    // batch would go on as a video item, which SGLang's V4.1 model has no
-    // embedder for.
-    if modality != SglangWireModality::Image && is_v41_batch(&model_specific_data) {
-        return Err(format!("{V41_PREFIX} vit_grid on a video batch"));
-    }
-    if modality == SglangWireModality::Image && is_v41_batch(&model_specific_data) {
-        // SGLang pads the image positions only when the id is set. Without it
-        // the model finds no position for the items' embeddings and fails in
-        // the scheduler.
-        if mm.im_token_id.is_none() {
-            return Err(format!("{V41_PREFIX} no im_token_id"));
-        }
-        let offsets = offsets.as_deref().unwrap_or_default();
-        return Ok(SglangWireMmInputs {
-            mm_items: deepseek_v41_items(feature, &model_specific_data, offsets, v41_vision)?,
-            im_token_id: mm.im_token_id,
-            video_token_id: None,
-        });
-    }
+    let item = SglangWireMmItem {
+        modality,
+        hash: mm.feature_hash,
+        offsets,
+        feature,
+        model_specific_data,
+    };
     Ok(SglangWireMmInputs {
-        mm_items: vec![SglangWireMmItem {
-            modality,
-            hash: mm.feature_hash,
-            offsets,
-            feature,
-            model_specific_data,
-        }],
+        mm_items: match per_image.cut(&item, mm.im_token_id)? {
+            Some(items) => items,
+            None => vec![item],
+        },
         im_token_id: mm.im_token_id,
         video_token_id: (modality == SglangWireModality::Video)
             .then_some(mm.im_token_id)
@@ -1063,11 +1062,13 @@ mod tests {
     fn translate(req: sglang_proto::GenerateRequest) -> Result<WireRequest, String> {
         translate_request_sglang(
             req,
-            default_ready_response().max_model_len,
-            1,
-            RankPlacement::Pin,
-            &PinYieldNote::default(),
-            None,
+            &SglangConnection {
+                max_model_len: default_ready_response().max_model_len,
+                ranks: 1,
+                placement: RankPlacement::Pin,
+                yields: &PinYieldNote::default(),
+                per_image: PerImageItems::default(),
+            },
         )
     }
 
@@ -1160,7 +1161,9 @@ mod tests {
             (image.clone(), video.clone()),
             (video.clone(), image.clone()),
         ] {
-            let output = translate_sglang_multimodal(first, vec![second], 9, None).unwrap();
+            let output =
+                translate_sglang_multimodal(first, vec![second], 9, PerImageItems::default())
+                    .unwrap();
             assert_eq!(output.im_token_id, Some(7));
             assert_eq!(output.video_token_id, Some(8));
             assert_eq!(output.mm_items.len(), 2);
@@ -1175,11 +1178,14 @@ mod tests {
                 assert!(item.model_specific_data.contains_key(key));
             }
         }
-        assert!(
-            translate_sglang_multimodal(image.clone(), vec![image], 9, None)
-                .unwrap_err()
-                .contains("one batch per modality")
-        );
+        assert!(translate_sglang_multimodal(
+            image.clone(),
+            vec![image],
+            9,
+            PerImageItems::default()
+        )
+        .unwrap_err()
+        .contains("one batch per modality"));
     }
 
     fn media_request(mm: sglang_proto::MultimodalInputs) -> sglang_proto::GenerateRequest {
@@ -1244,13 +1250,16 @@ mod tests {
         mm.modalities = vec!["video".to_string()];
         let mut missing_id = mm.clone();
         missing_id.im_token_id = None;
-        assert!(translate_sglang_multimodal(missing_id, Vec::new(), 5, None)
-            .unwrap_err()
-            .contains("placeholder token id"));
+        assert!(
+            translate_sglang_multimodal(missing_id, Vec::new(), 5, PerImageItems::default())
+                .unwrap_err()
+                .contains("placeholder token id")
+        );
         let grid = mm.model_specific_tensors.remove("image_grid_thw").unwrap();
         mm.model_specific_tensors
             .insert("video_grid_thw".into(), grid.clone());
-        let output = translate_sglang_multimodal(mm, Vec::new(), 5, None).unwrap();
+        let output =
+            translate_sglang_multimodal(mm, Vec::new(), 5, PerImageItems::default()).unwrap();
         let item = &output.mm_items[0];
         assert_eq!(item.modality, SglangWireModality::Video);
         assert_eq!(output.video_token_id, Some(7));
@@ -1285,7 +1294,9 @@ mod tests {
         let mut references = media_payload();
         references.pixel_values = None;
         references.image_urls = vec!["http://example.test/a.png".to_string()];
-        let error = translate_sglang_multimodal(references, Vec::new(), 5, None).unwrap_err();
+        let error =
+            translate_sglang_multimodal(references, Vec::new(), 5, PerImageItems::default())
+                .unwrap_err();
         assert!(
             error.contains("media references but no preprocessed tensors"),
             "{error}"
@@ -1717,11 +1728,13 @@ mod tests {
         let translate_among = |pin: Option<i32>, ranks: usize| {
             translate_request_sglang(
                 pinned(pin),
-                default_ready_response().max_model_len,
-                ranks,
-                RankPlacement::Pin,
-                &PinYieldNote::default(),
-                None,
+                &SglangConnection {
+                    max_model_len: default_ready_response().max_model_len,
+                    ranks,
+                    placement: RankPlacement::Pin,
+                    yields: &PinYieldNote::default(),
+                    per_image: PerImageItems::default(),
+                },
             )
         };
         assert_eq!(translate_among(None, 2).unwrap().routed_dp_rank, None);
@@ -1780,11 +1793,13 @@ mod tests {
         let place = |placement: RankPlacement, room: Option<i32>, pin: Option<i32>, ranks| {
             translate_request_sglang(
                 disaggregated(room, pin),
-                default_ready_response().max_model_len,
-                ranks,
-                placement,
-                &PinYieldNote::default(),
-                None,
+                &SglangConnection {
+                    max_model_len: default_ready_response().max_model_len,
+                    ranks,
+                    placement,
+                    yields: &PinYieldNote::default(),
+                    per_image: PerImageItems::default(),
+                },
             )
             .map(|wire| wire.routed_dp_rank)
         };
@@ -1840,11 +1855,13 @@ mod tests {
         // The room rides the wire beside the rank it placed the request on.
         let wire = translate_request_sglang(
             disaggregated(Some(7), Some(0)),
-            default_ready_response().max_model_len,
-            2,
-            RoomResidue,
-            &PinYieldNote::default(),
-            None,
+            &SglangConnection {
+                max_model_len: default_ready_response().max_model_len,
+                ranks: 2,
+                placement: RoomResidue,
+                yields: &PinYieldNote::default(),
+                per_image: PerImageItems::default(),
+            },
         )
         .unwrap();
         assert_eq!(
@@ -1873,11 +1890,13 @@ mod tests {
                     }),
                     ..Default::default()
                 },
-                default_ready_response().max_model_len,
-                ranks,
-                placement,
-                &PinYieldNote::default(),
-                None,
+                &SglangConnection {
+                    max_model_len: default_ready_response().max_model_len,
+                    ranks,
+                    placement,
+                    yields: &PinYieldNote::default(),
+                    per_image: PerImageItems::default(),
+                },
             )
             .unwrap();
             (wire.routed_dp_rank, wire.disagg_prefill_dp_rank)
@@ -1971,11 +1990,13 @@ mod tests {
             ] {
                 let result = translate_request_sglang(
                     request(prompt_len, sampling.clone()),
-                    max_model_len,
-                    1,
-                    RankPlacement::Pin,
-                    &PinYieldNote::default(),
-                    None,
+                    &SglangConnection {
+                        max_model_len,
+                        ranks: 1,
+                        placement: RankPlacement::Pin,
+                        yields: &PinYieldNote::default(),
+                        per_image: PerImageItems::default(),
+                    },
                 );
                 assert_eq!(
                     result.is_ok(),
