@@ -937,7 +937,10 @@ impl Loaded<'_, '_> {
         }
         let now = clock();
         if let Some((pick, members, plain)) = picked {
-            if let Some(decided) = single::noted(self, pick, members, plain, now) {
+            // The lease states the text's two lengths: the one place a
+            // plain request's text is passed over, for its characters.
+            let text = (maker.prompt_chars(), maker.prompt_bytes());
+            if let Some(decided) = single::noted(self, pick, members, plain, text, now) {
                 *whole = Some((decided, false));
                 return Ok(None);
             }

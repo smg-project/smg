@@ -401,6 +401,9 @@ impl Checked {
             media,
             seed: facts.seed,
             block_size: facts.block_size,
+            // A frame states a count and no text's length.
+            prompt_chars: 0,
+            prompt_bytes: 0,
             // The decision's instant and the candidates' column are its
             // deciding program's own.
             now_micros: 0,
@@ -630,6 +633,10 @@ impl Leased {
 /// trace's top, the lease) are made and freed on the thread that encodes
 /// them, and a deciding thread makes none.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a decision waits in the queue as it was made; a box would be an allocation on the deciding thread"
+)]
 pub(crate) enum Decided {
     /// A decision made under `term` for the request `id`, and the lease
     /// its decider hands over with it.

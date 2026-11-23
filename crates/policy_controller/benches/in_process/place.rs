@@ -27,7 +27,7 @@ use smg_policy_controller::{
     tracking::{Outcome, Placement, Side, TransportClass},
 };
 
-use super::{conversations, ruled, Host, Run, MODEL, RING};
+use super::{conversations, ruled, worded, Host, Run, MODEL, RING};
 
 /// The prompt a request by the one call states: 1,024 token ids, the size
 /// the plain request states.
@@ -46,10 +46,11 @@ impl TokenEntry for Whole {
     }
 }
 
-/// The entry `value` names: `decide_at`, the engine's entry, `place`, or
-/// `place` with a rule ([`ruled::ENTRY`]).
+/// The entry `value` names: `decide_at`, the engine's entry, `place`,
+/// `place` with a rule ([`ruled::ENTRY`]), or `place` with a prompt of text
+/// ([`worded::ENTRY`]).
 pub(super) fn named(value: &str) -> String {
-    let known = matches!(value, "decide_at" | "place" | ruled::ENTRY);
+    let known = matches!(value, "decide_at" | "place" | ruled::ENTRY | worded::ENTRY);
     assert!(known, "no entry {value}");
     value.to_owned()
 }
@@ -62,7 +63,7 @@ static ASKED: AtomicBool = AtomicBool::new(false);
 /// model, a list and a prompt's size: a cell whose request carries a key is
 /// not asked through it, and the run stops on one.
 pub(super) fn asked(run: &Run, host: &Host) -> bool {
-    if run.entry != "place" && run.entry != ruled::ENTRY {
+    if !matches!(&*run.entry, "place" | ruled::ENTRY | worded::ENTRY) {
         return false;
     }
     let keyed = (host.request)(0).facts.session_key != Identity::NONE;
@@ -145,7 +146,7 @@ pub(super) fn turn(host: &Host, prompt: &conversations::Turn<'_>, rule: bool) ->
 /// The dispatch and the end a host says of a placement, in a function of
 /// its own as the engine's entry has one for its guard.
 #[inline(never)]
-fn said(placement: &mut Placement<'_>) {
+pub(super) fn said(placement: &mut Placement<'_>) {
     placement.sent(Side::Single);
     let end = Outcome {
         side: Side::Single,
@@ -164,7 +165,9 @@ fn said(placement: &mut Placement<'_>) {
 /// the run's requests went through.
 pub(super) fn word() -> &'static str {
     if ASKED.load(Ordering::Relaxed) {
-        ruled::word().unwrap_or(" entry=place")
+        ruled::word()
+            .or_else(worded::word)
+            .unwrap_or(" entry=place")
     } else {
         " entry=decide_at"
     }

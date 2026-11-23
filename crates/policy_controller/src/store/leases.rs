@@ -310,7 +310,7 @@ impl Sides {
     /// - **The pick** is one of no target: no word of a single carries its
     ///   pick to a stage.
     /// - **The decode side** is a single's, as a guard lends it: no
-    ///   session, the lease's own size, never chosen.
+    ///   session, the lease's own three sizes, never chosen.
     ///
     /// The view is made in this call's frame and lent there: no part of it
     /// is moved, and no pick is built.
@@ -350,6 +350,8 @@ impl Sides {
             decode: HeldDecode {
                 session: Session::NONE,
                 tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
                 chosen: false,
             },
         }))

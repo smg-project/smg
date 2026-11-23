@@ -640,7 +640,7 @@ pub struct Request<'a> {
     pub constraints: Constraints<'a>, // what only the deciding host knows
 }
 
-// engine/view.rs (the fields a stage reads; 30 in all)
+// engine/view.rs (the fields a stage reads; 32 in all)
 pub struct RequestFacts<'a> {
     pub model: &'a str,            // the resolved model id
     pub phase: Phase,              // Single, Prefill, Decode or Encode
@@ -648,7 +648,9 @@ pub struct RequestFacts<'a> {
     pub priority: i32,             // priority band
     pub streaming: bool,
     pub max_output_tokens: u32,
-    pub prompt_tokens: u32,        // prompt size, counted or estimated by the host
+    pub prompt_tokens: u32,        // the prompt's token ids, counted; 0 for a request of text alone
+    pub prompt_chars: u32,         // the text's characters, counted where a stage reads a size
+    pub prompt_bytes: u32,         // the text's bytes; `prompt_size()` is the tokens, else these over four
     pub block_hashes: &'a [u64],   // one hash for each whole block of the prompt, in order
     pub hash_kind: HashKind,       // the blocks are token blocks or text blocks
     pub block_size: u32,           // tokens (or bytes) in one block
@@ -904,7 +906,9 @@ pub struct Lease {
     pub session: Session,                // the request's session
     pub session_verdict: SessionVerdict, // copied from the pick
     pub issued_micros: u64,              // the host's clock at issue
-    pub tokens: u32,                     // the prompt size the request stated
+    pub tokens: u32,                     // the token count the request stated, 0 for text alone
+    pub chars: u32,                      // its text's characters, which `bucket` books by
+    pub bytes: u32,                      // its text's bytes; `prompt_size()` as the facts'
 }
 
 pub enum Said {

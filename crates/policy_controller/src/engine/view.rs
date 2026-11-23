@@ -107,8 +107,23 @@ pub enum HashKind {
 
 /// Bytes of a request's text a token, for a host with no tokenizer. A text
 /// window is this many times the model's block size in bytes, and a text's
-/// size in tokens is its bytes over this.
+/// size in tokens is its bytes over this (`tokens_or_text`).
 pub const TEXT_BYTES_PER_TOKEN: u32 = 4;
+
+/// A request's size in tokens for a reader that prices a request of text
+/// by its length: `tokens`, the count of its token ids, and where it states
+/// none its text's `length` in bytes at [`TEXT_BYTES_PER_TOKEN`] a token.
+/// The one statement of the rule: a request's facts read it
+/// ([`RequestFacts::prompt_size`]), and so does a held decision's record,
+/// by the bytes its lease keeps
+/// ([`Lease::prompt_size`](crate::tracking::lease::Lease::prompt_size)).
+pub(crate) const fn tokens_or_text(tokens: u32, length: u32) -> u32 {
+    if tokens == 0 {
+        length / TEXT_BYTES_PER_TOKEN
+    } else {
+        tokens
+    }
+}
 
 /// The first `tokens` tokens of a request hashed in `kind`, in the unit its
 /// blocks are sized in: tokens, and under the text kind their bytes.
@@ -748,6 +763,11 @@ pub struct Candidate {
     /// ([`RequestFacts::in_flight`]): the row's place in the host's pool,
     /// whatever its index.
     pub position: u32,
+    /// The worker's id ([`WorkerId`]). Each rank of a data-parallel engine
+    /// is a row of its own with an id of its own: a rank's worker object
+    /// stands at an address of its own, and its id is that address's
+    /// fingerprint. The rows of one engine are joined by
+    /// [`Self::engine`], and never by this id.
     pub id: WorkerId,
     pub role: Role,
     pub dp_rank: u16,
@@ -765,6 +785,13 @@ pub struct Candidate {
     /// that lends its counts beside the rows
     /// ([`RequestFacts::lent_in_flight`]) leaves this zero, so a reader
     /// asks [`RequestFacts::in_flight`].
+    ///
+    /// The in-process front reads it off the worker object at every
+    /// decision: the object's own counter, which a host raises where it
+    /// makes the worker's load guard and lowers where the guard is
+    /// dropped. A guard can be made ahead of its send. The decode of a
+    /// pair named at the first decision is so counted on its row before
+    /// it is sent, and the classic policies count it the same way.
     pub in_flight: u32,
     /// The latest load row, when the host has a report for the worker.
     pub load: Option<LoadRow>,
@@ -1057,7 +1084,12 @@ pub struct RequestFacts<'a> {
     pub priority: i32,
     pub streaming: bool,
     pub max_output_tokens: u32,
-    /// The host's token count or estimate. A stage that reads it declares
+    /// The count of the request's token ids, or the count its host states,
+    /// and zero where the request gives no ids: a request of text alone
+    /// states its text's length ([`Self::prompt_bytes`],
+    /// [`Self::prompt_chars`]) and no count, so
+    /// a stage that prices a request of no stated size prices it by its
+    /// own rule. A stage that reads the size declares
     /// [`Needs::prompt_size`](crate::document::Needs::prompt_size): a host
     /// that sends a request on without reading its prompt states zero
     /// where no stage does. Nothing masks the field for a stage of a
@@ -1103,6 +1135,25 @@ pub struct RequestFacts<'a> {
     /// that carries hashes and states none. Last on the wire (the
     /// numbering follows the record's order).
     pub block_size: u32,
+    /// The length of the request's text in characters, where the request
+    /// gives text and no token ids and a stage of the document reads a
+    /// request's size ([`Needs::prompt_size`](crate::document::Needs::prompt_size));
+    /// `0` otherwise. Its reader at a decision is a stage that sizes a
+    /// request of text by its characters, as `bucket` does, and a lease
+    /// keeps it ([`Lease::chars`](crate::tracking::lease::Lease::chars)).
+    /// Counting it is one pass over the text, made once a request.
+    /// In-process only: a frame states a count.
+    pub prompt_chars: u32,
+    /// The length of the request's text in bytes, where the request gives
+    /// text and no token ids; `0` otherwise. It is written wherever the
+    /// text is at hand and costs no pass. [`Self::prompt_size`] makes a
+    /// count of it, which every reader that prices a request of text by
+    /// its length takes: the room rule, a plugin's view of a request, the
+    /// prefix stages, whose windows of text are bytes, and a frame. A
+    /// lease keeps it ([`Lease::bytes`](crate::tracking::lease::Lease::bytes)),
+    /// so a held decision reads the same count.
+    /// In-process only: a frame states a count.
+    pub prompt_bytes: u32,
     /// The host's clock at the decision, in microseconds since its origin.
     /// In-process only; no absolute instant crosses the wire.
     pub now_micros: u64,
@@ -1277,6 +1328,18 @@ pub const fn key_of_session(session: u64, model: u64, phase: Phase) -> u64 {
 }
 
 impl<'a> RequestFacts<'a> {
+    /// The request's size in tokens for a reader that prices a request of
+    /// text by its length (`tokens_or_text`): the count of its token ids
+    /// ([`Self::prompt_tokens`]), and where it states none its text's
+    /// bytes at [`TEXT_BYTES_PER_TOKEN`] a token ([`Self::prompt_bytes`]).
+    /// Zero where it states neither. A window of text is bytes, so a
+    /// prefix stage divides one unit by the same unit.
+    #[inline]
+    #[must_use]
+    pub const fn prompt_size(&self) -> u32 {
+        tokens_or_text(self.prompt_tokens, self.prompt_bytes)
+    }
+
     /// The rows the host named, where they answer: beside an empty column.
     /// The column is asked first, so a host that fills one pays nothing for
     /// the rows it does not name.
@@ -1759,12 +1822,13 @@ mod tests {
     /// them, so their size is a cost of those decisions: the pin is exact.
     /// The signal cells are one word, for every signal, and the client's
     /// key is one word more. The ring a caller lends is two words, and
-    /// where the request stands on it two more. A field the facts gain
-    /// moves this number and carries the decision bench's cells that copy
-    /// the facts (`benches/decision.rs`).
+    /// where the request stands on it two more. A text's two lengths are
+    /// one word: its characters fill what was spare, and its bytes take
+    /// the word. A field the facts gain moves this number and carries the
+    /// decision bench's cells that copy the facts (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
-        assert_eq!(size_of::<RequestFacts<'_>>(), 328);
+        assert_eq!(size_of::<RequestFacts<'_>>(), 336);
     }
 
     #[test]

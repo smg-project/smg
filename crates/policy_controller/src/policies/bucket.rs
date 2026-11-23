@@ -113,6 +113,18 @@ const NONE: u32 = u32::MAX;
 /// oldest leaves as if its interval had passed.
 const WINDOW_CAP: usize = 1 << 20;
 
+/// The size the policy places and books a request by: the count of its
+/// token ids, and where it states none the length of its text in
+/// characters. The classic `bucket` sizes a request so
+/// (`model_gateway/src/policies/bucket.rs:106-110`).
+const fn sized_by(tokens: u32, chars: u32) -> u32 {
+    if tokens == 0 {
+        chars
+    } else {
+        tokens
+    }
+}
+
 /// The absolute part of the balance rule, in booked tokens, when the
 /// document names none.
 pub const DEFAULT_ABS_THRESHOLD: u32 = 64;
@@ -743,7 +755,7 @@ impl Lifecycle for Bucket {
             if let Some(member) = pool.member_of(position, id) {
                 pool.book(
                     member,
-                    lease.tokens,
+                    sized_by(lease.tokens, lease.chars),
                     lease.issued_micros,
                     self.interval_micros,
                     Clock::Issue,
@@ -800,7 +812,7 @@ impl Lifecycle for Bucket {
             if let Some(at_micros) = dated {
                 pool.book(
                     member,
-                    lease.tokens,
+                    sized_by(lease.tokens, lease.chars),
                     at_micros,
                     self.interval_micros,
                     Clock::Dispatch,
@@ -1015,7 +1027,7 @@ impl Scorer for Bucket {
             let leads = if spills {
                 Some(loads.lightest)
             } else {
-                pool.owner(facts.prompt_tokens)
+                pool.owner(sized_by(facts.prompt_tokens, facts.prompt_chars))
             };
             if let Some(id) =
                 leads.and_then(|member| pool.members.get(member).map(|member| member.id))
@@ -1131,6 +1143,17 @@ mod tests {
     /// Book `tokens` on the worker of `row` at `at_micros`, as an issued
     /// decision that names it first.
     fn book(scorer: &Bucket, pool: &[Candidate], row: u32, tokens: u32, at_micros: u64) {
+        let lease = Lease {
+            tokens,
+            issued_micros: at_micros,
+            ..Lease::default()
+        };
+        issue(scorer, pool, row, &lease);
+    }
+
+    /// Tell the scorer the issue of `lease` on the worker of `row`, as a
+    /// decision that names it first.
+    fn issue(scorer: &Bucket, pool: &[Candidate], row: u32, lease: &Lease) {
         let mut targets = Targets::new();
         targets.push(Target {
             position: row,
@@ -1142,12 +1165,7 @@ mod tests {
             targets,
             ..Pick::default()
         });
-        let lease = Lease {
-            tokens,
-            issued_micros: at_micros,
-            ..Lease::default()
-        };
-        scorer.on_decision_issued(&lease, &decision);
+        scorer.on_decision_issued(lease, &decision);
     }
 
     /// The partition of `model`, which a decision listed.
@@ -1248,6 +1266,47 @@ mod tests {
             ranges(&thirds),
             [(0, 0, 1_364), (1, 1_365, 2_729), (2, 2_730, u32::MAX)]
         );
+    }
+
+    /// A request of text alone is placed and booked by its text's length in
+    /// characters, as the classic `bucket` sizes one
+    /// (`model_gateway/src/policies/bucket.rs:104-110`) and books it
+    /// (`:178-181`). A request that states token ids is placed and booked
+    /// by their count, whatever length stands beside it. A dispatch on
+    /// another worker books the same size there.
+    #[test]
+    fn a_request_of_text_alone_is_placed_and_booked_by_its_characters() {
+        let scorer = scorer(NEVER, 1.5, 5);
+        let pool = pool(4);
+        let led = |tokens, chars| {
+            let facts = RequestFacts {
+                prompt_chars: chars,
+                ..prefill("m", tokens, SECOND)
+            };
+            led_by(&scorer, &facts, &pool, &all(&pool))
+        };
+        // 2,500 characters and no token id: the third quarter's owner.
+        assert_eq!(led(0, 2_500), Some(2));
+        // Token ids win: 100 of them go to the first quarter's owner.
+        assert_eq!(led(100, 2_500), Some(0));
+        let sized = |tokens, chars, index| Lease {
+            tokens,
+            chars,
+            target_index: index,
+            issued_micros: SECOND,
+            ..Lease::default()
+        };
+        issue(&scorer, &pool, 2, &sized(0, 2_500, 0));
+        issue(&scorer, &pool, 0, &sized(100, 2_500, 0));
+        assert_eq!(loads(&scorer), (vec![100, 0, 2_500, 0], 2_600));
+        // The text's request is sent to its pick's second target, the last
+        // row: that worker is booked its characters too.
+        let target = Target {
+            id: pool[3].id,
+            ..Target::default()
+        };
+        scorer.on_dispatched(&sized(0, 2_500, 1), &target, Side::Single, 250);
+        assert_eq!(loads(&scorer), (vec![100, 0, 2_500, 2_500], 5_100));
     }
 
     #[test]

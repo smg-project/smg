@@ -235,6 +235,8 @@ fn single(id: u64) -> Lease {
         session_verdict: SessionVerdict::Claimed(WorkerId(7)),
         issued_micros: ISSUED_MICROS,
         tokens: TOKENS,
+        chars: 0,
+        bytes: 0,
     }
 }
 
@@ -359,6 +361,8 @@ fn a_singles_release_behind_its_dispatch_names_the_target_it_went_to() {
 /// before the word: the record's own lease, the index and the target the
 /// word is about, a pick of no target, and a decode side that is a
 /// single's. A dispatch that names no target of the pick lends nothing.
+/// A lease that states its text's two lengths lends them with its decode
+/// side, as it lends its token count.
 #[test]
 fn a_singles_lease_is_lent_as_it_stood_before_the_word() {
     let bed = Bed::new(Way::Engine);
@@ -385,6 +389,8 @@ fn a_singles_lease_is_lent_as_it_stood_before_the_word() {
     let a_singles = HeldDecode {
         session: Session::NONE,
         tokens: TOKENS,
+        chars: 0,
+        bytes: 0,
         chosen: false,
     };
     let (first, second) = (target(WorkerId(7), 0), target(WorkerId(9), 2));
@@ -413,6 +419,22 @@ fn a_singles_lease_is_lent_as_it_stood_before_the_word() {
         let sent = bed.sides(1);
         assert_eq!(lent(sent, end), Some((moved, 1, second, a_singles)));
     }
+
+    // A lease of a request of text: 400 characters in 800 bytes.
+    let (chars, bytes) = (400, 800);
+    let mut of_text = bed.sides(1);
+    (of_text.record.lease.chars, of_text.record.lease.bytes) = (chars, bytes);
+    let own = Lease {
+        chars,
+        bytes,
+        ..moved
+    };
+    let stated = HeldDecode {
+        chars,
+        bytes,
+        ..a_singles
+    };
+    assert_eq!(lent(of_text, ends[0]), Some((own, 1, second, stated)));
 }
 
 /// A pair's lease is no single's: with its decode side beside the record

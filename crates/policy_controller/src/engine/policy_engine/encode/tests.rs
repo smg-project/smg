@@ -1671,6 +1671,8 @@ fn decode_again(host: &Host, asks: &Asks<'_>, first: DecideOutcome, now: Instant
         decode: HeldDecode {
             session: first.decode_session,
             tokens: lease.tokens,
+            chars: lease.chars,
+            bytes: lease.bytes,
             chosen: true,
         },
     };

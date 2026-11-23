@@ -230,6 +230,9 @@ pub(crate) fn issue(
         // The engine's own clock: its decisions and its stages read it.
         issued_micros: front.clock().micros(taken.now),
         tokens,
+        // A frame states a count and no text's length.
+        chars: 0,
+        bytes: 0,
     };
     let record = LeaseRecord {
         lease,
