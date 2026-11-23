@@ -268,6 +268,13 @@ def test_launcher_complete_and_window_validation():
         epd_launcher.complete(args, "encoder")
     args.port = 30000
 
+    for field in ("dp_size", "attn_dp_size"):
+        setattr(args, field, 2)
+        for role in ("encoder", "prefill", "decode"):
+            with pytest.raises(ValueError, match=field):
+                epd_launcher.complete(args, role)
+        setattr(args, field, 1)
+
     args.revision = None
     with pytest.raises(ValueError, match="--revision"):
         epd_launcher.complete(args, "prefill")

@@ -574,14 +574,7 @@ async fn run_native(
                         }
                     }
                     Some(Err(error)) => {
-                        let _ = send_owned_event(
-                            &output,
-                            &terminal_error,
-                            Err(error),
-                            &mut cancel,
-                            active_deadline,
-                        )
-                        .await;
+                        push_terminal_error(&output, &terminal_error, error);
                         if safe {
                             return (true, false);
                         }

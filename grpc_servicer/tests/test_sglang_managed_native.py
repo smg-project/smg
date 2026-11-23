@@ -174,18 +174,22 @@ def test_plugin_intake_queue_and_backpressure_errors(monkeypatch):
     )
     queued.clear()
     plugin.before_queue(
-        lambda s, r: queued.append(r), SimpleNamespace(model_config=object(), tp_size=1), req2
+        lambda s, r: queued.append(r),
+        SimpleNamespace(model_config=object(), server_args=SimpleNamespace(tp_size=1)),
+        req2,
     )
     assert queued == [req2] and "metadata publication failed" in req2.to_finish
     assert not getattr(req2, "_smg_managed_exported", False)
 
-    # At TP > 1, rank 0 must NOT unilaterally abort on metadata publish failure so
-    # PrefillBootstrapQueue stays symmetric across TP ranks.
+    # At TP > 1 (or when TP size cannot be determined), rank 0 must NOT unilaterally abort
+    # on metadata publish failure so PrefillBootstrapQueue stays symmetric across ranks.
     req3 = SimpleNamespace(rid="blocked-tp4", to_finish=None)
     req3.set_finish_with_abort = lambda reason: setattr(req3, "to_finish", reason)
     queued.clear()
     plugin.before_queue(
-        lambda s, r: queued.append(r), SimpleNamespace(model_config=object(), tp_size=4), req3
+        lambda s, r: queued.append(r),
+        SimpleNamespace(model_config=object(), server_args=SimpleNamespace(tp_size=4)),
+        req3,
     )
     assert queued == [req3] and req3.to_finish is None
     assert not getattr(req3, "_smg_managed_exported", False)

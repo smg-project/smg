@@ -233,6 +233,18 @@ def retain_receiver_owner(original, scheduler, received, *args, **kwargs):
     return prepared
 
 
+def _single_rank_tp(scheduler) -> bool:
+    """Return True only when the scheduler is provably single-rank (TP=1, CP=1)."""
+    server_args = getattr(scheduler, "server_args", None)
+    tp_size = getattr(scheduler, "attn_tp_size", None)
+    if tp_size is None:
+        tp_size = getattr(scheduler, "tp_size", None)
+    if tp_size is None and server_args is not None:
+        tp_size = getattr(server_args, "tp_size", None)
+    cp_size = getattr(server_args, "attn_cp_size", 1) if server_args is not None else 1
+    return tp_size == 1 and cp_size == 1
+
+
 def before_queue(original, scheduler, req, *args, **kwargs):
     """Export once after receiver/TP/layout preparation and before native PD bootstrap."""
     if (
@@ -262,10 +274,10 @@ def before_queue(original, scheduler, req, *args, **kwargs):
             logging.getLogger(__name__).exception(
                 "managed metadata publication failed rid=%s", req.rid
             )
-            # Only abort locally on single-rank TP; at TP > 1, aborting rank 0 alone would
-            # diverge PrefillBootstrapQueue lengths across TP ranks. Let all ranks enqueue
-            # symmetrically so the gateway's layout deadline aborts every rank together.
-            if getattr(scheduler, "attn_tp_size", getattr(scheduler, "tp_size", 1)) == 1:
+            # Only abort locally when provably single-rank TP/CP; at TP/CP > 1, aborting
+            # rank 0 alone would diverge PrefillBootstrapQueue lengths across ranks. Let all
+            # ranks enqueue symmetrically so the gateway's layout deadline aborts every rank.
+            if _single_rank_tp(scheduler):
                 req.set_finish_with_abort("managed metadata publication failed")
             return original(scheduler, req, *args, **kwargs)
         req._smg_managed_exported = True
