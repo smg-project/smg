@@ -373,7 +373,7 @@ impl DeepseekV41Processor {
 
 /// The request's error for a patch output that cannot be reserved.
 fn refused(reason: impl std::fmt::Display) -> TransformError {
-    TransformError::ShapeError(format!(
+    TransformError::ReserveRefused(format!(
         "cannot reserve DeepSeek-V4.1 patch output: {reason}"
     ))
 }
@@ -868,7 +868,7 @@ mod tests {
             processor.preprocess(&[&image]),
         ] {
             assert!(
-                matches!(&result, Err(TransformError::ShapeError(message))
+                matches!(&result, Err(TransformError::ReserveRefused(message))
                     if message
                         .strip_prefix("cannot reserve DeepSeek-V4.1 patch output: ")
                         .is_some_and(|cause| !cause.is_empty())),

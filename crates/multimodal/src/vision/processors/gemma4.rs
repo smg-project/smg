@@ -508,9 +508,7 @@ fn stack(
     let mut values = Vec::new();
     values
         .try_reserve_exact(count * max_patches * patch_pixels)
-        .map_err(|error| {
-            TransformError::ReserveRefused(format!("cannot reserve Gemma 4 patch output: {error}"))
-        })?;
+        .map_err(refused)?;
     let mut positions = Vec::with_capacity(count * max_patches * 2);
     let mut tokens = Vec::with_capacity(count);
     for item in encoded {
@@ -577,7 +575,7 @@ fn shape(message: impl Into<String>) -> TransformError {
 
 /// The request's error for a patch output the allocator refuses.
 fn refused(error: std::collections::TryReserveError) -> TransformError {
-    shape(format!("cannot reserve Gemma 4 patch output: {error}"))
+    TransformError::ReserveRefused(format!("cannot reserve Gemma 4 patch output: {error}"))
 }
 
 /// Gemma 4 image and video preprocessor.
@@ -661,7 +659,7 @@ impl Gemma4Processor {
         let band_bytes = max_patches * patch_pixels * writer.element_size();
         let wire_len = band_bytes
             .checked_mul(images.len())
-            .ok_or_else(|| shape("Gemma 4 wire size overflow"))?;
+            .ok_or_else(|| TransformError::ReserveRefused("Gemma 4 wire size overflow".into()))?;
         // A pooled buffer: its bytes are a previous request's until the bands
         // below, padding included, are written.
         let mut wire = buffer_pool::try_take(wire_len).map_err(refused)?;
@@ -1200,8 +1198,8 @@ mod tests {
 
     /// A patch too large for any allocation, and a batch of them too large
     /// for any layout: the request reads an error in both forms of the
-    /// output. A geometry too large to count is refused when the processor
-    /// is built.
+    /// output, under the same variant when the batch's size passes `usize`.
+    /// A geometry too large to count is refused when the processor is built.
     #[test]
     fn a_patch_output_that_cannot_be_reserved_is_an_error() {
         let built = |patch: u32| {
@@ -1223,13 +1221,17 @@ mod tests {
             processor.preprocess(&[&image]),
         ] {
             assert!(
-                matches!(&result, Err(TransformError::ShapeError(message))
+                matches!(&result, Err(TransformError::ReserveRefused(message))
                     if message
                         .strip_prefix("cannot reserve Gemma 4 patch output: ")
                         .is_some_and(|cause| !cause.is_empty())),
                 "{result:?}"
             );
         }
+        assert!(matches!(
+            wire(&[&image; 5]),
+            Err(TransformError::ReserveRefused(message)) if message == "Gemma 4 wire size overflow"
+        ));
         assert!(matches!(
             built(1 << 25),
             Err(TransformError::ShapeError(message))
