@@ -377,8 +377,9 @@ cargo test -p smg-policy-controller --features ingest,in-process --test classic_
 
 A few rows of each sheet are also copied into the crate's test source, and the replay holds each copy to its sheet.
 
-`retry_wire.json`, `media_refs.json`, `context_window.json`, `rank_pin.json` and `sticky_rank.json` replay over
-worker objects, which the `in-process` feature brings.
+`retry_wire.json`, `media_refs.json`, `context_window.json`, `rank_pin.json`, `sticky_rank.json` and
+`encode_pair.json` replay over worker objects, which the `in-process` feature brings. The encode sheet's fleets are
+decided by the engine's entry for an encode request over three lists of worker objects.
 
 ## Limits left
 
@@ -388,8 +389,9 @@ fails once the reason no longer holds.
 - `power_of_two.json`: none. All 44 rows replay.
 - `all_vetoed.json`: none. All 104 rows replay.
 - `pair_index.json`: none. All 23 rows replay.
-- `encode_pair.json`: none is recorded yet. The module that replays it arrives with the crate's encoder lists
-  and its rule for encode items; until then the replay owes this sheet.
+- `encode_pair.json`: all 52 rows replay. In the nine that place items by consistent hashing a key's encoder is
+  not held to the recorded one: two rings place no key alike. The replay holds each key to the encoders it was
+  offered and equal keys to one encoder.
 - `pair_select.json`: five rows are decided apart, each named by the replay with the answer the pair's decision
   gives. Four run a prefill policy that weighs load against cache affinity itself (`cache_aware`): the gateway
   lifts the overload veto for such a policy and lets it place, and no profile of the crate places over a lifted
