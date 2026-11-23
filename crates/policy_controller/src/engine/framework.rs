@@ -319,16 +319,16 @@ pub trait Scorer: Lifecycle + Debug {
     /// one, and writes none ahead of the decision. The scorer finds the
     /// request's workers by its own rule and learns from `place_of` where
     /// each stands in the pool, which holds `rows` rows: `None` for a
-    /// worker that is no row of it, and for an id two rows of it carry,
-    /// which names neither. It asks `keep`, every filter of the profile,
-    /// about each place once, and of as many places as its rule goes
-    /// through: the hook bounds no walk. Returns how many rows it hands
-    /// out: the places `keep` kept, in the order it was asked, the pick
-    /// first and its alternates behind it. They are the rows the profile's
-    /// run over the whole pool hands out, in its order. `0` where it
-    /// places nothing by itself or its rule ran out: the profile's run
-    /// decides. It reads no value of the seed's stream. The default places
-    /// nothing.
+    /// worker that is no row of it, and for every worker of a pool where
+    /// two rows carry one id ([`PoolRows::place_of`]), which so names no
+    /// row. It asks `keep`, every filter of the profile, about each place
+    /// once, and of as many places as its rule goes through: the hook
+    /// bounds no walk. Returns how many rows it hands out: the places
+    /// `keep` kept, in the order it was asked, the pick first and its
+    /// alternates behind it. They are the rows the profile's run over the
+    /// whole pool hands out, in its order. `0` where it places nothing by
+    /// itself or its rule ran out: the profile's run decides. It reads no
+    /// value of the seed's stream. The default places nothing.
     fn own_by_place(
         &self,
         _facts: &RequestFacts<'_>,
@@ -852,6 +852,19 @@ pub struct WeightedScorer {
     pub weight: f32,
 }
 
+impl WeightedScorer {
+    /// The stage's share of the weights of a profile whose one scorer it
+    /// is, as the whole pass folds it into a score ([`combine`]): the
+    /// weight times its own inverse. A weight's share of itself need not
+    /// be one, and under a weight too small to invert it is not finite.
+    /// What places a request in front of the whole pass writes its scores
+    /// by this share, and only where it is finite.
+    #[inline]
+    fn sole_share(&self) -> f32 {
+        self.weight * (1.0 / self.weight)
+    }
+}
+
 /// One profile: an ordered set of filters, scorers and exactly one picker.
 #[derive(Debug)]
 pub struct Profile {
@@ -1320,8 +1333,7 @@ fn combine(
         // One stage whose share is the whole sum writes the scores where
         // they stand: each value and the band are the sum's own terms, a
         // zero plus the stage's clamped value.
-        let weight = weighted.weight;
-        if weight > 0.0 && weight * (1.0 / weight) == 1.0 {
+        if weighted.weight > 0.0 && weighted.sole_share() == 1.0 {
             let stage_band = weighted.scorer.score(facts, candidates, kept, scores);
             debug_assert!(
                 bandless(weighted, stage_band),
@@ -1334,6 +1346,8 @@ fn combine(
             return TieBand(0.0 + stage_band.0.clamp(0.0, 1.0));
         }
     }
+    // The sum of one weight above zero is that weight, so one stage's share
+    // below is its [`WeightedScorer::sole_share`], the value tested above.
     let total: f32 = profile.scorers.iter().map(|w| w.weight).sum();
     let norm = if total > 0.0 { 1.0 / total } else { 1.0 };
     let mut band = 0.0f32;
@@ -3023,6 +3037,12 @@ fn profile_index(binding: &Binding, phase: Phase) -> Option<u16> {
     }
 }
 
+/// `entry` where its binding's plan pairs (`pd-pair` or `epd`): what makes
+/// a model's prefill entry its pair entry ([`Engine::pair_entry`]).
+fn paired(entry: &Entry) -> Option<&Entry> {
+    matches!(entry.binding.plan, Plan::PdPair | Plan::Epd { .. }).then_some(entry)
+}
+
 /// The shadow profile a binding names for `phase`, by position: a
 /// single's for each phase, a pair's a side. `None` for a pair's encode
 /// side, which names none.
@@ -3752,13 +3772,15 @@ impl Marks {
     /// the stages as a draw's.
     const ENGINES: u16 = 1 << 7;
     /// The profile's one scorer places a request by itself
-    /// ([`Scorer::own`]) and has a finite weight above zero, every filter
-    /// answers row by row and the picker takes the best scores of every
-    /// row ([`Picker::takes_best`]): a picker that narrows first does not
+    /// ([`Scorer::own`]) and has a weight above zero whose share of itself
+    /// is finite ([`WeightedScorer::sole_share`]), every filter answers
+    /// row by row and the picker takes the best scores of every row
+    /// ([`Picker::takes_best`]): a picker that narrows first does not
     /// follow the scorer's order, a weight that orders nothing leaves the
-    /// rows to the picker's draw, and the profile runs. Under the mark a
-    /// request that carries a session key, over a pool whose host lists
-    /// its engines, is the scorer's to place ([`run_owned`]).
+    /// rows to the picker's draw, a weight too small to invert gives the
+    /// whole pass no score to order by, and the profile runs. Under the
+    /// mark a request that carries a session key, over a pool whose host
+    /// lists its engines, is the scorer's to place ([`run_owned`]).
     const OWNS: u16 = 1 << 8;
     /// A stage may refuse a request by a report of leases
     /// ([`Filter::refuses_by_reports`]). The engine's run reads nothing of
@@ -3818,7 +3840,9 @@ impl Marks {
             0
         };
         let alone = match &profile.scorers[..] {
-            [stage] => stage.weight > 0.0 && stage.weight.is_finite() && stage.scorer.owns(),
+            // The share, not the weight: a weight without end has none,
+            // and neither has one too small to invert.
+            [stage] => stage.weight > 0.0 && stage.sole_share().is_finite() && stage.scorer.owns(),
             _ => false,
         };
         let row_wise = profile.filters.iter().all(|f| f.row_wise());
@@ -5054,7 +5078,7 @@ impl Engine {
     /// one ring and one place, so a side of another ring form would take
     /// that place for its own. `false` where no binding matches. Only a
     /// request that lends a ring pays for the answer: one lookup of its
-    /// binding, and a second for a pair's decode profile. A decode asked
+    /// binding, which names a pair's decode profile too. A decode asked
     /// again is answered for a decode request's own binding, which a
     /// document may order ahead of the pair's, as [`Self::sample_for`]
     /// answers. A caller that writes a request's facts itself asks it
@@ -5068,18 +5092,19 @@ impl Engine {
     /// The profiles a request of `phase` for `model` is placed by on a
     /// ring its caller lends: the one that decides it and, for a pair
     /// asked at its prefill, its decode profile. One lookup of its
-    /// binding, and a second for a pair's. What makes a request looks
-    /// them up once and asks both of [`Self::key_place_of`] and
-    /// [`Self::head_rule_of`].
+    /// binding: a prefill's own entry is its model's pair entry where
+    /// the plan pairs ([`Self::pair_entry`]), and the decode profile is
+    /// read off it. What makes a request looks them up once and asks
+    /// both of [`Self::key_place_of`] and [`Self::head_rule_of`].
     pub(crate) fn ring_profiles(&self, model: &str, phase: Phase) -> RingProfiles {
-        let own = self.resolve(model, phase);
-        let own = own.map(|(_, index, _)| usize::from(index));
+        let Some((entry, own, _)) = self.resolve(model, phase) else {
+            return (None, None);
+        };
         let decode = (phase == Phase::Prefill)
-            .then(|| self.pair_binding(model))
+            .then(|| paired(entry))
             .flatten()
-            .and_then(|binding| profile_index(binding, Phase::Decode))
-            .map(usize::from);
-        (own, decode)
+            .and_then(|pair| profile_index(&pair.binding, Phase::Decode));
+        (Some(usize::from(own)), decode.map(usize::from))
     }
 
     /// [`Self::states_key_place`] by the two profiles of
@@ -5114,7 +5139,7 @@ impl Engine {
     /// no binding matches. The scorers answered when the engine was built,
     /// and no stage is asked here. Only a request that lends a ring to a
     /// profile with no place for its key's text pays for the answer: one
-    /// lookup of its binding, and a second for a pair's decode profile.
+    /// lookup of its binding, which names a pair's decode profile too.
     #[must_use]
     pub fn states_head_places(&self, model: &str, phase: Phase) -> Option<HeadRule<'_>> {
         self.head_rule_of(self.ring_profiles(model, phase))
@@ -5155,8 +5180,7 @@ impl Engine {
     /// its word for a pool a soft veto empties, which a pair's decode side
     /// is put to the all-vetoed rule by. Its prefill side is put to none.
     fn pair_entry(&self, model: &str) -> Option<&Entry> {
-        self.entry(model, Phase::Prefill)
-            .filter(|entry| matches!(entry.binding.plan, Plan::PdPair | Plan::Epd { .. }))
+        self.entry(model, Phase::Prefill).and_then(paired)
     }
 
     /// The binding a `phase` pool of `model` is decided under, whose
@@ -13750,8 +13774,10 @@ mod tests {
                 &mut stage,
             );
             // The sum's own terms: a zero plus the stage's share of the
-            // value brought into range.
-            let share = weight * (1.0 / weight);
+            // value brought into range. The share is the one a decision in
+            // front of the whole pass writes its scores by.
+            let share = profile.scorers[0].sole_share();
+            assert_eq!(share.to_bits(), (weight * (1.0 / weight)).to_bits());
             let term = |value: f32| (0.0 + share * value.clamp(0.0, 1.0)).to_bits();
             let written: Vec<u32> = scores.iter().map(|score| score.to_bits()).collect();
             let summed: Vec<u32> = GIVEN.iter().map(|&value| term(value)).collect();

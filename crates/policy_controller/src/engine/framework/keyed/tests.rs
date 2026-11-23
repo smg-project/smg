@@ -549,11 +549,21 @@ fn a_request_the_key_does_not_decide_is_left_whole_to_the_whole_decision() {
         assert_eq!(listed.read(), 0, "{name}");
     }
     // A ring at a weight that orders nothing places no request by itself:
-    // its whole pass scores every row alike and the picker draws.
-    for (weight, answered) in [(1.0, true), (0.0, false), (f32::INFINITY, false)] {
+    // its whole pass scores every row alike and the picker draws. Nor
+    // does one at a weight too small to invert: its share of the sum is
+    // not finite, and the whole pass has no score to order by. A weight
+    // under the least normal one still places where it inverts.
+    for (weight, answered) in [
+        (1.0, true),
+        (0.0, false),
+        (f32::INFINITY, false),
+        (1e-39, false),
+        (4e-39, true),
+    ] {
         let ring = hand_built_ring(weight);
         assert_eq!(ring.keyed.contains(&true), answered, "weight {weight}");
     }
+    assert!((1.0f32 / 1e-39).is_infinite() && (1.0f32 / 4e-39).is_finite());
 }
 
 /// A scorer that scores every row alike. Where it is told to, it states

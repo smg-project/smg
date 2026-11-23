@@ -750,6 +750,76 @@ fn a_keyed_request_by_the_rings_walk_is_the_whole_passes_answer_row_for_row() {
     }
 }
 
+/// The best rows the trace of a request with the routing key `key` names,
+/// each with its score to the bit, and whether the walk alone decided
+/// ([`placed`]).
+fn traced(
+    engine: &Engine,
+    key: &str,
+    rows: &[Candidate],
+    engines: Engines<'_>,
+) -> (Vec<(WorkerId, u32)>, bool) {
+    let facts = RequestFacts {
+        model: "m",
+        session_key: Identity::plain(key),
+        seed: 1,
+        ..RequestFacts::default()
+    };
+    let pool = PoolFacts {
+        pool_size: rows.len() as u32,
+        generation: 1,
+        membership_epoch: 1,
+        engines,
+        ..PoolFacts::default()
+    };
+    let cx = Constraints::default();
+    let decision = engine.decide(&facts, &pool, rows, &cx, &mut Scratch::new());
+    let trace = decision.trace();
+    let best = trace.top[..usize::from(trace.top_len)]
+        .iter()
+        .map(|&(id, score)| (id, score.to_bits()))
+        .collect();
+    (best, trace.survivors.get().is_none())
+}
+
+/// The trace of a request the ring's walk places names the whole pass's
+/// best rows at the whole pass's scores, to the bit. The whole pass folds
+/// the stage's share of the profile's weights into each score, and a
+/// weight's share of itself need not be one: the walk writes its steps by
+/// that share, at a weight whose share is one and at one whose share is
+/// not.
+#[test]
+fn a_walks_trace_scores_its_rows_as_the_whole_pass_scores_them() {
+    // The weights stand on both sides: the share of 41 is not one.
+    assert_eq!(3.0f32 * (1.0 / 3.0f32), 1.0);
+    assert_ne!(41.0f32 * (1.0 / 41.0f32), 1.0);
+    let ring_at = |weight: f32| {
+        let scorer = WeightedScorer {
+            scorer: Box::new(ConsistentHash::new(None)),
+            weight,
+        };
+        engine_of(vec![Box::new(Asked)], vec![scorer])
+    };
+    let (rows, listed, ends) = fleet(&[8; 8], 2);
+    let engines = Engines::new(0, &listed, &ends);
+    for weight in [1.0f32, 3.0, 41.0] {
+        // The whole pass is a ring of its own that is handed no list.
+        let (ring, whole) = (ring_at(weight), ring_at(weight));
+        let mut walked = 0;
+        for i in 0..64 {
+            let key = format!("conv-{i}");
+            let (by_pass, alone) = traced(&whole, &key, &rows, Engines::default());
+            assert!(!alone, "a pool that lists no engine is read whole");
+            let (by_walk, alone) = traced(&ring, &key, &rows, engines);
+            if alone {
+                assert_eq!(by_walk, by_pass, "{key} at weight {weight}");
+                walked += 1;
+            }
+        }
+        assert!(walked >= 48, "{walked} of 64 keys by the walk alone");
+    }
+}
+
 /// A client's key is walked as a session's key is: the same rows, and
 /// where the walk alone decides for the one it decides for the other.
 #[test]
