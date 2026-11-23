@@ -148,16 +148,6 @@ impl Llama4VisionProcessor {
         )))
     }
 
-    /// Get the tile size.
-    pub fn tile_size(&self) -> u32 {
-        self.tile_size
-    }
-
-    /// Get the max patches setting.
-    pub fn max_patches(&self) -> usize {
-        self.max_patches
-    }
-
     /// Get all factors of a number.
     fn get_factors(n: usize) -> HashSet<usize> {
         let mut factors = HashSet::new();
@@ -587,8 +577,8 @@ mod tests {
     #[test]
     fn test_llama4_vision_processor_default() {
         let processor = Llama4VisionProcessor::new();
-        assert_eq!(processor.tile_size(), TILE_SIZE);
-        assert_eq!(processor.max_patches(), DEFAULT_MAX_PATCHES);
+        assert_eq!(processor.tile_size, TILE_SIZE);
+        assert_eq!(processor.max_patches, DEFAULT_MAX_PATCHES);
         assert_eq!(processor.mean, LLAMA4_MEAN);
         assert_eq!(processor.std, LLAMA4_STD);
     }

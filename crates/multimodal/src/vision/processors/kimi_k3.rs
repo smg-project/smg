@@ -94,14 +94,6 @@ impl KimiK3Processor {
         }
     }
 
-    pub fn patch_size(&self) -> usize {
-        self.params.patch_size
-    }
-
-    pub fn merge_size(&self) -> usize {
-        self.params.merge_size
-    }
-
     /// Overlay the model's own transparency settings, if it ships any.
     ///
     /// Resolved once, when the processor is built for the model. An absent or malformed
@@ -210,8 +202,8 @@ mod tests {
     #[test]
     fn test_defaults_differ_from_k25() {
         let p = KimiK3Processor::new();
-        assert_eq!(p.patch_size(), 14);
-        assert_eq!(p.merge_size(), 2);
+        assert_eq!(p.params.patch_size, 14);
+        assert_eq!(p.params.merge_size, 2);
         assert_eq!(p.params.in_patch_limit, 65536);
         assert_ne!(
             p.params.in_patch_limit, K25_LIM,
