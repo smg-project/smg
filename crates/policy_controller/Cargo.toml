@@ -159,14 +159,17 @@ operator = [
 ]
 # The standalone controller: the ingestion drivers, the listeners with their
 # scopes, the protocol's generated service and client, the election, the gRPC
-# health service and the admin endpoints. The stock binary also needs
-# `worker-host` to read cache events.
+# health service and the admin endpoints. It turns on `worker-host`, so every
+# controller keeps its worker objects, probes them and reads cache events,
+# and `in-process`, the engine over worker objects.
 # Off by default: the engine alone has no server dependency. It builds on
 # Linux and macOS: the gRPC plugin kind dials a Unix socket and reads its
 # peer's user through `rustix`, which is declared for those two.
 controller = [
     "ingest",
     "operator",
+    "in-process",
+    "worker-host",
     "dep:axum",
     "dep:clap",
     "dep:hyper-util",
