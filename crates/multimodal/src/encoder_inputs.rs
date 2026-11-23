@@ -1204,14 +1204,6 @@ impl ModelSpecificValue {
         }
     }
 
-    /// Create a 2D uint tensor.
-    pub fn uint_2d(data: Vec<u32>, rows: usize, cols: usize) -> Self {
-        Self::UintTensor {
-            data,
-            shape: vec![rows, cols],
-        }
-    }
-
     /// Create a 1D int tensor from a vector.
     pub fn int_1d(data: Vec<i64>) -> Self {
         let len = data.len();
@@ -1516,11 +1508,6 @@ impl PreprocessedEncoderInputs {
         self.item_sizes.len()
     }
 
-    /// Get the number of dimensions of encoder_input.
-    pub fn ndim(&self) -> usize {
-        self.encoder_input.ndim()
-    }
-
     /// Get total number of encoder feature tokens across all media items.
     pub fn total_feature_tokens(&self) -> usize {
         self.feature_token_counts.iter().sum()
@@ -1739,7 +1726,6 @@ mod tests {
         );
 
         assert_eq!(inputs.batch_size(), 2);
-        assert_eq!(inputs.ndim(), 4);
         assert_eq!(inputs.total_feature_tokens(), 13);
         assert_eq!(inputs.encoder_input_shape(), vec![2, 3, 4, 5]);
     }
@@ -1767,11 +1753,6 @@ mod tests {
             ModelSpecificValue::uint_1d(vec![1, 2, 3]),
             ModelSpecificValue::UintTensor { data, shape }
                 if data == vec![1, 2, 3] && shape == vec![3]
-        ));
-        assert!(matches!(
-            ModelSpecificValue::uint_2d(vec![1, 2, 3, 4], 2, 2),
-            ModelSpecificValue::UintTensor { data, shape }
-                if data == vec![1, 2, 3, 4] && shape == vec![2, 2]
         ));
         assert!(matches!(
             ModelSpecificValue::int_1d(vec![1, 2, 3]),
