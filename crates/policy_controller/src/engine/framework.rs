@@ -15823,19 +15823,24 @@ mod tests {
             assert_eq!(places, (0, 0));
             assert_eq!(verdicts, (SessionVerdict::None, DecodeVerdict::NONE));
         }
-        // So it does on the decode side alone, beside a prefill side whose
-        // picker picks.
-        let decode_alone = Engine::new(
+        // So it does on one side alone, beside a side whose picker picks:
+        // on the decode side, then on the prefill side.
+        for profiles in [
             vec![least_requests_profile(), manual_profile()],
-            vec![Binding {
-                decode_profile: Some(1),
-                ..pair_binding()
-            }],
-            1,
-            Needs::default(),
-        );
-        let (places, _) = pair_placed(&decode_alone, &plain, &moved, &mut Scratch::new());
-        assert_eq!(places, (0, 0));
+            vec![manual_profile(), least_requests_profile()],
+        ] {
+            let one_side = Engine::new(
+                profiles,
+                vec![Binding {
+                    decode_profile: Some(1),
+                    ..pair_binding()
+                }],
+                1,
+                Needs::default(),
+            );
+            let (places, _) = pair_placed(&one_side, &plain, &moved, &mut Scratch::new());
+            assert_eq!(places, (0, 0));
+        }
     }
 
     /// A prefill picker's decline passes through among first partners too:
@@ -15955,6 +15960,55 @@ mod tests {
             engine.sessions.pins(prefill_session),
             Some([sides[0][1].id, WorkerId(0)])
         );
+    }
+
+    /// A decode side its rule places writes the decode side's buffers, as
+    /// its profile's run does, and the prefill's buffer stays as the
+    /// prefill's run left it. So the prefill's shadow speaks beside a pair
+    /// whose decode side alone was steered past the overload veto, under a
+    /// rule as under none: a lifted veto's mark on the prefill's buffer is
+    /// the prefill's own.
+    #[test]
+    fn a_decode_side_under_a_rule_leaves_the_prefills_buffer_to_the_prefill() {
+        let engine = |sessions: Option<SessionRule>| {
+            let binding = Binding {
+                shadow: Some(1),
+                sessions,
+                ..pair_binding()
+            };
+            let profiles = vec![strict_profile(), strict_profile()];
+            Engine::new(profiles, vec![binding], 1, Needs::default())
+        };
+        // Every decode is over its thresholds: the binding's rule steers
+        // the decode side, and the pair's trace names the lifted veto.
+        let [prefills, mut decodes] = two_sides(&[0, 0], &[0, 0]);
+        for decode in &mut decodes {
+            decode.health.overloaded = true;
+        }
+        let rule = SessionRule {
+            inflight_cap: 0,
+            ..SESSIONS
+        };
+        for (sessions, key) in [(None, None), (Some(rule), Some(7))] {
+            let (engine, facts) = (engine(sessions), pair_request(key));
+            let pools = PairPools {
+                prefills: &prefills,
+                decodes: &decodes,
+                ..PairPools::default()
+            };
+            let (pool, cx) = (PoolFacts::default(), Constraints::default());
+            let mut scratch = Scratch::new();
+            let live = engine.decide_pair(&facts, &pool, pools, &cx, &cx, &mut scratch);
+            let pick = live.pick().expect("a pair");
+            assert_eq!(pick.trace.lifted, LiftedVeto::Overload, "{key:?}");
+            let side = PairSide::Prefill;
+            let shadow =
+                engine.shadow_side(0, side, &facts, &pool, pools, &cx, &cx, pick, &mut scratch);
+            assert!(
+                shadow.is_some_and(|shadow| shadow.pick().is_some()),
+                "{key:?}"
+            );
+        }
     }
 
     /// A later decode of a key follows the key's decode pin: the call
