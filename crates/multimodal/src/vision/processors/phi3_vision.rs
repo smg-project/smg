@@ -103,11 +103,6 @@ impl Phi3VisionProcessor {
         }
     }
 
-    /// Get the number of crops.
-    pub fn num_crops(&self) -> usize {
-        self.num_crops
-    }
-
     /// The HD transform's target size for an image of `width` x `height`
     /// in landscape orientation (the transform turns a portrait image on its
     /// side first): the scale is the largest whose tiles fit the crop budget,
@@ -469,7 +464,7 @@ mod tests {
     #[test]
     fn test_phi3_vision_processor_default() {
         let processor = Phi3VisionProcessor::new();
-        assert_eq!(processor.num_crops(), 16);
+        assert_eq!(processor.num_crops, 16);
         assert_eq!(processor.default_mean(), CLIP_MEAN);
         assert_eq!(processor.default_std(), CLIP_STD);
     }
@@ -488,7 +483,7 @@ mod tests {
 
         // Should respect num_crops limit
         let num_tiles = (h / 336) * (w / 336);
-        assert!(num_tiles <= processor.num_crops() as u32);
+        assert!(num_tiles <= processor.num_crops as u32);
     }
 
     #[test]
@@ -628,7 +623,7 @@ mod tests {
         };
 
         let processor = Phi3VisionProcessor::from_preprocessor_config(&config);
-        assert_eq!(processor.num_crops(), 8);
+        assert_eq!(processor.num_crops, 8);
     }
 
     #[test]

@@ -60,14 +60,6 @@ impl KimiK25Processor {
             params: Self::new().params.resolved(config),
         }
     }
-
-    pub fn patch_size(&self) -> usize {
-        self.params.patch_size
-    }
-
-    pub fn merge_size(&self) -> usize {
-        self.params.merge_size
-    }
 }
 
 impl VisionPreProcessor for KimiK25Processor {
@@ -124,8 +116,8 @@ mod tests {
     #[test]
     fn test_defaults() {
         let p = KimiK25Processor::new();
-        assert_eq!(p.patch_size(), 14);
-        assert_eq!(p.merge_size(), 2);
+        assert_eq!(p.params.patch_size, 14);
+        assert_eq!(p.params.merge_size, 2);
         assert_eq!(p.params.factor(), 28);
         assert_eq!(p.params.in_patch_limit, DEFAULT_IN_PATCH_LIMIT);
     }
@@ -259,8 +251,8 @@ mod tests {
             ..Default::default()
         };
         let p = KimiK25Processor::from_preprocessor_config(&config);
-        assert_eq!(p.patch_size(), 14);
-        assert_eq!(p.merge_size(), 2);
+        assert_eq!(p.params.patch_size, 14);
+        assert_eq!(p.params.merge_size, 2);
     }
 
     #[test]

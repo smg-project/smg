@@ -121,16 +121,6 @@ impl Phi4VisionProcessor {
         }
     }
 
-    /// Get the dynamic_hd (max crops) value.
-    pub fn dynamic_hd(&self) -> usize {
-        self.dynamic_hd
-    }
-
-    /// Get the base resolution.
-    pub fn base_resolution(&self) -> u32 {
-        self.base_resolution
-    }
-
     /// Compute valid target aspect ratios for the given crop range.
     ///
     /// Returns sorted list of (width_crops, height_crops) tuples where
@@ -552,8 +542,8 @@ mod tests {
     #[test]
     fn test_phi4_vision_processor_default() {
         let processor = Phi4VisionProcessor::new();
-        assert_eq!(processor.dynamic_hd(), DEFAULT_DYNAMIC_HD);
-        assert_eq!(processor.base_resolution(), BASE_RESOLUTION);
+        assert_eq!(processor.dynamic_hd, DEFAULT_DYNAMIC_HD);
+        assert_eq!(processor.base_resolution, BASE_RESOLUTION);
         assert_eq!(processor.mean, PHI4_MEAN);
         assert_eq!(processor.std, PHI4_STD);
     }
@@ -695,14 +685,14 @@ mod tests {
         let processor = Phi4VisionProcessor::new();
 
         // Phi4 uses 448 base resolution (vs 336 in Phi3)
-        assert_eq!(processor.base_resolution(), 448);
+        assert_eq!(processor.base_resolution, 448);
 
         // Phi4 uses simple 0.5 normalization (vs CLIP in Phi3)
         assert_eq!(processor.mean, [0.5, 0.5, 0.5]);
         assert_eq!(processor.std, [0.5, 0.5, 0.5]);
 
         // Phi4 default dynamic_hd is 36 (vs 16 num_crops in Phi3)
-        assert_eq!(processor.dynamic_hd(), 36);
+        assert_eq!(processor.dynamic_hd, 36);
     }
 
     #[test]
