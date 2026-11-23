@@ -1704,12 +1704,14 @@ impl Tree {
     /// there, zero where it held none.
     ///
     /// The ownership leaves and the length is read under one `text` read
-    /// guard, as a replay credits it: a concurrent split truncates the node
+    /// guard, as a replay credits it: an insert's split truncates the node
     /// and clones its tenant map in one `text` write section, so it hands the
     /// tenant's prefix to the new node with its count, or it runs behind both
     /// steps. Read apart, a split between the two left the count off by the
     /// prefix: high where the length was read behind the removal, short
-    /// where it was read ahead.
+    /// where it was read ahead. A merge's split ([`Self::merge_tree`]) clones
+    /// the map ahead of its write section: a removal between the two is
+    /// debited whole, and the new node keeps the tenant uncounted.
     #[expect(
         clippy::unused_self,
         reason = "method logically belongs to the tree instance; keeps API consistent with collect_tenant_nodes"
