@@ -10,6 +10,7 @@ mod update_policies;
 use std::sync::Arc;
 
 pub use activate::ActivateWorkersStep;
+pub(crate) use activate::ACTIVATE_WORKERS_STEP;
 #[cfg(test)]
 pub(crate) use register::registration_hold;
 pub(crate) use register::REGISTER_WORKERS_STEP;

@@ -340,7 +340,8 @@ pub enum WorkerServiceError {
     /// Worker with this URL already exists (duplicate POST)
     Conflict { url: String, worker_id: WorkerId },
     /// A worker at this URL is being removed: its removal drains it for
-    /// `drain_secs` before the URL is free (a POST inside that window)
+    /// `drain_secs` before the URL is free (a POST of the URL or a PUT of
+    /// the worker inside that window)
     RemovalInProgress {
         url: String,
         worker_id: WorkerId,
@@ -813,6 +814,17 @@ impl WorkerService {
                     URL changes are not supported via PUT. Use DELETE + POST instead.",
                     config.url
                 ),
+            });
+        }
+
+        // A worker that a removal is draining is leaving: a PUT gets the
+        // answer a POST of its URL gets. A replacement would share the
+        // Draining status and be served again inside the drain.
+        if existing.status() == WorkerStatus::Draining {
+            return Err(WorkerServiceError::RemovalInProgress {
+                url,
+                worker_id,
+                drain_secs: existing.metadata().health_config.drain_settle_secs,
             });
         }
 
@@ -1700,6 +1712,102 @@ mod tests {
             retry_after.as_deref(),
             Some("7"),
             "Retry-After carries the drain window"
+        );
+    }
+
+    /// A worker that a removal is draining is leaving, and a PUT does not
+    /// bring it back to serve inside the drain.
+    #[tokio::test]
+    async fn a_put_does_not_bring_a_draining_worker_back() {
+        use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
+
+        use crate::workflow::{
+            create_worker_workflow_data, ActivateWorkersStep, RegisterWorkersStep,
+        };
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let service = make_service(Arc::clone(&registry));
+        let url = "http://10.0.0.8:8000";
+        let build = || -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .model(ModelCard::new("m"))
+                    .build(),
+            )
+        };
+        let worker = build();
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        // The run of a PUT answered now, bound to the revision it read.
+        let run_of_a_put = |replacement: &Arc<dyn Worker>| {
+            let mut data = create_worker_workflow_data(
+                worker_spec(url),
+                WorkerRegistrationMode::ReplaceById {
+                    worker_id: id.as_str().to_string(),
+                    expected_revision: worker.revision(),
+                },
+                app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None),
+                WorkerJobAsker::Api,
+            );
+            data.actual_workers = Some(vec![Arc::clone(replacement)]);
+            WorkflowContext::new(WorkflowInstanceId::new(), data)
+        };
+
+        let written = build();
+        let mut run = run_of_a_put(&written);
+        RegisterWorkersStep
+            .execute(&mut run)
+            .await
+            .expect("the PUT writes its replacement");
+        // A probe promotes the worker and a removal marks it after the PUT's
+        // activation chose Ready, before it takes the worker's lock.
+        let lost = registry.with_another_write_before_the_lock(
+            |_| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime for the step")
+                    .block_on(ActivateWorkersStep.execute(&mut run))
+            },
+            |registry| {
+                registry.transition_status(&id, WorkerStatus::Ready);
+                registry.transition_status(&id, WorkerStatus::Draining);
+            },
+        );
+        assert!(
+            matches!(&lost, Err(error) if error.to_string().contains("was not activated"))
+                && written.status() == WorkerStatus::Draining,
+            "a removal's mark behind the write of a PUT stands and fails its activation"
+        );
+
+        assert!(
+            matches!(
+                service.replace_worker(id.as_str(), worker_spec(url)).await,
+                Err(WorkerServiceError::RemovalInProgress { .. })
+            ),
+            "a PUT of a draining worker is refused as a POST of its URL is"
+        );
+
+        let dropped = RegisterWorkersStep
+            .execute(&mut run_of_a_put(&build()))
+            .await;
+        assert!(
+            matches!(&dropped, Err(error) if error.to_string().contains("is being removed")),
+            "the registry step of a PUT answered before the removal drops its replacement"
+        );
+
+        // The same revision is written without the Draining test: the refusal
+        // above was the removal's, not a stale revision's.
+        let rebuilt = build();
+        assert!(registry.replace_claiming_local(&id, Arc::clone(&rebuilt), worker.revision()));
+        ActivateWorkersStep
+            .execute(&mut run)
+            .await
+            .expect("a superseded PUT has nothing to activate");
+        assert_eq!(
+            rebuilt.status(),
+            WorkerStatus::Draining,
+            "the activation of a PUT superseded since leaves its successor's status alone"
         );
     }
 
