@@ -196,10 +196,8 @@ impl InklingAudioProcessor {
     }
 
     /// The dMel bin ids of one clip, `[frames, n_mels]`.
-    pub fn preprocess_decoded(
-        &self,
-        decoded: &DecodedAudio,
-    ) -> Result<Array2<f32>, TransformError> {
+    #[cfg(test)]
+    fn preprocess_decoded(&self, decoded: &DecodedAudio) -> Result<Array2<f32>, TransformError> {
         let frontend = self.frontend()?;
         let waveform = self.at_frontend_rate(decoded)?;
         let frames = frontend.frame_count(waveform.len());

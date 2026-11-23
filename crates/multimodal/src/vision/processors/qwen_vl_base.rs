@@ -505,7 +505,8 @@ impl QwenVLProcessorBase {
         self.config.max_pixels
     }
 
-    pub fn video_min_pixels(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn video_min_pixels(&self) -> usize {
         self.config.video_min_pixels
     }
 
@@ -513,7 +514,8 @@ impl QwenVLProcessorBase {
         self.config.video_max_pixels
     }
 
-    pub fn video_resize_mode(&self) -> QwenVideoResizeMode {
+    #[cfg(test)]
+    pub(crate) fn video_resize_mode(&self) -> QwenVideoResizeMode {
         self.config.video_resize_mode
     }
 
