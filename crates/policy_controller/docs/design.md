@@ -28,13 +28,16 @@ Paths without a crate name are under `crates/policy_controller/src/`.
 | classic | The gateway's routing policies of today (`--policy round_robin`, `cache_aware` and the others). |
 | policy document | A YAML or JSON file that says how workers are chosen. Section 3. |
 | profile | One way to choose: filters, then scorers, then one picker. |
+| stage | A filter, a scorer or a picker. |
 | binding | A rule of the document: which requests use which profile. |
 | engine | The code that takes a document, a request and a worker list and answers with a decision. |
 | host | A program that embeds the engine: the gateway, or the controller. |
 | controller | The standalone service built from this crate. Gateways can ask it over gRPC. |
-| decision | The engine's answer: a pick (up to four workers, best first) or a refusal with a reason. |
+| decision | The engine's answer: a pick (up to four targets, best first) or a refusal with a reason. A target is one worker, or a pair's two. |
 | lease | The engine's note that a decision's request is on its way. It ends when the request ends. |
 | prefill, decode, encode | The roles of workers that serve one request in stages. |
+| single request, pair, encode request | The three shapes of a request. One worker serves a single request. A prefill worker and a decode worker serve a pair. An encode request is a pair that also carries items for encode workers. |
+| routing key | A value read from a request, where its binding says. Policies use it to keep the requests of one key on one worker. |
 
 ## 1. What it is
 
@@ -121,25 +124,26 @@ on the gateway.
 
 ### The crate today, by size
 
-Lines of each folder under `src/`, tests included, counted on main.
+A snapshot: the lines of each folder under `src/`, tests included, counted at commit `4ac871fd1`.
+Later changes do not update these counts.
 
 | Folder | Lines | Files | What it holds |
 |---|---|---|---|
-| `document/` | 20,553 | 15 | The policy document: its types, validation, the presets of the ten policy names, the conversion from routing settings, apply and roll back. |
-| `engine/` | 56,487 | 33 | Both engines, the profile runner (`framework.rs`, 19,125 lines), the request and worker types. |
-| `policies/` | 12,512 | 12 | One file for each built-in policy. |
-| `stages/` | 10,200 | 8 | The built-in filters, scorers and pickers and their table. |
-| `tracking/` | 7,506 | 9 | The lease, its guard, the dispatch credit, the old record of sent prefixes. |
-| `store/` | 44,236 | 38 | The controller's in-memory store: worker records, loads, cache index, sessions, leases. |
-| `service/` | 79,311 | 49 | The controller: the gRPC service, election, replication, discovery. |
-| `worker_host/` | 17,656 | 12 | What lets a controller hold worker objects of the worker crate. |
-| `load/` | 6,313 | 10 | The controller's own load poller. |
-| `plugins/` | 16,039 | 21 | Runtimes for user stages in WebAssembly and over gRPC. |
-| other | 432 | 4 | `lib.rs`, the binary's `main`, two small files. |
-| **Total** | **271,245** | **211** | |
+| `document/` | 21,614 | 15 | The policy document: its types, validation, the presets of the ten policy names, the conversion from routing settings, apply and roll back. |
+| `engine/` | 80,067 | 67 | The engine, the profile runner (`framework.rs`, 20,369 lines), the request and worker types. |
+| `policies/` | 12,568 | 12 | One file for each built-in policy. |
+| `stages/` | 10,365 | 8 | The built-in filters, scorers and pickers and their table. |
+| `tracking/` | 10,075 | 12 | The lease, its guard, the placement, the dispatch credit, the record of sent prefixes. |
+| `store/` | 29,896 | 28 | The controller's in-memory store: worker records, loads, cache index, sessions, leases. |
+| `service/` | 80,546 | 59 | The controller: the gRPC service, election, replication, discovery. |
+| `worker_host/` | 18,895 | 19 | What lets a controller hold worker objects of the worker crate. |
+| `load/` | 5,842 | 10 | A worker's load report as a stage reads it, and the controller's own load poller. |
+| `plugins/` | 16,296 | 21 | Runtimes for user stages in WebAssembly and over gRPC. |
+| other | 498 | 4 | `lib.rs`, the binary's `main`, two small files. |
+| **Total** | **286,662** | **255** | |
 
-The engine that stays (section 5.7) is `engine/policy_engine.rs` and the folder beside it: 6,228
-lines with their tests, and 1,818 more for the record writer and its tests.
+The engine (section 5.7) is `engine/policy_engine.rs` and the folder beside it: 33,581 lines with
+their tests. The record writer and its tests are 3,354 more.
 
 ## 3. The policy document **[built]**
 
@@ -157,11 +161,13 @@ pub struct PolicySpec {
     pub view: ViewSpec,                          // what a decision may read beyond the basic facts
     pub index: BTreeMap<String, IndexSpec>,      // settings of the record of sent prefixes, by model
     pub signals: BTreeMap<String, SignalSpec>,   // named values of a worker's report that stages read
-    pub profiles: BTreeMap<String, ProfileSpec>, // the profiles (the one required field)
+    pub profiles: BTreeMap<String, ProfileSpec>, // the profiles (required, as `apiVersion` is)
     pub plans: PlansSpec,                        // rules of the prefill-decode plan
     pub bindings: Vec<BindingSpec>,              // in order; the first match wins; an empty
-                                                 // list binds the first profile to everything
-    pub explain: ExplainSpec,                    // how many decisions are kept to be explained
+                                                 // list binds a lone profile to everything
+                                                 // and is refused beside several profiles
+    pub explain: ExplainSpec,                    // which decisions are kept to be explained:
+                                                 // every Nth
 }
 
 pub struct ProfileSpec {
@@ -181,7 +187,8 @@ pub struct BindingSpec {
     pub routing_key: Option<RoutingKeySpec>, // where a request's routing key is read from
     pub sessions: Option<SessionsSpec>,      // sticky sessions
     pub shadow: Option<ShadowSpec>,          // a second profile run for comparison only
-    // canary, override and admission are in the schema and are refused: section 14
+    // a canary, `override: allowed` and an admission switched on are in the schema and are
+    // refused: section 14
 }
 
 pub struct Match {
@@ -239,51 +246,78 @@ bindings:
 
 ### 3.3 From routing flags to a document
 
-A user who never writes a document still gets one. The crate turns the routing settings (the
-policy name and its options, the mode, the overload switch and shed word, the sticky-session
-options) into the document they mean:
+A user who never writes a document still gets one. The crate turns the routing settings into the
+document they mean. The settings are the policy name and its options, the mode, the overload
+switch and shed word, and the sticky-session options.
 
 ```text
 routing settings ──> RoutingSettings::policy_document() ──> PolicySpec ──> validate ──> AppliedSpec
                      (document/routing_settings.rs, a pure function)
 ```
 
-Each of the ten policy names has a preset. For single workers it is one profile bound to every
-model. A prefill-decode mode gets two profiles under one pair binding over the prefill and decode
-phases, and behind it the main policy's profile bound to every other request: a gateway in that
-mode still places one single request over HTTP, a token count that takes one prefill worker, and
-classic places it by the main policy. Over gRPC or ZMQ the mode counts with no worker: the
-settings state how the gateway reaches its workers, and the document of a gateway of one router
-plans the pair alone there. Where the main policy states a setting no document says, the
-document plans the pair alone and that count is refused. A gateway of one router plans the pair
-alone as well where one family's policy names a block size and the other places by a prefix
-ring, which counts its key in another size. A preset also writes what its binding needs: a
-routing-key policy its key sources, `manual` its sessions rule. The presets are in
-`policies/<name>.rs`. Section 7 lists them.
+Each of the ten policy names has a preset. The presets are in `policies/<name>.rs`, and section 7
+lists them. A preset also writes what its binding needs: a routing-key policy gets its key
+sources, and `manual` gets its sessions rule.
 
-A user may instead supply a document. It is accepted when the routing settings say the same
-document or say nothing; otherwise the start is refused and the error names the first
-difference. A supplied document that binds no single request refuses a pair mode's token count.
+The mode and the gateway decide what the document binds:
+
+| Gateway | Mode | What the document binds |
+|---|---|---|
+| one router | single workers | one profile, bound to every model |
+| one router | prefill-decode, over HTTP | two profiles under one pair binding, over the prefill and decode phases; behind it, the main policy's profile, bound to every other request |
+| one router | prefill-decode, over gRPC or ZMQ | the pair binding alone |
+| many routers | single workers, or prefill-decode | the pair binding and, behind it, the main policy's profile for every other request; under `manual` with single workers, its one profile alone |
+| either | encode-prefill-decode | three profiles under one binding of the `epd` plan, and no single request |
+
+A gateway of many routers serves pairs and single workers, however it reaches them, so its
+document binds both. In a gateway of one router the second binding of a prefill-decode mode is
+there for one request, the token count. Over HTTP the gateway still places it as a single request,
+on one prefill worker, and classic places it by the main policy. Over gRPC or ZMQ the mode counts
+with no worker, as the encode mode does, so the document binds no single request. The settings
+state how the gateway reaches its workers.
+
+In two more cases the document plans the pair alone:
+
+- The main policy states a setting that no document says.
+- In a gateway of one router, one of the two policies (the pairs', the single requests') names a
+  block size and the other places by a prefix ring, which counts its key in another size.
+
+A request of the family left out is then refused: the token count in a gateway of one router,
+each single request in a gateway of many routers.
+
+A user may supply a document instead. Both launchers refuse beside it, by name, each routing flag
+that the document replaces. The command line refuses such a flag where it was typed, even at its
+default value. The Python launcher cannot tell whether a flag was typed, and refuses one that is
+off its default. A configuration built by hand is compared instead. The document is accepted when
+the routing settings say the same document or say nothing. Otherwise the start is refused, and the
+error names the first difference. A supplied document that binds no single request refuses each
+single request, in any gateway. For a prefill-decode mode of one router over HTTP that is the
+token count.
 
 ### 3.4 A validated document
 
-Validation turns a `PolicySpec` into an `AppliedSpec`: the built profiles and bindings with their
-stage objects, and what is resolved once from the document (block size, hash depth, each
-binding's routing-key sources, the signals). What a stage remembers lives in its stage object
-inside the `AppliedSpec`, so it belongs to one generation of the document. Two things live beside
-it. What belongs to one worker list (round robin's counter) is in the
-engine's value for that list (section 5.2). The record of sent prefixes is in the engine object
-(section 5.1).
+Validation turns a `PolicySpec` into an `AppliedSpec`. An `AppliedSpec` holds the built profiles
+and bindings with their stage objects. It also holds what is resolved once from the document: the
+block size, the hash depth, each binding's routing-key sources and the signals.
 
-Applying, listing and rolling back generations is `DocumentManager`
-(`document/operator/document_manager.rs`). It can keep the last eight generations in a folder,
-one file each, and roll back to one of them.
+What a policy remembers lives in four places:
+
+| What | Where |
+|---|---|
+| what a stage remembers | its stage object, inside the `AppliedSpec`: it belongs to one generation of the document |
+| what belongs to one worker list (round robin's counter) | the engine's value for that list (section 5.2) |
+| the record of sent prefixes | the engine object (section 5.1) |
+| a sessions rule's pins | the engine object: one table for the engine's life |
+
+`DocumentManager` (`document/operator/document_manager.rs`) applies, lists and rolls back
+generations. It can keep the last eight generations in a folder, one file each, and roll back to
+one of them.
 
 ### 3.5 The stage interfaces
 
 A filter, a scorer and a picker are three traits (`engine/framework.rs`). Each has two required
-methods, shown here. The others have default bodies (6 on a filter, 13 on a scorer, 15 on a
-picker) and are not shown: most are switches and short paths that the built-in stages use.
+methods, shown here. The others have default bodies and are not shown: most are switches and
+short paths that the built-in stages use.
 
 ```rust
 pub trait Filter {
