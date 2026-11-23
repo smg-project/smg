@@ -637,7 +637,8 @@ request goes to.
   cache events reads the index and the hash table together, as today.
 - **[built]** A prefill-decode pair decided over worker lists reads the hash table and the
   host's index of cache events for each side, by the side's own list, and writes each side's
-  pick into the hash table. An encode request's first decision reads neither yet. Classic keeps
+  pick into the hash table, where the index does not speak for the picked worker. An encode
+  request's first decision does the same for its pair. Classic keeps
   trees for each side. **[planned]** The engine reads the host's trees for each side.
 
 A decision of the engine publishes no insert to other gateways.
@@ -650,7 +651,7 @@ the gateway the gateway keeps them and lends them to the engine. On main it lend
 (section 9.2). Until it does, a request under the engine reads the hash table, and the index
 beside it where its model has one. A prefill-decode pair is lent no tree: each of its sides
 reads the hash table, and the index where its model has one, by the side's own list. An encode
-request's first decision reads neither yet. A controller is to
+request's pair reads them the same way. A controller is to
 keep trees of its own **[planned]**, and section 11 says what its contract must hold for that. On
 main a controller's engine reads its hash table alone (section 10.1).
 

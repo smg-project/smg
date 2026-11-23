@@ -13,6 +13,10 @@
 //! ([`signals::three`]). The decode asked again is a pair's
 //! ([`PairLists::decide`]) and is lent as one.
 //!
+//! **Who holds the prompt.** Each side of the pair is handed its own
+//! list's column and writes its pick behind the decision, as a pair's
+//! first decision does ([`side_columns`], [`record_sides`]).
+//!
 //! **The entries.** A host asks through
 //! [`PolicyEngine::decide_encode_at`]: the three lists' decision, with the
 //! pair's lease a pick is issued. No lease is issued for an encoder.
@@ -22,11 +26,14 @@ use std::{sync::Arc, time::Instant};
 use smg_worker::load::state::LoadSnapshot;
 
 use super::{
-    pair::{issued, not_decided, stamp, tried_engines, Buffers, PairLists, BUFFERS},
+    pair::{
+        issued, not_decided, record_sides, side_columns, stamp, tried_engines, Buffers, PairLists,
+        BUFFERS,
+    },
     signals, single, Loaded, PolicyEngine, PoolMembers,
 };
 use crate::engine::{
-    decision::{Decision, WIRES},
+    decision::{Decision, Target, WIRES},
     decision_engine::{DecideOutcome, DecisionRefused, Request, RequestMaker, WorkerLists},
     framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools},
     list_cell::LentList,
@@ -158,6 +165,11 @@ impl EncodeLists<'_> {
     /// is declined for a request with items, under the stage
     /// `encode-scope`, with a veto as without.
     ///
+    /// A side of the pair whose phase reads affinity is handed its own
+    /// list's column of who holds the prompt. Behind a pick the profile is
+    /// told of, that side's record of sent prefixes keeps where the prompt
+    /// went, as at a pair's first decision ([`PairLists::decide`]).
+    ///
     /// No lease is issued here and no stage is told of one: the engine's
     /// entry issues the pair's
     /// ([`PolicyEngine::decide_encode_at`](super::PolicyEngine::decide_encode_at)).
@@ -175,7 +187,17 @@ impl EncodeLists<'_> {
     ) -> Decision {
         let engine = engine.loaded();
         let sides = self.asked(engine);
-        self.decide_over(engine, sides, None, loads, now, request, items, placed)
+        self.decide_over(
+            engine,
+            sides,
+            None,
+            loads,
+            now,
+            request,
+            items,
+            placed,
+            |_| true,
+        )
     }
 
     /// The engine's own value of each of the pair's two lists, asked of
@@ -192,7 +214,10 @@ impl EncodeLists<'_> {
     /// which its caller asked of their cells, and of the encoders' where
     /// its caller read it. The encoders' cell is else asked here, behind
     /// every answer that reads no row of an encoder: a decision fills no
-    /// cell it does not read.
+    /// cell it does not read. `sends_to` says whether the request's caller
+    /// sends it to a target of the pick: each side's record of sent
+    /// prefixes is written for the first target it takes, as a pair's is
+    /// ([`record_sides`]).
     #[expect(
         clippy::too_many_arguments,
         reason = "a pair's inputs and the encode side's"
@@ -207,6 +232,7 @@ impl EncodeLists<'_> {
         request: &mut Request<'_>,
         items: EncodeItems<'_>,
         placed: &mut EncodePlaced,
+        sends_to: impl Fn(&Target) -> bool,
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
         let pair = &self.pair;
@@ -254,10 +280,10 @@ impl EncodeLists<'_> {
         };
         let mut decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;
-            let (workers, records) = (prefill.workers(), prefill.records(spec, clock));
-            let (prefills, pool) = records.write(workers, &live, prefills);
-            let (workers, records) = (decode.workers(), decode.records(spec, clock));
-            let (decodes, _) = records.write(workers, &live, decodes);
+            let (workers, prefill_records) = (prefill.workers(), prefill.records(spec, clock));
+            let (prefills, pool) = prefill_records.write(workers, &live, prefills);
+            let (workers, decode_records) = (decode.workers(), decode.records(spec, clock));
+            let (decodes, _) = decode_records.write(workers, &live, decodes);
             stamp(prefills, decodes, pair.classes, pair.admission);
             let (workers, records) = (encoders.workers(), encoders.records(spec, clock));
             let (rows, _) = records.write(workers, &live, &mut buffers.encoders);
@@ -274,14 +300,21 @@ impl EncodeLists<'_> {
                     .map(|side| side.as_ref().and_then(HeldCells::cells)),
                 None => [None; 3],
             };
+            // Each side of the pair is handed its own list's column of who
+            // holds the prompt, as a pair's first decision is. The engine
+            // keeps a column's entries beside the rows it admits.
+            let sides = (Some((prefill, prefill_records)), (decode, decode_records));
+            let read = side_columns(engine, facts, sides.0, sides.1, &mut buffers.columns);
+            let [prefill_column, decode_column] = &buffers.columns;
             let pools = PairPools {
                 prefills,
                 decodes,
                 prefill_signal_cells,
                 decode_signal_cells,
+                prefill_affinity: prefill_column.as_slice(),
+                decode_affinity: decode_column.as_slice(),
                 table: pair.classes.table(),
                 first: pair.classes.first(),
-                ..PairPools::default()
             };
             let encode = EncodePool {
                 encoders: rows,
@@ -291,7 +324,7 @@ impl EncodeLists<'_> {
                 ..EncodePool::default()
             };
             let (engine, scratch) = (spec.engine(), &mut buffers.scratch);
-            engine.decide_encode_pair(
+            let decision = engine.decide_encode_pair(
                 facts,
                 &pool,
                 pools,
@@ -302,7 +335,11 @@ impl EncodeLists<'_> {
                 &encode_cx,
                 scratch,
                 placed,
-            )
+            );
+            // Behind the pick, each side's record keeps where the prompt
+            // went, as behind a pair's.
+            record_sides(&decision, facts, (prefill, decode), read, &sends_to);
+            decision
         };
         let decision = BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
             Ok(mut buffers) => decide(&mut buffers),
@@ -390,7 +427,8 @@ impl PolicyEngine {
     ) -> Result<Decision, DecisionRefused> {
         let own = self.loaded();
         own.over_three(maker, placed, |lists, request, loads, placed| {
-            decide(own, lists, request, items, loads, placed, now)
+            let sends_to = |target: &_| maker.sends_to(target);
+            decide(own, lists, request, items, loads, placed, now, sends_to)
         })
     }
 }
@@ -408,7 +446,17 @@ impl Loaded<'_, '_> {
     ) -> Result<(DecideOutcome, bool), DecisionRefused> {
         self.over_three(maker, placed, |lists, request, loads, placed| {
             let later = request.constraints.decode_later;
-            let decided = decided(self, lists, request, items, loads, placed, clock());
+            let sends_to = |target: &_| maker.sends_to(target);
+            let decided = decided(
+                self,
+                lists,
+                request,
+                items,
+                loads,
+                placed,
+                clock(),
+                sends_to,
+            );
             (decided, later)
         })
     }
@@ -475,7 +523,15 @@ impl Loaded<'_, '_> {
 /// ([`EncodeItems::references`]). The entries that decide a decode again
 /// take no items ([`WorkerLists::Encode`]). The decline reads the request's
 /// own facts and no list, so it stands also where no decode takes images.
+///
+/// `sends_to` says whether the request's caller sends it to a target of
+/// the pick ([`RequestMaker::sends_to`]): each side's record of sent
+/// prefixes is written for the first target it takes, as a pair's is.
 #[inline]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "an encode request's inputs, and where its caller sends it"
+)]
 pub(super) fn decide(
     own: Loaded<'_, '_>,
     lists: &EncodeLists<'_>,
@@ -484,6 +540,7 @@ pub(super) fn decide(
     loads: Option<&Arc<LoadSnapshot>>,
     placed: &mut EncodePlaced,
     now: Instant,
+    sends_to: impl Fn(&Target) -> bool,
 ) -> Decision {
     // The engine's own value of each of the pair's lists, asked of the
     // list's cell once. The encoders' is asked where it is read: here
@@ -517,7 +574,9 @@ pub(super) fn decide(
         placed.clear();
         return single::declined(own, request, DECODE_LATER);
     }
-    lists.decide_over(own, sides, encoders, loads, now, request, items, placed)
+    lists.decide_over(
+        own, sides, encoders, loads, now, request, items, placed, sends_to,
+    )
 }
 
 /// One decision of an encode request by `own`, the engine of a gateway's
@@ -525,7 +584,11 @@ pub(super) fn decide(
 /// decision ([`decide`]) with the lease a pick issued. A pick issues its
 /// pair's two sides as a pair's first decision does ([`issued`]), and
 /// nothing for an encoder: no stage is told of one. A decision that picks
-/// no pair issues nothing.
+/// no pair issues nothing. `sends_to` is handed to [`decide`] as it stands.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "an encode request's inputs, and where its caller sends it"
+)]
 pub(super) fn decided(
     own: Loaded<'_, '_>,
     lists: &EncodeLists<'_>,
@@ -534,7 +597,8 @@ pub(super) fn decided(
     loads: Option<&Arc<LoadSnapshot>>,
     placed: &mut EncodePlaced,
     now: Instant,
+    sends_to: impl Fn(&Target) -> bool,
 ) -> DecideOutcome {
-    let decision = decide(own, lists, request, items, loads, placed, now);
+    let decision = decide(own, lists, request, items, loads, placed, now, sends_to);
     issued(own, request, decision, None, now)
 }

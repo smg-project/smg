@@ -820,3 +820,72 @@ fn an_id_keyed_requests_item_goes_where_its_key_goes_under_a_prefix_ring() {
         assert_eq!(keys.map(|key| encoder_of(key, Some(id))), homes, "{id}");
     }
 }
+
+/// An encode request's record of sent prefixes names the pair its request
+/// went to, as a pair's does. Where the route's rule refuses the decode of
+/// the pick's first target, the request goes past it, and the prompt's next
+/// requests go to the pair that one was sent to.
+#[test]
+fn a_prompt_sent_past_a_refused_decode_goes_to_its_encode_requests_pair_again() {
+    let preset = "cache_aware";
+    let mut document = PolicySpec::epd_presets("power_of_two", preset, preset).expect("presets");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let engine = hosted(PolicyEngine::new(spec));
+    let three = Three::of([2, 4, 1], |_, _| false);
+    let said: Said<'_> = (&[PLAIN], &[1, 1]);
+    let tokens: Vec<u32> = (1_000..5_096).collect();
+    let prompt = Prompt {
+        tokens: Some(&tokens),
+        ..Prompt::NONE
+    };
+    let keys = [Identity::plain("item")];
+    let items = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    // The rule refuses the first decode it is asked of, at that question
+    // alone: asked of it again, it would take it.
+    let refused = RefCell::new(None::<String>);
+    let rule = |worker: &dyn Worker| {
+        if !worker.url().starts_with("http://decode-") {
+            return true;
+        }
+        let mut refused = refused.borrow_mut();
+        if refused.is_some() {
+            return true;
+        }
+        *refused = Some(worker.url().to_owned());
+        false
+    };
+    let refusing = PlaceRequest {
+        prompt,
+        admits: Some(&rule),
+        ..asking(three.lists(said), items)
+    };
+    let sent = engine.place(&refusing).expect("a placement");
+    let (prefill, decode, _) = three.places(&sent);
+    drop(sent);
+    let passed = refused.borrow().clone().expect("the rule refused a decode");
+    assert_ne!(
+        three.workers[1][decode].url(),
+        passed,
+        "past the refused decode"
+    );
+    let stated = PlaceRequest {
+        prompt,
+        ..asking(three.lists(said), items)
+    };
+    let mut went = Vec::new();
+    for _ in 0..16 {
+        let again = engine.place(&stated).expect("a placement");
+        let (prefill, decode, _) = three.places(&again);
+        went.push((prefill, decode));
+        drop(again);
+    }
+    assert_eq!(
+        went,
+        [(prefill, decode); 16],
+        "the pair the prompt was sent to"
+    );
+}
