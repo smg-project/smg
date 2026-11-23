@@ -154,7 +154,7 @@ def encoder_staging_bytes(hidden_size, dtype):
 def encoder_window(config):
     """Reserve queued controls, then bound materialized artifacts and native sends."""
     send_copies = 1 if config.get("embedding_backend") == "mooncake" else config["max_receivers"]
-    execution_bytes = config["max_artifact_bytes"] + config["max_staging_bytes_per_request"] * (
+    execution_bytes = 2 * config["max_artifact_bytes"] + config["max_staging_bytes_per_request"] * (
         1 + send_copies
     )
     capacity = min(

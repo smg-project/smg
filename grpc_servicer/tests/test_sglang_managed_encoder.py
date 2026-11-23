@@ -175,8 +175,7 @@ async def test_native_encoder_early_facade_and_release_barrier(monkeypatch):
     assert not early.done()
     entry = epd_encoder.NativeEntry(time.monotonic() + 5.0, "r1", prefill_host="10.0.0.1")
     owner.entries["r1"] = entry
-    for waiter in owner.waiters.pop("r1", ()):
-        waiter.set()
+    owner._wake_waiters("r1", "registered")
     await send_started.wait()
 
     # Wrong host is rejected.
@@ -287,8 +286,12 @@ def test_launcher_complete_and_window_validation():
             "max_artifact_bytes": epd_launcher.encoder_artifact_bytes(qwen3_cfg, "bfloat16"),
             "max_staging_bytes_per_request": epd_launcher.encoder_staging_bytes(4096, "bfloat16"),
         }
-        win_cap, _ = epd_launcher.encoder_window(win_cfg)
+        win_cap, win_exec_bytes = epd_launcher.encoder_window(win_cfg)
         assert 0 < win_cap <= win_cfg["max_active"]
+        expected_copies = 1 if backend_name == "mooncake" else win_cfg["max_receivers"]
+        assert win_exec_bytes == 2 * win_cfg["max_artifact_bytes"] + win_cfg[
+            "max_staging_bytes_per_request"
+        ] * (1 + expected_copies)
     with pytest.raises(ValueError, match="visual dtype"):
         epd_launcher.encoder_artifact_bytes(qwen3_cfg, "int8")
     with pytest.raises(ValueError, match="vision geometry"):
@@ -363,6 +366,17 @@ async def test_native_encoder_forget_and_unknown_cancel_wake_waiters():
     await owner.cancel("r-cancel")
     with pytest.raises(epd_encoder.Rejected, match="aborted before execution"):
         await asyncio.wait_for(waiter_cancel, timeout=0.5)
+
+    waiter_race = asyncio.create_task(owner._wait_entry("r-race", timeout=120.0))
+    await asyncio.sleep(0.01)
+    owner.forget("r-race")
+    owner.abandoned.pop("r-race", None)
+    owner.entries["r-race"] = epd_encoder.NativeEntry(
+        time.monotonic() + 5.0, "r-race", prefill_host="10.0.0.1"
+    )
+    with pytest.raises(epd_encoder.Rejected, match="aborted before execution"):
+        await asyncio.wait_for(waiter_race, timeout=0.5)
+    owner.entries.pop("r-race", None)
 
     assert "r-forget" in owner.abandoned
 
@@ -477,6 +491,12 @@ async def test_http_facade_body_limit_independent_of_max_control_bytes(monkeypat
         assert int(code) != 499
         assert HTTPStatus(int(code)) == code
 
+    for mod in list(sys.modules):
+        if mod == "sglang" or mod.startswith("sglang."):
+            monkeypatch.setitem(sys.modules, mod, None)
+    monkeypatch.setitem(sys.modules, "sglang", None)
+    monkeypatch.setitem(sys.modules, "sglang.srt.disaggregation.encoder.server", None)
+    monkeypatch.setitem(sys.modules, "sglang.srt.disaggregation.encoder.runtime", None)
     owner.forget("cancelled-rid")
 
     class CancelledRequest:
@@ -492,33 +512,63 @@ async def test_http_facade_body_limit_independent_of_max_control_bytes(monkeypat
 @pytest.mark.asyncio
 async def test_serve_native_bounded_shutdown_on_hung_task(tmp_path, monkeypatch):
     ctx, push, pull, cmd_ep, evt_ep = _ipc_sockets(tmp_path)
+    started, calls = asyncio.Event(), []
 
-    async def hung_execute(request, owner_cancel=None):
+    async def hung_execute_encode_pipeline(encoder, submitter, native):
+        started.set()
         await asyncio.sleep(10)
 
-    monkeypatch.setattr(
-        epd_encoder.NativeEncoder,
-        "execute",
-        lambda self, cmd, art: hung_execute(cmd),
+    server_mod = SimpleNamespace(
+        meta_registry=SimpleNamespace(publish=lambda *a, **kw: asyncio.sleep(0))
     )
-    backend = SimpleNamespace(encoder=_FakeEncoder(hang_abandon=True), scheduler=SimpleNamespace())
+    runtime_mod = SimpleNamespace(execute_encode_pipeline=hung_execute_encode_pipeline)
+    for name, mod in [
+        ("sglang", SimpleNamespace()),
+        ("sglang.srt", SimpleNamespace()),
+        ("sglang.srt.disaggregation", SimpleNamespace()),
+        ("sglang.srt.disaggregation.encoder", SimpleNamespace()),
+        ("sglang.srt.disaggregation.encoder.server", server_mod),
+        ("sglang.srt.disaggregation.encoder.runtime", runtime_mod),
+        ("sglang.srt.managers", SimpleNamespace()),
+        (
+            "sglang.srt.managers.req_types",
+            SimpleNamespace(Modality=SimpleNamespace(IMAGE="img")),
+        ),
+    ]:
+        monkeypatch.setitem(sys.modules, name, mod)
+
+    encoder = _FakeEncoder(calls, hang_abandon=True)
+    encoder._embedding_dims = {"img": 16}
+    backend = SimpleNamespace(encoder=encoder, scheduler=SimpleNamespace())
     cfg = {
         "native_commands": cmd_ep,
         "native_events": evt_ep,
         "max_control_bytes": 4096,
         "max_artifact_bytes": 4096,
+        "max_staging_bytes_per_request": 4096,
         "max_receivers": 2,
         "shutdown_timeout_seconds": 0.15,
     }
     task = asyncio.create_task(epd_encoder.serve_native(cfg, backend))
     try:
         assert await asyncio.wait_for(pull.recv_json(), timeout=2) == {"ready": True}
-        await push.send_json({"sequence": 1, "operation": "execute", "rid": "hung"})
-        await asyncio.sleep(0.05)
+        await push.send_json(
+            {
+                "sequence": 1,
+                "operation": "execute",
+                "rid": "hung",
+                "prefill_host": "10.0.0.1",
+                "remaining_ms": 5000,
+                "embedding_tokens": 4,
+                "image_count": 1,
+            }
+        )
+        await asyncio.wait_for(started.wait(), timeout=2.0)
         start = time.monotonic()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=2.0)
+        assert ("abandon", "hung") in calls
         assert time.monotonic() - start < 1.0
     finally:
         if not task.done():

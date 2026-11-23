@@ -267,6 +267,11 @@ class NativeEncoder:
         self.closed = False
         self.submitter = OwnedBatchSubmitter(backend.scheduler)
 
+    def _wake_waiters(self, rid, reason):
+        for waiter in self.waiters.pop(rid, ()):
+            if not waiter.done():
+                waiter.set_result(reason)
+
     def _mark_abandoned(self, rid):
         if not isinstance(rid, str) or not 0 < len(rid) <= 512:
             return
@@ -280,8 +285,7 @@ class NativeEncoder:
         while len(self.abandoned) >= MAX_ABANDONED_RIDS:
             self.abandoned.pop(next(iter(self.abandoned)))
         self.abandoned[rid] = now + ABANDONED_TTL_SECONDS
-        for waiter in self.waiters.pop(rid, ()):
-            waiter.set()
+        self._wake_waiters(rid, "abandoned")
 
     def _is_abandoned(self, rid):
         expiry = self.abandoned.get(rid)
@@ -321,19 +325,25 @@ class NativeEncoder:
         if entry is None:
             require(not self.closed, "encoder shutting down", grpc.StatusCode.CANCELLED)
             self._require_not_abandoned(rid)
-            event = asyncio.Event()
-            self.waiters.setdefault(rid, []).append(event)
+            waiter = asyncio.get_running_loop().create_future()
+            self.waiters.setdefault(rid, []).append(waiter)
             try:
-                await asyncio.wait_for(event.wait(), timeout)
+                reason = await asyncio.wait_for(waiter, timeout)
             except asyncio.TimeoutError as exc:  # noqa: UP041 - Python 3.10
                 raise Rejected(
                     grpc.StatusCode.DEADLINE_EXCEEDED, "early native receiver expired"
                 ) from exc
             finally:
-                if (pending := self.waiters.get(rid)) and event in pending:
-                    pending.remove(event)
+                if (pending := self.waiters.get(rid)) and waiter in pending:
+                    pending.remove(waiter)
                     if not pending:
                         del self.waiters[rid]
+            require(reason != "closed", "encoder shutting down", grpc.StatusCode.CANCELLED)
+            require(
+                reason != "abandoned",
+                "native operation aborted before execution",
+                grpc.StatusCode.CANCELLED,
+            )
             entry = self.entries.get(rid)
             if entry is None:
                 self._require_not_abandoned(rid)
@@ -348,10 +358,10 @@ class NativeEncoder:
 
     async def facade(self, kind, request):
         """Serve one P->E receiver HTTP call (`metadata`, `register`, or `send`) with host fencing."""
+        entry = await self._wait_entry(request.get("req_id"))
         from sglang.srt.disaggregation.encoder import server as native
         from sglang.srt.disaggregation.encoder.runtime import send_staged_embedding
 
-        entry = await self._wait_entry(request.get("req_id"))
         if kind == "metadata":
             require(request.get("part_idx") == 0, "invalid part index")
             with entry.retain():
@@ -477,8 +487,7 @@ class NativeEncoder:
         entry = NativeEntry(time.monotonic() + remaining, rid, prefill_host=command["prefill_host"])
         self.abandoned.pop(rid, None)
         self.entries[rid] = entry
-        for waiter in self.waiters.pop(rid, ()):
-            waiter.set()
+        self._wake_waiters(rid, "registered")
         error = None
         try:
             tokens = command["embedding_tokens"]
@@ -545,9 +554,8 @@ class NativeEncoder:
     def close(self):
         """Mark the encoder shutting down and wake all early HTTP facade waiters."""
         self.closed = True
-        for waiters in self.waiters.values():
-            for waiter in waiters:
-                waiter.set()
+        for rid in list(self.waiters):
+            self._wake_waiters(rid, "closed")
         self.waiters.clear()
 
     async def dispatch(self, command, artifact):

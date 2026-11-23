@@ -5373,3 +5373,114 @@ fn prepared_push_terminal_error_keeps_first_error_after_partial_drain() {
     assert_eq!(stored.code(), Code::Internal);
     assert_eq!(stored.message(), "first cause");
 }
+
+#[tokio::test]
+async fn prepared_read_metadata_drops_malformed_frames_without_failing_runtime() {
+    use prost::Message;
+    use smg_grpc_client::sglang_managed::{proto, VERSION};
+    use zeromq::{PushSocket, Socket, SocketSend, ZmqMessage};
+
+    let Harness {
+        server,
+        mut engine_in,
+        mut engine_out,
+        _dir,
+        ..
+    } = managed_harness("prefill").await;
+    let runtime = server.state.prepared.get().unwrap();
+    let rid = "layout-malformed-drop";
+    let binding = prepared_binding(rid, "decode-rid");
+    let (registration, cancellation) = server.state.shared.registry.register(rid).unwrap();
+    let mut request = generate_request(rid, true, Vec::new());
+    request.tokenized.as_mut().unwrap().original_text = "image prompt".into();
+    let mut output = runtime
+        .submit(
+            PreparedRequest {
+                binding: binding.clone(),
+                request,
+                external: Some(("http://127.0.0.1:5000".into(), 1)),
+                manifest: None,
+                deadline: Instant::now() + Duration::from_secs(60),
+            },
+            registration,
+            cancellation,
+        )
+        .unwrap();
+    assert_eq!(recv_add(&mut engine_in).bounded().await.rid, rid);
+
+    let endpoint = format!("ipc://{}", _dir.path().join("layout.ipc").display());
+    let mut push = PushSocket::new();
+    push.connect(&endpoint).await.unwrap();
+
+    // 1-frame event and invalid UTF-8 rid cannot be attributed safely; they must be dropped
+    // without failing the metadata reader or cancelling the active request.
+    push.send(ZmqMessage::from(Bytes::from_static(b"only-one-frame")))
+        .await
+        .unwrap();
+    let mut invalid_rid = ZmqMessage::from(Bytes::from_static(b"\xff\xfe"));
+    invalid_rid.push_back(Bytes::from_static(b"ignored"));
+    push.send(invalid_rid).await.unwrap();
+
+    let manifest = proto::PreparedDecodeInput {
+        version: VERSION,
+        binding: Some(binding),
+        unpadded_ids: vec![1, 151_655, 2],
+        padded_ids: vec![1, 1_000_001, 2],
+        images: vec![proto::ImageMetadata {
+            occurrence: 0,
+            full_identity: vec![7; 32],
+            pad_values: vec![1_000_001],
+            offsets: vec![proto::Offset { start: 1, end: 1 }],
+            native_format: 1,
+            grid_thw: vec![1, 1, 1],
+            native_hash: 1,
+            ..Default::default()
+        }],
+        image_token_id: 151_655,
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let mut valid = ZmqMessage::from(rid.as_bytes().to_vec());
+    valid.push_back(Bytes::from(manifest.clone()));
+    push.send(valid).await.unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(2), output.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.prepared_input, manifest);
+    assert!(runtime.ready());
+
+    send(
+        &mut engine_out,
+        &batch(rid, vec![42], 1, Some("stop"), None),
+    )
+    .await;
+    assert_eq!(
+        chunk(output.next().bounded().await.unwrap().unwrap()).token_ids,
+        vec![42]
+    );
+    assert_eq!(
+        complete(output.next().bounded().await.unwrap().unwrap()).output_ids,
+        vec![42]
+    );
+    assert_scheduler_idle(&mut engine_in).await;
+    wait_until(|| server.state.shared.registry.active() == 0).await;
+    drop(push);
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn prepared_definitely_unsubmitted_matches_client_closed() {
+    use std::sync::Arc;
+
+    let mut closed = tonic::Status::unavailable("closed");
+    closed.set_source(Arc::new(engine_zmq_client::Error::ClientClosed {
+        message: "writer ended".to_string(),
+    }));
+    assert!(native::definitely_unsubmitted(&closed));
+    assert!(!native::definitely_unsubmitted(
+        &tonic::Status::unavailable("unknown")
+    ));
+}

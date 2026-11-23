@@ -177,10 +177,16 @@ impl ManagedNativeRuntime {
                 .map_err(|e| Status::unavailable(e.to_string()))?
                 .into_vec();
             if frames.len() != 2 {
-                return Err(Status::data_loss("native metadata frame count mismatch"));
+                tracing::warn!(
+                    frame_count = frames.len(),
+                    "native managed metadata frame count mismatch; dropping"
+                );
+                continue;
             }
-            let rid = std::str::from_utf8(&frames[0])
-                .map_err(|_| Status::data_loss("invalid native metadata rid"))?;
+            let Ok(rid) = std::str::from_utf8(&frames[0]) else {
+                tracing::warn!("invalid native managed metadata rid; dropping");
+                continue;
+            };
             if let Err(error) = self.publish_layout(rid, &frames[1]) {
                 tracing::warn!(rid, %error, "native managed metadata refused");
             }
@@ -374,8 +380,9 @@ impl ManagedNativeRuntime {
     }
 }
 
-/// Typed admission refusals precede enqueue; unknown transport writes retain ownership.
-fn definitely_unsubmitted(error: &Status) -> bool {
+/// Typed admission refusals (and pre-queue `ClientClosed` before `submit_owned` returns a stream)
+/// precede enqueue; unknown transport writes retain ownership.
+pub(crate) fn definitely_unsubmitted(error: &Status) -> bool {
     matches!(
         error.code(),
         tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition | tonic::Code::Unimplemented
@@ -386,6 +393,7 @@ fn definitely_unsubmitted(error: &Status) -> bool {
                 error,
                 engine_zmq_client::Error::EngineInputFull { .. }
                     | engine_zmq_client::Error::EngineInputBytesFull { .. }
+                    | engine_zmq_client::Error::ClientClosed { .. }
             )
         })
 }
