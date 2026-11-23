@@ -1881,4 +1881,4 @@ and the store's lease file into the kept engine's modules, with no behaviour cha
 Behind them, in the crate: `random` and `round_robin` details of the short path; pairs and encode
 requests over worker lists; the hash ring a host lends (decision 3). Waiting for a decision:
 new recorders (2), the controller's parts (5, 10), shadow and explain on the
-kept engine (7), CI's run of the kept engine's tests and the published set (11).
+kept engine (7), the published set (11).

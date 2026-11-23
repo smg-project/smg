@@ -1223,13 +1223,14 @@ impl Objects<Members> {
     /// long as it stands, and a membership change publishes another.
     ///
     /// A fact these lists carry does not move within a row's life: every
-    /// registration path starts another life where the image bit differs,
-    /// which publishes. A raw store write that moves the bit in place is
-    /// not published where the holder keeps a handed-in object: the object
-    /// stands as it was handed in, and a generation keeps the bit its
-    /// first ask read. One first asked before the holder follows the write
-    /// lends the old bit until the model's next membership change. One
-    /// first asked after that lends the row's new bit.
+    /// registration path starts another life where the image bit or a
+    /// demand fact differs, which publishes. A raw store write that moves
+    /// either in place is not published where the holder keeps a handed-in
+    /// object: the object stands as it was handed in, and a generation
+    /// keeps what its first ask read. One first asked before the holder
+    /// follows the write lends the old fact until the model's next
+    /// membership change. One first asked after that lends the row's new
+    /// fact.
     ///
     /// A member the holder holds no row's object for is left out of the
     /// lists and counted ([`Self::unstated`]). So every worker lent states
@@ -1283,9 +1284,10 @@ impl Objects<Members> {
     }
 
     /// What the holder's rows say of each of `members`, in their order:
-    /// whether the worker takes images, the row's id, and who can dial the
-    /// worker. `None` for a member the holder holds no row's object for,
-    /// which is counted.
+    /// whether the worker takes images, the row's id, what the worker
+    /// states for a request's hard demands, and who can dial the worker.
+    /// `None` for a member the holder holds no row's object for, which is
+    /// counted.
     fn fixed_facts(&self, members: &[Arc<dyn Worker>]) -> Box<[Option<Stated>]> {
         // The registry's ids first: the entry's lock is not held across a
         // read of the registry.
@@ -1302,7 +1304,10 @@ impl Objects<Members> {
                 facts: FixedFacts {
                     vision: laid.remainder.vision,
                     id: Some(laid.remainder.standing.row),
-                    ..FixedFacts::default()
+                    // The row's statement whole. Whether the worker
+                    // registered a rank is the object's to say: a list's
+                    // records read it there, whatever is lent here.
+                    demands: laid.remainder.demand_facts,
                 },
                 reach: Reach::of(&laid.remainder),
             })
@@ -1800,6 +1805,133 @@ mod tests {
             let after = generation();
             assert!(!Arc::ptr_eq(&before, &after), "a join publishes");
             assert!(bit(&after), "the next generation reads the row");
+        }
+    }
+
+    /// The holder lends what each stored worker states for a request's hard
+    /// demands, and a decision over its list reads it. A retry that demands
+    /// a runtime lands on the worker that states that runtime, whichever
+    /// request it is, and one that demands a runtime no worker states is
+    /// shed under the stage `wires`. The classic router holds a retry to
+    /// its first plan's runtime and transport by one test of each worker
+    /// (`model_gateway/src/routers/common/placement.rs:84-93`).
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_stored_workers_demand_facts_are_lent_and_hold_a_retry_to_its_runtime() {
+        use std::time::Instant;
+
+        use crate::{
+            document::spec::{AppliedSpec, PolicySpec},
+            engine::{
+                Constraints, Decided, Decision, DemandFacts, Demands, PolicyEngine, Request,
+                RequestFacts, RequestMaker, Role, ShedReason, WorkerLists,
+            },
+        };
+
+        /// A request stated ahead, with the list its host hands for it.
+        struct Asks<'a>(Request<'a>, WorkerLists<'a>);
+
+        impl RequestMaker for Asks<'_> {
+            fn model(&self) -> &str {
+                self.0.facts.model
+            }
+
+            fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
+                self.0
+            }
+
+            fn workers(&self) -> WorkerLists<'_> {
+                self.1
+            }
+        }
+
+        let mut replica = Replica::new();
+        replica.objects = replica.objects.with_status_followed();
+        // A stored worker that states `runtime`, ready by a check's word.
+        let ready = |key: &str, runtime: u32| {
+            let stated = WorkerFacts {
+                demand_facts: DemandFacts {
+                    runtime,
+                    ..DemandFacts::default()
+                },
+                ..facts(key, 1)
+            };
+            let id = replica.register(stated, None);
+            let row = replica.store.get(id).expect("the registered row");
+            let ready = replica
+                .store
+                .set_status(id, WorkerStatus::Ready, row.revision);
+            ready.expect("ready");
+            id
+        };
+        let (seven, nine) = (ready(A, 7), ready(B, 9));
+        replica.follow();
+
+        let registry = replica.objects.registry();
+        let generation = registry
+            .model_generation("m")
+            .expect("the model's generation");
+        let lent = replica.objects.lent(&generation, Role::Single);
+        let mut stated: Vec<(Option<WorkerId>, DemandFacts)> = lent
+            .facts
+            .expect("the holder lends facts")
+            .iter()
+            .map(|facts| (facts.id, facts.demands))
+            .collect();
+        stated.sort_by_key(|(_, demands)| demands.runtime);
+        let states = |runtime| DemandFacts {
+            runtime,
+            ..DemandFacts::default()
+        };
+        assert_eq!(
+            stated,
+            [(Some(seven), states(7)), (Some(nine), states(9))],
+            "each worker's statement, with its row's id"
+        );
+
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        document.generation = 1;
+        let applied = AppliedSpec::validate(&document).expect("the document validates");
+        let engine = PolicyEngine::new(applied);
+        // A retry that demands `runtime`, decided over the list lent.
+        let decide = |id: &'static [u8], runtime: u32| {
+            let asked = Request {
+                id,
+                facts: RequestFacts {
+                    model: "m",
+                    seed: 7,
+                    ..RequestFacts::default()
+                },
+                constraints: Constraints {
+                    demands: Demands {
+                        runtime,
+                        ..Demands::default()
+                    },
+                    ..Constraints::default()
+                },
+            };
+            let asks = Asks(asked, WorkerLists::Single(lent));
+            match engine.decide_at(&asks, Instant::now).expect("an answer") {
+                Decided::Whole(decided, _) => decided.decision,
+                Decided::Alone(_) => panic!("a place for a request that states a demand"),
+            }
+        };
+        let landed = |id: &'static [u8], runtime: u32| match decide(id, runtime) {
+            Decision::Pick(pick) => pick.targets.first().map(|target| target.id),
+            other => panic!("a worker states runtime {runtime}: {other:?}"),
+        };
+        for id in [&b"first"[..], b"second", b"third", b"fourth"] {
+            assert_eq!(landed(id, 9), Some(nine), "the runtime's one worker");
+            assert_eq!(landed(id, 7), Some(seven), "the runtime's one worker");
+        }
+        match decide(b"none", 5) {
+            Decision::Shed(shed) => {
+                assert_eq!(
+                    (shed.reason, shed.emptied_by),
+                    (ShedReason::NoEndpoints, "wires")
+                );
+            }
+            other => panic!("no worker states runtime 5: {other:?}"),
         }
     }
 
