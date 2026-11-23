@@ -1588,11 +1588,10 @@ fn the_read_of_a_section_builds_the_table_the_model_builds() {
     );
 }
 
-/// A short merge's key is a rank over seven position bits in a signed word,
-/// so a table carries one merge less than `MAX_RANKS`: a model with more is
-/// declined and its own merge stays in place, where the key of its last
-/// rank at the last position would be `NO_KEY`, and one rank more would be
-/// negative and sort before every other.
+/// A short merge's key is a pair's merge over seven position bits in one
+/// word whose top bit says no merge, so it carries the ranks under
+/// `MAX_RANKS`. `from_model` declines a model from that many merges on, one
+/// merge before the keys run out, and its own merge stays in place.
 #[test]
 fn a_model_with_more_merges_than_the_keys_carry_is_declined() {
     use crate::word_cache::ReadBpe;
@@ -1613,22 +1612,35 @@ fn a_model_with_more_merges_than_the_keys_carry_is_declined() {
             "more merges than a short merge's keys carry"
         ))
     );
-    // The keys at the bound, packed as `ShortMerge::set_pair` packs them.
-    let key = |rank: usize, at: u32| ((rank as u32) << super::SHORT_KEY_BITS | at) as i32;
-    let last = key(super::MAX_RANKS - 2, super::SHORT_KEY_MASK);
-    assert!(0 < last && last < super::NO_KEY, "{last}");
+    // The keys at the bound, as `ShortMerge::set_pair` packs them.
+    let last = SHORT_PIECE_SYMBOLS - 1;
+    let mut short = super::ShortMerge::<SHORT_PIECE_SYMBOLS>::of(
+        std::iter::repeat_n(0, SHORT_PIECE_SYMBOLS),
+        SHORT_PIECE_SYMBOLS,
+    );
+    let mut key =
+        |rank: usize, product: u32, at: usize| short.set_pair(at, Merge::new(rank as u32, product));
+    let whole = key(0, 0x8000_0001, 1);
     assert_eq!(
-        key(super::MAX_RANKS - 1, super::SHORT_KEY_MASK),
-        super::NO_KEY,
-        "the last rank of a declined model ties no merge at the last position"
+        (whole >> super::SHORT_KEY_BITS) as u32,
+        0x8000_0001,
+        "the key carries the product whole, as `merge_at` reads it back"
     );
     assert!(
-        key(super::MAX_RANKS - 3, super::SHORT_KEY_MASK) < key(super::MAX_RANKS - 2, 0),
-        "a lower rank sorts first whatever its position"
+        key(super::MAX_RANKS - 1, u32::MAX, last) < super::NO_MERGE,
+        "the greatest key of a rank the keys carry is a merge"
     );
     assert!(
-        key(super::MAX_RANKS, 0) < 0,
-        "one rank more would sort before every key"
+        key(super::MAX_RANKS - 3, u32::MAX, last) < key(super::MAX_RANKS - 2, 0, 0),
+        "a lower rank sorts first whatever its product and its position"
+    );
+    assert!(
+        key(super::MAX_RANKS, 0, 0) >= super::NO_MERGE,
+        "one rank more would read as no merge"
+    );
+    assert!(
+        short.set_pair(0, Merge::NONE) >= super::NO_MERGE,
+        "a pair that is no merge reads so at the first position too"
     );
 }
 
