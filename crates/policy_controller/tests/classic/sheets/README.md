@@ -433,8 +433,8 @@ fails once the reason no longer holds.
   is a refusal's reason: where the only ready prefill's partners are all over their thresholds beside a free decode
   of another transport, the gateway answers unavailable and the pair's decision names the overload veto. The other
   39 rows replay, the four of a prefill policy that weighs load against cache affinity itself (`cache_aware`)
-  among them: the gateway lifts the overload veto for such a policy and lets it place, and a prefill profile that
-  reads affinity runs with that veto lifted under a binding that steers.
+  among them: the gateway lifts the overload veto for such a policy and lets it place, and a prefill profile one of
+  whose scorers says the same of itself runs with that veto lifted under a binding that steers.
 - `pair_bound.json`: none. All 8 rows replay.
 - `pair_runtime.json`: none. All 10 rows replay.
 - `overload.json`: none where the worker is one object for all its ranks, as the recording gateway held it. All 25

@@ -6222,6 +6222,69 @@ mod tests {
         );
     }
 
+    /// A registered scorer that reads the affinity column and says nothing
+    /// of a gate of its own.
+    #[derive(Debug)]
+    struct ReadsColumn;
+
+    impl Lifecycle for ReadsColumn {}
+
+    impl Scorer for ReadsColumn {
+        fn name(&self) -> &'static str {
+            "reads-column"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(0.0);
+            TieBand::NORMALIZED
+        }
+
+        fn needs(&self) -> Needs {
+            Needs {
+                affinity: true,
+                ..Needs::default()
+            }
+        }
+    }
+
+    /// A profile weighs load against affinity where one of its scorers says
+    /// so of itself, and by nothing a stage is fed. Each of the two
+    /// affinity stages says so, behind the view's report age limit too. A
+    /// registered scorer that reads the column and says nothing leaves its
+    /// profile's need standing and its profile unmarked, and beside one of
+    /// the two it changes nothing.
+    #[test]
+    fn a_profile_weighs_by_a_scorers_own_word_and_by_no_need() {
+        let mut catalog = StageRegistry::builtin();
+        catalog
+            .scorer("reads-column", || Box::new(ReadsColumn))
+            .expect("a free name");
+        // The profile's need for the column, then its word.
+        let said = |score: &str, view: &str| {
+            let document = doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","view":{view},"profiles":{{"p":{{"score":[{score}],"pick":"best"}}}}}}"#
+            ));
+            let (engine, ..) = document
+                .built(&catalog, &[])
+                .expect("the document validates");
+            (engine.profiles()[0].needs().affinity, engine.weighs(0))
+        };
+        for view in ["{}", r#"{"max_report_age_ms":500}"#] {
+            assert_eq!(said(r#""prefix-affinity""#, view), (true, true), "{view}");
+            assert_eq!(said(r#""warmup-slice""#, view), (true, true), "{view}");
+            assert_eq!(said(r#""reads-column""#, view), (true, false), "{view}");
+            let both = r#""reads-column","warmup-slice""#;
+            assert_eq!(said(both, view), (true, true), "{view}");
+            assert_eq!(said(r#""least-load""#, view), (false, false), "{view}");
+        }
+    }
+
     fn doc(text: &str) -> PolicySpec {
         serde_json::from_str(text).expect("a well-formed document")
     }
@@ -6634,6 +6697,9 @@ mod tests {
             // The affinity column is fed where an affinity stage reads it
             // and nowhere else: a preset without one declares no column.
             assert_eq!(engine.needs().affinity, name == "cache_aware", "{name}");
+            // The same preset alone weighs load against affinity: its two
+            // affinity stages say so of themselves, and no other stage does.
+            assert_eq!(engine.weighs(0), name == "cache_aware", "{name}");
             assert_eq!(engine.needs().headers, name == "manual", "{name}");
             assert!(!engine.needs().active_sessions, "{name}");
             assert!(!engine.needs().session_in_flight, "{name}");
