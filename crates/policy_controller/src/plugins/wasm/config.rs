@@ -103,8 +103,9 @@ pub struct PluginSpec {
     /// The linear-memory cap of one instance, in MiB.
     pub memory_mib: u32,
     /// The plugin's own frame budget per stage call, in microseconds; `0`
-    /// takes the decision's remaining budget. The host clamps it to at most
-    /// the decision's, and meters it as fuel through `fuel_per_micro`.
+    /// takes the default frame ([`FrameBudget::DEFAULT_MICROS`]). The host
+    /// clamps it to at most the decision's, and meters it as fuel through
+    /// `fuel_per_micro`.
     pub budget_micros: u32,
     /// The host's calibration of fuel to wall time on the reference host.
     pub fuel_per_micro: u64,
