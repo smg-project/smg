@@ -302,7 +302,8 @@ pub struct LoadRow {
     pub kv_usage_permille: u16,
     /// The share of the KV cache the running requests hold, in permille.
     pub active_kv_permille: u16,
-    /// Tokens per second the worker drains; `0` when unknown.
+    /// Tokens per second the worker drains; `0` when unknown, and a known
+    /// rate under one reads as `1`.
     pub live_rate: u32,
     /// Context tokens resident for the running requests; `0` too when the
     /// engine does not count them.
