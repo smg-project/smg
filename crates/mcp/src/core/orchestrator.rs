@@ -406,8 +406,9 @@ struct ServerEntry {
     list_error: Option<String>,
 }
 
-/// A dynamic server as its connect leaves it: the key (its URL) that names
-/// the connection, and why its tools could not be listed (`None` when they
+/// A dynamic server as its connect leaves it: its URL (`server_key`, the
+/// name its tools are listed under), the key its connection is pooled under
+/// (`pool_key`), and why its tools could not be listed (`None` when they
 /// were). The caller keeps the outcome with its binding; the pool keeps it
 /// with the connection for a later hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
