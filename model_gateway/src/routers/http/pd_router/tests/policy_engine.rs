@@ -355,3 +355,92 @@ async fn a_decode_decided_behind_its_prefill_is_heard_behind_the_prefills_answer
         ]
     );
 }
+
+// ---- the ask keeps the shape the two sides were built for ----------------------------------
+
+/// A pair goes out prefill first under a document that picks its decode
+/// behind the prefill, and the decode its scorer puts in front there is a
+/// MoRI-IO engine. The two sides were built for the decode named first,
+/// which is no such engine: the prefill was told of no transfer, and a
+/// MoRI-IO decode would wait for one that never comes. So the route's rule
+/// at the ask refuses that engine, and the request goes to the decode named
+/// first. The prefill reports no transport, so the pair index pairs it with
+/// either decode. The scorer is asked behind the prefill's answer: the
+/// decode is asked again, and it is the rule that keeps it where it was.
+#[tokio::test]
+async fn a_decode_asked_again_does_not_move_to_a_moriio_engine() {
+    let said = Said::default();
+    let answered = Arc::new(AtomicBool::new(false));
+    let prefill_url = spawn_saying(&said, "the prefill answers", "{}", Some(&answered)).await;
+    let chat_completion = r#"{"object":"chat.completion"}"#;
+    let first_url = spawn_saying(
+        &said,
+        "the decode named first is asked",
+        chat_completion,
+        None,
+    )
+    .await;
+    let moriio_url =
+        spawn_saying(&said, "the MoRI-IO decode is asked", chat_completion, None).await;
+
+    let (first, later) = (
+        WorkerId::from_address(&first_url),
+        WorkerId::from_address(&moriio_url),
+    );
+    let (heard, mark) = (Arc::clone(&said), Arc::clone(&answered));
+    let stages = table_with(move || {
+        Box::new(Hears {
+            said: Arc::clone(&heard),
+            answered: Arc::clone(&mark),
+            first,
+            later,
+        })
+    });
+    let (router, _monitor) = pair_router_under(&stages, DecodePick::AfterPrefill);
+    let worker_at = |url: String, worker_type: WorkerType| {
+        BasicWorkerBuilder::new(url)
+            .worker_type(worker_type)
+            .runtime_type(RuntimeType::Vllm)
+    };
+    let workers: [Arc<dyn Worker>; 3] = [
+        Arc::new(worker_at(prefill_url, WorkerType::Prefill).build()),
+        Arc::new(worker_at(first_url, WorkerType::Decode).build()),
+        Arc::new(
+            worker_at(moriio_url, WorkerType::Decode)
+                .kv_connector("MoRIIOConnector")
+                .label("moriio_mode", "read")
+                .build(),
+        ),
+    ];
+    for worker in workers {
+        worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        router.worker_registry.register_or_replace(worker);
+    }
+    let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+    let chat: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "m",
+        "max_tokens": 50,
+        "messages": [{"role": "user", "content": "hi"}],
+    }))
+    .expect("valid chat request");
+    let response = router
+        .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+    drop(body.expect("the decode's answer"));
+
+    let order = said.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let at = |word: &str| order.iter().position(|line| line == word);
+    let answered_at = at("the prefill answers").expect("the prefill went first");
+    assert!(
+        order[answered_at..].iter().any(|word| word == "scored"),
+        "the decode is asked again behind the prefill's answer: {order:?}"
+    );
+    assert_eq!(at("the MoRI-IO decode is asked"), None, "{order:?}");
+    assert!(
+        at("the decode named first is asked").is_some_and(|sent| sent > answered_at),
+        "{order:?}"
+    );
+}
