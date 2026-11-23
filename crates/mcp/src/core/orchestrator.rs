@@ -406,14 +406,18 @@ struct ServerEntry {
     list_error: Option<String>,
 }
 
-/// A dynamic server as its connect leaves it: the key (its URL) that names
-/// the connection, and why its tools could not be listed (`None` when they
+/// A dynamic server as its connect leaves it: its URL (`server_key`, the
+/// name its tools are listed under), the key its connection is pooled under
+/// (`pool_key`), and why its tools could not be listed (`None` when they
 /// were). The caller keeps the outcome with its binding; the pool keeps it
 /// with the connection for a later hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectedServer {
     pub server_key: String,
     pub list_error: Option<String>,
+    /// The key the connection is pooled under. A binding of this server
+    /// carries it, and a tool call takes its connection by it.
+    pub pool_key: PoolKey,
 }
 
 /// Internal result type for approval-checked execution.
@@ -1231,7 +1235,9 @@ impl McpOrchestrator {
                     return Err(McpError::ToolDenied(entry.tool_name().to_string()));
                 }
                 self.metrics.record_approval_granted();
-                let result = self.execute_tool_with_reconnect(entry, arguments).await?;
+                let result = self
+                    .execute_tool_with_reconnect(entry, arguments, request_ctx.pool_key.as_ref())
+                    .await?;
                 Ok(ApprovalExecutionResult::Success(result))
             }
             ApprovalOutcome::Pending {
@@ -1250,7 +1256,13 @@ impl McpOrchestrator {
                 match rx.await {
                     Ok(ApprovalDecision::Approved) => {
                         self.metrics.record_approval_granted();
-                        let result = self.execute_tool_with_reconnect(entry, arguments).await?;
+                        let result = self
+                            .execute_tool_with_reconnect(
+                                entry,
+                                arguments,
+                                request_ctx.pool_key.as_ref(),
+                            )
+                            .await?;
                         Ok(ApprovalExecutionResult::Success(result))
                     }
                     Ok(ApprovalDecision::Denied { reason }) => {
@@ -1266,7 +1278,13 @@ impl McpOrchestrator {
         &self,
         entry: &ToolEntry,
         arguments: Value,
+        pool_key: Option<&PoolKey>,
     ) -> McpResult<CallToolResult> {
+        // A pool key is its own address's: a tool that targets another server
+        // by now (an alias retargeted since its session was made) is called
+        // without it.
+        let pool_key = pool_key.filter(|key| key.url == Self::target_server_key(entry));
+
         // One deadline for the whole call: the first attempt and a replay
         // after reconnection share the configured bound instead of each
         // starting a fresh one. Reconnection itself runs under the
@@ -1284,7 +1302,12 @@ impl McpOrchestrator {
             .map(|e| Arc::clone(&e.client));
 
         match self
-            .execute_tool_impl(entry, arguments.clone(), Self::remaining(deadline))
+            .execute_tool_impl(
+                entry,
+                arguments.clone(),
+                Self::remaining(deadline),
+                pool_key,
+            )
             .await
         {
             Ok(result) => Ok(result),
@@ -1293,9 +1316,14 @@ impl McpOrchestrator {
                 // with side effects gets an unknown outcome whether or not
                 // the connection comes back.
                 let replayable = Self::replayable(entry);
-                let recovery = self.recover_after_disconnect(&name, initial_client).await;
+                // A pooled connection is not recovered: the reconnection is
+                // the configured servers'.
+                let recovery = match pool_key {
+                    Some(_) => Err(McpError::ServerDisconnected(name.clone())),
+                    None => self.recover_after_disconnect(&name, initial_client).await,
+                };
                 Self::after_recovery(replayable, recovery, &name, entry.tool_name())?;
-                self.execute_tool_impl(entry, arguments, Self::remaining(deadline))
+                self.execute_tool_impl(entry, arguments, Self::remaining(deadline), pool_key)
                     .await
             }
             Err(e) => Err(e),
@@ -1514,6 +1542,7 @@ impl McpOrchestrator {
         entry: &ToolEntry,
         mut arguments: Value,
         bound: Option<Duration>,
+        pool_key: Option<&PoolKey>,
     ) -> McpResult<CallToolResult> {
         // The server the call reaches is the one the recovery is keyed by;
         // the tool and the argument mapping come from the alias's target or
@@ -1539,7 +1568,8 @@ impl McpOrchestrator {
         }
 
         // Execute on server
-        self.execute_on_server(target_server, request, bound).await
+        self.execute_on_server(target_server, request, bound, pool_key)
+            .await
     }
 
     /// Coerce argument types based on tool schema.
@@ -1613,6 +1643,7 @@ impl McpOrchestrator {
         server_key: &str,
         request: CallToolRequestParams,
         bound: Option<Duration>,
+        pool_key: Option<&PoolKey>,
     ) -> McpResult<CallToolResult> {
         // Every call is bounded: a hung server must not hold a tool loop open
         // forever, and a call that outlives the bound is reported as unknown
@@ -1621,28 +1652,18 @@ impl McpOrchestrator {
         let configured_secs = self.config.pool.call_timeout;
         let tool = request.name.to_string();
 
-        // Clone the client out of the map so no shard guard is held across
-        // the call: reconnection removes entries from the same map.
-        let static_client = self
-            .static_servers
-            .get(server_key)
-            .map(|entry| Arc::clone(&entry.client));
-        if let Some(client) = static_client {
-            let result = Self::bounded(bound, client.call_tool(request)).await;
-            return Self::map_call_result(server_key, &tool, configured_secs, result);
-        }
-
-        match self.connection_pool.get_unique_by_url(server_key) {
-            UrlLookup::Found(client) => {
-                // Note: Pooled connections trigger Disconnected but
-                // recovery logic is currently scoped to static servers.
-                let result = Self::bounded(bound, client.call_tool(request)).await;
-                return Self::map_call_result(server_key, &tool, configured_secs, result);
-            }
-            UrlLookup::Ambiguous => {
-                // Multiple pooled connections share this URL under different
-                // credentials/tenants. Picking one would run the call over
-                // another caller's authenticated connection, so fail closed.
+        // A call made for a binding with a pool key uses the connection
+        // pooled under that key (made with its own caller's credentials) and
+        // no other, whatever is held under the server's name; when the pool
+        // holds none under the key, the call reads the server as not found.
+        if let Some(key) = pool_key {
+            // The tools of an address are one list for every key pooled
+            // under it, so a call on an address pooled under more than one
+            // key stays refused.
+            if matches!(
+                self.connection_pool.get_unique_by_url(server_key),
+                UrlLookup::Ambiguous
+            ) {
                 warn!(
                     "Refusing tool execution on '{}': multiple pooled connections share this \
                      URL with different credentials/tenants; cannot select one safely",
@@ -1653,7 +1674,24 @@ impl McpOrchestrator {
                      tenants are pooled for this URL"
                 )));
             }
-            UrlLookup::NotFound => {}
+            let Some(client) = self.connection_pool.get(key) else {
+                return Err(McpError::ServerNotFound(server_key.to_string()));
+            };
+            // Note: Pooled connections trigger Disconnected but
+            // recovery logic is currently scoped to static servers.
+            let result = Self::bounded(bound, client.call_tool(request)).await;
+            return Self::map_call_result(server_key, &tool, configured_secs, result);
+        }
+
+        // Clone the client out of the map so no shard guard is held across
+        // the call: reconnection removes entries from the same map.
+        let static_client = self
+            .static_servers
+            .get(server_key)
+            .map(|entry| Arc::clone(&entry.client));
+        if let Some(client) = static_client {
+            let result = Self::bounded(bound, client.call_tool(request)).await;
+            return Self::map_call_result(server_key, &tool, configured_secs, result);
         }
 
         Err(McpError::ServerNotFound(server_key.to_string()))
@@ -1793,6 +1831,7 @@ impl McpOrchestrator {
             return Ok(ConnectedServer {
                 server_key,
                 list_error: None,
+                pool_key,
             });
         }
         let opened = pooled.is_none();
@@ -1876,6 +1915,7 @@ impl McpOrchestrator {
         Ok(ConnectedServer {
             server_key,
             list_error,
+            pool_key,
         })
     }
 
@@ -2068,6 +2108,10 @@ pub struct McpRequestContext<'a> {
     pub tenant_ctx: TenantContext,
     pub approval_mode: ApprovalMode,
     pub forwarded_headers: HashMap<String, String>,
+    /// The pool key a call is made with: a server named by `server_url` is
+    /// called on the connection pooled under it (`ConnectedServer::pool_key`).
+    /// A session sets it from its binding; `None` calls a configured server.
+    pub pool_key: Option<PoolKey>,
     /// Dynamic tools added for this request only.
     dynamic_tools: DashMap<QualifiedToolName, ToolEntry>,
     /// Dynamic server clients for this request.
@@ -2088,6 +2132,7 @@ impl<'a> McpRequestContext<'a> {
             tenant_ctx,
             approval_mode,
             forwarded_headers,
+            pool_key: None,
             dynamic_tools: DashMap::new(),
             dynamic_clients: DashMap::new(),
         }
@@ -3023,6 +3068,198 @@ mod tests {
             "{err:?}"
         );
         assert!(orchestrator.reconnection_locks.is_empty());
+    }
+
+    /// A dynamic server's tool call uses the connection pooled under its own
+    /// key, through a session and made directly with the key on the caller's
+    /// context; while its address is pooled under two keys it stays refused;
+    /// a call whose key the pool holds no more reads the server as not found
+    /// while its tool is still listed; a pooled connection that drops starts
+    /// no reconnection.
+    #[tokio::test]
+    async fn a_dynamic_call_uses_the_connection_its_own_caller_made() {
+        use rmcp::{
+            model::{CallToolResponse, ContentBlock, ServerCapabilities, ServerConfig},
+            service::RequestContext,
+            RoleServer, ServerHandler, ServiceExt,
+        };
+
+        use crate::core::session::{McpServerBinding, McpToolSession};
+
+        /// A server that answers every call with its own name.
+        struct Named(&'static str);
+        impl ServerHandler for Named {
+            fn get_info(&self) -> ServerConfig {
+                ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            }
+
+            async fn call_tool(
+                &self,
+                _request: CallToolRequestParams,
+                _context: RequestContext<RoleServer>,
+            ) -> Result<CallToolResponse, rmcp::ErrorData> {
+                Ok(CallToolResult::success(vec![ContentBlock::text(self.0)]).into())
+            }
+        }
+
+        let url = "http://tools.example/mcp";
+        let mut config = McpConfig::default();
+        config.pool.max_connections = 2;
+        let orchestrator = &McpOrchestrator::new(config).await.unwrap();
+        // Read-only, so that the dropped call reads the disconnect: a call
+        // that may not be replayed reads an unknown outcome.
+        let mut tool = ToolEntry::from_server_tool(url, create_test_tool("whoami"));
+        tool.annotations.read_only = true;
+        orchestrator.tool_inventory().insert_entry(tool);
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool(
+                "conf",
+                create_test_tool("whoami"),
+            ));
+        orchestrator
+            .register_alias("who", "conf", "whoami", None)
+            .unwrap();
+
+        // One connection for each token; its server answers with the token.
+        let mut servers = Vec::new();
+        let mut clients = Vec::new();
+        for token in ["three", "two", "one"] {
+            let (server_io, client_io) = tokio::io::duplex(4096);
+            let (server, client) = tokio::join!(Named(token).serve(server_io), ().serve(client_io));
+            servers.push(server.unwrap());
+            clients.push(client.unwrap());
+        }
+        // A configured server held under the address as its name, and under a
+        // name of its own: a call made for a binding with a pool key still
+        // uses its own connection.
+        let handler = Arc::new(SmgClientHandler::new(
+            url,
+            Arc::clone(&orchestrator.approval_manager),
+        ));
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let (server, client) = tokio::join!(
+            Named("configured").serve(server_io),
+            (*handler).clone().serve(client_io)
+        );
+        servers.push(server.unwrap());
+        let configured = Arc::new(client.unwrap());
+        for name in [url, "conf"] {
+            orchestrator.static_servers.insert(
+                name.to_string(),
+                ServerEntry {
+                    client: Arc::clone(&configured),
+                    handler: Arc::clone(&handler),
+                    config: sse_server(name, url),
+                    list_error: None,
+                },
+            );
+        }
+        // Pools the next connection as the one `token` made to `url`; the
+        // binding holds that connection's key.
+        let mut connect = |url: &str, token: &str| {
+            let config = McpServerConfig {
+                transport: McpTransport::Streamable {
+                    url: url.to_string(),
+                    token: Some(token.to_string()),
+                    headers: HashMap::new(),
+                },
+                ..sse_server("tools", url)
+            };
+            let key = PoolKey::from_config(&config, None);
+            let client = clients.pop().unwrap();
+            let pooling =
+                orchestrator
+                    .connection_pool
+                    .get_or_create(key.clone(), config, |_, _| std::future::ready(Ok(client)));
+            let binding = McpServerBinding {
+                label: "tools".to_string(),
+                server_key: url.to_string(),
+                allowed_tools: None,
+                list_error: None,
+                pool_key: Some(key),
+            };
+            async move {
+                pooling.await.unwrap();
+                binding
+            }
+        };
+        let session = |bindings| McpToolSession::new(orchestrator, bindings, "request");
+        let input = || ToolExecutionInput {
+            call_id: "call".to_string(),
+            tool_name: "whoami".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        // What a call reads: the text of its answer, or its error.
+        let read = |output: ToolExecutionOutput| match output.error_message {
+            Some(error) => error,
+            None => output.output[0]["text"].as_str().unwrap().to_string(),
+        };
+
+        let one = connect(url, "one").await;
+        let first = session(vec![one.clone()]);
+        assert_eq!(read(first.execute_tool(input()).await), "one");
+
+        // The address pooled under a second key: a call on it is refused.
+        let two = connect(url, "two").await;
+        assert_eq!(
+            first.execute_tool(input()).await.error_message,
+            Some(format!(
+                "Tool call failed: Server access denied: ambiguous MCP connection for '{url}': \
+                 multiple credentials or tenants are pooled for this URL"
+            ))
+        );
+        // Two bindings of the label, of which only the second admits the
+        // tool: the call uses the second's connection.
+        let narrowed = McpServerBinding {
+            allowed_tools: Some(vec!["other".to_string()]),
+            ..one
+        };
+        let second = session(vec![narrowed, two.clone()]);
+
+        // A third connection takes the first one's place in the pool of two.
+        connect("http://other.example/mcp", "three").await;
+        assert_eq!(
+            first.execute_tool(input()).await.error_message,
+            Some(format!("Tool call failed: Server not found: {url}"))
+        );
+        assert_eq!(read(second.execute_tool(input()).await), "two");
+        // The same call made directly: the key goes on the caller's context.
+        let mut ctx = orchestrator.create_request_context(
+            "request",
+            TenantContext::new("tenant"),
+            ApprovalMode::PolicyOnly,
+        );
+        ctx.pool_key = two.pool_key;
+        assert_eq!(
+            read(
+                orchestrator
+                    .execute_tool_resolved(input(), url, "tools", &ctx)
+                    .await
+            ),
+            "two"
+        );
+        // A key serves its own address alone: an alias whose target is
+        // another server is called there, without the key.
+        let who = ToolExecutionInput {
+            tool_name: "who".to_string(),
+            ..input()
+        };
+        assert_eq!(
+            read(
+                orchestrator
+                    .execute_tool_resolved(who, ALIAS_SERVER_KEY, "tools", &ctx)
+                    .await
+            ),
+            "configured"
+        );
+
+        // The second one's server goes away.
+        servers.remove(1).cancel().await.unwrap();
+        assert_eq!(
+            second.execute_tool(input()).await.error_message,
+            Some(format!("Tool call failed: Server disconnected: {url}"))
+        );
     }
 
     /// A static server's reconnection lock leaves the map with the last
