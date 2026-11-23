@@ -10,6 +10,11 @@
 //! none. It does so where it takes the request its maker makes
 //! ([`PolicyEngine::made`](super::PolicyEngine::made)), which every entry
 //! that makes one calls: a single's and a pair's, with a lease and without.
+//!
+//! The two calls a host makes with no engine above its lists turn a `0`
+//! the same way, in the host's own request and beside the instant they
+//! write there ([`PairLists::decide`](super::pair::PairLists::decide),
+//! [`EncodeLists::decide`](super::encode::EncodeLists::decide)).
 
 /// `stated`, the budget a host in process states for its request, as a
 /// stage is shown it: the widest value where the host stated none, and
@@ -47,7 +52,8 @@ mod tests {
             decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
             framework::{DecisionScope, Filter},
             view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts},
-            PairAdmission, PairLists, PartnerClasses, PlaceRequest, PolicyEngine,
+            EncodeItems, EncodeLists, EncodePlaced, PairAdmission, PairLists, PartnerClasses,
+            PlaceRequest, PolicyEngine,
         },
         stages::{registry::StageRegistry, Lifecycle},
         store::GatewayId,
@@ -272,6 +278,56 @@ mod tests {
             let leased = leased.expect("a decision").whole().expect("no place").0;
             assert!(leased.decision.pick().is_some(), "no pick: {leased:?}");
             all_shown(&noted, shown, "a pair, a lease");
+        }
+    }
+
+    /// The two calls a host makes with no engine above its lists turn a
+    /// request's `0` too, in the host's own request: a pair's two lists and
+    /// an encode request's three show each side's stage the widest value,
+    /// where each was shown `0`. A stated budget is shown as stated.
+    #[test]
+    fn the_calls_over_a_hosts_lists_show_a_stage_the_widest_with_no_engine_above() {
+        let preset = "power_of_two";
+        let presets = PolicySpec::epd_presets(preset, preset, preset);
+        let (engine, noted) = noting(presets.expect("the presets"));
+        let members = [0, 1, 2].map(|list| {
+            let ready = |at| ready_worker(&format!("http://list-{list}-worker-{at}:8000"), MODEL);
+            let workers: Arc<[Arc<dyn Worker>]> = (0..2).map(ready).collect();
+            engine.pool_members(&workers)
+        });
+        let classes = PartnerClasses::number(2, [&[0u32, 1][..], &[0, 1][..]]);
+        let pair = PairLists {
+            prefill: &members[0],
+            decode: &members[1],
+            classes: &classes,
+            admission: &Open,
+            prefill_places: None,
+            decode_places: None,
+            prefill_stalled: &[],
+            prefill_held: &[],
+            decode_stalled: &[],
+            decode_held: &[],
+        };
+        let lists = EncodeLists {
+            pair,
+            encoders: &members[2],
+            facts: &[],
+            prefill_classes: &[],
+        };
+        let (spec, clock, now) = (engine.spec(), engine.clock(), Instant::now());
+        for (stated, shown) in [(0, u32::MAX), (STATED, STATED)] {
+            let mut theirs = stating(Phase::Prefill, stated);
+            let decision = pair.decide(spec, None, clock, now, &mut theirs, None);
+            assert!(decision.pick().is_some(), "no pick: {decision:?}");
+            all_shown(&noted, shown, "a pair's lists");
+            assert_eq!(theirs.facts.budget_micros, shown);
+
+            let mut theirs = stating(Phase::Prefill, stated);
+            let (none, mut placed) = (EncodeItems::default(), EncodePlaced::new());
+            let decision = lists.decide(spec, None, clock, now, &mut theirs, none, &mut placed);
+            assert!(decision.pick().is_some(), "no pick: {decision:?}");
+            all_shown(&noted, shown, "an encode request's lists");
+            assert_eq!(theirs.facts.budget_micros, shown);
         }
     }
 
