@@ -5104,6 +5104,16 @@ impl MemoryStore {
         Slots(self)
     }
 
+    /// The slot of a target the world a decision read does not list,
+    /// where its registration filed one ([`Slots::filed`]). A decision
+    /// over worker objects can pick a member inside its registration
+    /// window: the objects follow a registration as its write lands, a
+    /// build ahead of the world that lists its row.
+    #[cfg(feature = "controller")]
+    pub(crate) fn filed_slot(&self, target: WorkerId) -> Option<WorkerSlot> {
+        self.slots().filed(target)
+    }
+
     /// Gives the member a membership write files its slot in the counts,
     /// and files it for the leases' doors until a world lists it. Called
     /// under the workers lock, by the write that makes the member's row.

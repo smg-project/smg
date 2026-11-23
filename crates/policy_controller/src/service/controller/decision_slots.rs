@@ -192,6 +192,7 @@ use super::{
 use crate::{
     engine::{
         decision::Decision,
+        decision_engine::DecisionRefused,
         decision_slot::DecisionSlot,
         explain::{DecisionRecord, SampleCount, Samples},
         framework::{release, Engine},
@@ -1017,11 +1018,21 @@ impl Deciding {
             // lets the answer leave. That read judges the store's write
             // and a stage's call with the decision before them.
             let decided = frame_decision::decide(world, objects, &taken, frames, own);
-            let Ok((decision, booked)) = decided else {
+            let (decision, booked) = match decided {
+                Ok(decided) => decided,
                 // The engine caught a panic of the decision and counted
                 // it: the request is answered as one the decider caught.
-                *caught = true;
-                return Err(Reason::Unspecified);
+                Err(DecisionRefused::Faulted) => {
+                    *caught = true;
+                    return Err(Reason::Unspecified);
+                }
+                // No other refusal reaches a single request here yet: one
+                // that did would be no panic, and is counted as none.
+                Err(
+                    DecisionRefused::PairSide
+                    | DecisionRefused::Unleased
+                    | DecisionRefused::Decode(_),
+                ) => return Err(Reason::Unspecified),
             };
             let filed = frame_decision::issue(store, world, &taken, term, &decision, booked);
             // No pick, while the start's document of a replica under a
@@ -3969,6 +3980,56 @@ pub(crate) mod tests {
         let (read, own): (Vec<u32>, Vec<u32>) = rows[3].iter().copied().unzip();
         assert_eq!(read.iter().sum::<u32>(), 3, "{rows:?}");
         assert_eq!(own.iter().sum::<u32>(), 3, "{rows:?}");
+    }
+
+    /// A decision can pick a worker the store's world does not list yet:
+    /// the worker objects follow a registration as its write lands, and
+    /// the store builds the pools that list the row a window later. The
+    /// lease of such a pick books the worker's count all the same, by the
+    /// slot the registration filed: the next decision reads one request in
+    /// flight on the worker, on its object and in its record. A lease that
+    /// booked nothing would leave every decision of the window reading the
+    /// new worker idle.
+    #[tokio::test]
+    async fn a_pick_inside_its_workers_registration_window_books_its_count() {
+        const LATE: &str = "model-late";
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&rows);
+        let spec = picking("seen", move || -> Box<dyn Picker> {
+            let rows = Arc::clone(&kept);
+            Box::new(Seen { rows })
+        });
+        let mut bed = bed(Some(spec), true, (1, 8), []);
+        // One more member, alone under its model, written ready and never
+        // published: the build that lists its row is still owed.
+        let key = String::from("http://late:8000");
+        let facts = WorkerFacts {
+            key: key.clone(),
+            engine: key,
+            incarnation: 1,
+            role: Role::Single,
+            models: vec![LATE.to_owned()],
+            dp_size: 1,
+            max_running: Some(4),
+            ..WorkerFacts::default()
+        };
+        let late = bed.store.upsert(facts).id();
+        let row = WorkersStore::get(&*bed.store, late).expect("the row");
+        if row.status != WorkerStatus::Ready {
+            let moved = bed
+                .store
+                .set_status(late, WorkerStatus::Ready, row.revision);
+            moved.expect("the row stands");
+        }
+        let listed = bed.store.snapshot().booked_of(late);
+        assert_eq!(listed, None, "no world lists the row yet");
+        for request in 1..=2u8 {
+            let answer = bed.ask(frame_for(LATE, request, u64::from(request))).await;
+            assert_eq!(picked(&answer), late);
+        }
+        // What the second decision was handed: the first one's lease, in
+        // the count its facts read and in the worker's record.
+        assert_eq!(rows.lock()[1], [(1, 1)]);
     }
 
     /// A frame with under a microsecond of its budget left where its
