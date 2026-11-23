@@ -5604,6 +5604,17 @@ impl AppliedSpec {
         self.key_sources.get(usize::try_from(at).ok()?)?.as_ref()
     }
 
+    /// Whether a binding of this generation takes a routing key from the
+    /// request's own id ([`KeySources::reads_rid`]). A host that learns
+    /// which binding a request meets from its body alone, where the model
+    /// stands, keeps every request's body readable while this generation
+    /// stands. A binding no request reaches counts too.
+    #[must_use]
+    pub fn reads_request_id(&self) -> bool {
+        let mut sources = self.key_sources.iter().flatten();
+        sources.any(KeySources::reads_rid)
+    }
+
     /// The mode a store derives its pair classes under while this
     /// generation stands: the document's `plans.pd-pair.pairing`.
     #[must_use]
@@ -8419,6 +8430,18 @@ mod tests {
         assert!(AppliedSpec::unbound()
             .key_sources_for("chat/a", Phase::Single)
             .is_none());
+        // One binding of the three keys by the request's own id, so the
+        // document does. The same document without that source does not,
+        // and neither does one that binds nothing.
+        assert!(applied.reads_request_id());
+        let headers_alone = AppliedSpec::validate(&doc(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"best"}},"bindings":[
+                {"match":{"model":"chat/*"},"profile":"p","routing_key":{"sources":[{"header":"x-smg-routing-key"},{"header":"cookie"}]}},
+                {"profile":"p"}]}"#,
+        ))
+        .expect("the document validates");
+        assert!(!headers_alone.reads_request_id());
+        assert!(!AppliedSpec::unbound().reads_request_id());
     }
 
     #[test]
