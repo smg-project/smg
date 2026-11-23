@@ -3373,6 +3373,7 @@ mod tests {
         assert_eq!(config.bootstrap_port_annotation, "sglang.ai/bootstrap-port");
         assert_eq!(config.kv_connector_annotation, "smg.ai/kv-connector");
         assert_eq!(config.kv_engine_id_annotation, "smg.ai/kv-engine-id");
+        assert_eq!(config.pairing_protocol_label, "smg.ai/pairing-protocol");
     }
 
     #[test]
@@ -3393,6 +3394,7 @@ mod tests {
             worker_ports_annotation: "smg.ai/worker-ports".to_string(),
             kv_connector_annotation: "custom.io/kv-connector".to_string(),
             kv_engine_id_annotation: "custom.io/kv-engine-id".to_string(),
+            pairing_protocol_label: "custom.io/pairing-protocol".to_string(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             model_id_source: None,
@@ -3872,6 +3874,7 @@ discovery:
                     worker_ports_annotation: "smg.ai/worker-ports".to_string(),
                     kv_connector_annotation: "smg.ai/kv-connector".to_string(),
                     kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
+                    pairing_protocol_label: "smg.ai/pairing-protocol".to_string(),
                     router_selector: HashMap::new(),
                     router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                     model_id_source: None,

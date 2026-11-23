@@ -441,6 +441,10 @@ class Router:
             'smg.ai/kv-connector'
         kv_engine_id_annotation: Kubernetes annotation containing KV engine IDs,
             aligned with worker_ports_annotation. Default: 'smg.ai/kv-engine-id'
+        pairing_protocol_label: Kubernetes Pod label containing the worker's
+            prefill/decode pairing protocol. A prefill and a decode pair only
+            when their protocols are equal. A Pod without the label states
+            none. Default: 'smg.ai/pairing-protocol'
         request_timeout_secs: Request timeout in seconds: the read of the body
             overall, and each attempt at an HTTP worker from its dispatch to
             its last message (504 call_upstream_timeout past it, the request's

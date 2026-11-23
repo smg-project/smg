@@ -265,6 +265,7 @@ class TestRouterConfigValidation:
         assert args.worker_ports_annotation == "smg.ai/worker-ports"
         assert args.kv_connector_annotation == "smg.ai/kv-connector"
         assert args.kv_engine_id_annotation == "smg.ai/kv-engine-id"
+        assert args.pairing_protocol_label == "smg.ai/pairing-protocol"
 
     def test_prometheus_config_validation(self):
         """Test Prometheus configuration validation."""

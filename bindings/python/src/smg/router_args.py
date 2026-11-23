@@ -591,6 +591,8 @@ class RouterArgs:
     otlp_traces_endpoint: str = "localhost:4317"
     overlap_decay: float = 0.0
     overload_token_usage_threshold: float = 1.0
+    # Kubernetes Pod label containing the worker's prefill/decode pairing protocol
+    pairing_protocol_label: str = "smg.ai/pairing-protocol"
     # Which parser reads a chat completion's reasoning and tool calls: Symphony ("symphony",
     # the default) for the models its registry knows, or the per-model parsers ("legacy"); a
     # request's X-SMG-Parser header overrides it
@@ -2129,6 +2131,16 @@ class RouterArgs:
             type=str,
             default=RouterArgs.kv_engine_id_annotation,
             help="Per-worker KV engine ID Pod annotation (default: smg.ai/kv-engine-id)",
+        )
+        k8s_group.add_argument(
+            f"--{prefix}pairing-protocol-label",
+            type=str,
+            default=RouterArgs.pairing_protocol_label,
+            help=(
+                "Pod label containing the worker's prefill/decode pairing protocol: a prefill"
+                " and a decode pair only when their protocols are equal"
+                " (default: smg.ai/pairing-protocol)"
+            ),
         )
         k8s_group.add_argument(
             f"--{prefix}encode-selector",

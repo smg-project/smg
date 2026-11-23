@@ -162,6 +162,11 @@ pub(super) struct DiscoveredWorker {
     pub(super) kv_connector: Option<String>,
     pub(super) kv_role: Option<String>,
     pub(super) kv_engine_id: Option<String>,
+    /// The worker's explicit prefill/decode pairing protocol, where the
+    /// provider's source states one. Kubernetes reads it from a Pod label.
+    /// The reconciler puts it on the worker spec, where it outranks the
+    /// protocol an engine reports about itself.
+    pub(super) pairing_protocol: Option<String>,
     /// Labels a provider keeps writing for compatibility with what it wrote
     /// before discovery became provider-neutral — Kubernetes' Pod name and UID.
     /// The reconciler writes them verbatim and never interprets them. They are
@@ -202,6 +207,7 @@ impl DiscoveredWorker {
             kv_connector,
             kv_role,
             kv_engine_id,
+            pairing_protocol,
         } = self;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"smg-discovered-worker-spec/v1");
@@ -215,6 +221,13 @@ impl DiscoveredWorker {
         hash_field(&mut hasher, kv_connector.as_deref());
         hash_field(&mut hasher, kv_role.as_deref());
         hash_field(&mut hasher, kv_engine_id.as_deref());
+        // Written only where stated, under a tag of its own: a worker that
+        // states no pairing protocol keeps the fingerprint it had before
+        // the field was read, so adding the field re-registers nobody.
+        if let Some(protocol) = pairing_protocol {
+            hasher.update(b"pairing_protocol");
+            hash_field(&mut hasher, Some(protocol));
+        }
         hasher.finalize().to_hex().to_string()
     }
 }
@@ -271,6 +284,7 @@ mod tests {
             kv_connector: None,
             kv_role: None,
             kv_engine_id: None,
+            pairing_protocol: None,
             compat_labels: BTreeMap::new(),
         }
     }
@@ -320,6 +334,21 @@ mod tests {
                 kv_engine_id: Some("e".to_string()),
                 ..base.clone()
             },
+            DiscoveredWorker {
+                pairing_protocol: Some("p".to_string()),
+                ..base.clone()
+            },
+            // A change of the value, not only its arrival: a Pod relabelled
+            // in the middle of a rollout updates its worker in place.
+            DiscoveredWorker {
+                pairing_protocol: Some("q".to_string()),
+                ..base.clone()
+            },
+            // Stated and empty is not the same answer as not stated.
+            DiscoveredWorker {
+                pairing_protocol: Some(String::new()),
+                ..base.clone()
+            },
         ];
         let mut seen = vec![base.fingerprint()];
         for variant in &variants {
@@ -327,6 +356,31 @@ mod tests {
             assert!(!seen.contains(&hash), "{variant:?} collided");
             seen.push(hash);
         }
+    }
+
+    /// A worker that states no pairing protocol keeps the fingerprint it had
+    /// before the field was read: these two are the fingerprints of the same
+    /// two records on the commit before it. Reading the field therefore
+    /// re-registers no worker that does not use it.
+    #[test]
+    fn a_worker_with_no_pairing_protocol_keeps_its_earlier_fingerprint() {
+        assert_eq!(
+            worker_at("10.0.0.1:8080").fingerprint(),
+            "3a04468c1f7c7f257b3ff4794b6ec558a281805bd5d103b6d71bf6ff85444e8e"
+        );
+        let full = DiscoveredWorker {
+            worker_type: WorkerType::Decode,
+            bootstrap_port: Some(9000),
+            model_id_override: Some("m".to_string()),
+            kv_connector: Some("c".to_string()),
+            kv_role: Some("r".to_string()),
+            kv_engine_id: Some("e".to_string()),
+            ..worker_at("grpc://10.0.0.1:8080")
+        };
+        assert_eq!(
+            full.fingerprint(),
+            "d3c6de55f4e2dcf4ac367bb58751b33a2f3b2bc74cf42c6b87a4f30c2870d88c"
+        );
     }
 
     /// Identity and compatibility labels are set aside in the hash. Otherwise a

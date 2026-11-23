@@ -231,6 +231,7 @@ The binary then takes the gateway's worker discovery flags, under the same names
 | `--service-discovery-namespace` | Kubernetes: the namespace to watch. Every namespace when unset. |
 | `--model-id-from` | Kubernetes: take each worker's model id from pod metadata: `namespace`, `label:<key>` or `annotation:<key>`. |
 | `--kv-connector-annotation`, `--kv-engine-id-annotation` | Kubernetes: `smg.ai/kv-connector` and `smg.ai/kv-engine-id`. The pod annotations that name a worker's KV connector and its engine ids. |
+| `--pairing-protocol-label` | Kubernetes: `smg.ai/pairing-protocol`. The pod label that names a worker's prefill/decode pairing protocol. A prefill and a decode pair only when their protocols are equal. |
 | `--discovery-file` | File: the JSON manifest that lists the workers. Required with `--discovery-provider file`. It may be created after startup. |
 | `--slurm-job-name`, `--slurm-encode-job-name`, `--slurm-prefill-job-name`, `--slurm-decode-job-name` | Slurm: the job names whose nodes are regular, encode, prefill and decode workers. Each can be given more than once. |
 | `--slurm-port` | Slurm: the inference port on every node of a discovered job. Required with `--discovery-provider slurm`. |

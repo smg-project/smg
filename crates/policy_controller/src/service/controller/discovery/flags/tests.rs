@@ -31,6 +31,7 @@ fn every_discovery_flag_of_the_gateway_parses_here() {
         &["--decode-selector", "role=decode"],
         &["--kv-connector-annotation", "example.com/connector"],
         &["--kv-engine-id-annotation", "example.com/worker-id"],
+        &["--pairing-protocol-label", "example.com/rollout"],
         &["--model-id-from", "label:model"],
         &["--discovery-file", "/run/workers.json"],
         &["--discovery-check-interval-secs", "5"],
@@ -83,6 +84,8 @@ fn the_legacy_flag_and_the_provider_flag_select_the_same_kubernetes_settings(
         "example.com/connector",
         "--kv-engine-id-annotation",
         "example.com/worker-id",
+        "--pairing-protocol-label",
+        "example.com/rollout",
         "--model-id-from",
         "label:model",
     ];
@@ -116,6 +119,7 @@ fn the_legacy_flag_and_the_provider_flag_select_the_same_kubernetes_settings(
     );
     assert_eq!(config.kv_connector_annotation, "example.com/connector");
     assert_eq!(config.kv_engine_id_annotation, "example.com/worker-id");
+    assert_eq!(config.pairing_protocol_label, "example.com/rollout");
     assert_eq!(config.model_id_source.as_deref(), Some("label:model"));
     assert!(parse(&["--service-discovery", "--discovery-provider", "kubernetes"]).is_err());
     Ok(())
@@ -254,6 +258,10 @@ fn a_refused_field_uses_the_flag_that_sets_it_for_the_selected_provider(
                 (
                     "discovery.kv_engine_id_annotation",
                     "--kv-engine-id-annotation",
+                ),
+                (
+                    "discovery.pairing_protocol_label",
+                    "--pairing-protocol-label",
                 ),
                 ("discovery.model_id_source", "--model-id-from"),
             ][..],
@@ -524,6 +532,7 @@ fn the_defaults_are_the_gateways() -> Result<(), Box<dyn Error>> {
     assert_eq!(config.port, 80);
     assert_eq!(config.kv_connector_annotation, "smg.ai/kv-connector");
     assert_eq!(config.kv_engine_id_annotation, "smg.ai/kv-engine-id");
+    assert_eq!(config.pairing_protocol_label, "smg.ai/pairing-protocol");
     assert_eq!(config.check_interval_secs, 30);
     Ok(())
 }

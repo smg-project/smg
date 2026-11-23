@@ -572,6 +572,9 @@ impl Entry {
             kv_connector: meta.kv_connector,
             kv_role: meta.kv_role,
             kv_engine_id: meta.kv_engine_id,
+            // Instance metadata carries no pairing protocol: only the one an
+            // engine reports about itself applies.
+            pairing_protocol: None,
             compat_labels: BTreeMap::new(),
         })
     }

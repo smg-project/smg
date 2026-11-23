@@ -4149,6 +4149,30 @@ mod tests {
     }
 
     #[test]
+    fn a_pairing_protocol_label_that_is_empty_or_padded_is_refused() {
+        for bad in ["", " ", " example.com/rollout", "example.com/rollout "] {
+            let mut config = regular_mode_config();
+            config.discovery = Some(
+                KubernetesDiscoveryConfig {
+                    selector: [("app".to_string(), "worker".to_string())].into(),
+                    pairing_protocol_label: bad.to_string(),
+                    ..Default::default()
+                }
+                .into(),
+            );
+
+            assert!(
+                matches!(
+                    ConfigValidator::validate(&config),
+                    Err(ConfigError::InvalidValue { ref field, .. })
+                        if field == "discovery.pairing_protocol_label"
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_validate_invalid_urls() {
         let config = RouterConfig::new(
             RoutingMode::Regular {

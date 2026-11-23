@@ -200,23 +200,26 @@ fn validate_kubernetes_discovery(
 
     validate_check_interval(discovery.check_interval_secs)?;
 
-    for (field, value) in [
+    for (field, value, reason) in [
         (
             "discovery.kv_connector_annotation",
             &discovery.kv_connector_annotation,
+            "Annotation name must not be empty or padded with whitespace",
         ),
         (
             "discovery.kv_engine_id_annotation",
             &discovery.kv_engine_id_annotation,
+            "Annotation name must not be empty or padded with whitespace",
+        ),
+        (
+            "discovery.pairing_protocol_label",
+            &discovery.pairing_protocol_label,
+            "Label name must not be empty or padded with whitespace",
         ),
     ] {
         let trimmed = value.trim();
         if trimmed.is_empty() || trimmed != value {
-            return Err(invalid_value(
-                field,
-                value,
-                "Annotation name must not be empty or padded with whitespace",
-            ));
+            return Err(invalid_value(field, value, reason));
         }
     }
 
