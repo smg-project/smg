@@ -37,9 +37,9 @@ thread_local! {
 /// outside when `f` refuses a body, so that the refusal names the path and the
 /// place of the error as the derived read does. A chat request nested in
 /// another body type may be parsed where a refusal is not retried, so it keeps
-/// the derived read; a type name that does not match only turns the switch off.
+/// the derived read: every other type turns the switch off.
 #[cfg(feature = "axum")]
-pub(crate) fn direct<T, R>(f: impl FnOnce() -> R) -> R {
+pub(crate) fn direct<T: 'static, R>(f: impl FnOnce() -> R) -> R {
     /// Puts the switch back when the direct read ends, also by a panic.
     struct Restore(bool);
 
@@ -50,7 +50,7 @@ pub(crate) fn direct<T, R>(f: impl FnOnce() -> R) -> R {
     }
 
     let on =
-        std::any::type_name::<T>() == std::any::type_name::<crate::chat::ChatCompletionRequest>();
+        std::any::TypeId::of::<T>() == std::any::TypeId::of::<crate::chat::ChatCompletionRequest>();
     let _restore = Restore(DIRECT.replace(on));
     f()
 }
@@ -74,6 +74,40 @@ const ROLES: &[&str] = &[
     "developer",
     "root",
 ];
+
+/// The kind of a message: the entry of `KINDS` at the place of its role in
+/// `ROLES`.
+#[derive(Clone, Copy)]
+enum Kind {
+    System,
+    User,
+    Assistant,
+    Tool,
+    Function,
+    Developer,
+    Root,
+}
+
+const KINDS: [Kind; ROLES.len()] = [
+    Kind::System,
+    Kind::User,
+    Kind::Assistant,
+    Kind::Tool,
+    Kind::Function,
+    Kind::Developer,
+    Kind::Root,
+];
+
+// A new variant of `ChatMessage` does not compile until this reader names it.
+const _: fn(&ChatMessage) = |message| match message {
+    ChatMessage::System { .. }
+    | ChatMessage::User { .. }
+    | ChatMessage::Assistant { .. }
+    | ChatMessage::Tool { .. }
+    | ChatMessage::Function { .. }
+    | ChatMessage::Developer { .. }
+    | ChatMessage::Root { .. } => {}
+};
 
 /// What stands before `role` in a message: each key and its value.
 type Before<'de> = Vec<(Cow<'de, str>, Held<'de>)>;
@@ -144,7 +178,7 @@ impl<'de> Visitor<'de> for Message<'_, 'de> {
             map,
         });
         Ok(match role {
-            0 => {
+            Kind::System => {
                 let m = System::deserialize(rest)?;
                 ChatMessage::System {
                     content: m.content,
@@ -152,7 +186,7 @@ impl<'de> Visitor<'de> for Message<'_, 'de> {
                     ext: m.ext,
                 }
             }
-            1 => {
+            Kind::User => {
                 let m = User::deserialize(rest)?;
                 ChatMessage::User {
                     content: m.content,
@@ -160,7 +194,7 @@ impl<'de> Visitor<'de> for Message<'_, 'de> {
                     ext: m.ext,
                 }
             }
-            2 => {
+            Kind::Assistant => {
                 let m = Assistant::deserialize(rest)?;
                 ChatMessage::Assistant {
                     content: m.content,
@@ -173,21 +207,21 @@ impl<'de> Visitor<'de> for Message<'_, 'de> {
                     ext: m.ext,
                 }
             }
-            3 => {
+            Kind::Tool => {
                 let m = Tool::deserialize(rest)?;
                 ChatMessage::Tool {
                     content: m.content,
                     tool_call_id: m.tool_call_id,
                 }
             }
-            4 => {
+            Kind::Function => {
                 let m = Function::deserialize(rest)?;
                 ChatMessage::Function {
                     content: m.content,
                     name: m.name,
                 }
             }
-            5 => {
+            Kind::Developer => {
                 let m = Developer::deserialize(rest)?;
                 ChatMessage::Developer {
                     content: m.content,
@@ -195,7 +229,7 @@ impl<'de> Visitor<'de> for Message<'_, 'de> {
                     ext: m.ext,
                 }
             }
-            _ => {
+            Kind::Root => {
                 let m = Root::deserialize(rest)?;
                 ChatMessage::Root {
                     content: m.content,
@@ -247,37 +281,38 @@ fn hand_key<'de, K: DeserializeSeed<'de>, E: de::Error>(
 struct Role;
 
 impl<'de> DeserializeSeed<'de> for Role {
-    type Value = usize;
+    type Value = Kind;
 
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<usize, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Kind, D::Error> {
         deserializer.deserialize_identifier(self)
     }
 }
 
 impl Visitor<'_> for Role {
-    type Value = usize;
+    type Value = Kind;
 
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("variant identifier")
     }
 
-    fn visit_u64<E: de::Error>(self, v: u64) -> Result<usize, E> {
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Kind, E> {
         usize::try_from(v)
             .ok()
-            .filter(|index| *index < ROLES.len())
+            .and_then(|index| KINDS.get(index).copied())
             .ok_or_else(|| {
                 E::invalid_value(de::Unexpected::Unsigned(v), &"variant index 0 <= i < 7")
             })
     }
 
-    fn visit_str<E: de::Error>(self, v: &str) -> Result<usize, E> {
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Kind, E> {
         ROLES
             .iter()
             .position(|role| *role == v)
+            .and_then(|index| KINDS.get(index).copied())
             .ok_or_else(|| E::unknown_variant(v, ROLES))
     }
 
-    fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<usize, E> {
+    fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Kind, E> {
         let v = String::from_utf8_lossy(v);
         self.visit_str(&v)
     }
@@ -970,6 +1005,10 @@ mod tests {
             r#"{"role":"system","name":null,"content":"x","partial":true,"zz":[1,{"a":2}]}"#,
             r#"{"role":"user","content":"hello \"there\"\n"}"#,
             r#"{"content":"role last","role":"user"}"#,
+            r#"{"tools":7,"role":"system","content":"x"}"#,
+            r#"{"tools":[{"type":"function"}],"role":"user","content":"x"}"#,
+            r#"{"reasoning":"why","reasoning_content":"why","role":"assistant","content":"a"}"#,
+            r#"{"audio":{"id":"a1"},"content":null,"role":"assistant"}"#,
             r#"{"name":"n","role":"user","content":"role in the middle"}"#,
             r#"{"\u0072ole":"user","content":"an escaped key"}"#,
             r#"{"content":"x","\u006eame":"n","role":"user"}"#,
@@ -1028,6 +1067,7 @@ mod tests {
             r"[]",
             r"null",
             r#"{"role":"assistant","reasoning":"a","reasoning_content":"b"}"#,
+            r#"{"reasoning":"a","reasoning_content":"b","role":"assistant"}"#,
             r#"{"role":"tool","content":"a","content":"b","tool_call_id":"c"}"#,
             r#"{"role":"user","content":"x","name":5}"#,
             r#"{"role":"assistant","tool_calls":[{}]}"#,

@@ -762,7 +762,7 @@ fn json_rejection(err: JsonRejection) -> Response {
 #[cfg(feature = "axum")]
 impl<S, T> FromRequest<S> for ValidatedJson<T>
 where
-    T: DeserializeOwned + Validate + Normalizable + Send,
+    T: DeserializeOwned + Validate + Normalizable + Send + 'static,
     S: Send + Sync,
 {
     type Rejection = Response;
@@ -1654,7 +1654,7 @@ mod tests {
     /// The status and body of a rejected body of type `T`.
     async fn rejected<T>(body: &str) -> (StatusCode, Value)
     where
-        T: DeserializeOwned + Validate + Normalizable + Send,
+        T: DeserializeOwned + Validate + Normalizable + Send + 'static,
     {
         let request = Request::builder()
             .method("POST")
