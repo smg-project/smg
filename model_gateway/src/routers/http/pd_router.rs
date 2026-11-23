@@ -175,6 +175,13 @@ impl DecodeAhead {
         self.answer.worker().as_ref()
     }
 
+    /// Whether a dispatch owes this decode an ask behind its prefill's
+    /// answer ([`Placed::owed_behind_prefill`]): an attempt hands its
+    /// dispatch the ask ([`Self::again`]) for such a decode alone.
+    fn owed_behind_prefill(&self) -> bool {
+        self.answer.owed_behind_prefill()
+    }
+
     /// This decode asked again behind its prefill's answer, by the attempt's
     /// `ask`. Where the answer names another decode, the request goes to
     /// that one: its answer and the guard that counts it take the first's
@@ -1195,7 +1202,10 @@ impl PDRouter {
                 (moved, guard)
             };
             let ask: &DecodeAsk<'_> = &ask;
-            let again = (mode != KvConnectorMode::MoriIo).then_some(ask);
+            // A decode the classic policies picked is owed no ask either:
+            // its answer's one test is all that pair pays behind its prefill.
+            let again = (mode != KvConnectorMode::MoriIo && guards.decode.owed_behind_prefill())
+                .then_some(ask);
 
             // Outcome accounting happens per-side inside the sequential path:
             // a prefill-only failure must not feed the decode worker's

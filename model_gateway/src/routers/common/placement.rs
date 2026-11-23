@@ -632,6 +632,20 @@ impl Placed {
         }
     }
 
+    /// Whether a dispatch that sends this answer, a pair's decode, behind
+    /// its prefill owes it anything there: the ask ([`decode_again`]), and
+    /// its send said apart from its guard ([`Self::ahead`], [`Self::sent`]).
+    /// True where the policy engine placed the request. A classic answer is
+    /// owed neither: asked again it stands, and [`Self::guard`] makes its
+    /// guard whole. A route asks this where it decides its dispatch's
+    /// shape, and sends a decode that is owed nothing as it does with no
+    /// engine. This test of the answer's one word is then all the pair pays
+    /// behind its prefill.
+    #[inline]
+    pub(crate) fn owed_behind_prefill(&self) -> bool {
+        self.engine.is_some()
+    }
+
     /// The worker alone, for a caller that sends it no request: a bench's
     /// placement, a test. An engine's side of the request is let go here,
     /// which the engine hears as a release. A route never calls this: it
@@ -2298,9 +2312,12 @@ fn pair_by_engine(
 /// The route says [`Placed::sent`] with the answered guard, on the decode
 /// the request goes to, at that decode's send.
 ///
-/// A route makes this one call for every pair it sends that way, with no
-/// test of its own around it. A thin front, always inlined: a classic
-/// answer pays the one test of its pointer, and its pair index is not read.
+/// A route makes this one call for every decode it holds ahead of a
+/// prefill's answer. Whether it holds one it asks the decode's answer where
+/// it decides its dispatch's shape ([`Placed::owed_behind_prefill`]), so a
+/// classic pair states no request again. The front is whole without that:
+/// always inlined, a classic answer pays the one test of its pointer here,
+/// and its pair index is not read.
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
@@ -7495,6 +7512,10 @@ pub(crate) mod tests {
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let heard = hearing_pairs_on(&policies, true);
         let pair = pair_from(&registry, &policies).expect("the engine places the pair");
+        assert!(
+            pair.decode.owed_behind_prefill(),
+            "a route holds the engine's decode for its ask and its send"
+        );
         drop(pair.prefill.guard(None));
         let ahead = pair.decode.ahead(Some("key"));
         assert_eq!(
@@ -7631,13 +7652,19 @@ pub(crate) mod tests {
         drop(guard);
     }
 
-    /// A classic pair's answer keeps the guard it was handed, by the one
-    /// test of the front: the route's read of the pair index is never made.
+    /// A classic pair's decode is owed nothing behind its prefill, so a
+    /// route that asks its answer first holds nothing for it. Asked again
+    /// all the same, it keeps the guard it was handed, by the one test of
+    /// the front: the route's read of the pair index is never made.
     #[test]
     fn a_classic_decode_asked_again_reads_no_pair_index() {
         let registry = one_pair();
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let pair = pair_from(&registry, &policies).expect("a classic pair");
+        assert!(
+            !pair.decode.owed_behind_prefill(),
+            "a classic decode is owed no ask and no send of its own"
+        );
         let ahead = pair.decode.ahead(None);
         let unread: PairsAgain<'_> = &|| panic!("a classic pair reads no pair index");
         let inputs = PlacementInputs::default();

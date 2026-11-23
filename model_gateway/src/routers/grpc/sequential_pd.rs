@@ -595,7 +595,9 @@ pub(crate) struct PrefillHarvest {
 /// its send ([`LoadGuards::behind_prefill`]), so the dispatch owes it two
 /// things once the prefill has answered: the decode asked again
 /// ([`WorkerSelectionStage::decode_again`]), which may move the request to
-/// another decode, and the send said on the decode the request goes to.
+/// another decode, and the send said on the decode the request goes to. A
+/// decode the classic policies picked is owed neither, and its dispatch
+/// holds nothing for it.
 pub(crate) struct DecodeBehindPrefill<'a> {
     /// The selection stage, which states the request again.
     pub stage: &'a WorkerSelectionStage,
@@ -626,8 +628,9 @@ pub(crate) struct DecodeBehindPrefill<'a> {
 /// `behind` is what one request's dispatch holds for its decode
 /// ([`DecodeBehindPrefill`]): once the prefill has answered the decode is
 /// asked again, and its send is said where it goes out. `None` for a
-/// dispatch whose decode guard said the send where it was made (a batch's
-/// sub-request).
+/// dispatch that owes its decode neither: a batch's sub-request, whose
+/// decode guard said the send where it was made, and a pair the classic
+/// policies picked.
 pub(crate) async fn execute_sequential_pd(
     proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
