@@ -167,7 +167,7 @@ pub unsafe extern "C" fn sgl_tokenizer_encode(
 /// * SglErrorCode::Success on success, error code on failure
 ///
 /// # Safety
-/// - `handle` must be a valid pointer returned by `sgl_tokenizer_create`
+/// - `handle` must be a valid pointer returned by `sgl_tokenizer_create_from_file`
 /// - `messages_json` must be a valid null-terminated C string containing valid JSON
 /// - `tools_json` may be null; if non-null, must be a valid null-terminated C string
 /// - `result_out` must be a valid pointer to writable memory
@@ -227,7 +227,7 @@ pub unsafe extern "C" fn sgl_tokenizer_apply_chat_template_with_tools(
 /// * SglErrorCode::Success on success, error code on failure
 ///
 /// # Safety
-/// - `handle` must be a valid pointer returned by `sgl_tokenizer_create`
+/// - `handle` must be a valid pointer returned by `sgl_tokenizer_create_from_file`
 /// - `messages_json` must be a valid null-terminated C string containing valid JSON
 /// - `result_out` must be a valid pointer to writable memory
 /// - `error_out` may be null; if non-null, must point to writable memory
