@@ -158,7 +158,8 @@ use tonic::{transport::Endpoint, Code};
 /// one.
 const READS_KEPT_LOADS: bool = false;
 
-/// A controller decides no request of a prefill, decode or encode phase yet.
+/// A controller decides no prefill whose plan pairs no side, no decode call
+/// and no encode request yet.
 const DECIDES_PHASES: bool = false;
 
 /// A new document's engine starts with no session pin yet: a pinned key is
@@ -2420,7 +2421,6 @@ async fn paired(harness: &mut Harness, ask: DecideRequest) -> Result<(Picked, Pi
 /// decode. Each side's worker is the one whose engine reports no requests,
 /// and the answer's two leases are one id's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "a controller refuses a pair's request until a pair is decided over worker lists"]
 async fn a_pair_plan_answers_its_prefill_for_both_sides_by_the_loads_their_engines_told() {
     let case = async {
         let mut harness = Harness::start().await.expect("the harness starts");
@@ -2470,6 +2470,14 @@ async fn a_pair_plan_answers_its_prefill_for_both_sides_by_the_loads_their_engin
         )
         .await
         .expect("the loads follow on both sides");
+
+        // A decision is given the load monitor's snapshot, where the pools
+        // above are the store's table. The monitor polls each engine on its
+        // own clock: it has polled all four since the table read so.
+        let told = Instant::now();
+        monitored(&harness, &engines, told)
+            .await
+            .expect("the monitor's reports follow");
 
         // The pair plan's document is applied in the case's process. A
         // request enters the plan at its prefill and is answered once, for

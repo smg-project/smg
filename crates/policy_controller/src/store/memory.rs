@@ -4186,6 +4186,27 @@ impl MemoryStore {
         self.issue_minted(record, booked, None, false, issued)
     }
 
+    /// Issues the two leases of one pair's decision under the one id the
+    /// store mints: [`Self::issue_decided`] for `record`, the prefill
+    /// part, with `side`, the decode side, laid beside it under the same
+    /// hold of the turn. `booked` holds the slots of the counts the sides
+    /// book, the prefill's first. `issued` hears the prefill and then the
+    /// decode if it was issued. `Ok` is the prefill side's lease.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::issue_decided`].
+    #[cfg(feature = "controller")]
+    pub(crate) fn issue_decided_pair(
+        &self,
+        record: LeaseRecord,
+        side: DecodeSide,
+        [booked, decode]: [Option<WorkerSlot>; 2],
+        issued: impl Fn(&crate::tracking::Lease),
+    ) -> Result<crate::tracking::Lease, LeaseRefused> {
+        self.issue_minted(record, booked, Some((side, decode)), false, issued)
+    }
+
     /// [`LeasesStore::issue_decode`] with the slot from the decision's world.
     /// The `issued` callback hears the decode lease under the file's turn.
     /// The lease comes with the issue's count, for a caller that may undo

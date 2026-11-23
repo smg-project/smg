@@ -264,7 +264,7 @@ A gateway you host can call the standalone service. Use the generated client or 
 |---|---|---|
 | Any gRPC listener | `Leader` | Reports the known leader, address and term. One lease covers all models. It takes no principal. |
 | Gateway | `Session` | Start with `Hello` naming the caller and a protocol range containing 1. `Welcome` returns identity and limits. Its spec generation is 0 and it leaves needs and hashing unset. Send dispatch, completion, release or gateway veto frames. A new session replaces the earlier one for that gateway. Hello can restore vetoes. Lease and pin restoration via `HelloPage`, `SpecAck` and pushing new specs to gateway sessions are unserved. |
-| Gateway | `Decide` | Bidirectional stream for a present gateway. Accepts single decisions. A request of a prefill, a decode or an encode phase gives `Busy` with an unspecified reason under any binding, and its gateway decides it. The wire carries no encode item, so use the in-process door or an embedded engine for the full encode plan. |
+| Gateway | `Decide` | Bidirectional stream for a present gateway. Accepts single decisions and a pair at its prefill. A decode call, an encode request and a prefill whose plan pairs no side give `Busy` with an unspecified reason, and their gateway decides them. The wire carries no encode item, so use the in-process door or an embedded engine for the full encode plan. |
 | Gateway | `WatchWorkers` | Snapshot followed by membership and status changes, for all models or a named set. Resume from a term and sequence. A position outside the retained history can require a new snapshot. The service refuses `with_needs`. |
 | Ingestion | `PushLoad`, `PushKvEvents` | Return `UNIMPLEMENTED` after admission. |
 | Control | `RegisterWorker` | `ADD` (default), `REPLACE`, or `UPSERT` by URL. An upsert with changed role, wire or models makes a new incarnation. `wait_ready` requires probes disabled. |
@@ -935,7 +935,7 @@ including role, replication, election, and load polling.
 
 ## Presets
 
-`PolicySpec::preset("least_load")` builds a complete document with generation 1. Each preset has one profile, the same three filters and a binding for every model. The copies below leave the number to the source. `PolicySpec::power_of_two` also accepts `ExpectedWait`, `Requests`, `LeastRequests` or `ResidentTokens { request_tokens }`. The resident variant ranks the full set by resident work. `pair_presets` and `epd_presets` compose side profiles from preset names and add `has-capacity` to the prefill side and `has-room` to the decode side. Over `MemoryStore` a row reads both bits open, so these documents place pairs as written, and the host that asks gates capacity at its own commit. The standalone controller answers a pair's request `Busy` and places no pair yet. [Preset constructors](src/document/spec.rs)
+`PolicySpec::preset("least_load")` builds a complete document with generation 1. Each preset has one profile, the same three filters and a binding for every model. The copies below leave the number to the source. `PolicySpec::power_of_two` also accepts `ExpectedWait`, `Requests`, `LeastRequests` or `ResidentTokens { request_tokens }`. The resident variant ranks the full set by resident work. `pair_presets` and `epd_presets` compose side profiles from preset names and add `has-capacity` to the prefill side and `has-room` to the decode side. Over `MemoryStore` a row reads both bits open, so these documents place pairs as written, and the host that asks gates capacity at its own commit. The standalone controller places a pair at its prefill, and reads both bits open too. [Preset constructors](src/document/spec.rs)
 
 <details>
 <summary>Preset documents</summary>
@@ -1191,8 +1191,8 @@ Each removal write has one attempt. A worker that an `Upsert` job finds again wh
 ## What is not built yet
 
 - A client that marks a request as asked again. The controller serves the mark. The crate's own client does not set it yet.
-- A served call that decides the decode under a held prefill lease. The stock controller answers a pair's request `Busy`, and its gateway decides it.
-- Encode placement through a served controller. The in-process engine places the encode items with `PolicyEngine::decide_encode_at`. The served controller answers every prefill, decode and encode request `Busy`, and the wire carries no item.
+- A served call that decides the decode under a held prefill lease. The stock controller decides a pair at its prefill. It answers a decode call `Busy`, and its gateway decides the decode.
+- Encode placement through a served controller. The in-process engine places the encode items with `PolicyEngine::decide_encode_at`. The served controller answers every encode request `Busy`, and the wire carries no item.
 - A choice by the media a worker can process, outside `epd`. No built-in filter reads it.
 - A request's hard demands for an encode request and through a served controller. A host that decides in process states them (`Constraints::demands`), a worker's registration states what it offers (`WorkerFacts::demand_facts`), and the door keeps the workers that meet them before any stage runs. A registration that changes what a worker states starts another life of the worker, as a change of its wires does. An encode request's three lists keep no demand yet: one that states a demand is shed under the stage `wires`, whatever its lists state. The stock controller's `Decide` request has no field for a demand yet, and a worker it registers states none.
 - A binding that matches on a tenant, a priority, a header, a prompt size or labels. The fields are in the schema. A document that writes one is refused as not in this build.

@@ -2415,6 +2415,34 @@ fn the_sweep_s_answer_tells_a_decode_side_that_completed_from_one_it_abandoned()
     );
 }
 
+#[cfg(feature = "controller")]
+#[test]
+fn a_pair_s_decode_side_is_told_issued_on_the_decode_worker() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    store.set_term(1);
+    let (mut record, mut decode) = pair(0, p, &[d], Instant::now());
+    record.lease.booked = p;
+    decode.session = Session::from_raw(41);
+    decode.tokens = 24;
+    let world = store.snapshot();
+    let slots = [world.booked_of(p), world.booked_of(d)];
+    let heard = RefCell::new(Vec::new());
+    let prefill = store
+        .issue_decided_pair(record, decode, slots, |lease| {
+            heard.borrow_mut().push(*lease);
+        })
+        .expect("minted under the store's term");
+    let decode = Lease {
+        side: Side::Decode,
+        booked: d,
+        session: decode.session,
+        tokens: decode.tokens,
+        ..prefill
+    };
+    assert_eq!(heard.into_inner(), [prefill, decode]);
+}
+
 #[test]
 fn a_pair_with_both_sides_waiting_takes_one_place_of_the_queue() {
     let store = MemoryStore::new();
