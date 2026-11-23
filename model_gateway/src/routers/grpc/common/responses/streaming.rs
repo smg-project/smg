@@ -1,6 +1,6 @@
 //! Streaming infrastructure for /v1/responses endpoint
 
-use std::sync::Arc;
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -13,8 +13,9 @@ use openai_protocol::{
         ResponseEvent,
     },
     responses::{
-        IncludeField, ResponseOutputItem, ResponseStatus, ResponseUsage, ResponsesRequest,
-        ResponsesResponse, ResponsesUsage,
+        IncludeField, IncompleteDetails, ResponseOutputItem, ResponseReasoningParam,
+        ResponseStatus, ResponseTool, ResponseUsage, ResponsesRequest, ResponsesResponse,
+        ResponsesToolChoice, ResponsesUsage, Truncation,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -236,6 +237,66 @@ struct InProgressResponse<'a> {
     id: &'a str,
     object: &'static str,
     status: &'static str,
+}
+
+/// The event that ends the stream, `response.completed`,
+/// `response.incomplete` or `response.failed` by `kind`: the final response
+/// object, the fields in the event's order, the request's fields borrowed.
+#[derive(Serialize)]
+struct ResponseTerminal<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    sequence_number: u64,
+    response: TerminalResponse<'a>,
+}
+
+#[derive(Serialize)]
+struct TerminalResponse<'a> {
+    id: &'a str,
+    object: &'static str,
+    created_at: u64,
+    status: ResponseStatus,
+    background: bool,
+    model: &'a str,
+    output: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<Cow<'a, serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    incomplete_details: Option<IncompleteDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<serde_json::Value>,
+    /// Absent when the stream was never given its request.
+    #[serde(flatten)]
+    request: Option<RequestEcho<'a>>,
+}
+
+/// The request's fields a final response object echoes; the last five read
+/// their defaults when the request left them out.
+#[derive(Serialize)]
+struct RequestEcho<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tool_calls: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<&'a ResponseReasoningParam>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    truncation: Option<Truncation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<&'a str>,
+    parallel_tool_calls: bool,
+    store: bool,
+    tools: &'a [ResponseTool],
+    metadata: Cow<'a, HashMap<String, serde_json::Value>>,
+    tool_choice: Cow<'a, ResponsesToolChoice>,
 }
 
 /// A content part's `added` and `done` events: the part's text is empty when
@@ -688,9 +749,19 @@ impl ResponseStreamEventEmitter {
         }
     }
 
+    /// The stream's terminal event, the one the finish reason gives, and the
+    /// encoder that writes it; `error` is that of a response its caller failed.
     // INVARIANT: this method is terminal — it drains internal state via `take()`
     // and must only be called once per emitter lifetime.
-    pub fn emit_completed(&mut self, usage: Option<serde_json::Value>) -> serde_json::Value {
+    fn terminal<'a>(
+        &'a mut self,
+        usage: Option<serde_json::Value>,
+        error: Option<&'a serde_json::Value>,
+    ) -> (ResponseTerminal<'a>, &'a mut SseEncoder) {
+        debug_assert!(
+            error.is_none() || self.finish_reason.as_deref() == Some("failed"),
+            "a terminal with an error must be read under the failed finish reason"
+        );
         // Build output array from tracked items
         let output: Vec<serde_json::Value> = self
             .output_items
@@ -714,105 +785,59 @@ impl ResponseStreamEventEmitter {
         // status.
         let (status, incomplete_details) =
             super::utils::response_status(self.finish_reason.as_deref(), self.cut_call);
-
-        // Build base response object; the kept items move in after the macro
-        // (the same key position), not through the macro's `to_value` copy.
-        let mut response_obj = json!({
-            "id": self.response_id,
-            "object": "response",
-            "created_at": self.created_at,
-            "status": status,
-            "background": self.background,
-            "model": self.model
-        });
-        response_obj["output"] = serde_json::Value::Array(output);
-        if let Some(error) = generation_failure_error(self.finish_reason.as_deref()) {
-            response_obj["error"] = error;
-        }
-        if let Some(details) = incomplete_details {
-            response_obj["incomplete_details"] = json!(details);
-        }
-
-        // Add usage if provided
-        if let Some(usage_val) = usage {
-            response_obj["usage"] = usage_val;
-        }
-
-        // Add all original request fields if available
-        if let Some(ref req) = self.original_request {
-            Self::add_optional_field(&mut response_obj, "instructions", req.instructions.as_ref());
-            Self::add_optional_field(
-                &mut response_obj,
-                "max_output_tokens",
-                req.max_output_tokens.as_ref(),
-            );
-            Self::add_optional_field(
-                &mut response_obj,
-                "max_tool_calls",
-                req.max_tool_calls.as_ref(),
-            );
-            Self::add_optional_field(
-                &mut response_obj,
-                "previous_response_id",
-                req.previous_response_id.as_ref(),
-            );
-            Self::add_optional_field(&mut response_obj, "reasoning", req.reasoning.as_ref());
-            // Written as the 32-bit number and read back, the text on the
-            // stack: a tree holds the number widened to 64 bits and wrote
-            // `0.7` as `0.699999988079071`.
-            for (key, value) in [("temperature", req.temperature), ("top_p", req.top_p)] {
-                let Some(value) = value else { continue };
-                response_obj[key] = super::utils::exact_f32(value);
-            }
-            Self::add_optional_field(&mut response_obj, "truncation", req.truncation.as_ref());
-            Self::add_optional_field(&mut response_obj, "user", req.user.as_ref());
-
-            response_obj["parallel_tool_calls"] = json!(req.parallel_tool_calls.unwrap_or(true));
-            response_obj["store"] = json!(req.store.unwrap_or(true));
-            let empty_tools = vec![];
-            let empty_metadata = Default::default();
-            response_obj["tools"] = json!(req.tools.as_ref().unwrap_or(&empty_tools));
-            response_obj["metadata"] = json!(req.metadata.as_ref().unwrap_or(&empty_metadata));
-
-            // tool_choice: serialize if present, otherwise use "auto"
-            if let Some(ref tc) = req.tool_choice {
-                response_obj["tool_choice"] = json!(tc);
-            } else {
-                response_obj["tool_choice"] = json!("auto");
-            }
-        }
-
-        // The response object moves into the event, not through a copy.
-        let mut event = json!({
-            "type": match status {
+        let sequence_number = self.next_sequence();
+        let event = ResponseTerminal {
+            kind: match status {
                 ResponseStatus::Failed => ResponseEvent::FAILED,
                 ResponseStatus::Incomplete => ResponseEvent::INCOMPLETE,
                 _ => ResponseEvent::COMPLETED,
             },
-            "sequence_number": self.next_sequence()
-        });
-        event["response"] = response_obj;
-        event
+            sequence_number,
+            response: TerminalResponse {
+                id: &self.response_id,
+                object: "response",
+                created_at: self.created_at,
+                status,
+                background: self.background,
+                model: &self.model,
+                output,
+                error: error.map(Cow::Borrowed).or_else(|| {
+                    generation_failure_error(self.finish_reason.as_deref()).map(Cow::Owned)
+                }),
+                incomplete_details,
+                usage,
+                request: self.original_request.as_ref().map(|req| RequestEcho {
+                    instructions: req.instructions.as_deref(),
+                    max_output_tokens: req.max_output_tokens,
+                    max_tool_calls: req.max_tool_calls,
+                    previous_response_id: req.previous_response_id.as_deref(),
+                    reasoning: req.reasoning.as_ref(),
+                    // The spelling of the stored record (`1e-6`): a 32-bit
+                    // field would write `0.000001`.
+                    temperature: req.temperature.map(super::utils::exact_f32),
+                    top_p: req.top_p.map(super::utils::exact_f32),
+                    truncation: req.truncation,
+                    user: req.user.as_deref(),
+                    parallel_tool_calls: req.parallel_tool_calls.unwrap_or(true),
+                    store: req.store.unwrap_or(true),
+                    tools: req.tools.as_deref().unwrap_or_default(),
+                    metadata: req
+                        .metadata
+                        .as_ref()
+                        .map_or_else(Cow::default, Cow::Borrowed),
+                    tool_choice: req
+                        .tool_choice
+                        .as_ref()
+                        .map_or_else(Cow::default, Cow::Borrowed),
+                }),
+            },
+        };
+        (event, &mut self.encoder)
     }
 
-    /// The `response.failed` terminal event of a response that ended with
-    /// `error` after its items were emitted (a record that could not be
-    /// written, for one); terminal like [`Self::emit_completed`], which it is
-    /// built on. The paths that emit their terminal themselves use it.
-    pub fn emit_failed(
-        &mut self,
-        usage: Option<serde_json::Value>,
-        error: &serde_json::Value,
-    ) -> serde_json::Value {
-        self.finish_reason = Some("failed".into());
-        let mut event = self.emit_completed(usage);
-        event["type"] = json!(ResponseEvent::FAILED);
-        event["response"]["status"] = json!("failed");
-        event["response"]["error"] = error.clone();
-        if let Some(response) = event["response"].as_object_mut() {
-            response.remove("incomplete_details");
-        }
-        event
+    #[cfg(test)]
+    pub fn emit_completed(&mut self, usage: Option<serde_json::Value>) -> serde_json::Value {
+        serde_json::to_value(self.terminal(usage, None).0).unwrap()
     }
 
     /// Close the item event sequences still open (the reasoning item, the
@@ -835,16 +860,14 @@ impl ResponseStreamEventEmitter {
         error: Option<&serde_json::Value>,
         tx: &SseSender,
     ) -> Result<(), String> {
-        if error.is_some() {
+        if error.is_some() && self.finish_reason.as_deref() != Some("failed") {
             self.finish_reason = Some("failed".into());
         }
         self.close_items(tx).await?;
-        let event = match error {
-            Some(error) => self.emit_failed(usage, error),
-            None => self.emit_completed(usage),
-        };
-        let failed = event["type"] == ResponseEvent::FAILED;
-        self.send_event(&event, tx).await?;
+        let abandoned = self.abandoned;
+        let (event, encoder) = self.terminal(usage, error);
+        let failed = event.kind == ResponseEvent::FAILED;
+        Self::send_frame(encoder, abandoned, event.kind, &event, tx).await?;
         if failed {
             // Counted only once the terminal reached the client: a stream that
             // dies before its terminal is not a delivered failure, and the
@@ -867,11 +890,13 @@ impl ResponseStreamEventEmitter {
         tx: &SseSender,
     ) {
         let usage_json = usage.map(|usage| json!(usage));
-        let event = match not_stored {
-            Some(error) => self.emit_failed(usage_json, error),
-            None => self.emit_completed(usage_json),
-        };
-        let delivered = self.send_event_best_effort(&event, tx).await;
+        if not_stored.is_some() {
+            self.finish_reason = Some("failed".into());
+        }
+        let abandoned = self.abandoned;
+        let (event, encoder) = self.terminal(usage_json, not_stored);
+        let delivered = !abandoned
+            && Self::sent(Self::send_frame(encoder, abandoned, event.kind, &event, tx).await);
         if delivered && not_stored.is_some() {
             Metrics::record_responses_stream_failure(&self.model, failure_reason(not_stored));
         }
@@ -885,13 +910,6 @@ impl ResponseStreamEventEmitter {
             .into_iter()
             .map(serde_json::to_value)
             .collect()
-    }
-
-    /// Helper to add optional fields to JSON object
-    fn add_optional_field<T: Serialize>(obj: &mut serde_json::Value, key: &str, value: Option<&T>) {
-        if let Some(val) = value {
-            obj[key] = json!(val);
-        }
     }
 
     // ========================================================================
@@ -1059,7 +1077,7 @@ impl ResponseStreamEventEmitter {
     fn normalize_function_item<'a>(
         &self,
         item: &'a serde_json::Value,
-    ) -> std::borrow::Cow<'a, serde_json::Value> {
+    ) -> Cow<'a, serde_json::Value> {
         if item["type"] == "function_call" && item["namespace"].is_null() {
             if let Some(name) = item["name"].as_str() {
                 let tools = self
@@ -1071,11 +1089,11 @@ impl ResponseStreamEventEmitter {
                     let mut item = item.clone();
                     item["name"] = json!(name);
                     item["namespace"] = json!(namespace);
-                    return std::borrow::Cow::Owned(item);
+                    return Cow::Owned(item);
                 }
             }
         }
-        std::borrow::Cow::Borrowed(item)
+        Cow::Borrowed(item)
     }
 
     /// The `response.output_item.added` event of `item` under `output_index`,
@@ -1120,8 +1138,8 @@ impl ResponseStreamEventEmitter {
         tx: &SseSender,
     ) -> Result<(), String> {
         let item = match self.normalize_function_item(&item) {
-            std::borrow::Cow::Owned(normalized) => normalized,
-            std::borrow::Cow::Borrowed(_) => item,
+            Cow::Owned(normalized) => normalized,
+            Cow::Borrowed(_) => item,
         };
         let sequence_number = self.next_sequence();
         let kept: &serde_json::Value = if retain {
@@ -1161,8 +1179,8 @@ impl ResponseStreamEventEmitter {
     /// index the emitter does not track keeps nothing.
     pub fn keep_output_item(&mut self, output_index: usize, item: serde_json::Value) {
         let item = match self.normalize_function_item(&item) {
-            std::borrow::Cow::Owned(normalized) => normalized,
-            std::borrow::Cow::Borrowed(_) => item,
+            Cow::Owned(normalized) => normalized,
+            Cow::Borrowed(_) => item,
         };
         if let Some(tracked) = self
             .output_items
@@ -1260,9 +1278,9 @@ impl ResponseStreamEventEmitter {
     ///
     /// This constructs the final ResponsesResponse from all accumulated output items
     /// for persistence. Should be called after streaming is complete.
-    /// Reads non-destructively so `emit_completed()` can still drain state afterwards.
+    /// Reads non-destructively so the terminal event can still drain state afterwards.
     pub fn finalize(&self, usage: Option<ResponseUsage>) -> ResponsesResponse {
-        // Build output array from tracked items, read in place (emit_completed drains later)
+        // Build output array from tracked items, read in place (the terminal event drains later)
         let output: Vec<ResponseOutputItem> = self
             .output_items
             .iter()
@@ -2946,8 +2964,9 @@ mod tests {
         assert!(rx.recv().await.is_none(), "nothing follows the error event");
     }
 
-    /// The terminal event echoes the request's sampling numbers as the
-    /// request wrote them, the text a response that does not stream gives.
+    /// The terminal event echoes the request's sampling numbers unwidened
+    /// (`0.7`, not `0.699999988079071`) and in the spelling of a 64-bit JSON
+    /// number: a `top_p` of 0.000001 reads `1e-6`, not `0.000001`.
     #[tokio::test]
     async fn the_terminal_event_echoes_the_request_numbers_as_written() {
         let mut emitter =
@@ -2957,7 +2976,7 @@ mod tests {
                 "model": "test-model",
                 "input": "hi",
                 "temperature": 0.7,
-                "top_p": 0.9
+                "top_p": 0.000001
             }))
             .unwrap(),
         );
@@ -2969,7 +2988,10 @@ mod tests {
             .expect("the terminal frame")
             .expect("a frame");
         let text = String::from_utf8(frame.to_vec()).unwrap();
-        assert!(text.contains(r#""temperature":0.7,"top_p":0.9,"#), "{text}");
+        assert!(
+            text.contains(r#""temperature":0.7,"top_p":1e-6,"#),
+            "{text}"
+        );
     }
 
     #[test]
