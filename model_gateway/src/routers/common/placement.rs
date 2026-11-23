@@ -867,10 +867,11 @@ fn report_unplaced(model_id: &str, unplaced: &Unplaced, placed_none: &'static st
 ///
 /// Records the selection metric under the chosen worker's own transport
 /// label, as a classic selection does, and under the label of the profile
-/// that picked. A decision made ahead of every profile names none (a
-/// session followed to its worker): it is counted under the configured
-/// policy's name, which is what a classic selection counts every request
-/// under.
+/// that picked. A decision made ahead of every profile names none: it is
+/// counted under the name the settings give the main policy
+/// ([`PolicyRegistry::policy_name`]), which is what a classic selection
+/// counts a request under. The name is read off the settings: no policy
+/// object is asked.
 fn placed_by_engine(
     engine: &'static PolicyEngine,
     policies: &PolicyRegistry,
@@ -886,7 +887,7 @@ fn placed_by_engine(
     match engine.place(&request) {
         Ok(placement) => {
             let counted_under = if placement.profile.is_empty() {
-                policies.get_policy_or_default(model_id).name()
+                policies.policy_name()
             } else {
                 placement.profile
             };
@@ -2168,7 +2169,8 @@ fn with_pair_request<R>(
 ///
 /// Records the selection metric of each side under that worker's transport
 /// label and the label of the profile that picked the side, and under the
-/// configured policy's name where the engine names none.
+/// name the settings give the side's policy where the engine names none
+/// ([`PolicyRegistry::side_policy_name`]): no policy object is asked.
 #[inline(never)]
 #[expect(
     clippy::too_many_arguments,
@@ -2245,12 +2247,18 @@ fn pair_by_engine(
         (
             metrics_labels::WORKER_PREFILL,
             &pair.prefill,
-            configured(labels.0, policies.get_prefill_policy().name()),
+            configured(
+                labels.0,
+                policies.side_policy_name(crate::policies::Side::Prefill),
+            ),
         ),
         (
             metrics_labels::WORKER_DECODE,
             &pair.decode,
-            configured(labels.1, policies.get_decode_policy().name()),
+            configured(
+                labels.1,
+                policies.side_policy_name(crate::policies::Side::Decode),
+            ),
         ),
     ] {
         let transport = worker.connection_mode().as_metric_label();
@@ -6918,7 +6926,12 @@ pub(crate) mod tests {
     /// The classic ring policy's registry beside one whose engine decides
     /// under the stock preset of the same name.
     fn ring_policies() -> (PolicyRegistry, PolicyRegistry) {
-        let engine = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        // The engine's registry as a gateway makes it where the policy
+        // controller runs: it makes no classic policy object.
+        let engine = PolicyRegistry::for_policy_engine(
+            PolicyConfig::ConsistentHashing,
+            RoutingKeyOverrideConfig::default(),
+        );
         preset_on(&engine, "consistent_hashing");
         (PolicyRegistry::new(PolicyConfig::ConsistentHashing), engine)
     }
@@ -6957,6 +6970,9 @@ pub(crate) mod tests {
         }
         assert!(owners.len() > 3, "the keys spread: {owners:?}");
         assert!(registry.get_routing_snapshot(MODEL).hash_ring_is_filled());
+        // The model's ring was read from the registry's kept rings: no
+        // classic policy object was made for it, and none was asked.
+        assert_eq!(engine.classic_made_or_asked(), 0);
     }
 
     /// The ring is the model's whatever part of a pool a request is held
@@ -7058,6 +7074,81 @@ pub(crate) mod tests {
         };
         assert!(!fills_the_ring("round_robin"));
         assert!(fills_the_ring("consistent_hashing"));
+    }
+
+    /// The selection metric's lines for [`MODEL`] as a recorder renders
+    /// them: each line's policy label with its count.
+    fn selections_by_policy(rendered: &str) -> BTreeMap<String, u64> {
+        let label = "policy=\"";
+        let mut counted = BTreeMap::new();
+        for line in rendered.lines() {
+            if !line.starts_with("smg_worker_selection_total{") {
+                continue;
+            }
+            let (labels, count) = line.rsplit_once(' ').expect("a sample's value");
+            let from = labels.find(label).expect("the policy label") + label.len();
+            let policy = labels[from..].split('"').next().expect("the label's value");
+            let count: u64 = count.parse().expect("a count");
+            *counted.entry(policy.to_owned()).or_insert(0) += count;
+        }
+        counted
+    }
+
+    /// The proof's two requests beside the count of classic policy objects:
+    /// a keyed request under a ring policy, and a request whose text the
+    /// document reads. The registry is the one a gateway makes where the
+    /// policy controller runs, and the engine's document is the one the
+    /// same settings mean. Each selection is counted under the name the
+    /// settings give the policy, which is the label of the profile their
+    /// document makes of it. The text questions are the document's. No
+    /// classic policy object was made, and none was asked to place.
+    #[test]
+    fn a_keyed_request_and_a_request_whose_text_is_read_ask_no_classic_policy() {
+        use crate::config::RouterConfig;
+
+        let cache_aware = PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096);
+        for (policy, reads_text) in [
+            (PolicyConfig::ConsistentHashing, false),
+            (cache_aware, true),
+        ] {
+            let name = policy.name();
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+            let settings = RouterConfig {
+                policy,
+                ..Default::default()
+            };
+            let policies = PolicyRegistry::for_policy_engine(
+                settings.policy.clone(),
+                settings.routing_key_override.clone(),
+            );
+            let document = settings.policy_document().expect("the settings' document");
+            let spec = AppliedSpec::validate(&document);
+            engine_on(&policies, spec.expect("a valid document"));
+            assert_eq!(
+                policies.any_policy_needs_request_text(None),
+                reads_text,
+                "{name}"
+            );
+            assert_eq!(policies.pair_needs_request_text(), reads_text, "{name}");
+
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-routing-key", HeaderValue::from_static("session-A"));
+            let inputs = PlacementInputs {
+                text: Some("the words of a prompt its route read for the placement"),
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            metrics::with_local_recorder(&recorder, || {
+                let first = pick(&registry, &policies, inputs);
+                let again = pick(&registry, &policies, inputs);
+                assert_eq!(again.url(), first.url(), "{name}: the key's worker");
+            });
+            let counted = selections_by_policy(&handle.render());
+            assert_eq!(counted, BTreeMap::from([(name.to_owned(), 2)]), "{name}");
+            assert_eq!(policies.classic_made_or_asked(), 0, "{name}");
+        }
     }
 
     // ---- a pair under the policy engine ------------------------------------------------------

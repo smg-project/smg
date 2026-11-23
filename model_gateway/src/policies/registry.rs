@@ -140,6 +140,10 @@ impl LoadBalancingPolicy for NoClassicPolicy {
 /// policy's answers are constants, so the bits change only where a policy is
 /// added or removed, and a request reads one byte instead of walking the
 /// per-model map.
+///
+/// Where the policy engine places every request the bits are its
+/// document's answers ([`Self::of_document`]), written where the engine is
+/// set, and no policy is asked.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct TextNeeds(u8);
 
@@ -180,6 +184,19 @@ impl TextNeeds {
 
     fn join(self, other: Self) -> Self {
         Self(self.0 | other.0)
+    }
+
+    /// What a document that needs `needs` answers, where the policy engine
+    /// places every request. The text of a request that carries no token
+    /// ids is read where a stage hashes the text's windows or places by the
+    /// prompt's size, and the text of a request that carries them where a
+    /// stage reads the text itself. A routing key lifts neither: the
+    /// document's stages place a key that follows no session yet, and read
+    /// of it what they read of any request.
+    fn of_document(needs: Needs) -> Self {
+        let with_tokens = needs.text;
+        let without_tokens = with_tokens || needs.text_hashes || needs.prompt_size;
+        Self::from_answers(without_tokens, with_tokens, true)
     }
 
     /// Whether some policy wants the text of a request that carries token
@@ -276,6 +293,13 @@ pub struct PolicyRegistry {
     /// and how many requests reached its stand-in's placing call
     /// ([`Self::classic_made_or_asked`]).
     made_or_asked: Arc<AtomicUsize>,
+
+    /// The name the settings give each side's policy, by the side's place
+    /// in [`Side`]: kept where the side is set
+    /// ([`Self::set_side_policy`]), the first name set standing as the
+    /// first policy does. A registry made for the policy engine keeps this
+    /// of a side and nothing else ([`Self::side_policy_name`]).
+    side_names: Arc<[OnceLock<&'static str>; 3]>,
 
     /// Ordered routing-key header names, parsed once from
     /// `routing_key_override.headers`; the first header present with a valid
@@ -448,6 +472,7 @@ impl PolicyRegistry {
             routing_key_override: routing_key_override.enabled,
             classic,
             made_or_asked: Arc::new(AtomicUsize::new(made)),
+            side_names: Arc::default(),
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
             rings: Arc::new(KeptRings::default()),
@@ -804,11 +829,38 @@ impl PolicyRegistry {
     }
 
     /// Hands the registry the engine the gateway started, once: a second
-    /// engine is not taken.
+    /// engine is not taken. From here on the engine's document answers the
+    /// text questions ([`TextNeeds::of_document`]): the stored answer is
+    /// written here, and a request reads it as before.
     pub(crate) fn set_engine(&self, engine: &'static PolicyEngine) {
         if self.engine.set(engine).is_err() {
             warn!("a policy engine is already set: the second one is not taken");
         }
+        self.refresh_text_needs();
+    }
+
+    /// The name the settings give the main policy: what a classic selection
+    /// counts a request under where its model has no policy of its own. An
+    /// answer of the policy engine that names no profile is counted under
+    /// it, and no policy object is asked for the name.
+    pub(crate) fn policy_name(&self) -> &'static str {
+        self.default_policy_config.name()
+    }
+
+    /// The name the settings give the policy of a pair's `side`
+    /// ([`Self::set_side_policy`]), and where they give the side none the
+    /// name of the policy its getter falls back to: the main policy for a
+    /// prefill or a decode side, `consistent_hashing` for an encode side.
+    /// A side of the policy engine's answer that names no profile is
+    /// counted under it. No policy object is asked for the name, and a
+    /// policy handed whole ([`Self::set_prefill_policy`]) names nothing
+    /// here.
+    pub(crate) fn side_policy_name(&self, side: Side) -> &'static str {
+        let kept = self.side_names[side as usize].get().copied();
+        kept.unwrap_or_else(|| match side {
+            Side::Prefill | Side::Decode => self.policy_name(),
+            Side::Encode => PolicyConfig::ConsistentHashing.name(),
+        })
     }
 
     /// Hand every policy the worker monitor's load feed (thread-safe, can be
@@ -1169,6 +1221,8 @@ impl PolicyRegistry {
     /// routers: the first policy set stands, and a later call builds
     /// nothing.
     pub fn set_side_policy(&self, side: Side, config: &PolicyConfig) {
+        // The side's name stands whether or not a policy is built for it.
+        let _ = self.side_names[side as usize].set(config.name());
         let kept = match side {
             Side::Prefill => &self.prefill_policy,
             Side::Decode => &self.decode_policy,
@@ -1333,14 +1387,26 @@ impl PolicyRegistry {
     /// range over: the default policy and the per-model policies. Called
     /// where the per-model map changes; one recomputation at a time, so the
     /// bits published last are those of a walk that saw every earlier change.
+    /// Where the policy engine places every request its document answers
+    /// instead, and no policy is walked: called where the engine is set too.
     fn refresh_text_needs(&self) {
         let _one_at_a_time = self.text_needs_refresh.lock();
+        let needs = match self.document_needs() {
+            Some(needs) => TextNeeds::of_document(needs),
+            None => self.policies_text_needs(),
+        };
+        self.text_needs.store(needs.0, Ordering::Release);
+    }
+
+    /// What the default policy and the per-model policies answer the text
+    /// questions.
+    fn policies_text_needs(&self) -> TextNeeds {
         let mut needs = TextNeeds::of(self.default_policy.as_ref());
         for entry in self.model_policies.iter() {
             let policy = entry.value().as_ref();
             needs = needs.join(TextNeeds::of(policy));
         }
-        self.text_needs.store(needs.0, Ordering::Release);
+        needs
     }
 
     /// Whether any policy routes on backend load (see
@@ -3596,5 +3662,169 @@ mod tests {
             picks, RECORDED,
             "the replay picked {picks:?}; the recorded sequence is the decision"
         );
+    }
+
+    /// Hands `reg` an engine over a stock preset's document, as the
+    /// gateway's start hands the one it started.
+    fn preset_engine_on(reg: &PolicyRegistry, preset: &str) {
+        use smg_policy_controller::document::{AppliedSpec, PolicySpec};
+
+        use crate::routers::common::placement::tests::engine_on;
+
+        let document = PolicySpec::preset(preset).expect("a stock preset");
+        engine_on(
+            reg,
+            AppliedSpec::validate(&document).expect("a valid document"),
+        );
+    }
+
+    /// Where the policy engine places every request its document answers
+    /// the text questions, from the call that sets the engine on, and the
+    /// settings' policy is asked nothing: each row's settings say the
+    /// opposite of its document. A document reads the text of a request
+    /// that carries no token ids where a stage hashes the text's windows
+    /// (`cache_aware`, `prefix_hash`) or places by the prompt's size
+    /// (`bucket`), and no stock stage reads the text beside token ids. A
+    /// routing key under the sticky override lifts nothing: the document's
+    /// stages place a key that follows no session yet. A valid
+    /// routing-tokens hint lifts the need as it does under a classic
+    /// policy, and a change of the membership keeps the document's answer.
+    ///
+    /// Both registries answer so: the one a gateway makes where the policy
+    /// controller runs, and a classic one handed an engine. The first
+    /// answers nothing before its engine is set, hands the pair's question
+    /// the same stored answer through its stand-in, and makes no classic
+    /// policy object.
+    #[test]
+    fn an_engines_document_answers_the_text_questions() {
+        type Made = fn(PolicyConfig, RoutingKeyOverrideConfig) -> PolicyRegistry;
+        let kinds: [(Made, bool); 2] = [
+            (PolicyRegistry::for_policy_engine, false),
+            (PolicyRegistry::with_override, true),
+        ];
+        let keyed = headers_with_routing_key("session-A");
+        let hinted = headers_with_tokens("1,2,3");
+        for (preset, reads) in [
+            ("round_robin", false),
+            ("consistent_hashing", false),
+            ("cache_aware", true),
+            ("prefix_hash", true),
+            ("bucket", true),
+        ] {
+            for (made, classic) in kinds {
+                let settings = if reads {
+                    PolicyConfig::RoundRobin
+                } else {
+                    cache_aware_config()
+                };
+                let reg = made(settings, enabled_override());
+                let before = classic && !reads;
+                assert_eq!(reg.any_policy_needs_request_text(None), before, "{preset}");
+                preset_engine_on(&reg, preset);
+                let answers = |reg: &PolicyRegistry| {
+                    [
+                        reg.any_policy_needs_request_text(None),
+                        reg.any_policy_needs_request_text(Some(&keyed)),
+                        reg.any_policy_needs_request_text(Some(&hinted)),
+                        reg.any_policy_needs_request_text_with_tokens(None),
+                        reg.any_policy_needs_request_text_with_tokens(Some(&keyed)),
+                    ]
+                };
+                let documents = [reads, reads, false, false, false];
+                assert_eq!(answers(&reg), documents, "{preset}");
+                // A model's first worker and its model's leaving refresh
+                // the stored answer: it stays the document's.
+                let _ = reg.on_worker_added("m", Some("cache_aware"));
+                assert_eq!(answers(&reg), documents, "{preset}: a worker added");
+                reg.on_model_unserved("m");
+                assert_eq!(answers(&reg), documents, "{preset}: its model unserved");
+                if !classic {
+                    assert_eq!(reg.pair_needs_request_text(), reads, "{preset}");
+                    assert_eq!(reg.classic_made_or_asked(), 0, "{preset}");
+                }
+            }
+        }
+    }
+
+    /// The name the registry answers for a pair's side is the one the
+    /// settings give the side's policy, kept where the side is set, and the
+    /// first name set stands as the first policy does. A side the settings
+    /// give no policy answers what its getter falls back to: the main
+    /// policy, and `consistent_hashing` for an encode side. Under the
+    /// classic policies the name is the one the side's policy object
+    /// answers for itself. A registry made for the policy engine answers
+    /// the same names and makes no policy object for them.
+    #[test]
+    fn the_settings_name_each_side_of_a_pair() {
+        let sides = [Side::Prefill, Side::Decode, Side::Encode];
+        let names = |reg: &PolicyRegistry| sides.map(|side| reg.side_policy_name(side));
+        let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let engine = PolicyRegistry::for_policy_engine(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig::default(),
+        );
+        for reg in [&classic, &engine] {
+            assert_eq!(
+                names(reg),
+                ["round_robin", "round_robin", "consistent_hashing"]
+            );
+            reg.set_side_policy(Side::Prefill, &PolicyConfig::Random);
+            reg.set_side_policy(Side::Decode, &PolicyConfig::ConsistentHashing);
+            reg.set_side_policy(Side::Encode, &PolicyConfig::Passthrough);
+            let set = ["random", "consistent_hashing", "passthrough"];
+            assert_eq!(names(reg), set);
+            for side in sides {
+                reg.set_side_policy(side, &PolicyConfig::RoundRobin);
+            }
+            assert_eq!(names(reg), set, "the first name set stands");
+        }
+        let objects = [
+            classic.get_prefill_policy().name(),
+            classic.get_decode_policy().name(),
+            classic.get_encode_policy().name(),
+        ];
+        assert_eq!(names(&classic), objects);
+        assert_eq!(engine.classic_made_or_asked(), 0);
+    }
+
+    /// The name the registry answers for the settings' main policy is the
+    /// name that policy's object answers for itself, for every policy the
+    /// settings can name: a selection the policy engine counts under the
+    /// settings' name is counted where a classic selection counts it.
+    #[test]
+    fn the_settings_name_each_policy_as_it_names_itself() {
+        for name in [
+            "random",
+            "round_robin",
+            "passthrough",
+            "cache_aware",
+            "power_of_two",
+            "least_load",
+            "bucket",
+            "manual",
+            "consistent_hashing",
+            "prefix_hash",
+        ] {
+            // The two policies whose settings name fields with no default.
+            let mut settings = serde_json::json!({
+                "type": name,
+                "balance_abs_threshold": 32,
+                "balance_rel_threshold": 1.1,
+            });
+            match name {
+                "cache_aware" => {
+                    settings["cache_threshold"] = 0.5.into();
+                    settings["eviction_interval_secs"] = 0.into();
+                    settings["max_tree_size"] = 4096.into();
+                }
+                "bucket" => settings["bucket_adjust_interval_secs"] = 5.into(),
+                _ => settings = serde_json::json!({ "type": name }),
+            }
+            let settings: PolicyConfig =
+                serde_json::from_value(settings).expect("the policy's settings");
+            let reg = PolicyRegistry::new(settings);
+            assert_eq!(reg.policy_name(), name);
+            assert_eq!(reg.policy_name(), reg.get_default_policy().name());
+        }
     }
 }
