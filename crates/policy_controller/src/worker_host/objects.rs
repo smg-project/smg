@@ -580,6 +580,32 @@ impl<G: Generation> Objects<G> {
         &self.registry
     }
 
+    /// Whether this host dials `worker`. No for the object of a row that
+    /// one gateway alone reaches, where the host asked for such an object
+    /// with its checks off ([`Self::with_host_local_unchecked`]). Yes for
+    /// every other, for a worker the holder laid no object for, and for
+    /// every worker of a host that asked for no such object. What a
+    /// host's load monitor asks its workers by
+    /// ([`load_monitor`](super::load_monitor)).
+    ///
+    /// The answer is the row's reach as the object's entry holds it. A
+    /// row that states another reach is laid again and its object built
+    /// anew, so the answer stands for an object's life. An object its
+    /// host handed in and keeps ([`Self::with_built_kept`]) is the one
+    /// whose entry moves in place.
+    pub(super) fn dials(&self, worker: &dyn Worker) -> bool {
+        if !self.host_local_unchecked {
+            return true;
+        }
+        let Some(object) = self.registry.get_id_by_url(worker.url()) else {
+            return true;
+        };
+        let held = self.held.read();
+        held.rows
+            .get(&object)
+            .is_none_or(|laid| laid.remainder.reachable_from == Reachability::Any)
+    }
+
     /// The row the object under `object` stands for, with the revision it
     /// was built from; `None` for an id the holder laid no object under, or
     /// one whose row went.

@@ -545,11 +545,13 @@ where
 
 /// The readers of a [`load_monitor`]'s loads: the decisions of an engine
 /// over the host's lists, which read the snapshot the monitor publishes.
-struct SnapshotReaders;
+/// They hold the holder of the objects, which says the workers its host
+/// dials.
+struct SnapshotReaders<G>(Arc<Objects<G>>);
 
-impl LoadConsumer for SnapshotReaders {
-    /// Always. The host holds the monitor only while a decision reads its
-    /// snapshot, and drops it for the rest. The monitor asks under polling
+impl<G: Generation> LoadConsumer for SnapshotReaders<G> {
+    /// Always. The host runs the monitor only while a decision reads its
+    /// snapshot, and stops it for the rest. The monitor asks under polling
     /// by need alone, which [`load_monitor`] leaves off.
     fn needs_loads(&self) -> bool {
         true
@@ -559,13 +561,24 @@ impl LoadConsumer for SnapshotReaders {
     /// own stages, which are told the request's end, and none books through
     /// the monitor.
     fn reconcile_in_flight(&self, _worker: &dyn Worker) {}
+
+    /// Whether the host dials the worker ([`Objects::dials`]): a host
+    /// that is no gateway asks a worker one gateway alone reaches for no
+    /// load. The answer stands for the object's life, so a worker left
+    /// out leaves no report and no verdict of the monitor behind.
+    fn polls(&self, worker: &dyn Worker) -> bool {
+        self.0.dials(worker)
+    }
 }
 
 /// The worker crate's own load monitor over the holder's registry, for a
 /// host whose decisions read the monitor's snapshot.
 ///
-/// It polls every `Ready` object each `every`, cut to whole seconds: the
-/// monitor takes one second for less. It publishes the reports as one
+/// It polls every `Ready` object its host dials each `every`, cut to whole
+/// seconds: the monitor takes one second for less. An object built for a
+/// row that one gateway alone reaches is asked for no load, where the
+/// host asked for such objects with their checks off ([`Objects::dials`]).
+/// It publishes the reports as one
 /// snapshot ([`WorkerMonitor::subscribe`]), which the host hands its
 /// decisions. Its own sink judges each worker's overload by the thresholds
 /// its object states ([`Objects::with_overload_thresholds`]) and writes
@@ -573,20 +586,28 @@ impl LoadConsumer for SnapshotReaders {
 /// whatever its objects state. Each report also feeds the worker crate's
 /// engine gauges, as under every monitor.
 ///
-/// It is built stopped. The host starts it
-/// ([`WorkerMonitor::start_event_loop`]) where its decisions read the
-/// snapshot, and drops it where they do not. The drop ends the monitor's
-/// tasks and its channel, whose last snapshot a reader still holds, and
+/// It is built stopped, and a host keeps the one it built. The host starts
+/// it ([`WorkerMonitor::start_event_loop`]) where its decisions read the
+/// snapshot, and stops it where they do not ([`WorkerMonitor::stop`]). The
+/// stop ends every task of the monitor and waits for each end. Then it
+/// publishes the snapshot empty and takes every overload verdict off the
+/// objects. The channel stands through a stop: a reader handed it once
+/// reads the next start's reports on it.
+///
+/// A drop is no such end. It ends the monitor's tasks and its channel,
+/// whose last snapshot a reader still holds, awaits nothing and
 /// says nothing to the sink: the verdicts stand on the objects until the
-/// host takes them off ([`clear_all_overload_flags`]). Where its decisions
-/// read a snapshot again the host builds another monitor: its snapshot
-/// starts empty, and its start fails every verdict open.
+/// host takes them off ([`clear_all_overload_flags`]). Another monitor's
+/// snapshot starts empty, and its start fails every verdict open.
 ///
 /// [`clear_all_overload_flags`]: smg_worker::registry::WorkerRegistry::clear_all_overload_flags
-pub fn load_monitor<G: Generation>(objects: &Objects<G>, every: Duration) -> Arc<WorkerMonitor<G>> {
+pub fn load_monitor<G: Generation>(
+    objects: &Arc<Objects<G>>,
+    every: Duration,
+) -> Arc<WorkerMonitor<G>> {
     Arc::new(WorkerMonitor::new(
         Arc::clone(objects.registry()),
-        Arc::new(SnapshotReaders),
+        Arc::new(SnapshotReaders(Arc::clone(objects))),
         every.as_secs(),
         // No poll is forced for the gauges' sake and none is left out by
         // need: every group is polled.
@@ -614,8 +635,8 @@ mod tests {
         engine::view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
         store::{
             GatewayId, LoadSample, LoadSource, MemoryStore, Overload, PollMode as StorePollMode,
-            SignalWriteOutcome, ViewBuffers, ViewQuery, WorkerFacts, WorkerPatch, WorkerStatus,
-            WorkersStore,
+            Reachability, SignalWriteOutcome, ViewBuffers, ViewQuery, WorkerFacts, WorkerPatch,
+            WorkerStatus, WorkersStore,
         },
         worker_host::{object, Members, SoleLead},
     };
@@ -2148,6 +2169,38 @@ mod tests {
         assert_eq!(members.len(), 2);
         let one_rank = |kept: &KeptMember| matches!(*kept.shown.lock(), Shown::OneRank(_));
         assert!(members.values().all(one_rank));
+    }
+
+    /// A host's load monitor asks no worker its host cannot dial. A holder
+    /// that builds the object of a row one gateway alone reaches with its
+    /// checks off says no of that worker, and the monitor wants no load
+    /// stream for it. The holder says yes of a row every gateway reaches,
+    /// of a worker it laid no object for, and of every worker where its
+    /// host asked for no object with its checks off.
+    #[test]
+    fn a_hosts_load_monitor_asks_no_worker_its_host_cannot_dial() {
+        const LOCAL: &str = "http://loads-local:8000";
+        const STRANGER: &str = "http://loads-stranger:8000";
+        let local = |url: &str| WorkerFacts {
+            reachable_from: Reachability::Gateway(GatewayId(1)),
+            ..facts(url)
+        };
+        let mut replica = Replica::new();
+        replica.objects =
+            Arc::new(Objects::new(Arc::new(WorkerRegistry::new())).with_host_local_unchecked());
+        let (_, reached) = replica.add(facts(URL));
+        let (_, unreached) = replica.add(local(LOCAL));
+        let monitor = load_monitor(&replica.objects, PERIOD);
+        assert!(monitor.loads_wanted(slice::from_ref(&reached)));
+        assert!(!monitor.loads_wanted(slice::from_ref(&unreached)));
+
+        // A host that asked for no object with its checks off dials every
+        // worker, and the first holder laid no object at this one's address.
+        let checking = Replica::new();
+        let (_, stranger) = checking.add(local(STRANGER));
+        let dialed = load_monitor(&checking.objects, PERIOD);
+        assert!(dialed.loads_wanted(slice::from_ref(&stranger)));
+        assert!(monitor.loads_wanted(slice::from_ref(&stranger)));
     }
 
     /// A host's load monitor judges a worker where its report lands, by the

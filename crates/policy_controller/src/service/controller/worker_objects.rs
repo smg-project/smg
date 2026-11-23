@@ -1,7 +1,8 @@
 //! The replica's worker objects under the controller: the wake of their
 //! follower, and under the `worker-host` feature their holder over the
 //! controller's store with the one task that follows it, the lead of a
-//! replica that elects, and the health probes it runs while it leads.
+//! replica that elects, and the health probes and the load monitor it
+//! runs while it leads.
 
 #[cfg(feature = "worker-host")]
 use std::sync::Arc;
@@ -13,6 +14,8 @@ use tokio::sync::Notify;
 mod follower;
 #[cfg(feature = "worker-host")]
 mod lead;
+#[cfg(feature = "worker-host")]
+mod load_monitor;
 #[cfg(feature = "worker-host")]
 mod prober;
 

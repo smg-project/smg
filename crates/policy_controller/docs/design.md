@@ -1318,7 +1318,7 @@ the worker crate's structures, and the one engine.
 | workers | records in the store, and worker objects kept in step with them | worker objects in a worker-crate registry; beside each, the code that keeps the objects holds what a registration stated and the object does not hold as stated (10.3); the membership log that watchers and standbys read stays |
 | lists | the store's published copy | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
 | health | the worker crate's health checker over the worker objects, on the leader; each outcome is copied into the store's record | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
-| loads | the crate's own poller and table | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so every worker's loads are read: no new cost against classic, whose gateway hands every worker the same two defaults |
+| loads | the crate's own poller and table | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic, whose gateway hands every worker the same two defaults |
 | cache events | an index of the store's own | the kv-index crate's index, filled by the worker crate's collector |
 | sessions | the store's tables | the engine's session table |
 | leases | the store's lease tables, in memory, one for each deciding thread | stay: a controller must remember what it issued to gateways |
