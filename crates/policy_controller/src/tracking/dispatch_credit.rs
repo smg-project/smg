@@ -245,6 +245,30 @@ impl DispatchCreditPass<'_> {
                 since.credit_through(self.through(sample)).counts()
             })
     }
+
+    /// Calls `each` with the instant and the stated prompt tokens of every
+    /// send of the row that still counts: the sends [`Self::of`] counts,
+    /// one call a send. The instant is the one the count dates the send
+    /// by: its lease's issue instant plus the time its host reported from
+    /// the decision to the dispatch, in microseconds of the engine's
+    /// clock. A send of no stated size states no tokens. The sends come
+    /// lane by lane as the count keeps them, oldest first within a lane: a
+    /// stage that wants one order sorts.
+    ///
+    /// It releases what a report or the time limit reaches, as
+    /// [`Self::of`] does, and holds the row's sends still from that
+    /// release until it returns: a send to the row waits and lands behind
+    /// the read. So `each` must not read this row through any count that
+    /// holds it, report a send or wait, because each may need what the
+    /// read holds. A document's count that took over the rows of the one
+    /// it follows shares them with it. A stage that asks takes the row's
+    /// locks at every read, which a total takes only where it releases.
+    pub fn sends(&self, row: &Candidate, each: impl FnMut(u64, u32)) {
+        if let Some(since) = self.tally.get(&(row.id, row.dp_rank)) {
+            let sample = row.load.map_or(0, |_| row.load_sampled_at_micros);
+            since.each_through(self.through(sample), each);
+        }
+    }
 }
 
 /// A pass over a count that sets no time limit and no report delay
