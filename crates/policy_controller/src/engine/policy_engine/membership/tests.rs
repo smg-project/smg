@@ -654,15 +654,45 @@ fn a_replacement_under_a_stated_id_that_stands_owes_a_whole_read() {
     let mut members = Some(follow);
     let _ = told(&heard);
 
-    // The host stated 8 and then 7 again of the worker ahead of the first
+    // The host states 8 and then 7 again of the worker ahead of the first
     // word.
+    host.state(0, 8);
     replace(&registry, 0);
+    host.state(0, 7);
     replace(&registry, 0);
     drain(&engine, members.as_mut().expect("the follow"));
     assert_eq!(told_and_standing(&heard), (vec![], vec![]));
 
     engine.follow_registry(&mut members);
     assert_eq!(told_and_standing(&heard), (vec![], vec![WorkerId(7)]));
+}
+
+/// A host that keeps ids by address can state another id of a worker and
+/// take every statement of it back ahead of the word: the word then names
+/// the fingerprint of the worker's address, and what requests left under
+/// the id between would stay. A replacement that changes the id told owes
+/// a whole read at the next upkeep, whatever its host states of the new
+/// object: its snapshot names the ids that stand.
+#[test]
+fn a_replacement_that_changes_the_id_told_to_one_not_stated_owes_a_whole_read() {
+    let registry = registry(1);
+    let host = Stating::over(&registry);
+    host.state(0, 7);
+    let (engine, heard, follow) = following(&host);
+    let mut members = Some(follow);
+    let _ = told(&heard);
+
+    // The host states 8 of the worker, and then nothing, ahead of the
+    // word.
+    host.state(0, 8);
+    replace(&registry, 0);
+    host.ids.lock().remove(&url(0));
+    drain(&engine, members.as_mut().expect("the follow"));
+    let rekeyed = [("left", WorkerId(7)), ("joined", id(0))];
+    assert_eq!(told_and_standing(&heard), (rekeyed.to_vec(), vec![]));
+
+    engine.follow_registry(&mut members);
+    assert_eq!(told_and_standing(&heard), (vec![], vec![id(0)]));
 }
 
 /// Two workers stand under one stated id, and the host gives one of them
