@@ -1069,7 +1069,8 @@ file has no such word yet: it takes the document, and its stages hear such a req
 Its decision is the engine's own, so its record of sent prefixes follows the word all the same.
 
 Upkeep, about once a second (`sweep`): expired session keys are removed, and the record of sent
-prefixes gets a bounded step of clean-up.
+prefixes gets a bounded step of clean-up. A record leaves the engine's map once no list's table
+holds it and it holds no worker's place.
 
 ## 7. The ten built-in policies **[built]**
 
