@@ -18,7 +18,7 @@ use super::{
 };
 pub use crate::error::TransformError;
 
-pub type Result<T> = std::result::Result<T, TransformError>;
+pub(crate) type Result<T> = std::result::Result<T, TransformError>;
 
 /// Extract RGB pixel data from a DynamicImage, avoiding a copy when already RGB8.
 /// Returns (width, height, raw_bytes) where raw_bytes is interleaved R,G,B,R,G,B,...
@@ -124,7 +124,7 @@ pub struct TransparentBg {
 /// `a = alpha / 255`, then truncates. `a` depends on the pixel's alpha alone
 /// and `(1 - a) * bg` on the alpha and the background's level, so each is
 /// computed once per level, 256 values, and a pixel reads the two it needs.
-pub fn fill_transparent_bg(image: &DynamicImage, config: TransparentBgConfig) -> RgbImage {
+pub(crate) fn fill_transparent_bg(image: &DynamicImage, config: TransparentBgConfig) -> RgbImage {
     if !image.color().has_alpha() {
         return image.to_rgb8();
     }
@@ -200,7 +200,7 @@ pub fn fill_transparent_bg(image: &DynamicImage, config: TransparentBgConfig) ->
 ///
 /// Processes 8 pixels at a time so the compiler can unroll and auto-vectorize
 /// the stride-3 gather pattern.
-pub fn deinterleave_rgb_to_planes(
+pub(crate) fn deinterleave_rgb_to_planes(
     rgb: &[u8],
     r_plane: &mut [f32],
     g_plane: &mut [f32],
@@ -485,7 +485,7 @@ pub fn to_tensor(image: &DynamicImage) -> Array3<f32> {
 /// keeps the table of its reference's fused rescale-and-normalize
 /// ([`PixelNorm::table_f32`](crate::encoder_inputs::PixelNorm::table_f32)),
 /// which no single multiply-add reproduces in the last bit.
-pub fn to_tensor_by_table(image: &DynamicImage, table: &[[f32; 256]; 3]) -> Array3<f32> {
+pub(crate) fn to_tensor_by_table(image: &DynamicImage, table: &[[f32; 256]; 3]) -> Array3<f32> {
     let (w, h, raw) = rgb_bytes(image);
     build_planar_tensor_by_table(&raw, w, h, table)
 }
@@ -562,7 +562,7 @@ pub(crate) fn to_tensor_and_normalize_table(mean: &[f64; 3], std: &[f64; 3]) -> 
 /// [`to_tensor_and_normalize`] differs from these three roundings in the
 /// last bit on about half of the byte values; a reference that composes the
 /// two transforms takes this one.
-pub fn to_tensor_then_normalize(
+pub(crate) fn to_tensor_then_normalize(
     image: &DynamicImage,
     mean: &[f64; 3],
     std: &[f64; 3],
@@ -586,7 +586,7 @@ pub(crate) fn to_tensor_then_normalize_table(mean: &[f64; 3], std: &[f64; 3]) ->
 /// (`12.5 -> 12`, `13.5 -> 14`), unlike Rust's `f64::round()` which rounds
 /// half away from zero.
 #[inline]
-pub fn round_half_to_even(x: f64) -> f64 {
+pub(crate) fn round_half_to_even(x: f64) -> f64 {
     let rounded = x.round();
     // Check if we're exactly at a .5 case
     if (x - x.floor() - 0.5).abs() < 1e-9 {
@@ -750,7 +750,7 @@ pub(crate) fn resize_catmull_rom_rgb(src: &RgbImage, width: u32, height: u32) ->
 
 /// Resize borrowed interleaved RGB bytes without first materializing an
 /// `image::RgbImage` over an owned input buffer.
-pub fn resize_rgb_bytes(
+pub(crate) fn resize_rgb_bytes(
     data: &[u8],
     width: u32,
     height: u32,
@@ -2584,7 +2584,7 @@ fn resize_pil_image(
 /// Byte-for-byte equivalent of [`resize_bicubic_pil`] but for the raw-RGB video
 /// frame path (`preprocess_video_rgb`). Returns an `RgbImage` to drop straight
 /// into the existing [`resize_rgb_bytes`] call sites.
-pub fn resize_bicubic_pil_rgb(
+pub(crate) fn resize_bicubic_pil_rgb(
     data: &[u8],
     width: u32,
     height: u32,
@@ -2628,7 +2628,7 @@ pub fn resize_bicubic_pil_rgb(
 /// Pillow-exact BILINEAR resize over borrowed interleaved RGB bytes: the
 /// bytes of [`resize_bilinear_pil`], for a processor that resizes a decoded
 /// image's bytes more than once before it converts them.
-pub fn resize_bilinear_pil_rgb(
+pub(crate) fn resize_bilinear_pil_rgb(
     data: &[u8],
     width: u32,
     height: u32,
@@ -2947,7 +2947,7 @@ pub fn resize_bicubic_torch_aa_rgb(
 /// run for `InterpolationMode.LANCZOS` on the CPU): Pillow's Lanczos-3
 /// kernel in the torch `uint8` quantization of [`resize_bicubic_torch_aa_rgb`],
 /// interleaved RGB bytes in and out.
-pub fn resize_lanczos_torch_aa_rgb_bytes(
+pub(crate) fn resize_lanczos_torch_aa_rgb_bytes(
     data: &[u8],
     width: u32,
     height: u32,
@@ -2979,7 +2979,11 @@ pub fn resize_lanczos_torch_aa_rgb_bytes(
 
 /// The torchvision `uint8` BICUBIC resize of [`resize_bicubic_torch_aa_rgb`]
 /// for a decoded image.
-pub fn resize_bicubic_torch_aa(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
+pub(crate) fn resize_bicubic_torch_aa(
+    image: &DynamicImage,
+    out_w: u32,
+    out_h: u32,
+) -> DynamicImage {
     let (in_w, in_h, data) = rgb_bytes(image);
     let output = resize_torch_uint8_rgb(
         &data,
@@ -3251,7 +3255,7 @@ fn torch_aa_plain_until(count: usize) -> usize {
 /// `a = -0.5` widened by the downscale factor, with torch's `f32` weights and
 /// its compiled loop's order of roundings (`torch_aa_passes`), so an output is
 /// the reference's bit for bit; the width pass runs first.
-pub fn resize_bicubic_torch_aa_f32(
+pub(crate) fn resize_bicubic_torch_aa_f32(
     data: &[u8],
     width: u32,
     height: u32,
@@ -3318,7 +3322,7 @@ pub(crate) fn resize_bicubic_torch_aa_f32_strips(
 /// (`torch_aa_passes`), so an output is the reference's bit for bit; the
 /// width pass runs first, and reads the table instead of a normalized copy of
 /// the image.
-pub fn resize_bilinear_torch_aa_normalized(
+pub(crate) fn resize_bilinear_torch_aa_normalized(
     data: &[u8],
     width: u32,
     height: u32,
@@ -3603,7 +3607,7 @@ fn torch_aa_passes_with_fma<F: FnMut(&[f32])>(
 /// Center crop image to specified dimensions.
 ///
 /// If the crop size is larger than the image, the image is returned unchanged.
-pub fn center_crop(image: &DynamicImage, crop_w: u32, crop_h: u32) -> DynamicImage {
+pub(crate) fn center_crop(image: &DynamicImage, crop_w: u32, crop_h: u32) -> DynamicImage {
     let (w, h) = image.dimensions();
     if crop_w >= w && crop_h >= h {
         return image.clone();
@@ -3742,7 +3746,7 @@ pub(crate) fn paste_rgb(
 ///
 /// This is used by LLaVA models which expect square inputs. The image is
 /// centered and padded with the mean color on the shorter dimension.
-pub fn expand_to_square(image: &DynamicImage, background: Rgb<u8>) -> DynamicImage {
+pub(crate) fn expand_to_square(image: &DynamicImage, background: Rgb<u8>) -> DynamicImage {
     let (w, h) = image.dimensions();
     if w == h {
         return image.clone();
@@ -3791,7 +3795,7 @@ fn pad_to_size_pil(
 /// copy); when it fills the target, it is returned without a canvas. An aspect
 /// ratio so extreme that the contained dimension rounds to zero is an error,
 /// as it is in Pillow (`height and width must be > 0`).
-pub fn pad_to_size_pil_rgb(
+pub(crate) fn pad_to_size_pil_rgb(
     data: &[u8],
     width: u32,
     height: u32,
@@ -3869,7 +3873,7 @@ pub fn pad_to_size_pil_rgb(
 /// Stack multiple [C, H, W] tensors into [B, C, H, W].
 ///
 /// All tensors must have the same shape.
-pub fn stack_batch(tensors: &[Array3<f32>]) -> Result<Array4<f32>> {
+pub(crate) fn stack_batch(tensors: &[Array3<f32>]) -> Result<Array4<f32>> {
     TransformError::if_empty(tensors)?;
 
     let shape = tensors[0].shape();
@@ -3911,7 +3915,7 @@ pub fn stack_batch(tensors: &[Array3<f32>]) -> Result<Array4<f32>> {
 /// - 3: BICUBIC
 /// - 4: BOX
 /// - 5: HAMMING
-pub fn pil_to_filter(resampling: Option<usize>) -> FilterType {
+pub(crate) fn pil_to_filter(resampling: Option<usize>) -> FilterType {
     match resampling {
         Some(0) => FilterType::Nearest,
         Some(1) => FilterType::Lanczos3,
@@ -3925,7 +3929,7 @@ pub fn pil_to_filter(resampling: Option<usize>) -> FilterType {
 
 /// Convert normalized mean values [0, 1] to RGB bytes, truncated like the
 /// reference's `int(x * 255)` (the CLIP mean fills with 122, 116, 104).
-pub fn mean_to_rgb(mean: &[f64; 3]) -> Rgb<u8> {
+pub(crate) fn mean_to_rgb(mean: &[f64; 3]) -> Rgb<u8> {
     Rgb([
         (mean[0] * 255.0) as u8,
         (mean[1] * 255.0) as u8,
@@ -4040,7 +4044,11 @@ fn torch_cubic_passes_fma(
 /// 448:336 and 640:336 among them). A Keys kernel with `a = -0.5` and a
 /// single summation differs from it by up to a fifth of the normalized
 /// scale on a 2x downscale.
-pub fn resize_bicubic_torch_f32(tensor: &Array3<f32>, out_h: usize, out_w: usize) -> Array3<f32> {
+pub(crate) fn resize_bicubic_torch_f32(
+    tensor: &Array3<f32>,
+    out_h: usize,
+    out_w: usize,
+) -> Array3<f32> {
     let (h, w) = (tensor.shape()[1], tensor.shape()[2]);
     if out_h == 0 || out_w == 0 || h == 0 || w == 0 {
         return Array3::zeros((tensor.shape()[0], out_h, out_w));
