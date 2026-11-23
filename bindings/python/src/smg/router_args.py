@@ -1024,7 +1024,7 @@ class RouterArgs:
             default=RouterArgs.policy_controller,
             help=(
                 "Choose off for the classic routing policies or on for the policy controller."
-                " Requests the controller cannot decide are refused by name."
+                " With on, the routing options keep their meaning through a policy document."
             ),
         )
         routing_group.add_argument(
