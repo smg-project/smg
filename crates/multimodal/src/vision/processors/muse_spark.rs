@@ -459,24 +459,6 @@ impl MuseSparkVisionProcessor {
         )
     }
 
-    /// The resize plan of a `width` x `height` image under `config`.
-    pub fn image_plan(
-        width: u32,
-        height: u32,
-        config: &PreProcessorConfig,
-    ) -> Result<ResizePlan, TransformError> {
-        MuseSparkVisionSettings::for_images(config).plan(height as usize, width as usize)
-    }
-
-    /// The resize plan of a clip's `width` x `height` frames under `config`.
-    pub fn video_plan(
-        width: u32,
-        height: u32,
-        config: &PreProcessorConfig,
-    ) -> Result<ResizePlan, TransformError> {
-        MuseSparkVisionSettings::for_video(config).plan(height as usize, width as usize)
-    }
-
     fn preprocess_frames<'a, I>(
         &self,
         frames: I,
@@ -1142,11 +1124,15 @@ mod tests {
     fn video_frames_resize_under_the_per_frame_cap() {
         let config = video_config();
         // 1280x720 under 256 tokens per frame: the reference grid is 12x21.
-        let plan = MuseSparkVisionProcessor::video_plan(1280, 720, &config).unwrap();
+        let plan = MuseSparkVisionSettings::for_video(&config)
+            .plan(720, 1280)
+            .unwrap();
         assert_eq!((plan.grid_h, plan.grid_w, plan.tokens), (24, 42, 252));
         assert_eq!((plan.width, plan.height), (588, 336));
         // The same frame as an image gets the image cap instead.
-        let plan = MuseSparkVisionProcessor::image_plan(1280, 720, &image_config()).unwrap();
+        let plan = MuseSparkVisionSettings::for_images(&image_config())
+            .plan(720, 1280)
+            .unwrap();
         assert_eq!((plan.grid_h, plan.grid_w, plan.tokens), (52, 92, 1196));
     }
 

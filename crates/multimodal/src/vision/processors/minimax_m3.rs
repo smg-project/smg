@@ -115,26 +115,6 @@ impl MiniMaxM3VisionProcessor {
         )
     }
 
-    /// Create a processor with custom settings.
-    pub fn with_config(
-        patch_size: usize,
-        merge_size: usize,
-        min_pixels: usize,
-        max_pixels: usize,
-        temporal_patch_size: usize,
-    ) -> Self {
-        // The caller's `max_pixels` governs video too; flooring it at the
-        // video default would ignore a deliberate reduction.
-        Self::build(
-            patch_size,
-            merge_size,
-            temporal_patch_size,
-            min_pixels,
-            max_pixels,
-            max_pixels,
-        )
-    }
-
     fn build(
         patch_size: usize,
         merge_size: usize,
@@ -223,11 +203,6 @@ impl MiniMaxM3VisionProcessor {
     }
 
     /// Layer a config over this processor's settings.
-    ///
-    /// Values the config does not specify keep whatever this processor was
-    /// built with, so settings supplied through [`Self::with_config`] survive
-    /// into `preprocess` and `calculate_num_tokens` instead of being reset to
-    /// the checkpoint defaults.
     fn layered_over(&self, config: &PreProcessorConfig) -> Result<Self, TransformError> {
         let merge_size = config
             .merge_size
@@ -562,10 +537,10 @@ mod tests {
     }
 
     #[test]
-    fn with_config_settings_survive_request_layering() {
+    fn built_settings_survive_request_layering() {
         // A processor built with explicit settings must keep them when a
         // request config does not override them.
-        let processor = MiniMaxM3VisionProcessor::with_config(14, 2, 3136, 200_704, 2);
+        let processor = MiniMaxM3VisionProcessor::build(14, 2, 2, 3136, 200_704, 200_704);
         let mut config = m3_config();
         // The checkpoint block carries merge/temporal but no pixel bounds.
         config.max_pixels = None;
