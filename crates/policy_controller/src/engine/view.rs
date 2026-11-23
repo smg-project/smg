@@ -811,7 +811,9 @@ pub struct Candidate {
     pub labels: u64,
     /// Encode-side compatibility for an encode-prefill-decode dispatch.
     pub ec_compatible: bool,
-    /// The worker takes images.
+    /// The worker takes pixel media: an image or a video
+    /// ([`MediaCounts::holds_pixels`]). The crate's docs say of such a
+    /// worker that it takes images.
     pub vision: bool,
     /// Reachable from one gateway only (a host-local wire).
     pub host_local: bool,
@@ -895,7 +897,8 @@ impl Candidate {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FixedFacts {
-    /// Whether the worker takes images ([`Candidate::vision`]).
+    /// Whether the worker takes pixel media, an image or a video
+    /// ([`Candidate::vision`]).
     pub vision: bool,
     /// The id the program knows the worker by ([`Candidate::id`]): a
     /// controller's id of the stored worker an object stands for. A
@@ -974,6 +977,15 @@ impl MediaCounts {
         video: 0,
         bytes: 0,
     };
+
+    /// Whether the request holds pixels: an image or a video. Only a
+    /// worker with a vision encoder takes such media, so a test of vision
+    /// by these counts reads this, never the image count alone. A host
+    /// states each count as it is.
+    #[must_use]
+    pub const fn holds_pixels(&self) -> bool {
+        (self.images | self.video) != 0
+    }
 }
 
 /// An allow-listed header: its name as a position into the spec's declared

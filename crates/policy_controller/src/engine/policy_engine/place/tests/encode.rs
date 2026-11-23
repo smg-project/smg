@@ -232,7 +232,8 @@ fn gap(answer: Result<Placement<'_>, Unplaced>) -> Option<&'static str> {
 /// to decide it again. The same items with no image stated take the decode
 /// that holds fewer requests. That request's prefill alone is booked, and
 /// its decode is decided again on the placement, over the pair's two of the
-/// three lists, with the item's encoder kept.
+/// three lists, with the item's encoder kept. References beside a video and
+/// no image are booked as those beside an image.
 ///
 /// The classic router prefers a decode that takes images for such a
 /// request where a pair has one
@@ -307,6 +308,28 @@ fn references_beside_an_image_keep_one_decision_on_a_decode_that_takes_images() 
     let placement = engine.place(&demanding).expect("a placement");
     assert_eq!(three.places(&placement), (0, 1, vec![0]));
     assert_eq!(*heard.lock(), [issued(prefill), issued(takes_images)]);
+    drop(placement);
+    heard.lock().clear();
+
+    // Nor is this one: the same references beside a video and no image. A
+    // video holds the decode as an image does, so the request keeps one
+    // decision that books both sides, and its decode never stood chosen.
+    // The classic router asks vision for an image or a video alike
+    // (`model_gateway/src/routers/grpc/multimodal/capability.rs:325-344`
+    // on main d6517a4fe).
+    let with_a_video = PlaceRequest {
+        media: MediaCounts {
+            video: 1,
+            ..MediaCounts::NONE
+        },
+        ..with_an_image
+    };
+    let mut placement = engine.place(&with_a_video).expect("a placement");
+    assert_eq!(three.places(&placement), (0, 1, vec![0]));
+    assert_eq!(*heard.lock(), [issued(prefill), issued(takes_images)]);
+    placement.sent(Side::Prefill);
+    let never_chosen = Unplaced::Refused(DecisionRefused::Decode(DecodeRefused::NotChosen));
+    assert_eq!(placement.decode_again(&with_a_video), Err(never_chosen));
 }
 
 /// An encode request is placed by one call: the placement names its

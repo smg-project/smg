@@ -275,9 +275,9 @@ pub struct PlaceRequest<'a> {
     /// under every document. The word is a pair's: over one list it asks
     /// nothing, and a first attempt that carries it is plain still. An
     /// encode request whose decode is held to the workers that take images
-    /// ([`EncodeItems::decode_images`], or references beside an image)
-    /// books its decode with its prefill whatever it states here: a decode
-    /// asked again reads no image fact.
+    /// ([`EncodeItems::decode_images`], or references beside an image or a
+    /// video) books its decode with its prefill whatever it states here: a
+    /// decode asked again reads no image fact.
     pub decode_again: bool,
     /// The hash ring the caller keeps of the model's workers, lent to the
     /// request's decision ([`LentRing`]): one ring for a pair's two lists,
@@ -746,15 +746,15 @@ impl RequestMaker for Made<'_, '_> {
         }
         // The document's word, like the keys: read from the generation
         // that decides. An encode request whose decode is held to the ones
-        // that take images, by its demand or by the preference of image
-        // references, states no later decode: a decode asked again reads
-        // no image fact. The hold is read last, so a request that asks no
-        // decode again reads none of it.
+        // that take images, by its demand or by the preference of
+        // references beside pixels, states no later decode: a decode asked
+        // again reads no image fact. The hold is read last, so a request
+        // that asks no decode again reads none of it.
         let later = request.decode_again
             && spec.decode_pick() == DecodePick::AfterPrefill
             && !request
                 .encode
-                .is_some_and(|items| items.holds_decode_to_images(request.media.images > 0));
+                .is_some_and(|items| items.holds_decode_to_images(request.media.holds_pixels()));
         Request {
             id: request.request_id.map_or(&[], str::as_bytes),
             facts,

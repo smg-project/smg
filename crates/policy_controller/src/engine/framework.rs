@@ -2245,16 +2245,19 @@ impl<'a> Set<'a> {
     }
 }
 
-/// The stage a pool is shed under when none of its rows takes the images
-/// its request carries: the `epd` plan's vision rule sheds under it, and so
-/// does a request's vision demand
+/// The stage a pool is shed under when none of its rows takes the pixels
+/// its request holds, an image or a video: the `epd` plan's vision rule
+/// sheds under it, and so does a request's vision demand
 /// ([`UnmetDemand::Vision`](crate::engine::demands::UnmetDemand::Vision)).
 pub(crate) const VISION: &str = "vision";
 
-/// The `epd` plan's vision rule: a request carrying images takes an encoder
-/// with a vision encoder; a request without them takes any.
+/// The `epd` plan's vision rule: a request that holds pixels, an image or
+/// a video ([`MediaCounts::holds_pixels`]), takes an encoder with a vision
+/// encoder; a request that holds none takes any.
+///
+/// [`MediaCounts::holds_pixels`]: crate::engine::view::MediaCounts::holds_pixels
 fn vision_fits(facts: &RequestFacts<'_>, c: &Candidate) -> bool {
-    facts.media.images == 0 || c.vision
+    !facts.media.holds_pixels() || c.vision
 }
 
 /// The scoring half of a profile's run, over the survivors its filter half
@@ -15560,6 +15563,59 @@ mod tests {
                 .pick()
                 .is_some(),
             "a single-plan binding reads no compatibility bit"
+        );
+    }
+
+    /// A video asks vision as an image does: a request of the encode phase
+    /// whose media is video alone takes the vision encoder alone, and a
+    /// pool with none is shed under the rule's stage. Audio alone asks
+    /// none. The classic router asks vision for any pixel item, an image
+    /// or a video (`is_pixel_modality` and `request_needs_vision`,
+    /// `model_gateway/src/routers/grpc/multimodal/capability.rs:325-344`
+    /// on main d6517a4fe).
+    #[test]
+    fn a_video_alone_takes_the_vision_encoder_under_the_epd_plan() {
+        let epd = epd_engine();
+        let decide = |media: MediaCounts, pool: &[Candidate]| {
+            let facts = RequestFacts {
+                media,
+                ..encode_facts(0)
+            };
+            let cx = Constraints::default();
+            epd.decide(
+                &facts,
+                &PoolFacts::default(),
+                pool,
+                &cx,
+                &mut Scratch::new(),
+            )
+        };
+        let video = MediaCounts {
+            video: 1,
+            ..MediaCounts::default()
+        };
+        let audio = MediaCounts {
+            audio: 1,
+            ..MediaCounts::default()
+        };
+        let pool = [
+            encode_candidate(0, true, false),
+            encode_candidate(1, true, true),
+        ];
+        let seen = decide(video, &pool);
+        let pick = seen.pick().expect("a pick");
+        let order: Vec<u32> = pick.targets.iter().map(|t| t.position).collect();
+        assert_eq!(order, [1], "a video takes the vision encoder alone");
+        match decide(video, &pool[..1]) {
+            Decision::Shed(shed) => assert_eq!(
+                (shed.emptied_by, shed.reason),
+                ("vision", ShedReason::NoEndpoints)
+            ),
+            other => panic!("a pool with no vision encoder answered {other:?}"),
+        }
+        assert!(
+            decide(audio, &pool[..1]).pick().is_some(),
+            "audio alone takes an encoder without a vision encoder"
         );
     }
 
