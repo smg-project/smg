@@ -414,8 +414,22 @@ fn the_plain_worker_warning_names_the_engine_the_route_and_what_was_read() {
     for (loads, read) in [
         (answer(&[0]), "does not name every rank"),
         (NativeLoads::Absent, "is not served"),
-        (NativeLoads::Unreadable, "answered what is no load report"),
-        (NativeLoads::Inconclusive, "gave no answer"),
+        (
+            NativeLoads::Unreadable(FetchFailure::Answer),
+            "answered what is no load report",
+        ),
+        (
+            NativeLoads::Unreadable(FetchFailure::Deadline),
+            "gave no answer",
+        ),
+        (
+            NativeLoads::Inconclusive(FetchFailure::Transport),
+            "gave no answer",
+        ),
+        (
+            NativeLoads::Inconclusive(FetchFailure::Answer),
+            "gave no answer",
+        ),
     ] {
         assert_eq!(missing_rank_loads(&loads, 2), Some(read));
     }

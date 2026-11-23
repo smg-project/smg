@@ -16,7 +16,10 @@ use super::{
 };
 use crate::{
     identity::{basic::ConnectionMode, endpoint::Endpoint},
-    load::monitor::{NativeLoads, WorkerMonitor, ENGINE_LOADS_ROUTE},
+    load::{
+        counts::FetchFailure,
+        monitor::{NativeLoads, WorkerMonitor, ENGINE_LOADS_ROUTE},
+    },
     worker::WorkerSpec,
     UNKNOWN_MODEL_ID,
 };
@@ -122,8 +125,9 @@ fn missing_rank_loads(loads: &NativeLoads, ranks: usize) -> Option<&'static str>
         NativeLoads::Available(answer) if answer.names_dp_ranks(ranks) => None,
         NativeLoads::Available(_) => Some("does not name every rank"),
         NativeLoads::Absent => Some("is not served"),
-        NativeLoads::Unreadable => Some("answered what is no load report"),
-        NativeLoads::Inconclusive => Some("gave no answer"),
+        NativeLoads::Unreadable(FetchFailure::Answer) => Some("answered what is no load report"),
+        // A send or a body read that failed on the way is no answer of the engine's.
+        NativeLoads::Unreadable(_) | NativeLoads::Inconclusive(_) => Some("gave no answer"),
     }
 }
 
