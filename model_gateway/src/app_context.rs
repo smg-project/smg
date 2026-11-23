@@ -1102,7 +1102,7 @@ impl AppContextBuilder {
         spec: &AppliedSpec,
         events: Option<&Arc<KvEventMonitor>>,
         policies: &PolicyRegistry,
-        workers: &Arc<WorkerRegistry>,
+        workers: &WorkerRegistry,
     ) -> Option<Arc<dyn CacheIndexes>> {
         let trees = spec
             .needs()

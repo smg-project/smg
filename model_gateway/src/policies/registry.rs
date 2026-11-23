@@ -867,7 +867,7 @@ impl PolicyRegistry {
         &self,
         document: &PolicySpec,
         page: u32,
-        workers: &Arc<WorkerRegistry>,
+        workers: &WorkerRegistry,
     ) -> Arc<LentTrees> {
         let made = || {
             let trees = Arc::new(LentTrees::of_document(document.clone(), page));
@@ -3467,7 +3467,7 @@ mod tests {
             config.policy.clone(),
             RoutingKeyOverrideConfig::default(),
         );
-        let workers = Arc::new(WorkerRegistry::new());
+        let workers = WorkerRegistry::new();
         for url in ["http://w1:8000", "http://w2:8000"] {
             workers.register(ready_worker(url, "llama-3"));
         }
