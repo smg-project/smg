@@ -56,10 +56,9 @@ use crate::{
 ///   document. Either document binds both: pairs first, over the prefill
 ///   and decode phases, and single requests behind. The sides of a pair run
 ///   under the mode's side policies and single requests under the main
-///   policy, as under the gateway's own policies. Over gRPC the mode counts
-///   tokens with no worker. The settings do not say which a gateway runs,
-///   so its document binds the single request all the same, and no request
-///   reaches that binding there.
+///   policy, as under the gateway's own policies. Over gRPC or ZMQ the mode
+///   counts tokens with no worker, so a gateway of one router plans the
+///   pair alone there ([`ConnectionModeSetting`]).
 /// - A policy's own setting lands in the stage of the preset that reads it,
 ///   and only where it differs from the number that stage runs at when its
 ///   document names none. The controller names those numbers and this
@@ -96,13 +95,14 @@ use crate::{
 /// A document of two families plans one where the other has no document.
 /// Pairs are left out of a regular configuration of many routers under the
 /// manual policy, whose session rule runs under the single plan alone, and
-/// beside the encode mode. Single requests are left out of a pair
-/// configuration whose main policy reads a setting no document says: a
-/// gateway of one router then refuses its token count, which its own
-/// policies place. That gateway leaves them out as well where one family's
-/// policy names a block size and the other places by a prefix ring, which
-/// counts its key in another size. A request of the family left out is
-/// refused.
+/// beside the encode mode. Single requests are left out of a pair gateway of
+/// one router that reaches its workers over gRPC or ZMQ: it places none.
+/// They are left out of a pair configuration whose main policy reads a
+/// setting no document says: a gateway of one router then refuses its token
+/// count, which its own policies place. That gateway leaves them out as well
+/// where one family's policy names a block size and the other places by a
+/// prefix ring, which counts its key in another size. A request of the
+/// family left out is refused.
 ///
 /// # What is not read
 ///
@@ -126,6 +126,9 @@ pub struct RoutingSettings {
     /// The gateway runs many routers side by side, so one document plans pairs
     /// and single workers.
     pub enable_igw: bool,
+    /// How the gateway reaches its workers. A pair mode of one router places
+    /// a single request, its token count, over HTTP alone.
+    pub connection_mode: ConnectionModeSetting,
     /// A document supplied beside the settings, to run in place of the one
     /// they mean.
     pub policy_spec: Option<PolicySpec>,
@@ -177,6 +180,7 @@ impl Default for RoutingSettings {
             mode: ModeSettings::Regular,
             policy: PolicySettings::Random,
             enable_igw: false,
+            connection_mode: ConnectionModeSetting::Http,
             policy_spec: None,
             grouped_dp_sticky: None,
             dp_minimum_tokens_scheduler: false,
@@ -210,6 +214,21 @@ impl RoutingSettings {
             | ModeSettings::EncodePrefillDecode { .. } => None,
         }
     }
+}
+
+/// How a gateway reaches its workers, as the configuration names it. One
+/// thing follows from it here: whether a gateway of one router in the pair
+/// mode places a single request, which its document then binds
+/// ([`RoutingSettings`], where a setting lands).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionModeSetting {
+    /// Over HTTP. A pair mode counts tokens on one prefill worker, a single
+    /// request its own routing places by the main policy.
+    Http,
+    /// Over gRPC. A pair mode counts tokens with no worker.
+    Grpc,
+    /// Over ZMQ, by the router that serves gRPC: no worker counts tokens.
+    Zmq,
 }
 
 /// The settings of the sticky override this module reads.
@@ -571,10 +590,12 @@ impl RoutingSettings {
             given.generation = 1;
         }
         // The default configuration of this gateway's kind: a provider mode
-        // has a document under the multi-router setting alone.
+        // has a document under the multi-router setting alone, and a pair
+        // mode binds a single request by how the gateway reaches its workers.
         let plain = Self {
             mode: self.mode.with_defaults(),
             enable_igw: self.enable_igw,
+            connection_mode: self.connection_mode,
             ..defaults.clone()
         }
         .policy_document()?;
@@ -752,18 +773,19 @@ fn presets(config: &RoutingSettings) -> Result<Planned<'_>, RoutingSettingsError
 /// pair run under the mode's side policies, which are the main policy in a
 /// regular configuration. Single requests run under the main policy.
 ///
-/// Over gRPC the pair mode counts tokens with no worker, as the encode mode
-/// does. The settings do not say which a gateway runs, so the pair mode's
-/// document binds the single request either way: over gRPC no request
-/// reaches that binding, and the document's needs still hold the main
-/// policy's.
+/// Over gRPC or ZMQ the pair mode counts tokens with no worker, as the
+/// encode mode does. A gateway of one router then places no single request
+/// and its document plans the pair alone: a binding no request reaches
+/// would still add the main policy's needs to the document's. A gateway of
+/// many routers serves single workers however it reaches them.
 ///
 /// `None` where the document plans one family: a regular configuration of
-/// one router, the encode mode, and a regular configuration whose main
-/// policy runs on no side of a pair. The manual policy is that one: its
-/// picker leaves the placement to the binding's session rule, and a rule
-/// runs under the single plan alone. A gateway in the encode mode counts
-/// tokens with no worker, so its document binds no single request.
+/// one router, the encode mode, a pair mode of one router over gRPC or ZMQ,
+/// and a regular configuration whose main policy runs on no side of a
+/// pair. The manual policy is that one: its picker leaves the placement to
+/// the binding's session rule, and a rule runs under the single plan alone.
+/// A gateway in the encode mode counts tokens with no worker, so its
+/// document binds no single request.
 fn both_families(config: &RoutingSettings) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
     let (mode, main) = (&config.mode, &config.policy);
     let both = match mode {
@@ -773,7 +795,7 @@ fn both_families(config: &RoutingSettings) -> Result<Option<Planned<'_>>, Routin
         ModeSettings::PrefillDecode {
             prefill_policy: _,
             decode_policy: _,
-        } => true,
+        } => config.enable_igw || config.connection_mode == ConnectionModeSetting::Http,
         ModeSettings::EncodePrefillDecode {
             encode_policy: _,
             prefill_policy: _,
@@ -3200,6 +3222,73 @@ mod tests {
                 .expect("the document of two families");
             assert_eq!(both.bindings.len(), 2);
             assert_eq!(validated(&both).err(), None);
+        }
+        // The sides of one binding say one document together: a ring beside
+        // a side that names the size counts in it, as it did, and the
+        // single request is bound under a main policy that names none.
+        let mixed = RoutingSettings {
+            mode: pair_mode(Some(ring()), Some(cache_aware_over(96))),
+            ..config(PolicySettings::RoundRobin)
+        };
+        let both = mixed
+            .policy_document()
+            .expect("the document of two families");
+        assert_eq!((both.bindings.len(), both.view.block_size), (2, Some(96)));
+        assert_eq!(validated(&both).err(), None);
+    }
+
+    /// Over gRPC or ZMQ a gateway in the pair mode counts tokens with no
+    /// worker. Its document of one router is then the pair's own: it binds
+    /// no single request, and reads nothing for the main policy. A gateway
+    /// of many routers serves single workers however it reaches them, and
+    /// over HTTP the single request is bound. A given document beside no
+    /// routing setting is in force over each.
+    #[test]
+    fn a_pair_mode_of_one_router_binds_a_single_request_over_http_alone() {
+        let over = |connection_mode| RoutingSettings {
+            connection_mode,
+            ..round_robin_pairs_under(at_flag_defaults("cache_aware"))
+        };
+        let events = |document: &PolicySpec| {
+            validated(document)
+                .map(|applied| applied.needs().events)
+                .ok()
+        };
+        let both = over(ConnectionModeSetting::Http)
+            .policy_document()
+            .expect("the document over HTTP");
+        assert_eq!((both.bindings.len(), events(&both)), (2, Some(true)));
+
+        let given = preset("round_robin");
+        for connection_mode in [ConnectionModeSetting::Grpc, ConnectionModeSetting::Zmq] {
+            let settings = over(connection_mode);
+            let alone = pair_alone(&settings).expect("the pair's own document");
+            assert_eq!(
+                (alone.bindings.len(), events(&alone)),
+                (1, Some(false)),
+                "{connection_mode:?}"
+            );
+            assert_eq!(
+                settings.policy_document().as_ref(),
+                Ok(&alone),
+                "{connection_mode:?}"
+            );
+            assert_eq!(
+                many_routers(settings).policy_document().as_ref(),
+                Ok(&both),
+                "{connection_mode:?}"
+            );
+            let unset = RoutingSettings {
+                mode: pair_mode(None, None),
+                connection_mode,
+                policy_spec: Some(given.clone()),
+                ..defaults()
+            };
+            assert_eq!(
+                unset.policy_document_in_force(&defaults()),
+                Ok(given.clone()),
+                "{connection_mode:?}"
+            );
         }
     }
 
