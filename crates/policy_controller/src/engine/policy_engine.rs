@@ -1329,16 +1329,16 @@ mod tests {
 
     /// The places one pick decides: the picker places by itself, no stage
     /// scores, and the filters are the two tests of a worker's health.
-    /// Round robin's preset is one, and passthrough's. No other preset is
-    /// one, and each names its own profile and the stage of it that asks more.
+    /// Round robin's preset is one, random's and passthrough's. No other preset
+    /// is one, and each names its own profile and the stage of it that asks more.
     #[test]
     fn a_place_is_picked_alone_where_its_picker_decides_by_itself() {
-        for engine in [preset("round_robin"), preset("passthrough")] {
+        for name in ["round_robin", "random", "passthrough"] {
+            let engine = preset(name);
             let place = engine.place_for(MODEL, Phase::Single);
             assert!(matches!(place, Place::Alone(_)), "{place:?}");
         }
         for name in [
-            "random",
             "power_of_two",
             "least_load",
             "consistent_hashing",
@@ -1359,10 +1359,10 @@ mod tests {
             assert!(!stage.to_string().is_empty(), "{name}: {stage}");
         }
         assert_eq!(
-            preset("random").place_for(MODEL, Phase::Single),
+            preset("manual").place_for(MODEL, Phase::Single),
             Place::NotAlone {
-                profile: "random",
-                in_the_way: InTheWay::Picker("random"),
+                profile: "manual",
+                in_the_way: InTheWay::Picker("manual"),
             }
         );
         assert!(matches!(
@@ -1507,6 +1507,48 @@ mod tests {
                 let at = engine.pick(profile, members.lent(), RoutingState::eligible);
                 assert_eq!(at, Some((first + step) % workers), "{workers} workers");
             }
+        }
+    }
+
+    /// The `random` preset's pick is one draw of its picker over the pool:
+    /// every ready worker takes a near even share and a worker that is not
+    /// ready takes none, by the pool's own draws and by a pass over a list
+    /// alike. A pool whose draws miss is passed over, and the pass names
+    /// its ready worker.
+    #[test]
+    fn a_random_pick_is_one_draw_over_the_ready_workers() {
+        let engine = preset("random");
+        let profile = alone(&engine);
+        let list = pool(8);
+        list[3].set_status(WorkerStatus::NotReady);
+        let members = PublishedList::new(Arc::clone(&list));
+        let (mut picks, mut passes) = ([0u32; 8], [0u32; 8]);
+        for _ in 0..4_000 {
+            let at = engine.pick(profile, members.lent(), RoutingState::eligible);
+            picks[at.expect("a ready worker")] += 1;
+            let at = engine.pick_among(profile, &list, RoutingState::eligible);
+            passes[at.expect("a ready worker")] += 1;
+        }
+        for shares in [picks, passes] {
+            assert_eq!(shares[3], 0, "{shares:?}");
+            let even = |&share: &u32| (350..800).contains(&share);
+            assert_eq!(
+                shares.iter().filter(|share| even(share)).count(),
+                7,
+                "{shares:?}"
+            );
+        }
+
+        // One ready worker of 64: eight draws miss it nearly nine times in
+        // ten, and the pass over the pool then names it.
+        let wide = pool(64);
+        for worker in wide.iter().skip(1) {
+            worker.set_status(WorkerStatus::NotReady);
+        }
+        let members = PublishedList::new(wide);
+        for _ in 0..200 {
+            let at = engine.pick(profile, members.lent(), RoutingState::eligible);
+            assert_eq!(at, Some(0));
         }
     }
 

@@ -794,16 +794,18 @@ waits for it (5.2).
 hint, no demand, no lifted overload veto, no later decode, no held-back worker and no places of its
 list. A profile is decided by *one pick* when its picker needs nothing of the request, it has no
 scorer and no filter beyond the health tests, and its binding has no sessions rule and names no
-shadow. On main two pickers say so: round robin and `passthrough`.
+shadow. On main three pickers say so: round robin, `random` and `passthrough`.
 
 1. The engine asks `maker.plain()`. If the request is plain and a single one, the host handed one
    list, every worker of the list serves the protocols the request states, and the list's model
    is bound to a profile that one pick decides, the picker names a worker by its own rule and the
    engine answers with its position. Round robin adds one to the list's counter and takes the
    worker it lands on if that worker is eligible. Where it is not, the engine reads the list once
-   and the rotation picks among the eligible workers. `passthrough` takes the first eligible
-   worker in the list's order. Where no worker of the list is eligible, the request takes the
-   full path.
+   and the rotation picks among the eligible workers. `random` draws a position below the list's
+   size from the calling thread's own draw sequence, and again while the worker drawn is not
+   eligible, eight draws at most. Past them the engine reads the list once and draws among the
+   eligible workers. `passthrough` takes the first eligible worker in the list's order. Where no
+   worker of the list is eligible, the request takes the full path.
 2. If no stage of the document needs lease events, that is all. No request is built, no clock is
    read, no lease exists, and the host owes the engine nothing more.
 
@@ -984,7 +986,7 @@ the decode side adds `has-room`.
 
 | Policy | Scorers | Picker | What it remembers between decisions |
 |---|---|---|---|
-| `random` | none | `random` | nothing: it draws from the decision's seed |
+| `random` | none | `random` | nothing: it draws from the decision's seed, and the one pick from the calling thread's own draw sequence |
 | `passthrough` | none | `passthrough` | nothing: the first survivor |
 | `round_robin` | none | `round-robin` | one counter for each worker list, which the one pick and a first attempt's whole decision both turn, at every list size; in a fixed table, one rotation for each set of surviving workers, which a refused turn, a retry and a request held to places turn, and one for each pool whose draw is handed no list counter |
 | `power_of_two` | `least-load` | `power-of-two` | what was dispatched to each worker since its last load report |

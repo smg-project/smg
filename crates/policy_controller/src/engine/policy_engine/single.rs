@@ -1650,7 +1650,7 @@ pub(crate) mod tests {
     /// kept: the retries behind it allocate nothing for it.
     #[test]
     fn only_a_retry_over_ranks_takes_the_threads_list_and_it_grows_once() {
-        let engine = preset("random");
+        let engine = preset("power_of_two");
         let (ranks, _) = engines(&[4, 4]);
         let ranked = PublishedList::new(Arc::clone(&ranks));
         let alone = pool(8);
