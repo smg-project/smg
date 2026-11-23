@@ -4096,11 +4096,8 @@ pub(crate) mod tests {
             ("grpc://d:1", WorkerType::Decode, None),
         ]);
         let can_pair = |pairing: smg_policy_controller::document::Pairing| {
-            let mut document = smg_policy_controller::document::PolicySpec::pair_presets(
-                "round_robin",
-                "round_robin",
-            )
-            .expect("paired presets");
+            let mut document =
+                PolicySpec::pair_presets("round_robin", "round_robin").expect("paired presets");
             document.plans.pd_pair.pairing = pairing;
             let settings = crate::config::RouterConfig {
                 mode: crate::config::RoutingMode::PrefillDecode {
