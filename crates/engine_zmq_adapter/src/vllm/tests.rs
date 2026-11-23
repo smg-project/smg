@@ -560,7 +560,7 @@ fn kv_transfer_params_prefer_json_then_the_legacy_pair() {
 fn out_of_vocab_token_ids_are_refused() {
     const VOCAB: u32 = 1000;
     let check = |req: &vllm::GenerateRequest| {
-        validate_token_ids(req, &[], VocabBounds::new(VOCAB, None), false)
+        validate_token_ids(req, &[], VocabBounds::new(VOCAB, None), None)
     };
     let ok = tokenized_req(vllm::SamplingParams {
         stop_token_ids: vec![0, 999],
@@ -670,12 +670,12 @@ fn image_req(
 #[test]
 fn an_out_of_vocab_id_passes_at_an_image_position_only() {
     // The model's 1000 rows; the tokenizer's ids reach 1000, the image token.
-    let bounds = VocabBounds::new(1000, Some(1000));
-    let check = |mut req: vllm::GenerateRequest| {
+    let check_within = |mut req: vllm::GenerateRequest, bounds| {
         let media = translate_media(&mut req, ModelDtype::BFloat16).expect("translated");
-        validate_token_ids(&req, &media.embed_positions, bounds, false)
+        validate_token_ids(&req, &media.embed_positions, bounds, None)
             .map(|()| media.embed_positions)
     };
+    let check = |req| check_within(req, VocabBounds::new(1000, Some(1000)));
 
     // The image token 1000 at the image's positions 1..4.
     let accepted = check(image_req(vec![5, 1000, 1000, 1000, 6], (1, 3), Some(1000)));
@@ -702,9 +702,13 @@ fn an_out_of_vocab_id_passes_at_an_image_position_only() {
         )),
         Err("Token id 1000 is out of vocabulary".to_string())
     );
-    // Inside the range but not the image token: the table embeds it.
+    // Inside the range but not the image token: the table embeds it, so it
+    // keeps the model's bound even where the tokenizer's ids reach it.
     assert_eq!(
-        check(image_req(vec![5, 1000, 1001, 1000, 6], (1, 3), Some(1000))),
+        check_within(
+            image_req(vec![5, 1000, 1001, 1000, 6], (1, 3), Some(1000)),
+            VocabBounds::new(1000, Some(1001))
+        ),
         Err("Token id 1001 is out of vocabulary".to_string())
     );
     // An image position is held to the tokenizer's bound: a caller naming
@@ -725,7 +729,7 @@ fn an_out_of_vocab_id_passes_at_an_image_position_only() {
             &req,
             &media.embed_positions,
             VocabBounds::new(1000, None),
-            false
+            None
         ),
         Err("Token id 1000 is out of vocabulary".to_string())
     );
@@ -805,17 +809,20 @@ fn an_out_of_vocab_id_passes_at_an_image_position_only() {
 /// prefill side's expanded prompt, its image-token run included, with the
 /// media stripped (the KV it pulls supplies those positions): on an engine
 /// whose connector pulls on the claim, its prompt is held to the tokenizer's
-/// bound at every position but the last (computed locally, so held to the
-/// model's), and its `stop_token_ids` and `logit_bias` to the model's. The same prompt without the decode-side params, at `n > 1`, or
-/// on an engine that does not pull on the claim is refused.
+/// bound at every position but its local tail (computed on this engine, so
+/// held to the model's), and its `stop_token_ids` and `logit_bias` to the
+/// model's. The same prompt without the decode-side params, at `n > 1`,
+/// asking `prompt_logprobs`, on an engine that does not pull on the claim,
+/// or with an unknown tail is refused.
 #[test]
 fn a_pd_decode_side_is_held_to_the_outer_bound() {
     let bounds = VocabBounds::new(1000, Some(1000));
-    let check_on = |mut req: vllm::GenerateRequest, pulls_remote_kv: bool| {
+    let check_on = |mut req: vllm::GenerateRequest, tail: Option<usize>| {
         let media = translate_media(&mut req, ModelDtype::BFloat16).expect("translated");
-        validate_token_ids(&req, &media.embed_positions, bounds, pulls_remote_kv)
+        let tail = tail.and_then(NonZeroUsize::new);
+        validate_token_ids(&req, &media.embed_positions, bounds, tail)
     };
-    let check = |req| check_on(req, true);
+    let check = |req| check_on(req, Some(1));
     // The gateway's language-model-only decode leg: the expanded ids, the
     // per-image hashes only, the KV handoff.
     let decode = |sampling: vllm::SamplingParams, params: Option<&str>| {
@@ -856,9 +863,10 @@ fn a_pd_decode_side_is_held_to_the_outer_bound() {
         Err("Token id 999999999 is out of vocabulary".to_string())
     );
 
-    // A forged claim on an engine with no KV connector changes nothing.
+    // A forged claim on an engine with no KV connector changes nothing, nor
+    // does a claim on one whose local tail is unknown.
     assert_eq!(
-        check_on(decode(vllm::SamplingParams::default(), DECODE), false),
+        check_on(decode(vllm::SamplingParams::default(), DECODE), None),
         refused
     );
 
@@ -872,6 +880,47 @@ fn a_pd_decode_side_is_held_to_the_outer_bound() {
         }
         assert_eq!(check(tail), refused, "{input_ids:?}");
     }
+    // Where the engine computes a longer tail itself (NIXL pulls short of a
+    // multi-module MTP drafter's prefill lookahead), every position of it
+    // keeps the model's bound, and the positions ahead of it do not.
+    let with_prompt = |input_ids: Vec<u32>| {
+        let mut req = decode(vllm::SamplingParams::default(), DECODE);
+        if let Some(vllm::generate_request::Input::Tokenized(t)) = req.input.as_mut() {
+            t.input_ids = input_ids;
+        }
+        req
+    };
+    assert_eq!(
+        check_on(with_prompt(vec![5, 1000, 1000, 1000, 6, 7, 8]), Some(3)),
+        Ok(())
+    );
+    assert_eq!(
+        check_on(with_prompt(vec![5, 1000, 1000, 1000, 1000, 7, 8]), Some(3)),
+        refused
+    );
+    assert_eq!(
+        check(with_prompt(vec![5, 1000, 1000, 1000, 1000, 7, 8])),
+        Ok(())
+    );
+
+    // `prompt_logprobs` makes the engine skip reading any cached prefix, the
+    // pulled KV included, so it computes the whole prompt: the first
+    // position, which the scoring check leaves alone, keeps the model's bound.
+    let scored = |input_ids: Vec<u32>| {
+        let mut req = decode(
+            vllm::SamplingParams {
+                prompt_logprobs: Some(0),
+                ..Default::default()
+            },
+            DECODE,
+        );
+        if let Some(vllm::generate_request::Input::Tokenized(t)) = req.input.as_mut() {
+            t.input_ids = input_ids;
+        }
+        req
+    };
+    assert_eq!(check(scored(vec![1000, 5, 6])), refused);
+    assert_eq!(check(with_prompt(vec![1000, 5, 6])), Ok(()));
 
     // Not a decode side: no params, a prefill side's, a malformed field.
     for params in [
@@ -926,7 +975,7 @@ fn a_legacy_host_port_pair_alone_is_no_handoff() {
             &req,
             &media.embed_positions,
             VocabBounds::new(1000, Some(1500)),
-            pulls,
+            pulls.then_some(NonZeroUsize::MIN),
         )
     };
     let legacy = |input_ids: Vec<u32>, sampling: vllm::SamplingParams| {

@@ -46,7 +46,12 @@ pub(super) async fn connect_engine(state: Arc<State>, inputs: ConnectInputs) {
             // A PD decode side's prompt KV is pulled only by a consumer of
             // a connector that acts on the request's handoff claim; elsewhere
             // the claim is ignored and the engine computes the prompt itself.
-            client.note_kv_transfer_config(&state.model.kv_connector, &state.model.kv_role);
+            // Even after a pull it computes the prompt's tail itself.
+            client.note_kv_transfer_config(
+                &state.model.kv_connector,
+                &state.model.kv_role,
+                state.model.pd_local_tail,
+            );
             // Known at start: the wire reports every scheduler step while the
             // engine's statistics are on, before its first batch shows it.
             if state.model.log_stats == Some(true) {

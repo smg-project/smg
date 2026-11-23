@@ -5040,6 +5040,7 @@ fn decode_side_on(connector: &str) -> VllmModelInfo {
     model.kv_connector = connector.to_string();
     model.kv_role = "kv_consumer".to_string();
     model.kv_engine_id = "decode-engine".to_string();
+    model.pd_local_tail = 1;
     model.runs_mooncake = connector == "MooncakeConnector";
     model
 }

@@ -4,6 +4,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
+    num::NonZeroUsize,
     ops::Range,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -1242,19 +1243,24 @@ impl VocabBounds {
 /// feature and leaves its positions text.
 ///
 /// The decode side of a PD pair is held to vLLM's bound at every position
-/// but its last: its prompt is the prefill side's expanded one, image-token
-/// run included, with the media stripped to an identity batch (or to
-/// nothing) because the KV it pulls supplies those positions. The last
-/// position keeps the ordinary bounds: every connector pulls at most the
-/// whole prompt, and on a full hit the scheduler recomputes the last token
-/// locally to sample the next (`_update_waiting_for_remote_kv`), so that
-/// token is embedded on this engine. That holds only when the request
+/// but its local tail: its prompt is the prefill side's expanded one,
+/// image-token run included, with the media stripped to an identity batch
+/// (or to nothing) because the KV it pulls supplies those positions. The
+/// tail keeps the ordinary bounds, because the engine computes it itself
+/// after the pull. On a full hit the scheduler recomputes the last token to
+/// sample the next (`_update_waiting_for_remote_kv`). NIXL in vLLM 0.31 and
+/// later also pulls short of the multi-module MTP drafter's prefill
+/// lookahead (`_prefill_backoff`). `handoff_tail` is that tail's length as
+/// the servicer reports it for the engine. It applies only when the request
 /// claims the handoff in the form the engine's connector pulls on
-/// ([`consumes_remote_prefill`], single-sample only) and
-/// `engine_pulls_remote_kv` says the engine's connector does
-/// ([`pulls_on_do_remote_prefill`]). An engine that does not pull on the
-/// claim computes the prompt itself, so a forged or mismatched claim there
-/// gets the ordinary bounds. A decode side whose KV load fails, or which is
+/// ([`consumes_remote_prefill`], single-sample only), and only when it asks
+/// no `prompt_logprobs`. Such a request skips reading any cached prefix
+/// (vLLM's default `skip_reading_prefix_cache`), so the scheduler drops the
+/// connector's hit and computes the whole prompt locally. `None` says the
+/// engine does not pull on the claim ([`pulls_on_do_remote_prefill`]) or
+/// its tail is unknown: the engine then computes the prompt itself as far
+/// as this check knows, so a forged, mismatched or unmeasured claim gets
+/// the ordinary bounds. A decode side whose KV load fails, or which is
 /// preempted, and is recomputed reads what vLLM's own frontend would have
 /// let through.
 ///
@@ -1266,22 +1272,36 @@ pub(crate) fn validate_token_ids(
     req: &vllm::GenerateRequest,
     embed_positions: &[Range<usize>],
     bounds: VocabBounds,
-    engine_pulls_remote_kv: bool,
+    handoff_tail: Option<NonZeroUsize>,
 ) -> Result<(), String> {
     let sampling = req.sampling_params.as_ref();
     if let Some(vllm::generate_request::Input::Tokenized(tokenized)) = &req.input {
         let ids = &tokenized.input_ids;
-        let handoff = engine_pulls_remote_kv && consumes_remote_prefill(req);
-        let text_bound = if handoff { bounds.outer } else { bounds.model };
+        let scores_prompt = sampling.is_some_and(|sp| sp.prompt_logprobs.is_some());
+        let tail = handoff_tail.filter(|_| !scores_prompt && consumes_remote_prefill(req));
+        let text_bound = if tail.is_some() {
+            bounds.outer
+        } else {
+            bounds.model
+        };
         validate_prompt_ids(ids, embed_positions, text_bound, bounds.outer)?;
-        // The decode side computes its last prompt token itself, KV pulled
-        // or not: a text id there reads the embedding table.
-        if let (true, Some(&id)) = (handoff, ids.last()) {
-            if id >= bounds.model && !in_runs(embed_positions, ids.len() - 1) {
+        // The decode side computes its local tail itself, KV pulled or not:
+        // a text id there reads the embedding table.
+        if let Some(tail) = tail {
+            let start = ids.len().saturating_sub(tail.get());
+            let largest = ids[start..]
+                .iter()
+                .enumerate()
+                .filter(|&(offset, &id)| {
+                    id >= bounds.model && !in_runs(embed_positions, start + offset)
+                })
+                .map(|(_, &id)| id)
+                .max();
+            if let Some(id) = largest {
                 return Err(format!("Token id {id} is out of vocabulary"));
             }
         }
-        if sampling.is_some_and(|sp| sp.prompt_logprobs.is_some()) {
+        if scores_prompt {
             refuse_unscorable_prompt_ids(ids, bounds.model)?;
         }
     }

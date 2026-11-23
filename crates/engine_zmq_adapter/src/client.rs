@@ -5,6 +5,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap},
+    num::NonZeroUsize,
     path::Path,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -186,10 +187,11 @@ pub(crate) struct ZmqConnectionMeta {
     vocab_bounds: OnceLock<VocabBounds>,
     /// Set once by the caller that knows it (the servicer that launched the
     /// engine) when the engine's KV connector pulls a PD decode side's prompt
-    /// KV on `do_remote_prefill`: only then does a request's handoff claim
-    /// loosen its prompt bound
+    /// KV on `do_remote_prefill`: how many trailing prompt tokens the engine
+    /// still computes itself after the pull. Only then does a request's
+    /// handoff claim loosen its prompt bound, and only ahead of that tail
     /// (see [`ZmqEngineClient::note_kv_transfer_config`]).
-    engine_pulls_remote_kv: OnceLock<()>,
+    remote_kv_local_tail: OnceLock<NonZeroUsize>,
     /// The engine's supported tasks (`get_supported_tasks`), fetched on first
     /// use and kept for the connection, as vLLM's frontend keeps them.
     supported_tasks: tokio::sync::OnceCell<Arc<[String]>>,
@@ -450,7 +452,7 @@ impl ZmqEngineClient {
                 tokenizer_eos: OnceLock::new(),
                 structured_outputs: OnceLock::new(),
                 vocab_bounds: OnceLock::new(),
-                engine_pulls_remote_kv: OnceLock::new(),
+                remote_kv_local_tail: OnceLock::new(),
                 supported_tasks: tokio::sync::OnceCell::new(),
                 engine_truncates_long_prompts: OnceLock::new(),
                 engine_places_by_rendezvous_room: OnceLock::new(),
@@ -611,15 +613,23 @@ impl ZmqEngineClient {
 
     /// Note the engine's KV connector and role, as the servicer reports
     /// them for PD (`kv_connector` projects a `MultiConnector` onto its one
-    /// P2P child). When that connector pulls a decode side's prompt KV on
-    /// `do_remote_prefill: true` (NIXL, Mooncake, MoRIIO, as a consumer), a
-    /// request claiming that handoff has its prompt held to vLLM's own bound
-    /// rather than the model's (see `validate_token_ids`). Any other
-    /// configuration leaves the claim changing nothing: such an engine
-    /// computes the prompt itself. The first matching call wins.
-    pub fn note_kv_transfer_config(&self, kv_connector: &str, kv_role: &str) {
+    /// P2P child), and `local_tail`: how many trailing prompt tokens a decode
+    /// side still computes itself after the pull (at least the last, which
+    /// is recomputed to sample the next; more where the connector pulls short
+    /// of a speculative drafter's prefill lookahead). When that connector
+    /// pulls a decode side's prompt KV on `do_remote_prefill: true` (NIXL,
+    /// Mooncake, MoRIIO, as a consumer), a request claiming that handoff has
+    /// its prompt ahead of the tail held to vLLM's own bound rather than the
+    /// model's (see `validate_token_ids`). Any other configuration leaves the
+    /// claim changing nothing: such an engine computes the prompt itself. So
+    /// does a zero `local_tail` (unknown): the tail is never assumed to be
+    /// one token. The first matching call wins.
+    pub fn note_kv_transfer_config(&self, kv_connector: &str, kv_role: &str, local_tail: u32) {
+        let Some(tail) = NonZeroUsize::new(local_tail as usize) else {
+            return;
+        };
         if pulls_on_do_remote_prefill(kv_connector, kv_role) {
-            let _ = self.meta.engine_pulls_remote_kv.set(());
+            let _ = self.meta.remote_kv_local_tail.set(tail);
         }
     }
 
@@ -915,8 +925,8 @@ impl ZmqEngineClient {
         let embed_positions = std::mem::take(&mut media.embed_positions);
         let bounds = self.vocab_bounds();
         if let Some(bounds) = bounds {
-            let pulls_remote_kv = self.meta.engine_pulls_remote_kv.get().is_some();
-            validate_token_ids(&req, &embed_positions, bounds, pulls_remote_kv)
+            let handoff_tail = self.meta.remote_kv_local_tail.get().copied();
+            validate_token_ids(&req, &embed_positions, bounds, handoff_tail)
                 .map_err(tonic::Status::invalid_argument)?;
         }
         drop(embed_positions);
@@ -3605,12 +3615,14 @@ mod tests {
     /// reaches a NIXL consumer engine, held to the tokenizer's
     /// bound; the same prompt without the handoff, with an id past the
     /// tokenizer's too, ending in an id past the model's vocabulary (that
-    /// token is computed locally), or with an out-of-vocab `logit_bias` key,
-    /// does not.
+    /// token is computed locally), with such an id in a longer local tail
+    /// (an MTP drafter's prefill lookahead), or with an out-of-vocab
+    /// `logit_bias` key, does not.
     /// On an engine that would not pull on the claim (no connector, a
-    /// producer, an unprojected wrapper) the claim changes nothing, nor does
-    /// the legacy host/port pair on a consumer: the engine would compute the
-    /// prompt itself, so these are refused.
+    /// producer, an unprojected wrapper) or whose local tail is unknown the
+    /// claim changes nothing, nor does the legacy host/port pair on a
+    /// consumer: the engine would compute the prompt itself, so these are
+    /// refused.
     #[tokio::test]
     async fn a_pd_decode_leg_is_held_to_the_tokenizers_bound() {
         let request = |input_ids: Vec<u32>,
@@ -3642,7 +3654,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (client, mut engines) = connected_ranks(dir.path(), 1).await;
         client.set_vocab_size(1000, Some(1000));
-        client.note_kv_transfer_config("NixlConnector", "kv_both");
+        client.note_kv_transfer_config("NixlConnector", "kv_both", 1);
         for (req, refusal) in [
             (
                 request(leg(), None, None),
@@ -3697,18 +3709,22 @@ mod tests {
         };
         assert_eq!(status.message(), "Token id 1000 is out of vocabulary");
 
-        // The forged claim on engines that would not pull on it: no KV
-        // connector, a producer, an unprojected wrapper.
+        // The forged claim on engines that would not pull on it (no KV
+        // connector, a producer, an unprojected wrapper) or whose local tail
+        // is unknown, and the real claim on a consumer that computes the
+        // last three prompt tokens itself (an MTP drafter's lookahead).
         for config in [
             None,
-            Some(("NixlConnector", "kv_producer")),
-            Some(("MultiConnector", "kv_both")),
+            Some(("NixlConnector", "kv_producer", 1)),
+            Some(("MultiConnector", "kv_both", 1)),
+            Some(("NixlConnector", "kv_both", 0)),
+            Some(("NixlConnector", "kv_both", 3)),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let (other, mut engines) = connected_ranks(dir.path(), 1).await;
             other.set_vocab_size(1000, Some(1000));
-            if let Some((connector, role)) = config {
-                other.note_kv_transfer_config(connector, role);
+            if let Some((connector, role, tail)) = config {
+                other.note_kv_transfer_config(connector, role, tail);
             }
             let Err(status) = other
                 .generate_vllm_streams(request(leg(), DECODE, None))
