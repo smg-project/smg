@@ -25,11 +25,12 @@ use super::{
     pd_protocol::{EncodeHandoff, PdProtocol},
     ContextRequirements,
 };
-#[cfg(test)]
-use crate::observability::log_throttle::KeyedLogThrottle;
 use crate::{
     middleware::{tenant_resolution::AcceptedAt, SHED_RETRY_AFTER_SECS},
-    observability::metrics::{metrics_labels, Metrics},
+    observability::{
+        log_throttle::KeyedLogThrottle,
+        metrics::{metrics_labels, Metrics},
+    },
     policies::{
         hash_ring::HashRing, policy_reads_hash_ring, CacheNamespace, LoadBalancingPolicy,
         PolicyRegistry, SelectWorkerInfo, WorkerRole,
@@ -86,7 +87,8 @@ type AdmittedPdPair = (Arc<dyn Worker>, Placed, RuntimeType);
 const ACCEPTS_MEDIA_REFS: CandidateFilter<'static> = &accepts_media_refs;
 
 /// Why an EPD selection produced nothing: a full Prefill pool, unsupported
-/// media references, or a failure judged per role afterwards by
+/// media references, an encode item where the policy engine places the
+/// gateway's requests, or a failure judged per role afterwards by
 /// [`WorkerSelectionStage::selection_failure`].
 enum EpdSelectionFailure {
     Unavailable,
@@ -95,6 +97,9 @@ enum EpdSelectionFailure {
     DecodeVisionUnsupported,
     EncodeNotSupported,
     EncodeVisionUnsupported,
+    /// The policy engine places the gateway's requests, and it places no
+    /// encoder: a request that carries an encode item is not served.
+    EncodeUnderPolicyEngine,
 }
 
 impl PrefillCandidateError for EpdSelectionFailure {
@@ -151,6 +156,21 @@ type AdmittedEpdSelection = (
 /// selection because it had already waited longer than the queue timeout
 /// inside the gateway.
 pub(crate) const SELECTION_QUEUE_TIMEOUT_ERROR_CODE: &str = "selection_queue_timeout";
+
+/// Client-visible, gateway-owned code for a request refused ahead of its
+/// prefill/decode pair because it carries media for the model's encode
+/// workers and the gateway places its requests by the policy engine
+/// (`--policy-controller on`), which places no encoder.
+pub(crate) const ENCODE_UNDER_POLICY_ENGINE_CODE: &str = "encode_under_policy_engine";
+
+/// The lines of that refusal, a model at a time under the refusal lines'
+/// own allowance: a client that sends one such request sends the next
+/// alike.
+static ENCODE_UNDER_POLICY_ENGINE_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+    placement::REFUSAL_LINES_PER_SECOND,
+    Duration::from_secs(1),
+    placement::REFUSAL_LOG_MODELS,
+);
 
 /// Worker selection stage: Select appropriate worker(s) based on routing mode
 pub(crate) struct WorkerSelectionStage {
@@ -1115,6 +1135,9 @@ impl WorkerSelectionStage {
                     EpdSelectionFailure::DecodeVisionUnsupported => {
                         return self.vision_refusal(model_id, "decode workers")
                     }
+                    EpdSelectionFailure::EncodeUnderPolicyEngine => {
+                        return self.encode_under_policy_engine(model_id)
+                    }
                     EpdSelectionFailure::Unavailable => {}
                 }
                 // Encode is a demanded role only when the request carries
@@ -1938,6 +1961,35 @@ impl WorkerSelectionStage {
         )
     }
 
+    /// The gateway places its requests by the policy engine
+    /// (`--policy-controller on`), which places a prefill/decode pair and no
+    /// encoder: a request that carries media for the model's encode workers
+    /// is not served, whatever the pools hold. A 501, as the gateway answers
+    /// a kind of request that one of its routes does not serve. A 501 is
+    /// terminal for the retry layer by status, and no retry changes this
+    /// answer. Its line is written under the refusal lines' allowance.
+    fn encode_under_policy_engine(&self, model_id: &str) -> Response {
+        if let Some(admitted) = ENCODE_UNDER_POLICY_ENGINE_LOG.admit(model_id) {
+            warn!(
+                function = "WorkerSelectionStage::execute",
+                mode = ?self.mode,
+                model_id = %model_id,
+                code = ENCODE_UNDER_POLICY_ENGINE_CODE,
+                suppressed = admitted.suppressed,
+                "Refused a request that carries media for the encode workers: the policy engine places no encoder"
+            );
+        }
+        error::not_implemented(
+            ENCODE_UNDER_POLICY_ENGINE_CODE,
+            format!(
+                "model '{model_id}' takes a request's media on encode workers, and this gateway \
+                 runs with --policy-controller on, which places no request on encode workers \
+                 yet: send the request without media, or to a gateway that runs with \
+                 --policy-controller off"
+            ),
+        )
+    }
+
     /// The response for a failed pair placement. The verdict was judged from
     /// the role's own candidates inside the placement, so a shed is answered
     /// as it was built and counted once; a role nobody serves is a 404 unless
@@ -2394,6 +2446,15 @@ impl WorkerSelectionStage {
     /// The prefill and the decode are each answered as the placement
     /// answers a worker ([`Placed`]): the route makes that side's load
     /// guard from it.
+    ///
+    /// This is the encode stage's own selection, the fifth of the functions
+    /// that choose a worker, and it holds that function's arm for the policy
+    /// engine. The engine places the pair, through
+    /// [`placement::select_pair`], and no encoder. Where the gateway started
+    /// the engine, a request that carries an encode item is refused by name
+    /// ahead of the pair ([`Self::encode_under_policy_engine`]). A request
+    /// with no item is placed on the engine's pair, and the lines below
+    /// assign it no encoder and ask no policy.
     fn placed_encode_prefill_decode_workers(
         &self,
         model_id: &str,
@@ -2404,6 +2465,11 @@ impl WorkerSelectionStage {
     ) -> Result<PlacedEpdSelection, EpdSelectionFailure> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let needs_encode = !encode_item_hashes.is_empty();
+        // The engine's arm. An item is refused ahead of the pair, so the
+        // engine is told of no request that it would then have to give up.
+        if needs_encode && self.policy_registry.engine().is_some() {
+            return Err(EpdSelectionFailure::EncodeUnderPolicyEngine);
+        }
         let mut available_encode = Self::available_workers(&snapshot, RoutingPool::GrpcEncode);
         // An encoder serves the request by its runtime's encode handoff: a
         // push encoder must advertise the producer role of a connector and
@@ -5063,6 +5129,146 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Where the gateway started the policy engine, the encode stage's
+    /// selection asks no classic policy. A request that carries an item is
+    /// refused by name ahead of its pair: a 501 under the stage's own code,
+    /// which the retry layer does not repeat, and the engine hears of no
+    /// request, neither a lease nor its release. A request with no item is
+    /// placed on the engine's pair and on no encoder. The registry made for
+    /// the engine counts no classic policy made or asked behind either.
+    /// With no engine the stage places the item by its encode policy, as it
+    /// did.
+    #[tokio::test]
+    async fn the_engine_places_an_encode_requests_pair_and_refuses_an_item_by_name() {
+        use crate::{
+            config::types::RoutingKeyOverrideConfig,
+            routers::common::placement::tests::hearing_pairs_on,
+        };
+
+        /// The encode policy behind a count of the items it is asked to
+        /// place.
+        #[derive(Debug)]
+        struct Counted {
+            inner: Arc<dyn LoadBalancingPolicy>,
+            asked: AtomicUsize,
+        }
+
+        impl LoadBalancingPolicy for Counted {
+            fn select_worker(
+                &self,
+                workers: &[Arc<dyn Worker>],
+                info: &SelectWorkerInfo,
+            ) -> Option<usize> {
+                self.asked.fetch_add(1, Ordering::Relaxed);
+                self.inner.select_worker(workers, info)
+            }
+
+            fn name(&self) -> &'static str {
+                self.inner.name()
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let model = "epd-engine";
+        let stage_over = |policies: PolicyRegistry| {
+            let registry = ec_registry(
+                model,
+                &[
+                    (8930, WorkerType::Encode, "ECCPUConnector"),
+                    (8931, WorkerType::Prefill, "ECCPUConnector"),
+                    (8932, WorkerType::Decode, "ECCPUConnector"),
+                ],
+            );
+            WorkerSelectionStage::new(
+                registry,
+                Arc::new(policies),
+                WorkerSelectionMode::EncodePrefillDecode,
+                None,
+            )
+        };
+        let demand = |items: bool| EpdDemands {
+            wire: None,
+            encode: MediaDemands {
+                media_refs: false,
+                vision: items,
+                pipeline: PipelinePin::Any,
+            },
+            decode_vision: false,
+            image_fanout: items,
+        };
+        let item = [vec![1]];
+
+        // The engine places: an item is refused, and the engine hears nothing.
+        let policies = PolicyRegistry::for_policy_engine(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig::default(),
+        );
+        let heard = hearing_pairs_on(&policies, false);
+        let said = || heard.lock().expect("the stage heard").clone();
+        let stage = stage_over(policies);
+        let refusal = stage
+            .admit_encode_prefill_decode_workers(
+                model,
+                PlacementInputs::default(),
+                None,
+                &item,
+                demand(true),
+            )
+            .await
+            .err()
+            .expect("an item is refused");
+        assert_eq!(refusal.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            error::extract_error_code_from_response(&refusal),
+            ENCODE_UNDER_POLICY_ENGINE_CODE
+        );
+        assert!(!is_retryable_response(&refusal));
+        assert!(said().is_empty(), "the engine heard {:?}", said());
+        assert_eq!(stage.policy_registry.classic_made_or_asked(), 0);
+
+        // The engine places: no item is the engine's pair and no encoder.
+        let (encoders, prefill, decode, _) = stage
+            .select_encode_prefill_decode_workers(
+                model,
+                PlacementInputs::default(),
+                &[],
+                demand(false),
+                None,
+            )
+            .unwrap_or_else(|_| panic!("the engine places the pair"));
+        assert!(encoders.is_empty());
+        assert_eq!(
+            (prefill.url(), decode.url()),
+            ("grpc://127.0.0.1:8931", "grpc://127.0.0.1:8932")
+        );
+        assert_eq!(said()[..2], ["issued", "issued"]);
+        assert_eq!(stage.policy_registry.classic_made_or_asked(), 0);
+
+        // No engine: the item is placed by the stage's encode policy.
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let counted = Arc::new(Counted {
+            inner: PolicyFactory::create_from_config(&PolicyConfig::RoundRobin),
+            asked: AtomicUsize::new(0),
+        });
+        policies.set_encode_policy(Arc::clone(&counted) as Arc<dyn LoadBalancingPolicy>);
+        let stage = stage_over(policies);
+        let (encoders, ..) = stage
+            .select_encode_prefill_decode_workers(
+                model,
+                PlacementInputs::default(),
+                &item,
+                demand(true),
+                None,
+            )
+            .unwrap_or_else(|_| panic!("the EPD set is selected"));
+        assert_eq!(encoders.len(), 1);
+        assert_eq!(encoders[0].worker.url(), "grpc://127.0.0.1:8930");
+        assert_eq!(counted.asked.load(Ordering::Relaxed), 1);
     }
 
     /// The encode stage reads the hash ring off the generation it holds for
