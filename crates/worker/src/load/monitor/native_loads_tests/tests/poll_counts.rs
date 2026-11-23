@@ -4,6 +4,8 @@
 
 use std::collections::VecDeque;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use super::*;
 use crate::{
     common_proto::KvEventBatch,
@@ -201,6 +203,86 @@ fn no_table_worker(url: &str) -> Arc<dyn Worker> {
     )
 }
 
+/// What a cutting engine does behind the headers and half the body of a
+/// native answer: it sends no more and keeps the connection, or closes it.
+#[derive(Clone, Copy)]
+enum Cut {
+    Stalls,
+    Closes,
+}
+
+/// One request's head off `socket`, or nothing where the peer is gone.
+async fn request_head(socket: &mut tokio::net::TcpStream) -> Option<String> {
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !head.windows(4).any(|end| end == b"\r\n\r\n") {
+        match socket.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(read) => head.extend_from_slice(&chunk[..read]),
+        }
+    }
+    Some(String::from_utf8_lossy(&head).into_owned())
+}
+
+/// A loopback engine that speaks HTTP by hand. Its gateway route is absent.
+/// Its native route answers the two ranks' body whole once, and from then
+/// on sends an answer's headers and half its body, and cuts it as `cut`
+/// says. The second value is told once a half is sent.
+async fn spawn_cutting(cut: Cut) -> (String, Arc<Notify>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the cutting engine");
+    let addr = listener.local_addr().expect("its address");
+    let asked = Arc::new(AtomicUsize::new(0));
+    let sent_half = Arc::new(Notify::new());
+    let told = Arc::clone(&sent_half);
+    let whole = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{NATIVE_DP_BODY}",
+        NATIVE_DP_BODY.len()
+    );
+    let serve = move |mut socket: tokio::net::TcpStream| {
+        let (asked, whole, told) = (Arc::clone(&asked), whole.clone(), Arc::clone(&told));
+        async move {
+            while let Some(head) = request_head(&mut socket).await {
+                let answer = if !head.starts_with("GET /v1/loads") {
+                    "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n"
+                } else if asked.fetch_add(1, Ordering::SeqCst) == 0 {
+                    whole.as_str()
+                } else {
+                    let half = &whole[..whole.len() - NATIVE_DP_BODY.len() / 2];
+                    socket.write_all(half.as_bytes()).await.expect("half");
+                    told.notify_one();
+                    match cut {
+                        Cut::Stalls => std::future::pending().await,
+                        Cut::Closes => return,
+                    }
+                };
+                socket.write_all(answer.as_bytes()).await.expect("answer");
+            }
+        }
+    };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            tokio::spawn(serve(socket));
+        }
+    });
+    (format!("http://{addr}"), sent_half)
+}
+
+/// Two fetches of the two ranks at `url` over one memo: the first finds the
+/// native route, the second reads it again.
+async fn fetch_twice(counts: &PollCounts, url: &str) {
+    let memo = DashMap::new();
+    for _ in 0..2 {
+        WorkerMonitor::fetch_engine_loads(two_ranks(url), ConnectionMode::Http, &memo, counts)
+            .await;
+    }
+}
+
 /// One fetch of the engine that `worker` is, on its own wire.
 async fn fetch(counts: &PollCounts, worker: &Arc<dyn Worker>) {
     fetch_engine(counts, vec![Arc::clone(worker)]).await;
@@ -349,8 +431,10 @@ async fn a_read_over_http_counts_a_report_or_its_failure_by_its_reason() {
 /// worker of a runtime with no gauge table, at an address nothing answers
 /// at and at an engine whose native route refuses. The rank workers of one
 /// engine count the one read they share, once. A native route that
-/// answered, and then answers a body that does not read, is the engine's
-/// answer.
+/// answered, and then answers a body that is no load report, is the
+/// engine's answer, and one that then closes on half a body is the
+/// transport's. A body that is no load report on a route that never
+/// answered is the engine's answer once: the route is absent from then on.
 #[tokio::test]
 async fn a_native_read_that_fails_counts_its_reason_once_an_engine() {
     let counts = PollCounts::default();
@@ -389,11 +473,7 @@ async fn a_native_read_that_fails_counts_its_reason_once_an_engine() {
         ],
     )
     .await;
-    let memo = DashMap::new();
-    for _ in 0..2 {
-        let ranks = two_ranks(&turning.url);
-        WorkerMonitor::fetch_engine_loads(ranks, ConnectionMode::Http, &memo, &counts).await;
-    }
+    fetch_twice(&counts, &turning.url).await;
     assert_eq!(
         counts.totals(),
         PollTotals {
@@ -405,6 +485,54 @@ async fn a_native_read_that_fails_counts_its_reason_once_an_engine() {
             ..PollTotals::default()
         },
         "the route answered once: its unread body is one bad answer"
+    );
+
+    fetch_twice(&counts, &spawn_cutting(Cut::Closes).await.0).await;
+    let strange = spawn_engine(StatusCode::OK, UNREADABLE_NATIVE_BODY).await;
+    fetch_twice(&counts, &strange.url).await;
+    assert_eq!(
+        counts.totals(),
+        PollTotals {
+            scrapes: 2,
+            scrape_failures: FailureTotals {
+                transport: 4,
+                answer: 5,
+                unsupported: 1,
+                ..FailureTotals::default()
+            },
+            ..PollTotals::default()
+        },
+        "a cut body, then a strange one and the route it leaves absent"
+    );
+}
+
+/// A native body that stalls behind its headers is a deadline: the
+/// request's timeout ends the body's read. The engine answers whole once,
+/// then sends half a body and no more. The clock stops once the half is
+/// sent and is moved past the timeout.
+#[tokio::test]
+async fn a_native_body_that_stalls_behind_its_headers_counts_a_deadline() {
+    let counts = PollCounts::default();
+    let (stalling, sent_half) = spawn_cutting(Cut::Stalls).await;
+    let timeout = async {
+        sent_half.notified().await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::pause();
+        tokio::time::advance(REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+    };
+    tokio::join!(fetch_twice(&counts, &stalling), timeout);
+    assert_eq!(
+        counts.totals(),
+        PollTotals {
+            scrapes: 1,
+            scrape_failures: FailureTotals {
+                deadline: 1,
+                ..FailureTotals::default()
+            },
+            ..PollTotals::default()
+        }
     );
 }
 

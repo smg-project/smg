@@ -21,14 +21,16 @@ pub(crate) enum FetchFailure {
     /// way: no answer of the engine's.
     Transport,
     /// The engine, or the host's load source in its place, answered with an
-    /// error.
+    /// error or with a body that is no load report.
     Answer,
     /// The poll's deadline, or the request's own, ended the fetch.
     Deadline,
     /// The engine's metrics state no load gauge.
     NoLoad,
-    /// The engine has no load read: the call is not implemented, or its
-    /// runtime has no gauge table.
+    /// The engine has no load read for the worker: the call is not
+    /// implemented, or no native load route is there and the worker has no
+    /// gauges to read instead (its runtime has no gauge table, or it is one
+    /// rank of a data-parallel engine).
     Unsupported,
     /// The host had no client for the worker, or no word of its load source
     /// in time: the host's failure, no engine's.
@@ -43,13 +45,16 @@ pub struct FailureTotals {
     /// way.
     pub transport: u64,
     /// The engine, or the host's load source in its place, answered with an
-    /// error.
+    /// error or with a body that is no load report.
     pub answer: u64,
     /// The poll's deadline, or the request's own, ended the fetch.
     pub deadline: u64,
     /// The engine's metrics stated no load gauge.
     pub no_load: u64,
-    /// The engine has no load read.
+    /// The engine has no load read for the worker: the call is not
+    /// implemented, or no native load route is there and the worker has no
+    /// gauges to read instead (its runtime has no gauge table, or it is one
+    /// rank of a data-parallel engine).
     pub unsupported: u64,
     /// The host had no client for the worker, or no word of its load source
     /// in time.
