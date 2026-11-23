@@ -39,6 +39,7 @@ use std::{
 };
 
 use prost::Message as _;
+use smg_worker::load::state::LoadReceiver;
 use tokio::sync::watch;
 use tonic::{
     codegen::http,
@@ -234,7 +235,12 @@ impl Shared {
         address: String,
         elector: &Elector,
         standing: watch::Receiver<ElectionObservation>,
-        (store, feed, objects): (Arc<MemoryStore>, Feed, Arc<Objects<Members>>),
+        (store, feed, objects, loads): (
+            Arc<MemoryStore>,
+            Feed,
+            Arc<Objects<Members>>,
+            LoadReceiver,
+        ),
         catalog: Arc<StageRegistry>,
         deciders: usize,
     ) -> io::Result<Self> {
@@ -250,6 +256,7 @@ impl Shared {
             &Reads {
                 store: Arc::clone(&store),
                 objects: Arc::clone(&objects),
+                loads,
                 fence: elector.fence(),
                 standing: standing.clone(),
                 clock: Arc::new(Instant::now),

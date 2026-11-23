@@ -582,6 +582,7 @@ mod tests {
                     Clock, DecideStats, DecisionSlots, Job, Reads,
                 },
                 election::{ElectionObservation, LeasePlace},
+                frame_loads,
                 gateways::{tests::PATIENT, SessionPlace},
                 principal::{tests::told, Layer, ENTRY},
                 replication::journaled_for,
@@ -705,6 +706,7 @@ mod tests {
         .expect("the deciders start");
         let reads = Reads {
             objects: holder(&store),
+            loads: frame_loads::silent(),
             store,
             fence: elector.fence(),
             standing: stood,

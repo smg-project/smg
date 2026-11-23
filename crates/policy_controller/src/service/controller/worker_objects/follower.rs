@@ -43,8 +43,8 @@ const OVERLOAD_DEFAULTS: OverloadThresholds = OverloadThresholds {
 /// Each object states its row's overload thresholds over the program's
 /// default ([`OVERLOAD_DEFAULTS`]): what a load monitor over the registry
 /// judges the worker by ([`load_monitor`](crate::worker_host::load_monitor)).
-/// The service runs no such monitor yet, so no verdict is written on an
-/// object.
+/// The service runs that monitor while the replica leads, and it writes
+/// each verdict on the worker's object.
 ///
 /// An object's status follows its row's
 /// ([`Objects::with_status_followed`]). A decision reads a worker's status

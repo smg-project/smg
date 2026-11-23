@@ -81,6 +81,7 @@ use smg_policy_controller::{
     },
     tracking::LeaseId,
 };
+use smg_worker::load::state::LoadReceiver;
 use tokio::{
     io::{copy, sink},
     net::{TcpListener, TcpStream},
@@ -405,6 +406,9 @@ pub struct Replica {
     control: SocketAddr,
     replication: SocketAddr,
     store: Arc<MemoryStore>,
+    /// The channel of the controller's load monitor: what a decision is
+    /// given of its workers' load.
+    loads: LoadReceiver,
     readiness: Readiness,
     stop: Option<oneshot::Sender<()>>,
     serve: JoinSet<Result<(), Error>>,
@@ -1136,6 +1140,7 @@ impl Replica {
             .of(Scope::Replication)
             .ok_or("the controller has no replication listener")?;
         let store = controller.store();
+        let loads = controller.loads();
         let readiness = controller.readiness();
         let (stop, stopped) = oneshot::channel::<()>();
         let mut serve = JoinSet::new();
@@ -1151,6 +1156,7 @@ impl Replica {
             control,
             replication,
             store,
+            loads,
             readiness,
             stop: Some(stop),
             serve,
@@ -1656,6 +1662,25 @@ impl Harness {
             })?;
         }
         Ok(())
+    }
+
+    /// Whether the controller's load monitor has published, for every row
+    /// of each of `engines`, a report sampled at or after `since`. A
+    /// decision is given the monitor's snapshot, where [`Self::pool`] reads
+    /// the store's load table: the monitor polls on its own clock.
+    pub fn monitored(&self, engines: &[usize], since: Instant) -> bool {
+        let snapshot = self.replica.loads.borrow();
+        let mut rows = self.members.iter();
+        rows.all(|(id, (engine, _))| {
+            if !engines.contains(engine) {
+                return true;
+            }
+            let row = WorkersStore::get(self.store.as_ref(), *id);
+            row.is_some_and(|row| {
+                let report = snapshot.report(&row.facts.key);
+                report.is_some_and(|(_, sampled)| sampled >= since)
+            })
+        })
     }
 
     /// The pool serving `model` in `role` as the store holds it at this

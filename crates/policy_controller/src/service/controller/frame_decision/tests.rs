@@ -13,8 +13,9 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use smg_worker::load::state::LoadSnapshot;
 
-use super::{decide, FrameBuffers};
+use super::{decide, hands_reports, FrameBuffers};
 use crate::{
     document::spec::{self, AppliedSpec, Assignment, PolicySpec},
     engine::{
@@ -76,7 +77,9 @@ fn served(
     objects.follow(store);
     let mut frames = FrameBuffers::default();
     let own = Part::default();
-    let decided = store.deciding(|world| decide(world, objects, &taken, &mut frames, &own));
+    // The load monitor published nothing: the request reads no report.
+    let loads = Arc::new(LoadSnapshot::default());
+    let decided = store.deciding(|world| decide(world, objects, &taken, &mut frames, &loads, &own));
     decided.expect("the engine decides").0
 }
 
@@ -618,4 +621,44 @@ fn a_served_request_decides_by_the_rows_named_under_no_cap_as_by_the_column_fill
         picked.insert(to);
     }
     assert!(picked.len() > 1, "the deepest holders tie: {picked:?}");
+}
+
+/// A frame's request is given the snapshot where its document reads load
+/// reports and no stage of it keeps them: the three load-led presets. A
+/// document that reads no report is given none, and neither is one that
+/// holds the resident-work stage, which keeps the reports it is told.
+#[test]
+fn a_request_is_given_the_snapshot_where_its_document_reads_reports_and_keeps_none() {
+    let applied = |document: &str| {
+        let document: PolicySpec =
+            serde_json::from_str(document).expect("a document of this build");
+        AppliedSpec::validate(&document).expect("the document validates")
+    };
+    for name in ["least_load", "power_of_two", "cache_aware"] {
+        assert!(hands_reports(&preset(name, 1)), "{name} reads load reports");
+    }
+    let unread = applied(
+        r#"{
+          "apiVersion": "smg.policy/v1",
+          "generation": 1,
+          "profiles": { "p": { "pick": "random" } },
+          "bindings": [{ "profile": "p" }]
+        }"#,
+    );
+    assert!(!hands_reports(&unread), "the document reads no report");
+    let keeping = applied(
+        r#"{
+          "apiVersion": "smg.policy/v1",
+          "generation": 1,
+          "profiles": { "p": {
+            "score": ["least-load", { "resident-work": { "request_tokens": 512 } }],
+            "pick": "best"
+          } },
+          "bindings": [{ "profile": "p" }]
+        }"#,
+    );
+    assert!(
+        !hands_reports(&keeping),
+        "a stage of the document keeps reports"
+    );
 }

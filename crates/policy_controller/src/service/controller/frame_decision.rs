@@ -6,7 +6,10 @@
 //! ([`Objects::lent`]). [`decide`] takes the engine and the list of one
 //! load of the world, states what the asking gateway may take of the list
 //! as places ([`GatewayPlaces::taken`]), makes the frame's request
-//! ([`FrameRequest`]) and asks the engine's entry that issues no lease.
+//! ([`FrameRequest`]), gives it the load snapshot its deciding thread holds
+//! ([`FrameLoads`](super::frame_loads::FrameLoads)) where the document
+//! reads reports and keeps none, and asks the engine's entry that issues no
+//! lease.
 //! [`issue`] files a pick's lease in the store, which tells the document's
 //! stages of it under its hold of the file's turn.
 //!
@@ -17,7 +20,9 @@
 //! A request of any other phase has no decision here yet: its deciding
 //! thread answers it `Busy` before anything is read for it.
 
-use std::sync::atomic::Ordering;
+use std::sync::{atomic::Ordering, Arc};
+
+use smg_worker::load::state::LoadSnapshot;
 
 use super::{
     decision_slots::{DecisionCall, Part},
@@ -26,6 +31,7 @@ use super::{
     wire::{Checked, Lists},
 };
 use crate::{
+    document::spec::AppliedSpec,
     engine::{
         decision::{shed, Decision, ShedReason},
         decision_engine::{DecisionRefused, WorkerLists},
@@ -59,7 +65,10 @@ pub(crate) struct Booked {
 /// The decision of a single request's frame, in the world of one load: the
 /// engine and the gateway's vetoes are that world's, and the list is the
 /// one the worker objects' registry holds for the frame's model at this
-/// read. What the decision counts, it counts in `own`, its decider's part:
+/// read. The load reports are those of `loads`, the newest snapshot the
+/// replica's load monitor published when the frame was taken, where the
+/// document is given it ([`hands_reports`]). What the
+/// decision counts, it counts in `own`, its decider's part:
 /// a frame with more block hashes than the document reads, and the workers
 /// its gateway's wires took.
 ///
@@ -81,6 +90,7 @@ pub(crate) fn decide(
     objects: &Objects<Members>,
     taken: &DecisionCall<'_, Checked>,
     buffers: &mut FrameBuffers,
+    loads: &Arc<LoadSnapshot>,
     own: &Part,
 ) -> Result<(Decision, Booked), DecisionRefused> {
     let DecisionCall {
@@ -118,6 +128,11 @@ pub(crate) fn decide(
                     let list = WorkerLists::Single(lent);
                     let maker = FrameRequest::new(frame, &read, left, list);
                     let maker = maker.held_to(held.places, held.stalled, held.held);
+                    let maker = if hands_reports(spec) {
+                        maker.reading(loads)
+                    } else {
+                        maker
+                    };
                     front.decide_without_lease(&maker, now)
                 }
                 Taken::Emptied(stage) => {
@@ -150,6 +165,22 @@ pub(crate) fn decide(
         said,
     };
     Ok((decision, booked))
+}
+
+/// Whether a frame's request is given the load monitor's snapshot under
+/// `spec`: its document reads load reports or a named signal, whose values
+/// the same reports state, and no stage of it keeps reports.
+///
+/// A stage that keeps reports is told each one by its engine's own task,
+/// ahead of the snapshot that task keeps, and a snapshot a request gives is
+/// outside that order ([`RequestMaker::loads`]). A controller runs no such
+/// task yet: a document that holds such a stage is given none here, and its
+/// decisions read no report.
+///
+/// [`RequestMaker::loads`]: crate::engine::RequestMaker::loads
+fn hands_reports(spec: &AppliedSpec) -> bool {
+    let needs = spec.needs();
+    (needs.loads || needs.signal_cells) && !spec.engine().keeps_loads()
 }
 
 /// Files the lease of `decision`'s pick, one a decision, ahead of the read

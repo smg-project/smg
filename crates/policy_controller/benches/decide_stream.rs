@@ -145,12 +145,13 @@
 //! the best alone and the next two alike, the best two alike, all three
 //! alike. Two builds are compared where they print one tally.
 //!
-//! A served decision reads no load report yet (`READS_LOADS`): a controller
-//! decides a single request over worker objects, and its engine is lent no
-//! load report. Until it is, the bands hold no row's pool: it moves with
-//! the leases on file, and a row whose pool moves stops the bench. So no
-//! wire row is run, and each kind's line says so. The count cells run:
-//! they read a decision's calls of the allocator, not its pool.
+//! A served decision reads no report of the bench's yet (`READS_LOADS`): a
+//! controller's decision is given its load monitor's snapshot, and the bench
+//! writes its members' reports into the store's table, which no decision
+//! reads. Until its members answer the monitor, the bands hold no row's
+//! pool: it moves with the leases on file, and a row whose pool moves stops
+//! the bench. So no wire row is run, and each kind's line says so. The count
+//! cells run: they read a decision's calls of the allocator, not its pool.
 //!
 //! Every row runs on the allocator the binary registers, under a copy of
 //! its settings (`MALLOC_CONF`). A served decision's frame holds lists
@@ -555,10 +556,11 @@ mod kernel {
 const GATEWAY: &str = "bench-gateway";
 const PRESET: &str = "least_load";
 /// Whether a served decision reads the load reports a row's members stand
-/// in their bands by. A controller's single decision is lent none yet, so
-/// no wire row is run: a row's pool moves with the leases on file, and a
-/// row's guard stops a pool that moves. It turns when a controller's
-/// engine is lent its loads.
+/// in their bands by. A controller's single decision is given its load
+/// monitor's snapshot, and the bench writes its reports into the store's
+/// table, so no wire row is run: a row's pool moves with the leases on
+/// file, and a row's guard stops a pool that moves. It turns when the
+/// bench's members answer the load monitor's polls.
 const READS_LOADS: bool = false;
 /// The pair plan of the pair count cell: the plan of the engine's own
 /// pair cells (`pair_classes`), least load on each side.
@@ -2262,7 +2264,7 @@ fn main() -> io::Result<()> {
         for kind in kinds.into_iter().filter(|kind| all || rows == *kind) {
             writeln!(
                 out,
-                "policy_decide_stream/{kind} not run: a served decision reads no load report yet"
+                "policy_decide_stream/{kind} not run: a served decision reads no report of the bench's yet"
             )?;
         }
         return Ok(());

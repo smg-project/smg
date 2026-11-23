@@ -153,11 +153,10 @@ use tokio::{
 };
 use tonic::{transport::Endpoint, Code};
 
-/// A controller's decisions do not read an engine's load report yet.
-const READS_LOADS: bool = false;
-
-/// A controller's decisions do not read an engine's overload verdict yet.
-const READS_OVERLOAD: bool = false;
+/// A document that holds a stage that keeps load reports is given none in
+/// a controller's decision yet: the two-draw preset's resident form holds
+/// one.
+const READS_KEPT_LOADS: bool = false;
 
 /// A controller decides no request of a prefill, decode or encode phase yet.
 const DECIDES_PHASES: bool = false;
@@ -355,6 +354,22 @@ async fn named_again(harness: &mut Harness, run: &str, engine: usize) -> Result<
     Err(format!(
         "a rotation names an engine whose veto ended: not within {bound:?}"
     ))
+}
+
+/// Waits until the controller's load monitor has polled every row of each
+/// of `engines` since `since`: a decision is given the monitor's snapshot,
+/// where the pool's rows are the store's.
+async fn monitored(
+    harness: &Harness,
+    engines: &[usize],
+    since: Instant,
+) -> Result<Duration, String> {
+    within(
+        "the load monitor polls each engine again",
+        POLL_INTERVAL + ROOM,
+        || harness.monitored(engines, since),
+    )
+    .await
 }
 
 /// `ask` under the routing key `key`.
@@ -868,6 +883,14 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         .await
         .expect("the resident tokens follow");
 
+        // A decision is given the load monitor's snapshot, where the pool
+        // above is the store's table. The monitor polls each engine on its
+        // own clock: it has polled both pools since the table read so.
+        let told = Instant::now();
+        monitored(&harness, &engines, told)
+            .await
+            .expect("the monitor's reports follow");
+
         // A load-led decision follows the loads the engines told: under the
         // least-load preset no pick names the engine that holds requests.
         harness
@@ -877,12 +900,10 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             let pick = picked(&mut harness, nth("load", n))
                 .await
                 .expect("a pick answers an ask over a ready fleet");
-            if READS_LOADS {
-                assert_ne!(
-                    pick.engine, busy,
-                    "a load-led pick leaves the engine that holds requests: {pick:?}"
-                );
-            }
+            assert_ne!(
+                pick.engine, busy,
+                "a load-led pick leaves the engine that holds requests: {pick:?}"
+            );
         }
 
         // Two draws compared by the loads the engines told: under the
@@ -896,12 +917,10 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             let pick = picked(&mut harness, nth("two", n))
                 .await
                 .expect("a pick answers an ask over a ready fleet");
-            if READS_LOADS {
-                assert_ne!(
-                    pick.engine, busy,
-                    "of two draws the better load is taken: {pick:?}"
-                );
-            }
+            assert_ne!(
+                pick.engine, busy,
+                "of two draws the better load is taken: {pick:?}"
+            );
         }
 
         // The first row the filters keep, in the host's order: the host's
@@ -962,28 +981,22 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .patch_overload(busy, least)
             .await
             .expect("an operator's patch is taken");
-        if READS_OVERLOAD {
-            left_out(&mut harness, "spared", ranks, busy)
-                .await
-                .expect("an engine at its patched limit leaves the rotation");
-        }
+        left_out(&mut harness, "spared", ranks, busy)
+            .await
+            .expect("an engine at its patched limit leaves the rotation");
         let mut vetoed = HashSet::new();
         for n in (0u64..).take(2 * ranks) {
             let pick = picked(&mut harness, nth("veto", n))
                 .await
                 .expect("a pick answers an ask over a ready fleet");
-            if READS_OVERLOAD {
-                assert_ne!(pick.engine, busy, "an overloaded engine is no pick");
-            }
+            assert_ne!(pick.engine, busy, "an overloaded engine is no pick");
             vetoed.insert(pick);
         }
-        if READS_OVERLOAD {
-            assert_eq!(
-                vetoed.len(),
-                ranks - 1,
-                "a rotation under the veto names every other row: {vetoed:?}"
-            );
-        }
+        assert_eq!(
+            vetoed.len(),
+            ranks - 1,
+            "a rotation under the veto names every other row: {vetoed:?}"
+        );
         let mut lifted = HashSet::new();
         for n in (0u64..).take(2 * ranks) {
             let mut ask = nth("lift", n);
@@ -998,26 +1011,22 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             ranks,
             "the gateway's lift of the veto keeps the overloaded row: {lifted:?}"
         );
-        if READS_OVERLOAD {
-            for n in (0u64..).take(ranks) {
-                let pick = picked(&mut harness, nth("stood", n))
-                    .await
-                    .expect("a pick answers an ask over a ready fleet");
-                assert_ne!(
-                    pick.engine, busy,
-                    "the veto stood through both rotations: {pick:?}"
-                );
-            }
+        for n in (0u64..).take(ranks) {
+            let pick = picked(&mut harness, nth("stood", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_ne!(
+                pick.engine, busy,
+                "the veto stood through both rotations: {pick:?}"
+            );
         }
         harness
             .patch_overload(busy, OverloadThresholds::default())
             .await
             .expect("an operator's patch is taken");
-        if READS_OVERLOAD {
-            named_again(&mut harness, "regained", busy)
-                .await
-                .expect("the patch taken back, the engine is a pick again");
-        }
+        named_again(&mut harness, "regained", busy)
+            .await
+            .expect("the patch taken back, the engine is a pick again");
 
         // A rotation names every row before it names one again: under the
         // round-robin preset two turns of asks name each row twice.
@@ -1432,12 +1441,10 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             let pick = picked(&mut harness, nth("unheld", n))
                 .await
                 .expect("a pick answers an ask over a ready fleet");
-            if READS_LOADS {
-                assert_ne!(
-                    pick.engine, busy,
-                    "a prompt that states no block is placed by the load: {pick:?}"
-                );
-            }
+            assert_ne!(
+                pick.engine, busy,
+                "a prompt that states no block is placed by the load: {pick:?}"
+            );
         }
         for engine in engines.iter().filter(|engine| **engine != busy) {
             for idle in harness.heard(*engine) {
@@ -1480,17 +1487,15 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .patch_overload(busy, least)
             .await
             .expect("an operator's patch is taken");
-        if READS_OVERLOAD {
-            harness
-                .apply("round_robin")
-                .expect("a preset of this build applies");
-            left_out(&mut harness, "ring-spared", ranks, busy)
-                .await
-                .expect("an engine at its patched limit leaves the rotation");
-            harness
-                .apply("consistent_hashing")
-                .expect("a preset of this build applies");
-        }
+        harness
+            .apply("round_robin")
+            .expect("a preset of this build applies");
+        left_out(&mut harness, "ring-spared", ranks, busy)
+            .await
+            .expect("an engine at its patched limit leaves the rotation");
+        harness
+            .apply("consistent_hashing")
+            .expect("a preset of this build applies");
         for n in 0..8 {
             let again = picked(&mut harness, keyed(nth("kept", n), key))
                 .await
@@ -1500,29 +1505,25 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
                 "a session key keeps its ring worker over the veto"
             );
         }
-        if READS_OVERLOAD {
-            harness
-                .apply("round_robin")
-                .expect("a preset of this build applies");
-            for n in (0u64..).take(ranks) {
-                let pick = picked(&mut harness, nth("ring-stood", n))
-                    .await
-                    .expect("a pick answers an ask over a ready fleet");
-                assert_ne!(
-                    pick.engine, busy,
-                    "the veto stood through the key's asks: {pick:?}"
-                );
-            }
+        harness
+            .apply("round_robin")
+            .expect("a preset of this build applies");
+        for n in (0u64..).take(ranks) {
+            let pick = picked(&mut harness, nth("ring-stood", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_ne!(
+                pick.engine, busy,
+                "the veto stood through the key's asks: {pick:?}"
+            );
         }
         harness
             .patch_overload(busy, OverloadThresholds::default())
             .await
             .expect("an operator's patch is taken");
-        if READS_OVERLOAD {
-            named_again(&mut harness, "ring-regained", busy)
-                .await
-                .expect("the patch taken back, the engine is a pick again");
-        }
+        named_again(&mut harness, "ring-regained", busy)
+            .await
+            .expect("the patch taken back, the engine is a pick again");
 
         // A keyed ask returns to its worker: under the ring preset one
         // routing key names one row at each ask, and 64 keys do not all
@@ -1837,7 +1838,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             let counted = picked(&mut harness, for_model(nth("counted", n), COUNTED))
                 .await
                 .expect("a pick answers an ask over a ready fleet");
-            if READS_LOADS {
+            if READS_KEPT_LOADS {
                 assert_eq!(
                     counted.engine, spare,
                     "the lesser resident work is taken: {counted:?}"

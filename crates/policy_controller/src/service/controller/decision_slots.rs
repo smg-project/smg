@@ -180,12 +180,14 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use smg_worker::load::state::LoadReceiver;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 use super::{
     election::ElectionObservation,
     frame_decision::{self, FrameBuffers},
+    frame_loads::FrameLoads,
     lifecycle,
     wire::{self, Checked},
 };
@@ -457,6 +459,9 @@ pub(crate) struct Reads {
     /// The replica's worker objects: a decision is made over the list
     /// their registry holds for its model.
     pub(crate) objects: Arc<Objects<Members>>,
+    /// The channel of the replica's load monitor: a decision reads the
+    /// reports of the snapshot that stands on it.
+    pub(crate) loads: LoadReceiver,
     /// The controller's one fence.
     pub(crate) fence: Arc<Fence>,
     /// The election's last sight of the lease, for the term a `Busy`
@@ -555,6 +560,7 @@ impl DecisionSlots {
                 let decider = Deciding {
                     reads: reads.clone(),
                     frames: FrameBuffers::default(),
+                    loads: FrameLoads::of(reads.loads.clone()),
                     sample_count: SampleCount::default(),
                     faulted: false,
                     caught: false,
@@ -682,6 +688,8 @@ fn watched(
 struct Deciding {
     reads: Reads,
     frames: FrameBuffers,
+    /// The newest snapshot of the load monitor, held between frames.
+    loads: FrameLoads,
     sample_count: SampleCount,
     /// The last decision panicked: a streak of them writes one line.
     faulted: bool,
@@ -1072,6 +1080,9 @@ impl Deciding {
         let taken = taken.placed(self.working.as_ref());
         let (frames, own) = (&mut self.frames, counts.part(self.index));
         let caught = &mut self.caught;
+        // The load reports the decision reads: the monitor's newest, taken
+        // once a frame.
+        let loads = self.loads.newest();
         // No task follows the store under a case's deciders: each decision
         // lays the worker objects of the rows written since the last.
         #[cfg(test)]
@@ -1084,7 +1095,7 @@ impl Deciding {
             // at its instant, and the stages told, before the read that
             // lets the answer leave. That read judges the store's write
             // and a stage's call with the decision before them.
-            let decided = frame_decision::decide(world, objects, &taken, frames, own);
+            let decided = frame_decision::decide(world, objects, &taken, frames, loads, own);
             let (decision, booked) = match decided {
                 Ok(decided) => decided,
                 // The engine caught a panic of the decision and counted
@@ -1262,6 +1273,7 @@ pub(crate) mod tests {
     };
 
     use parking_lot::Mutex;
+    use smg_worker::load::state::{one_rank_load, LoadReceiver, LoadSnapshot};
     use tokio::{
         sync::{mpsc, watch},
         time::timeout,
@@ -1284,6 +1296,7 @@ pub(crate) mod tests {
         service::{
             controller::{
                 election::ElectionObservation,
+                frame_loads::{self, FrameLoads},
                 frame_request::FrameRequest,
                 gateways::{
                     tests::{GRACE, PATIENT},
@@ -1396,13 +1409,14 @@ pub(crate) mod tests {
         WorkerObjects::new(Arc::clone(store), ObjectsWake::default()).holder()
     }
 
-    /// A store and its feed with the holder of its worker objects, as the
-    /// service's shared state takes the three.
+    /// A store and its feed with the holder of its worker objects and a
+    /// load channel nobody publishes on, as the service's shared state takes
+    /// the four.
     pub(crate) fn followed(
         (store, feed): (Arc<MemoryStore>, Feed),
-    ) -> (Arc<MemoryStore>, Feed, Arc<Objects<Members>>) {
+    ) -> (Arc<MemoryStore>, Feed, Arc<Objects<Members>>, LoadReceiver) {
         let objects = holder(&store);
-        (store, feed, objects)
+        (store, feed, objects, frame_loads::silent())
     }
 
     /// A store, a candidate of its election and the deciders over both.
@@ -1417,6 +1431,9 @@ pub(crate) mod tests {
         deciders: DecisionSlots,
         /// The members serving [`MODEL`] in the single role, ready.
         workers: Vec<WorkerId>,
+        /// The teller of the load channel the bed's deciders hold: a case
+        /// publishes a snapshot as the load monitor does.
+        loads: watch::Sender<Arc<LoadSnapshot>>,
         sender: mpsc::Sender<wire::Decided>,
         answers: mpsc::Receiver<wire::Decided>,
     }
@@ -1543,9 +1560,11 @@ pub(crate) mod tests {
             Arc::new(move || script.read())
         };
         let (standing, stood) = watch::channel(ElectionObservation::default());
+        let (loads, published) = watch::channel(Arc::new(LoadSnapshot::default()));
         let reads = Reads {
             store: Arc::clone(&store),
             objects: holder(&store),
+            loads: published,
             fence: elector.fence(),
             standing: stood,
             clock,
@@ -1562,6 +1581,7 @@ pub(crate) mod tests {
             script,
             deciders,
             workers,
+            loads,
             sender,
             answers,
         }
@@ -1573,6 +1593,7 @@ pub(crate) mod tests {
         Deciding {
             reads: bed.reads.clone(),
             frames: Default::default(),
+            loads: FrameLoads::of(bed.reads.loads.clone()),
             sample_count: Default::default(),
             faulted: false,
             caught: false,
@@ -1818,6 +1839,83 @@ pub(crate) mod tests {
             // worker objects lend, with its lease.
             assert_eq!(unleased(answer), bed.engines(&frame, 1));
         }
+    }
+
+    /// A snapshot as the load monitor publishes it for the bed's three
+    /// workers: the one at `idle` reports no queue, and the others are deep
+    /// in theirs.
+    fn reports(idle: usize) -> Arc<LoadSnapshot> {
+        let loads = ["w0", "w1", "w2"].iter().enumerate();
+        let loads = loads.map(|(at, name)| {
+            let load = if at == idle {
+                one_rank_load(0, 0.1, 10.0)
+            } else {
+                one_rank_load(900_000, 0.9, 10.0)
+            };
+            (format!("http://{name}:8000"), load)
+        });
+        LoadSnapshot::from_loads_for_test(loads.collect())
+    }
+
+    /// A deciding thread gives each frame's request the newest snapshot
+    /// the load monitor published. Under the least-load preset every pick
+    /// names the one worker whose report shows no queue. The monitor then
+    /// publishes another worker so, and the picks follow at the next frame.
+    /// It publishes an empty snapshot, as at its lead's end, and the next
+    /// frame reads no report of the one before: its pick is the one worker
+    /// that holds no request.
+    #[tokio::test]
+    async fn a_decision_reads_the_reports_the_load_monitor_last_published() {
+        let mut bed = bed(Some(preset("least_load", 1)), true, (2, 8), []);
+        // Three frames a publication: a worker of the bed runs four requests
+        // at the most.
+        for (idle, ids) in [(0, 1..=3u8), (1, 4..=6)] {
+            bed.loads.send_replace(reports(idle));
+            for id in ids {
+                let answer = bed.ask(frame(id, 100 + u64::from(id))).await;
+                assert_eq!(picked(&answer), bed.workers[idle], "{answer:?}");
+            }
+        }
+        bed.loads.send_replace(Arc::new(LoadSnapshot::default()));
+        let answer = bed.ask(frame(7, 107)).await;
+        assert_eq!(picked(&answer), bed.workers[2], "{answer:?}");
+    }
+
+    /// A document with a stage that keeps load reports is given no
+    /// snapshot: its engine's own task tells such a stage each report, and
+    /// a controller runs no such task yet. The monitor publishes one worker
+    /// with no queue and the others deep in theirs, and three frames still
+    /// name three workers, each by the requests it holds. The scorer that
+    /// reads reports outweighs the one that keeps them eight to one: given
+    /// the snapshot, it would name the worker with no queue three times.
+    #[tokio::test]
+    async fn a_document_with_a_stage_that_keeps_reports_is_given_no_snapshot() {
+        let document: PolicySpec = serde_json::from_str(
+            r#"{
+              "apiVersion": "smg.policy/v1",
+              "generation": 1,
+              "profiles": { "p": {
+                "score": [
+                  { "least-load": { "weight": 8 } },
+                  { "resident-work": { "request_tokens": 512 } }
+                ],
+                "pick": "best"
+              } },
+              "bindings": [{ "profile": "p" }]
+            }"#,
+        )
+        .expect("a document of this build");
+        let mut bed = bed(Some(applied(&document)), true, (2, 8), []);
+        bed.loads.send_replace(reports(0));
+        let mut named = Vec::new();
+        for id in 1..=3u8 {
+            let answer = bed.ask(frame(id, 100 + u64::from(id))).await;
+            named.push(picked(&answer));
+        }
+        assert!(
+            named[0] != named[1] && named[1] != named[2] && named[0] != named[2],
+            "the picks followed a report: {named:?}"
+        );
     }
 
     /// A decision reads a worker's status on its object, and the object's
