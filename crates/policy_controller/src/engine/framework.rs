@@ -7454,7 +7454,7 @@ impl Engine {
     /// is given. An engine with no such stage never runs it: a publication
     /// that tells nobody walks no row. A plugin that watches signals hears
     /// of a world's reports no more than it did before a stage kept any.
-    pub(crate) fn tell_loads(&self, reports: impl Fn(&mut dyn FnMut(&Signal))) {
+    pub(crate) fn tell_loads(&self, reports: impl Fn(&mut dyn FnMut(&Signal<'_>))) {
         for keeper in &self.keepers {
             match *keeper {
                 Keeper::Scorer { profile, stage } => {
@@ -7550,7 +7550,7 @@ impl Lifecycle for Engine {
         self.membership_stages(change);
     }
 
-    fn on_signal(&self, signal: &Signal) {
+    fn on_signal(&self, signal: &Signal<'_>) {
         for profile in &self.profiles {
             for w in &profile.scorers {
                 w.scorer.on_signal(signal);

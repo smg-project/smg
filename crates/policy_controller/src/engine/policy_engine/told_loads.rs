@@ -54,8 +54,22 @@
 //! state, and the sample's instant on the engine's decision clock. A worker
 //! object that stands for several ranks is told as its one record: the
 //! ranks' sum, under the rank its registration states. The slot of the
-//! worker's count is none ([`WorkerSlot::NONE`]): this engine keeps no table
-//! of counts, and a worker's count is its object's.
+//! worker's count is none
+//! ([`WorkerSlot::NONE`](crate::tracking::WorkerSlot::NONE)): this engine
+//! keeps no table of counts, and a worker's count is its object's.
+//!
+//! **Its named values.** Under a document a stage of which keeps a signal's
+//! column, the report is told with the values it states under the
+//! document's names ([`ReportSignals`]), as a list's cells state them
+//! ([`stated_signals`]): one conversion, the signal's own unit, a value in
+//! range, and each value's own sample instant on the engine's decision
+//! clock. A name the report does not state reads none, and a report of
+//! several ranks states no named value, as a list's cells hold none of it.
+//! No age is tested here: a telling has no request's clock. Under any other
+//! document a report states none, and nothing is converted for it. The
+//! values stand in one row the task keeps, written again at each report:
+//! they are lent for the stage's call, and a stage copies out what it
+//! keeps.
 //!
 //! **What can be passed over.** The host's channel keeps one snapshot, and a
 //! snapshot keeps one report a worker. So of two reports of one worker the
@@ -84,8 +98,9 @@
 //! and no named signal keeps the channel for such a stage alone, and no
 //! decision of it reads the engine's snapshot. Where a stage keeps reports,
 //! a snapshot is at hand for decisions behind its telling: the registry's
-//! ready words, one look-up for each joined worker, one list of the new
-//! reports with one conversion each, and the stages' own work at each.
+//! ready words, one look-up for each joined worker, one conversion of each
+//! new report, its named values where a stage reads them, and the stages'
+//! own work at each. A telling allocates nothing.
 
 use smg_worker::load::state::LoadSnapshot;
 
@@ -94,9 +109,13 @@ use super::{
     PolicyEngine,
 };
 use crate::{
-    engine::{records::stated_report, view::WorkerId},
+    engine::{
+        records::{stated_report, stated_signals},
+        view::WorkerId,
+    },
+    load::{ReportSignals, SignalCells},
     stages::Lifecycle,
-    tracking::{in_flight::WorkerSlot, lease::Signal},
+    tracking::lease::Signal,
 };
 
 impl PolicyEngine {
@@ -107,11 +126,18 @@ impl PolicyEngine {
     ///
     /// An engine with no such stage returns at once. Else the registry's
     /// ready words are heard first ([`Self::follow_so_far`]), and nothing
-    /// is told while the task follows no registry. The new reports are
-    /// found once, for every stage. A stage's panic at a report is held
-    /// and counted ([`Self::upkeep_faults`]), each report under a catch of
-    /// its own: the stage hears the ones behind it.
-    pub(super) fn tell_loads(&self, members: &mut Option<Follow>, newest: &LoadSnapshot) {
+    /// is told while the task follows no registry. Each new report is
+    /// found once and told to every such stage, ahead of the next: its
+    /// named values stand in `cells`, the one row the task keeps for them.
+    /// A stage's panic at a report is held and counted
+    /// ([`Self::upkeep_faults`]), each report under a catch of its own:
+    /// the stage hears the ones behind it.
+    pub(super) fn tell_loads(
+        &self,
+        members: &mut Option<Follow>,
+        cells: &mut SignalCells,
+        newest: &LoadSnapshot,
+    ) {
         let engine = self.document.spec.engine();
         if !engine.keeps_loads() {
             return;
@@ -120,34 +146,45 @@ impl PolicyEngine {
         let Some(follow) = members.as_ref() else {
             return;
         };
-        let new = |(id, worker): (WorkerId, &Joined)| self.new_report(id, worker, newest);
-        let reports: Vec<Signal> = follow.joined().filter_map(new).collect();
-        engine.tell_loads(|tell| {
-            for report in &reports {
-                self.held(|| tell(report));
-            }
-        });
+        for (id, worker) in follow.joined() {
+            let Some(report) = self.new_report(id, worker, newest, cells) else {
+                continue;
+            };
+            engine.tell_loads(|tell| {
+                self.held(|| tell(&report));
+            });
+        }
     }
 
     /// The report of `newest` for `worker`, which the stages know as `id`,
     /// as a stage is told it, where its sample instant is not the one told
     /// last of the worker: one look-up, and one conversion of a report that
-    /// is new. The instant counts as told from here on. A conversion that
-    /// panics is held and counted ([`Self::upkeep_faults`]), and its report
-    /// is told to no stage.
-    fn new_report(&self, id: WorkerId, worker: &Joined, newest: &LoadSnapshot) -> Option<Signal> {
+    /// is new. The instant counts as told from here on. Its named values
+    /// are written into `cells` where a stage of the document keeps a
+    /// signal's column, and nothing is converted for them elsewhere. A
+    /// conversion that panics is held and counted
+    /// ([`Self::upkeep_faults`]), and its report is told to no stage.
+    fn new_report<'c>(
+        &self,
+        id: WorkerId,
+        worker: &Joined,
+        newest: &LoadSnapshot,
+        cells: &'c mut SignalCells,
+    ) -> Option<Signal<'c>> {
         let (report, sampled_at) = newest.report(&worker.address)?;
         if worker.told_at.replace(Some(sampled_at)) == Some(sampled_at) {
             return None;
         }
-        let stated = || stated_report(report, sampled_at, worker.role, &self.clock);
-        let (row, sampled_at_micros) = self.held(stated)?;
-        Some(Signal::Load {
-            worker: id,
-            dp_rank: worker.dp_rank,
-            row,
-            slot: WorkerSlot::NONE,
-            sampled_at_micros,
+        self.held(move || {
+            let clock = &self.clock;
+            let (row, sampled_at_micros) = stated_report(report, sampled_at, worker.role, clock);
+            let signals = if self.document.signals {
+                let columns = self.document.spec.signal_columns();
+                stated_signals(report, sampled_at, columns, clock, cells)
+            } else {
+                ReportSignals::NONE
+            };
+            Signal::load(id, worker.dp_rank, row, sampled_at_micros).with_signals(signals)
         })
     }
 }

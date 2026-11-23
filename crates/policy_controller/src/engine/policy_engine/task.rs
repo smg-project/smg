@@ -36,6 +36,7 @@ use crate::{
         decision_engine::{DecisionEngine, RequestMaker, SweepOutcome},
         framework::release,
     },
+    load::SignalCells,
     stages::Lifecycle,
 };
 
@@ -276,13 +277,17 @@ impl PolicyEngine {
         let (mut taken, mut feed) = (0, None);
         // The follow of the host's registry, once it is handed.
         let mut members = None;
-        self.step(&upkeep, &mut members, &mut taken, &mut feed);
+        // The named values of the report a telling tells, one row.
+        let mut told = SignalCells::default();
+        self.step(&upkeep, &mut members, &mut told, &mut taken, &mut feed);
         loop {
             tokio::select! {
-                _ = tick.tick() => self.step(&upkeep, &mut members, &mut taken, &mut feed),
+                _ = tick.tick() => {
+                    self.step(&upkeep, &mut members, &mut told, &mut taken, &mut feed);
+                }
                 went_on = published(feed.as_mut()) => {
                     if went_on {
-                        let tell = |newest: &_| self.tell_loads(&mut members, newest);
+                        let tell = |newest: &_| self.tell_loads(&mut members, &mut told, newest);
                         self.loads.keep(feed.as_mut(), tell);
                     } else {
                         feed = None;
@@ -298,11 +303,13 @@ impl PolicyEngine {
     /// the upkeep before. That is the follow of the registry the host
     /// handed ([`Self::follow_registry`]), then the host's load channel,
     /// where it handed one the task has not taken: `taken` counts the
-    /// hand-over `feed` came with.
+    /// hand-over `feed` came with. `told` is the row the task keeps for
+    /// the named values of the report a telling tells.
     fn step(
         &self,
         upkeep: &impl Fn(Instant) -> SweepOutcome,
         members: &mut Option<Follow>,
+        told: &mut SignalCells,
         taken: &mut u64,
         feed: &mut Option<LoadReceiver>,
     ) {
@@ -314,7 +321,7 @@ impl PolicyEngine {
         self.follow_registry(members);
         if let Some(handed) = self.loads.handed_past(*taken) {
             (*taken, *feed) = handed;
-            let tell = |newest: &_| self.tell_loads(members, newest);
+            let tell = |newest: &_| self.tell_loads(members, told, newest);
             self.loads.keep(feed.as_mut(), tell);
         }
     }

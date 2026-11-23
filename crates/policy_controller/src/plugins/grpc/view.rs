@@ -494,7 +494,7 @@ pub(crate) fn since(event: &proto::lifecycle_event::Event) -> u32 {
 
 /// A signal; a veto's instant on the host's clock becomes the microseconds
 /// it has left at `now_micros` on that clock (`0` when none).
-pub(crate) fn signal(s: &Signal, now_micros: u64) -> proto::lifecycle_event::Event {
+pub(crate) fn signal(s: &Signal<'_>, now_micros: u64) -> proto::lifecycle_event::Event {
     use proto::signal::Kind;
     let (worker_id, dp_rank, kind) = match s {
         Signal::Load {

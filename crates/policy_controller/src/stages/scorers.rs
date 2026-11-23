@@ -118,7 +118,7 @@ impl<S: ReadsLoad> Lifecycle for WithLoadReportAgeLimit<S> {
         self.stage.on_membership(change);
     }
 
-    fn on_signal(&self, signal: &Signal) {
+    fn on_signal(&self, signal: &Signal<'_>) {
         self.stage.on_signal(signal);
     }
 
@@ -1722,13 +1722,14 @@ impl Lifecycle for ResidentWork {
     /// A rank's report as its host shows it to decisions: the stage keeps
     /// the rank's cost as one number in the cell of its slot. A host that
     /// names no slot is kept no number.
-    fn on_signal(&self, signal: &Signal) {
+    fn on_signal(&self, signal: &Signal<'_>) {
         let Signal::Load {
             worker,
             dp_rank,
             row,
             slot,
             sampled_at_micros,
+            ..
         } = *signal
         else {
             return;
@@ -2371,6 +2372,7 @@ pub(crate) mod tests {
             framework::{Picker, Shortlist},
             view::{Health, LoadRow},
         },
+        load::ReportSignals,
         policies::{
             cache_aware::{Gates, WarmupSlice},
             least_load::LeastLoad,
@@ -2432,7 +2434,7 @@ pub(crate) mod tests {
             fn on_membership(&self, _: &Membership<'_>) {
                 self.0.events.lock().push(EventKind::Membership);
             }
-            fn on_signal(&self, _: &Signal) {
+            fn on_signal(&self, _: &Signal<'_>) {
                 self.0.events.lock().push(EventKind::Signal);
             }
             fn keeps_loads(&self) -> bool {
@@ -3422,6 +3424,7 @@ pub(crate) mod tests {
             row: row.load.expect("a report to tell"),
             slot,
             sampled_at_micros: row.load_sampled_at_micros,
+            signals: ReportSignals::NONE,
         });
     }
 
@@ -4335,6 +4338,7 @@ pub(crate) mod tests {
                 row: row.load.expect("a report"),
                 slot,
                 sampled_at_micros: row.load_sampled_at_micros,
+                signals: ReportSignals::NONE,
             });
         }
 

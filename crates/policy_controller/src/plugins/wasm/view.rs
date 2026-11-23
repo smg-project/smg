@@ -1017,7 +1017,7 @@ pub(crate) fn membership<'a>(
 
 /// A signal; a veto's instant on the host's clock becomes the microseconds
 /// it has left at `now_micros` on that clock (`0` when none).
-pub(crate) fn signal(s: &Signal, now_micros: u64) -> wit::Signal {
+pub(crate) fn signal(s: &Signal<'_>, now_micros: u64) -> wit::Signal {
     match s {
         Signal::Load {
             worker,

@@ -11,4 +11,4 @@ pub(crate) mod signals;
 #[cfg(any(feature = "ingest", feature = "in-process"))]
 pub use load_report::{load_row, signal_values};
 pub use load_report_reader::{LoadReportPass, LoadReportReader};
-pub use signals::{SignalCell, SignalCells, SignalColumn};
+pub use signals::{ReportSignals, SignalCell, SignalCells, SignalColumn};

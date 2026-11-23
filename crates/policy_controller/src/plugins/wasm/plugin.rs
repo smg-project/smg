@@ -2944,7 +2944,7 @@ impl BoundPlugin for PluginBinding {
         self.plugin.hand(change);
     }
 
-    fn observe_signal(&self, signal: &Signal) {
+    fn observe_signal(&self, signal: &Signal<'_>) {
         let now = self.plugin.runtime.now_micros();
         self.plugin
             .observe(wit::LifecycleEvent::Signal(marshal::signal(signal, now)));
