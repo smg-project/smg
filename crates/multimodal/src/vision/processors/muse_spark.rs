@@ -22,6 +22,8 @@
 //! normalization ([`EncoderInput::U8`]), so the destination's dtype is written
 //! once at serialization and a cached item serves every destination.
 
+use std::collections::TryReserveError;
+
 use image::DynamicImage;
 use ndarray::Array2;
 
@@ -408,6 +410,11 @@ fn patchify_group(
         .for_each(buffer_pool::recycle);
 }
 
+/// The request's error for a patch output that cannot be reserved.
+fn refused(error: TryReserveError) -> TransformError {
+    TransformError::ReserveRefused(format!("cannot reserve Muse Spark patch output: {error}"))
+}
+
 /// Muse Spark image and video processor.
 #[derive(Debug, Clone, Copy)]
 pub struct MuseSparkVisionProcessor {
@@ -490,7 +497,7 @@ impl MuseSparkVisionProcessor {
         let mut original = (0u32, 0u32);
         let mut rows_per_group = 0;
         let mut out: Vec<u8> = Vec::new();
-        let mut group: Vec<std::borrow::Cow<'a, [u8]>> = Vec::with_capacity(temporal);
+        let mut group: Vec<std::borrow::Cow<'a, [u8]>> = Vec::with_capacity(temporal.min(count));
         let mut written = 0;
         for (index, (width, height, data)) in frames.enumerate() {
             let plan = match plan {
@@ -498,8 +505,13 @@ impl MuseSparkVisionProcessor {
                 None => {
                     let first = settings.plan(height, width)?;
                     original = (width as u32, height as u32);
-                    rows_per_group = first.grid_h * first.grid_w;
-                    out = buffer_pool::take(groups * rows_per_group * features);
+                    rows_per_group = first.grid_h.saturating_mul(first.grid_w);
+                    out = buffer_pool::try_take(
+                        groups
+                            .saturating_mul(rows_per_group)
+                            .saturating_mul(features),
+                    )
+                    .map_err(refused)?;
                     plan = Some(first);
                     first
                 }
@@ -613,14 +625,15 @@ impl VisionPreProcessor for MuseSparkVisionProcessor {
         let do_resize = self.do_resize;
         let features = settings.patch_features();
         let mut plans = Vec::with_capacity(images.len());
-        let mut total_rows = 0;
+        let mut total_rows = 0usize;
         for image in images {
             let (width, height) = (image.width() as usize, image.height() as usize);
             let plan = settings.plan(height, width)?;
-            total_rows += plan.grid_h * plan.grid_w;
+            total_rows = total_rows.saturating_add(plan.grid_h.saturating_mul(plan.grid_w));
             plans.push(plan);
         }
-        let mut out = buffer_pool::take(total_rows * features);
+        let mut out =
+            buffer_pool::try_take(total_rows.saturating_mul(features)).map_err(refused)?;
         let mut tokens = Vec::with_capacity(images.len());
         let mut sizes = Vec::with_capacity(images.len());
         let mut grids = Vec::with_capacity(images.len() * 3);
@@ -1197,5 +1210,39 @@ mod tests {
             videos.preprocess_video(&frames, &clip),
             Err(TransformError::InconsistentShapes)
         ));
+    }
+
+    /// A patch row no allocation holds, then sizes `usize` cannot count (the
+    /// patch grid of an image, the rows of a batch, the patch grid of a clip
+    /// whose temporal width no frame list holds): each reads the refused
+    /// reserve.
+    #[test]
+    fn a_patch_output_that_cannot_be_reserved_is_an_error() {
+        let processor = |patch_size, merge_size| {
+            let mut processor = MuseSparkVisionProcessor::new();
+            processor.image.patch_size = patch_size;
+            processor.image.merge_size = merge_size;
+            processor.video = processor.image;
+            processor.do_resize = false;
+            processor
+        };
+        let half = usize::BITS / 2;
+        let image = solid(1, 1, Rgb([0; 3]));
+        let clip = VideoClipOptions::sampled_at(2.0);
+        let mut long_groups = processor(1, 1 << half);
+        long_groups.video.temporal_patch_size = 1 << (usize::BITS - 2);
+
+        for result in [
+            processor(1 << 30, 1).preprocess(&[&image]),
+            processor(1, 1 << half).preprocess(&[&image]),
+            processor(1, (1 << half) - 1).preprocess(&[&image; 2]),
+            long_groups.preprocess_video(std::slice::from_ref(&image), &clip),
+        ] {
+            assert!(
+                matches!(&result, Err(TransformError::ReserveRefused(message))
+                    if message.starts_with("cannot reserve Muse Spark patch output: ")),
+                "{result:?}"
+            );
+        }
     }
 }
