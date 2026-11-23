@@ -26,7 +26,7 @@ impl<'a, H: JobHost> QueueTest<'a, H> {
             concurrency_limit: &queue.concurrency_limit,
             outcomes: &queue.outcomes,
             kept: &queue.kept,
-            cancelled_before_start: &queue.cancelled_before_start,
+            cancelled_before_start: &queue.cancelled_before_start.marks,
         }
     }
 
@@ -114,7 +114,7 @@ impl<'a, H: JobHost> QueueTest<'a, H> {
         kept: &DashMap<String, Kept<H::Job>>,
         marks: &DashSet<WorkerId>,
     ) {
-        JobQueue::<H>::run_kept(url, host, status_map, kept, marks).await;
+        JobQueue::<H>::run_kept(url, host, status_map, kept, marks, &DashMap::new()).await;
     }
 
     /// Delivers an outcome to its own waiter.
