@@ -1591,6 +1591,88 @@ impl Format {
         self.emits(self.prompt_state(prompt)) == Emits::Reasoning
     }
 
+    /// The prompt to replay in the place of the one a caller does not have, for a whole `text`
+    /// read with no prompt, as a route that parses a text by a parser's name reads it. Where
+    /// `text` began inside a thought its prompt opened: the turn's opener and behind it the
+    /// marker that opens the thought, or the turn anchor that starts in the thought (Hy4's
+    /// prompt opens the thought, so its output holds `</think:opensource>` and nothing that
+    /// opens a thought before it). The first marker of `text` that the turn's start or a thought
+    /// has a row for tells it: the text began inside when that marker's rows all leave one
+    /// thought, and a prompt the table knows replays into that thought. Any other text starts
+    /// where the turn does, with the turn's opener: one that opens its thought or a call first,
+    /// one whose table reads the close from the turn's start too (MiniMax M3's), and one with no
+    /// such marker. A text that opens its turn itself, where the table reads the opener from an
+    /// unopened turn's start (Inkling 2's), replays the turn's end, which opens none. The answer
+    /// is a guess from the text alone: a close the model wrote as plain text ahead of every such
+    /// marker (in its answer, in a string of a JSON answer or of a call no marker opens) reads as
+    /// the end of a thought, and a text that began inside an answer the prompt opened by a marker
+    /// of its own (Kimi K3's) starts where the turn does, outside that answer, which is lost
+    /// there as it is with no prompt at all. A caller that has the prompt replays the prompt.
+    pub fn unprompted(&self, text: &str) -> String {
+        let opener = self.turn_opener().unwrap_or_default();
+        if let Some(unopened) = &self.unopened {
+            let read = |row: &Transition| {
+                row.from == unopened.state && self.terminal_text(row.on) == opener
+            };
+            if self.transitions.iter().any(read) && text.trim_start().starts_with(opener) {
+                return unopened.end.clone();
+            }
+        }
+        let start = self.prompt_state(opener);
+        let thinks = |state: usize| self.emits(state) == Emits::Reasoning;
+        let mut scanner = self.scanner();
+        let mut rest = text;
+        // In bounded parts, so that the first marker that decides ends the read.
+        loop {
+            let (part, behind) = rest.split_at(rest.floor_char_boundary(4096));
+            let scanned = if part.is_empty() {
+                scanner.finish()
+            } else {
+                scanner.feed(part)
+            };
+            for piece in scanned.pieces() {
+                let Piece::Marker(on) = piece else { continue };
+                // The rows the parser reads the marker by, its recovery rows among them.
+                let rows = || {
+                    let recovery = self.recovery_transitions.iter();
+                    self.transitions
+                        .iter()
+                        .chain(recovery.filter(move |_| !self.shown(on)))
+                        .filter(move |row| row.on == on)
+                };
+                if !rows().any(|row| row.from == start || thinks(row.from) || thinks(row.to)) {
+                    continue;
+                }
+                let thought = rows().next().map_or(start, |row| row.from);
+                if !thinks(thought) || !rows().all(|row| row.from == thought && !thinks(row.to)) {
+                    return opener.to_string();
+                }
+                let turns = self.turn_texts();
+                let inside = turns
+                    .iter()
+                    .copied()
+                    .chain(turns.is_empty().then_some(""))
+                    .find_map(|turn| {
+                        let from = self.prompt_state(turn);
+                        let prompt = if from == thought {
+                            turn.to_string()
+                        } else {
+                            let mut rows = self.transitions.iter();
+                            let opens = rows.find(|row| row.from == from && row.to == thought)?;
+                            format!("{turn}{}", self.terminal_text(opens.on))
+                        };
+                        (self.prompt_state(&prompt) == thought).then_some(prompt)
+                    });
+                return inside.unwrap_or_else(|| opener.to_string());
+            }
+            if part.is_empty() {
+                return opener.to_string();
+            }
+            scanner.reclaim(scanned);
+            rest = behind;
+        }
+    }
+
     /// Whether `prompt` closed the thought itself and wrote what the template writes after the
     /// close (a request with thinking switched off: Qwen3's `<think>\n\n</think>\n\n`), so the
     /// structural tags owe none of it before their first text
@@ -2859,6 +2941,64 @@ mod tests {
             said(&shown),
             ("a thought</a>an answer".to_string(), String::new(), 0)
         );
+    }
+
+    #[test]
+    fn a_text_with_no_prompt_begins_inside_the_thought_whose_close_stands_first() {
+        use crate::formats::{
+            deepseek_v3_2, hy4, inkling2, kimi_k3::kimi_k3, minimax_m3, qwen3::qwen3,
+        };
+        let qwen3 = || qwen3(CallSyntax::Json);
+        let straddling = format!("{}</think:opensource>a", "r".repeat(4094));
+        for (format, text, prompt) in [
+            // The prompt had opened the thought: its close stands first.
+            (
+                hy4(),
+                "r</think:opensource>a",
+                "<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+            ),
+            // The same, where a turn anchor starts in the thought.
+            (
+                deepseek_v3_2(),
+                "r</think>a",
+                "<｜Assistant｜><think>",
+            ),
+            // A close the parser reads inside a thought by a recovery row stands first: it
+            // decides, and the thought's close behind it tells nothing.
+            (
+                kimi_k3(),
+                "r<|close|>response<|sep|><|close|>think<|sep|>",
+                "<|open|>message role=\"assistant\"<|sep|>",
+            ),
+            // A call stands first: the close inside its argument is the argument's text.
+            (
+                qwen3(),
+                "<tool_call>\n{\"name\": \"f\", \"arguments\": {\"x\": \"</think>\"}}\n</tool_call>",
+                "<|im_start|>assistant",
+            ),
+            // The text opens its turn itself, behind whitespace the table drops.
+            (
+                inkling2(),
+                "\n<|message_model|><|content_text|>ok<|end_message|>",
+                "<|end_message|>",
+            ),
+            // The thought's close cut in two by the end of the first part the function reads.
+            (
+                hy4(),
+                straddling.as_str(),
+                "<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+            ),
+            // No marker that decides, to the end of the text: the turn's opener.
+            (
+                hy4(),
+                "just an answer",
+                "<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜>",
+            ),
+            // A close the table also reads from the turn's start tells nothing.
+            (minimax_m3(), "r</mm:think>a", "]~b]ai\n"),
+        ] {
+            assert_eq!(format.unprompted(text), prompt, "{text:?}");
+        }
     }
 
     #[test]
