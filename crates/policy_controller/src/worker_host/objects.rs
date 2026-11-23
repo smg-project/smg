@@ -3,7 +3,8 @@
 //! it, and the store follows that write ([`mod@write`]). A standby's applier
 //! hands it each event of its leader's stream ([`mod@standby`]). A host can
 //! also ask it to follow the rows' status, or to build each object with the
-//! thresholds its own load monitor judges overload by.
+//! thresholds its own load monitor judges overload by. A door reads the row
+//! that stands off it ([`mod@read`]).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -44,6 +45,7 @@ use crate::{
 };
 
 mod host_count;
+mod read;
 mod standby;
 mod write;
 

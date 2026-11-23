@@ -1911,19 +1911,6 @@ impl MemoryStore {
 
 #[cfg(feature = "worker-host")]
 impl MemoryStore {
-    /// Every row whose facts name `engine`: its plain row, or each rank
-    /// that stands. One pass over the rows under the membership lock, once
-    /// a registration at a door. No decision reads it.
-    pub(crate) fn of_engine(&self, engine: &str) -> Vec<WorkerRow> {
-        let workers = self.workers.lock();
-        workers
-            .rows
-            .values()
-            .filter(|row| row.row.facts.engine == engine)
-            .map(|row| row.row.clone())
-            .collect()
-    }
-
     /// One membership write this replica's worker objects decided, applied
     /// as their holder tells it: a leader's side of [`Self::follow`], over
     /// the one body ([`Self::decided`]). The holder decided the change over
@@ -1937,8 +1924,8 @@ impl MemoryStore {
     /// test the store's own patch and removal make there, and what its own
     /// registration has by deciding under the lock. A writer outside the
     /// holder's turn can move the row between the holder's read and this
-    /// call: a replica that just took the lead may still apply its last
-    /// leader's last event.
+    /// call: a caller of the store's own registration, patch or removal
+    /// takes no turn of the holder.
     ///
     /// A status is the table's word until a worker object's leads. The
     /// holder read `row`'s off an object, which trails the table by the
