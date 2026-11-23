@@ -448,14 +448,13 @@ enum BodyRead {
 /// body: parked on a body that stalled mid-stream, it would learn that its
 /// client left only when the body next yields, and the engine request behind
 /// the body would run on as long. Here every read races the body against the
-/// client's leaving; on [`BodyRead::ClientLeft`] the caller ends its read
-/// and drops the body,
-/// and the chat layer ends the engine request the way it does for its own
-/// clients. A background response's wait is on the sender of its relay, which
-/// closes with the work and not with the client: its reads are the body's
-/// own, and the work outlives the client as it is meant to. `client_gone`
-/// is the wait the relay keeps for one chat body; the order of a read is
-/// [`ClientGone::poll_read`]'s.
+/// client's leaving; on [`BodyRead::ClientLeft`] the caller ends its read and
+/// drops the body, and the chat layer ends the engine request the way it does
+/// for its own clients. A background response's wait is on the sender of its
+/// relay, which closes with the work and not with the client: its reads are
+/// the body's own, and the work outlives the client as it is meant to.
+/// `client_gone` is the wait the relay keeps for one chat body; the order of a
+/// read is [`ClientGone::poll_read`]'s.
 async fn next_frame(stream: &mut BodyDataStream, client_gone: &mut ClientGone) -> BodyRead {
     std::future::poll_fn(|cx| client_gone.poll_read(cx, |cx| stream.poll_next_unpin(cx)))
         .await

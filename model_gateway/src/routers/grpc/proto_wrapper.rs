@@ -775,8 +775,10 @@ impl ClientGone {
         }
     }
 
-    /// The closed flag is read first, so a busy `source` cannot outrun it.
-    /// Repeated polls under one waker skip the wait: its wake follows the flag.
+    /// `None` is the client's leaving, `Some` what `source` gave. The closed
+    /// flag is read first, so a busy `source` cannot outrun it; the wait is
+    /// polled only while `source` is pending, and not again under the waker
+    /// it holds: the channel raises the flag before it wakes that waker.
     pub(crate) fn poll_read<T>(
         &mut self,
         cx: &mut Context<'_>,
