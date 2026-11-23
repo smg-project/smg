@@ -244,7 +244,8 @@ pub(crate) struct DecisionCall<'a, A> {
     /// The place of the decider that decides, at its file of leases: a
     /// decision whose profile holds a stage that may refuse by a report
     /// of leases applies what waits at the files of leases through it.
-    /// None in process, where no file's frames wait for a look.
+    /// None for a caller with no place, where no file's frames wait for a
+    /// look.
     pub(crate) place: Option<&'a AtWork>,
 }
 

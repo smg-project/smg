@@ -4,7 +4,7 @@
 //!
 //! The store holds what a decision reads and nothing a request path writes:
 //! membership, health, loads, the KV index behind its event cursors,
-//! reservations, session pins and leases. Every path that writes it today
+//! reservations and leases. Every path that writes it today
 //! ends in one of these sinks (the step-3 inventory counted thirteen paths
 //! into six writes), so the drivers that move into the controller (discovery,
 //! the handshake, the prober, the poll, the subscriptions, the relays) and the
@@ -17,7 +17,6 @@
 //! | [`LoadSink`] | the subscription task per record, the poll per engine per tick, the scrape per interval, a relay per frame | up to ten records per rank per second busy, one per second idle |
 //! | [`KvEventSink`] | the subscription task per batch, a relay per frame | one batch per scheduler step that moved blocks |
 //! | [`ReservationStore`] | a commit (a prefill slot, a decode room), a lease's end | two per pair dispatch |
-//! | [`SessionsStore`] | a keyed commit, the TTL sweep, a gateway's `Hello` pages | per keyed decision |
 //! | [`LeasesStore`] | every decision, dispatch and completion report, the dispatch-deadline sweep, `Hello` pages | two to three frames per request |
 //!
 //! Rules every implementation keeps:
@@ -104,7 +103,6 @@ pub use loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake};
 pub(crate) use memory::DecodeIssue;
 pub use memory::{AtWork, Hand, LookOutcome, MemoryStore, StoreCheckpoint, StoreStats};
 pub use reservations::{ReservationKind, ReservationStore};
-pub use sessions::{Pin, SessionsStore};
 pub use signals::{SignalSink, SignalWriteOutcome};
 pub use snapshot::{
     AffinityQuery, EncodePairBuffers, OutsideLists, PairBuffers, PoolView, StaleGeneration,

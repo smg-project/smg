@@ -1,7 +1,6 @@
-//! The sessions store: a session key's pin to its target (design 5.1, the
-//! sessions row), and the count of the key's requests in flight.
+//! The sessions store: the count of a session key's requests in flight.
 
-use std::{collections::hash_map::Entry, time::Instant};
+use std::collections::hash_map::Entry;
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
@@ -11,71 +10,10 @@ use crate::engine::{
     view::{Session, WorkerId},
 };
 
-/// A session's pin.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Pin {
-    pub worker: WorkerId,
-    /// The last decision that used it, on the host's clock: a merge reads
-    /// it.
-    pub last_used: Instant,
-    /// The instant the pin ends, by the TTL of the rule that placed its
-    /// key: at or past it the sweep drops the pin and a decision's read
-    /// takes none. It stands on the decision clock, in microseconds since
-    /// the store's origin, as the engine's table holds the instant it
-    /// forgets the key: a dispatch writes it as read, or as its lease's
-    /// own rule counts it from the lease's issue, never earlier than the
-    /// end that stood, and converts no clock. `None` for a key its rule
-    /// keeps with no TTL: such a pin stays until a dispatch under a table
-    /// moves it and its end, or its worker's row goes.
-    pub ends: Option<u64>,
-}
-
-/// Where session pins are written: at the commit of a keyed decision, never
-/// at selection. Keys are fingerprints (never `0`). A worker that leaves
-/// keeps its pins while its key may be registered again, and takes them with
-/// it where it is not. By the design the gateways keep a bounded table of the pins
-/// they received and replay it in `Hello`, merged here by last use: no
-/// gateway replays its pins in this build, and the merge door has no caller.
-pub trait SessionsStore: Send + Sync {
-    /// Pin `key` to `worker` at `at`, to end at `ends` on the decision
-    /// clock (`None`: at no instant); a re-pin moves it and its end.
-    fn pin(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<u64>);
-
-    /// Pin `key` as [`pin`](Self::pin) does, for a writer that knows the
-    /// key's rule by its lease alone: the end that stands stays where it is
-    /// the later one, and no end is later than any instant. A lease
-    /// dispatched behind a newer one of its key, or behind a dispatch whose
-    /// table ended the pin later, then never ends the pin earlier.
-    fn pin_no_earlier(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<u64>);
-
-    fn lookup(&self, key: u64) -> Option<Pin>;
-
-    fn unpin(&self, key: u64);
-
-    /// Workers left for good: their pins go with them, in one walk.
-    /// Returns how many.
-    fn drop_workers(&self, workers: &[WorkerId]) -> usize;
-
-    /// Drop the pins whose own end is at or before `now`, an instant of
-    /// the decision clock. Returns how many.
-    fn expire(&self, now: u64) -> usize;
-
-    /// Merge a pin a gateway replayed: a key already pinned keeps the later
-    /// use. The pin's end is a number of the clock of the store that wrote
-    /// it: a caller turns it into this store's before it merges.
-    fn merge(&self, key: u64, pin: Pin);
-
-    fn len(&self) -> usize;
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
 /// A session key's requests in flight: the workers that carry them, and
 /// how many each carries. The store keeps one for a key while a lease of
-/// the key stands on file, and a keyed decision under a rule with an
-/// in-flight cap reads it. The first worker stands in the entry itself: a
+/// the key stands on file. No decision reads it: a controller serves no
+/// in-flight cap yet. The first worker stands in the entry itself: a
 /// key whose requests all stand on one worker, as a pinned key's do,
 /// allocates nothing. A worker whose count falls to zero leaves.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -122,41 +60,27 @@ impl InFlight {
     }
 }
 
-/// One shard of a store's sessions' tables.
+/// One shard of a store's sessions' table.
 #[derive(Default)]
-pub(super) struct Shard {
-    /// The pins of record.
-    pub(super) pins: FxHashMap<u64, Pin>,
+struct Shard {
     /// The requests in flight of each key that has a lease on file.
     in_flight: FxHashMap<u64, InFlight>,
 }
 
-/// A store's sessions' tables, in the shards of the engine's own table
-/// ([`shard_of`]): each key's pin of record and, beside it, the key's
-/// requests in flight. One lock a shard holds both.
+/// A store's count of each session key's requests in flight, in the shards
+/// of the engine's own table ([`shard_of`]).
 ///
 /// A lease's file writes under its own turn: the turn first, then the
-/// key's shard. A registration that takes its key's pins along renames
-/// them under the workers lock: that lock first, then each shard. Every
-/// other caller takes a shard with no lock of the store's held, and
-/// nothing is taken under one, so no path takes two of them the other
-/// way. The engine's own table is told each leave and join under the
-/// workers lock too, and takes its absent list's lock, then a shard of
-/// its own ([`crate::engine::SessionTable`]).
+/// key's shard. Nothing is taken under a shard.
 #[derive(Default)]
 pub(super) struct SessionTables {
     shards: [Mutex<Shard>; SHARDS],
 }
 
 impl SessionTables {
-    /// The shard that holds `key`'s pin of record and its count.
-    pub(super) fn shard(&self, key: u64) -> &Mutex<Shard> {
+    /// The shard that holds `key`'s count.
+    fn shard(&self, key: u64) -> &Mutex<Shard> {
         &self.shards[shard_of(key)]
-    }
-
-    /// Every shard, for a pass that walks them one hold after another.
-    pub(super) fn shards(&self) -> &[Mutex<Shard>] {
-        &self.shards
     }
 
     /// One request more of `session` stands on `worker`: a lease's side
