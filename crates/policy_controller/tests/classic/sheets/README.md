@@ -389,8 +389,13 @@ fails once the reason no longer holds.
 - `pair_index.json`: none. All 23 rows replay.
 - `encode_pair.json`: none is recorded yet. The module that replays it arrives with the crate's encoder lists
   and its rule for encode items; until then the replay owes this sheet.
-- `pair_select.json`: none is recorded yet. The module that replays it arrives with the crate's pair
-  decision; until then the replay owes this sheet.
+- `pair_select.json`: five rows are decided apart, each named by the replay with the answer the pair's decision
+  gives. Four run a prefill policy that weighs load against cache affinity itself (`cache_aware`): the gateway
+  lifts the overload veto for such a policy and lets it place, and no profile of the crate places over a lifted
+  veto yet. A prefill of such a profile that is only over its thresholds keeps its refusal. One is a refusal's
+  reason: where the only ready prefill's partners are all over their thresholds beside a free decode of another
+  transport, the gateway answers unavailable and the pair's decision names the overload veto. The other 35 rows
+  replay.
 - `overload.json`: six rows are decided apart, each by a rule of the crate's store that the replay names with the
   verdicts the store gives. The store holds a usage and its threshold in permille, so a usage within half a permille
   under the threshold reads at it (`a-usage-under-the-threshold-by-less-than-half-a-permille-is-under-it`). The

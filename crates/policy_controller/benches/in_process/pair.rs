@@ -11,9 +11,9 @@
 //! Every worker has a load report, and a prefill states its rate as its
 //! measured input rate too: the one drain a prefill's record reads.
 //! `--overloaded 1` puts a pair's decodes alone over their thresholds: the
-//! rule for such a list steers a pair's decode side, and a pair whose
-//! prefills are all over theirs is refused. The result's `conversions=`
-//! counts the two lists together.
+//! rule for such a list steers a pair's decode side. A pair whose prefills
+//! are all over theirs goes to the pair's default, which no cell runs. The
+//! result's `conversions=` counts the two lists together.
 
 use std::{cell::OnceCell, ops::Deref, sync::Arc, time::Instant};
 

@@ -1465,10 +1465,10 @@ On main: 18 sheets, 482 lines.
 
 | | Sheets | Lines |
 |---|---|---|
-| replayed and passing | 16 | 437 |
-| recorded, replayed by nothing (`pair_select`, `constraint_decider`) | 2 | 45 |
+| replayed and passing | 17 | 477 |
+| recorded, replayed by nothing (`constraint_decider`) | 1 | 5 |
 | replayed through the engine that stays (`PolicyEngine`) | **0** | **0** |
-| replayed lines held to an answer of the crate's own, not classic's | | 23 |
+| replayed lines held to an answer of the crate's own, not classic's | | 28 |
 
 A replay through `PolicyEngine` over worker objects is in work and not on main yet. Measured
 with it locally on 2026-11-22, on main (`096c0f5ea`): of the 408 lines that record a decision
@@ -1599,7 +1599,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | the crate's ring places a routing key on another worker than classic's ring (decision 3) |
 | `manual` and sticky sessions on that engine | **[partly]** | their sheets replay through the decision function, not through the engine |
 | `bucket` on that engine | **[partly]** | the same |
-| Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) is replayed by nothing |
+| Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; five of its 40 lines are held to an answer of the crate's own |
 | Encode-prefill-decode on that engine | **[partly]** | `PolicyEngine::decide_encode_at` decides it over a host's three lists and issues the pair's lease; it declines a request held to a wire that one worker of the three lists is not dialed on, and one that asks images of its decode and states the later decode; `place` does not take it |
 | The lease and its events; the guard | **[built]** | |
 | The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request and for a pair, with the route's rule and the decision made again, three decisions a call at most; `place` for an encode request, the later decisions held to the workers the route's rule takes and the start call are not |

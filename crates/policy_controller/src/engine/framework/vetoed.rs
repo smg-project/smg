@@ -16,8 +16,9 @@
 //! A pair's decode side is put to the rule: its set carries the pair
 //! binding's word ([`Set::ruled`]), so partners whose every usable worker
 //! is vetoed are steered or shed as a single request's pool is, over their
-//! own rows. A pair's first decision asks for the overload veto alone, and
-//! its prefill side is put to no rule.
+//! own rows. A pair's first decision asks the rule for the overload veto
+//! alone, and its prefill side is put to no rule. A pair whose pool still
+//! fails, vetoed on every usable worker, is paired by load ([`paired`]).
 //!
 //! A profile that places a request by its session key reads the same word
 //! ahead of its pass ([`keeps_its_key`]): where the binding steers, a keyed
@@ -32,18 +33,18 @@
 //! one mark.
 
 use super::{
-    engines::run_owned, filter, keep_folded, leads, run_single, single_emptied, trace_of,
-    Assignment, Binding, Buffers, Engine, Filter, Picker, Plan, Profile, Scorer, Scratch,
-    SessionRule, Set,
+    classed, engines::run_owned, filter, keep_folded, leads, places, reason_of, run_single, shed,
+    single_emptied, trace_of, Assignment, Binding, Buffers, Engine, Filter, PairTable, Picker,
+    Plan, Profile, Scorer, Scratch, SessionRule, Set,
 };
 use crate::{
     engine::{
-        decision::{Decision, LiftedVeto, Pick, Targets, Trace},
+        decision::{Decision, LiftedVeto, Pick, Survivors, Targets, Trace},
         sticky_sessions::SessionVerdict,
         view::{Candidate, Constraints, Health, PoolFacts, RequestFacts},
     },
     stages::{
-        filters::{Healthy, NotOverloaded, NotTried},
+        filters::{HasCapacity, Healthy, NotOverloaded, NotTried},
         pickers::Best,
         scorers::LeastRequests,
     },
@@ -374,10 +375,7 @@ pub(super) fn emptied(
             .iter()
             .any(|row| !NotOverloaded.keep(facts, row, cx))
     {
-        let pass = Constraints {
-            overload_lifted: true,
-            ..*cx
-        };
+        let pass = lifted_cx(cx, true, false);
         // On a retry a chosen prefill's partners keep to the ones the
         // request has not tried while one is left: their pass reads the
         // tried list first. It stands where it keeps a partner, unless the
@@ -492,11 +490,7 @@ fn doubted(
         tried: &[],
         ..*facts
     };
-    let pass = Constraints {
-        overload_lifted: cx.overload_lifted || set.vetoed == AllVetoed::Steer,
-        stalled: cx.held,
-        ..*cx
-    };
+    let pass = lifted_cx(cx, set.vetoed == AllVetoed::Steer, true);
     let stage = if own {
         let mut rows = std::mem::take(&mut buf.undoubted);
         undoubted(set.candidates, &mut rows);
@@ -516,6 +510,17 @@ fn doubted(
             emptied_by
         }
         Some(stage) => stage,
+    }
+}
+
+/// The constraints of a pass that lifts a veto: the overload veto where the
+/// binding steers (`steers`) or the host lifted it, and with `doubt` the
+/// liveness veto, the host's mask cut to the rows a hold stands on.
+fn lifted_cx<'a>(cx: &Constraints<'a>, steers: bool, doubt: bool) -> Constraints<'a> {
+    Constraints {
+        overload_lifted: cx.overload_lifted || steers,
+        stalled: if doubt { cx.held } else { cx.stalled },
+        ..*cx
     }
 }
 
@@ -605,6 +610,208 @@ pub(super) fn steered(
     })
 }
 
+/// One side of a pair as the pair's default reads it ([`paired`]): the
+/// side's profile and its index, the request as the side's stages read it,
+/// the side's rows and the constraints over them.
+#[derive(Clone, Copy)]
+pub(super) struct Half<'a> {
+    profile: &'a Profile,
+    index: u16,
+    facts: &'a RequestFacts<'a>,
+    rows: &'a [Candidate],
+    cx: &'a Constraints<'a>,
+    /// Whether the admission limit is set aside where a row is judged: the
+    /// prefill side's, whose limit is asked behind the pick.
+    limit_aside: bool,
+}
+
+impl<'a> Half<'a> {
+    pub(super) const fn new(
+        profile: &'a Profile,
+        index: u16,
+        facts: &'a RequestFacts<'a>,
+        rows: &'a [Candidate],
+        cx: &'a Constraints<'a>,
+    ) -> Self {
+        Self {
+            profile,
+            index,
+            facts,
+            rows,
+            cx,
+            limit_aside: false,
+        }
+    }
+
+    /// Whether the side's hard filters keep `row` under `cx`, on the
+    /// request's own facts. On the prefill side the admission limit is set
+    /// aside: it is asked of the one prefill the default takes, behind its
+    /// pick. No soft filter is asked: a room or the built-in filter of tried
+    /// workers steers no default. The row's class is not asked: a row
+    /// outside any pairing stands in its pool, and pairs with nobody
+    /// ([`paired`]).
+    fn stands(&self, row: &Candidate, cx: &Constraints<'_>) -> bool {
+        let hard = self.profile.filters.iter().filter(|f| !f.soft());
+        let mut asked = hard.filter(|f| !(self.limit_aside && f.name() == HasCapacity.name()));
+        asked.all(|f| f.keep(self.facts, row, cx))
+    }
+
+    /// The side's rows the request may take ([`places::rows`]).
+    fn places(&self) -> impl Iterator<Item = &'a Candidate> {
+        places::rows(self.rows, self.cx)
+    }
+
+    /// The side's rows that stand in the pass that lifts `lifted`
+    /// ([`lifted_cx`]), into `buf.kept`, the mark left in `buf.lifted`. The
+    /// set opens with the places the side's host states, as every pass of
+    /// the rule does ([`places::open`]). With the liveness veto lifted, rows
+    /// that carry a doubt are read with none ([`undoubted`]).
+    fn usable(&self, lifted: LiftedVeto, steers: bool, buf: &mut Buffers) {
+        let doubt = lifted == LiftedVeto::Liveness;
+        let pass = lifted_cx(self.cx, steers, doubt);
+        // The rows are written again only where one carries a doubt.
+        let own = doubt && self.rows.iter().any(|row| row.health.stalled);
+        let mut rows = std::mem::take(&mut buf.undoubted);
+        if own {
+            undoubted(self.rows, &mut rows);
+        }
+        let read = if own { &rows[..] } else { self.rows };
+        buf.kept.clear();
+        places::open(&mut buf.kept, read.len(), self.cx);
+        buf.kept
+            .retain(|&at| self.stands(&read[at as usize], &pass));
+        buf.undoubted = rows;
+        buf.lifted = lifted;
+    }
+}
+
+/// The pair's default: the pair a refused pool goes to, where every usable
+/// worker of the pool that failed is vetoed. It is the steering default of
+/// the gateway's own pair selection
+/// (`model_gateway/src/routers/common/placement.rs:1084-1172` on main). Each
+/// usable prefill stands with the usable partner that holds the fewest
+/// requests, and the pair of the least load is taken: the prefill's load
+/// first, then its partner's. Equal pairs are drawn by the prefill side's
+/// seed, and equal partners by the decode side's. Pairs the overload veto
+/// alone refuses come first, under a binding that steers. The liveness veto
+/// is lifted only where nothing else pairs, and never onto a worker over
+/// its thresholds under a binding that sheds. A hold stays in the
+/// constraints of every pass ([`lifted_cx`]). A side's workers are those
+/// at the places its host states, in each pass and where its pool is judged
+/// (`:774-786`, `:1097-1104`). Every pass reads the request's own facts. No
+/// built-in hard filter reads the retry's tried list, so the default takes
+/// a tried worker again, as the gateway's does. The pair's trace is the
+/// prefill's: it says the veto lifted and counts the prefills its pass kept.
+///
+/// Asked where the prefill side's own run shed ([`Engine::decide_pair`]),
+/// with the prefill classes that have an open partner in `scratch.classes`.
+/// It answers for a prefill pool no worker of which stands (`:1395-1413`
+/// there) and for a decode pool no worker of which stands (`:1438-1465`).
+/// It answers `None`, and the caller's refusal stands, where:
+/// - a prefill with an open partner stands with its limit aside. Under a
+///   prefill profile that reads affinity (`weighs`) and a binding that
+///   steers, a prefill over its thresholds alone counts as standing there
+///   (`:1327-1340`). Such a profile is taken to weigh load against affinity
+///   itself, and a pick by load would move a session off the worker that
+///   holds its prefix;
+/// - a prefill and a decode both stand as they are: the prefills fail for
+///   want of a partner, and the decode pool is not vetoed on every worker.
+///   The prefills judged are those with a decode to pair with anywhere in
+///   the decode pool, in or outside the request's places: the gateway's
+///   list of them is the pool's own and no request's
+///   (`model_gateway/src/routers/common/pair_index.rs:99-103`, `:143-146`).
+///   The decodes are those at the places, a decode outside any pairing
+///   among them;
+/// - nothing pairs.
+///
+/// The admission limit has the last word on the prefill taken, where the
+/// prefill profile lists it as a hard filter (`:1148-1153`). At its limit
+/// the request is shed under the limit's stage, and that refusal's trace
+/// names no lifted veto: no request was steered.
+pub(super) fn paired(
+    [prefill, decode]: [Half<'_>; 2],
+    table: &PairTable<'_>,
+    (steers, weighs): (bool, bool),
+    pool: &PoolFacts<'_>,
+    scratch: &mut Scratch,
+) -> Option<Decision> {
+    let prefill = Half {
+        limit_aside: true,
+        ..prefill
+    };
+    let lift = lifted_cx(prefill.cx, steers && weighs, false);
+    let open = |row: &&Candidate| classed(&scratch.classes, row.pair_class);
+    let mut partnered = prefill.places().filter(open);
+    // The pools as the gateway judges them: the prefills at the places that
+    // have a decode to pair with, in whatever state and at whatever place,
+    // and every decode at the places.
+    let pairs = |row: &&Candidate| {
+        let classes = table.of(&row.pair_class);
+        let mut decodes = decode.rows.iter();
+        decodes.any(|partner| classed(classes, partner.pair_class))
+    };
+    let mut prefills = prefill.places().filter(pairs);
+    let stands = |side: &Half<'_>, row: &Candidate| side.stands(row, side.cx);
+    if partnered.any(|row| prefill.stands(row, &lift))
+        || (prefills.any(|row| stands(&prefill, row))
+            && decode.places().any(|row| stands(&decode, row)))
+    {
+        return None;
+    }
+    let tiers = [LiftedVeto::Overload, LiftedVeto::Liveness];
+    for lifted in tiers.into_iter().skip(usize::from(!steers)) {
+        prefill.usable(lifted, steers, &mut scratch.single);
+        decode.usable(lifted, steers, &mut scratch.decode);
+        // Each usable prefill with the fewest requests among its usable
+        // partners. The prefills of the least pair stay.
+        let (prefills, decodes) = (&mut scratch.single.kept, &scratch.decode.kept);
+        let loads = |at: &u32| {
+            let row = &prefill.rows[*at as usize];
+            let classes = table.of(&row.pair_class);
+            let partners = decodes.iter().map(|&at| &decode.rows[at as usize]);
+            let partners = partners.filter(|partner| classed(classes, partner.pair_class));
+            let fewest = partners.map(|partner| partner.in_flight).min()?;
+            Some((row.in_flight, fewest))
+        };
+        let Some(least) = prefills.iter().filter_map(loads).min() else {
+            continue;
+        };
+        let usable = Survivors::counted(prefills.len() as u32);
+        prefills.retain(|at| loads(at) == Some(least));
+        let buf = &mut scratch.single;
+        let Decision::Pick(mut taken) =
+            steered(prefill.index, prefill.facts, pool, prefill.rows, buf)
+        else {
+            return None;
+        };
+        // The trace counts the prefills the pass kept, not the least pair's.
+        taken.trace.survivors = usable;
+        let first = *taken.targets.first()?;
+        let row = prefill.rows.get(first.position as usize)?;
+        let mut hard = prefill.profile.filters.iter().filter(|f| !f.soft());
+        let limit = hard.find(|f| f.name() == HasCapacity.name());
+        if let Some(limit) = limit.filter(|limit| !limit.keep(prefill.facts, row, prefill.cx)) {
+            let trace = Trace {
+                lifted: LiftedVeto::None,
+                ..taken.trace
+            };
+            return Some(shed(reason_of(limit.name()), limit.name(), trace));
+        }
+        // The decode: the taken prefill's usable partner of the fewest
+        // requests.
+        let (classes, buf) = (table.of(&row.pair_class), &mut scratch.decode);
+        buf.kept
+            .retain(|&at| classed(classes, decode.rows[at as usize].pair_class));
+        let mut pair = steered(decode.index, decode.facts, pool, decode.rows, buf);
+        if let Decision::Pick(pick) = &mut pair {
+            pick.targets.pair_under(&first);
+            pick.trace = taken.trace;
+        }
+        return Some(pair);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -615,7 +822,7 @@ mod tests {
     use crate::{
         document::spec::{Assignment, Needs, OverloadSpec, PolicySpec, Recovery, RulePlaced},
         engine::{
-            decision::{Decision, LiftedVeto, ShedReason},
+            decision::{Decision, LiftedVeto, ShedReason, Survivors},
             framework::{
                 tests::Stored, Binding, DecisionScope, Engine, Filter, Marks, PairPools, PairSide,
                 Picker, Plan, Profile, Scorer, Scratch, TieBand, WeightedScorer, DRAW_FROM,
@@ -1293,22 +1500,23 @@ mod tests {
         (shed_of(&decision), asked.load(Ordering::Relaxed))
     }
 
-    /// A pair's prefill side sheds a pool the overload veto empties: it is
-    /// put to no rule. Under a binding that steers, a prefill side over its
-    /// thresholds on every worker is shed at the veto, and the filter listed
-    /// behind the veto is asked about no prefill.
+    /// A pair's prefill pool nobody is usable in is shed at the stage that
+    /// emptied it. The prefill side's own run is put to no rule, and the
+    /// pair's default asks the profile's filters once more with each veto
+    /// lifted: the filter listed behind the veto refuses both prefills in
+    /// each of its two passes.
     #[test]
-    fn a_pairs_prefill_side_sheds_at_the_veto_and_is_filtered_once() {
+    fn a_pairs_prefill_pool_with_no_usable_worker_sheds_at_the_veto() {
         let none: (&[u32], &[u32]) = (&[], &[]);
         let side = pairs_side_shed(Box::new(NotOverloaded), [over(0, 1), over(1, 2)], none);
-        assert_eq!(side, ((ShedReason::Saturated, "not-overloaded"), 0));
+        assert_eq!(side, ((ShedReason::Saturated, "not-overloaded"), 4));
     }
 
     /// A pair's engine built by hand: each side filters by the health stage
     /// and the overload veto and takes the best of equals, so a side the
     /// rule steers is the only one whose pick the requests in flight
-    /// decide. `shed` makes its binding shed a pool the veto empties. The
-    /// decode side's shadow is a twin of its profile.
+    /// decide. `shed` makes its binding shed a pool the veto empties. Each
+    /// side's shadow is a twin of its profile.
     fn pair_engine(shed: bool) -> Engine {
         pair_engine_of(shed, [vetoes(), vetoes()])
     }
@@ -1332,6 +1540,7 @@ mod tests {
                 side("prefill", prefill),
                 side("decode", decode),
                 side("twin", vetoes()),
+                side("prefill-twin", vetoes()),
             ],
             vec![Binding {
                 model: "*".into(),
@@ -1339,7 +1548,7 @@ mod tests {
                 plan: Plan::PdPair,
                 profile: 0,
                 decode_profile: Some(1),
-                shadow: None,
+                shadow: Some(3),
                 decode_shadow: Some(2),
                 sessions: None,
                 overload: None,
@@ -1420,28 +1629,29 @@ mod tests {
         );
     }
 
-    /// A pair's first decision crosses no doubt. Under a binding that sheds,
-    /// the rule keeps a doubted decode under its thresholds beside a busy
-    /// one, and a decode kept past a doubt opens no prefill: the pool is
-    /// shed as saturated, as it was. The gateway's own pair selection places
-    /// that pair by its fallback
+    /// Under a binding that sheds, a doubted decode under its thresholds
+    /// beside a busy one takes the pair. The rule keeps that decode past its
+    /// doubt, and a decode kept so opens no prefill: the prefill side sheds,
+    /// and the pair's default pairs the free prefill with it, the liveness
+    /// veto lifted and no worker over its thresholds taken. The gateway's own
+    /// pair selection places that pair by its fallback
     /// (`model_gateway/src/routers/common/placement.rs:1443-1458`,
     /// `:1138-1147`).
     #[test]
-    fn a_pairs_first_decision_crosses_no_doubt_under_a_binding_that_sheds() {
+    fn a_binding_that_sheds_pairs_past_a_decodes_doubt() {
         let prefills = [classed(free(0, 0), 1)];
         let decodes = [classed(over(0, 1), 1), classed(doubted(1, 0), 1)];
         let decision = decide_pair(&pair_engine(true), &prefills, &decodes);
-        assert_eq!(
-            shed_of(&decision),
-            (ShedReason::Saturated, "not-overloaded")
-        );
+        assert_eq!(pair_of(&decision), (0, 1));
+        assert_eq!(decision.trace().lifted, LiftedVeto::Liveness);
     }
 
-    /// What a pair's first decision leaves refused, as it was. Decodes of
-    /// one class all over stay unasked while a decode of another class is
-    /// open. A decode pool doubted on every worker opens no prefill, and a
-    /// prefill pool over on every worker is put to no rule.
+    /// What a pair's first decision asks of its rule: the overload veto of
+    /// a decode pool, and no more. Decodes of one class all over stay
+    /// unasked while a decode of another class is open. A decode pool
+    /// doubted on every worker opens no prefill, and a prefill pool over on
+    /// every worker is put to no rule: each goes to the pair's default,
+    /// which says the veto it lifted.
     #[test]
     fn a_pairs_first_decision_answers_for_a_decode_pool_over_alone() {
         let engine = pair_engine(false);
@@ -1456,10 +1666,219 @@ mod tests {
         assert_eq!(decision.trace().lifted, LiftedVeto::None);
         let (idle, busy) = ([classed(free(0, 0), 1)], [classed(over(0, 0), 1)]);
         let suspect = [classed(doubted(0, 0), 1)];
-        let refused = decide_pair(&engine, &idle, &suspect);
-        assert_eq!(shed_of(&refused), (ShedReason::NoEndpoints, "healthy"));
-        let refused = decide_pair(&engine, &busy, &idle);
+        let (doubt, load) = (LiftedVeto::Liveness, LiftedVeto::Overload);
+        for (prefills, decodes, lifted) in [(&idle, &suspect, doubt), (&busy, &idle, load)] {
+            let paired = decide_pair(&engine, prefills, decodes);
+            assert_eq!((pair_of(&paired), paired.trace().lifted), ((0, 0), lifted));
+        }
+    }
+
+    /// A prefill pool refused on every worker goes to the pair of the least
+    /// load: the prefill's requests first, then its partner's. Pairs the
+    /// overload veto alone refuses come first: a doubted prefill that holds
+    /// fewer is passed by. A binding that sheds takes no worker over its
+    /// thresholds: the doubted prefill takes the request, and a pool over on
+    /// every worker is shed as saturated. The gateway's own default pairs so
+    /// (`model_gateway/src/routers/common/placement.rs:1093-1147`, asked at
+    /// `:1395-1413`).
+    #[test]
+    fn a_refused_prefill_pool_goes_to_the_pair_of_the_least_load() {
+        let prefills = [
+            classed(over(0, 2), 1),
+            classed(over(1, 1), 2),
+            classed(over(2, 1), 3),
+            classed(doubted(3, 0), 3),
+        ];
+        let decodes = [free(0, 0), free(1, 5), free(2, 4)];
+        let decodes = [0, 1, 2].map(|at| classed(decodes[at], at as u32 + 1));
+        let steered = decide_pair(&pair_engine(false), &prefills, &decodes);
+        assert_eq!(pair_of(&steered), (2, 2));
+        // The pair's trace is the prefill side's: its profile, the veto
+        // lifted, and the three prefills the lifted pass kept.
+        let trace = steered.trace();
+        assert_eq!((trace.profile, trace.lifted), (0, LiftedVeto::Overload));
+        assert_eq!(trace.survivors, Survivors::counted(3));
+        let shedding = pair_engine(true);
+        let doubted = decide_pair(&shedding, &prefills, &decodes);
+        assert_eq!(pair_of(&doubted), (3, 2));
+        assert_eq!(doubted.trace().lifted, LiftedVeto::Liveness);
+        let refused = decide_pair(&shedding, &prefills[..3], &decodes);
         assert_eq!(shed_of(&refused), (ShedReason::Saturated, "not-overloaded"));
+    }
+
+    /// A free prefill no decode pairs with is no prefill of the pool the
+    /// default judges: beside it, the prefills that have a partner, all over
+    /// their thresholds, pair by load. The gateway's index lists the
+    /// prefills with a compatible decode, and its default is judged over
+    /// them (`model_gateway/src/routers/common/pair_index.rs:99-103`,
+    /// `placement.rs:1395-1404` beside it).
+    #[test]
+    fn a_free_prefill_no_decode_pairs_with_is_not_of_the_refused_pool() {
+        let prefills = [classed(over(0, 1), 1), classed(free(1, 0), 2)];
+        let decodes = [classed(free(0, 0), 1)];
+        let paired = decide_pair(&pair_engine(false), &prefills, &decodes);
+        assert_eq!(pair_of(&paired), (0, 0));
+        assert_eq!(paired.trace().lifted, LiftedVeto::Overload);
+    }
+
+    /// The pair's default keeps each side to the places its host states. A
+    /// worker outside them is no worker of the pool the default judges,
+    /// however free, and no pass takes it: a free prefill outside the
+    /// places, and a free decode outside them. The gateway's own default
+    /// judges the workers the request may use and pairs among them
+    /// (`model_gateway/src/routers/common/placement.rs:774-786`,
+    /// `:1097-1104`).
+    ///
+    /// The prefills it judges are those with a decode to pair with anywhere
+    /// in the pool. A free prefill whose one partner is outside the decodes'
+    /// places stands among them, so beside a free decode at the places the
+    /// request is refused, as on main: the gateway lists a prefill's
+    /// partners for the pool and no request (`pair_index.rs:99-103`,
+    /// `:143-146` there), finds no pool vetoed on every worker and refuses
+    /// too (`placement.rs:1438-1447`, `:1094-1096`).
+    #[test]
+    fn a_pairs_default_keeps_to_each_sides_places() {
+        let engine = pair_engine(false);
+        let held = |prefills: &[Candidate], decodes: &[Candidate], places: [Option<&[u32]>; 2]| {
+            let pools = PairPools {
+                prefills,
+                decodes,
+                ..PairPools::default()
+            };
+            let [cx, decode_cx] = places.map(|places| Constraints {
+                places,
+                ..Constraints::default()
+            });
+            let (req, pool, scratch) = (facts(1), PoolFacts::default(), &mut Scratch::new());
+            let paired = engine.decide_pair(&req, &pool, pools, &cx, &decode_cx, scratch);
+            let lifted = paired.trace().lifted;
+            let pair = paired.pick().map(|_| (pair_of(&paired), lifted));
+            pair.ok_or_else(|| shed_of(&paired))
+        };
+        let (first, every): (Option<&[u32]>, Option<&[u32]>) = (Some(&[0]), None);
+        let prefills = [classed(over(0, 1), 1), classed(free(1, 0), 1)];
+        let pair = held(&prefills, &[classed(free(0, 0), 1)], [first, every]);
+        assert_eq!(pair, Ok(((0, 0), LiftedVeto::Overload)));
+        let decodes = [classed(doubted(0, 1), 1), classed(free(1, 0), 1)];
+        let pair = held(&[classed(free(0, 0), 1)], &decodes, [every, first]);
+        assert_eq!(pair, Ok(((0, 0), LiftedVeto::Liveness)));
+        let prefills = [classed(over(0, 1), 1), classed(free(1, 0), 2)];
+        let decodes = [classed(free(0, 0), 1), classed(free(1, 0), 2)];
+        let refused = held(&prefills, &decodes, [every, first]);
+        assert_eq!(refused, Err((ShedReason::NoEndpoints, "partnered")));
+    }
+
+    /// A pool the liveness veto refuses on every worker pairs by load under
+    /// either word of the binding: the prefill pool, and the decode pool
+    /// beside a standing prefill. A worker a hold stands on is never taken,
+    /// however few requests it holds. The gateway's own default lifts the
+    /// liveness veto so (`model_gateway/src/routers/common/placement.rs:1138-1147`,
+    /// asked at `:1395-1413` and `:1438-1465`).
+    #[test]
+    fn a_pool_doubted_on_every_worker_pairs_by_load() {
+        let mut suspect = [doubted(0, 2), doubted(1, 1), doubted(2, 0)];
+        suspect[2].health.breaker_open = true;
+        let suspect = suspect.map(|worker| classed(worker, 1));
+        let idle = [classed(free(0, 0), 1)];
+        let pools = [
+            (&suspect[..], &idle[..], (1, 0)),
+            (&idle[..], &suspect[..], (0, 1)),
+        ];
+        for shed in [false, true] {
+            for (prefills, decodes, pair) in pools {
+                let paired = decide_pair(&pair_engine(shed), prefills, decodes);
+                assert_eq!(pair_of(&paired), pair, "shedding: {shed}");
+                assert_eq!(paired.trace().lifted, LiftedVeto::Liveness);
+            }
+        }
+    }
+
+    /// The admission limit has the last word on a pair's default. A free
+    /// prefill at its limit keeps the limit's refusal beside a prefill a
+    /// veto refuses: the request waits, and no veto is lifted for it. Where
+    /// the default takes a prefill at its limit the request is shed under
+    /// the limit too, and the next prefill is not taken in its place. The
+    /// gateway's own selection answers both so
+    /// (`model_gateway/src/routers/common/placement.rs:1467-1480`,
+    /// `:1148-1153`).
+    #[test]
+    fn the_admission_limit_has_the_last_word_on_a_pairs_default() {
+        let mut filters = vetoes();
+        filters.push(Box::new(HasCapacity));
+        let engine = pair_engine_of(false, [filters, vetoes()]);
+        let room = |mut worker: Candidate| {
+            worker.has_capacity = true;
+            classed(worker, 1)
+        };
+        let decodes = [classed(free(0, 0), 1)];
+        let full = (ShedReason::NoEndpoints, "has-capacity");
+        for vetoed in [over(1, 0), doubted(1, 0)] {
+            let prefills = [classed(free(0, 4), 1), room(vetoed)];
+            assert_eq!(shed_of(&decide_pair(&engine, &prefills, &decodes)), full);
+        }
+        // Two prefills over their thresholds: the less loaded is taken, at
+        // its limit and then with a slot.
+        let busier = room(over(1, 5));
+        let limited = decide_pair(&engine, &[classed(over(0, 4), 1), busier], &decodes);
+        assert_eq!(shed_of(&limited), full);
+        // That refusal names no lifted veto: no request was steered.
+        assert_eq!(limited.trace().lifted, LiftedVeto::None);
+        let paired = decide_pair(&engine, &[room(over(0, 4)), busier], &decodes);
+        assert_eq!(pair_of(&paired), (0, 0));
+        // The limit is set aside on the prefill side alone. A decode whose
+        // own profile lists the limit, and that is at it, pairs with nobody.
+        let mut both = [vetoes(), vetoes()];
+        for side in &mut both {
+            side.push(Box::new(HasCapacity));
+        }
+        let alone = [room(over(0, 4))];
+        let refused = decide_pair(&pair_engine_of(false, both), &alone, &decodes);
+        assert_eq!(shed_of(&refused), (ShedReason::Saturated, "not-overloaded"));
+    }
+
+    /// A prefill profile that reads affinity is taken to weigh load against
+    /// it itself. Under a binding that steers, its prefill over its
+    /// thresholds alone with an open partner keeps its refusal: a pick by
+    /// load would move a session off the worker that holds its prefix. The
+    /// default answers for such a profile everywhere else: under a binding
+    /// that sheds, and where every prefill is doubted. The gateway keeps
+    /// its default from such a policy's prefill the same way, and places
+    /// that prefill by the policy with the veto lifted, which no profile
+    /// here does yet
+    /// (`model_gateway/src/routers/common/placement.rs:1327-1340`).
+    #[test]
+    fn a_profile_that_reads_affinity_keeps_a_busy_prefill_from_the_default() {
+        #[derive(Debug)]
+        struct ReadsAffinity;
+        impl Filter for ReadsAffinity {
+            fn name(&self) -> &'static str {
+                "reads-affinity"
+            }
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+            fn needs(&self) -> Needs {
+                Needs {
+                    affinity: true,
+                    ..Needs::default()
+                }
+            }
+        }
+        let weighing = |shed| {
+            let mut filters = vetoes();
+            filters.push(Box::new(ReadsAffinity));
+            pair_engine_of(shed, [filters, vetoes()])
+        };
+        let decodes = [classed(free(0, 0), 1)];
+        let busy = [classed(over(0, 1), 1), classed(doubted(1, 0), 1)];
+        let refused = decide_pair(&weighing(false), &busy, &decodes);
+        assert_eq!(shed_of(&refused), (ShedReason::Saturated, "not-overloaded"));
+        let suspect = [classed(doubted(0, 2), 1), busy[1]];
+        for (engine, prefills) in [(weighing(true), &busy), (weighing(false), &suspect)] {
+            let paired = decide_pair(&engine, prefills, &decodes);
+            assert_eq!(pair_of(&paired), (1, 0));
+            assert_eq!(paired.trace().lifted, LiftedVeto::Liveness);
+        }
     }
 
     /// A free decode keeps its pool from the rule, whoever it pairs with: a
@@ -1467,7 +1886,8 @@ mod tests {
     /// The gateway's own pair selection lifts the veto for the decode side
     /// only where no decode of the whole pool is available
     /// (`model_gateway/src/routers/common/placement.rs:1315-1321`, `:1341`),
-    /// and refuses these pairs.
+    /// and refuses these pairs. Its default answers for no such pool either:
+    /// the decode pool is not vetoed on every worker (`:1094`, `:1443-1448`).
     #[test]
     fn a_free_decode_keeps_its_pool_from_the_rule() {
         let engine = pair_engine(false);
@@ -1622,6 +2042,17 @@ mod tests {
         let decision = engine.decide_pair(&req, &pool, pools, &cx, &cx, &mut Scratch::new());
         assert_eq!(pair_of(&decision), (0, 0));
         assert_eq!(decision.trace().lifted, LiftedVeto::Overload);
+        // The pair's default reads the request's own facts. The same
+        // partner, free and tried, stays refused by the hard filter as on
+        // main: no veto refuses it, so none is lifted for it.
+        let mut idle = decodes;
+        idle[0].health.overloaded = false;
+        let pools = PairPools {
+            decodes: &idle,
+            ..pools
+        };
+        let decision = engine.decide_pair(&req, &pool, pools, &cx, &cx, &mut Scratch::new());
+        assert_eq!(shed_of(&decision), (ShedReason::NoEndpoints, "untried"));
         // Two tried partners beside one the host just failed to reach,
         // under `not-tried` behind the hard filter: the tried ones.
         let (decodes, ids) = partners([0, 1, 2]);
@@ -1691,6 +2122,37 @@ mod tests {
         let reversed = pair_engine_of(false, [vetoes(), reversed]);
         assert_eq!(given(&reversed, &roomy, &ids[1..], &ids[..1]), [2, 1]);
         assert_eq!(given(&engine, &roomy, &ids[1..], &ids[..1]), [0]);
+    }
+
+    /// Under a profile that lists no `not-tried`, a filter of the host's
+    /// that reads the tried list answers on the request's own facts in the
+    /// partners' pass. One that keeps the tried partner alone leaves the
+    /// retry on it, however busy, and the pass with the list set aside is
+    /// not run. The gateway's own selection steps aside from a tried worker
+    /// while another is left
+    /// (`model_gateway/src/routers/common/placement.rs:1485-1494`,
+    /// `:1562-1570`), and asks no filter of a host's: this answer is the
+    /// engine's own.
+    #[test]
+    fn a_hosts_filter_that_keeps_a_tried_partner_stands_on_a_retry() {
+        /// Keeps the workers an earlier attempt tried, and every worker of
+        /// a request that tried none: a hard filter.
+        #[derive(Debug)]
+        struct Again;
+        impl Filter for Again {
+            fn name(&self) -> &'static str {
+                "again"
+            }
+            fn keep(&self, req: &RequestFacts<'_>, row: &Candidate, _: &Constraints<'_>) -> bool {
+                req.tried.is_empty() || req.tried.contains(&row.id)
+            }
+        }
+        let mut sticky = vetoes();
+        sticky.push(Box::new(Again));
+        let engine = pair_engine_of(false, [vetoes(), sticky]);
+        let (decodes, ids) = partners([0, 1, 2]);
+        assert_eq!(given(&engine, &decodes, &[], &[]), [0, 1, 2]);
+        assert_eq!(given(&engine, &decodes, &ids[2..], &[]), [2]);
     }
 
     /// A decode asked for a held prefill is put to the rule, both its tiers.
@@ -1765,7 +2227,8 @@ mod tests {
             };
             let (held, side, scratch) = (prefills[0].id, PairSide::Decode, &mut Scratch::new());
             let first = engine.decide_pair(&req, &pool, pools, &cx, &cx, scratch);
-            // A first decision refuses decodes all doubted, and asks no shadow.
+            // A first decision's pair past a doubt is the default's, and no
+            // shadow is said beside it either.
             let twin = first.pick().map(|live| {
                 let said = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, live, scratch);
                 said.map(|shadow| order(&shadow)[0])
@@ -1778,7 +2241,39 @@ mod tests {
         };
         assert_eq!(shadows([free, over]), (Some(Some(0)), Some(0), false));
         assert_eq!(shadows([over, over]), (Some(None), None, false));
-        assert_eq!(shadows([doubted, doubted]), (None, None, true));
+        assert_eq!(shadows([doubted, doubted]), (Some(None), None, true));
+    }
+
+    /// A pair the default made gets no shadow on either side: a twin
+    /// decides by its profile where the live side was taken by load, and
+    /// its stages shed a pool the vetoes refuse.
+    /// Beside a pair whose decode side alone the rule steered, the prefill's
+    /// shadow speaks: its live side was put to no rule. One scratch serves
+    /// both pairs, the default's first.
+    #[test]
+    fn a_pair_the_default_made_gets_no_shadow() {
+        let (engine, scratch) = (pair_engine(false), &mut Scratch::new());
+        let (req, pool, cx) = (facts(1), PoolFacts::default(), Constraints::default());
+        let mut said = |prefill: Candidate, decode: Candidate| {
+            let (prefills, decodes) = ([classed(prefill, 1)], [classed(decode, 1)]);
+            let pools = PairPools {
+                prefills: &prefills,
+                decodes: &decodes,
+                ..PairPools::default()
+            };
+            let live = engine.decide_pair(&req, &pool, pools, &cx, &cx, scratch);
+            assert_eq!(pair_of(&live), (0, 0));
+            assert_eq!(live.trace().lifted, LiftedVeto::Overload);
+            let pick = live.pick().expect("a pair");
+            PairSide::BOTH.map(|side| {
+                let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, pick, scratch);
+                twin.map(|shadow| order(&shadow)[0])
+            })
+        };
+        // The default's pair: every prefill is over its thresholds.
+        assert_eq!(said(over(0, 1), free(0, 0)), [None, None]);
+        // The rule's pair: every decode is over, and the prefill side open.
+        assert_eq!(said(free(0, 0), over(0, 1)), [Some(0), None]);
     }
 
     /// An engine of one profile: `veto` and a filter that refuses every row,
@@ -4051,28 +4546,27 @@ mod tests {
         assert_eq!(asked.load(Ordering::Relaxed), pool.len());
     }
 
-    /// A pair's prefill side is put to the liveness tier no more than to the
-    /// overload tier: a prefill side doubted on every worker is shed at the
-    /// health stage, and the filter listed behind that stage is asked about
-    /// no prefill.
+    /// A pair's prefill pool doubted on every worker, with nobody usable in
+    /// it, is shed at the health stage. The pair's default lifts the doubt
+    /// in its last pass alone: the filter listed behind that stage is asked
+    /// about both prefills there, and about none before.
     #[test]
-    fn a_pairs_prefill_side_doubted_on_every_worker_sheds_at_the_health_stage() {
+    fn a_pairs_prefill_pool_doubted_with_no_usable_worker_sheds_at_the_health_stage() {
         let none: (&[u32], &[u32]) = (&[], &[]);
         let side = pairs_side_shed(Box::new(Healthy), [doubted(0, 1), doubted(1, 2)], none);
-        assert_eq!(side, ((ShedReason::NoEndpoints, "healthy"), 0));
+        assert_eq!(side, ((ShedReason::NoEndpoints, "healthy"), 2));
     }
 
-    /// A hold changes nothing on a pair's prefill side, which is put to no
-    /// tier. A prefill side the host holds on every row, and one with a
-    /// doubted row among held ones, are shed at the health stage, and the
-    /// filter listed behind that stage is asked about no prefill. The tier a
-    /// decode asked again is put to reads a hold as a single request's does.
+    /// A hold stands in every pass of a pair's default. A prefill pool the
+    /// host holds on every row is shed at the health stage, and the filter
+    /// listed behind that stage is asked about no prefill. With a doubted
+    /// row among held ones it is asked about that row alone.
     #[test]
-    fn a_pairs_prefill_side_under_a_hold_sheds_at_the_health_stage() {
-        for held in [&[0, 1][..], &[0]] {
+    fn a_pairs_prefill_pool_under_a_hold_sheds_at_the_health_stage() {
+        for (held, asked) in [(&[0, 1][..], 0), (&[0], 1)] {
             let masks: (&[u32], &[u32]) = (&[0, 1], held);
             let side = pairs_side_shed(Box::new(Healthy), [free(0, 1), free(1, 2)], masks);
-            assert_eq!(side, ((ShedReason::NoEndpoints, "healthy"), 0));
+            assert_eq!(side, ((ShedReason::NoEndpoints, "healthy"), asked));
         }
     }
 
