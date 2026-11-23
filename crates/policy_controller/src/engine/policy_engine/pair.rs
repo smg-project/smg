@@ -362,7 +362,7 @@ impl<'a> PairLists<'a> {
         request: &mut Request<'_>,
         held: Option<&Target>,
     ) -> Decision {
-        self.decide_sides(engine, sides, loads, now, request, held, true)
+        self.decide_sides(engine, sides, loads, now, request, held, true, |_| true)
     }
 
     /// A pair's first decision with a hard demand its request states left
@@ -377,13 +377,17 @@ impl<'a> PairLists<'a> {
         now: Instant,
         request: &mut Request<'_>,
     ) -> Decision {
-        self.decide_sides(engine, sides, loads, now, request, None, false)
+        self.decide_sides(engine, sides, loads, now, request, None, false, |_| true)
     }
 
     /// [`Self::decide_over`], and whether a hard demand the request states
     /// is `judged` over the two lists: each side is then held to the
     /// places whose worker meets it, and the records' decision is handed
-    /// none.
+    /// none. `sends_to` says whether the request's caller sends it to a
+    /// target of the pick ([`RequestMaker::sends_to`]): each side's record
+    /// of sent prefixes is written for the first target it takes.
+    ///
+    /// [`RequestMaker::sends_to`]: crate::engine::RequestMaker::sends_to
     #[expect(
         clippy::too_many_arguments,
         reason = "a pair's decision over its two lists, and how it reads a demand"
@@ -397,6 +401,7 @@ impl<'a> PairLists<'a> {
         request: &mut Request<'_>,
         held: Option<&Target>,
         judged: bool,
+        sends_to: impl Fn(&Target) -> bool,
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
         // The host's indexes of cache events and the records of sent
@@ -543,16 +548,18 @@ impl<'a> PairLists<'a> {
                 }
             };
             // Behind a pick its profile is told of, each side's record of
-            // sent prefixes keeps where the prompt went. A pair neither
-            // side of which read its record asks nothing of the pick.
+            // sent prefixes keeps where the prompt went: the first target
+            // the request's caller sends to (`sends_to`), and nobody
+            // where it sends to none. A pair neither side of which read
+            // its record asks nothing of the pick.
             let read = prefill_read.is_some() || decode_read.is_some();
-            let told = read.then(|| overlap::told_target(&decision)).flatten();
-            if let Some(first) = told {
+            let sent = read.then(|| overlap::sent_target(&decision, &sends_to));
+            if let Some(sent) = sent.flatten() {
                 if let Some(read) = prefill_read {
                     let pool = prefill.affinity();
-                    overlap::record_prefix(pool, Phase::Prefill, facts, read, first.id);
+                    overlap::record_prefix(pool, Phase::Prefill, facts, read, sent.id);
                 }
-                if let (Some(read), Some(pair)) = (decode_read, first.pair) {
+                if let (Some(read), Some(pair)) = (decode_read, sent.pair) {
                     let pool = decode.affinity();
                     overlap::record_prefix(pool, Phase::Decode, facts, read, pair.decode_id);
                 }
@@ -920,6 +927,13 @@ fn issue_decode_caught(
 /// of either list is dialed on a wire the request does not state, the
 /// request is declined under the wires' name, ahead of every test the
 /// lists' own decision makes.
+///
+/// `sends_to` says whether the request's caller sends it to a target of
+/// the pick ([`RequestMaker::sends_to`]): each side's record of sent
+/// prefixes is written for the first target it takes. A decode decided
+/// again is handed `|_| true` and writes for its first target.
+///
+/// [`RequestMaker::sends_to`]: crate::engine::RequestMaker::sends_to
 #[inline]
 pub(super) fn decide(
     own: Loaded<'_, '_>,
@@ -928,6 +942,7 @@ pub(super) fn decide(
     target: Option<&Target>,
     loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
+    sends_to: impl Fn(&Target) -> bool,
 ) -> Decision {
     // The engine's own value of each list, asked of the list's cell once.
     let sides = (own.members_of(lists.prefill), own.members_of(lists.decode));
@@ -936,7 +951,7 @@ pub(super) fn decide(
     if !wires.is_empty() && !wires.contains(dialed) {
         return single::declined(own, request, WIRES);
     }
-    lists.decide_over(own, sides, loads, now, request, target)
+    lists.decide_sides(own, sides, loads, now, request, target, true, sends_to)
 }
 
 /// One decision of a pair by `own`, the engine of a gateway's own process,
@@ -946,7 +961,8 @@ pub(super) fn decide(
 /// With the view of the guard that holds the first it is the decode asked
 /// again behind the prefill that view names. The decision reads the
 /// reports in `loads`: the snapshot the request gives for this call, or
-/// the newest the engine's own task keeps at hand.
+/// the newest the engine's own task keeps at hand. `sends_to` is handed
+/// to [`decide`] as it stands.
 pub(super) fn decided(
     own: Loaded<'_, '_>,
     lists: &PairLists<'_>,
@@ -954,9 +970,10 @@ pub(super) fn decided(
     held: Option<&HeldDecision<'_>>,
     loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
+    sends_to: impl Fn(&Target) -> bool,
 ) -> DecideOutcome {
     let target = held.map(|held| held.target);
-    let decision = decide(own, lists, request, target, loads, now);
+    let decision = decide(own, lists, request, target, loads, now, sends_to);
     issued(own, request, decision, held, now)
 }
 
@@ -3141,6 +3158,7 @@ mod tests {
                 None,
                 None,
                 now,
+                |_| true,
             );
             let outcome = super::decided(
                 leasing.engine.loaded(),
@@ -3149,6 +3167,7 @@ mod tests {
                 None,
                 None,
                 now,
+                |_| true,
             );
             assert!(outcome.lease.is_some(), "the leasing form issues its pick");
             assert_eq!(alone.picked(&decision), leasing.picked(&outcome.decision));
@@ -3164,6 +3183,7 @@ mod tests {
             None,
             None,
             now,
+            |_| true,
         );
         let outcome = super::decided(
             leasing.engine.loaded(),
@@ -3172,6 +3192,7 @@ mod tests {
             None,
             None,
             now,
+            |_| true,
         );
         assert_eq!(alone.picked(&first), leasing.picked(&outcome.decision));
         let (ours, theirs) = (target_at(&first, 0), target_at(&outcome.decision, 0));
@@ -3197,6 +3218,7 @@ mod tests {
             Some(&ours),
             None,
             call,
+            |_| true,
         );
         let issued = super::decided(
             leasing.engine.loaded(),
@@ -3205,6 +3227,7 @@ mod tests {
             Some(&held),
             None,
             call,
+            |_| true,
         );
         assert!(issued.lease.is_some(), "the leasing form issues the decode");
         assert_eq!(alone.picked(&again), leasing.picked(&issued.decision));
@@ -3219,6 +3242,7 @@ mod tests {
             None,
             None,
             now,
+            |_| true,
         ) {
             Decision::Shed(shed) => assert_eq!(
                 (shed.reason, shed.emptied_by),
@@ -3238,6 +3262,7 @@ mod tests {
                 behind,
                 None,
                 call,
+                |_| true,
             );
             assert!(matches!(&declined.decision, Decision::Shed(shed) if shed.emptied_by == WIRES));
             assert!(declined.lease.is_none());

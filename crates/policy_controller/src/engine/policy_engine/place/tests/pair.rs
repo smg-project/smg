@@ -689,7 +689,8 @@ fn a_pairs_call_makes_three_decisions_at_most() {
 /// A route's rule that panics passes its panic to the call's caller, and
 /// the decision it was asked under is given up by name as the panic
 /// passes: its lease is released once, and the engine is owed nothing. The
-/// same holds for a single request's whole decision.
+/// same holds for a single request's whole decision, and for a rule that
+/// panics where a pair's decision asks it.
 #[test]
 fn a_rule_that_panics_loses_no_lease() {
     let failing = |_: &dyn Worker| -> bool { panic!("the route's rule failed") };
@@ -726,6 +727,34 @@ fn a_rule_that_panics_loses_no_lease() {
     assert!(passed(&|| engine.place(&request).is_ok()));
     let first = worker_id(list[0].as_ref());
     assert_eq!(heard.lock().as_slice(), given_up(first));
+    assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+
+    // A pair whose sides read their record of sent prefixes asks the rule
+    // inside its decision. This rule panics at its first question alone:
+    // a panic swallowed there would leave the walk a rule that admits.
+    let mut document = PolicySpec::pair_presets("cache_aware", "cache_aware").expect("presets");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let engine = hosted(PolicyEngine::new(spec));
+    let lists = Lists::of(1, 1);
+    let classes = lists.every();
+    let tokens: Vec<u32> = (1_000..5_096).collect();
+    let asked = Cell::new(false);
+    let once = |_: &dyn Worker| -> bool {
+        if asked.replace(true) {
+            return true;
+        }
+        panic!("the route's rule failed")
+    };
+    let request = PlaceRequest {
+        prompt: Prompt {
+            tokens: Some(&tokens),
+            ..Prompt::NONE
+        },
+        admits: Some(&once),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
+    };
+    assert!(passed(&|| engine.place(&request).is_ok()));
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 
@@ -862,4 +891,61 @@ fn a_pair_that_states_a_demand_is_placed_on_the_workers_that_meet_it() {
     assert_eq!(engine.place(&decided).err(), Some(none));
     assert_eq!(said(&heard).len(), from, "a shed issues nothing");
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+}
+
+/// A pair's record of sent prefixes names the workers its request went to.
+/// Where the route's rule refuses the decode of the pick's first target,
+/// the walk takes a later target or the call's next decision, and the
+/// prompt's next requests go to the pair that one was sent to. A decision
+/// asks the rule of a worker once: a decode refused at its first question
+/// alone is passed by the request and by the record.
+#[test]
+fn a_prompt_sent_past_a_refused_decode_goes_to_its_pair_again() {
+    let mut document = PolicySpec::pair_presets("cache_aware", "cache_aware").expect("presets");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let engine = hosted(PolicyEngine::new(spec));
+    let lists = Lists::of(2, 4);
+    let classes = lists.every();
+    let pair = lists.under(&classes, &Open);
+    let tokens: Vec<u32> = (1_000..5_096).collect();
+    let prompt = Prompt {
+        tokens: Some(&tokens),
+        ..Prompt::NONE
+    };
+    // The rule refuses the first decode it is asked of, at that question
+    // alone: asked of it again, it would take it.
+    let refused = RefCell::new(None::<String>);
+    let rule = |worker: &dyn Worker| {
+        if *worker.worker_type() != WorkerType::Decode {
+            return true;
+        }
+        let mut refused = refused.borrow_mut();
+        if refused.is_some() {
+            return true;
+        }
+        *refused = Some(worker.url().to_owned());
+        false
+    };
+    let refusing = PlaceRequest {
+        prompt,
+        admits: Some(&rule),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+    };
+    let sent = engine.place(&refusing).expect("a placement");
+    let to = lists.places(&sent);
+    drop(sent);
+    let passed = refused.borrow().clone().expect("the rule refused a decode");
+    assert_ne!(lists.decodes[to.1].url(), passed, "past the refused decode");
+    let stated = PlaceRequest {
+        prompt,
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+    };
+    let mut went = Vec::new();
+    for _ in 0..16 {
+        let again = engine.place(&stated).expect("a placement");
+        went.push(lists.places(&again));
+        drop(again);
+    }
+    assert_eq!(went, [to; 16], "the pair the prompt was sent to");
 }
