@@ -8,6 +8,7 @@ for orchestration without tokenization.
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from collections.abc import AsyncIterator
@@ -45,7 +46,7 @@ from smg_grpc_servicer.sglang.compat import (
     get_multimodal_types,
     get_tokenizer,
 )
-from smg_grpc_servicer.sglang.config_view import EngineConfigView
+from smg_grpc_servicer.sglang.config_view import EngineConfigView, v41_vision
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.hidden_states import (
     refuse_hidden_states_above_server_mode,
@@ -90,6 +91,123 @@ logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 # Profile round-trips include trace serialization, which can take minutes.
 PROFILE_COMM_TIMEOUT = 600.0
+
+
+# The grid only the Router's DeepSeek-V4.1 preprocessor sends with an image
+# batch; GLM-5.3 Flash sends ``patches_per_image`` as well.
+V41_MARKER = "vit_grid"
+V41_PREFIX = "DeepSeek-V4.1 image batch:"
+
+
+def _v41_image_tokens(height: int, width: int, ratio: int) -> int:
+    """How many prompt positions SGLang's V4.1 model fills for a patch grid: the
+    length of its ``image_token_types`` for the downsampled grid, a start token,
+    each line's tokens and a newline, and an end token."""
+    lines, tokens_per_line = (height + ratio - 1) // ratio, (width + ratio - 1) // ratio
+    return lines * (tokens_per_line + 1) + 2
+
+
+def _deepseek_v41_items(feature, tensors: dict, offsets: list, vision=None) -> list:
+    """One item per image, the shape SGLang's own DeepSeek-V4.1 processor builds.
+
+    The Router sends every image's patches in one tensor, with each image's
+    patch grid (``vit_grid``), patch count and token count alongside. SGLang's
+    V4.1 model encodes one image per item and reads its grid as ``n_vit_h`` /
+    ``n_vit_w``; a batch whose counts disagree is refused here, before the
+    scheduler, where it would stop the engine. With the served model's patch
+    size and downsample ratio (``vision``, from ``v41_vision``), so is a batch
+    whose patch rows or spans do not fit that model.
+    """
+    prefix = V41_PREFIX
+    if "patches_per_image" not in tensors:
+        raise ValueError(f"{prefix} no patches_per_image")
+    counts = {}
+    for name in ("vit_grid", "patches_per_image", "types_per_image"):
+        tensor = tensors.get(name)
+        if tensor is None:
+            continue
+        if tensor.is_floating_point() or tensor.is_complex():
+            raise ValueError(f"{prefix} {name} is {tensor.dtype}, not an integer tensor")
+        counts[name] = tensor.reshape(-1).tolist()
+    grid_values = counts["vit_grid"]
+    if len(grid_values) % 2:
+        raise ValueError(
+            f"{prefix} vit_grid holds {len(grid_values)} values, not (height, width) pairs"
+        )
+    grids = list(zip(grid_values[0::2], grid_values[1::2]))
+    patches = counts["patches_per_image"]
+    tokens = counts.get("types_per_image")
+    images = len(grids)
+    if images == 0:
+        raise ValueError(f"{prefix} no images")
+    for name, count in (
+        ("placeholders", len(offsets)),
+        ("patch counts", len(patches)),
+        ("token counts", images if tokens is None else len(tokens)),
+    ):
+        if count != images:
+            raise ValueError(f"{prefix} {images} images but {count} {name}")
+    # A patch row holds at least one value.
+    if len(feature.shape) < 2 or 0 in feature.shape[1:]:
+        raise ValueError(
+            f"{prefix} pixel_values has shape {list(feature.shape)}, not rows of patches"
+        )
+    rows = feature.shape[0]
+    if sum(patches) != rows:
+        raise ValueError(f"{prefix} {sum(patches)} patches but the pixel tensor has {rows} rows")
+    if vision is not None:
+        patch_size = vision[0]
+        # The model's patch embedding is a Linear(3 * patch_size**2, ...) over
+        # each flattened row.
+        row_values = math.prod(feature.shape[1:])
+        if row_values != 3 * patch_size**2:
+            raise ValueError(
+                f"{prefix} each patch row holds {row_values} values, but the model's "
+                f"{patch_size}x{patch_size} patches take 3x{patch_size}x{patch_size} = "
+                f"{3 * patch_size**2}"
+            )
+    items = []
+    start = 0
+    previous_last = None
+    for index, ((height, width), count, (first, last)) in enumerate(zip(grids, patches, offsets)):
+        if height < 1 or width < 1 or height * width != count:
+            raise ValueError(
+                f"{prefix} image {index} has a {height}x{width} grid but {count} patches"
+            )
+        # SGLang writes the items' embeddings over the placeholders in prompt
+        # order, so the ranges must be in prompt order and must not overlap.
+        if previous_last is not None and first <= previous_last:
+            raise ValueError(
+                f"{prefix} image {index}'s placeholder {first}..={last} does not start "
+                f"after image {index - 1}'s, which ends at {previous_last}"
+            )
+        previous_last = last
+        span = last - first + 1
+        if tokens is not None and span != tokens[index]:
+            raise ValueError(
+                f"{prefix} image {index} fills {span} prompt positions but has "
+                f"{tokens[index]} tokens"
+            )
+        if vision is not None:
+            grid_tokens = _v41_image_tokens(height, width, vision[1])
+            if span != grid_tokens:
+                raise ValueError(
+                    f"{prefix} image {index} fills {span} prompt positions but its "
+                    f"{height}x{width} grid makes {grid_tokens} tokens"
+                )
+        pixels = feature[start : start + count]
+        items.append(
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                # The scheduler receives the item pickled, and a view would
+                # carry every image's patches with it.
+                feature=pixels if images == 1 else pixels.clone(),
+                model_specific_data={"n_vit_h": int(height), "n_vit_w": int(width)},
+                offsets=[(first, last)],
+            )
+        )
+        start += count
+    return items
 
 
 def _aggregate_communicator_results(results: list, ok_message: str) -> tuple[bool, str]:
@@ -1006,6 +1124,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         # Parse multimodal inputs if present
         mm_inputs = None
+        if (
+            grpc_req.HasField("mm_inputs")
+            and not grpc_req.mm_inputs.HasField("pixel_values")
+            and V41_MARKER in grpc_req.mm_inputs.model_specific_tensors
+        ):
+            # Grids without the pixels they describe would drop the images unseen.
+            raise ValueError(f"{V41_PREFIX} no pixel_values to cut its per-image items from")
         if grpc_req.HasField("mm_inputs") and grpc_req.mm_inputs.HasField("pixel_values"):
             mm_inputs = self._parse_mm_inputs(grpc_req.mm_inputs, extra_mm_inputs, len(input_ids))
 
@@ -1087,14 +1212,30 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                     "failed to find the placeholder token in input_ids. "
                     "Check that placeholder_token_id matches the tokenized image token."
                 )
+            feature = self._decode_tensor_data(batch.pixel_values)
+            tensors = {
+                key: self._decode_tensor_data(value)
+                for key, value in batch.model_specific_tensors.items()
+            }
+            if modality != Modality.IMAGE and V41_MARKER in tensors:
+                # Only an image batch is cut into V4.1 items. Under the video
+                # label the batch would go on as a video item, which SGLang's
+                # V4.1 model has no embedder for.
+                raise ValueError(f"{V41_PREFIX} vit_grid on a video batch")
+            if modality == Modality.IMAGE and V41_MARKER in tensors:
+                if token is None:
+                    # SGLang pads the image positions only when the id is set.
+                    # Without it the model finds no position for the items'
+                    # embeddings and fails in the scheduler.
+                    raise ValueError(f"{V41_PREFIX} no im_token_id")
+                vision = v41_vision(self.model_config.hf_config)
+                mm_items.extend(_deepseek_v41_items(feature, tensors, offsets, vision))
+                continue
             mm_items.append(
                 MultimodalDataItem(
                     modality=modality,
-                    feature=self._decode_tensor_data(batch.pixel_values),
-                    model_specific_data={
-                        key: self._decode_tensor_data(value)
-                        for key, value in batch.model_specific_tensors.items()
-                    },
+                    feature=feature,
+                    model_specific_data=tensors,
                     offsets=offsets or None,
                 )
             )
