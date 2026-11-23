@@ -102,7 +102,10 @@ use crate::{
             error_reason_for_response, error_type_for_response, error_type_from_status,
             route_to_endpoint,
         },
-        http::router::{send_with_stale_conn_retry, RerankResponseSpec, Router},
+        http::router::{
+            read_body_capped, send_with_stale_conn_retry, worker_body_too_large, BodyReadError,
+            RerankResponseSpec, Router,
+        },
         prefill_queue_full, prefill_queue_timeout, RouterTrait, PD_PREFILL_QUEUE_FULL,
         PD_PREFILL_QUEUE_TIMEOUT,
     },
@@ -213,8 +216,7 @@ pub struct PDRouter {
     pub policy_registry: Arc<PolicyRegistry>,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
-    /// The limit `Router::build_rerank_response` reads the rerank answer
-    /// under: the router configuration's `max_payload_size`.
+    /// Cap on buffered worker response bodies, mirroring the ingress limit.
     max_payload_size: usize,
     prefill_admission: Option<Arc<PrefillAdmission>>,
     /// Round-robin over the data-parallel ranks of MoRI-IO pairs.
@@ -402,7 +404,7 @@ impl PDRouter {
             .cloned();
 
         if let Some(worker) = first_worker {
-            Self::proxy_to_worker(&worker, endpoint, headers).await
+            Self::proxy_to_worker(&worker, endpoint, headers, self.max_payload_size).await
         } else {
             error::service_unavailable("no_prefill_servers", "No prefill servers available")
         }
@@ -412,6 +414,7 @@ impl PDRouter {
         worker: &Arc<dyn Worker>,
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
+        max_payload_size: usize,
     ) -> Response {
         let url = format!("{}/{endpoint}", worker.base_url());
         let mut request_builder = worker.http_client().get(&url);
@@ -433,18 +436,21 @@ impl PDRouter {
             Ok(res) if res.status().is_success() => {
                 let response_headers = header_utils::preserve_response_headers(res.headers());
 
-                match res.bytes().await {
+                match read_body_capped(res.bytes_stream(), max_payload_size).await {
                     Ok(body) => {
                         let mut response = Response::new(Body::from(body));
                         *response.status_mut() = StatusCode::OK;
                         *response.headers_mut() = response_headers;
                         response
                     }
+                    Err(BodyReadError::TooLarge) => {
+                        worker_body_too_large(max_payload_size, worker.url())
+                    }
                     // The request's own timeout running out mid-body ends the
                     // request as it does on every other body read of these
                     // routers (504 under its code), never as the worker's
                     // transport failing.
-                    Err(e) if is_request_timeout(&e) => {
+                    Err(BodyReadError::Transport(e)) if is_request_timeout(&e) => {
                         error!(
                             worker = Endpoint::redacted_str(worker.url()),
                             "Response body read timed out: {}",
@@ -455,7 +461,7 @@ impl PDRouter {
                             cause(&e)
                         ))
                     }
-                    Err(e) => {
+                    Err(BodyReadError::Transport(e)) => {
                         error!(
                             worker = Endpoint::redacted_str(worker.url()),
                             "Failed to read response body: {}",
@@ -836,8 +842,9 @@ impl PDRouter {
         };
 
         // The reservation resolves on the one answer both dispatch paths
-        // converge on. A buffered answer is the decode side's body, held
-        // whole already (read without a bound), so the re-read is unbounded.
+        // converge on. A buffered answer is held whole already (each body
+        // kept for it read under the payload limit, the logprob merge
+        // joining the two), so the re-read takes no bound of its own.
         let response = tenant_rate_limit::resolve(
             reservation.as_ref(),
             route,
@@ -1343,13 +1350,20 @@ impl PDRouter {
     /// failure ([`OwnFailure`]). Its 500 is definitive for the payload and
     /// is settled on the request's ledger ([`Self::settle_attempt`]). Its
     /// other statuses are replayed as before.
-    async fn side_refused(side: PdSide, response: reqwest::Response) -> Response {
+    async fn side_refused(
+        side: PdSide,
+        response: reqwest::Response,
+        max_payload_size: usize,
+    ) -> Response {
         let status = response.status();
         // Taken before the body read consumes the response.
         let retry_after = response.headers().get(RETRY_AFTER).cloned();
-        let detail = match response.bytes().await {
+        let detail = match read_body_capped(response.bytes_stream(), max_payload_size).await {
             Ok(body) => upstream_error_message(&body),
-            Err(e) => format!(
+            Err(BodyReadError::TooLarge) => {
+                format!("{status}, and its error body exceeded {max_payload_size} bytes")
+            }
+            Err(BodyReadError::Transport(e)) => format!(
                 "{status}, and its error body could not be read: {}",
                 cause(&e)
             ),
@@ -1364,13 +1378,17 @@ impl PDRouter {
     }
 
     /// [`Self::side_refused`] for a decode worker, with the refusal logged.
-    async fn decode_refused(decode: &dyn Worker, response: reqwest::Response) -> Response {
+    async fn decode_refused(
+        decode: &dyn Worker,
+        response: reqwest::Response,
+        max_payload_size: usize,
+    ) -> Response {
         error!(
             "Decode server returned error status decode_url={} status={}",
             decode.redacted_url(),
             response.status()
         );
-        Self::side_refused(PdSide::Decode, response).await
+        Self::side_refused(PdSide::Decode, response, max_payload_size).await
     }
 
     /// An attempt's definitive answer on the request's ledger, settled as
@@ -1455,7 +1473,8 @@ impl PDRouter {
                 metrics_labels::WORKER_DECODE,
                 status,
             );
-            return Self::decode_refused(decode.as_ref(), decode_response).await;
+            return Self::decode_refused(decode.as_ref(), decode_response, self.max_payload_size)
+                .await;
         }
         Metrics::record_pd_ttft(
             metrics_labels::BACKEND_PD,
@@ -1750,7 +1769,8 @@ impl PDRouter {
             }
             Err(DispatchError::Prefill(response)) => return response,
             Err(DispatchError::Decode(response)) => {
-                return Self::decode_refused(decode.as_ref(), response).await;
+                return Self::decode_refused(decode.as_ref(), response, self.max_payload_size)
+                    .await;
             }
         };
 
@@ -1984,11 +2004,17 @@ impl PDRouter {
                 headers,
                 dp_rank,
             );
-            let prefill_bytes =
-                match Self::prefill_side_bytes(ledger, prefill.as_ref(), prefill_request).await {
-                    Ok(bytes) => bytes,
-                    Err(refusal) => return refusal,
-                };
+            let prefill_bytes = match Self::prefill_side_bytes(
+                ledger,
+                prefill.as_ref(),
+                prefill_request,
+                self.max_payload_size,
+            )
+            .await
+            {
+                Ok(bytes) => bytes,
+                Err(refusal) => return refusal,
+            };
             Metrics::record_pd_prefill_duration(
                 metrics_labels::BACKEND_PD,
                 context.model_id,
@@ -2165,7 +2191,12 @@ impl PDRouter {
             headers,
             dp_rank,
         );
-        let prefill_side = Self::prefill_side_bytes(ledger, prefill.as_ref(), prefill_request);
+        let prefill_side = Self::prefill_side_bytes(
+            ledger,
+            prefill.as_ref(),
+            prefill_request,
+            self.max_payload_size,
+        );
         let decode_side = send_with_stale_conn_retry(decode_request);
         tokio::pin!(decode_side);
 
@@ -2256,6 +2287,7 @@ impl PDRouter {
         ledger: &AttemptLedger,
         prefill: &dyn Worker,
         request: reqwest::RequestBuilder,
+        max_payload_size: usize,
     ) -> Result<Bytes, Response> {
         let response = match send_with_stale_conn_retry(request).await {
             Ok(response) => response,
@@ -2269,9 +2301,9 @@ impl PDRouter {
                 status
             );
             Self::record_sequential_side(ledger, prefill, metrics_labels::WORKER_PREFILL, status);
-            return Err(Self::side_refused(PdSide::Prefill, response).await);
+            return Err(Self::side_refused(PdSide::Prefill, response, max_payload_size).await);
         }
-        match response.bytes().await {
+        match read_body_capped(response.bytes_stream(), max_payload_size).await {
             Ok(bytes) => {
                 Self::record_sequential_side(
                     ledger,
@@ -2281,7 +2313,16 @@ impl PDRouter {
                 );
                 Ok(bytes)
             }
-            Err(e) => Err(Self::prefill_read_failed(ledger, prefill, &e)),
+            Err(BodyReadError::TooLarge) => {
+                Self::record_sequential_side(
+                    ledger,
+                    prefill,
+                    metrics_labels::WORKER_PREFILL,
+                    StatusCode::BAD_GATEWAY,
+                );
+                Err(worker_body_too_large(max_payload_size, prefill.url()))
+            }
+            Err(BodyReadError::Transport(e)) => Err(Self::prefill_read_failed(ledger, prefill, &e)),
         }
     }
 
@@ -2358,14 +2399,20 @@ impl PDRouter {
                 let response_headers =
                     header_utils::preserve_response_headers(decode_response.headers());
 
-                match decode_response.bytes().await {
+                match read_body_capped(decode_response.bytes_stream(), self.max_payload_size).await
+                {
                     Ok(decode_body) => {
                         let mut response = Response::new(Body::from(decode_body));
                         *response.status_mut() = status;
                         *response.headers_mut() = response_headers;
                         response
                     }
-                    Err(e) if is_request_timeout(&e) => {
+                    Err(BodyReadError::TooLarge) => {
+                        let mut answer = worker_body_too_large(self.max_payload_size, decode.url());
+                        answer.extensions_mut().insert(OwnFailure(PdSide::Decode));
+                        answer
+                    }
+                    Err(BodyReadError::Transport(e)) if is_request_timeout(&e) => {
                         error!(
                             worker = Endpoint::redacted_str(decode.url()),
                             "Decode response timed out: {}",
@@ -2373,7 +2420,7 @@ impl PDRouter {
                         );
                         request_timeout_response(format!("Failed to read response: {}", cause(&e)))
                     }
-                    Err(e) => {
+                    Err(BodyReadError::Transport(e)) => {
                         error!(
                             worker = Endpoint::redacted_str(decode.url()),
                             "Failed to read decode response: {}",
@@ -2612,10 +2659,15 @@ impl PDRouter {
         return_logprob: bool,
         prefill_body: Option<Bytes>,
     ) -> Response {
-        let response = res.bytes().await;
+        let response = read_body_capped(res.bytes_stream(), self.max_payload_size).await;
         let decode_body = match response {
             Ok(decode_body) => decode_body,
-            Err(e) if is_request_timeout(&e) => {
+            Err(BodyReadError::TooLarge) => {
+                let mut answer = worker_body_too_large(self.max_payload_size, decode.url());
+                answer.extensions_mut().insert(OwnFailure(PdSide::Decode));
+                return answer;
+            }
+            Err(BodyReadError::Transport(e)) if is_request_timeout(&e) => {
                 error!(
                     worker = Endpoint::redacted_str(decode.url()),
                     "Decode response timed out: {}",
@@ -2623,7 +2675,7 @@ impl PDRouter {
                 );
                 return request_timeout_response(format!("Failed to read response: {}", cause(&e)));
             }
-            Err(e) => {
+            Err(BodyReadError::Transport(e)) => {
                 error!(
                     worker = Endpoint::redacted_str(decode.url()),
                     "Failed to read decode response: {}",
@@ -2684,14 +2736,26 @@ impl PDRouter {
                 Endpoint::redacted_str(prefill_url),
                 prefill_status
             );
-            return Err(Self::side_refused(PdSide::Prefill, prefill_response).await);
+            return Err(Self::side_refused(
+                PdSide::Prefill,
+                prefill_response,
+                self.max_payload_size,
+            )
+            .await);
         }
 
         // Read prefill body if needed for logprob merging
         let prefill_body = if return_logprob {
-            match prefill_response.bytes().await {
+            match read_body_capped(prefill_response.bytes_stream(), self.max_payload_size).await {
                 Ok(body) => Some(body),
-                Err(e) => {
+                // This body is the prefill side's part of the answer: over
+                // the limit it is the 502, as the handoff read answers it.
+                Err(BodyReadError::TooLarge) => {
+                    let mut answer = worker_body_too_large(self.max_payload_size, prefill_url);
+                    answer.extensions_mut().insert(OwnFailure(PdSide::Prefill));
+                    return Err(answer);
+                }
+                Err(BodyReadError::Transport(e)) => {
                     warn!(
                         worker = Endpoint::redacted_str(prefill_url),
                         "Failed to read prefill response body for logprobs: {}",
@@ -2701,15 +2765,26 @@ impl PDRouter {
                 }
             }
         } else {
-            // For non-logprob requests, just consume the response without storing
+            // For non-logprob requests, consume the response chunk by chunk
+            // without storing it.
             debug!("Consuming prefill response body (non-logprob request)");
-            match prefill_response.bytes().await {
-                Ok(_) => debug!("Prefill response consumed successfully"),
-                Err(e) => warn!(
-                    worker = Endpoint::redacted_str(prefill_url),
-                    "Error consuming prefill response: {}",
-                    cause(&e)
-                ),
+            let mut chunks = prefill_response.bytes_stream();
+            loop {
+                match chunks.next().await {
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        warn!(
+                            worker = Endpoint::redacted_str(prefill_url),
+                            "Error consuming prefill response: {}",
+                            cause(&e)
+                        );
+                        break;
+                    }
+                    None => {
+                        debug!("Prefill response consumed successfully");
+                        break;
+                    }
+                }
             }
             None
         };
@@ -3273,7 +3348,7 @@ impl RouterTrait for PDRouter {
         let status = res.status();
         let mut response_headers = header_utils::preserve_response_headers(res.headers());
         header_utils::insert_routed_worker_id(&mut response_headers, worker.redacted_url());
-        match res.bytes().await {
+        match read_body_capped(res.bytes_stream(), self.max_payload_size).await {
             Ok(bytes) => {
                 worker.record_outcome(status.as_u16());
                 let mut response = Response::new(Body::from(bytes));
@@ -3281,7 +3356,11 @@ impl RouterTrait for PDRouter {
                 *response.headers_mut() = response_headers;
                 response
             }
-            Err(e) if is_request_timeout(&e) => {
+            Err(BodyReadError::TooLarge) => {
+                worker.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
+                worker_body_too_large(self.max_payload_size, worker.url())
+            }
+            Err(BodyReadError::Transport(e)) if is_request_timeout(&e) => {
                 error!(
                     worker = Endpoint::redacted_str(worker.url()),
                     endpoint = "/v1/messages/count_tokens",
@@ -3291,7 +3370,7 @@ impl RouterTrait for PDRouter {
                 worker.record_outcome(StatusCode::GATEWAY_TIMEOUT.as_u16());
                 request_timeout_response(format!("count-tokens timed out: {}", cause(&e)))
             }
-            Err(e) => {
+            Err(BodyReadError::Transport(e)) => {
                 error!(
                     worker = Endpoint::redacted_str(worker.url()),
                     endpoint = "/v1/messages/count_tokens",
@@ -4095,7 +4174,8 @@ mod tests {
                 .build(),
         );
 
-        let anonymous = PDRouter::proxy_to_worker(&worker, "get_server_info", None).await;
+        let anonymous =
+            PDRouter::proxy_to_worker(&worker, "get_server_info", None, usize::MAX).await;
         assert_eq!(anonymous.status(), StatusCode::OK);
         let own = PDRouter::proxy_to_worker(
             &worker,
@@ -4104,6 +4184,7 @@ mod tests {
                 "authorization".to_string(),
                 "Bearer callers-own-key".to_string(),
             )]),
+            usize::MAX,
         )
         .await;
         assert_eq!(own.status(), StatusCode::OK);
@@ -4165,6 +4246,7 @@ mod tests {
                 ("accept-encoding".to_string(), "gzip, deflate".to_string()),
                 ("cookie".to_string(), "session=1".to_string()),
             ]),
+            usize::MAX,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -4208,7 +4290,8 @@ mod tests {
                 .build(),
         );
 
-        let response = PDRouter::proxy_to_worker(&worker, "get_server_info", None).await;
+        let response =
+            PDRouter::proxy_to_worker(&worker, "get_server_info", None, usize::MAX).await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = json_of(response).await;
         assert_eq!(body["error"]["code"], "read_response_body_failed", "{body}");
@@ -4234,7 +4317,8 @@ mod tests {
                 .build(),
         );
 
-        let response = PDRouter::proxy_to_worker(&worker, "get_server_info", None).await;
+        let response =
+            PDRouter::proxy_to_worker(&worker, "get_server_info", None, usize::MAX).await;
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(
             error::extract_error_code_from_response(&response),
@@ -4697,7 +4781,7 @@ mod tests {
             let answered = match call {
                 ProxiedGet => {
                     let worker = worker_at(registered, WorkerType::Prefill);
-                    PDRouter::proxy_to_worker(&worker, "get_server_info", None)
+                    PDRouter::proxy_to_worker(&worker, "get_server_info", None, usize::MAX)
                         .await
                         .status()
                 }
@@ -4860,6 +4944,64 @@ mod tests {
         assert_eq!(answer["object"], "rerank");
         assert_eq!(answer["id"], "my-rid");
         assert_eq!(answer["results"], json!([{"score": 0.75, "index": 1}]));
+    }
+
+    #[tokio::test]
+    async fn a_side_answer_above_the_payload_limit_reads_502() {
+        const OVER: &str =
+            r#"{"object":"response","output":"one side's answer above the payload limit"}"#;
+        // The limit fits one side's answer, not the other's. The prefill
+        // answer is part of the client's only when logprobs are asked.
+        let mut read = Vec::new();
+        for (prefill, decode, logprobs, stream) in [
+            ("{}", OVER, false, false),
+            ("{}", OVER, true, false),
+            (OVER, "{}", true, false),
+            (OVER, "{}", true, true),
+        ] {
+            let (prefill_url, _) = spawn_recording_stub(prefill).await;
+            let (decode_url, _) = spawn_recording_stub(decode).await;
+            let router = PDRouter {
+                max_payload_size: 64,
+                ..single_attempt_router()
+            };
+            // A breaker that opens on the first failure shows which worker
+            // the 502 is charged to.
+            let pair = [
+                fragile_worker(prefill_url, WorkerType::Prefill),
+                fragile_worker(decode_url, WorkerType::Decode),
+            ];
+            for worker in &pair {
+                router
+                    .worker_registry
+                    .register_or_replace(Arc::clone(worker));
+            }
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+            let chat: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "logprobs": logprobs,
+                "stream": stream,
+            }))
+            .expect("valid chat request");
+            let response = router
+                .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+                .await;
+            read.push((
+                response.status(),
+                error_code(&response).map(str::to_owned),
+                pair.map(|worker| !worker.circuit_breaker_can_execute()),
+            ));
+        }
+
+        let code = Some("upstream_response_too_large".to_owned());
+        let refused = |charged: [bool; 2]| (StatusCode::BAD_GATEWAY, code.clone(), charged);
+        // Charged, prefill then decode: the side above the limit, alone.
+        assert_eq!(
+            read,
+            [[false, true], [false, true], [true, false], [true, false]].map(refused)
+        );
     }
 
     #[tokio::test]
@@ -7294,8 +7436,12 @@ mod tests {
             .body(r#"{"error":"boom \"quoted\""}"#)
             .unwrap();
 
-        let response =
-            PDRouter::side_refused(PdSide::Decode, reqwest::Response::from(upstream)).await;
+        let response = PDRouter::side_refused(
+            PdSide::Decode,
+            reqwest::Response::from(upstream),
+            usize::MAX,
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(error_code(&response), Some("decode_worker_failed_to_start"));
@@ -7330,8 +7476,12 @@ mod tests {
             .body(r#"{"error":"busy"}"#)
             .unwrap();
 
-        let response =
-            PDRouter::side_refused(PdSide::Prefill, reqwest::Response::from(upstream)).await;
+        let response = PDRouter::side_refused(
+            PdSide::Prefill,
+            reqwest::Response::from(upstream),
+            usize::MAX,
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(

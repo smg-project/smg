@@ -292,16 +292,19 @@ impl Router {
                         let response_headers =
                             header_utils::preserve_response_headers(res.headers());
 
-                        match res.bytes().await {
+                        match read_body_capped(res.bytes_stream(), self.max_payload_size).await {
                             Ok(body) => {
                                 let mut response = Response::new(Body::from(body));
                                 *response.status_mut() = status;
                                 *response.headers_mut() = response_headers;
                                 response
                             }
+                            Err(BodyReadError::TooLarge) => {
+                                worker_body_too_large(self.max_payload_size, worker.url())
+                            }
                             // The worker's answer ended before it was whole:
                             // the upstream's failure, under the code it had.
-                            Err(e) => error::bad_gateway(
+                            Err(BodyReadError::Transport(e)) => error::bad_gateway(
                                 "read_response_failed",
                                 format!("Failed to read response: {}", cause(&e)),
                             ),
@@ -1088,8 +1091,9 @@ impl Router {
                     let status = res.status();
 
                     let response_headers = header_utils::preserve_response_headers(res.headers());
+                    let worker_url = res.url().clone();
 
-                    match res.bytes().await {
+                    match read_body_capped(res.bytes_stream(), self.max_payload_size).await {
                         Ok(body) => {
                             let mut response = Response::new(Body::from(body));
                             *response.status_mut() = status;
@@ -1100,7 +1104,17 @@ impl Router {
                             }
                             last_response = Some(response);
                         }
-                        Err(e) => {
+                        Err(BodyReadError::TooLarge) => {
+                            let refusal =
+                                worker_body_too_large(self.max_payload_size, worker_url.as_str());
+                            // A 2xx is the worker that holds the call: its
+                            // answer ends the fan-out, over the limit too.
+                            if status.is_success() {
+                                return refusal;
+                            }
+                            last_response = Some(refusal);
+                        }
+                        Err(BodyReadError::Transport(e)) => {
                             last_response = Some(error::bad_gateway(
                                 "read_response_failed",
                                 format!("Failed to read response: {}", cause(&e)),
@@ -1360,37 +1374,25 @@ impl Router {
     /// under the call, answered under its own code, never a fault of the
     /// gateway's. The request's own timeout running out mid-body ends the
     /// request as it does before the head (see [`convert_reqwest_error`]).
-    async fn read_worker_body_capped<S>(mut stream: S, limit: usize) -> Result<Bytes, Response>
+    async fn read_worker_body_capped<S>(
+        stream: S,
+        limit: usize,
+        worker: &str,
+    ) -> Result<Bytes, Response>
     where
         S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
     {
-        let mut body = BytesMut::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(e) if is_request_timeout(&e) => {
-                    return Err(request_timeout_response(format!(
-                        "Failed to get response body: {}",
-                        cause(&e)
-                    )));
-                }
-                Err(e) => {
-                    return Err(error::bad_gateway(
-                        "read_response_body_failed",
-                        format!("Failed to get response body: {}", cause(&e)),
-                    ));
-                }
-            };
-            if body.len().saturating_add(chunk.len()) > limit {
-                warn!(limit, "Worker response exceeded the body limit");
-                return Err(error::bad_gateway(
-                    "upstream_response_too_large",
-                    format!("Response from worker exceeded {limit} bytes"),
-                ));
-            }
-            body.extend_from_slice(&chunk);
+        match read_body_capped(stream, limit).await {
+            Ok(body) => Ok(body),
+            Err(BodyReadError::Transport(e)) if is_request_timeout(&e) => Err(
+                request_timeout_response(format!("Failed to get response body: {}", cause(&e))),
+            ),
+            Err(BodyReadError::Transport(e)) => Err(error::bad_gateway(
+                "read_response_body_failed",
+                format!("Failed to get response body: {}", cause(&e)),
+            )),
+            Err(BodyReadError::TooLarge) => Err(worker_body_too_large(limit, worker)),
         }
-        Ok(body.freeze())
     }
 
     // Send an already-serialized request body. The stale-connection resend
@@ -1509,6 +1511,7 @@ impl Router {
             let mut response = match Self::read_worker_body_capped(
                 res.bytes_stream(),
                 self.max_payload_size,
+                source.worker().url(),
             )
             .await
             {
@@ -1728,6 +1731,50 @@ impl Router {
         }
         keep_worker(Json(rerank_response).into_response())
     }
+}
+
+/// Why a capped read of a worker body ended before the body was whole.
+pub(super) enum BodyReadError {
+    /// The body passed the limit.
+    TooLarge,
+    /// The transport failed under the read, or the request's timeout ran out.
+    Transport(reqwest::Error),
+}
+
+/// Buffer a worker response body, capped at `limit` bytes: the body, or why
+/// the read ended. Each caller answers the two ends in its own words.
+pub(super) async fn read_body_capped<S>(mut stream: S, limit: usize) -> Result<Bytes, BodyReadError>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
+    let (mut first, mut buf) = (Bytes::new(), BytesMut::new());
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(BodyReadError::Transport)?;
+        if (first.len() + buf.len()).saturating_add(chunk.len()) > limit {
+            return Err(BodyReadError::TooLarge);
+        }
+        if first.is_empty() && buf.is_empty() {
+            // A body of one chunk is handed back as it came, without a copy.
+            first = chunk;
+        } else if !chunk.is_empty() {
+            buf.reserve(first.len() + chunk.len());
+            buf.extend_from_slice(&std::mem::take(&mut first));
+            buf.extend_from_slice(&chunk);
+        }
+    }
+    Ok(if buf.is_empty() { first } else { buf.freeze() })
+}
+
+/// The 502 for a body of `worker` above `limit` bytes, under its own code.
+pub(super) fn worker_body_too_large(limit: usize, worker: &str) -> Response {
+    warn!(
+        worker = Endpoint::redacted_str(worker),
+        limit, "Worker response exceeded the body limit"
+    );
+    error::bad_gateway(
+        "upstream_response_too_large",
+        format!("Response from worker exceeded {limit} bytes"),
+    )
 }
 
 /// Post-dispatch inputs for the rerank response builder; the request itself
@@ -2081,7 +2128,9 @@ async fn buffer_transcription_response(
     // and ends as a 502 before memory grows, and the request's own
     // timeout ends the request as it does before the head.
     let (mut response, reason) =
-        match Router::read_worker_body_capped(res.bytes_stream(), max_payload_size).await {
+        match Router::read_worker_body_capped(res.bytes_stream(), max_payload_size, worker.url())
+            .await
+        {
             Ok(body) => {
                 let mut response = Response::new(Body::from(body));
                 *response.status_mut() = status;
@@ -3247,6 +3296,53 @@ mod tests {
         }
     }
 
+    /// The cancel call ends on the answer of the worker that holds the call:
+    /// its `2xx` above the payload limit is the `502`, and no later answer
+    /// replaces it. An error answer above the limit stands only until
+    /// another worker answers.
+    #[tokio::test]
+    async fn a_cancel_answer_above_the_payload_limit_follows_the_fan_out_rule() {
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let mut read = Vec::new();
+        // The first worker answers above the limit at once, the second
+        // under it a moment later.
+        for (first, second) in [
+            (StatusCode::OK, StatusCode::NOT_FOUND),
+            (StatusCode::NOT_FOUND, StatusCode::OK),
+        ] {
+            let mut workers = Vec::new();
+            for (status, body, wait) in [(first, "above the limit", 0), (second, "{}", 100)] {
+                let app = axum::Router::new().fallback(move || async move {
+                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                    (status, body)
+                });
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test stub server lives for the duration of the test process"
+                )]
+                tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                workers.push(plain_worker(&format!("http://{addr}")));
+            }
+            let router = streaming_router(PolicyConfig::RoundRobin, 8, workers);
+            let response = router.cancel_response(None, &tenant, "resp_1").await;
+            let code = response.headers().get(error::HEADER_X_SMG_ERROR_CODE);
+            read.push((response.status(), code.cloned()));
+        }
+
+        let too_large = HeaderValue::from_static("upstream_response_too_large");
+        assert_eq!(
+            read,
+            [
+                (StatusCode::BAD_GATEWAY, Some(too_large)),
+                (StatusCode::OK, None)
+            ]
+        );
+    }
+
     /// smg-lab #288: the `model` label of the request families is bounded by
     /// the served models. A request for a model no worker serves is counted
     /// under `other` (the value the bounded interner and the `path` label
@@ -4140,9 +4236,10 @@ mod tests {
     async fn read_worker_body_capped_accepts_body_at_limit() {
         let url = spawn_cut_stub("/body", "application/json", &["abc", "def", "gh"], false).await;
 
-        let body = Router::read_worker_body_capped(worker_body(&http_client(), &url).await, 8)
-            .await
-            .unwrap();
+        let body =
+            Router::read_worker_body_capped(worker_body(&http_client(), &url).await, 8, &url)
+                .await
+                .unwrap();
 
         assert_eq!(body.as_ref(), b"abcdefgh");
     }
@@ -4151,9 +4248,10 @@ mod tests {
     async fn read_worker_body_capped_rejects_oversized_body_with_502() {
         let url = spawn_cut_stub("/body", "application/json", &["abc", "def", "gh"], false).await;
 
-        let response = Router::read_worker_body_capped(worker_body(&http_client(), &url).await, 7)
-            .await
-            .unwrap_err();
+        let response =
+            Router::read_worker_body_capped(worker_body(&http_client(), &url).await, 7, &url)
+                .await
+                .unwrap_err();
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
@@ -4170,9 +4268,10 @@ mod tests {
     async fn read_worker_body_capped_maps_a_read_failure_to_a_bad_gateway() {
         let url = spawn_cut_stub("/body", "application/json", &["abc"], true).await;
 
-        let response = Router::read_worker_body_capped(worker_body(&http_client(), &url).await, 8)
-            .await
-            .unwrap_err();
+        let response =
+            Router::read_worker_body_capped(worker_body(&http_client(), &url).await, 8, &url)
+                .await
+                .unwrap_err();
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
@@ -4218,7 +4317,7 @@ mod tests {
         let url = spawn_close_after_headers_stub().await;
 
         let response =
-            Router::read_worker_body_capped(worker_body(&http_client(), &url).await, 1 << 20)
+            Router::read_worker_body_capped(worker_body(&http_client(), &url).await, 1 << 20, &url)
                 .await
                 .unwrap_err();
 
@@ -4241,7 +4340,7 @@ mod tests {
         let body = worker_body(&client, &url).await;
         tokio::time::pause();
 
-        let response = Router::read_worker_body_capped(body, 1 << 20)
+        let response = Router::read_worker_body_capped(body, 1 << 20, &url)
             .await
             .unwrap_err();
 
