@@ -1023,10 +1023,15 @@ impl AppContextBuilder {
         let spec = config
             .hosted_policy(&document, &StageRegistry::builtin())
             .map_err(|refused| format!("policy controller: {refused}"))?;
+        let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+            format!("policy controller: the engine's task needs a Tokio runtime: {error}")
+        })?;
         // One engine for the life of the process: its placements borrow it.
         let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(spec)));
         engine.set_loads(loads);
-        tokio::spawn(engine.run());
+        // The engine's task keeps nothing a shutdown waits for: its upkeep
+        // and its load snapshot end with the runtime.
+        runtime.spawn(engine.run());
         policies.set_engine(engine);
         Ok(())
     }
