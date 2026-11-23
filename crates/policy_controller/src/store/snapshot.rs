@@ -1218,19 +1218,6 @@ impl StoreSnapshot {
         self.derived.pools.get(pool)?.booked.get(row).copied()
     }
 
-    /// Whether this world lists `id` at `rank`: asked of a dispatch
-    /// report's row, which may have left or changed its rank since its
-    /// decision. A member holds one rank in every pool that lists it, so
-    /// the first pool found answers.
-    #[cfg_attr(
-        not(feature = "controller"),
-        expect(dead_code, reason = "called by the served controller alone")
-    )]
-    pub(crate) fn lists_rank(&self, id: WorkerId, rank: u16) -> bool {
-        self.pooled_row(id)
-            .is_some_and(|(pool, row)| self.rows[pool][row].dp_rank == rank)
-    }
-
     /// The first pool that lists `id`, with the member's row there: one
     /// binary search a pool, as a pool's rows stand in id order.
     fn pooled_row(&self, id: WorkerId) -> Option<(usize, usize)> {

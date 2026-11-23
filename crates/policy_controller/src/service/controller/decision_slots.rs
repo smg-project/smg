@@ -205,7 +205,7 @@ use crate::{
         proto::{self, busy::Reason},
     },
     stages::lifecycle::Lifecycle,
-    store::{AtWork, GatewayId, LeaseRefused, LookOutcome, MemoryStore, StoreSnapshot},
+    store::{AtWork, GatewayId, Hand, LeaseRefused, LookOutcome, MemoryStore, StoreSnapshot},
     tracking::lease::{Lease, LeaseId, ReleaseReason, DISPATCH_TTL},
     worker_host::{Members, Objects},
 };
@@ -552,7 +552,7 @@ impl DecisionSlots {
             let files = "the store's files of leases are not one a decider";
             return Err(io::Error::new(io::ErrorKind::InvalidInput, files));
         }
-        lifecycle::tells(&reads.store);
+        lifecycle::tells(&reads.store, &reads.objects);
         let told = Arc::new(watch::Sender::new(false));
         let shared = Arc::new(Shared::default());
         let queues = (0..deciders)
@@ -874,7 +874,7 @@ impl Deciding {
         else {
             return;
         };
-        let hand = lifecycle::open(&self.reads.store, gateway);
+        let hand = Hand::new(gateway);
         let abandoned = ReleaseReason::Abandoned;
         leased.given_up(&self.reads.store, &hand, abandoned);
         // The decider is at work at that file, so the hand left the frame
@@ -1281,7 +1281,7 @@ pub(crate) mod tests {
     };
 
     use super::{
-        watched, Clock, DecideStats, Deciding, DecisionCall, DecisionSlots, Job, Part, Reads,
+        watched, Clock, DecideStats, Deciding, DecisionCall, DecisionSlots, Hand, Job, Part, Reads,
         Refused, LOOK_CAP, LOOK_FLOOR, PARTS, TERM_MARK,
     };
     use crate::{
@@ -2223,7 +2223,7 @@ pub(crate) mod tests {
         held.recv_timeout(PATIENCE)
             .expect("the decider reads the clock");
         let gone = Said::Released(None, ReleaseReason::ClientGone);
-        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let hand = Hand::new(GATEWAY);
         bed.store.hand(&hand, LeaseId(lease_of(&first).id), gone);
         let live = LeasesStore::live(&*bed.store, GATEWAY);
         assert_eq!(live, 1, "the hand leaves the release to the decider");
@@ -2366,7 +2366,7 @@ pub(crate) mod tests {
                 side: proto::Side::Single.into(),
                 since_decision_micros: 250,
             };
-            let hand = lifecycle::open(&bed.store, GATEWAY);
+            let hand = Hand::new(GATEWAY);
             lifecycle::dispatched(&bed.store, &hand, &frame, bed.script.taken)
                 .expect("the frame reads");
         }
@@ -2784,7 +2784,7 @@ pub(crate) mod tests {
             .expect("the stage's issue call");
         // Its gateway gives the lease up while the stage's call runs.
         let id = LeaseId(1 << 32 | 1);
-        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let hand = Hand::new(GATEWAY);
         let gone = ReleaseReason::ClientGone;
         bed.store.hand(&hand, id, Said::Released(None, gone));
         bed.script.steps.lock().push_back(Step::At(BUDGET));
@@ -2812,7 +2812,7 @@ pub(crate) mod tests {
         // frame is left to the decider at work, which applies it as it
         // leaves that work.
         let id = LeaseId(1 << 32 | 1);
-        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let hand = Hand::new(GATEWAY);
         let gone = Said::Released(None, ReleaseReason::ClientGone);
         bed.store.hand(&hand, id, gone);
         word.send(()).expect("the stage waits for the case");
@@ -2924,7 +2924,7 @@ pub(crate) mod tests {
         // the ring full and applies in place, where the stage's release
         // call panics.
         let id = LeaseId(1 << 32 | 1);
-        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let hand = Hand::new(GATEWAY);
         let gone = || Said::Released(None, ReleaseReason::ClientGone);
         bed.store.hand(&hand, id, gone());
         for _ in 1..MemoryStore::HANDOVER {
@@ -2988,7 +2988,7 @@ pub(crate) mod tests {
         // While the stage's call runs, the gateway gives the first lease up
         // and fills the ring behind that frame.
         let first = LeaseId(1 << 32 | 1);
-        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let hand = Hand::new(GATEWAY);
         let gone = || Said::Released(None, ReleaseReason::ClientGone);
         bed.store.hand(&hand, first, gone());
         for _ in 1..MemoryStore::HANDOVER {
@@ -3063,14 +3063,14 @@ pub(crate) mod tests {
             .expect("the decider reads the clock");
         // The ring fills, and one hand more waits at it.
         let gone = || Said::Released(None, ReleaseReason::ClientGone);
-        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let hand = Hand::new(GATEWAY);
         for _ in 0..MemoryStore::HANDOVER {
             bed.store.hand(&hand, LeaseId(0), gone());
         }
         let (through, handed) = std_mpsc::channel();
         let store = Arc::clone(&bed.store);
         let waiting = thread::spawn(move || {
-            store.hand(&lifecycle::open(&store, GATEWAY), LeaseId(0), gone());
+            store.hand(&Hand::new(GATEWAY), LeaseId(0), gone());
             through.send(()).expect("the case waits for the hand");
         });
         // The lead is an hour gone at every read from here on. Two more
@@ -3312,7 +3312,7 @@ pub(crate) mod tests {
         assert_eq!(bed.submit(again(frame(1, 1))), None);
         held.recv_timeout(PATIENCE)
             .expect("the decider reads the clock");
-        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let hand = Hand::new(GATEWAY);
         let dispatched = Said::Dispatched(Dispatch::default(), bed.script.taken);
         bed.store.hand(&hand, LeaseId(id(1)), dispatched);
         go.send(()).expect("the decider holds the other end");
@@ -3357,7 +3357,7 @@ pub(crate) mod tests {
         assert_eq!(bed.submit(frame(2, 1)), None);
         held.recv_timeout(PATIENCE)
             .expect("the decider reads the clock");
-        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let hand = Hand::new(GATEWAY);
         bed.store.hand(&hand, LeaseId(id(1)), gone);
         assert_eq!(*told.lock(), [(id(1), None)], "left to the decider at work");
         go.send(()).expect("the decider holds the other end");
@@ -3425,7 +3425,7 @@ pub(crate) mod tests {
         let answer = bed.ask(frame(1, 1)).await;
         // The case's thread names no decider: its hand applies the release,
         // or the decider does as it leaves its work.
-        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let hand = Hand::new(GATEWAY);
         let gone = Said::Released(None, ReleaseReason::ClientGone);
         bed.store.hand(&hand, LeaseId(lease_of(&answer).id), gone);
         settled(|| named.lock().len() >= 2).await;
@@ -3479,7 +3479,7 @@ pub(crate) mod tests {
         // Two leases stand on its file: its look behind the answers
         // starts its watch, and it waits for a job from there.
         watching(&bed, 1).await;
-        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let hand = Hand::new(GATEWAY);
         let gone = Said::Released(None, ReleaseReason::ClientGone);
         for answer in &answers {
             bed.store.hand(&hand, LeaseId(lease_of(answer).id), gone);
@@ -3507,7 +3507,7 @@ pub(crate) mod tests {
         // waits until the store shows no thread at work.
         settled(|| bed.store.working() == 0).await;
         assert_eq!(bed.store.watches(), 0, "two leases stand on its file");
-        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let hand = Hand::new(GATEWAY);
         let gone = Said::Released(None, ReleaseReason::ClientGone);
         for (applied, answer) in answers.iter().enumerate() {
             bed.store.hand(&hand, LeaseId(lease_of(answer).id), gone);
@@ -3537,7 +3537,7 @@ pub(crate) mod tests {
         decider.working = Some(bed.store.at_work());
         let answer = decider.answer(checked(frame(1, 1)), GATEWAY, bed.script.taken);
         let lease = LeaseId(lease_of(&answer.frame()).id);
-        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let hand = Hand::new(GATEWAY);
         let mut waits = Vec::new();
         let job = decider.wait_by(|within| {
             waits.push(within.map(|period| period.as_millis()));
@@ -3673,7 +3673,7 @@ pub(crate) mod tests {
         for name in ["s0", "s1", "s2"] {
             serving(&bed.store, name, &served, Role::Single, WireModes::NONE);
         }
-        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let hand = Hand::new(GATEWAY);
         let answer = bed.ask(frame_for(&models[0], 1, 1)).await;
         let lease = lease_of(&answer).id;
         // The first model's decider waits for a job on its watch over the
@@ -3774,7 +3774,7 @@ pub(crate) mod tests {
         for name in ["s0", "s1", "s2"] {
             serving(&bed.store, name, &served, Role::Single, WireModes::NONE);
         }
-        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let hand = Hand::new(GATEWAY);
         for model in &models {
             let answer = bed.ask(frame_for(model, 1, 1)).await;
             let dispatched = a_dispatched(lease_of(&answer).id);
@@ -3824,7 +3824,7 @@ pub(crate) mod tests {
         let kept = Arc::clone(&heard);
         let spec = picking("heard", move || Box::new(Heard(Arc::clone(&kept))));
         let mut bed = bed(Some(spec), true, (2, 8), []);
-        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let hand = Hand::new(GATEWAY);
         let gone = Said::Released(None, ReleaseReason::ClientGone);
         let parts = u32::try_from(FRAMES).expect("five hundred");
         let cells = [
@@ -3895,7 +3895,7 @@ pub(crate) mod tests {
         for name in ["s0", "s1", "s2"] {
             serving(&bed.store, name, &served, Role::Single, WireModes::NONE);
         }
-        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let hand = Hand::new(GATEWAY);
         let pause = |long: Duration| {
             if !long.is_zero() {
                 thread::sleep(long);
@@ -5229,7 +5229,7 @@ pub(crate) mod tests {
             let answer = bed.ask(keyed(key, 1_000 + key)).await;
             let worker = picked(&answer);
             assert_eq!(verdict(&bed, &answer), SessionVerdict::Claimed(worker));
-            let hand = lifecycle::open(&bed.store, GATEWAY);
+            let hand = Hand::new(GATEWAY);
             lifecycle::dispatched(&bed.store, &hand, &a_dispatched(lease_of(&answer).id), at)
                 .expect("the frame reads");
             first.push((key, worker, session(&bed, &answer)));
@@ -5297,7 +5297,7 @@ pub(crate) mod tests {
         let first = bed.ask(keyed(1, 1_001)).await;
         let owner = picked(&first);
         assert_eq!(verdict(&bed, &first), SessionVerdict::Claimed(owner));
-        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let hand = Hand::new(GATEWAY);
         lifecycle::dispatched(&bed.store, &hand, &a_dispatched(lease_of(&first).id), at)
             .expect("the frame reads");
         // One request of the key in flight: the second stays.

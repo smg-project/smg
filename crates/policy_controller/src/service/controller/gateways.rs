@@ -1110,7 +1110,7 @@ pub(crate) mod tests {
         for gateway in [A, B] {
             lifecycle::completed(
                 &store,
-                &lifecycle::open(&store, gateway),
+                &lifecycle::tests::open(&store, gateway),
                 &a_completed(1, served),
                 t0,
             )
@@ -1144,7 +1144,7 @@ pub(crate) mod tests {
         let gone = welcomed(&gateways, A, "gateway-a", TERM, t0);
         lifecycle::completed(
             &store,
-            &lifecycle::open(&store, A),
+            &lifecycle::tests::open(&store, A),
             &a_completed(1, served),
             t0,
         )
@@ -1180,7 +1180,7 @@ pub(crate) mod tests {
         // Its late frame, then its end.
         lifecycle::completed(
             &store,
-            &lifecycle::open(&store, A),
+            &lifecycle::tests::open(&store, A),
             &a_completed(1, served),
             t0 + GRACE,
         )
@@ -1277,7 +1277,7 @@ pub(crate) mod tests {
                 let seat = welcomed(&gateways, gateway, &subject, TERM, now);
                 lifecycle::completed(
                     &store,
-                    &lifecycle::open(&store, gateway),
+                    &lifecycle::tests::open(&store, gateway),
                     &a_completed(1, served),
                     now,
                 )

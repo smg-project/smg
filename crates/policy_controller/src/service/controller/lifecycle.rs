@@ -22,15 +22,15 @@
 //! applies it where it is at work or keeps its watch over the file, and
 //! the session itself where it does neither, in the order the frames
 //! were read. A `Decide` stream hands the release of a decision it stops
-//! at its send through a hand of its own ([`open`]).
+//! at its send through a hand of its own.
 //!
 //! A frame whose lease is on file tells the engine that issued it, the
 //! generation's own, what became of the decision: its dispatch, its
 //! completion or its release. A generation that no longer stands is told
 //! nothing: the stages of a later one never saw the issue. A dispatch
 //! alone goes further: it feeds the standing generation's counts of
-//! sends, whichever generation issued the lease, where the standing
-//! world still lists the worker at the rank the dispatch names.
+//! sends, whichever generation issued the lease, where the replica's
+//! worker objects still list the worker at the rank the dispatch names.
 //!
 //! A pair's lease stands under one id: its record is the prefill side,
 //! and its decode side is filed beside the record. A frame moves the
@@ -40,7 +40,7 @@
 //! pair's lease does not hold, or on a side that ended, writes nothing
 //! and tells nothing. A single's lease reads no side.
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use tonic::Status;
 use tracing::error;
@@ -53,8 +53,9 @@ use crate::{
         completed::Class,
         released::{Reason, What},
     },
-    store::{GatewayId, Hand, MemoryStore, Sides, StoreSnapshot},
+    store::{Hand, MemoryStore, Sides, StoreSnapshot},
     tracking::lease::{Dispatch, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass},
+    worker_host::{Members, Objects},
 };
 
 /// A `Dispatched` frame: the gateway's lease moves to dispatched at `now`.
@@ -114,33 +115,37 @@ pub(crate) fn released(
     Ok(())
 }
 
-/// Opens a hand at the leases' files, a session's or a `Decide` stream's:
-/// what it says of `gateway`'s leases is handed through it, and the store
-/// is given the word to the engine that whoever applies it tells with
-/// ([`tells`]).
-pub(crate) fn open(store: &MemoryStore, gateway: GatewayId) -> Hand {
-    tells(store);
-    Hand::new(gateway)
-}
-
-/// Gives the store the word to the engine of a frame applied to a lease.
-pub(crate) fn tells(store: &MemoryStore) {
-    store.tell_through(told);
+/// Gives the store the word to the engine of a frame applied to a lease:
+/// whoever applies the frame tells with it. The word holds `objects`, the
+/// replica's worker objects, and asks them whether the worker a dispatch
+/// names stands at its rank ([`Objects::lists_rank`]).
+///
+/// A replica gives it once, at the start of its deciders, and so before a
+/// session or a `Decide` stream opens a hand: the first word a store is
+/// given stays.
+pub(crate) fn tells(store: &MemoryStore, objects: &Arc<Objects<Members>>) {
+    let objects = Arc::clone(objects);
+    store.tell_through(move |store, world, found, said, by| {
+        told(store, world, found, said, by, |id, rank| {
+            objects.lists_rank(id, rank)
+        });
+    });
 }
 
 /// Tells the engine what a frame said of a lease, whoever applies the
 /// frame: the lease's own word ([`lease_words::told`]), which holds a
 /// stage's call that panics and counts it on the store
 /// ([`MemoryStore::lifecycle_faults`]). A streak of faults writes one line
-/// here.
+/// here. `listed` says whether a worker stands at a rank.
 fn told(
     store: &MemoryStore,
     world: &StoreSnapshot,
     found: &Sides,
     said: Said,
     by: Option<DecisionSlot>,
+    listed: impl Fn(WorkerId, u16) -> bool,
 ) {
-    if lease_words::told(store, world, found, said, by) {
+    if lease_words::told(store, world, found, said, by, listed) {
         error!(
             lease = found.record.lease.id.0,
             "a lease's lifecycle call panicked: held, and the lease's event stands as applied"
@@ -272,7 +277,8 @@ pub(crate) mod tests {
     use tonic::{Code, Status};
 
     use super::{
-        class, completed, dispatch, dispatched, open, outcome, reason, release, released, side,
+        class, completed, dispatch, dispatched, outcome, reason, release, released, side, tells,
+        told,
     };
     use crate::{
         document::spec::{AppliedSpec, PolicySpec},
@@ -285,7 +291,10 @@ pub(crate) mod tests {
         },
         policies::random::Random,
         service::{
-            controller::{decision_slots::tests::ready, gateways::tests::lease},
+            controller::{
+                decision_slots::tests::{holder, ready},
+                gateways::tests::lease,
+            },
             proto::{
                 self,
                 completed::Class,
@@ -294,8 +303,8 @@ pub(crate) mod tests {
         },
         stages::{lifecycle::Lifecycle, registry::StageRegistry},
         store::{
-            DecodeSide, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore,
-            PickRecord, WorkerFacts, WorkersStore,
+            DecodeSide, GatewayId, Hand, HealthSink, LeaseRecord, LeaseState, LeasesStore,
+            MemoryStore, PickRecord, WorkerFacts, WorkersStore,
         },
         tracking::{
             lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
@@ -314,6 +323,18 @@ pub(crate) mod tests {
         /// A case's own step inside a stage's call: the hearing stage's
         /// next release on this thread runs it once, before it returns.
         static AT_RELEASE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// A hand at the leases' files of a case's store, which no deciders
+    /// were started over. Where the store holds no word to the engine it
+    /// is given the engine's own ([`told`]) with no worker object to ask:
+    /// a count takes a send at a rank it does not know. The first word a
+    /// store is given stays.
+    pub(crate) fn open(store: &MemoryStore, gateway: GatewayId) -> Hand {
+        store.tell_through(|store, world, found, said, by| {
+            told(store, world, found, said, by, |_, _| true);
+        });
+        Hand::new(gateway)
     }
 
     /// A worker the store holds a row for.
@@ -1241,21 +1262,26 @@ pub(crate) mod tests {
     }
 
     /// A dispatch that comes late enters no rank of a worker that left: a
-    /// count asks the world that tells it whether the rank is listed. The
-    /// lease reads dispatched all the same, and a worker the world lists
-    /// is counted.
+    /// count asks the worker objects the store's word holds whether the
+    /// rank is listed, and the removal took the worker's object out
+    /// before the store was told. The lease reads dispatched all the
+    /// same, and a worker whose object stands is counted.
     #[test]
     fn a_late_dispatch_enters_no_rank_of_a_worker_that_left() {
-        let store = MemoryStore::new();
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
+        tells(&store, &objects);
         let t0 = Instant::now();
         let left = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
         let stays = ready(&store, "b", COUNTED, Role::Single, WireModes::HTTP);
         let count = counting(&store, 1);
         issued_on(&store, 1, 1, left, t0);
         issued_on(&store, 2, 1, stays, t0);
-        let row = WorkersStore::get(&store, left).expect("the row");
-        store.remove(left, row.revision).expect("the row leaves");
-        let hand = open(&store, A);
+        objects.follow(&*store);
+        let row = WorkersStore::get(&*store, left).expect("the row");
+        let removed = objects.remove(&store, left, row.revision);
+        assert!(removed.is_some(), "the row leaves");
+        let hand = Hand::new(A);
         dispatched(&store, &hand, &a_dispatched(1), t0).expect("the frame reads");
         dispatched(&store, &hand, &a_dispatched(2), t0).expect("the frame reads");
         assert!(matches!(
@@ -1264,6 +1290,27 @@ pub(crate) mod tests {
         ));
         assert_eq!(sends(&count, left), 0);
         assert_eq!(sends(&count, stays), 1);
+    }
+
+    /// A dispatch on a worker whose object stands is counted while the
+    /// store's world lists the worker not yet: a registration's object
+    /// stands from its write, and the world lists its row at the build
+    /// its publication window ends with. The decision that sent the
+    /// request read the worker objects, and so does its count.
+    #[test]
+    fn a_dispatch_inside_a_registrations_window_is_counted() {
+        let store = Arc::new(MemoryStore::with_publish_window(Duration::from_secs(3600)));
+        let objects = holder(&store);
+        tells(&store, &objects);
+        let t0 = Instant::now();
+        let count = counting(&store, 1);
+        let joined = worker(&store, "late");
+        objects.follow(&*store);
+        issued_on(&store, 1, 1, joined, t0);
+        let listed = store.deciding(|world| world.booked_of(joined).is_some());
+        assert!(!listed, "the world lists the worker inside its window");
+        dispatched(&store, &Hand::new(A), &a_dispatched(1), t0).expect("the frame reads");
+        assert_eq!(sends(&count, joined), 1);
     }
 
     /// An apply hands the standing generation's sends to the generation it
