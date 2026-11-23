@@ -408,6 +408,12 @@ Who writes it: the health checker (status), the load monitor (overload, liveness
 load guard (the in-flight counters), request outcomes (the circuit breaker). A controller serves no
 request: the leases its store holds on file write the in-flight counter there (`HostCount`).
 
+These are the main writers, not all of them. The status is also written at a drain, at a
+registration's activation, by the registry itself where a worker leaves or comes from a peer's
+record, and on a controller by its worker host, which follows the store's row. The liveness flag
+is also written on the word of the stream each worker pushes on (section 4.3), of a passed probe
+and of a request's own token stream.
+
 A decision reads a worker in one read: `Worker::routing_state()` gives ready, circuit breaker,
 stalled, overloaded and the in-flight count.
 
