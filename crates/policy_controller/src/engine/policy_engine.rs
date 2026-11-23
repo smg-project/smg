@@ -818,9 +818,9 @@ impl PolicyEngine {
         // Under a document a stage of which reads a named signal the
         // list's word says whether this request's profile reads one.
         if self.signals && members.reads_signal(&self.spec, request.facts.model) {
-            return signals::decide(self, request, members, loads, now, said);
+            return signals::decide(self, request, members, maker, loads, now, said);
         }
-        self.decide_with_loads(request, members, loads, now, said)
+        self.decide_with_loads(request, members, maker, loads, now, said)
     }
 
     /// [`Self::decide_made`] behind its choice of the snapshot: the
@@ -828,11 +828,17 @@ impl PolicyEngine {
     /// live profile and, where the binding names one, its shadow behind
     /// it. A request that is lent its list's signal cells is decided here
     /// too, as the copy that carries them ([`signals::decide`]).
+    ///
+    /// `maker` is the request's own, handed on for its entry in a token
+    /// tree its host lends. A copy that carries signal cells is decided
+    /// inside that tree like the request it was made of, and hands its
+    /// maker as a trait object ([`signals::decide`]).
     #[inline]
     fn decide_with_loads(
         &self,
         request: &mut Request<'_>,
         members: &PoolMembers,
+        maker: &(impl RequestMaker + ?Sized),
         loads: Option<&Arc<LoadSnapshot>>,
         now: Instant,
         said: &mut Option<Shadowed>,
@@ -842,12 +848,20 @@ impl PolicyEngine {
         if self.any_shadow {
             if let Some(binding) = members.shadow(&self.spec, request.facts.model) {
                 let (decision, shadow) =
-                    with_shadow::decide(self, request, members, loads, now, binding);
+                    with_shadow::decide(self, request, members, maker, loads, now, binding);
                 *said = shadow;
                 return decision;
             }
         }
-        single::decide(self, request, members, loads, now, single::WithoutShadow)
+        single::decide(
+            self,
+            request,
+            members,
+            maker,
+            loads,
+            now,
+            single::WithoutShadow,
+        )
     }
 
     /// The decision's pass: the place it answers, or its whole decision

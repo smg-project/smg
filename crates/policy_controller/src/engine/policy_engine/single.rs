@@ -68,7 +68,7 @@ use super::{keys, overlap, PolicyEngine, PoolMembers};
 use crate::{
     engine::{
         decision::{Decision, Shed, ShedReason, Trace, SUBSET_HINT, WIRES},
-        decision_engine::{AlonePick, DecideOutcome, Leased, Plain, Request},
+        decision_engine::{AlonePick, DecideOutcome, Leased, Plain, Request, RequestMaker},
         demands::UnmetDemand,
         framework::Engine,
         lease_events,
@@ -191,9 +191,11 @@ pub(super) fn noted(
 /// ([`super::with_shadow`]).
 pub(super) trait WholeDecision {
     /// The engine's whole decision over `records`, the records of
-    /// `workers`, for the request `facts` state.
+    /// `workers`, for the request `facts` state. It is run by reference:
+    /// the lookup that names a request's holders takes a decision it may
+    /// ask again ([`overlap::decide`]), and asks it once.
     fn decide(
-        self,
+        &mut self,
         engine: &Engine,
         records: &PoolRecords,
         workers: &[Arc<dyn Worker>],
@@ -209,7 +211,7 @@ pub(super) struct WithoutShadow;
 impl WholeDecision for WithoutShadow {
     #[inline(always)]
     fn decide(
-        self,
+        &mut self,
         engine: &Engine,
         records: &PoolRecords,
         workers: &[Arc<dyn Worker>],
@@ -229,6 +231,13 @@ impl WholeDecision for WithoutShadow {
 /// host's load snapshot for this decision. A request that states what no
 /// stage here runs is declined under that stage's name.
 ///
+/// `maker` is asked for the request's entry in its host's token tree of
+/// sent prefixes ([`RequestMaker::token_key`]) where the host lends the
+/// request's place one ([`overlap::decide`]). It is asked of the maker's
+/// own type and no argument carries the entry: a maker that names none
+/// costs a decision nothing. The decision is compiled once for each maker
+/// type, as the engine's entry that calls it is.
+///
 /// A request that states a hard demand is decided under its constraints
 /// held to the workers that meet it ([`held`]). A list the demands leave
 /// nobody is shed with no endpoint under the stage of the demand that took
@@ -243,6 +252,7 @@ pub(super) fn decide(
     own: &PolicyEngine,
     request: &mut Request<'_>,
     members: &PoolMembers,
+    maker: &(impl RequestMaker + ?Sized),
     loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
     whole: impl WholeDecision,
@@ -287,9 +297,9 @@ pub(super) fn decide(
     // A retry leaves every worker of the engines it tried: over a list
     // where an engine holds several, its facts name them all.
     let decision = if facts.tried.is_empty() || !records.has_ranks() {
-        by_facts::<false>(own, members, records, &live, facts, cx, whole)
+        by_facts::<false>(own, members, records, &live, facts, cx, maker, whole)
     } else {
-        retried(own, members, records, &live, facts, cx, whole)
+        retried(own, members, records, &live, facts, cx, maker, whole)
     };
     if let Some(meeting) = meeting {
         MEETING.set(meeting);
@@ -307,7 +317,14 @@ pub(super) fn decide(
 /// what a first attempt runs in line there. With one instance for both
 /// callers a first attempt's whole decision was called, 30 instructions a
 /// decision more.
+///
+/// `maker` is the request's own, a retry's too: the lookup that names a
+/// request's holders asks it for the request's entry in a lent token tree.
 #[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a decision's inputs, the request's maker and the whole decision"
+)]
 fn by_facts<const RETRY: bool>(
     own: &PolicyEngine,
     members: &PoolMembers,
@@ -315,7 +332,8 @@ fn by_facts<const RETRY: bool>(
     live: &records::Live<'_>,
     facts: &mut RequestFacts<'_>,
     cx: &Constraints<'_>,
-    whole: impl WholeDecision,
+    maker: &(impl RequestMaker + ?Sized),
+    mut whole: impl WholeDecision,
 ) -> Decision {
     let spec = &own.spec;
     let (engine, workers) = (spec.engine(), members.workers());
@@ -334,6 +352,7 @@ fn by_facts<const RETRY: bool>(
             workers,
             records.ids(),
             facts,
+            |page| maker.token_key(page),
             |facts| whole.decide(engine, records, workers, live, facts, cx),
         ),
     }
@@ -345,7 +364,9 @@ fn by_facts<const RETRY: bool>(
 /// ([`PoolRecords::tried_engines`]). The key's rows, the whole pass and a
 /// binding's shadow profile so read one list, and the request's own list
 /// stays as its host made it. The decision's instant is written back into
-/// `facts`: the request's lease is dated by it.
+/// `facts`: the request's lease is dated by it. The request's maker goes
+/// with the copy, so a retry is decided inside a lent token tree as a
+/// first attempt is.
 ///
 /// The workers stand in the calling thread's own list ([`TRIED`]), so a
 /// retry allocates nothing once the list has grown. Out of line and cold:
@@ -353,6 +374,10 @@ fn by_facts<const RETRY: bool>(
 /// hold one test of this and nothing else.
 #[cold]
 #[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a decision's inputs, the request's maker and the whole decision"
+)]
 fn retried(
     own: &PolicyEngine,
     members: &PoolMembers,
@@ -360,6 +385,7 @@ fn retried(
     live: &records::Live<'_>,
     facts: &mut RequestFacts<'_>,
     cx: &Constraints<'_>,
+    maker: &(impl RequestMaker + ?Sized),
     whole: impl WholeDecision,
 ) -> Decision {
     let mut tried = TRIED.take();
@@ -368,7 +394,7 @@ fn retried(
         tried: &tried,
         ..*facts
     };
-    let decision = by_facts::<true>(own, members, records, live, &mut widened, cx, whole);
+    let decision = by_facts::<true>(own, members, records, live, &mut widened, cx, maker, whole);
     facts.now_micros = widened.now_micros;
     TRIED.set(tried);
     decision
@@ -493,8 +519,9 @@ pub(super) fn issued(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::{cell::Cell, collections::BTreeSet, sync::Arc, time::Duration};
+    use std::{borrow::Cow, cell::Cell, collections::BTreeSet, sync::Arc, time::Duration};
 
+    use kv_index::{TenantId, TokenTree};
     use parking_lot::Mutex;
     use smg_worker::{
         identity::{basic::Worker, builder::BasicWorkerBuilder},
@@ -511,9 +538,7 @@ pub(crate) mod tests {
         },
         engine::{
             decision::{LiftedVeto, PlacedBy, Target, Targets, MAX_TARGETS},
-            decision_engine::{
-                Decided, DecisionEngine, DecisionRefused, RequestMaker, WorkerLists,
-            },
+            decision_engine::{Decided, DecisionEngine, DecisionRefused, TokenKey, WorkerLists},
             demands::{DemandFacts, Demands},
             framework::{Picker, Place, PoolWord, TieBand, DRAW_FROM},
             prompt_hashes::HashSeeds,
@@ -556,6 +581,72 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// A host that keeps a token tree of the prompts it sent to its workers
+    /// and lends it. It keeps no index of cache events.
+    struct Lends(Arc<TokenTree>);
+
+    impl overlap::CacheIndexes for Lends {
+        fn index(&self, _: &str) -> Option<Arc<dyn overlap::CacheIndex>> {
+            None
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
+            None
+        }
+
+        fn token_tree(&self, _: &str, _: Phase) -> Option<Arc<TokenTree>> {
+            Some(Arc::clone(&self.0))
+        }
+    }
+
+    /// What a lending host's document holds beyond its preset.
+    #[derive(Clone, Copy, Debug)]
+    enum Also {
+        /// Nothing.
+        Nothing,
+        /// The binding names a copy of its profile as its shadow.
+        Shadow,
+        /// The profile costs each worker by a named signal too. No report
+        /// states it, so every worker costs the same.
+        Signal,
+    }
+
+    /// The engine of a preset under a host that lends its token tree, a
+    /// page of sixteen tokens, and the host's tree. `also` is what the
+    /// document holds beyond the preset.
+    fn lent(name: &str, also: Also) -> (PolicyEngine, Arc<TokenTree>) {
+        let mut document = PolicySpec::preset(name).expect("a built-in preset");
+        document.generation = 1;
+        let live = document.bindings[0].profile.clone();
+        let live = live.expect("a binding of one profile");
+        match also {
+            Also::Nothing => {}
+            Also::Shadow => {
+                let twin = document.profiles[&live].clone();
+                document.profiles.insert("twin".into(), twin);
+                document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+            }
+            Also::Signal => {
+                let tokens = serde_json::from_str(r#"{"unit":"tokens"}"#).expect("a signal");
+                document.signals.insert("held".into(), tokens);
+                let cost =
+                    r#"{"least-cost":{"terms":{"signal.held":1},"unreported":"missing-as-zero"}}"#;
+                let profile = document.profiles.get_mut(&live);
+                let profile = profile.expect("the binding's profile");
+                profile
+                    .score
+                    .push(serde_json::from_str(cost).expect("a scorer"));
+            }
+        }
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        let engine = PolicyEngine::new(spec);
+        let tree = Arc::new(TokenTree::with_config(16, Default::default()));
+        engine
+            .affinity()
+            .set_indexes(Arc::new(Lends(Arc::clone(&tree))));
+        (engine, tree)
+    }
+
     pub(crate) fn request<'a>() -> Request<'a> {
         Request {
             id: b"request",
@@ -575,6 +666,10 @@ pub(crate) mod tests {
         pub(crate) members: Option<&'a PoolMembers>,
         pub(crate) loads: Option<Arc<LoadSnapshot>>,
         pub(crate) made: Cell<u32>,
+        /// The token ids the host names as the request's entry in a token
+        /// tree, and how many times the engine asked for the entry.
+        pub(crate) key: Option<&'a [u32]>,
+        pub(crate) keyed: Cell<u32>,
     }
 
     impl<'a> Asks<'a> {
@@ -584,6 +679,8 @@ pub(crate) mod tests {
                 members,
                 loads: None,
                 made: Cell::new(0),
+                key: None,
+                keyed: Cell::new(0),
             }
         }
     }
@@ -608,6 +705,12 @@ pub(crate) mod tests {
 
         fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
             self.loads.as_ref()
+        }
+
+        fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
+            self.keyed.set(self.keyed.get() + 1);
+            let tokens = Cow::Borrowed(self.key?);
+            Some(TokenKey { tokens, marker: 0 })
         }
     }
 
@@ -2127,6 +2230,114 @@ pub(crate) mod tests {
             };
             assert_eq!(placed_by(9), keyed, "a key, ruled: {ruled}");
         }
+    }
+
+    /// A conversation whose host lends its token tree and names its entry
+    /// there goes back to its worker however long it grows, whatever a
+    /// turn's seed: the tree matches the whole prompt. The record of hashed
+    /// prefixes holds a prompt's first 256 blocks, under the share a match
+    /// needs once the prompt is past 13,653 tokens. The host is asked for
+    /// the entry once a decision, and a worker its host took out of the tree
+    /// holds no prompt. A binding that names a shadow is answered the same:
+    /// its live decision is made inside the tree as well. So is a request
+    /// whose profile reads a named signal: the copy that carries its list's
+    /// signal cells is decided inside the tree too.
+    #[test]
+    fn a_long_conversation_goes_back_to_its_worker_by_the_token_tree() {
+        for also in [Also::Nothing, Also::Shadow, Also::Signal] {
+            let (engine, tree) = lent("cache_aware", also);
+            let list = pool(8);
+            let members = engine.pool_members(&list);
+            let sent = |tokens: &[u32], seed: u64| {
+                let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+                let mut asked = request();
+                asked.facts.seed = seed;
+                hashes.write_to(&mut asked.facts);
+                let asks = Asks {
+                    key: Some(tokens),
+                    ..Asks::of(asked, Some(&members))
+                };
+                let decided = decided(&engine, &asks);
+                assert_eq!(asks.keyed.get(), 1, "the entry is asked for once: {also:?}");
+                let pick = decided.decision.pick().expect("a pick");
+                pick.targets.first().expect("a target").position
+            };
+            let mut said: Vec<u32> = (0..16_000).collect();
+            let first = sent(&said, 0);
+            for turn in 1..32 {
+                said.extend(turn * 1_000_000..turn * 1_000_000 + 16);
+                assert_eq!(sent(&said, u64::from(turn)), first, "turn {turn}: {also:?}");
+            }
+            // The tree is the host's to keep. With every worker taken out
+            // of it before a request, the request's seed places it.
+            let moved = (0..32).any(|seed| {
+                for worker in list.iter() {
+                    tree.remove_tenant_all(&TenantId::from(worker.url()));
+                }
+                sent(&said, seed) != first
+            });
+            assert!(moved, "a worker out of the tree holds no prompt: {also:?}");
+        }
+    }
+
+    /// The entry is asked for where the host lends a tree of sent prefixes
+    /// and the profile reads one, and nowhere else. A place one pick decides
+    /// is answered ahead of the whole pass and never asks. A whole pass
+    /// whose profile reads no record of sent prefixes never asks either, and
+    /// neither does a decision whose host lends no tree.
+    #[test]
+    fn a_decision_that_is_lent_no_tree_asks_for_no_entry() {
+        let tokens: Vec<u32> = (0..256).collect();
+        let asked_of = |name: &str, lends: bool| {
+            let engine = if lends {
+                lent(name, Also::Nothing).0
+            } else {
+                preset(name)
+            };
+            let list = pool(4);
+            let members = engine.pool_members(&list);
+            let asks = Asks {
+                key: Some(&tokens),
+                ..Asks::of(request(), Some(&members))
+            };
+            let alone = matches!(answered(&engine, &asks), Decided::Alone(_));
+            (alone, asks.keyed.get())
+        };
+        assert_eq!(asked_of("round_robin", true), (true, 0));
+        assert_eq!(asked_of("least_load", true), (false, 0));
+        assert_eq!(asked_of("cache_aware", true), (false, 1));
+        assert_eq!(asked_of("cache_aware", false), (false, 0));
+    }
+
+    /// A retry over a list where an engine holds several workers is decided
+    /// inside the lent tree as a first attempt is. Its facts are a copy
+    /// that names every worker of the engines it tried, and the copy goes
+    /// to the same lookup with the request's maker: the host is asked for
+    /// the entry once. The tree names the worker the first attempt was
+    /// sent to, and the retry leaves that worker's engine.
+    #[test]
+    fn a_retry_over_ranks_is_decided_inside_the_lent_tree() {
+        let (engine, _tree) = lent("cache_aware", Also::Nothing);
+        let (list, engine_of) = engines(&[2, 2]);
+        let members = engine.pool_members(&list);
+        let tokens: Vec<u32> = (0..256).collect();
+        let sent = |tried: &[WorkerId]| {
+            let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+            let mut asked = request();
+            hashes.write_to(&mut asked.facts);
+            asked.facts.tried = tried;
+            let asks = Asks {
+                key: Some(&tokens),
+                ..Asks::of(asked, Some(&members))
+            };
+            let decided = decided(&engine, &asks);
+            assert_eq!(asks.keyed.get(), 1, "the entry is asked for once");
+            let pick = decided.decision.pick().expect("a pick");
+            pick.targets.first().expect("a target").position as usize
+        };
+        let first = sent(&[]);
+        let again = sent(&[worker_id(list[first].as_ref())]);
+        assert_ne!(engine_of[again], engine_of[first]);
     }
 
     /// What a stage heard of a lease: the word, the worker the lease told

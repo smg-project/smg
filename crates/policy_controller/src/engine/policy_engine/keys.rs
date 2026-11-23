@@ -52,7 +52,12 @@ impl PoolRows for ListRows<'_> {
 /// The decision's instant is written into `facts` here
 /// ([`RequestFacts::now_micros`]), the one `live` was made at.
 ///
+/// Marked for inlining across the crate line: the single decision that
+/// calls it is compiled for its host's maker, in the host's crate. Without
+/// the mark the call stays, 33 instructions a decision.
+///
 /// [`records::decide`]: crate::engine::records::decide
+#[inline]
 pub(super) fn decide(
     engine: &Engine,
     records: &PoolRecords,

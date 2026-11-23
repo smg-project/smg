@@ -520,8 +520,10 @@ fn what_a_shadow_said_names_its_binding_its_kind_and_its_first_target() {
     let word = engine.spec().engine().shadow_for(MODEL, Phase::Single);
     let word = word.expect("the binding's shadow");
     let mut asked = request(7);
+    // The request's maker, which names no entry in a token tree.
+    let maker = Asks::of(asked, Some(&members));
     let now = Instant::now();
-    let (decision, said) = super::decide(&engine, &mut asked, &members, None, now, word);
+    let (decision, said) = super::decide(&engine, &mut asked, &members, &maker, None, now, word);
     // The shadow's picker takes the row behind the live pick's: the live
     // pick's alternate.
     let pick = decision.pick().expect("a pick");

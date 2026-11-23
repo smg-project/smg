@@ -53,7 +53,7 @@ use crate::{
     document::spec::AppliedSpec,
     engine::{
         decision::Decision,
-        decision_engine::Request,
+        decision_engine::{Request, RequestMaker},
         records::{HeldCells, Live},
         shadow::Shadowed,
         view::{Phase, RequestFacts},
@@ -97,11 +97,19 @@ impl PoolMembers {
 /// profile reads none is not decided here ([`PoolMembers::reads_signal`]):
 /// it is decided as its maker made it, and no stage of it holds a signal's
 /// column.
+///
+/// `maker` is the request's own, handed on with the copy: where the
+/// request's host lends a token tree, the copy's decision asks it for the
+/// request's entry there. It is taken as a trait object, so this function
+/// is compiled once, and the copy's decision is no second caller of the
+/// decision a request with no cells takes: as one, it put that decision
+/// out of line for every request.
 #[inline(never)]
 pub(super) fn decide(
     own: &PolicyEngine,
     request: &mut Request<'_>,
     members: &PoolMembers,
+    maker: &dyn RequestMaker,
     loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
     said: &mut Option<Shadowed>,
@@ -117,7 +125,7 @@ pub(super) fn decide(
         },
         ..*request
     };
-    let decision = own.decide_with_loads(&mut lent, members, loads, now, said);
+    let decision = own.decide_with_loads(&mut lent, members, maker, loads, now, said);
     hand_back(request, &lent);
     decision
 }

@@ -30,9 +30,9 @@
 //!   table, the dispatch credit, a pool's turn) moves under an atomic or a
 //!   lock no decision holds across its stages.
 
-#[cfg(feature = "in-process")]
-use std::sync::Arc;
 use std::time::Instant;
+#[cfg(feature = "in-process")]
+use std::{borrow::Cow, fmt, sync::Arc};
 
 #[cfg(feature = "in-process")]
 use smg_worker::load::state::LoadSnapshot;
@@ -118,6 +118,23 @@ pub trait RequestMaker {
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         None
     }
+
+    /// The entry of the request's prompt in the host's token tree of sent
+    /// prefixes ([`CacheIndexes::token_tree`]), as its host names it
+    /// ([`TokenKey`]): `None` from a host that holds no token ids of the
+    /// prompt, and from a maker that does not say. `page` is the tree's
+    /// page in tokens, which the marker of a cache partition fills whole.
+    ///
+    /// Asked at most once a decision, and only where the host lends the
+    /// request's place such a tree: never by a place one pick decides, and
+    /// never by an engine that reads its own rows.
+    ///
+    /// [`CacheIndexes::token_tree`]: crate::engine::CacheIndexes::token_tree
+    #[cfg(feature = "in-process")]
+    fn token_key(&self, page: usize) -> Option<TokenKey<'_>> {
+        let _ = page;
+        None
+    }
 }
 
 impl RequestMaker for Request<'_> {
@@ -197,6 +214,37 @@ pub enum WorkerLists<'a> {
     /// references and that states images only prefers such a decode: it is
     /// decided, and its decode asked again is held to no image fact.
     Encode(super::policy_engine::encode::EncodeLists<'a>),
+}
+
+/// The entry of a request's prompt in its host's token tree of sent
+/// prefixes, named by the request's host ([`RequestMaker::token_key`]).
+///
+/// The naming is the host's, as it is for a prompt's hashes
+/// ([`HashSeeds`]). A host that partitions its workers' caches hands the
+/// prompt's ids behind a marker of the partition, so two partitions part
+/// within the marker, and says how long the marker is. The engine keeps two
+/// partitions apart exactly as well as these ids do.
+///
+/// It is never a field of a request's facts: no stage, trace or kept
+/// sample holds a client's tokens. Its `Debug` prints sizes alone.
+#[cfg(feature = "in-process")]
+pub struct TokenKey<'a> {
+    /// The ids the tree is matched and written by: the prompt's token ids,
+    /// behind the partition's marker where the request has one.
+    pub tokens: Cow<'a, [u32]>,
+    /// How many of the leading ids are the marker and no part of the
+    /// prompt: a match's length has them taken off. Zero with no partition.
+    pub marker: usize,
+}
+
+#[cfg(feature = "in-process")]
+impl fmt::Debug for TokenKey<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenKey")
+            .field("tokens", &self.tokens.len())
+            .field("marker", &self.marker)
+            .finish()
+    }
 }
 
 /// What a guard holds of its decision, lent to its engine for one word

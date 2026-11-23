@@ -44,7 +44,7 @@ use super::{
 };
 use crate::engine::{
     decision::Decision,
-    decision_engine::{DecideOutcome, Request},
+    decision_engine::{DecideOutcome, Request, RequestMaker},
     framework::{Engine, ShadowRows},
     records,
     shadow::{Counted, Shadow, ShadowCounts, Shadowed},
@@ -64,7 +64,7 @@ struct WithShadow<'a> {
 
 impl WholeDecision for WithShadow<'_> {
     fn decide(
-        self,
+        &mut self,
         engine: &Engine,
         records: &records::PoolRecords,
         workers: &[Arc<dyn Worker>],
@@ -125,6 +125,9 @@ impl PolicyEngine {
 /// said beside it where one was due: the whole decision followed by the
 /// shadow profile's ([`WithShadow`]). `binding` is the document's word of
 /// the request's binding ([`Engine::shadow_for`]), as its list keeps it.
+/// `maker` is the request's own, handed on for its entry in a token tree
+/// its host lends ([`single::decide`]): the live answer is the one the
+/// binding would give with no shadow.
 ///
 /// The answer is the live decision's. A request refused ahead of the whole
 /// decision has no shadow decision: no profile decided it. Nothing is
@@ -138,6 +141,7 @@ pub(super) fn decide(
     own: &PolicyEngine,
     request: &mut Request<'_>,
     members: &PoolMembers,
+    maker: &(impl RequestMaker + ?Sized),
     loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
     binding: (u32, ShadowRows),
@@ -147,7 +151,7 @@ pub(super) fn decide(
         binding,
         outcome: &mut outcome,
     };
-    let decision = single::decide(own, request, members, loads, now, whole);
+    let decision = single::decide(own, request, members, maker, loads, now, whole);
     let said = match outcome {
         Shadow::Said(said) => Some(said),
         Shadow::NotDue => None,
