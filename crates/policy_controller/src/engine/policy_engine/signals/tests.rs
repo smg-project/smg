@@ -18,13 +18,17 @@ use smg_worker::{
         builder::BasicWorkerBuilder,
     },
     load::{
-        monitor::{LoadConsumer, WorkerMonitor},
+        monitor::{poll_group_once_for_test, LoadConsumer, WorkerMonitor},
         state::{LoadReceiver, LoadSnapshot},
     },
     model_card::ModelCard,
     test_support::{no_health_check, ready_worker, Members, WorkerRegistry},
-    worker::{NamedValue, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus, WorkerType},
+    worker::{
+        NamedValue, SchedulerLoadSnapshot, WorkerGroupKey, WorkerLoadResponse, WorkerSpec,
+        WorkerStatus, WorkerType,
+    },
 };
+use tokio::{net::TcpListener, task::JoinSet};
 
 use crate::{
     document::spec::{AcrossRanks, AppliedSpec, Needs, PolicySpec, ShadowSpec, SignalSpec},
@@ -306,6 +310,39 @@ fn rank_row(rank: usize) -> Arc<dyn Worker> {
     Arc::new(worker)
 }
 
+/// A ready worker object at `url` that stands for `ranks` ranks: its
+/// registration states that width and no rank of its own.
+fn wide_at(url: &str, ranks: usize) -> Arc<dyn Worker> {
+    let mut spec = WorkerSpec::new(url);
+    spec.dp_size = Some(ranks);
+    let worker = <BasicWorkerBuilder>::from_spec(spec)
+        .worker_type(WorkerType::Regular)
+        .connection_mode(ConnectionMode::Http)
+        .model(ModelCard::new(MODEL))
+        .health_config(no_health_check())
+        .build();
+    worker.set_status(WorkerStatus::Ready);
+    Arc::new(worker)
+}
+
+/// [`wide_at`] the address of the list's place `at`.
+fn wide(at: usize, ranks: usize) -> Arc<dyn Worker> {
+    wide_at(&url(at), ranks)
+}
+
+/// A polled engine at an address of its own, served for as long as the
+/// set that comes with the address is held: its load route answers
+/// `answer`, and it serves no other route.
+async fn polled_engine(answer: &'static str) -> (String, JoinSet<std::io::Result<()>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let url = format!("http://{}", listener.local_addr().expect("its address"));
+    let route = axum::routing::get(move || async move { answer });
+    let routes = axum::Router::new().route("/v1/loads", route);
+    let mut served = JoinSet::new();
+    served.spawn(async move { axum::serve(listener, routes).await });
+    (url, served)
+}
+
 /// The readers of a case's load monitor: the case's decisions, which read
 /// the snapshot it publishes and book nothing through it.
 struct Readers;
@@ -562,22 +599,30 @@ fn a_value_ends_by_its_signals_maximum_age_from_its_own_sample() {
     }
 }
 
-/// A report of several ranks gives no value, whatever the signal declares
-/// across ranks and however the report was made: it states one sample
-/// instant, and its ranks' entries may be of several. Here the first
-/// worker's report lists two ranks, as a polled answer does. The second's
-/// is the report a poll publishes while both its ranks push: the poll's
-/// own version, both ranks' entries, one instant. It counts no rank, as
-/// an answer that leaves its count out does: the ranks it lists alone
-/// say that it is of several. The third's lists one rank and counts two,
-/// as a partial answer does. The fourth's is one rank's whole, and it
-/// alone is read.
+/// A report that lists every rank it counts gives one value, made of its
+/// ranks' values as the signal declares across ranks, however the report
+/// was made. A report short of ranks gives none. Here the first three
+/// workers' objects each stand for two ranks. The first worker's
+/// report lists two ranks, as a polled answer does. The second's is the
+/// report a poll publishes while both its ranks push: the poll's own
+/// version, both ranks' entries. It counts no rank, as an answer that
+/// leaves its count out does, and lists two: it is not short. The third's
+/// lists one rank and counts two, as a partial answer does: the rank it
+/// leaves out states nothing, and no value is made. The fourth's is one
+/// rank's whole.
 #[test]
-fn a_report_of_several_ranks_gives_no_value() {
-    for across in ["sum", "max", "min", "mean"] {
+fn a_whole_report_of_several_ranks_gives_one_value_and_a_short_one_none() {
+    let made = [
+        ("sum", 40.0, 12.0),
+        ("max", 30.0, 7.0),
+        ("min", 10.0, 5.0),
+        ("mean", 20.0, 6.0),
+    ];
+    for (across, listed, published) in made {
         let signal = format!(r#","max_age_ms":500,"across_ranks":"{across}""#);
         let built = built(&reads(&signal, "best"));
-        let list = pool(4);
+        let one = ready_worker(&url(3), MODEL);
+        let list: Arc<[Arc<dyn Worker>]> = [wide(0, 2), wide(1, 2), wide(2, 2), one].into();
         let members = PublishedList::new(Arc::clone(&list));
         let now = Instant::now();
         let merged = WorkerLoadResponse {
@@ -599,10 +644,113 @@ fn a_report_of_several_ranks_gives_no_value() {
         let read = read_at(&built, &asks(7, &members, Some(&loads)), now);
         assert_eq!(
             read,
-            [(0, None), (1, None), (2, None), (3, Some(10.0))],
+            [
+                (0, Some(listed)),
+                (1, Some(published)),
+                (2, None),
+                (3, Some(10.0))
+            ],
             "{across}"
         );
     }
+}
+
+/// A report of several ranks is read where it lists as many ranks as its
+/// worker object stands for: the width the object's registration states,
+/// with no rank of its own. A pushed report counts the rows it holds, so
+/// its own count does not say that a rank is still to report, and every
+/// report here lists each rank it counts. The first worker's object stands
+/// for two ranks and its report lists two: one value, their sum. The
+/// second's states no width and the third's registers a rank of two: each
+/// stands for one rank, and a report of two is not read. The fourth's
+/// stands for two and its report lists three. The fifth's stands for three
+/// and its report lists two. Neither is read. The sixth's stands for two
+/// and its report lists one rank: a report of one row is read as the
+/// worker's whole, whatever its object stands for.
+#[test]
+fn a_report_of_several_ranks_is_read_of_the_object_that_stands_for_as_many() {
+    let built = built(&reads(r#","across_ranks":"sum""#, "best"));
+    let list: Arc<[Arc<dyn Worker>]> = [
+        wide(0, 2),
+        ready_worker(&url(1), MODEL),
+        rank_row(1),
+        wide(3, 2),
+        wide(4, 3),
+        wide(5, 2),
+    ]
+    .into();
+    let members = PublishedList::new(Arc::clone(&list));
+    let two = || ranks(vec![held(10.0), held(30.0)]);
+    let three = ranks(vec![held(1.0), held(2.0), held(4.0)]);
+    let stated = [two(), two(), two(), three, two(), report(held(9.0))];
+    let reports = list.iter().map(|worker| worker.url().to_owned());
+    let loads = LoadSnapshot::from_loads_for_test(reports.zip(stated).collect());
+    let read = read_at(&built, &asks(7, &members, Some(&loads)), Instant::now());
+    let whole = [Some(40.0), None, None, None, None, Some(9.0)];
+    assert_eq!(read, (0..).zip(whole).collect::<Vec<_>>());
+}
+
+/// What a polled engine of three ranks answers on its load route: each
+/// rank states `held` in tokens.
+const THREE_RANKS: &str = r#"{"dp_rank_count":3,"loads":[
+    {"dp_rank":0,"values":[{"name":"held","unit":"tokens","value":5.0}]},
+    {"dp_rank":1,"values":[{"name":"held","unit":"tokens","value":7.0}]},
+    {"dp_rank":2,"values":[{"name":"held","unit":"tokens","value":9.0}]}]}"#;
+
+/// A worker object that stands for three ranks, two of which push their
+/// load, through the worker crate's own monitor. The monitor's file of
+/// pushed records counts the two rows it holds, and no value is made of
+/// them: the object stands for three. Then the two ranks go quiet and the
+/// monitor polls the engine, whose answer lists all three ranks: the
+/// poll's report reads one value, their sum. The poll adds no rank to the
+/// file, so the worker's next pushed record publishes two rows under a
+/// count of two again, and again no value is read. Read by the report's
+/// own count alone, those two rows would stand for the whole worker.
+#[tokio::test]
+async fn a_pushed_report_short_of_its_objects_ranks_gives_no_value_behind_a_whole_poll() {
+    const INTERVAL: Duration = Duration::from_secs(10);
+    let built = built(&reads(r#","across_ranks":"sum""#, "best"));
+    let (engine, _served) = polled_engine(THREE_RANKS).await;
+    let list: Arc<[Arc<dyn Worker>]> = [wide_at(&engine, 3)].into();
+    let members = PublishedList::new(Arc::clone(&list));
+    let (monitor, channel) = monitor_over(&list);
+    let stated = |loads: &LoadSnapshot| {
+        let report = loads.get(&engine).expect("the worker's report");
+        (report.loads.len(), report.dp_rank_count)
+    };
+    let read = |loads: &Arc<LoadSnapshot>, now| {
+        let read = read_at(&built, &asks(7, &members, Some(loads)), now);
+        read.first().expect("the one worker").1
+    };
+    // The two ranks' records are an interval old at the tick, so the tick
+    // polls the worker.
+    let tick = Instant::now();
+    let pushed_at = tick.checked_sub(INTERVAL).expect("an older clock");
+    monitor.apply_pushed_load(&list[0], 0, &pushes(50.0), pushed_at);
+    monitor.apply_pushed_load(&list[0], 1, &pushes(70.0), pushed_at);
+    let pushed = published(&monitor, &channel);
+    assert_eq!(stated(&pushed), (2, 2), "the file counts the rows it holds");
+    assert_eq!(read(&pushed, pushed_at), None, "two rows of three ranks");
+
+    let group = WorkerGroupKey {
+        model_id: MODEL.into(),
+        worker_type: WorkerType::Regular,
+        connection_mode: ConnectionMode::Http,
+    };
+    poll_group_once_for_test(&monitor, &group, INTERVAL, tick).await;
+    let polled = Arc::clone(&channel.borrow());
+    assert_eq!(stated(&polled), (3, 3), "the poll's answer, whole");
+    assert_eq!(read(&polled, tick), Some(21.0), "the three ranks' sum");
+
+    let next = tick + Duration::from_millis(1);
+    monitor.apply_pushed_load(&list[0], 0, &pushes(60.0), next);
+    let pushed = published(&monitor, &channel);
+    assert_eq!(
+        stated(&pushed),
+        (2, 2),
+        "the poll added no rank to the file"
+    );
+    assert_eq!(read(&pushed, next), None, "two rows of three ranks again");
 }
 
 /// The two token counts a report offers by name are read with no list of
@@ -1009,17 +1157,20 @@ async fn a_pushing_workers_token_counts_are_read_behind_a_record_that_leaves_the
 }
 
 /// A worker object that stands for several ranks and pushes its load gives
-/// no named value. Its report lists each rank at that rank's latest record
-/// under the newest record's instant, so it is not one sample. The first
-/// worker here pushes over two ranks and the second over one, through the
-/// worker crate's own monitor, whose report is the one read. Then the
-/// first worker's second rank stops reporting. Read as one sample two
-/// seconds on, its last value would stand as new under a maximum age of
-/// one second: the row's value, as the largest of the ranks'.
+/// one value of its ranks', each rank read at its own sample. Its report
+/// lists each rank at that rank's latest record, and each entry states its
+/// own sample instant. The first worker here stands for two ranks and
+/// pushes over both, and the second pushes over its one, through the
+/// worker crate's own monitor, whose report
+/// is the one read: the first reads the larger of its two ranks' values.
+/// Then the first worker's second rank stops reporting. Two seconds on,
+/// under a maximum age of one second, that rank's last value has ended and
+/// the worker's value with it. Read under the report's one instant, the
+/// newest record's, the stopped rank's value would stand as new.
 #[tokio::test]
-async fn a_worker_that_pushes_over_several_ranks_gives_no_value() {
+async fn a_worker_that_pushes_over_several_ranks_gives_one_value_until_a_rank_stops() {
     let built = built(&reads(r#","max_age_ms":1000,"across_ranks":"max""#, "best"));
-    let list = pool(2);
+    let list: Arc<[Arc<dyn Worker>]> = [wide(0, 2), ready_worker(&url(1), MODEL)].into();
     let members = PublishedList::new(Arc::clone(&list));
     let (monitor, channel) = monitor_over(&list);
     let start = Instant::now();
@@ -1031,7 +1182,7 @@ async fn a_worker_that_pushes_over_several_ranks_gives_no_value() {
     let listed = [0, 1].map(|at| loads.get(&url(at)).map(ranks));
     assert_eq!(listed, [Some(2), Some(1)]);
     let read = read_at(&built, &asks(7, &members, Some(&loads)), start);
-    assert_eq!(read, [(0, None), (1, Some(9.0))]);
+    assert_eq!(read, [(0, Some(7.0)), (1, Some(9.0))]);
 
     let later = start + Duration::from_secs(2);
     monitor.apply_pushed_load(&list[0], 0, &pushes(6.0), later);

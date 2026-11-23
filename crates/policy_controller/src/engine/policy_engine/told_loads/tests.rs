@@ -19,7 +19,9 @@ use smg_worker::{
     model_card::ModelCard,
     registry::{event::WorkerEvent, WorkerId as ObjectId},
     test_support::{no_health_check, ready_worker, WorkerRegistry},
-    worker::{NamedValue, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus, WorkerType},
+    worker::{
+        NamedValue, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerSpec, WorkerStatus, WorkerType,
+    },
 };
 use tokio::{
     sync::broadcast::{self, Receiver},
@@ -247,6 +249,20 @@ fn registry(workers: usize) -> Arc<WorkerRegistry> {
         registered.expect("a free address");
     }
     registry
+}
+
+/// A ready worker object at `url(at)` that stands for `ranks` ranks: its
+/// registration states that width and no rank of its own.
+fn wide(at: usize, ranks: usize) -> Arc<dyn Worker> {
+    let mut spec = WorkerSpec::new(url(at));
+    spec.dp_size = Some(ranks);
+    let worker = <BasicWorkerBuilder>::from_spec(spec)
+        .worker_type(WorkerType::Regular)
+        .model(ModelCard::new(MODEL))
+        .health_config(no_health_check())
+        .build();
+    worker.set_status(WorkerStatus::Ready);
+    Arc::new(worker)
 }
 
 /// The instant of the sample numbered `step`: a millisecond a step from one
@@ -1078,15 +1094,27 @@ fn named(name: &str, unit: &str, value: f64, age_ms: Option<u32>) -> NamedValue 
 /// second signal ends a millisecond old at a decision. A name a report
 /// does not state reads none, whatever the report told ahead of it stated.
 /// A value under another unit than the signal's reads none, and so does
-/// one out of range. A report of two ranks states no named value at all.
-/// Each told value is the cell the list's own cells hold of the same
-/// report.
+/// one out of range. A report of two ranks states one value a name where
+/// its worker object stands for two ranks, as the fifth's does: its ranks'
+/// values made one as the signal declares, here their sum, under the
+/// report's sample, since neither entry states one of its own. A report
+/// that lists one rank and counts two states no named value at all. Nor
+/// does the seventh's, a report of two ranks whose worker object states
+/// no width. Each told value is the cell the list's own cells hold of the
+/// same report.
 #[tokio::test(start_paused = true)]
 async fn a_stage_that_keeps_a_column_is_told_what_each_report_states_under_it() {
     let (engine, heard) = keeping_named();
-    let registry = registry(5);
+    let registry = registry(4);
+    for worker in [
+        wide(4, 2),
+        ready_worker(&url(5), MODEL),
+        ready_worker(&url(6), MODEL),
+    ] {
+        registry.register(worker).expect("a free address");
+    }
     engine.set_registry(Arc::clone(&registry) as Arc<dyn Members>);
-    let mut stated = reports(&[1, 2, 3, 4, 5], 0);
+    let mut stated = reports(&[1, 2, 3, 4, 5, 6, 7], 0);
     let mut state = |at: usize, values: Vec<NamedValue>| {
         let report = stated.get_mut(&url(at)).expect("the worker's report");
         report.loads[0].values = values;
@@ -1098,16 +1126,26 @@ async fn a_stage_that_keeps_a_column_is_told_what_each_report_states_under_it() 
     let far = named("queue", "ms", 1e16, None);
     state(3, vec![named("held", "bytes", 1.0, None), far]);
     state(4, vec![named("held", "tokens", 2.0, None)]);
-    let fifth = stated.get_mut(&url(4)).expect("the fifth report");
-    let mut rank = fifth.loads[0].clone();
-    rank.dp_rank = 1;
-    fifth.loads.push(rank);
-    fifth.dp_rank_count = 2;
+    state(5, vec![named("held", "tokens", 6.0, None)]);
+    state(6, vec![named("held", "tokens", 8.0, None)]);
+    // The fifth and the seventh list two ranks, each stating the same.
+    for at in [4, 6] {
+        let report = stated.get_mut(&url(at)).expect("the worker's report");
+        let mut rank = report.loads[0].clone();
+        rank.dp_rank = 1;
+        report.loads.push(rank);
+        report.dp_rank_count = 2;
+    }
+    // The sixth lists its one rank and counts two.
+    stated
+        .get_mut(&url(5))
+        .expect("the sixth report")
+        .dp_rank_count = 2;
     let (_feed, channel) = monitor(&stated);
     engine.set_loads(channel);
     let task = running(&engine).await;
 
-    let ids: Vec<WorkerId> = (0..5).map(id).collect();
+    let ids: Vec<WorkerId> = (0..7).map(id).collect();
     let place = |worker: WorkerId| ids.iter().position(|id| *id == worker);
     let mut told = std::mem::take(&mut *heard.lock());
     told.sort_by_key(|word| place(word.0));
@@ -1121,12 +1159,14 @@ async fn a_stage_that_keeps_a_column_is_told_what_each_report_states_under_it() 
         (ids[1], false, [None, Some((9.0, at(2)))]),
         (ids[2], false, [Some((11.0, at(3))), None]),
         (ids[3], false, [None, None]),
-        (ids[4], true, [None, None]),
+        (ids[4], false, [Some((4.0, at(5))), None]),
+        (ids[5], true, [None, None]),
+        (ids[6], true, [None, None]),
     ];
     assert_eq!(told, whole, "each report's own values, by their columns");
 
     let worker = |at: usize| registry.get_by_url(&url(at)).expect("a worker");
-    let list: Arc<[Arc<dyn Worker>]> = (0..5).map(worker).collect();
+    let list: Arc<[Arc<dyn Worker>]> = (0..7).map(worker).collect();
     let snapshot = at_hand(&engine).expect("the snapshot at hand");
     let (spec, clock) = (engine.spec(), engine.clock());
     let live = Live::at(spec.engine(), clock, Instant::now(), Some(&snapshot), None);

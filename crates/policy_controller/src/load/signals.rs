@@ -223,8 +223,8 @@ pub struct ReportSignals<'a>(&'a [SignalCell]);
 impl<'a> ReportSignals<'a> {
     /// No named value: every column reads none. A report states it under
     /// a document none of whose stages keeps a signal's column, and so
-    /// does a report of several ranks. A host that states no named value
-    /// tells every report with it.
+    /// does a report that is not the whole of its worker object. A host
+    /// that states no named value tells every report with it.
     pub const NONE: Self = Self(&[]);
 
     /// The values in `cells`: one cell a signal the document declares, in

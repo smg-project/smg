@@ -303,7 +303,7 @@ pub enum Signal<'a> {
         /// states none, as the policy store does. The in-process engine
         /// states them under a document a stage of which keeps a signal's
         /// column, as its lists' cells state them, and none of a report
-        /// of several ranks.
+        /// that is not the whole of its worker object.
         signals: ReportSignals<'a>,
     },
     Health {
