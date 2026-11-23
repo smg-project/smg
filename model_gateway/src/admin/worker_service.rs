@@ -37,7 +37,10 @@ use crate::{
         CircuitBreakerConfig, RouterConfig,
     },
     routers::{common::snapshot::WorkerRegistry, provider_support},
-    workflow::{job_queue::cancel_registration, Job, JobQueue, WorkerRegistrationMode},
+    workflow::{
+        job_queue::{add_worker_in_flight, cancel_registration},
+        Job, JobQueue, WorkerRegistrationMode,
+    },
 };
 
 /// Validate the URL of an incoming worker-management request, translating a
@@ -688,11 +691,38 @@ impl WorkerService {
         // A URL with a worker behind its mapping is a 409. A worker its
         // removal is draining holds the URL for the drain window; that answer
         // says so and when to retry, instead of offering a PUT or a PATCH of
-        // a worker that is leaving.
-        let live = self
+        // a worker that is leaving. A data-parallel group stands under its
+        // rank URLs, none under the id its POST answered: a rank that stays
+        // answers for the group, else the rank whose drain its removal waits
+        // for, the longest. Not while a registration of the URL is in flight:
+        // its id may never reach the ranks found (ranks registered at startup
+        // fail it, and its end releases the id). That POST is told to poll
+        // here, not at the claim below: a registration that ended before the
+        // claim would have this POST admitted over the ranks it registered.
+        let live = match self
             .worker_registry
             .get_id_by_url_or_reservation(&worker_url)
-            .and_then(|id| self.worker_registry.get(&id).map(|worker| (id, worker)));
+        {
+            Some(id) => match self.worker_registry.get(&id) {
+                Some(worker) => Some((id, worker)),
+                None if add_worker_in_flight(queue, &worker_url) => {
+                    return Err(WorkerServiceError::CreateInProgress {
+                        url: worker_url,
+                        worker_id: Some(id),
+                    });
+                }
+                None => find_workers_by_url(&self.worker_registry, &worker_url)
+                    .into_iter()
+                    .max_by_key(|rank| {
+                        (
+                            rank.status() != WorkerStatus::Draining,
+                            rank.metadata().health_config.drain_settle_secs,
+                        )
+                    })
+                    .map(|rank| (id, rank)),
+            },
+            None => None,
+        };
         if let Some((worker_id, existing)) = live {
             return Err(if existing.status() == WorkerStatus::Draining {
                 WorkerServiceError::RemovalInProgress {
@@ -1808,6 +1838,80 @@ mod tests {
             rebuilt.status(),
             WorkerStatus::Draining,
             "the activation of a PUT superseded since leaves its successor's status alone"
+        );
+    }
+
+    /// A registered data-parallel group stands under its rank URLs, none
+    /// under the id its `POST` answered. A second `POST` of its address is
+    /// refused with that id while a rank stays, and as a removal with the
+    /// longest drain once every rank is leaving. A registration of the
+    /// address in flight is still the answer to poll.
+    #[tokio::test]
+    async fn create_worker_refuses_the_address_of_a_registered_data_parallel_group() {
+        use openai_protocol::worker::HealthCheckConfig;
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let queue = Arc::new(std::sync::OnceLock::new());
+        queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                std::sync::Weak::new(),
+            ))
+            .ok();
+        let service = WorkerService::new(Arc::clone(&registry), queue, RouterConfig::default());
+        let url = "grpc://10.0.0.9:8000";
+        let id = registry.reserve_id_for_url(url);
+        for (rank, drain_settle_secs) in [3, 9].into_iter().enumerate() {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("m"))
+                .health_config(HealthCheckConfig {
+                    drain_settle_secs,
+                    ..Default::default()
+                })
+                .dp_config(rank, 2)
+                .build();
+            registry
+                .register(Arc::new(worker))
+                .expect("a rank registers");
+        }
+        let ranks = find_workers_by_url(&registry, url);
+
+        ranks[0].set_status(WorkerStatus::Draining);
+        let err = service
+            .create_worker(worker_spec(url))
+            .await
+            .expect_err("the rank that stays holds the address");
+        assert!(
+            matches!(&err, WorkerServiceError::Conflict { worker_id, .. } if *worker_id == id),
+            "the refusal of a registered worker, with the id of the first POST: {err}"
+        );
+
+        ranks[1].set_status(WorkerStatus::Draining);
+        let err = service
+            .create_worker(worker_spec(url))
+            .await
+            .expect_err("the draining ranks hold the address");
+        assert!(
+            matches!(
+                &err,
+                WorkerServiceError::RemovalInProgress { worker_id, drain_secs: 9, .. }
+                    if *worker_id == id
+            ),
+            "a group whose every rank is leaving is being removed, for its longest drain: {err}"
+        );
+
+        assert!(service
+            .get_job_queue()
+            .expect("the queue is set")
+            .claim_if_idle(&registration(url)));
+        let err = service
+            .create_worker(worker_spec(url))
+            .await
+            .expect_err("a registration in flight holds the address");
+        assert!(
+            matches!(&err, WorkerServiceError::CreateInProgress { worker_id: Some(in_flight), .. } if *in_flight == id),
+            "a registration in flight answers with its id to poll, not for the ranks: {err}"
         );
     }
 

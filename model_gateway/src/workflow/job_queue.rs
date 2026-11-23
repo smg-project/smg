@@ -324,7 +324,7 @@ pub(crate) async fn cancel_registration(
 
 /// Whether the status entry under `url` is a registration job that has
 /// not ended: queued, or running (the type name of [`Job::job_type`]).
-fn add_worker_in_flight(queue: &JobQueue, url: &str) -> bool {
+pub(crate) fn add_worker_in_flight(queue: &JobQueue, url: &str) -> bool {
     queue.get_status(url).is_some_and(|status| {
         status.job_type == Job::REGISTRATION_TYPE
             && matches!(status.status.as_str(), "pending" | "processing")
