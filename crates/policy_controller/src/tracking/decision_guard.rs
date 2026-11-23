@@ -62,6 +62,8 @@
 //! the field as false: the controller issues both sides at the first ask, and
 //! [`DecisionGuard::decide_decode`] answers that the side was not chosen.
 
+#[cfg(feature = "in-process")]
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::{
     fmt,
     ops::Deref,
@@ -480,6 +482,12 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     /// by no other door: a door that keeps a file of leases answers a
     /// second ask by its file.
     ///
+    /// What `sendable` asks can panic, a route's own rule among it. The
+    /// side the call issued is then released by the same name, the handle
+    /// stands as it stood before the call, and the panic goes on to the
+    /// caller: a walk leaves no lease behind, and its host may still send
+    /// the first decision's decode or ask again.
+    ///
     /// # Errors
     ///
     /// As [`Self::decide_decode`].
@@ -500,7 +508,10 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
             return Ok(asked);
         }
         let pick = self.decided.decision.pick();
-        let first = pick.and_then(|pick| pick.targets.iter().position(&mut sendable));
+        let walked = catch_unwind(AssertUnwindSafe(|| {
+            pick.and_then(|pick| pick.targets.iter().position(&mut sendable))
+        }));
+        let first = walked.as_ref().map_or(None, |first| *first);
         if first.and_then(|index| self.take_decode(index)).is_some() {
             return Ok(None);
         }
@@ -509,7 +520,10 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         (self.decided.decision, self.decided.lease) = (decision, lease);
         (self.decided.decode_session, self.stated, self.index) = before;
         (self.target, self.decode) = (target, chosen);
-        Ok(Some(unsent))
+        match walked {
+            Ok(_) => Ok(Some(unsent)),
+            Err(panic) => resume_unwind(panic),
+        }
     }
 
     /// Whether the pair's decode side stands chosen: its request stated a

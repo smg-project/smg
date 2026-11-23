@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::{
-    engine::{decision_engine::DecodeRefused, policy_engine::encode::EncodeLists},
+    engine::{decision_engine::DecodeRefused, policy_engine::encode::EncodeLists, view::Session},
     tracking::lease::TransportClass,
 };
 
@@ -56,27 +56,28 @@ fn untaken(lists: &Lists, placement: &mut Placement<'_>, request: &PlaceRequest<
 }
 
 /// A picker that names every worker the filters keep, in the list's order,
-/// and keeps the size each issue and each release of a lease states.
+/// and keeps what each issue and each release of a lease states, as its
+/// reader takes it from the lease: a size, or a side with its session.
 #[derive(Debug)]
-struct Sizes(Arc<Mutex<Vec<(&'static str, u32)>>>);
+struct Stated<T>(Arc<Mutex<Vec<(&'static str, T)>>>, fn(&Lease) -> T);
 
-impl Lifecycle for Sizes {
+impl<T: fmt::Debug + Send> Lifecycle for Stated<T> {
     fn hears(&self) -> EventSet {
         EventSet::LEASE
     }
 
     fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
-        self.0.lock().push(("issued", lease.tokens));
+        self.0.lock().push(("issued", (self.1)(lease)));
     }
 
     fn on_released(&self, lease: &Lease, _: ReleaseReason) {
-        self.0.lock().push(("released", lease.tokens));
+        self.0.lock().push(("released", (self.1)(lease)));
     }
 }
 
-impl Picker for Sizes {
+impl<T: fmt::Debug + Send> Picker for Stated<T> {
     fn name(&self) -> &'static str {
-        "sizes"
+        "stated"
     }
 
     fn pick(
@@ -259,7 +260,8 @@ fn a_decode_call_that_takes_no_decode_leaves_the_first_calls_size_stated() {
     let sizes = Arc::new(Mutex::new(Vec::new()));
     let kept = Arc::clone(&sizes);
     let mut stages = StageRegistry::builtin();
-    let added = stages.picker("sizes", move || Box::new(Sizes(Arc::clone(&kept))));
+    let size = |lease: &Lease| lease.tokens;
+    let added = stages.picker("stated", move || Box::new(Stated(Arc::clone(&kept), size)));
     added.expect("a free name");
     let mut document = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
     document.generation = 1;
@@ -270,7 +272,7 @@ fn a_decode_call_that_takes_no_decode_leaves_the_first_calls_size_stated() {
         let healthy = FilterSpec::Name("healthy".to_owned());
         profile.filter.retain(|filter| *filter != healthy);
         if name == "decode" {
-            profile.pick = "sizes".into();
+            profile.pick = "stated".into();
         }
     }
     let spec = AppliedSpec::validate_in(&document, &stages, &[]);
@@ -300,6 +302,202 @@ fn a_decode_call_that_takes_no_decode_leaves_the_first_calls_size_stated() {
             ("released", 64),
             ("issued", 8)
         ]
+    );
+}
+
+/// A decode call that takes no decode puts back the session the decode
+/// side's words state, as it puts back their size. A request's own id is
+/// its routing value here, so the call issues its side under the session
+/// its own request states, and gives it up under that session. The first
+/// decision's decode, sent behind it, is issued under the first call's
+/// session again.
+#[test]
+fn a_decode_call_that_takes_no_decode_leaves_the_first_calls_session_stated() {
+    let sessions = Arc::new(Mutex::new(Vec::new()));
+    let kept = Arc::clone(&sessions);
+    let mut stages = StageRegistry::builtin();
+    let session = |lease: &Lease| (lease.side, lease.session);
+    let added = stages.picker("stated", move || {
+        Box::new(Stated(Arc::clone(&kept), session))
+    });
+    added.expect("a free name");
+    let mut document = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
+    document.generation = 1;
+    document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+    let rid = KeySourceSpec {
+        rid: true,
+        ..KeySourceSpec::default()
+    };
+    document.bindings[0].routing_key = Some(RoutingKeySpec {
+        sources: vec![rid],
+        strip_lineage: false,
+    });
+    // A decode that is not ready stays a candidate of the decision. The
+    // decode side's picker hears every word of the pair's lease.
+    for (name, profile) in &mut document.profiles {
+        let healthy = FilterSpec::Name("healthy".to_owned());
+        profile.filter.retain(|filter| *filter != healthy);
+        if name == "decode" {
+            profile.pick = "stated".into();
+        }
+    }
+    let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+    let engine = hosted(PolicyEngine::new(spec.expect("the stages hold the picker")));
+
+    let lists = Lists::of(1, 1);
+    let classes = lists.every();
+    let keyed = |id: &'static str| PlaceRequest {
+        request_id: Some(id),
+        ..later(lists.under(&classes, &Open))
+    };
+    // The decode side's words among the ones heard from `from` on.
+    let of_the_decode = |from: usize| -> Vec<(&'static str, Session)> {
+        let heard = sessions.lock();
+        let decode = heard[from..]
+            .iter()
+            .filter(|(_, stated)| stated.0 == Side::Decode);
+        decode
+            .map(|&(word, (_, session))| (word, session))
+            .collect()
+    };
+    // The session a request's decode side states where its first
+    // decision's decode is sent with no decode call.
+    let stated = |id: &'static str| {
+        let from = sessions.lock().len();
+        let mut placement = engine.place(&keyed(id)).expect("a placement");
+        placement.sent(Side::Prefill);
+        placement.sent(Side::Decode);
+        let words = of_the_decode(from);
+        let [("issued", session)] = words[..] else {
+            panic!("one issue of the decode side: {words:?}");
+        };
+        session
+    };
+    let (first, second) = (stated("first"), stated("second"));
+    assert_ne!(first, Session::NONE, "a keyed request states a session");
+    assert_ne!(first, second, "each request its own session");
+
+    let from = sessions.lock().len();
+    let mut placement = engine.place(&keyed("first")).expect("a placement");
+    placement.sent(Side::Prefill);
+    lists.decodes[0].set_status(WorkerStatus::NotReady);
+    let answer = untaken(&lists, &mut placement, &keyed("second"));
+    assert_eq!(answer, Unplaced::NoWorkers);
+    lists.decodes[0].set_status(WorkerStatus::Ready);
+    placement.sent(Side::Decode);
+    assert_eq!(
+        of_the_decode(from),
+        [("issued", second), ("released", second), ("issued", first)]
+    );
+}
+
+/// A route's rule that panics as a decode decided again asks it of a
+/// decode passes its panic to the call's caller, and the side the call
+/// issued is given up by name as the panic passes, once. The placement
+/// stands as it stood before the call, on the first decision's decode,
+/// still chosen. Asked again under a rule that holds, it takes a decode.
+/// Dropped behind the panic, it says its prefill's end and nothing of a
+/// decode that was booked nowhere.
+#[test]
+fn a_rule_that_panics_inside_a_decode_decided_again_loses_no_lease() {
+    let (engine, heard) = asked_again();
+    let lists = Lists::of(1, 1);
+    let classes = lists.every();
+    let fails = Cell::new(false);
+    let admits = |_: &dyn Worker| -> bool {
+        assert!(!fails.get(), "the route's rule failed");
+        true
+    };
+    let request = PlaceRequest {
+        admits: Some(&admits),
+        ..later(lists.under(&classes, &Open))
+    };
+    let (prefill, decode) = (lists.prefill_id(0), lists.decode_id(0));
+    // A placement whose decode call met the rule's panic. What its caller
+    // reads of it is read ahead of the call and behind it, and stands.
+    let met = || {
+        let from = said(&heard).len();
+        let mut placement = engine.place(&request).expect("a placement");
+        placement.sent(Side::Prefill);
+        let read = |placement: &Placement<'_>| {
+            let ids = (placement.id(), placement.decode_id());
+            let shown = format!("{placement:?}");
+            (lists.places(placement), ids, placement.owes_events(), shown)
+        };
+        let before = read(&placement);
+        fails.set(true);
+        let asked = catch_unwind(AssertUnwindSafe(|| {
+            placement.decode_again(&request).is_ok()
+        }));
+        fails.set(false);
+        assert!(asked.is_err(), "the rule's panic reaches the caller");
+        assert_eq!(read(&placement), before, "the placement stands as it stood");
+        assert_eq!(
+            said(&heard)[from..],
+            [
+                word("issued at 0", prefill),
+                word("dispatched at 0", prefill),
+                word("issued at 0", decode),
+                word("released CommitFailed", decode),
+            ]
+        );
+        placement
+    };
+
+    // Asked again under a rule that holds: the call is not refused.
+    let mut asked = met();
+    let from = said(&heard).len();
+    assert_eq!(asked.decode_again(&request), Ok(()));
+    asked.sent(Side::Decode);
+    asked.ended(Side::Prefill, SERVED);
+    asked.ended(Side::Decode, SERVED);
+    assert!(!asked.owes_events());
+    assert_eq!(
+        said(&heard)[from..],
+        [
+            word("issued at 0", decode),
+            word("dispatched at 0", decode),
+            word("completed Ok", prefill),
+            word("completed Ok", decode),
+        ]
+    );
+    drop(asked);
+
+    // Dropped behind the panic: the prefill's end as cancelled, and
+    // nothing of a decode that stands chosen.
+    let dropped = met();
+    let from = said(&heard).len();
+    drop(dropped);
+    assert_eq!(said(&heard)[from..], [word("completed Cancelled", prefill)]);
+    assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+}
+
+/// A decode's decision that panics does not reach the call's caller: the
+/// engine holds the panic, counts it and refuses the call. Nothing was
+/// issued for it, so the stages hear nothing, and the first decision's
+/// decode still stands chosen.
+#[test]
+fn a_decode_decision_that_panics_is_refused_and_leaves_the_first_decode_chosen() {
+    let (engine, heard) = asked_again();
+    let lists = Lists::of(1, 1);
+    let classes = lists.every();
+    let request = later(lists.under(&classes, &Open));
+    let mut placement = engine.place(&request).expect("a placement");
+    placement.sent(Side::Prefill);
+    let at_send = said(&heard);
+
+    let failing = Gates(|_| true, |_| panic!("the caller's admission failed"));
+    let again = later(lists.under(&classes, &failing));
+    let answer = untaken(&lists, &mut placement, &again);
+    assert_eq!(answer, Unplaced::Refused(DecisionRefused::Faulted));
+    assert_eq!(engine.faults(), 1);
+    assert_eq!(said(&heard), at_send, "a refused call issues nothing");
+
+    placement.sent(Side::Decode);
+    let decode = lists.decode_id(0);
+    assert_eq!(
+        said(&heard)[at_send.len()..],
+        [word("issued at 0", decode), word("dispatched at 0", decode)]
     );
 }
 
