@@ -51,6 +51,13 @@
 //! 4. Atomically clear stale entries for the group from the watch
 //!    channel and merge in the fresh loads.
 //!
+//! A group's interval is the smallest its workers state for themselves, in
+//! whole seconds, and the monitor's own where none states one
+//! ([`WorkerMonitor::with_interval`]). It is never under
+//! [`LEAST_POLL_INTERVAL`]. A tick that a slow poll overran is skipped: the
+//! loop polls once when that poll returns, and next on the interval's own
+//! beat.
+//!
 //! ## The port
 //!
 //! What a pushed record or a poll's answer means for routing crosses the
@@ -76,6 +83,7 @@ use rustc_hash::FxHashMap;
 use tokio::{
     sync::{broadcast, Notify},
     task::JoinHandle,
+    time::MissedTickBehavior,
 };
 use tracing::{debug, info, warn};
 
@@ -673,6 +681,24 @@ impl<G: Generation> WorkerMonitor<G> {
             #[cfg(test)]
             classic: None,
         }
+    }
+
+    /// The monitor's own interval as a duration: what a group polls at where
+    /// none of its workers states an interval for itself. [`Self::new`] and
+    /// [`Self::with_sink`] take it in whole seconds, raised to one. This
+    /// takes any duration and raises one under [`LEAST_POLL_INTERVAL`] to
+    /// it. It takes the monitor by value: the interval is said before the
+    /// monitor is shared and its loops start.
+    #[must_use]
+    pub fn with_interval(mut self, interval: Duration) -> Self {
+        self.default_interval = interval.max(LEAST_POLL_INTERVAL);
+        self
+    }
+
+    /// The monitor's own interval: what a group polls at where none of its
+    /// workers states one for itself.
+    pub fn interval(&self) -> Duration {
+        self.default_interval
     }
 
     /// A load record pushed on a worker's KV-event stream (`KvEventBatch.load`,
@@ -2337,12 +2363,19 @@ fn group_keys_for_worker(worker: &Arc<dyn Worker>) -> Vec<WorkerGroupKey> {
         .collect()
 }
 
+/// The least interval a group polls at. A tick asks every polled engine of
+/// the group for its load and publishes one snapshot, so at this interval
+/// an engine is asked ten times a second. A load that has to be newer than
+/// that is pushed on the worker's event stream.
+pub const LEAST_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Compute the polling interval for a group from per-worker overrides.
 ///
 /// Uses the smallest `load_monitor_interval_secs` across the group so
-/// the fastest worker's polling cadence wins. Falls back to
-/// `default_interval` when no worker sets an override. Always floored
-/// to one second to prevent tight-loop DoS.
+/// the fastest worker's polling cadence wins: a worker's override is whole
+/// seconds, raised to one. Falls back to `default_interval` when no worker
+/// sets an override. Always floored to [`LEAST_POLL_INTERVAL`] to prevent
+/// tight-loop DoS.
 fn group_interval(workers: &[Arc<dyn Worker>], default_interval: Duration) -> Duration {
     let override_secs = workers
         .iter()
@@ -2352,7 +2385,7 @@ fn group_interval(workers: &[Arc<dyn Worker>], default_interval: Duration) -> Du
     let interval = override_secs
         .map(|s| Duration::from_secs(s.max(1)))
         .unwrap_or(default_interval);
-    interval.max(Duration::from_secs(1))
+    interval.max(LEAST_POLL_INTERVAL)
 }
 
 /// Background event handler. Lives as long as the `WorkerMonitor`.
@@ -2483,6 +2516,11 @@ async fn group_monitor_loop<G: Generation>(
     interval: Duration,
 ) {
     let mut interval_timer = tokio::time::interval(interval);
+    // A tick that a poll overran is skipped. The timer's own default fires
+    // every such tick when the slow poll returns: one poll behind another
+    // with no interval between them, thirty of them behind a poll that ran
+    // to its deadline at the least interval.
+    interval_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         interval_timer.tick().await;
@@ -2652,7 +2690,7 @@ mod native_loads_tests {
             assert_metric, render_with_recorder, BasicWorkerBuilder, LoadReaders, WorkerMonitor,
             WorkerRegistry,
         },
-        worker::{HealthCheckConfig, NamedValue, OverloadUpdate},
+        worker::{HealthCheckConfig, NamedValue, OverloadUpdate, WorkerSpec},
     };
 
     const ENGINE_METRICS: &str = "vllm:num_requests_running{m=\"a\"} 7.0\n\
@@ -3589,6 +3627,127 @@ mod native_loads_tests {
             1,
             "a loop's poll still holds the monitor"
         );
+    }
+
+    /// A monitor told `interval` as its own, over one group of HTTP workers
+    /// whose host keeps one load source for them all. Each entry of `own`
+    /// is a worker: the whole seconds it states for itself, or nothing. The
+    /// source's calls are the polls that reached it.
+    fn polled_every(
+        interval: Duration,
+        own: &[Option<u64>],
+    ) -> (Arc<SourceConnector>, Arc<WorkerMonitor>) {
+        let connector = SourceConnector::keeping(Some(host_answer(1)));
+        let registry = Arc::new(WorkerRegistry::new());
+        for (at, stated) in own.iter().enumerate() {
+            let mut spec = WorkerSpec::new(format!("http://engine-{at}.invalid:8000"));
+            spec.load_monitor_interval_secs = *stated;
+            let worker = BasicWorkerBuilder::from_spec(spec)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .runtime_type(RuntimeType::Vllm)
+                .model(ModelCard::new("a"))
+                .engine_connector(Arc::clone(&connector) as Arc<dyn EngineConnector>)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build();
+            registry.register(Arc::new(worker)).unwrap();
+        }
+        let monitor = WorkerMonitor::new(registry, Arc::new(LoadReaders::Aware), 1, false, false)
+            .with_interval(interval);
+        (connector, Arc::new(monitor))
+    }
+
+    /// A monitor told an interval under a second polls at it: once at its
+    /// start, then four times a second at a quarter second.
+    #[tokio::test(start_paused = true)]
+    async fn a_monitor_told_a_quarter_second_polls_four_times_a_second() {
+        let (connector, monitor) = polled_every(Duration::from_millis(250), &[None]);
+        assert_eq!(monitor.interval(), Duration::from_millis(250));
+        monitor.start_event_loop();
+        // Between the first poll and the second.
+        tokio::time::sleep(Duration::from_millis(125)).await;
+        assert_eq!(connector.calls(), 1);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(connector.calls(), 5);
+    }
+
+    /// An interval under the least is raised to it: told ten milliseconds,
+    /// a monitor polls ten times a second.
+    #[tokio::test(start_paused = true)]
+    async fn an_interval_under_the_least_is_raised_to_it() {
+        let (connector, monitor) = polled_every(Duration::from_millis(10), &[None]);
+        assert_eq!(monitor.interval(), LEAST_POLL_INTERVAL);
+        monitor.start_event_loop();
+        tokio::time::sleep(LEAST_POLL_INTERVAL / 2).await;
+        assert_eq!(connector.calls(), 1);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(connector.calls(), 11);
+    }
+
+    /// A worker's own interval stands over the monitor's. One worker of a
+    /// group states one second and the other states nothing: a monitor told
+    /// a quarter second polls the two each second.
+    #[tokio::test(start_paused = true)]
+    async fn a_workers_own_second_stands_over_the_monitors_quarter_second() {
+        let (connector, monitor) = polled_every(Duration::from_millis(250), &[Some(1), None]);
+        monitor.start_event_loop();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(connector.calls(), 2);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(connector.calls(), 6);
+    }
+
+    /// The ticks a slow poll overran are skipped, at every interval. The
+    /// first ask of the host's connector never answers, so the first poll
+    /// lasts the poll's deadline: thirty ticks at the least interval, three
+    /// at one second. One poll follows it at once and the next comes one
+    /// interval later. The timer's own default sends a poll for every tick
+    /// overrun, one behind another.
+    #[tokio::test(start_paused = true)]
+    async fn the_ticks_a_slow_poll_overran_are_skipped_at_every_interval() {
+        for interval in [LEAST_POLL_INTERVAL, Duration::from_secs(1)] {
+            let (connector, monitor) = polled_every(interval, &[None]);
+            connector.silent_asks.store(1, Ordering::Relaxed);
+            monitor.start_event_loop();
+            tokio::time::sleep(LOAD_POLL_DEADLINE + interval / 2).await;
+            assert_eq!(
+                connector.calls(),
+                1,
+                "the polls behind a slow poll at {interval:?}"
+            );
+            tokio::time::sleep(interval).await;
+            assert_eq!(connector.calls(), 2, "the next tick at {interval:?}");
+            monitor.stop().await;
+        }
+    }
+
+    /// What polling costs at the least interval, for a group of eight
+    /// workers and of sixty-four. A tick asks every worker's engine once
+    /// and publishes one snapshot: each worker is asked ten times a second,
+    /// and the group publishes ten snapshots a second whatever its size.
+    #[tokio::test(start_paused = true)]
+    async fn a_group_at_the_least_interval_asks_each_worker_ten_times_a_second() {
+        for workers in [8, 64] {
+            let (connector, monitor) = polled_every(LEAST_POLL_INTERVAL, &vec![None; workers]);
+            monitor.start_event_loop();
+            // Between the first tick and the second.
+            tokio::time::sleep(LEAST_POLL_INTERVAL / 2).await;
+            let (asked, published) = (connector.calls(), monitor.load_state.publish_count());
+            assert_eq!(asked, workers, "the first tick of {workers} workers");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(
+                (
+                    connector.calls() - asked,
+                    monitor.load_state.publish_count() - published
+                ),
+                (10 * workers, 10),
+                "one second of {workers} workers"
+            );
+            monitor.stop().await;
+        }
     }
 
     /// A routing side that asks the worker at one URL for no load, and reads

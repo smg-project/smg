@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use clap::ValueEnum;
 pub use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
@@ -265,6 +265,12 @@ pub struct RouterConfig {
     pub job_queue_concurrency: usize,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// The load monitor's interval in milliseconds, 100 at the least. When
+    /// set it is the interval, and `load_monitor_interval_secs` is not read
+    /// for it. The overload shed's Retry-After stays whole seconds: this
+    /// value raised to the next one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_monitor_interval_ms: Option<u64>,
     /// Seconds without any contact from a worker (a load poll, a health probe,
     /// a KV event, a response) after which a transport failure excludes it
     /// from routing; the first successful contact re-admits it.
@@ -1518,7 +1524,7 @@ pub enum PolicyConfig {
     /// with the lower expected wait, scored like `least_load`
     /// (`(queued_tokens + inflight_tokens) / throughput + kv_pressure_weight * k/(1-k)`).
     /// The worker loads it reads are polled at the gateway's one cadence,
-    /// `load_monitor_interval_secs`.
+    /// `load_monitor_interval_secs`, or `load_monitor_interval_ms` where set.
     #[serde(rename = "power_of_two")]
     PowerOfTwo {
         #[serde(default)]
@@ -1700,8 +1706,9 @@ fn default_least_load_throughput() -> f64 {
 }
 
 /// The per-policy poll interval of earlier releases. The load monitor has one
-/// cadence, `load_monitor_interval_secs`; a policy configuration that still
-/// sets this key is refused with that knob named, never silently ignored.
+/// cadence, `load_monitor_interval_secs` or `load_monitor_interval_ms` where
+/// set; a policy configuration that still sets this key is refused with the
+/// seconds knob named, never silently ignored.
 pub const RETIRED_POLICY_INTERVAL_KEY: &str = "load_check_interval_secs";
 
 /// least_load's per-worker waiting-queue cap of earlier releases. The router's
@@ -1983,6 +1990,7 @@ impl Default for RouterConfig {
             job_queue_capacity: default_job_queue_capacity(),
             job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
+            load_monitor_interval_ms: None,
             worker_stall_secs: default_worker_stall_secs(),
             worker_wedge_secs: default_worker_wedge_secs(),
             worker_stale_secs: default_worker_stale_secs(),
@@ -2094,6 +2102,15 @@ impl RouterConfig {
     /// Validate the configuration
     pub fn validate(&self) -> ConfigResult<()> {
         ConfigValidator::validate(self)
+    }
+
+    /// The load monitor's interval: `load_monitor_interval_ms` where it is
+    /// set, `load_monitor_interval_secs` where it is not.
+    pub fn load_monitor_interval(&self) -> Duration {
+        match self.load_monitor_interval_ms {
+            Some(millis) => Duration::from_millis(millis),
+            None => Duration::from_secs(self.load_monitor_interval_secs),
+        }
     }
 
     /// Connection attempts per health-check success stamped on a worker
@@ -2388,6 +2405,42 @@ mod tests {
         assert!(json.contains("health_check_port"));
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.health_check_port, Some(8081));
+    }
+
+    /// The load monitor's interval in milliseconds is unset by default and
+    /// stays out of a serialized configuration, and a configuration written
+    /// before the key reads as unset. Where it is set it is the interval
+    /// over the seconds, which stand beside it. Where it is not, the
+    /// seconds are the interval.
+    #[test]
+    fn the_load_monitor_interval_in_milliseconds_wins_over_the_seconds() {
+        let config = RouterConfig::default();
+        assert_eq!(config.load_monitor_interval_ms, None);
+        assert_eq!(config.load_monitor_interval(), Duration::from_secs(10));
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("load_monitor_interval_ms"));
+        let without: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(without.load_monitor_interval_ms, None);
+
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .load_monitor_interval_secs(5)
+            .load_monitor_interval_ms(Some(250))
+            .build_unchecked();
+        assert_eq!(config.load_monitor_interval(), Duration::from_millis(250));
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.load_monitor_interval_secs, 5);
+        assert_eq!(with.load_monitor_interval_ms, Some(250));
+
+        let seconds_alone = RouterConfig {
+            load_monitor_interval_secs: 5,
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            seconds_alone.load_monitor_interval(),
+            Duration::from_secs(5)
+        );
     }
 
     #[test]

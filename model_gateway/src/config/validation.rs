@@ -1,14 +1,16 @@
 use std::{
     net::{IpAddr, SocketAddr},
     path::Path,
+    time::Duration,
 };
 
 use axum::http::{HeaderName, HeaderValue, Uri};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use smg_worker::identity::url_door::listed_worker_url_refusal;
-use smg_worker::identity::{
-    basic::ConnectionMode, endpoint::Endpoint, url_door::worker_url_refusal,
+use smg_worker::{
+    identity::{basic::ConnectionMode, endpoint::Endpoint, url_door::worker_url_refusal},
+    load::monitor::LEAST_POLL_INTERVAL,
 };
 use tokio::sync::Semaphore;
 
@@ -1401,6 +1403,15 @@ impl ConfigValidator {
             "load_monitor_interval_secs",
             config.load_monitor_interval_secs,
         )?;
+        if let Some(millis) = config.load_monitor_interval_ms {
+            if Duration::from_millis(millis) < LEAST_POLL_INTERVAL {
+                return Err(ConfigError::invalid_value(
+                    "load_monitor_interval_ms",
+                    millis,
+                    format!("Must be >= {}", LEAST_POLL_INTERVAL.as_millis()),
+                ));
+            }
+        }
 
         Ok(())
     }
@@ -2271,6 +2282,27 @@ mod tests {
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// A load monitor interval in milliseconds under the monitor's least is
+    /// refused under its own name, zero included. The least itself is
+    /// taken, and so is a configuration that states none.
+    #[test]
+    fn a_load_monitor_interval_under_the_least_is_refused_by_its_name() {
+        let least = u64::try_from(LEAST_POLL_INTERVAL.as_millis()).expect("milliseconds");
+        let stating = |millis: Option<u64>| RouterConfig {
+            load_monitor_interval_ms: millis,
+            ..Default::default()
+        };
+        for under in [0, least - 1] {
+            assert!(matches!(
+                ConfigValidator::validate(&stating(Some(under))),
+                Err(ConfigError::InvalidValue { ref field, ref reason, .. })
+                    if field == "load_monitor_interval_ms" && reason == "Must be >= 100"
+            ));
+        }
+        assert!(ConfigValidator::validate(&stating(Some(least))).is_ok());
+        assert!(ConfigValidator::validate(&stating(None)).is_ok());
     }
 
     /// A `RouterConfig` built directly, as a language binding or a library
