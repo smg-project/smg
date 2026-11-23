@@ -252,13 +252,14 @@ Each of the ten policy names has a preset. For single workers it is one profile 
 model. A prefill-decode mode gets two profiles under one pair binding over the prefill and decode
 phases, and behind it the main policy's profile bound to every other request: a gateway in that
 mode still places one single request over HTTP, a token count that takes one prefill worker, and
-classic places it by the main policy. Over gRPC the mode counts with no worker, and no request
-reaches that binding. Where the main policy states a setting no document says, the document
-plans the pair alone and that count is refused. A gateway of one router plans the pair alone as
-well where one family's policy names a block size and the other places by a prefix ring, which
-counts its key in another size. A preset also writes what its binding needs: a routing-key
-policy its key sources, `manual` its sessions rule. The presets are in `policies/<name>.rs`.
-Section 7 lists them.
+classic places it by the main policy. Over gRPC or ZMQ the mode counts with no worker: the
+settings state how the gateway reaches its workers, and the document of a gateway of one router
+plans the pair alone there. Where the main policy states a setting no document says, the
+document plans the pair alone and that count is refused. A gateway of one router plans the pair
+alone as well where one family's policy names a block size and the other places by a prefix
+ring, which counts its key in another size. A preset also writes what its binding needs: a
+routing-key policy its key sources, `manual` its sessions rule. The presets are in
+`policies/<name>.rs`. Section 7 lists them.
 
 A user may instead supply a document. It is accepted when the routing settings say the same
 document or say nothing; otherwise the start is refused and the error names the first
