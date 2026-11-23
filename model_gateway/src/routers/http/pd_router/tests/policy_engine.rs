@@ -3,10 +3,13 @@
 //! over a table that holds a scorer of the case's own and under a supplied
 //! document that names that scorer on the decode side.
 
+use std::sync::{atomic::AtomicBool, Mutex, PoisonError};
+
 use smg_policy_controller::{
     document::{DecodePick, PolicySpec},
-    engine::{Candidate, RequestFacts, Scorer, TieBand},
+    engine::{Candidate, Decision, RequestFacts, Scorer, Target, TieBand, WorkerId},
     stages::{Lifecycle, StageRegistry},
+    tracking::{EventSet, Lease, Outcome, ReleaseReason, Side},
 };
 
 use super::*;
@@ -151,4 +154,204 @@ async fn the_decode_sides_rank_on_the_wire_is_the_picked_rows_own() {
         assert_eq!(prefill_body.get("routed_dp_rank"), None);
         assert_eq!(decode_body.get("disagg_prefill_dp_rank"), None);
     }
+}
+
+// ---- a decode decided behind its prefill ---------------------------------------------------
+
+/// What the scorer and the engines' servers said, in the order they said
+/// it.
+type Said = Arc<Mutex<Vec<String>>>;
+
+fn say(said: &Said, word: impl Into<String>) {
+    let mut said = said.lock().unwrap_or_else(PoisonError::into_inner);
+    said.push(word.into());
+}
+
+/// A scorer that takes every word of a lease, so the engine leases each
+/// pick under it, and writes down each time it is asked and each word it is
+/// told. Until the prefill has answered it puts `first` in front, and from
+/// then on `later`: the rows of a later instant rank another way.
+#[derive(Debug)]
+struct Hears {
+    said: Said,
+    answered: Arc<AtomicBool>,
+    first: WorkerId,
+    later: WorkerId,
+}
+
+impl Lifecycle for Hears {
+    fn hears(&self) -> EventSet {
+        EventSet::LEASE
+    }
+
+    fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
+        say(&self.said, format!("issued {:?}", lease.side));
+    }
+
+    fn on_dispatched(&self, _: &Lease, _: &Target, side: Side, _: u32) {
+        say(&self.said, format!("dispatched {side:?}"));
+    }
+
+    fn on_completed(&self, _: &Lease, outcome: &Outcome) {
+        say(&self.said, format!("ended {:?}", outcome.side));
+    }
+
+    fn on_released(&self, lease: &Lease, _: ReleaseReason) {
+        say(&self.said, format!("released {:?}", lease.side));
+    }
+}
+
+impl Scorer for Hears {
+    fn name(&self) -> &'static str {
+        STAGE
+    }
+
+    fn score(
+        &self,
+        _: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        // How often one decision asks its scorer is the engine's own: asked
+        // twice in a row is written once. A word of a lease is always written.
+        let asked_last = {
+            let said = self.said.lock().unwrap_or_else(PoisonError::into_inner);
+            said.last().is_some_and(|word| word == "scored")
+        };
+        if !asked_last {
+            say(&self.said, "scored");
+        }
+        let front = if self.answered.load(Ordering::Relaxed) {
+            self.later
+        } else {
+            self.first
+        };
+        for (score, &row) in out.iter_mut().zip(kept) {
+            *score = if candidates[row as usize].id == front {
+                1.0
+            } else {
+                0.0
+            };
+        }
+        TieBand::NORMALIZED
+    }
+}
+
+/// A server that writes `word` down for each request and answers `reply`.
+/// With `answered` it is the prefill's: it raises the mark as it answers.
+async fn spawn_saying(
+    said: &Said,
+    word: &'static str,
+    reply: &'static str,
+    answered: Option<&Arc<AtomicBool>>,
+) -> String {
+    let (said, answered) = (Arc::clone(said), answered.cloned());
+    spawn_stub(axum::Router::new().fallback(axum::routing::any(move || {
+        let (said, answered) = (Arc::clone(&said), answered.clone());
+        async move {
+            say(&said, word);
+            if let Some(answered) = answered {
+                answered.store(true, Ordering::Relaxed);
+            }
+            ([(CONTENT_TYPE, "application/json")], reply)
+        }
+    })))
+    .await
+}
+
+/// A pair goes out prefill first under a document that picks its decode
+/// behind the prefill, and the decode side's scorer hears the request's
+/// words in one order with the two engines. The pair's first decision
+/// books the prefill alone. When the prefill has answered the route asks
+/// the decode again: the scorer is asked once more, the decode it now puts
+/// first is issued, and the prefill side's end is told then, where the
+/// route learned the prefill answered and not at the response's end. The
+/// decode's dispatch follows, the request goes to the decode decided
+/// behind the prefill and not to the one named first, and the decode's end
+/// is the response's. No side is told twice, and none is released.
+#[tokio::test]
+async fn a_decode_decided_behind_its_prefill_is_heard_behind_the_prefills_answer() {
+    let said = Said::default();
+    let answered = Arc::new(AtomicBool::new(false));
+    let prefill_url = spawn_saying(
+        &said,
+        "the prefill answers",
+        r#"{"kv_transfer_params":{"remote_engine_id":"eng0","remote_block_ids":[1,2]}}"#,
+        Some(&answered),
+    )
+    .await;
+    let chat_completion = r#"{"object":"chat.completion"}"#;
+    let first_url = spawn_saying(
+        &said,
+        "the decode named first is asked",
+        chat_completion,
+        None,
+    )
+    .await;
+    let later_url = spawn_saying(
+        &said,
+        "the decode decided later is asked",
+        chat_completion,
+        None,
+    )
+    .await;
+
+    let (first, later) = (
+        WorkerId::from_address(&first_url),
+        WorkerId::from_address(&later_url),
+    );
+    let (heard, mark) = (Arc::clone(&said), Arc::clone(&answered));
+    let stages = table_with(move || {
+        Box::new(Hears {
+            said: Arc::clone(&heard),
+            answered: Arc::clone(&mark),
+            first,
+            later,
+        })
+    });
+    let (router, _monitor) = pair_router_under(&stages, DecodePick::AfterPrefill);
+    let [prefill, named_first] = sequential_pair(prefill_url, first_url);
+    let decided_later: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(later_url)
+            .worker_type(WorkerType::Decode)
+            .runtime_type(RuntimeType::Vllm)
+            .build(),
+    );
+    decided_later.set_status(openai_protocol::worker::WorkerStatus::Ready);
+    for worker in [prefill, named_first, decided_later] {
+        router.worker_registry.register_or_replace(worker);
+    }
+    let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+    let chat: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "m",
+        "max_tokens": 50,
+        "messages": [{"role": "user", "content": "hi"}],
+    }))
+    .expect("valid chat request");
+    let response = router
+        .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // The decode side has ended once its answer is read whole and let go.
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+    drop(body.expect("the decode's answer"));
+
+    let order = said.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    assert_eq!(
+        order,
+        [
+            "scored",
+            "issued Prefill",
+            "dispatched Prefill",
+            "the prefill answers",
+            "scored",
+            "issued Decode",
+            "ended Prefill",
+            "dispatched Decode",
+            "the decode decided later is asked",
+            "ended Decode",
+        ]
+    );
 }
