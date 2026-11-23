@@ -694,6 +694,14 @@ impl PoolRecords {
     pub(crate) fn tried_engines(&self, tried: &[WorkerId], whole: &mut Vec<WorkerId>) {
         whole.clear();
         whole.extend_from_slice(tried);
+        self.more_tried_engines(tried, whole);
+    }
+
+    /// [`Self::tried_engines`] for a further list of the same decision, as
+    /// a pair's second list is: adds to `whole` the id of every row of an
+    /// engine of this list that holds a row `tried` names, where `whole`
+    /// does not hold it yet, and takes nothing out of `whole`.
+    pub(crate) fn more_tried_engines(&self, tried: &[WorkerId], whole: &mut Vec<WorkerId>) {
         for &id in tried {
             let Some(place) = self.place_of(id) else {
                 continue;

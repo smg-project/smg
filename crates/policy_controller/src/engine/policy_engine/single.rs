@@ -89,8 +89,8 @@ thread_local! {
     /// The calling thread's own list of the workers a retry is decided to
     /// have tried, where an engine of its list holds several
     /// ([`retried`]): taken for one decision and put back behind it, as
-    /// [`MEETING`] is.
-    static TRIED: Cell<Vec<WorkerId>> = const { Cell::new(Vec::new()) };
+    /// [`MEETING`] is. A pair's retry takes it the same way.
+    pub(super) static TRIED: Cell<Vec<WorkerId>> = const { Cell::new(Vec::new()) };
 }
 
 /// The stage a pair whose request states places is declined under

@@ -77,7 +77,7 @@ use crate::{
         list_cell::LentList,
         pair_classes::PartnerClasses,
         records::{vetoes, HeldCells, Live},
-        view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, Session},
+        view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, Session, WorkerId},
     },
     stages::Lifecycle,
     tracking::lease::{Lease, LeaseId, LeaseKind, Side, DISPATCH_TTL},
@@ -302,6 +302,25 @@ impl<'a> PairLists<'a> {
         request.facts.now_micros = live.now_micros();
         request.facts.budget_micros = super::budget::shown(request.facts.budget_micros);
         let (facts, cx) = (&request.facts, &request.constraints);
+        // A retry leaves every worker of the engines it tried, each list by
+        // its own engines: where a list holds several workers of one
+        // engine, the facts name them all, as a single request's do. A
+        // first attempt runs nine instructions for it: the test of its
+        // empty list, and behind its decision the test of a list to hand
+        // back.
+        let tried = if facts.tried.is_empty() {
+            None
+        } else {
+            tried_engines(engine, facts.tried, [prefill, decode])
+        };
+        let widened;
+        let facts = match &tried {
+            Some(tried) => {
+                widened = RequestFacts { tried, ..*facts };
+                &widened
+            }
+            None => facts,
+        };
         let sides = [
             Beside {
                 places: self.prefill_places,
@@ -361,13 +380,46 @@ impl<'a> PairLists<'a> {
                 }
             }
         };
-        BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
+        let decision = BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
             Ok(mut buffers) => decide(&mut buffers),
             // A stage asked for a decision from inside its own, on this
             // thread: that decision takes buffers of its own.
             Err(_) => decide(&mut Buffers::default()),
-        })
+        });
+        // The thread's list goes back for its next retry.
+        if let Some(tried) = tried {
+            single::TRIED.set(tried);
+        }
+        decision
     }
+}
+
+/// The workers of the engines a pair's retry tried: `tried` as its host
+/// named them, and behind them every other worker of an engine of either
+/// list that holds a tried worker, each list read by its own engines
+/// (`PoolRecords::tried_engines`). `None` where neither list holds
+/// several workers of one engine: the request's own list stands.
+///
+/// The workers stand in the calling thread's own list ([`single::TRIED`]),
+/// which the caller puts back behind its decision: a retry allocates
+/// nothing once the list has grown. Out of line and cold: a first attempt
+/// runs none of it.
+#[cold]
+#[inline(never)]
+fn tried_engines(
+    engine: &PolicyEngine,
+    tried: &[WorkerId],
+    [prefill, decode]: [&PoolMembers; 2],
+) -> Option<Vec<WorkerId>> {
+    let (spec, clock) = (&engine.document.spec, &engine.clock);
+    let (prefills, decodes) = (prefill.records(spec, clock), decode.records(spec, clock));
+    if !prefills.has_ranks() && !decodes.has_ranks() {
+        return None;
+    }
+    let mut whole = single::TRIED.take();
+    prefills.tried_engines(tried, &mut whole);
+    decodes.more_tried_engines(tried, &mut whole);
+    Some(whole)
 }
 
 /// What one thread keeps for its pair decisions: each list's records, the
@@ -3889,5 +3941,128 @@ mod tests {
             assert_eq!(partners(0, Some(&places)), places, "reachable {places:?}");
             assert_eq!(partners(1, Some(&places)), shared, "reachable {places:?}");
         }
+    }
+
+    /// One side's list engine after engine, one engine a number of
+    /// `shape`: that many ranks of one data-parallel engine in their
+    /// order, or a worker that registered no rank for a `1`. Beside it,
+    /// each worker's engine by its place in the list.
+    fn ranked(
+        name: &str,
+        worker_type: WorkerType,
+        shape: &[usize],
+    ) -> (Arc<[Arc<dyn Worker>]>, Vec<usize>) {
+        let (mut list, mut engine_of) = (Vec::new(), Vec::new());
+        for (engine, &size) in shape.iter().enumerate() {
+            for rank in 0..size {
+                let built = <BasicWorkerBuilder>::from_spec(WorkerSpec {
+                    worker_type,
+                    ..WorkerSpec::new(format!("grpc://{name}-{engine}:9000"))
+                });
+                let built = match size {
+                    1 => built,
+                    _ => built.dp_config(rank, size),
+                };
+                let worker = built.health_config(no_health_check()).build();
+                worker.set_status(WorkerStatus::Ready);
+                list.push(Arc::new(worker) as Arc<dyn Worker>);
+                engine_of.push(engine);
+            }
+        }
+        (list.into(), engine_of)
+    }
+
+    /// A pair's retry leaves every rank of the engines it tried, a side at
+    /// a time: a tried prefill takes its engine's other rank out of the
+    /// prefills and leaves the decodes as they were, a tried decode does
+    /// the same on its side, and both together move both sides. Named the
+    /// tried rank alone, each side kept its engine's other rank. That is
+    /// the gateway's classic answer for a pair: each side steps aside from
+    /// the engines the request tried
+    /// (`model_gateway/src/routers/common/placement.rs:1486-1493` and
+    /// `:1562-1569` at main `75d279287`).
+    #[test]
+    fn a_pairs_retry_leaves_every_rank_of_the_engines_it_tried() {
+        use std::collections::BTreeSet;
+
+        // On each side two ranks of one engine, then two of another.
+        let (prefills, prefill_engine) = ranked("prefill", WorkerType::Prefill, &[2, 2]);
+        let (decodes, decode_engine) = ranked("decode", WorkerType::Decode, &[2, 2]);
+        let classes = every(prefills.len(), decodes.len() as u32);
+        let tried_prefill = worker_id(prefills[1].as_ref());
+        let tried_decode = worker_id(decodes[0].as_ref());
+        let host = Host::over(hearing(), prefills, decodes);
+        // The engines a retry's targets stand on, a side each, over the
+        // turns of both lists.
+        let landed = |tried: &[WorkerId]| {
+            let (mut on_prefills, mut on_decodes) = (BTreeSet::new(), BTreeSet::new());
+            for seed in 0..32 {
+                let mut asks = host.asks(&classes, false);
+                asks.0.facts.seed = seed;
+                asks.0.facts.attempt = 1;
+                asks.0.facts.tried = tried;
+                let outcome = leased(&host, &asks, Instant::now());
+                for target in named(&outcome.decision) {
+                    let pair = target.pair.expect("a pair");
+                    on_prefills.insert(prefill_engine[target.position as usize]);
+                    on_decodes.insert(decode_engine[pair.decode_position as usize]);
+                }
+            }
+            (on_prefills, on_decodes)
+        };
+        let (both, second) = (BTreeSet::from([0, 1]), BTreeSet::from([1]));
+        assert_eq!(landed(&[]), (both.clone(), both.clone()), "nobody tried");
+        assert_eq!(
+            landed(&[tried_prefill]),
+            (second.clone(), both.clone()),
+            "the tried prefill's engine steps aside, and no decode does"
+        );
+        assert_eq!(
+            landed(&[tried_decode]),
+            (both, second.clone()),
+            "the tried decode's engine steps aside, and no prefill does"
+        );
+        assert_eq!(
+            landed(&[tried_prefill, tried_decode]),
+            (second.clone(), second),
+            "a tried pair moves on both sides"
+        );
+    }
+
+    /// The decode asked again behind a held prefill leaves every rank of
+    /// the engine its retry tried, as the pair's first decision does.
+    #[test]
+    fn the_decode_asked_again_leaves_every_rank_of_the_engine_it_tried() {
+        use std::collections::BTreeSet;
+
+        let (prefills, _) = ranked("prefill", WorkerType::Prefill, &[1]);
+        let (decodes, decode_engine) = ranked("decode", WorkerType::Decode, &[2, 2]);
+        let classes = every(prefills.len(), decodes.len() as u32);
+        let held = prefill_alone(worker_id(prefills[0].as_ref()));
+        // The first engine's second rank was tried.
+        let tried = [worker_id(decodes[1].as_ref())];
+        let host = Host::over(hearing(), prefills, decodes);
+        let landed = |tried: &[WorkerId]| {
+            let mut on_decodes = BTreeSet::new();
+            for seed in 0..32 {
+                let Asks(mut request, lists, _) = host.asks(&classes, true);
+                request.facts.seed = seed;
+                request.facts.attempt = 1;
+                request.facts.tried = tried;
+                let now = Instant::now();
+                let again = lists.decide(&host.engine, None, now, &mut request, Some(&held));
+                for target in named(&again) {
+                    let pair = target.pair.expect("a pair");
+                    on_decodes.insert(decode_engine[pair.decode_position as usize]);
+                }
+            }
+            on_decodes
+        };
+        assert_eq!(landed(&[]), BTreeSet::from([0, 1]), "nobody tried");
+        assert_eq!(
+            landed(&tried),
+            BTreeSet::from([1]),
+            "the tried decode's engine"
+        );
     }
 }
