@@ -320,6 +320,7 @@ use super::{
     read_file_with_limit, run_video_command_output, split_png_stream, video_metadata_from,
     video_temp_suffix, write_temp_video_file, FrameSampling, MediaConnector, MediaConnectorConfig,
     MediaConnectorError, MediaSource, ProbedVideoInfo, VideoFetchConfig, VideoMetadata,
+    VIDEO_COMMAND_TEXT_BYTES,
 };
 use crate::error::MediaFault;
 
@@ -564,11 +565,11 @@ async fn a_sized_command_output_is_read_into_one_reservation() {
         command.arg("--list");
         command
     };
-    let unsized_run = run_video_command_output(list(), "test binary", 0)
+    let unsized_run = run_video_command_output(list(), "test binary", 0, usize::MAX)
         .await
         .expect("the listing");
     let bytes = unsized_run.stdout.len();
-    let output = run_video_command_output(list(), "test binary", bytes)
+    let output = run_video_command_output(list(), "test binary", bytes, bytes)
         .await
         .expect("the listing");
     assert_eq!(output.stdout.len(), bytes);
@@ -581,11 +582,41 @@ async fn a_refused_output_reservation_ends_the_decode() {
     // A decoder that is not there: a spawn tried first would answer for it.
     let dir = tempfile::tempdir().expect("a temp dir");
     let command = tokio::process::Command::new(dir.path().join("ffmpeg"));
-    let error = run_video_command_output(command, "ffmpeg", usize::MAX)
+    let error = run_video_command_output(command, "ffmpeg", usize::MAX, usize::MAX)
         .await
         .expect_err("a reservation of usize::MAX bytes is refused");
     assert_eq!(error.fault(), MediaFault::Internal);
     assert!(is_video_budget_error(&error), "{error}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_is_read_up_to_what_its_caller_can_use() {
+    let shell = |script: &str| {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", script]);
+        command
+    };
+    // One byte past the limit ends the run, long before the command ends
+    // or the process timeout does, and the command with it.
+    let past_limit = run_video_command_output(shell("echo; exec sleep 60"), "sh", 0, 0);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(10), past_limit)
+        .await
+        .expect("the run ends at its limit")
+        .expect_err("an output past its limit");
+    assert!(
+        error.to_string().contains("more than the 0 bytes"),
+        "{error}"
+    );
+
+    // More diagnostics than are kept: the rest is dropped, and the command
+    // is not held on its pipe.
+    let noisy = shell("head -c 2000000 /dev/zero >&2");
+    let output = run_video_command_output(noisy, "sh", 0, 1024)
+        .await
+        .expect("the run");
+    assert!(output.status.success());
+    assert_eq!(output.stderr.len(), VIDEO_COMMAND_TEXT_BYTES);
 }
 
 /// A decoder this process cannot start is this process's fault, not the
@@ -596,7 +627,7 @@ async fn a_refused_output_reservation_ends_the_decode() {
 async fn a_decoder_that_cannot_start_is_our_fault() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let missing = dir.path().join("ffprobe");
-    let error = run_video_command_output(tokio::process::Command::new(&missing), "ffprobe", 0)
+    let error = run_video_command_output(tokio::process::Command::new(&missing), "ffprobe", 0, 0)
         .await
         .expect_err("a decoder that is not there");
     assert!(
@@ -613,10 +644,14 @@ async fn a_decoder_that_cannot_start_is_our_fault() {
 
     let not_executable = dir.path().join("ffmpeg");
     std::fs::write(&not_executable, b"not a program").expect("a plain file");
-    let error =
-        run_video_command_output(tokio::process::Command::new(&not_executable), "ffmpeg", 0)
-            .await
-            .expect_err("a decoder that cannot be run");
+    let error = run_video_command_output(
+        tokio::process::Command::new(&not_executable),
+        "ffmpeg",
+        0,
+        0,
+    )
+    .await
+    .expect_err("a decoder that cannot be run");
     assert!(
         matches!(&error, MediaConnectorError::DecoderUnavailable(io) if io.kind() == std::io::ErrorKind::PermissionDenied),
         "{error}"
