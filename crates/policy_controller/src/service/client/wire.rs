@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 use crate::{
     engine::{
         decision::{
-            Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
+            Decision, LiftedVeto, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
             Trace, MAX_TARGETS, TRACE_TOP,
         },
-        door::{self, Leased},
+        decision_engine::{DecideOutcome, Leased, Request},
         view::{HashKind, Identity, Phase, Session, WorkerId},
     },
     service::{
@@ -24,8 +24,7 @@ use crate::{
             released::{Reason, What},
         },
     },
-    store::Said,
-    tracking::lease::{self, Lease, LeaseId, LeaseKind, Side},
+    tracking::lease::{self, Lease, LeaseId, LeaseKind, Said, Side},
 };
 
 /// A request as the wire carries it, and the block hashes left out of the
@@ -35,7 +34,7 @@ use crate::{
 /// frame to its size from the list's tail, so a longer copy would wait in
 /// the link's queue for nothing. The link counts the hashes left out with
 /// its own cut.
-pub(crate) fn request(request: &door::Request<'_>) -> (proto::DecideRequest, usize) {
+pub(crate) fn request(request: &Request<'_>) -> (proto::DecideRequest, usize) {
     let (facts, constraints) = (&request.facts, &request.constraints);
     let held = facts.block_hashes.len().min(MAX_HASHES);
     let asked = proto::DecideRequest {
@@ -133,7 +132,7 @@ fn narrow<T: TryFrom<u32>>(number: u32, path: &'static str) -> Result<T, Unread>
 /// The controller's decision as the door's own record, told at `now`.
 /// A pair gives the handle a prefill and a decode to report, under the
 /// one id and dispatch span the door keeps in its prefill lease.
-pub(crate) fn decided(told: &proto::Decision, now: Instant) -> Result<door::Decided, Unread> {
+pub(crate) fn decided(told: &proto::Decision, now: Instant) -> Result<DecideOutcome, Unread> {
     let trace = told
         .trace
         .as_ref()
@@ -168,7 +167,12 @@ pub(crate) fn decided(told: &proto::Decision, now: Instant) -> Result<door::Deci
         None if told.leases.is_empty() => None,
         None => return Err(unread("leases", "only a pick carries a lease")),
     };
-    Ok(door::Decided { decision, lease })
+    // A controller's file of leases holds the decode side whole.
+    Ok(DecideOutcome {
+        decision,
+        lease,
+        decode_session: Session::NONE,
+    })
 }
 
 fn targets(told: &[proto::Target]) -> Result<Targets, Unread> {
@@ -181,12 +185,12 @@ fn targets(told: &[proto::Target]) -> Result<Targets, Unread> {
             .pair
             .map(|pair| {
                 Ok(Pair {
-                    decode_position: 0,
                     decode_id: WorkerId(pair.decode_id),
                     decode_dp_rank: narrow(
                         pair.decode_dp_rank,
                         "pick.targets.pair.decode_dp_rank",
                     )?,
+                    ..Pair::default()
                 })
             })
             .transpose()?;
@@ -302,9 +306,9 @@ fn trace(told: &proto::Trace) -> Result<Trace, Unread> {
         None => Survivors::NOT_COUNTED,
     };
     let lifted = match proto::LiftedVeto::try_from(told.lifted) {
-        Ok(proto::LiftedVeto::None) => Lifted::None,
-        Ok(proto::LiftedVeto::Overload) => Lifted::Overload,
-        Ok(proto::LiftedVeto::Liveness) => Lifted::Liveness,
+        Ok(proto::LiftedVeto::None) => LiftedVeto::None,
+        Ok(proto::LiftedVeto::Overload) => LiftedVeto::Overload,
+        Ok(proto::LiftedVeto::Liveness) => LiftedVeto::Liveness,
         Err(_) => return Err(unread("trace.lifted", "unknown veto")),
     };
     // The mark is read first: ahead of every profile the position on the
@@ -364,32 +368,44 @@ mod tests {
         engine::{
             decision,
             decision::{
-                Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
-                Trace,
+                Decision, LiftedVeto, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target,
+                Targets, Trace,
             },
-            door, view,
+            decision_engine::Request,
+            view,
             view::{
                 Constraints, HashKind, Header, Identity, MediaCounts, Phase, RequestFacts, WorkerId,
             },
         },
         service::{
             client::MAX_HASHES,
-            controller::wire::{Beside, Checked, Decided, Leased, Lists, Viewed},
+            controller::wire::{tests::made, Beside, Checked, Decided, Leased, Lists},
             proto::{
                 self, decide_answer::Answer, decision::Outcome, gateway_frame::Frame,
                 identity::Form,
             },
         },
-        store::Said,
         tracking::{
             lease,
-            lease::{Lease, LeaseId, ReleaseReason, Side, TransportClass},
+            lease::{Lease, LeaseId, ReleaseReason, Said, Side, TransportClass},
         },
     };
 
+    /// What a controller has left of a request's budget where it makes the
+    /// request of a frame.
+    const LEFT: Duration = Duration::from_micros(1_500);
+
+    /// Every field a host states of a request crosses the wire, and the
+    /// controller makes its request of the frame. Four things of that
+    /// request are the controller's own. Its budget is what the controller
+    /// has left. It says no wire: the wires the host states are read on
+    /// the frame, where it is checked. Its block hashes are cut at the
+    /// depth the deciding document reads, and of a subset hint it states
+    /// a 0 alone. The case's three hashes and its hint of 0 are inside
+    /// both, and the frame is read for each as it crossed.
     #[test]
     fn the_controller_reads_every_request_field_as_the_host_stated_it() {
-        let mut asked = door::Request {
+        let mut asked = Request {
             id: b"a request",
             facts: RequestFacts {
                 model: "model-a",
@@ -429,7 +445,7 @@ mod tests {
             },
             constraints: Constraints {
                 excluded: &[WorkerId(26), WorkerId(27)],
-                wire_modes: crate::WireModes::HTTP.union(crate::WireModes::GRPC),
+                wire_modes: crate::engine::WireModes::HTTP.union(crate::engine::WireModes::GRPC),
                 overload_lifted: true,
                 subset_hint: Some(0),
                 ..Constraints::default()
@@ -488,21 +504,13 @@ mod tests {
             assert_eq!(checked.budget().as_micros(), u128::from(want.budget_micros));
             assert!(!checked.has_text());
             assert!(!checked.again());
-            let view = Viewed {
-                now_micros: 88,
-                budget_micros: 1_500,
-                affinity: &[],
-                stalled: &[],
-                held: &[],
-                in_flight: None,
-                max_block_hashes: want.block_hashes.len(),
-                pins: None,
-                signal_cells: None,
-            };
-            checked.read(
+            assert_eq!(checked.wires(), Some(asked.constraints.wire_modes));
+            assert_eq!(checked.block_hashes(), want.block_hashes);
+            assert_eq!(checked.subset(), asked.constraints.subset_hint);
+            made(
+                &checked,
                 &mut Lists::default(),
-                view,
-                door::unnamed,
+                LEFT,
                 |facts, constraints| {
                     assert_eq!(facts.model, want.model);
                     assert_eq!(facts.namespace_seed, want.namespace_seed);
@@ -517,13 +525,14 @@ mod tests {
                     assert_eq!(facts.phase, want.phase);
                     assert_eq!(facts.attempt, want.attempt);
                     assert_eq!(facts.tried, want.tried);
-                    assert_eq!(facts.budget_micros, view.budget_micros);
+                    assert_eq!(u128::from(facts.budget_micros), LEFT.as_micros());
                     assert_eq!(facts.headers, want.headers);
                     assert_eq!(facts.media, want.media);
                     assert_eq!(facts.seed, want.seed);
                     assert_eq!(facts.block_size, want.block_size);
+                    assert_eq!(facts.client_key, want.client_key);
                     assert_eq!(constraints.excluded, asked.constraints.excluded);
-                    assert_eq!(constraints.wire_modes, asked.constraints.wire_modes);
+                    assert_eq!(constraints.wire_modes, crate::engine::WireModes::NONE);
                     assert_eq!(
                         constraints.overload_lifted,
                         asked.constraints.overload_lifted
@@ -539,7 +548,7 @@ mod tests {
     #[test]
     fn a_request_copies_no_more_hashes_than_a_frame_holds() {
         let blocks = vec![7; MAX_HASHES + 1_000];
-        let asked = door::Request {
+        let asked = Request {
             id: b"a request",
             facts: RequestFacts {
                 model: "model-a",
@@ -560,7 +569,7 @@ mod tests {
     /// the controller decides over the same tenant and session.
     #[test]
     fn an_empty_plain_key_reads_over_the_link_as_the_key_it_is() {
-        let asked = door::Request {
+        let asked = Request {
             id: b"a request",
             facts: RequestFacts {
                 model: "model-a",
@@ -575,18 +584,7 @@ mod tests {
         assert!(!want.tenant.is_none() && !want.session_key.is_none());
         let (sent, _) = request(&asked);
         let checked = Checked::new(sent).expect("the controller reads the request");
-        let view = Viewed {
-            now_micros: 88,
-            budget_micros: 1_500,
-            affinity: &[],
-            stalled: &[],
-            held: &[],
-            in_flight: None,
-            max_block_hashes: 0,
-            pins: None,
-            signal_cells: None,
-        };
-        checked.read(&mut Lists::default(), view, door::unnamed, |facts, _| {
+        made(&checked, &mut Lists::default(), LEFT, |facts, _| {
             assert_eq!(facts.tenant.hash, want.tenant.hash);
             assert_eq!(facts.session().get(), want.session().get());
         });
@@ -604,7 +602,7 @@ mod tests {
             top_len: 3,
             seed: 27,
             generation: 13,
-            lifted: Lifted::Overload,
+            lifted: LiftedVeto::Overload,
         }
     }
 
@@ -700,7 +698,7 @@ mod tests {
         let Decision::Pick(mut pick) = pick(1, false, Survivors::counted(1)) else {
             panic!("a pick");
         };
-        pick.trace.lifted = Lifted::Liveness;
+        pick.trace.lifted = LiftedVeto::Liveness;
         let decision = Decision::Pick(pick);
         let read = decided(&told(decision, None), Instant::now()).expect("a pick");
         assert_eq!(read.decision, decision);
@@ -739,7 +737,7 @@ mod tests {
             ticket: 75,
             max_wait_micros: 15_000,
             trace: Trace {
-                lifted: Lifted::None,
+                lifted: LiftedVeto::None,
                 ..shed.trace
             },
         });
@@ -754,7 +752,7 @@ mod tests {
     #[test]
     fn a_shed_made_ahead_of_every_profile_names_none_over_a_link() {
         let now = Instant::now();
-        let ahead = door::shed(ShedReason::NoEndpoints, "wires", 0, 6);
+        let ahead = decision::shed(ShedReason::NoEndpoints, "wires", 0, 6);
         let wire = told(ahead, None);
         let sent = wire.trace.as_ref().expect("a trace");
         assert!(sent.no_profile);
@@ -977,7 +975,7 @@ mod tests {
             (Side::Encode, proto::Side::Encode),
         ] {
             let dispatch = Said::Dispatched(
-                crate::store::Dispatch {
+                lease::Dispatch {
                     target_index: 2,
                     side,
                     since_decision_micros: 250,

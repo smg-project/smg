@@ -247,7 +247,7 @@ impl EncoderInput {
     }
 
     /// Elements in all.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.shape().iter().product()
     }
 
@@ -279,7 +279,7 @@ impl EncoderInput {
     }
 
     /// Bytes per element as stored.
-    pub fn element_size(&self) -> usize {
+    pub(crate) fn element_size(&self) -> usize {
         match self {
             Self::F32(_) => size_of::<f32>(),
             Self::U8 { .. } => size_of::<u8>(),
@@ -349,7 +349,7 @@ impl EncoderInput {
     }
 
     /// The input as normalized `f32`, owned: a move for floats.
-    pub fn into_f32(self) -> ArrayD<f32> {
+    pub(crate) fn into_f32(self) -> ArrayD<f32> {
         match self {
             Self::F32(array) => array,
             other => other.as_f32().into_owned(),
@@ -507,13 +507,9 @@ impl EncoderInput {
         self.view().write_as(dtype)
     }
 
-    /// [`EncoderInputView::write_into`] for the whole input.
-    pub fn write_into(&self, dtype: EncoderDtype, out: &mut [u8]) -> Result<(), String> {
-        self.view().write_into(dtype, out)
-    }
-
     /// Rows `[start, start + len)` along the first axis, as an owned input.
-    pub fn slice_axis0(&self, start: usize, len: usize) -> AnyhowResult<Self> {
+    #[cfg(test)]
+    pub(crate) fn slice_axis0(&self, start: usize, len: usize) -> AnyhowResult<Self> {
         Ok(self.view().slice_axis0(start, len)?.to_owned())
     }
 
@@ -587,7 +583,7 @@ impl EncoderInput {
 
     /// Stack inputs along the first axis. Bytes stack with bytes of the same
     /// normalization, floats with floats; the two forms do not mix.
-    pub fn concat(parts: &[&Self]) -> AnyhowResult<Self> {
+    pub(crate) fn concat(parts: &[&Self]) -> AnyhowResult<Self> {
         let first = parts.first().context("cannot join zero encoder inputs")?;
         match first {
             Self::Wire { .. } | Self::SharedWire { .. } => {
@@ -639,7 +635,7 @@ impl EncoderInput {
                         norm,
                     })
                 } else {
-                    Self::wire(concat_byte_slices(&slices, byte_len), dtype, joined, norm)
+                    Self::wire(concat_byte_slices(&slices, byte_len)?, dtype, joined, norm)
                         .map_err(anyhow::Error::msg)
                 }
             }
@@ -707,17 +703,19 @@ impl EncoderInput {
 }
 
 /// Copy large byte batches into disjoint output bands on the shared pool.
-fn concat_byte_slices(slices: &[&[u8]], len: usize) -> Vec<u8> {
+fn concat_byte_slices(slices: &[&[u8]], len: usize) -> AnyhowResult<Vec<u8>> {
     let tasks = execution::task_count(len, slices.len(), 1);
     if tasks == 1 {
-        let mut bytes = Vec::with_capacity(len);
+        // Pooled like the banded join below: a buffer of the exact length is
+        // no class of the pool, so every request would allocate it anew.
+        let mut bytes = buffer_pool::take_empty(len).context("cannot reserve the joined wire")?;
         for slice in slices {
             bytes.extend_from_slice(slice);
         }
-        return bytes;
+        return Ok(bytes);
     }
 
-    let mut bytes = buffer_pool::take(len);
+    let mut bytes = buffer_pool::try_take(len).context("cannot reserve the joined wire")?;
     let mut remaining = bytes.as_mut_slice();
     execution::scope(|spawner| {
         for group in slices.chunks(slices.len().div_ceil(tasks)) {
@@ -733,7 +731,7 @@ fn concat_byte_slices(slices: &[&[u8]], len: usize) -> Vec<u8> {
             });
         }
     });
-    bytes
+    Ok(bytes)
 }
 
 /// A borrowed [`EncoderInput`]: the whole, or rows of it. Per-destination
@@ -764,10 +762,6 @@ impl<'a> EncoderInputView<'a> {
         }
     }
 
-    pub fn ndim(&self) -> usize {
-        self.shape().len()
-    }
-
     /// Elements in all.
     pub fn len(&self) -> usize {
         self.shape().iter().product()
@@ -775,14 +769,6 @@ impl<'a> EncoderInputView<'a> {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// The normalization bytes carry; `None` for floats, already normalized.
-    pub fn pixel_norm(&self) -> Option<PixelNorm> {
-        match self {
-            Self::F32(_) => None,
-            Self::U8 { norm, .. } | Self::Wire { norm, .. } => Some(*norm),
-        }
     }
 
     /// An owned copy, in the same form.
@@ -1205,23 +1191,6 @@ pub enum ModelSpecificValue {
 }
 
 impl ModelSpecificValue {
-    /// Create a 1D uint tensor from a vector.
-    pub fn uint_1d(data: Vec<u32>) -> Self {
-        let len = data.len();
-        Self::UintTensor {
-            data,
-            shape: vec![len],
-        }
-    }
-
-    /// Create a 2D uint tensor.
-    pub fn uint_2d(data: Vec<u32>, rows: usize, cols: usize) -> Self {
-        Self::UintTensor {
-            data,
-            shape: vec![rows, cols],
-        }
-    }
-
     /// Create a 1D int tensor from a vector.
     pub fn int_1d(data: Vec<i64>) -> Self {
         let len = data.len();
@@ -1281,7 +1250,7 @@ impl ModelSpecificValue {
 
     /// Stack per-item values along their first dimension. A scalar has no
     /// item dimension: it must be the same in every part and is kept once.
-    pub fn concat_first_dim(parts: &[&Self]) -> AnyhowResult<Self> {
+    pub(crate) fn concat_first_dim(parts: &[&Self]) -> AnyhowResult<Self> {
         let first = parts.first().context("cannot join zero values")?;
         match first {
             Self::Tensor { .. } => {
@@ -1526,11 +1495,6 @@ impl PreprocessedEncoderInputs {
         self.item_sizes.len()
     }
 
-    /// Get the number of dimensions of encoder_input.
-    pub fn ndim(&self) -> usize {
-        self.encoder_input.ndim()
-    }
-
     /// Get total number of encoder feature tokens across all media items.
     pub fn total_feature_tokens(&self) -> usize {
         self.feature_token_counts.iter().sum()
@@ -1749,7 +1713,6 @@ mod tests {
         );
 
         assert_eq!(inputs.batch_size(), 2);
-        assert_eq!(inputs.ndim(), 4);
         assert_eq!(inputs.total_feature_tokens(), 13);
         assert_eq!(inputs.encoder_input_shape(), vec![2, 3, 4, 5]);
     }
@@ -1763,7 +1726,10 @@ mod tests {
         )
         .with_extra(
             "image_grid_thw",
-            ModelSpecificValue::uint_1d(vec![1, 16, 16]),
+            ModelSpecificValue::UintTensor {
+                data: vec![1, 16, 16],
+                shape: vec![3],
+            },
         )
         .with_extra("aspect_ratio_id", ModelSpecificValue::Int(0));
 
@@ -1773,16 +1739,6 @@ mod tests {
 
     #[test]
     fn model_specific_value_tensor_constructors_set_shapes() {
-        assert!(matches!(
-            ModelSpecificValue::uint_1d(vec![1, 2, 3]),
-            ModelSpecificValue::UintTensor { data, shape }
-                if data == vec![1, 2, 3] && shape == vec![3]
-        ));
-        assert!(matches!(
-            ModelSpecificValue::uint_2d(vec![1, 2, 3, 4], 2, 2),
-            ModelSpecificValue::UintTensor { data, shape }
-                if data == vec![1, 2, 3, 4] && shape == vec![2, 2]
-        ));
         assert!(matches!(
             ModelSpecificValue::int_1d(vec![1, 2, 3]),
             ModelSpecificValue::IntTensor { data, shape }
@@ -2259,6 +2215,7 @@ mod tests {
             } else {
                 // a narrower wire cannot be widened into the reference's float32: nothing is written
                 assert!(wire
+                    .view()
                     .write_into(EncoderDtype::Float32, &mut vec![0u8; 72 * 4])
                     .is_err());
                 assert!(wire.write_as(EncoderDtype::Float32).is_empty());
@@ -2328,6 +2285,36 @@ mod buffer_pool_tests {
             assert_eq!(MINE.held(), 2 << 20, "the float32 wire came back");
             let again = buffer_pool::take(values * 4);
             assert_eq!(again.as_ptr(), address);
+        });
+    }
+
+    /// A join that runs as one task takes its buffer from the pool, as the
+    /// banded join does.
+    #[test]
+    fn a_join_of_one_task_takes_its_buffer_from_the_pool() {
+        static MINE: BufferPool = BufferPool::new();
+        buffer_pool::with_pool(&MINE, || {
+            // Two parts of 153,600 bytes, under the size a join is split at:
+            // their 307,200 bytes are the 512 KiB class, which holds a buffer.
+            let idle = buffer_pool::take(307_200);
+            let address = idle.as_ptr();
+            buffer_pool::recycle(idle);
+            let part = |fill: u8| {
+                EncoderInput::wire(
+                    vec![fill; 153_600],
+                    EncoderDtype::BFloat16,
+                    vec![100, 768],
+                    norm(),
+                )
+                .expect("a wire")
+            };
+            let joined = EncoderInput::concat(&[&part(1), &part(2)])
+                .expect("joined")
+                .into_bytes_as(EncoderDtype::BFloat16)
+                .expect("written");
+            assert_eq!((joined.as_ptr(), joined.len()), (address, 307_200));
+            assert!(joined[..153_600].iter().all(|&byte| byte == 1));
+            assert!(joined[153_600..].iter().all(|&byte| byte == 2));
         });
     }
 }

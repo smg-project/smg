@@ -325,7 +325,8 @@ struct RoutingArgs {
     /// DP engines per startup ZMQ worker: each ipc:// or tcp:// worker becomes a
     /// grouped worker whose handshake awaits this many engines on one socket set
     /// (default: as many as the first engine to dial declares, one for an
-    /// engine that declares none).
+    /// engine that declares none). Under --dp-aware a worker given this count
+    /// registers as one worker per engine, which share the socket set.
     #[arg(long, value_parser = parse_positive_usize, help_heading = "Worker Configuration")]
     zmq_engine_count: Option<usize>,
 
@@ -493,9 +494,8 @@ struct RoutingArgs {
     /// overloaded, instead of routing it to the least-loaded one (or, for a
     /// cache-aware prefill pool or a regular request that consistent_hashing
     /// places by its routing key, by its policy); also sheds a worker that
-    /// crossed a threshold between selection and dispatch, except for a
-    /// request the policy controller placed. Off by default: steering never
-    /// turns a load signal into an outage
+    /// crossed a threshold between selection and dispatch. Off by default:
+    /// steering never turns a load signal into an outage
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     worker_overload_shed: bool,
 
@@ -718,8 +718,7 @@ struct RoutingArgs {
 
     /// Choose off for the classic routing policies or on for the policy
     /// controller. With on, the routing flags keep their meaning through a
-    /// policy document. Requests the controller cannot decide are refused
-    /// by name without using the classic policies
+    /// policy document
     #[arg(
         long,
         value_parser = ["on", "off"],
@@ -753,22 +752,6 @@ struct RoutingArgs {
     /// the exit is then a failure
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     print_policy_spec: bool,
-
-    /// Follow workers from the policy controller's gateway listener (requires --policy-controller on).
-    #[arg(long, value_name = "host:port", help_heading = "Policy Controller")]
-    policy_controller_address: Option<String>,
-
-    /// PEM certificate authority file for the controller connection.
-    #[arg(long, value_name = "path", help_heading = "Policy Controller")]
-    policy_controller_tls_ca_cert: Option<String>,
-
-    /// PEM client certificate file for the controller connection.
-    #[arg(long, value_name = "path", help_heading = "Policy Controller")]
-    policy_controller_tls_cert: Option<String>,
-
-    /// PEM client private key file for the controller connection.
-    #[arg(long, value_name = "path", help_heading = "Policy Controller")]
-    policy_controller_tls_key: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -834,6 +817,12 @@ struct WorkerArgs {
     /// Interval in seconds between load monitor checks for PowerOfTwo routing
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
+
+    /// Interval in milliseconds between load monitor checks, 100 at the
+    /// least. When set it is the interval, and --load-monitor-interval is
+    /// not read for it.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(100..), help_heading = "Load Monitoring")]
+    load_monitor_interval_ms: Option<u64>,
 
     /// Seconds without any contact from a worker (a load poll, a health probe,
     /// a KV event, a response) after which a transport failure excludes it
@@ -1281,7 +1270,11 @@ struct ServingArgs {
     /// Idle timeout in seconds for pooled upstream connections. Must stay
     /// below the backend HTTP server's keep-alive timeout (vLLM and SGLang
     /// default to 5), or reused connections the server already closed fail
-    /// non-idempotent sends. 0 keeps idle connections forever.
+    /// non-idempotent sends. 0 keeps idle connections forever. While a
+    /// nonzero value is below --load-monitor-interval, an idle HTTP worker is
+    /// connected anew for every load poll; where the server's keep-alive can
+    /// be raised above that interval, a value between the two keeps the
+    /// connection.
     #[arg(long, default_value_t = 3, help_heading = "Request Handling")]
     upstream_pool_idle_timeout_secs: u64,
 
@@ -1488,7 +1481,8 @@ struct ServingArgs {
     #[arg(long, default_value_t = 60, help_heading = "Circuit Breaker")]
     cb_timeout_duration_secs: u64,
 
-    /// Sliding window duration for tracking failures
+    /// While the circuit is closed, a failed request more than this many
+    /// seconds after the last one starts the count anew
     #[arg(long, default_value_t = 120, help_heading = "Circuit Breaker")]
     cb_window_duration_secs: u64,
 
@@ -2204,88 +2198,6 @@ mod tests {
         Cli::parse_from(argv).router_args
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn the_policy_controller_flags_reach_the_router_configuration() {
-        let cli = Cli::try_parse_from([
-            "smg",
-            "--policy-controller",
-            "on",
-            "--policy-controller-address",
-            "controller:30100",
-            "--policy-controller-tls-ca-cert",
-            "ca.pem",
-            "--policy-controller-tls-cert",
-            "cert.pem",
-            "--policy-controller-tls-key",
-            "key.pem",
-        ])
-        .unwrap();
-        let config = cli
-            .router_args
-            .configure(vec![], vec![])
-            .unwrap()
-            .router_config;
-        assert!(config.policy_controller);
-        assert_eq!(
-            config.policy_controller_address.as_deref(),
-            Some("controller:30100")
-        );
-        assert_eq!(
-            config.policy_controller_tls_ca_cert.as_deref(),
-            Some("ca.pem")
-        );
-        assert_eq!(
-            config.policy_controller_tls_cert.as_deref(),
-            Some("cert.pem")
-        );
-        assert_eq!(config.policy_controller_tls_key.as_deref(), Some("key.pem"));
-    }
-
-    #[test]
-    fn a_controller_address_refuses_worker_urls_even_outside_the_selected_mode() {
-        let cli = Cli::try_parse_from([
-            "smg",
-            "--policy-controller",
-            "on",
-            "--policy-controller-address",
-            "controller:30100",
-        ])
-        .unwrap();
-        let error = cli
-            .router_args
-            .to_router_config(vec![("http://worker:8000".to_owned(), None)], vec![])
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("--policy-controller-address") && error.contains("--prefill"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn a_controller_address_refuses_a_discovery_provider_before_reading_its_settings() {
-        let cli = Cli::try_parse_from([
-            "smg",
-            "--policy-controller",
-            "on",
-            "--policy-controller-address",
-            "controller:30100",
-            "--discovery-provider",
-            "file",
-        ])
-        .unwrap();
-        let error = cli
-            .router_args
-            .to_router_config(vec![], vec![])
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("--policy-controller-address") && error.contains("--discovery-provider"),
-            "{error}"
-        );
-    }
-
     #[test]
     fn the_switch_flows_into_router_config() {
         use clap::error::ErrorKind;
@@ -2309,11 +2221,14 @@ mod tests {
     fn policy_file(
         name: &str,
     ) -> Result<
-        (tempfile::NamedTempFile, smg_policy_controller::PolicySpec),
+        (
+            tempfile::NamedTempFile,
+            smg_policy_controller::document::PolicySpec,
+        ),
         Box<dyn std::error::Error>,
     > {
         let file = tempfile::NamedTempFile::new()?;
-        let document = smg_policy_controller::PolicySpec::preset(name)?;
+        let document = smg_policy_controller::document::PolicySpec::preset(name)?;
         serde_yaml::to_writer(file.as_file(), &document)?;
         Ok((file, document))
     }
@@ -4601,6 +4516,55 @@ mod tests {
         assert!(!server_config.router_config.disable_load_monitoring);
     }
 
+    /// `--load-monitor-interval-ms` reaches both configurations beside the
+    /// seconds option, which keeps its own value, and is the monitor's
+    /// interval over it. With no word of it the seconds are the interval,
+    /// ten by default. A value under the monitor's least is refused when
+    /// the line is read.
+    #[test]
+    fn the_load_monitor_interval_in_milliseconds_flows_into_both_configs() {
+        use std::time::Duration;
+
+        use smg_worker::load::monitor::LEAST_POLL_INTERVAL;
+
+        let cli = cli_args_from(&[
+            "--load-monitor-interval",
+            "5",
+            "--load-monitor-interval-ms",
+            "250",
+        ]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.load_monitor_interval_secs, 5);
+        assert_eq!(router_config.load_monitor_interval_ms, Some(250));
+        assert_eq!(
+            router_config.load_monitor_interval(),
+            Duration::from_millis(250)
+        );
+        let server_config = cli.to_server_config(router_config).unwrap();
+        let nested = &server_config.router_config;
+        assert_eq!(nested.load_monitor_interval_secs, 5);
+        assert_eq!(nested.load_monitor_interval_ms, Some(250));
+
+        let seconds = |flags: &[&str]| {
+            let config = cli_args_from(flags).to_router_config(vec![], vec![]);
+            let config = config.unwrap();
+            assert_eq!(config.load_monitor_interval_ms, None);
+            config.load_monitor_interval()
+        };
+        assert_eq!(
+            seconds(&["--load-monitor-interval", "5"]),
+            Duration::from_secs(5)
+        );
+        assert_eq!(seconds(&[]), Duration::from_secs(10));
+
+        let least = LEAST_POLL_INTERVAL.as_millis();
+        for (millis, taken) in [(least - 1, false), (least, true)] {
+            let millis = millis.to_string();
+            let line = ["smg", "--load-monitor-interval-ms", millis.as_str()];
+            assert_eq!(Cli::try_parse_from(line).is_ok(), taken, "{millis} ms");
+        }
+    }
+
     /// Cache-index flags must reach the cache_aware policy variant and the
     /// shared `RouterConfig.cache_boundaries`, and survive into
     /// `ServerConfig.router_config`. Two-path config-plumbing guard.
@@ -5912,28 +5876,31 @@ mod tests {
         assert_eq!(listener.runtime_worker_threads, Some(2));
     }
 
-    /// `configure` validates the configuration once, through the builder's
-    /// `build()`: a second pass over the same value repeats every file read
-    /// of the validators (the scheduler YAML, the log-directory probe) for no
-    /// second opinion. An inotify watch on the scheduler file counts the
-    /// read-only opens `configure` closes; the count does not depend on
-    /// timing, since the events queue until they are read. The watch takes
-    /// the opens as well: the kernel folds two identical queued events into
-    /// one, and the open between two closes keeps them apart.
+    /// Observe real scheduler-file opens through the original configure path.
+    /// Keep the fixture on an anonymous inode so unrelated traversal of named
+    /// temporary files cannot open it. CLOEXEC keeps its owner descriptor out
+    /// of the subprocesses other CLI tests start in the same test process.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn configure_reads_the_scheduler_file_once() {
-        use std::mem::MaybeUninit;
+    fn scheduler_read_events_after_configuration(
+        configure_calls: usize,
+    ) -> (usize, usize, Vec<u32>) {
+        use std::{io::Write, mem::MaybeUninit, os::fd::AsRawFd};
 
-        use rustix::fs::inotify::{self, CreateFlags, ReadFlags, WatchFlags};
+        use rustix::fs::{
+            inotify::{self, CreateFlags, ReadFlags, WatchFlags},
+            memfd_create, MemfdFlags,
+        };
 
-        let dir = tempfile::tempdir().unwrap();
-        let scheduler = dir.path().join("scheduler.yaml");
-        std::fs::write(&scheduler, "{}\n").unwrap();
+        let mut scheduler_file = std::fs::File::from(
+            memfd_create("smg-scheduler-config-read-oracle", MemfdFlags::CLOEXEC).unwrap(),
+        );
+        scheduler_file.write_all(b"{}\n").unwrap();
+        assert!(scheduler_file.metadata().unwrap().is_file());
+        let scheduler = format!("/proc/self/fd/{}", scheduler_file.as_raw_fd());
         let watch = inotify::init(CreateFlags::NONBLOCK | CreateFlags::CLOEXEC).unwrap();
         inotify::add_watch(
             &watch,
-            &scheduler,
+            scheduler.as_str(),
             WatchFlags::OPEN | WatchFlags::CLOSE_NOWRITE,
         )
         .unwrap();
@@ -5941,19 +5908,31 @@ mod tests {
         let cli = cli_args_from(&[
             "--priority-scheduler-enabled",
             "--priority-scheduler-config",
-            scheduler.to_str().unwrap(),
+            scheduler.as_str(),
         ]);
-        cli.configure(vec![], vec![]).expect("configures");
+        for _ in 0..configure_calls {
+            cli.configure(vec![], vec![]).expect("configures");
+        }
 
-        // Every read-only open `configure` made has closed by now; the
-        // non-blocking read drains what queued and stops at an empty queue.
+        // Count and drain every event. OPEN prevents identical queued CLOSE
+        // events from coalescing when the witness configures twice.
         let mut buf = [MaybeUninit::<u8>::uninit(); 4096];
         let mut events = inotify::Reader::new(&watch, &mut buf);
         let mut reads = 0;
+        let mut opens = 0;
+        let mut observed_events = Vec::new();
         loop {
             match events.next() {
                 Ok(event) => {
-                    if event.events().contains(ReadFlags::CLOSE_NOWRITE) {
+                    let flags = event.events();
+                    // Keep a bounded diagnostic prefix, but count and drain every event.
+                    if observed_events.len() < 32 {
+                        observed_events.push(flags.bits());
+                    }
+                    if flags.contains(ReadFlags::OPEN) {
+                        opens += 1;
+                    }
+                    if flags.contains(ReadFlags::CLOSE_NOWRITE) {
                         reads += 1;
                     }
                 }
@@ -5961,6 +5940,32 @@ mod tests {
                 Err(error) => panic!("reading the inotify events: {error}"),
             }
         }
-        assert_eq!(reads, 1, "configure read the scheduler file {reads} times");
+        (reads, opens, observed_events)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configure_reads_the_scheduler_file_once() {
+        let (reads, opens, observed_events) = scheduler_read_events_after_configuration(1);
+        assert_eq!(
+            reads, 1,
+            "configure read the scheduler file {reads} times; observed {opens} opens; \
+             event flag prefix {observed_events:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scheduler_read_observer_detects_repeated_configuration() {
+        let (reads, opens, observed_events) = scheduler_read_events_after_configuration(2);
+        assert_eq!(
+            reads, 2,
+            "two configurations must read twice; observed {reads} closes and {opens} opens; \
+             event flag prefix {observed_events:?}"
+        );
+        assert_eq!(
+            opens, 2,
+            "two configurations must open twice; event flag prefix {observed_events:?}"
+        );
     }
 }

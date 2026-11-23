@@ -13,13 +13,15 @@ use futures::stream::{self, StreamExt};
 use super::{
     config::BuiltinToolType,
     orchestrator::{
-        McpOrchestrator, McpRequestContext, ToolExecutionInput, ToolExecutionOutput,
-        ToolExecutionResult,
+        printable_label, McpOrchestrator, McpRequestContext, ToolExecutionInput,
+        ToolExecutionOutput, ToolExecutionResult,
     },
+    pool::PoolKey,
     UNKNOWN_SERVER_KEY,
 };
 use crate::{
     approval::ApprovalMode,
+    error::McpError,
     inventory::{QualifiedToolName, ToolCategory, ToolEntry},
     tenant::TenantContext,
 };
@@ -42,10 +44,15 @@ pub struct McpServerBinding {
     /// When `Some`, only the listed tool names are exposed for this server.
     /// When `None`, all tools from the server are exposed.
     pub allowed_tools: Option<Vec<String>>,
-    /// Why the server's tools could not be listed when this binding was made;
-    /// `None` when they were listed. A request's item reports its own
-    /// connect's outcome, whatever the pool did since.
+    /// Why the request cannot read the server's tools; `None` when it can.
+    /// The connect sets its listing's failure; a session sets `Server not
+    /// found` for a listed binding whose key the pool holds no more when the
+    /// session is built.
     pub list_error: Option<String>,
+    /// The pool key a dynamic server was connected with; `None` for a
+    /// configured server. A tool call of the binding on the key's own
+    /// address uses the connection pooled under that key and no other.
+    pub pool_key: Option<PoolKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,7 +65,13 @@ struct ExposedToolBinding {
     server_key: String,
     associated_server_key: String,
     server_label: String,
+    /// The binding the tool is attributed to, by its place in the session's
+    /// bindings: the label is its label, a call takes its pool key.
+    binding_index: Option<usize>,
     resolved_tool_name: String,
+    /// The alias target the session listed the tool with; `None` for a
+    /// server's own tool. A call runs an entry that still holds it.
+    alias_target: Option<QualifiedToolName>,
     is_builtin_routed: bool,
     approval_mode: ApprovalMode,
 }
@@ -110,7 +123,7 @@ impl<'a> McpToolSession<'a> {
     /// request context for downstream execution paths.
     pub fn new_with_headers(
         orchestrator: &'a McpOrchestrator,
-        mcp_servers: Vec<McpServerBinding>,
+        mut mcp_servers: Vec<McpServerBinding>,
         request_id: impl Into<String>,
         forwarded_headers: HashMap<String, String>,
     ) -> Self {
@@ -118,6 +131,23 @@ impl<'a> McpToolSession<'a> {
         let tenant_ctx = TenantContext::default();
         let server_keys: Vec<String> = mcp_servers.iter().map(|b| b.server_key.clone()).collect();
         let mut mcp_tools = Self::collect_visible_mcp_tools(orchestrator, &server_keys);
+        // A request's own server whose key the pool holds no more: its calls
+        // find no server, and its listing says so, where it read as a listing
+        // of no tools. Asked after the tools are read: a connection that
+        // leaves between the two is told as well.
+        for binding in &mut mcp_servers {
+            if binding.list_error.is_none()
+                && binding
+                    .pool_key
+                    .as_ref()
+                    .is_some_and(|key| !orchestrator.is_pooled(key))
+            {
+                binding.list_error = Some(
+                    McpError::ServerNotFound(printable_label(&binding.label).to_string())
+                        .to_string(),
+                );
+            }
+        }
 
         // The model's view of a server is the union of its bindings' allowlists
         // (a server bound under several labels lists each label's own set,
@@ -278,13 +308,35 @@ impl<'a> McpToolSession<'a> {
     /// Execute a single tool while preserving pending approval state.
     pub async fn execute_tool_result(&self, input: ToolExecutionInput) -> ToolExecutionResult {
         let invoked_name = input.tool_name.clone();
+        let exposed = self.exposed_name_map.get(&invoked_name);
+        // A session calls what it listed: the entry read here is the one the
+        // call runs, and an entry whose alias target is not the listed one is
+        // not this session's tool.
+        let entry = exposed.and_then(|binding| {
+            self.orchestrator
+                .tool_inventory()
+                .get_entry(&binding.server_key, &binding.resolved_tool_name)
+        });
+        let admitted = exposed.filter(|binding| {
+            entry.as_ref().is_none_or(|now| {
+                now.alias_target.as_ref().map(|alias| &alias.target)
+                    == binding.alias_target.as_ref()
+            })
+        });
 
-        if let Some(binding) = self.exposed_name_map.get(&invoked_name) {
+        if let Some(binding) = admitted {
             let resolved_tool_name = binding.resolved_tool_name.clone();
-            let request_ctx = self.request_ctx_for(binding.approval_mode);
+            let mut request_ctx = self.request_ctx_for(binding.approval_mode);
+            // The call carries the pool key of the binding its tool is
+            // attributed to.
+            request_ctx.pool_key = binding
+                .binding_index
+                .and_then(|index| self.all_mcp_servers.get(index))
+                .and_then(|b| b.pool_key.clone());
             let mut result = self
                 .orchestrator
-                .execute_tool_resolved_result(
+                .execute_resolved_entry_result(
+                    entry,
                     ToolExecutionInput {
                         call_id: input.call_id,
                         tool_name: resolved_tool_name.clone(),
@@ -307,18 +359,22 @@ impl<'a> McpToolSession<'a> {
 
             result
         } else {
-            let fallback_label = self
-                .all_mcp_servers
-                .first()
-                .map(|b| b.label.as_str())
-                .unwrap_or(DEFAULT_SERVER_LABEL)
-                .to_string();
+            // A tool the session listed is refused under its own binding.
+            let (server_key, server_label) = match exposed {
+                Some(binding) => (binding.server_key.as_str(), binding.server_label.as_str()),
+                None => (
+                    UNKNOWN_SERVER_KEY,
+                    self.all_mcp_servers
+                        .first()
+                        .map_or(DEFAULT_SERVER_LABEL, |b| b.label.as_str()),
+                ),
+            };
             let err = format!("Tool '{invoked_name}' is not in this session's exposed tool map");
             ToolExecutionResult::Executed(ToolExecutionOutput {
                 call_id: input.call_id,
                 tool_name: invoked_name.clone(),
-                server_key: UNKNOWN_SERVER_KEY.to_string(),
-                server_label: fallback_label,
+                server_key: server_key.to_string(),
+                server_label: server_label.to_string(),
                 arguments_str: input.arguments.to_string(),
                 output: serde_json::json!({ "error": &err }),
                 is_error: true,
@@ -449,9 +505,10 @@ impl<'a> McpToolSession<'a> {
             .collect()
     }
 
-    /// The failure of the tool listing made when `server_label` (bound to
-    /// `server_key`) was connected for this request, for its `mcp_list_tools`
-    /// item's `error`; `None` when the listing succeeded.
+    /// Why this request cannot read the tools of `server_label` (bound to
+    /// `server_key`), for its `mcp_list_tools` item's `error`: the failure of
+    /// the listing made at its connect, or `Server not found` when its key
+    /// left the pool before the session was built; `None` otherwise.
     pub fn list_error_for_binding(&self, server_label: &str, server_key: &str) -> Option<String> {
         self.all_mcp_servers
             .iter()
@@ -561,8 +618,10 @@ impl<'a> McpToolSession<'a> {
         for entry in tools {
             let server_key = entry.server_key().to_string();
             let associated_server_key = Self::associated_server_key(entry);
-            let server_label = Self::label_for_entry(entry, &bindings)
-                .unwrap_or(associated_server_key)
+            let binding_index = Self::binding_for_entry(entry, &bindings);
+            let server_label = binding_index
+                .and_then(|index| mcp_servers.get(index))
+                .map_or(associated_server_key, |b| b.label.as_str())
                 .to_string();
             let resolved_tool_name = entry.tool_name().to_string();
             let is_builtin_routed = Self::builtin_binding_for_entry(entry, builtin_tool_bindings);
@@ -598,7 +657,9 @@ impl<'a> McpToolSession<'a> {
                     server_key,
                     associated_server_key: associated_server_key.to_string(),
                     server_label,
+                    binding_index,
                     resolved_tool_name,
+                    alias_target: entry.alias_target.as_ref().map(|a| a.target.clone()),
                     is_builtin_routed,
                     approval_mode: ApprovalMode::PolicyOnly,
                 },
@@ -664,27 +725,26 @@ impl<'a> McpToolSession<'a> {
             .unwrap_or_else(|| entry.server_key())
     }
 
-    /// The label a tool is attributed to: the first binding of its server
-    /// whose allowlist admits it (a server bound under several labels lists
-    /// each label's own tools); failing that, the server's first binding.
-    /// `bindings` pairs each binding with its allowlist, built once.
-    fn label_for_entry<'b>(
-        entry: &ToolEntry,
-        bindings: &'b [LabelledAllowlist<'b>],
-    ) -> Option<&'b str> {
+    /// The binding a tool is attributed to, by its place in `bindings`: the
+    /// first binding of its server whose allowlist admits it (a server bound
+    /// under several labels lists each label's own tools); failing that, the
+    /// server's first binding. `bindings` pairs each binding with its
+    /// allowlist, built once.
+    fn binding_for_entry(entry: &ToolEntry, bindings: &[LabelledAllowlist<'_>]) -> Option<usize> {
         let key = Self::associated_server_key(entry);
         let mut of_server = bindings
             .iter()
-            .filter(|(b, _)| b.server_key == key)
+            .enumerate()
+            .filter(|(_, (b, _))| b.server_key == key)
             .peekable();
-        let first = of_server.peek().map(|(b, _)| b.label.as_str());
+        let first = of_server.peek().map(|(index, _)| *index);
         of_server
-            .find(|(_, allowed)| {
+            .find(|(_, (_, allowed))| {
                 allowed
                     .as_ref()
                     .is_none_or(|allowed| Self::matches_allowed_tool_name(entry, allowed))
             })
-            .map(|(b, _)| b.label.as_str())
+            .map(|(index, _)| index)
             .or(first)
     }
 
@@ -773,12 +833,14 @@ mod tests {
                 server_key: "key1".to_string(),
                 allowed_tools: None,
                 list_error: None,
+                pool_key: None,
             },
             McpServerBinding {
                 label: "label2".to_string(),
                 server_key: "key2".to_string(),
                 allowed_tools: None,
                 list_error: None,
+                pool_key: None,
             },
         ];
 
@@ -814,6 +876,7 @@ mod tests {
             server_key: "my_key".to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         }];
         let session = McpToolSession::new(&orchestrator, mcp_servers, "test-request");
 
@@ -860,6 +923,7 @@ mod tests {
             server_key: "server1".to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         }];
         let session = McpToolSession::new(&orchestrator, mcp_servers, "test-request");
 
@@ -880,6 +944,7 @@ mod tests {
                 server_key: "server1".to_string(),
                 allowed_tools: None,
                 list_error: None,
+                pool_key: None,
             }],
             "test-request",
         );
@@ -921,6 +986,7 @@ mod tests {
             server_key: "server1".to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         };
         let narrow = McpServerBinding {
             label: "conf-b".to_string(),
@@ -973,6 +1039,7 @@ mod tests {
                 server_key: "server1".to_string(),
                 allowed_tools: Some(listed.clone()),
                 list_error: None,
+                pool_key: None,
             }],
             "test-request",
         );
@@ -986,6 +1053,58 @@ mod tests {
         }
     }
 
+    /// A session calls what it listed: an alias registered again with
+    /// another target is not this session's tool.
+    #[tokio::test]
+    async fn an_alias_registered_again_with_another_target_is_not_called() {
+        let orchestrator = McpOrchestrator::new_test();
+        insert_test_tool(&orchestrator, "server1", "search");
+        insert_test_tool(&orchestrator, "server2", "search");
+        orchestrator
+            .register_alias("find", "server1", "search", None)
+            .unwrap();
+        let binding = |label: &str, server_key: &str| McpServerBinding {
+            label: label.to_string(),
+            server_key: server_key.to_string(),
+            allowed_tools: None,
+            list_error: None,
+            pool_key: None,
+        };
+        let session = McpToolSession::new(
+            &orchestrator,
+            vec![binding("zero", "server0"), binding("one", "server1")],
+            "test-request",
+        );
+        assert!(session.has_exposed_tool("find"));
+        let call = || {
+            session.execute_tool(ToolExecutionInput {
+                call_id: "call".to_string(),
+                tool_name: "find".to_string(),
+                arguments: json!({}),
+            })
+        };
+
+        // Registered again with the target it had, the alias is still called.
+        orchestrator
+            .register_alias("find", "server1", "search", None)
+            .unwrap();
+        assert_eq!(
+            call().await.error_message.as_deref(),
+            Some("Tool call failed: Server not found: server1")
+        );
+
+        orchestrator
+            .register_alias("find", "server2", "search", None)
+            .unwrap();
+        let refused = call().await;
+        assert_eq!(
+            refused.error_message.as_deref(),
+            Some("Tool 'find' is not in this session's exposed tool map")
+        );
+        // The refusal reads under the label the alias was listed with.
+        assert_eq!(refused.server_label, "one");
+    }
+
     #[test]
     fn test_resolve_label_with_inventory() {
         let orchestrator = McpOrchestrator::new_test();
@@ -997,6 +1116,7 @@ mod tests {
             server_key: "server1".to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         }];
         let session = McpToolSession::new(&orchestrator, mcp_servers, "test-request");
 
@@ -1019,12 +1139,14 @@ mod tests {
                     server_key: "server1".to_string(),
                     allowed_tools: None,
                     list_error: None,
+                    pool_key: None,
                 },
                 McpServerBinding {
                     label: "beta".to_string(),
                     server_key: "server2".to_string(),
                     allowed_tools: None,
                     list_error: None,
+                    pool_key: None,
                 },
             ],
             "test-request",
@@ -1064,18 +1186,21 @@ mod tests {
                     server_key: "s1".to_string(),
                     allowed_tools: None,
                     list_error: None,
+                    pool_key: None,
                 },
                 McpServerBinding {
                     label: "b".to_string(),
                     server_key: "s2".to_string(),
                     allowed_tools: None,
                     list_error: None,
+                    pool_key: None,
                 },
                 McpServerBinding {
                     label: "c".to_string(),
                     server_key: "s3".to_string(),
                     allowed_tools: None,
                     list_error: None,
+                    pool_key: None,
                 },
             ],
             "test-request",
@@ -1118,12 +1243,14 @@ mod tests {
                 server_key: "brave-builtin".to_string(),
                 allowed_tools: None,
                 list_error: None,
+                pool_key: None,
             },
             McpServerBinding {
                 label: "regular".to_string(),
                 server_key: "regular-server".to_string(),
                 allowed_tools: None,
                 list_error: None,
+                pool_key: None,
             },
         ];
 
@@ -1167,6 +1294,7 @@ mod tests {
                 server_key: "internal-server".to_string(),
                 allowed_tools: None,
                 list_error: None,
+                pool_key: None,
             }],
             "test-request",
         );
@@ -1198,6 +1326,7 @@ mod tests {
                 server_key: "image-server".to_string(),
                 allowed_tools: None,
                 list_error: None,
+                pool_key: None,
             }],
             "test-request",
         );
@@ -1220,6 +1349,7 @@ mod tests {
                 server_key: "server1".to_string(),
                 allowed_tools: Some(vec!["brave_web_search".to_string()]),
                 list_error: None,
+                pool_key: None,
             }],
             "test-request",
         );
@@ -1251,12 +1381,14 @@ mod tests {
             server_key: "server1".to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         };
         let narrow = McpServerBinding {
             label: "conf-b".to_string(),
             server_key: "server1".to_string(),
             allowed_tools: Some(vec!["echo".to_string()]),
             list_error: None,
+            pool_key: None,
         };
 
         let session = McpToolSession::new(
@@ -1326,6 +1458,7 @@ mod tests {
                 server_key: "server1".to_string(),
                 allowed_tools: None,
                 list_error: None,
+                pool_key: None,
             }],
             "test-request",
         );
@@ -1358,6 +1491,7 @@ mod tests {
                 server_key: "server1".to_string(),
                 allowed_tools: Some(vec!["web_search".to_string()]),
                 list_error: None,
+                pool_key: None,
             }],
             "test-request",
         );
@@ -1389,6 +1523,7 @@ mod tests {
                 server_key: "internal-server".to_string(),
                 allowed_tools: None,
                 list_error: None,
+                pool_key: None,
             }],
             "test-request",
         );
@@ -1424,6 +1559,7 @@ mod tests {
                 server_key: "internal-server".to_string(),
                 allowed_tools: None,
                 list_error: None,
+                pool_key: None,
             }],
             "test-request",
         );
@@ -1456,12 +1592,14 @@ mod tests {
                     server_key: "public-server".to_string(),
                     allowed_tools: None,
                     list_error: None,
+                    pool_key: None,
                 },
                 McpServerBinding {
                     label: "shared-label".to_string(),
                     server_key: "internal-server".to_string(),
                     allowed_tools: None,
                     list_error: None,
+                    pool_key: None,
                 },
             ],
             "test-request",
@@ -1493,12 +1631,14 @@ mod tests {
                     server_key: "server1".to_string(),
                     allowed_tools: Some(vec!["brave_web_search".to_string()]),
                     list_error: None,
+                    pool_key: None,
                 },
                 McpServerBinding {
                     label: "deepwiki".to_string(),
                     server_key: "server2".to_string(),
                     allowed_tools: None,
                     list_error: None,
+                    pool_key: None,
                 },
             ],
             "test-request",
@@ -1560,6 +1700,7 @@ mod tests {
                 server_key: crate::inventory::ALIAS_SERVER_KEY.to_string(),
                 allowed_tools: None,
                 list_error: None,
+                pool_key: None,
             }],
             "test-request",
         );

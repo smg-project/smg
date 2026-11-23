@@ -2,7 +2,7 @@
 
 use std::{
     future::Future,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -12,8 +12,11 @@ use axum::{
 };
 use futures::{future::Either, FutureExt};
 use openai_protocol::common::CachePartition;
-use smg_policy_controller::{engine::view::Phase, tracking::lease::ReleaseReason, WireModes};
-use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
+use parking_lot::Mutex;
+use smg_worker::identity::{
+    basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
+    sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL,
+};
 use tracing::{debug, error, warn};
 
 use super::{
@@ -22,27 +25,25 @@ use super::{
     pd_protocol::{EncodeHandoff, PdProtocol},
     ContextRequirements,
 };
-#[cfg(test)]
-use crate::observability::log_throttle::KeyedLogThrottle;
 use crate::{
     middleware::{tenant_resolution::AcceptedAt, SHED_RETRY_AFTER_SECS},
-    observability::metrics::{metrics_labels, Metrics},
+    observability::{
+        log_throttle::KeyedLogThrottle,
+        metrics::{metrics_labels, Metrics},
+    },
     policies::{
         hash_ring::HashRing, policy_reads_hash_ring, CacheNamespace, LoadBalancingPolicy,
         PolicyRegistry, SelectWorkerInfo, WorkerRole,
     },
-    policy_controller::{
-        self,
-        engine::{self, Ask, Placed, PolicyEngine},
-    },
     routers::{
         common::{
             attempt_ledger::AttemptLedger,
-            header_utils::extract_target_worker,
+            kv_transfer::is_moriio_worker,
             pair_index::{PdPairIndex, PdWire},
+            pd_admission::{self, PdAdmissionGuard, Tried},
             placement::{
-                self, CandidateFilter, PairFailure, PipelinePin, PlacementFailure, PlacementInputs,
-                RefusalSite,
+                self, CandidateFilter, PairFailure, PipelinePin, Placed, PlacementFailure,
+                PlacementInputs, RefusalSite,
             },
             prefill_admission::{
                 acquire_prefill, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
@@ -53,6 +54,7 @@ use crate::{
         },
         error,
         grpc::{
+            backend_client::{connected_backend_client, BackendClient},
             context::{
                 stage_output, DispatchContext, EncodeWorkerAssignment, ExecutionPlan,
                 PreparationOutput, RequestContext, RequestInput, RequestType, RoutingSnapshot,
@@ -65,11 +67,17 @@ use crate::{
 };
 
 /// Result type for PD worker pair selection: (prefill, decode, runtime_type)
+#[cfg(any(test, feature = "test-util"))]
 type PdWorkerPair = (Arc<dyn Worker>, Arc<dyn Worker>, RuntimeType);
 
-/// A pair attempt's workers, with the controller's placement where it
-/// placed them.
-type PdAttempt = (PdWorkerPair, Option<Placed>);
+/// A PD pair as the placement answers it: each worker as a [`Placed`],
+/// which that side's load guard is made from.
+type PlacedPdPair = (Placed, Placed, RuntimeType);
+
+/// A PD pair the Prefill admission seated: the prefill's handle, whose
+/// guard the admission made from its answer, and the decode as its
+/// placement answered it, which the dispatch makes its guard from.
+type AdmittedPdPair = (Arc<dyn Worker>, Placed, RuntimeType);
 
 /// The candidate predicate of a request carrying media references with no
 /// pipeline pin: only workers that process them themselves. The stage
@@ -79,7 +87,8 @@ type PdAttempt = (PdWorkerPair, Option<Placed>);
 const ACCEPTS_MEDIA_REFS: CandidateFilter<'static> = &accepts_media_refs;
 
 /// Why an EPD selection produced nothing: a full Prefill pool, unsupported
-/// media references, or a failure judged per role afterwards by
+/// media references, an encode item where the policy engine places the
+/// gateway's requests, or a failure judged per role afterwards by
 /// [`WorkerSelectionStage::selection_failure`].
 enum EpdSelectionFailure {
     Unavailable,
@@ -88,6 +97,9 @@ enum EpdSelectionFailure {
     DecodeVisionUnsupported,
     EncodeNotSupported,
     EncodeVisionUnsupported,
+    /// The policy engine places the gateway's requests, and it places no
+    /// encoder: a request that carries an encode item is not served.
+    EncodeUnderPolicyEngine,
 }
 
 impl PrefillCandidateError for EpdSelectionFailure {
@@ -119,10 +131,24 @@ impl PrefillCandidateError for PdSelectionFailure {
 }
 
 /// Result type for EPD worker selection: (encode assignments, prefill, decode, runtime_type).
+#[cfg(test)]
 type EncodePrefillDecodeWorkerSelection = (
     Vec<EncodeWorkerAssignment>,
     Arc<dyn Worker>,
     Arc<dyn Worker>,
+    RuntimeType,
+);
+
+/// An EPD selection as the placement answers its pair: the prefill and the
+/// decode each as a [`Placed`], which that side's load guard is made from.
+type PlacedEpdSelection = (Vec<EncodeWorkerAssignment>, Placed, Placed, RuntimeType);
+
+/// An EPD selection the Prefill admission seated, its pair as
+/// [`AdmittedPdPair`] holds one.
+type AdmittedEpdSelection = (
+    Vec<EncodeWorkerAssignment>,
+    Arc<dyn Worker>,
+    Placed,
     RuntimeType,
 );
 
@@ -131,15 +157,25 @@ type EncodePrefillDecodeWorkerSelection = (
 /// inside the gateway.
 pub(crate) const SELECTION_QUEUE_TIMEOUT_ERROR_CODE: &str = "selection_queue_timeout";
 
+/// Client-visible, gateway-owned code for a request refused ahead of its
+/// prefill/decode pair because it carries media for the model's encode
+/// workers and the gateway places its requests by the policy engine
+/// (`--policy-controller on`), which places no encoder.
+pub(crate) const ENCODE_UNDER_POLICY_ENGINE_CODE: &str = "encode_under_policy_engine";
+
+/// The lines of that refusal, a model at a time under the refusal lines'
+/// own allowance: a client that sends one such request sends the next
+/// alike.
+static ENCODE_UNDER_POLICY_ENGINE_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+    placement::REFUSAL_LINES_PER_SECOND,
+    Duration::from_secs(1),
+    placement::REFUSAL_LOG_MODELS,
+);
+
 /// Worker selection stage: Select appropriate worker(s) based on routing mode
 pub(crate) struct WorkerSelectionStage {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
-    policy_engine: Option<Arc<PolicyEngine>>,
-    /// Whether the pair's policy settings keep a request to the worker it
-    /// names ([`placement::pair_keeps_target`]). No role policy is built
-    /// under the policy controller, so the stage is told.
-    pair_keeps_target: bool,
     mode: WorkerSelectionMode,
     prefill_admission: Option<Arc<PrefillAdmission>>,
     /// The longest a request may have waited inside the gateway when it
@@ -167,25 +203,10 @@ impl WorkerSelectionStage {
         Self {
             worker_registry,
             policy_registry,
-            policy_engine: None,
-            pair_keeps_target: false,
             mode,
             prefill_admission,
             queue_timeout: None,
         }
-    }
-
-    /// Use the policy engine for regular selection when configured.
-    pub(crate) fn with_policy_engine(mut self, policy_engine: Option<Arc<PolicyEngine>>) -> Self {
-        self.policy_engine = policy_engine;
-        self
-    }
-
-    /// State whether the pair's policy settings keep a request to the worker
-    /// it names ([`placement::pair_keeps_target`]).
-    pub(crate) fn with_pair_keeps_target(mut self, keeps: bool) -> Self {
-        self.pair_keeps_target = keeps;
-        self
     }
 
     /// Refuse a request that reaches selection more than `timeout` after the
@@ -331,7 +352,7 @@ pub(crate) fn waited_past_timeout(
     (waited > timeout).then_some(waited)
 }
 
-fn disaggregated((prefill, decode, runtime_type): PdWorkerPair) -> WorkerSelection {
+fn disaggregated((prefill, decode, runtime_type): AdmittedPdPair) -> WorkerSelection {
     WorkerSelection::Disaggregated {
         encode_assignments: None,
         prefill,
@@ -381,10 +402,9 @@ struct SelectionInputs<'a> {
     ids: &'a [u32],
     headers: Option<&'a HeaderMap>,
     rid_key: Option<String>,
-    /// The body's `rid`, where the routing snapshot keeps it for the
-    /// retries: the classic sticky key derives from it, or a policy engine
-    /// stands, whose asks state it. Elsewhere no retry reads it and none is
-    /// copied.
+    /// The body's `rid` as the request states it: the placement is handed
+    /// it. The routing snapshot keeps it for the retries where the sticky
+    /// key derives from it. Elsewhere no retry reads it and none is copied.
     rid: Option<&'a str>,
     /// Whether the routing snapshot keeps a copy of the text: always without
     /// token ids, and with them only for a policy that reads text next to
@@ -435,7 +455,6 @@ impl<'a> SelectionInputs<'a> {
             .policy_registry
             .derive_rid_key(rid)
             .map(str::to_string);
-        let rid = rid.filter(|_| rid_key.is_some() || stage.policy_engine.is_some());
 
         // Text is copied only when a configured policy would actually read it
         // (see the `keep_text` field).
@@ -513,7 +532,10 @@ impl<'a> SelectionInputs<'a> {
                 .keep_text
                 .then(|| self.text.map(str::to_string))
                 .flatten(),
-            rid: self.rid.map(str::to_string),
+            rid: self
+                .rid
+                .filter(|_| self.rid_key.is_some())
+                .map(str::to_string),
             cache_namespace: self.cache_namespace,
             needs_vision: self.needs_vision,
             decode_needs_vision: self.demand.decode,
@@ -531,6 +553,7 @@ impl<'a> SelectionInputs<'a> {
             tokens: self.tokens(),
             headers: self.headers,
             rid_key: self.rid_key.as_deref(),
+            rid: self.rid,
             cache_namespace: self.cache_namespace,
             candidate_filter,
             tried: &[],
@@ -568,7 +591,7 @@ impl WorkerSelectionStage {
             .map(str::to_string);
         ctx.state.routing_snapshot = Some(inputs.snapshot());
 
-        let (workers, prefill_guard, placed) = self.pick(ctx, accepted, &inputs).await?;
+        let (workers, prefill_guard) = self.pick(ctx, accepted, &inputs).await?;
         if let Some(guard) = prefill_guard {
             ctx.state.pd_prefill_guard = Some(guard);
         }
@@ -612,20 +635,19 @@ impl WorkerSelectionStage {
         }
 
         ctx.state.workers = Some(workers);
-        ctx.state.placed = placed;
         Ok(())
     }
 
     /// The mode's pick over the gathered inputs: the single worker that
-    /// meets every demand with any controller placement, or the pair
-    /// admitted within the queue budget with its prefill slot, any encode
-    /// assignments and any controller placement.
+    /// meets every demand, or the pair admitted within the queue budget (with
+    /// the encode assignments in EPD mode) and the Prefill admission slot it
+    /// holds.
     async fn pick(
         &self,
         ctx: &RequestContext,
         accepted: Option<Instant>,
         inputs: &SelectionInputs<'_>,
-    ) -> Result<(WorkerSelection, Option<PrefillLoadGuard>, Option<Placed>), Response> {
+    ) -> Result<(WorkerSelection, Option<PrefillLoadGuard>), Response> {
         let model_id = inputs.model_id;
         let media = inputs.media;
         let context_requirements = inputs.context_requirements;
@@ -633,52 +655,47 @@ impl WorkerSelectionStage {
         let accepts_refs = |worker: &dyn Worker| media.accepts_refs(worker);
         let placement = inputs.placement(inputs.media_refs.then_some(&accepts_refs));
         let sticky_key = ctx.state.sticky_key.as_deref();
-        // Under a policy engine the controller places no encode stage yet: a
-        // request with encode items is refused by name, and one with none is a
-        // pair.
-        let mode = match self.mode {
-            WorkerSelectionMode::EncodePrefillDecode if self.policy_engine.is_some() => {
-                if inputs.media_refs || inputs.intermediate.is_some() {
-                    return Err(policy_controller::refused("encode items"));
-                }
-                WorkerSelectionMode::PrefillDecode
-            }
-            mode => mode,
-        };
-        match mode {
+        match self.mode {
             WorkerSelectionMode::Regular => {
-                let (worker, placed) = self
-                    .select_regular_attempt(
+                match self.select_regular(
+                    model_id,
+                    context_requirements,
+                    media,
+                    None,
+                    inputs.text,
+                    inputs.tokens(),
+                    inputs.headers,
+                    inputs.rid_key.as_deref(),
+                    inputs.rid,
+                    inputs.cache_namespace,
+                    wire,
+                    &[],
+                ) {
+                    Some(w) => Ok((WorkerSelection::Single { worker: w }, None)),
+                    None => Err(self.context_selection_failure(
                         model_id,
-                        context_requirements,
-                        media,
                         wire,
-                        PlacementInputs {
-                            candidate_filter: None,
-                            ..placement
-                        },
-                        Attempt::First(ctx),
-                    )
-                    .await?;
-                Ok((WorkerSelection::Single { worker }, None, placed))
+                        media,
+                        context_requirements,
+                    )),
+                }
             }
             WorkerSelectionMode::PrefillDecode => {
-                let ((pair, placed), guard) = self
+                let (pair, guard) = self
                     .admit_selection_within_budget(
                         ctx,
                         accepted,
-                        self.select_pd_attempt(
+                        self.admit_pd_pair(
                             model_id,
                             placement,
                             sticky_key,
                             wire,
                             media,
                             inputs.demand,
-                            Attempt::First(ctx),
                         ),
                     )
                     .await?;
-                Ok((disaggregated(pair), Some(guard), placed))
+                Ok((disaggregated(pair), Some(guard)))
             }
             WorkerSelectionMode::EncodePrefillDecode => {
                 let hashes = if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
@@ -741,7 +758,6 @@ impl WorkerSelectionStage {
                         runtime_type,
                     },
                     Some(guard),
-                    None,
                 ))
             }
         }
@@ -821,28 +837,32 @@ impl WorkerSelectionStage {
                 && decided_on.is_none_or(|decoding| decoding.decides_alike(worker))
         };
 
-        let (workers, placed) = match self.mode {
+        let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                let inputs = PlacementInputs {
+                match self.select_regular(
+                    model_id,
+                    context_requirements,
+                    media,
+                    Some(&admits),
                     text,
                     tokens,
                     headers,
                     rid_key,
+                    ctx.routing.rid.as_deref(),
                     cache_namespace,
-                    candidate_filter: Some(&admits),
-                    tried: &ctx.tried,
-                };
-                let (worker, placed) = self
-                    .select_regular_attempt(
-                        model_id,
-                        context_requirements,
-                        media,
-                        wire,
-                        inputs,
-                        Attempt::Retry(ctx),
-                    )
-                    .await?;
-                (WorkerSelection::Single { worker }, placed)
+                    wire,
+                    &ctx.tried,
+                ) {
+                    Some(w) => WorkerSelection::Single { worker: w },
+                    None => {
+                        return Err(self.context_selection_failure(
+                            model_id,
+                            wire,
+                            media,
+                            context_requirements,
+                        ))
+                    }
+                }
             }
             WorkerSelectionMode::PrefillDecode | WorkerSelectionMode::EncodePrefillDecode => {
                 let pinned = |worker: &dyn Worker| media.accepts_refs(worker) && admits(worker);
@@ -851,12 +871,13 @@ impl WorkerSelectionStage {
                     tokens,
                     headers,
                     rid_key,
+                    rid: ctx.routing.rid.as_deref(),
                     cache_namespace,
                     candidate_filter: Some(&pinned),
-                    tried: &[],
+                    tried: &ctx.tried,
                 };
-                let ((pair, placed), guard) = self
-                    .select_pd_attempt(
+                let (pair, guard) = self
+                    .admit_pd_pair(
                         model_id,
                         inputs,
                         ctx.sticky_key.as_deref(),
@@ -874,17 +895,131 @@ impl WorkerSelectionStage {
                         )
                         .with_media_refs(media_refs, ctx.wire.pipeline)
                         .with_context(context_requirements),
-                        Attempt::Retry(ctx),
                     )
                     .await?;
                 ctx.pd_prefill_guard = Some(guard);
-                (disaggregated(pair), placed)
+                disaggregated(pair)
             }
         };
 
         ctx.workers = Some(workers);
-        ctx.placed = placed;
         Ok(())
+    }
+
+    /// A pair's decode asked again behind its prefill's answer, for the
+    /// dispatch that sends one request's two sides one behind the other
+    /// ([`placement::decode_again`]). The stage states the request again
+    /// from what outlived it, as a retry's selection does, on the retained
+    /// plan's wire. `first` is the decode the dispatch holds, and `ahead`
+    /// its load guard.
+    ///
+    /// The pair index as it stands now is read by the placement's own call,
+    /// for a decode the policy engine placed and whose send was not said.
+    /// A classic pair reads nothing here.
+    ///
+    /// The route's rule for a decode the request may move to: the request's
+    /// ledger admits it, as at every selection; it takes the built request
+    /// ([`takes_the_built_request`]): it reads it as the first decode does,
+    /// in a window no narrower, and takes the media references the wire
+    /// forwards; the gateway holds its client, since a connect behind the
+    /// prefill's answer could fail a request the first decode would have
+    /// served; and its admission gate takes the request now, by one try
+    /// with no wait ([`pd_admission::try_admit_decode`]). The first decode
+    /// holds with no try: its client and its claim stand. A claim tried for
+    /// a decode the engine then passes over is given back at the next try,
+    /// and at the call's end.
+    ///
+    /// Answers the guard to keep, and the decode the request moved to where
+    /// it moved, with its client and its gate's claim.
+    pub(crate) fn decode_again(
+        &self,
+        request: &RequestAgain<'_>,
+        first: &Placed,
+        ahead: WorkerLoadGuard,
+    ) -> (Option<MovedDecode>, WorkerLoadGuard) {
+        let model_id = request.model_id;
+        // The index the placement reads, kept for the rule: the rule is
+        // asked behind that read.
+        let read: OnceLock<Arc<PdPairIndex>> = OnceLock::new();
+        let pairs = || {
+            let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+            let mode = self.policy_registry.pd_pairing_mode();
+            Arc::clone(read.get_or_init(|| snapshot.pd_pairs(PdWire::Grpc, mode)))
+        };
+        // What the decode the rule last said yes to brings with it. The
+        // engine asks the rule once a decode, best first, and takes the
+        // first it says yes to that is ready: that last yes is the decode
+        // the request moves to.
+        let brought: Mutex<Option<Brought>> = Mutex::new(None);
+        let takes_the_request = |worker: &dyn Worker| {
+            let mut brought = brought.lock();
+            *brought = None;
+            let alike = takes_the_built_request(&**first, worker, model_id, request.wire);
+            if !alike || !request.ledger.admits(worker) {
+                return false;
+            }
+            if same_worker(first.worker(), worker) {
+                return true;
+            }
+            let mut held = read
+                .get()
+                .into_iter()
+                .flat_map(|pairs| pairs.decode_pool.iter());
+            let Some(decode) = held.find(|held| same_worker(held, worker)) else {
+                return false;
+            };
+            let Some(client) = connected_backend_client(worker) else {
+                return false;
+            };
+            let claim = match pd_admission::try_admit_decode(decode, 1) {
+                Tried::NoWindow => None,
+                Tried::Claimed(claim) => Some(claim),
+                Tried::Full => return false,
+            };
+            *brought = Some(Brought {
+                decode: Arc::clone(decode),
+                client: (*client).clone(),
+                claim,
+            });
+            true
+        };
+        let rid = request.routing.rid.as_deref();
+        let inputs = PlacementInputs {
+            text: request.routing.routing_text.as_deref(),
+            tokens: Some(request.tokens).filter(|ids| !ids.is_empty()),
+            headers: request.headers,
+            rid_key: self.policy_registry.derive_rid_key(rid),
+            rid,
+            cache_namespace: request.routing.cache_namespace,
+            candidate_filter: Some(&takes_the_request),
+            tried: request.tried,
+        };
+        let (moved, guard) = placement::decode_again(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            &pairs,
+            Some(request.wire),
+            inputs,
+            first,
+            ahead,
+        );
+        let brought = brought.into_inner();
+        let moved = moved.and_then(|decode| {
+            debug_assert!(
+                brought
+                    .as_ref()
+                    .is_some_and(|brought| Arc::ptr_eq(&brought.decode, decode.worker())),
+                "the rule's last yes was to the decode the engine took"
+            );
+            let Brought { client, claim, .. } = brought?;
+            Some(MovedDecode {
+                decode,
+                client,
+                claim,
+            })
+        });
+        (moved, guard)
     }
 
     /// Keep known grid-bearing decode identities on vision-capable workers.
@@ -928,14 +1063,19 @@ impl WorkerSelectionStage {
         wire: Option<WireConstraint>,
         media: MediaDemands,
         demand: PairDemands,
-    ) -> Result<(PdWorkerPair, PrefillLoadGuard), Response> {
+    ) -> Result<(AdmittedPdPair, PrefillLoadGuard), Response> {
         acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
-            |(prefill, _, _): &PdWorkerPair| prefill,
-            |capacity| self.select_pd_pair(model_id, inputs, wire, capacity, demand),
+            |(prefill, _, _): &PlacedPdPair| prefill,
+            |capacity| self.placed_pd_pair(model_id, inputs, wire, capacity, demand),
         )
         .await
+        // The prefill's side went into its guard. The dispatch makes the
+        // decode's guard from its answer.
+        .map(|((prefill, decode, runtime), guard)| {
+            ((prefill.into_guarded_worker(), decode, runtime), guard)
+        })
         .map_err(|error| {
             Self::acquire_failure(model_id, error, |failure| {
                 self.pd_selection_failure(model_id, failure, media)
@@ -951,13 +1091,13 @@ impl WorkerSelectionStage {
         sticky_key: Option<&str>,
         encode_item_hashes: &[Vec<u8>],
         demand: EpdDemands,
-    ) -> Result<(EncodePrefillDecodeWorkerSelection, PrefillLoadGuard), Response> {
+    ) -> Result<(AdmittedEpdSelection, PrefillLoadGuard), Response> {
         acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
-            |(_, prefill, _, _): &EncodePrefillDecodeWorkerSelection| prefill,
+            |(_, prefill, _, _): &PlacedEpdSelection| prefill,
             |capacity| {
-                self.select_encode_prefill_decode_workers(
+                self.placed_encode_prefill_decode_workers(
                     model_id,
                     inputs,
                     encode_item_hashes,
@@ -967,6 +1107,12 @@ impl WorkerSelectionStage {
             },
         )
         .await
+        // As for a PD pair: the prefill's side went into its guard, and the
+        // dispatch makes the decode's guard from its answer.
+        .map(|((assignments, prefill, decode, runtime), guard)| {
+            let prefill = prefill.into_guarded_worker();
+            ((assignments, prefill, decode, runtime), guard)
+        })
         .map_err(|error| {
             Self::acquire_failure(model_id, error, |failure| {
                 match failure {
@@ -987,6 +1133,9 @@ impl WorkerSelectionStage {
                     }
                     EpdSelectionFailure::DecodeVisionUnsupported => {
                         return self.vision_refusal(model_id, "decode workers")
+                    }
+                    EpdSelectionFailure::EncodeUnderPolicyEngine => {
+                        return self.encode_under_policy_engine(model_id)
                     }
                     EpdSelectionFailure::Unavailable => {}
                 }
@@ -1023,6 +1172,104 @@ impl WorkerSelectionStage {
             }
         }
     }
+}
+
+/// What a dispatch hands the selection stage to state its request again,
+/// for a pair's decode asked again behind its prefill
+/// ([`WorkerSelectionStage::decode_again`]): what outlived the parsed
+/// request, as a retry's selection reads it.
+pub(crate) struct RequestAgain<'a> {
+    pub model_id: &'a str,
+    pub routing: &'a RoutingSnapshot,
+    pub headers: Option<&'a HeaderMap>,
+    /// The prompt's token ids, off the request the decode is sent.
+    pub tokens: &'a [u32],
+    /// The retained plan's wire: the decode's request was built for it.
+    pub wire: WireConstraint,
+    /// The engines the request's failed attempts were sent to.
+    pub tried: &'a [String],
+    pub ledger: &'a AttemptLedger,
+}
+
+/// A decode a request moved to behind its prefill: its placement's answer,
+/// the client the gateway held for it ahead of the move, and what its
+/// admission gate seated for the dispatch, `None` where its engine reports
+/// no window.
+pub(crate) struct MovedDecode {
+    pub decode: Placed,
+    pub client: BackendClient,
+    pub claim: Option<PdAdmissionGuard>,
+}
+
+/// What the route's rule holds for a decode it said yes to, where the
+/// request would move to it ([`WorkerSelectionStage::decode_again`]): the
+/// decode, its client and its gate's claim.
+struct Brought {
+    decode: Arc<dyn Worker>,
+    client: BackendClient,
+    claim: Option<PdAdmissionGuard>,
+}
+
+/// Whether `held` and `worker` name one worker object.
+fn same_worker(held: &Arc<dyn Worker>, worker: &dyn Worker) -> bool {
+    std::ptr::addr_eq(Arc::as_ptr(held), std::ptr::from_ref(worker))
+}
+
+/// Whether the decode request built for `first` may go to `worker` in its
+/// place: `worker` reads it as `first` does ([`reads_the_request_alike`]),
+/// in a window no narrower ([`holds_what_the_first_holds`]), and takes the
+/// media references the retained plan's wire forwards, on the side of its
+/// pipeline pin, as every selection asks of a candidate
+/// ([`MediaDemands::accepts_refs`]). A decode request can keep its
+/// references: a request of more than one sample works its prompt out again
+/// on its decode, and a decode that processes none would refuse it.
+fn takes_the_built_request(
+    first: &dyn Worker,
+    worker: &dyn Worker,
+    model: &str,
+    wire: WireConstraint,
+) -> bool {
+    reads_the_request_alike(first, worker)
+        && holds_what_the_first_holds(first, worker, model)
+        && MediaDemands::NONE
+            .with_wire(Some(wire))
+            .accepts_refs(worker)
+}
+
+/// Whether `worker` reads a decode request built for `first` as `first`
+/// does. The request is built whole before the prefill goes out, for the
+/// decode the first decision named, and nothing shapes it again behind a
+/// second ask. So a decode that takes it runs the first one's runtime on
+/// the first one's connection, constrains a turn by the same labels,
+/// samples by the same defaults, and handles media the same way. It is no
+/// MoRI-IO engine, whose prefill would have been told its decode.
+fn reads_the_request_alike(first: &dyn Worker, worker: &dyn Worker) -> bool {
+    worker.connection_mode() == first.connection_mode()
+        && worker.metadata().spec.runtime_type == first.metadata().spec.runtime_type
+        && worker.metadata().decoding == first.metadata().decoding
+        && sampling_defaults(worker) == sampling_defaults(first)
+        && multimodal::worker_language_model_only(worker)
+            == multimodal::worker_language_model_only(first)
+        && !is_moriio_worker(worker)
+}
+
+/// Whether `worker`'s context window for `model` holds every request that
+/// `first`'s holds. The request's sizes were checked against the first
+/// decode alone, where the pair was placed with no window demand stated. A
+/// worker that states no window binds nothing, as at that check.
+fn holds_what_the_first_holds(first: &dyn Worker, worker: &dyn Worker, model: &str) -> bool {
+    match (first.context_length(model), worker.context_length(model)) {
+        (_, None) => true,
+        (Some(first), Some(window)) => window >= first,
+        (None, Some(_)) => false,
+    }
+}
+
+/// The sampling defaults a worker's label states, which request building
+/// lays under a request for its decode worker.
+fn sampling_defaults(worker: &dyn Worker) -> Option<&String> {
+    let labels = &worker.metadata().spec.labels;
+    labels.get(DEFAULT_SAMPLING_PARAMS_LABEL)
 }
 
 /// Candidate predicate for requests carrying media references.
@@ -1220,100 +1467,6 @@ fn pair_admitted_by(
         })
 }
 
-/// A shape of attempt the controller does not place yet.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Shape {
-    /// A media input.
-    Media,
-    /// A context demand a worker's window binds.
-    Window,
-    /// An explicit target worker the classic would keep.
-    Target,
-    /// A retry under a decoding rule.
-    RetryUnderRule,
-}
-
-impl Shape {
-    /// The shape's name in the refusal.
-    fn name(self) -> &'static str {
-        match self {
-            Self::Media => "media input",
-            Self::Window => "a context demand a worker's window binds",
-            Self::Target => "an explicit target worker",
-            Self::RetryUnderRule => "a retry under a decoding rule",
-        }
-    }
-
-    /// The answer to an attempt of this shape: the refusal by name. A
-    /// context demand no window holds is the client's to fix, so there the
-    /// classic's 400 answers, as with no policy engine. `unheld` gives it, and
-    /// gives none where a window holds the demand: such a request could be
-    /// served, and the controller cannot place by its demand yet.
-    fn refusal(self, unheld: impl FnOnce() -> Option<Response>) -> Response {
-        (self == Self::Window)
-            .then(unheld)
-            .flatten()
-            .unwrap_or_else(|| policy_controller::refused(self.name()))
-    }
-}
-
-/// The request state still available when an attempt selects.
-enum Attempt<'a> {
-    First(&'a RequestContext),
-    Retry(&'a DispatchContext),
-}
-
-impl<'a> Attempt<'a> {
-    /// The facts still available for the controller's ask, under the
-    /// gateway's own `id` for it and with the prompt's `hashes`. Nothing a
-    /// client sent names an ask. The request's headers and its own `rid`
-    /// are the sources of its routing key: a first attempt states both, and
-    /// a retry states the two as the request left them behind.
-    fn ask(self, model: &'a str, id: &'a [u8], hashes: &'a engine::Hashes) -> Ask<'a> {
-        let (streaming, headers, rid, tried) = match self {
-            Self::First(ctx) => (
-                ctx.is_streaming(),
-                ctx.input.headers.as_ref(),
-                ctx.input.request_type.rid(),
-                &[][..],
-            ),
-            Self::Retry(ctx) => (
-                ctx.streaming,
-                ctx.headers.as_ref(),
-                ctx.routing.rid.as_deref(),
-                &ctx.tried_rows[..],
-            ),
-        };
-        Ask {
-            streaming,
-            headers,
-            rid,
-            tried,
-            hashes: Some(hashes),
-            ..Ask::of(id, model)
-        }
-    }
-
-    /// The ledger of the request's attempts, where this is a retry: a
-    /// worker that answered the request definitively takes no next attempt.
-    fn ledger(&self) -> Option<&'a AttemptLedger> {
-        match self {
-            Self::First(_) => None,
-            Self::Retry(ctx) => Some(&ctx.ledger),
-        }
-    }
-
-    /// The retry number, `0` for the first attempt, as the retry loop
-    /// counts it. A pair's ask states it: a failed pair names two rows, so
-    /// the count of the tried rows is not its number.
-    fn number(&self) -> u8 {
-        match self {
-            Self::First(_) => 0,
-            Self::Retry(ctx) => u8::try_from(ctx.attempt).unwrap_or(u8::MAX),
-        }
-    }
-}
-
 /// What a retry's media demands of a candidate. The retained wire carries
 /// the media-refs pin and the pipeline pin, the routing snapshot the
 /// pixel-media fact.
@@ -1322,39 +1475,6 @@ fn retry_media(ctx: &DispatchContext) -> MediaDemands {
         media_refs: ctx.wire.requires_media_refs,
         vision: ctx.routing.needs_vision,
         pipeline: ctx.wire.pipeline,
-    }
-}
-
-/// The wires a route of the gRPC pipeline dials, as its ask states them:
-/// the one connection `wire` pins, else both wires the pipeline speaks. The
-/// controller then places among the rows that serve one of them. A row on
-/// another wire is never named, where the route's rule could only pass it
-/// over.
-fn route_wires(wire: Option<WireConstraint>) -> WireModes {
-    match wire.map(|wire| wire.connection) {
-        Some(ConnectionMode::Http) => WireModes::HTTP,
-        Some(ConnectionMode::Grpc) => WireModes::GRPC,
-        Some(ConnectionMode::Zmq) => WireModes::ZMQ,
-        None => WireModes::GRPC.union(WireModes::ZMQ),
-    }
-}
-
-/// The route's rule for a worker of `pool`, built from the classic
-/// selection's own rules: the pool's match, the request's wire, and on a
-/// retry the ledger's admit. The controller reads none of them. At a
-/// commit a target one of them refuses is passed over like one the gateway
-/// cannot send to: a regular target, or a pair either of whose workers its
-/// own pool's rule refuses. A demand the controller keeps ahead of its
-/// stages takes this function's place once a request can state it.
-fn on_route<'a>(
-    pool: RoutingPool,
-    wire: Option<WireConstraint>,
-    ledger: Option<&'a AttemptLedger>,
-) -> impl Fn(&dyn Worker) -> bool + Send + Sync + 'a {
-    move |worker| {
-        pool.matches(worker)
-            && WireConstraint::admits(wire, worker)
-            && ledger.is_none_or(|ledger| ledger.admits(worker))
     }
 }
 
@@ -1861,6 +1981,35 @@ impl WorkerSelectionStage {
         )
     }
 
+    /// The gateway places its requests by the policy engine
+    /// (`--policy-controller on`), which places a prefill/decode pair and no
+    /// encoder: a request that carries media for the model's encode workers
+    /// is not served, whatever the pools hold. A 501, as the gateway answers
+    /// a kind of request that one of its routes does not serve. A 501 is
+    /// terminal for the retry layer by status, and no retry changes this
+    /// answer. Its line is written under the refusal lines' allowance.
+    fn encode_under_policy_engine(&self, model_id: &str) -> Response {
+        if let Some(admitted) = ENCODE_UNDER_POLICY_ENGINE_LOG.admit(model_id) {
+            warn!(
+                function = "WorkerSelectionStage::execute",
+                mode = ?self.mode,
+                model_id = %model_id,
+                code = ENCODE_UNDER_POLICY_ENGINE_CODE,
+                suppressed = admitted.suppressed,
+                "Refused a request that carries media for the encode workers: the policy engine places no encoder"
+            );
+        }
+        error::not_implemented(
+            ENCODE_UNDER_POLICY_ENGINE_CODE,
+            format!(
+                "model '{model_id}' takes a request's media on encode workers, and this gateway \
+                 runs with --policy-controller on, which places no request on encode workers \
+                 yet: send the request without media, or to a gateway that runs with \
+                 --policy-controller off"
+            ),
+        )
+    }
+
     /// The response for a failed pair placement. The verdict was judged from
     /// the role's own candidates inside the placement, so a shed is answered
     /// as it was built and counted once; a role nobody serves is a 404 unless
@@ -1951,310 +2100,6 @@ impl WorkerSelectionStage {
         )
     }
 
-    /// Whether the classic holds a request with these `headers` to the
-    /// worker it names ([`placement::strict_target`]): the policy of the
-    /// stage's mode reads an explicit target. The controller reads none
-    /// yet, and would place the request on another worker in silence. The
-    /// header is asked first, so a request that names nobody asks no policy.
-    ///
-    /// A regular request asks its model's policy, as the classic selection
-    /// does. A pair asks its settings: no role policy is built under the
-    /// controller, and the registry would answer for the main one.
-    fn strict_target(&self, model_id: &str, headers: Option<&HeaderMap>) -> bool {
-        extract_target_worker(headers).is_some()
-            && match self.mode {
-                WorkerSelectionMode::Regular => {
-                    let policy = self.policy_registry.get_policy_or_default(model_id);
-                    placement::strict_target(policy.as_ref(), headers)
-                }
-                WorkerSelectionMode::PrefillDecode | WorkerSelectionMode::EncodePrefillDecode => {
-                    self.pair_keeps_target
-                }
-            }
-    }
-
-    /// The shape of an attempt the controller does not place yet, or none:
-    /// a `media` input, a `context` demand a window of `pools` binds, an
-    /// explicit target in `headers` the classic would keep, a retry under a
-    /// decoding rule. The store builds the candidates and reads none of
-    /// these demands. The commit's rule only passes a target over, and a
-    /// demand few workers meet could end the asks with no worker. So these
-    /// shapes are refused by name until a request can state them, but for a
-    /// demand no window holds ([`Shape::refusal`]).
-    fn undecided(
-        &self,
-        model_id: &str,
-        context: ContextRequirements,
-        pools: &[RoutingPool],
-        media: bool,
-        headers: Option<&HeaderMap>,
-        retry_under_rule: bool,
-    ) -> Option<Shape> {
-        if media {
-            return Some(Shape::Media);
-        }
-        let demand = context.left_by(
-            &self.worker_registry.get_routing_snapshot(model_id),
-            pools,
-            model_id,
-        );
-        if !demand.binds_nobody() {
-            return Some(Shape::Window);
-        }
-        if self.strict_target(model_id, headers) {
-            return Some(Shape::Target);
-        }
-        retry_under_rule.then_some(Shape::RetryUnderRule)
-    }
-
-    /// Whether a retry of `ctx` can be placed at all. Under the controller's
-    /// policy engine a retry of a shape the stage refuses by name has no next
-    /// attempt: the refusal must not stand where a worker's failure does.
-    /// The classic selection answers every retry itself.
-    pub(crate) fn places_retry(&self, ctx: &DispatchContext) -> bool {
-        if self.policy_engine.is_none() {
-            return true;
-        }
-        let media = retry_media(ctx) != MediaDemands::NONE;
-        let (prefill_pool, decode_pool) = PdWire::Grpc.pools();
-        let (pools, media): (&[RoutingPool], bool) = match self.mode {
-            WorkerSelectionMode::Regular => (&[RoutingPool::GrpcPipelineRegular], media),
-            WorkerSelectionMode::PrefillDecode | WorkerSelectionMode::EncodePrefillDecode => (
-                &[prefill_pool, decode_pool],
-                media || ctx.routing.decode_needs_vision,
-            ),
-        };
-        self.undecided(
-            &ctx.model_id,
-            ctx.routing.context_requirements,
-            pools,
-            media,
-            ctx.headers.as_ref(),
-            ctx.constraint_decided_on.is_some(),
-        )
-        .is_none()
-    }
-
-    /// Place a regular attempt through the configured policy engine or the classic
-    /// policies.
-    async fn select_regular_attempt(
-        &self,
-        model_id: &str,
-        context: ContextRequirements,
-        media: MediaDemands,
-        wire: Option<WireConstraint>,
-        inputs: PlacementInputs<'_>,
-        attempt: Attempt<'_>,
-    ) -> Result<(Arc<dyn Worker>, Option<Placed>), Response> {
-        let no_worker = || self.context_selection_failure(model_id, wire, media, context);
-        let Some(policy_engine) = self.policy_engine.as_ref() else {
-            return self
-                .select_regular(
-                    model_id,
-                    context,
-                    media,
-                    inputs.candidate_filter,
-                    inputs.text,
-                    inputs.tokens,
-                    inputs.headers,
-                    inputs.rid_key,
-                    inputs.cache_namespace,
-                    wire,
-                    inputs.tried,
-                )
-                .map(|worker| (worker, None))
-                .ok_or_else(no_worker);
-        };
-
-        let under_rule =
-            matches!(attempt, Attempt::Retry(ctx) if ctx.constraint_decided_on.is_some());
-        let pools = [RoutingPool::GrpcPipelineRegular];
-        let media_input = media != MediaDemands::NONE;
-        let shape = self.undecided(
-            model_id,
-            context,
-            &pools,
-            media_input,
-            inputs.headers,
-            under_rule,
-        );
-        if let Some(shape) = shape {
-            return Err(shape.refusal(|| {
-                let capable = self.capable_regular(model_id, wire, media.with_wire(wire));
-                unheld_by(&capable, context, model_id)
-            }));
-        }
-
-        let prompt = engine::Prompt::of(inputs.tokens, inputs.cache_namespace);
-        let hashes = policy_engine.hashes(model_id, &prompt);
-        let id = engine::mark();
-        let rule = on_route(RoutingPool::GrpcPipelineRegular, wire, attempt.ledger());
-        let ask = Ask {
-            wires: route_wires(wire),
-            ..attempt.ask(model_id, &id, &hashes)
-        };
-        let placed = policy_engine
-            .place_where(&ask, rule, Instant::now())
-            .await
-            .map_err(|unplaced| unplaced.answer(model_id))?;
-        Ok((Arc::clone(placed.worker()), Some(placed)))
-    }
-
-    /// A pair attempt's workers with the prefill's admission guard: placed
-    /// by the policy controller where the stage holds a policy engine, else
-    /// selected by [`Self::admit_pd_pair`] with the same arguments as before.
-    ///
-    /// Returned as a future, as [`Self::admit_within_budget`] is: the
-    /// arguments move into the one arm that runs and are kept once. The
-    /// hosted arm is boxed: its future is the larger by some four hundred
-    /// bytes, and by value it would size the stage's future for every
-    /// request, placed or not.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the pair's selection threads every input the classic placement consumes"
-    )]
-    fn select_pd_attempt<'a>(
-        &'a self,
-        model_id: &'a str,
-        inputs: PlacementInputs<'a>,
-        sticky_key: Option<&'a str>,
-        wire: Option<WireConstraint>,
-        media: MediaDemands,
-        demand: PairDemands,
-        attempt: Attempt<'a>,
-    ) -> impl Future<Output = Result<(PdAttempt, PrefillLoadGuard), Response>> + 'a {
-        match self.policy_engine.as_ref() {
-            Some(policy_engine) => Either::Left(Box::pin(self.place_pd_pair(
-                policy_engine,
-                model_id,
-                inputs,
-                sticky_key,
-                wire,
-                media,
-                demand,
-                attempt,
-            ))),
-            None => Either::Right(
-                self.admit_pd_pair(model_id, inputs, sticky_key, wire, media, demand)
-                    .map(|admitted| admitted.map(|(pair, guard)| ((pair, None), guard))),
-            ),
-        }
-    }
-
-    /// A pair attempt placed by the controller through `policy_engine`, with
-    /// the prefill's admission guard. The checks ahead of the ask are the
-    /// regular helper's, in the pair's words. The ask states the prefill
-    /// phase, and the prompt's size is its hashes' count. The pair's
-    /// runtime is its prefill worker's.
-    ///
-    /// The ask states the wires the route dials, so the controller names no
-    /// pair on another wire. The pair's commit takes the route's rule a side
-    /// at a time, and passes over a pair either of whose workers it refuses:
-    /// one off its pool, or one a retry's pin or ledger refuses. No rule of
-    /// a side tells a pair of two runtimes. Such a pair is still given up as
-    /// a failed commit and refused, as the regular helper refuses an attempt
-    /// no target holds.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the pair's selection threads every input the classic placement consumes"
-    )]
-    async fn place_pd_pair(
-        &self,
-        policy_engine: &Arc<PolicyEngine>,
-        model_id: &str,
-        inputs: PlacementInputs<'_>,
-        sticky_key: Option<&str>,
-        wire: Option<WireConstraint>,
-        media: MediaDemands,
-        demand: PairDemands,
-        attempt: Attempt<'_>,
-    ) -> Result<(PdAttempt, PrefillLoadGuard), Response> {
-        let (prefill_pool, decode_pool) = PdWire::Grpc.pools();
-        let under_rule =
-            matches!(attempt, Attempt::Retry(ctx) if ctx.constraint_decided_on.is_some());
-        let media_input =
-            media != MediaDemands::NONE || demand.prefill || demand.decode || demand.refs;
-        let pools = [prefill_pool, decode_pool];
-        let shape = self.undecided(
-            model_id,
-            demand.context,
-            &pools,
-            media_input,
-            inputs.headers,
-            under_rule,
-        );
-        if let Some(shape) = shape {
-            return Err(shape.refusal(|| {
-                let snapshot = self.worker_registry.get_routing_snapshot(model_id);
-                let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
-                pair_unheld_by(&pairs, wire, demand.context, model_id, &|_: &dyn Worker| {
-                    true
-                })
-                .err()
-            }));
-        }
-
-        // Named a fact at a time over the default, so a prompt that learns
-        // another fact still builds here with that fact unstated.
-        let prompt = engine::Prompt {
-            tokens: inputs.tokens,
-            ..engine::Prompt::default()
-        };
-        let prompt = engine::Prompt {
-            namespace: inputs.cache_namespace,
-            ..prompt
-        };
-        let hashes = policy_engine.hashes(model_id, &prompt);
-        let id = engine::mark();
-        let ledger = attempt.ledger();
-        let ask = Ask {
-            phase: Phase::Prefill,
-            // The sequential dispatch asks the decode again behind its
-            // prefill's answer.
-            decode_again: true,
-            attempt: Some(attempt.number()),
-            wires: route_wires(wire),
-            ..attempt.ask(model_id, &id, &hashes)
-        };
-        // A worker passes the rule of its own pool: a pool matches its own
-        // type alone.
-        let on_prefill = on_route(prefill_pool, wire, ledger);
-        let on_decode = on_route(decode_pool, wire, ledger);
-        let (mut placed, guard) = policy_engine
-            .place_pair_where(
-                &ask,
-                |worker| on_prefill(worker) || on_decode(worker),
-                self.prefill_admission.as_deref(),
-                sticky_key,
-            )
-            .await
-            .map_err(|unplaced| unplaced.answer(model_id))?;
-        let prefill = Arc::clone(placed.worker());
-        let runtime = prefill.metadata().spec.runtime_type;
-        let decode = placed
-            .decode()
-            .filter(|decode| decode.metadata().spec.runtime_type == runtime)
-            .cloned();
-        let Some(decode) = decode else {
-            placed.released(ReleaseReason::CommitFailed, Instant::now());
-            return Err(engine::Unplaced::NoTargetHolds.answer(model_id));
-        };
-        // Under a document that picks the decode after the prefill the
-        // decode stands chosen, and the dispatch asks it again stages from
-        // here. The placement keeps the ask for that, with the route's rule
-        // of this commit for a decode: its pool, its wire, the prefill's
-        // runtime. The request's ledger is read at the second ask.
-        if placed.decode_waits() {
-            let on_decode_route = move |worker: &dyn Worker| {
-                on_route(decode_pool, wire, None)(worker)
-                    && worker.metadata().spec.runtime_type == runtime
-            };
-            let kept = engine::KeptAsk::of(policy_engine, &ask, on_decode_route);
-            placed.keep_ask(kept.with_hashes(hashes));
-        }
-        Ok((((prefill, decode, runtime), Some(placed)), guard))
-    }
-
     /// One attempt's single worker from the regular pool. One snapshot
     /// answers both: what its pool's windows leave of the context demand
     /// ([`ContextRequirements::left_by`]), and the candidates. `admits` is
@@ -2276,10 +2121,11 @@ impl WorkerSelectionStage {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
+        rid: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
         tried: &[String],
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Option<Placed> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let context = context.left_by(&snapshot, &[RoutingPool::GrpcPipelineRegular], model_id);
         let accepts = |worker: &dyn Worker| {
@@ -2300,6 +2146,7 @@ impl WorkerSelectionStage {
             tokens,
             headers,
             rid_key,
+            rid,
             cache_namespace,
             wire,
             candidate_filter,
@@ -2332,11 +2179,13 @@ impl WorkerSelectionStage {
             tokens,
             headers,
             rid_key,
+            None,
             cache_namespace,
             wire,
             candidate_filter,
             &[],
         )
+        .map(Placed::into_worker)
     }
 
     /// One attempt's single worker from the regular pool of `snapshot`, the
@@ -2356,11 +2205,12 @@ impl WorkerSelectionStage {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
+        rid: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
         candidate_filter: Option<CandidateFilter<'_>>,
         tried: &[String],
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Option<Placed> {
         // A retry pins the retained wire, and with it the media pin and the
         // pipeline pin, on top of whatever the caller excludes.
         let pipeline = wire.map_or(PipelinePin::Any, |w| w.pipeline);
@@ -2383,13 +2233,15 @@ impl WorkerSelectionStage {
             &self.worker_registry,
             &self.policy_registry,
             model_id,
-            Arc::clone(snapshot.pool(RoutingPool::GrpcPipelineRegular)),
+            snapshot,
+            RoutingPool::GrpcPipelineRegular,
             wire,
             PlacementInputs {
                 text,
                 tokens,
                 headers,
                 rid_key,
+                rid,
                 cache_namespace,
                 candidate_filter,
                 tried,
@@ -2454,14 +2306,17 @@ impl WorkerSelectionStage {
 
     /// Apply media and context constraints within the existing compatible-pair
     /// index, then let the configured policies and admission choose the roles.
-    fn select_pd_pair(
+    ///
+    /// Each worker is answered as the placement answers it ([`Placed`]):
+    /// the route makes that side's load guard from it.
+    fn placed_pd_pair(
         &self,
         model_id: &str,
         inputs: PlacementInputs<'_>,
         wire: Option<WireConstraint>,
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
         demand: PairDemands,
-    ) -> Result<PdWorkerPair, PdSelectionFailure> {
+    ) -> Result<PlacedPdPair, PdSelectionFailure> {
         // One snapshot answers both: the pair index, and what the windows
         // of its two pools leave of the context demand. Both pools derive
         // from ONE membership snapshot: separate pool lookups could straddle
@@ -2491,6 +2346,25 @@ impl WorkerSelectionStage {
             )
         })?;
         Ok((pair.prefill, pair.decode, pair.runtime))
+    }
+
+    /// [`Self::placed_pd_pair`] with the two workers alone, for a caller
+    /// that sends the pair no request: a bench's placement, a case. An
+    /// engine's side of the request is let go here, which the engine hears
+    /// as a release.
+    #[cfg(any(test, feature = "test-util"))]
+    fn select_pd_pair(
+        &self,
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        wire: Option<WireConstraint>,
+        prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+        demand: PairDemands,
+    ) -> Result<PdWorkerPair, PdSelectionFailure> {
+        self.placed_pd_pair(model_id, inputs, wire, prefill_capacity, demand)
+            .map(|(prefill, decode, runtime)| {
+                (prefill.into_worker(), decode.into_worker(), runtime)
+            })
     }
 
     /// The per-request narrowing of a pair placement over `pairs`, then
@@ -2588,16 +2462,34 @@ impl WorkerSelectionStage {
     ///
     /// Full Prefill pools wait for admission; unsupported references are
     /// refused explicitly, while other failures are judged per role.
-    fn select_encode_prefill_decode_workers(
+    ///
+    /// The prefill and the decode are each answered as the placement
+    /// answers a worker ([`Placed`]): the route makes that side's load
+    /// guard from it.
+    ///
+    /// This is the encode stage's own selection, the fifth of the functions
+    /// that choose a worker, and it holds that function's arm for the policy
+    /// engine. The engine places the pair, through
+    /// [`placement::select_pair`], and no encoder. Where the gateway started
+    /// the engine, a request that carries an encode item is refused by name
+    /// ahead of the pair ([`Self::encode_under_policy_engine`]). A request
+    /// with no item is placed on the engine's pair, and the lines below
+    /// assign it no encoder and ask no policy.
+    fn placed_encode_prefill_decode_workers(
         &self,
         model_id: &str,
         inputs: PlacementInputs<'_>,
         encode_item_hashes: &[Vec<u8>],
         demand: EpdDemands,
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
-    ) -> Result<EncodePrefillDecodeWorkerSelection, EpdSelectionFailure> {
+    ) -> Result<PlacedEpdSelection, EpdSelectionFailure> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let needs_encode = !encode_item_hashes.is_empty();
+        // The engine's arm. An item is refused ahead of the pair, so the
+        // engine is told of no request that it would then have to give up.
+        if needs_encode && self.policy_registry.engine().is_some() {
+            return Err(EpdSelectionFailure::EncodeUnderPolicyEngine);
+        }
         let mut available_encode = Self::available_workers(&snapshot, RoutingPool::GrpcEncode);
         // An encoder serves the request by its runtime's encode handoff: a
         // push encoder must advertise the producer role of a connector and
@@ -2702,7 +2594,7 @@ impl WorkerSelectionStage {
         let pairs_with_prefill = |worker: &Arc<dyn Worker>| {
             worker.metadata().spec.runtime_type == pair.runtime
                 && (handoff != Some(EncodeHandoff::Push)
-                    || ec_pair(worker.as_ref(), pair.prefill.as_ref()))
+                    || ec_pair(worker.as_ref(), &*pair.prefill))
         };
         // Only image-only reference requests can merge a push encoder's prompt updates.
         let prompt_hash;
@@ -2733,6 +2625,34 @@ impl WorkerSelectionStage {
         )
         .ok_or(EpdSelectionFailure::Unavailable)?;
         Ok((assignments, pair.prefill, pair.decode, pair.runtime))
+    }
+
+    /// [`Self::placed_encode_prefill_decode_workers`] with the pair's two
+    /// workers alone, for a case, which sends them no request.
+    #[cfg(test)]
+    fn select_encode_prefill_decode_workers(
+        &self,
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        encode_item_hashes: &[Vec<u8>],
+        demand: EpdDemands,
+        prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+    ) -> Result<EncodePrefillDecodeWorkerSelection, EpdSelectionFailure> {
+        self.placed_encode_prefill_decode_workers(
+            model_id,
+            inputs,
+            encode_item_hashes,
+            demand,
+            prefill_capacity,
+        )
+        .map(|(assignments, prefill, decode, runtime)| {
+            (
+                assignments,
+                prefill.into_worker(),
+                decode.into_worker(),
+                runtime,
+            )
+        })
     }
 }
 
@@ -2904,19 +2824,22 @@ impl SelectionBench {
     /// One regular placement of a request carrying `tokens`, as the stage
     /// runs a first attempt's.
     pub fn place(&self, tokens: Option<&[u32]>) -> Option<Arc<dyn Worker>> {
-        self.stage.select_regular(
-            &self.model,
-            self.context,
-            MediaDemands::NONE,
-            None,
-            None,
-            tokens,
-            None,
-            None,
-            None,
-            None,
-            &[],
-        )
+        self.stage
+            .select_regular(
+                &self.model,
+                self.context,
+                MediaDemands::NONE,
+                None,
+                None,
+                tokens,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .map(Placed::into_worker)
     }
 
     /// One pair placement of a request carrying `tokens`, as the stage runs
@@ -2937,7 +2860,7 @@ impl SelectionBench {
 #[cfg(test)]
 mod tests {
     mod lora;
-    mod policy_controller;
+    mod rank;
 
     use std::{
         collections::HashMap,
@@ -3944,6 +3867,137 @@ mod tests {
         );
     }
 
+    /// A stage over `workers` regular gRPC workers of `model_id`, with the
+    /// registry of policies it reads: a case hands that registry an engine.
+    fn stage_and_policies(
+        model_id: &str,
+        workers: u16,
+    ) -> (WorkerSelectionStage, Arc<PolicyRegistry>) {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for i in 0..workers {
+            worker_registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{}", 8360 + i))
+                        .model(ModelCard::new(model_id))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        }
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            Arc::clone(&policy_registry),
+            WorkerSelectionMode::Regular,
+            None,
+        );
+        (stage, policy_registry)
+    }
+
+    /// A first attempt's regular selection of a request that states `rid`.
+    fn regular_pick(stage: &WorkerSelectionStage, model_id: &str, rid: Option<&str>) -> Placed {
+        stage
+            .select_regular(
+                model_id,
+                ContextRequirements::default(),
+                MediaDemands::NONE,
+                None,
+                None,
+                None,
+                None,
+                None,
+                rid,
+                None,
+                None,
+                &[],
+            )
+            .expect("a worker")
+    }
+
+    /// Where the gateway started the policy engine, the regular stage's pick
+    /// keeps the engine's placement for its load guards. The engine hears
+    /// the dispatch where the first guard is made and the end where that
+    /// guard is dropped. A batch's other guards and the selection's own drop
+    /// tell it nothing more.
+    #[test]
+    fn the_regular_stages_load_guards_tell_the_engine_the_dispatch_and_the_end() {
+        use crate::routers::{
+            common::placement::tests::hearing_engine_on, grpc::context::LoadGuards,
+        };
+
+        let model_id = "test-model-engine-guards";
+        let (stage, policies) = stage_and_policies(model_id, 2);
+        let heard = hearing_engine_on(&policies);
+        let said = || heard.lock().expect("the stage heard").clone();
+
+        let selection = WorkerSelection::Single {
+            worker: regular_pick(&stage, model_id, None),
+        };
+        assert_eq!(said(), ["issued"]);
+        let guards = LoadGuards::scaled(&selection, Some("the route's own key"), 3);
+        assert_eq!(said(), ["issued", "dispatched Single"]);
+        drop(selection);
+        assert_eq!(said(), ["issued", "dispatched Single"]);
+        drop(guards);
+        assert_eq!(
+            said(),
+            ["issued", "dispatched Single", "completed Cancelled"]
+        );
+
+        // A selection no guard was made from gives its lease up.
+        drop(regular_pick(&stage, model_id, None));
+        assert_eq!(said()[3..], ["issued", "released Abandoned"]);
+    }
+
+    /// The regular stage hands the engine the body's `rid` as the request
+    /// states it. Under a document that reads the routing value from that
+    /// id, the request is counted under the value on its worker and keeps
+    /// that worker. A request that states no id has no value to count under.
+    #[test]
+    fn the_regular_stage_hands_the_engine_the_bodys_id() {
+        use smg_policy_controller::document::{
+            AppliedSpec, KeySourceSpec, PolicySpec, RoutingKeySpec,
+        };
+
+        use crate::routers::{common::placement::tests::engine_on, grpc::context::LoadGuards};
+
+        let model_id = "test-model-engine-rid";
+        let (stage, policies) = stage_and_policies(model_id, 3);
+        let mut document = PolicySpec::preset("consistent_hashing").expect("a stock preset");
+        document.bindings[0].routing_key = Some(RoutingKeySpec {
+            sources: vec![KeySourceSpec {
+                rid: true,
+                ..KeySourceSpec::default()
+            }],
+            strip_lineage: false,
+        });
+        let spec = AppliedSpec::validate(&document);
+        engine_on(&policies, spec.expect("a valid document"));
+
+        let keyed = WorkerSelection::Single {
+            worker: regular_pick(&stage, model_id, Some("conversation-1")),
+        };
+        let worker = Arc::clone(keyed.single().expect("a single selection"));
+        let guards = LoadGuards::new(&keyed, None);
+        assert_eq!((worker.load(), worker.routing_key_load()), (1, 1));
+        for _ in 0..4 {
+            let again = regular_pick(&stage, model_id, Some("conversation-1"));
+            assert_eq!(again.url(), worker.url());
+        }
+        drop(guards);
+        assert_eq!((worker.load(), worker.routing_key_load()), (0, 0));
+
+        let plain = WorkerSelection::Single {
+            worker: regular_pick(&stage, model_id, None),
+        };
+        let worker = Arc::clone(plain.single().expect("a single selection"));
+        let guards = LoadGuards::new(&plain, None);
+        assert_eq!((worker.load(), worker.routing_key_load()), (1, 0));
+        drop(guards);
+    }
+
     /// The gRPC transport must shed an all-overloaded model with the same
     /// distinct overload 503 the HTTP router uses. Its usual empty-pool answer
     /// is a 404, which would both misreport pressure as model absence and skip
@@ -4168,7 +4222,6 @@ mod tests {
             attempt: 0,
             ledger: AttemptLedger::default(),
             tried: Vec::new(),
-            tried_rows: Box::default(),
             model_id: model_id.to_string(),
             dispatch_model: model_id.to_string(),
             streaming: false,
@@ -4187,7 +4240,6 @@ mod tests {
             constraint_decided_on: None,
             tokenizer: None,
             workers: None,
-            placed: None,
             sticky_key: None,
             clients: None,
             encode_outputs: None,
@@ -4303,7 +4355,7 @@ mod tests {
         let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::TokenSpeed));
         let decided_on = |worker: &Arc<dyn Worker>| {
             utils::WorkerDecoding::of(Some(&WorkerSelection::Single {
-                worker: Arc::clone(worker),
+                worker: Arc::clone(worker).into(),
             }))
         };
         let selected = |ctx: &DispatchContext| match ctx.workers.as_ref().unwrap() {
@@ -4402,7 +4454,7 @@ mod tests {
             let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::TokenSpeed));
             ctx.constraint_decided_on =
                 Some(utils::WorkerDecoding::of(Some(&WorkerSelection::Single {
-                    worker: Arc::clone(&workers[2]),
+                    worker: Arc::clone(&workers[2]).into(),
                 })));
             let request = RequestType::Generate(Arc::new(
                 serde_json::from_value(serde_json::json!({"text":"Hello"})).unwrap(),
@@ -4420,8 +4472,8 @@ mod tests {
                     .await
                     .unwrap();
                 let selected = match ctx.workers.as_ref().unwrap() {
-                    WorkerSelection::Single { worker } => worker,
-                    WorkerSelection::Disaggregated { decode, .. } => decode,
+                    WorkerSelection::Single { worker } => worker.worker(),
+                    WorkerSelection::Disaggregated { decode, .. } => decode.worker(),
                 };
                 assert_eq!(selected.url(), workers[2].url());
             }
@@ -4558,7 +4610,7 @@ mod tests {
         headers.insert("x-smg-routing-key", "session-42".parse().unwrap());
         ctx.headers = Some(headers);
         let selected = |ctx: &DispatchContext| match ctx.workers.as_ref().unwrap() {
-            WorkerSelection::Single { worker } => Arc::clone(worker),
+            WorkerSelection::Single { worker } => Arc::clone(worker.worker()),
             WorkerSelection::Disaggregated { .. } => panic!("expected single selection"),
         };
 
@@ -4609,6 +4661,167 @@ mod tests {
             selected(&ctx).url(),
             owner.url(),
             "with every engine tried the pool is used whole again"
+        );
+    }
+
+    /// A PD retry re-selects away from the prefill engine its failed attempt
+    /// used: the cache-aware policy recorded the prompt on it during that
+    /// attempt and would re-select it, so only the tried set moves the
+    /// retry; with every prefill tried the pool is used whole again.
+    #[tokio::test]
+    async fn reselect_pd_skips_the_prefill_engines_the_failed_attempts_used() {
+        let model_id = "tried-pd-prefill-model";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let mut prefills = Vec::new();
+        for (url, worker_type) in [
+            ("grpc://127.0.0.1:9330", WorkerType::Prefill),
+            ("grpc://127.0.0.1:9331", WorkerType::Prefill),
+            ("grpc://127.0.0.1:9332", WorkerType::Prefill),
+            ("grpc://127.0.0.1:9333", WorkerType::Decode),
+        ] {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new(model_id))
+                    .worker_type(worker_type)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(RuntimeType::Vllm)
+                    .health_config(no_health_check())
+                    .build(),
+            );
+            worker_registry.register(Arc::clone(&worker)).unwrap();
+            if worker_type == WorkerType::Prefill {
+                prefills.push(worker);
+            }
+        }
+        // The file's cache-aware defaults: the relative gate alone (the
+        // `CacheAwareConfig::default` margin is 0) would spill the second
+        // pick off the owner, which still holds its first attempt's slot.
+        let cache_policy = Arc::new(CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 4096,
+            ..Default::default()
+        }));
+        cache_policy.init_workers(&prefills);
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        policy_registry.set_prefill_policy(cache_policy);
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            policy_registry,
+            WorkerSelectionMode::PrefillDecode,
+            None,
+        );
+        let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::Vllm));
+        // A prompt long enough for the token tree to record (a handful of
+        // tokens never reaches it).
+        let prompt: Vec<u32> = (1..=16).collect();
+        let plan = retained_plan(&prompt);
+        let selected_prefill = |ctx: &DispatchContext| match ctx.workers.as_ref().unwrap() {
+            WorkerSelection::Disaggregated { prefill, .. } => Arc::clone(prefill),
+            WorkerSelection::Single { .. } => panic!("expected PD selection"),
+        };
+
+        stage.reselect(&mut ctx, &plan).await.unwrap();
+        let owner = selected_prefill(&ctx);
+        stage.reselect(&mut ctx, &plan).await.unwrap();
+        assert_eq!(
+            selected_prefill(&ctx).url(),
+            owner.url(),
+            "the prompt recorded on the first attempt's prefill re-selects it"
+        );
+
+        ctx.tried.push(owner.base_url().to_string());
+        stage.reselect(&mut ctx, &plan).await.unwrap();
+        let second = selected_prefill(&ctx);
+        assert_ne!(
+            second.url(),
+            owner.url(),
+            "the retry leaves the tried prefill engine"
+        );
+
+        ctx.tried.push(second.base_url().to_string());
+        stage.reselect(&mut ctx, &plan).await.unwrap();
+        let third = selected_prefill(&ctx);
+        assert!(
+            third.url() != owner.url() && third.url() != second.url(),
+            "the second retry leaves both tried prefill engines"
+        );
+
+        // With every prefill tried the pool is used whole again: the retry
+        // is placed, and no worker is refused for having been tried.
+        ctx.tried.push(third.base_url().to_string());
+        stage
+            .reselect(&mut ctx, &plan)
+            .await
+            .expect("a pool whose every prefill was tried takes the retry");
+    }
+
+    /// The decode side honors the tried set the same way: a routing key pins
+    /// the decode pick to one engine, and the retry leaves it while another
+    /// decode is left; with every decode tried the pool is used whole again.
+    #[tokio::test]
+    async fn reselect_pd_skips_the_decode_engines_the_failed_attempts_used() {
+        let model_id = "tried-pd-decode-model";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, worker_type) in [
+            ("grpc://127.0.0.1:9340", WorkerType::Prefill),
+            ("grpc://127.0.0.1:9341", WorkerType::Decode),
+            ("grpc://127.0.0.1:9342", WorkerType::Decode),
+        ] {
+            worker_registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new(model_id))
+                        .worker_type(worker_type)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::Vllm)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        }
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            Arc::new(PolicyRegistry::new(PolicyConfig::ConsistentHashing)),
+            WorkerSelectionMode::PrefillDecode,
+            None,
+        );
+        let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::Vllm));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-routing-key", "session-42".parse().unwrap());
+        ctx.headers = Some(headers);
+        let plan = retained_plan(&[1, 2, 3]);
+        let selected_decode = |ctx: &DispatchContext| match ctx.workers.as_ref().unwrap() {
+            WorkerSelection::Disaggregated { decode, .. } => Arc::clone(decode.worker()),
+            WorkerSelection::Single { .. } => panic!("expected PD selection"),
+        };
+
+        stage.reselect(&mut ctx, &plan).await.unwrap();
+        let owner = selected_decode(&ctx);
+        stage.reselect(&mut ctx, &plan).await.unwrap();
+        assert_eq!(
+            selected_decode(&ctx).url(),
+            owner.url(),
+            "without a failed attempt the key re-selects its decode owner"
+        );
+
+        ctx.tried.push(owner.base_url().to_string());
+        stage.reselect(&mut ctx, &plan).await.unwrap();
+        let second = selected_decode(&ctx);
+        assert_ne!(
+            second.url(),
+            owner.url(),
+            "the retry leaves the tried decode engine"
+        );
+
+        ctx.tried.push(second.base_url().to_string());
+        stage.reselect(&mut ctx, &plan).await.unwrap();
+        assert_eq!(
+            selected_decode(&ctx).url(),
+            owner.url(),
+            "with every decode tried the pool is used whole again"
         );
     }
 
@@ -4936,6 +5149,146 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Where the gateway started the policy engine, the encode stage's
+    /// selection asks no classic policy. A request that carries an item is
+    /// refused by name ahead of its pair: a 501 under the stage's own code,
+    /// which the retry layer does not repeat, and the engine hears of no
+    /// request, neither a lease nor its release. A request with no item is
+    /// placed on the engine's pair and on no encoder. The registry made for
+    /// the engine counts no classic policy made or asked behind either.
+    /// With no engine the stage places the item by its encode policy, as it
+    /// did.
+    #[tokio::test]
+    async fn the_engine_places_an_encode_requests_pair_and_refuses_an_item_by_name() {
+        use crate::{
+            config::types::RoutingKeyOverrideConfig,
+            routers::common::placement::tests::hearing_pairs_on,
+        };
+
+        /// The encode policy behind a count of the items it is asked to
+        /// place.
+        #[derive(Debug)]
+        struct Counted {
+            inner: Arc<dyn LoadBalancingPolicy>,
+            asked: AtomicUsize,
+        }
+
+        impl LoadBalancingPolicy for Counted {
+            fn select_worker(
+                &self,
+                workers: &[Arc<dyn Worker>],
+                info: &SelectWorkerInfo,
+            ) -> Option<usize> {
+                self.asked.fetch_add(1, Ordering::Relaxed);
+                self.inner.select_worker(workers, info)
+            }
+
+            fn name(&self) -> &'static str {
+                self.inner.name()
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let model = "epd-engine";
+        let stage_over = |policies: PolicyRegistry| {
+            let registry = ec_registry(
+                model,
+                &[
+                    (8930, WorkerType::Encode, "ECCPUConnector"),
+                    (8931, WorkerType::Prefill, "ECCPUConnector"),
+                    (8932, WorkerType::Decode, "ECCPUConnector"),
+                ],
+            );
+            WorkerSelectionStage::new(
+                registry,
+                Arc::new(policies),
+                WorkerSelectionMode::EncodePrefillDecode,
+                None,
+            )
+        };
+        let demand = |items: bool| EpdDemands {
+            wire: None,
+            encode: MediaDemands {
+                media_refs: false,
+                vision: items,
+                pipeline: PipelinePin::Any,
+            },
+            decode_vision: false,
+            image_fanout: items,
+        };
+        let item = [vec![1]];
+
+        // The engine places: an item is refused, and the engine hears nothing.
+        let policies = PolicyRegistry::for_policy_engine(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig::default(),
+        );
+        let heard = hearing_pairs_on(&policies, false);
+        let said = || heard.lock().expect("the stage heard").clone();
+        let stage = stage_over(policies);
+        let refusal = stage
+            .admit_encode_prefill_decode_workers(
+                model,
+                PlacementInputs::default(),
+                None,
+                &item,
+                demand(true),
+            )
+            .await
+            .err()
+            .expect("an item is refused");
+        assert_eq!(refusal.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            error::extract_error_code_from_response(&refusal),
+            ENCODE_UNDER_POLICY_ENGINE_CODE
+        );
+        assert!(!is_retryable_response(&refusal));
+        assert!(said().is_empty(), "the engine heard {:?}", said());
+        assert_eq!(stage.policy_registry.classic_made_or_asked(), 0);
+
+        // The engine places: no item is the engine's pair and no encoder.
+        let (encoders, prefill, decode, _) = stage
+            .select_encode_prefill_decode_workers(
+                model,
+                PlacementInputs::default(),
+                &[],
+                demand(false),
+                None,
+            )
+            .unwrap_or_else(|_| panic!("the engine places the pair"));
+        assert!(encoders.is_empty());
+        assert_eq!(
+            (prefill.url(), decode.url()),
+            ("grpc://127.0.0.1:8931", "grpc://127.0.0.1:8932")
+        );
+        assert_eq!(said()[..2], ["issued", "issued"]);
+        assert_eq!(stage.policy_registry.classic_made_or_asked(), 0);
+
+        // No engine: the item is placed by the stage's encode policy.
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let counted = Arc::new(Counted {
+            inner: PolicyFactory::create_from_config(&PolicyConfig::RoundRobin),
+            asked: AtomicUsize::new(0),
+        });
+        policies.set_encode_policy(Arc::clone(&counted) as Arc<dyn LoadBalancingPolicy>);
+        let stage = stage_over(policies);
+        let (encoders, ..) = stage
+            .select_encode_prefill_decode_workers(
+                model,
+                PlacementInputs::default(),
+                &item,
+                demand(true),
+                None,
+            )
+            .unwrap_or_else(|_| panic!("the EPD set is selected"));
+        assert_eq!(encoders.len(), 1);
+        assert_eq!(encoders[0].worker.url(), "grpc://127.0.0.1:8930");
+        assert_eq!(counted.asked.load(Ordering::Relaxed), 1);
     }
 
     /// The encode stage reads the hash ring off the generation it holds for
@@ -7112,6 +7465,57 @@ mod tests {
         assert_eq!(snapshot.routing_text.as_deref(), Some("Hello"));
     }
 
+    /// The routing snapshot keeps the body's `rid` only where a retry reads
+    /// it: it stays where the sticky key derives from it, and a retry derives
+    /// that key from it again. Elsewhere the snapshot keeps no copy.
+    #[tokio::test]
+    async fn the_snapshot_keeps_the_rid_only_where_a_retry_reads_it() {
+        use crate::config::types::RoutingKeyOverrideConfig;
+
+        const RID: &str = "conv_t2_r1";
+        async fn kept(stage: &WorkerSelectionStage) -> Option<String> {
+            let mut ctx = prepared_ctx(Arc::clone(&stage.worker_registry), None);
+            let RequestType::Generate(request) = &mut ctx.input.request_type else {
+                panic!("a generate request");
+            };
+            Arc::make_mut(request).rid = Some(RID.to_owned());
+            stage.execute(&mut ctx).await.expect("a selection");
+            ctx.state.routing_snapshot.expect("the snapshot").rid
+        }
+        let registry = Arc::new(WorkerRegistry::new());
+        registry
+            .register(regular_worker(
+                "grpc://127.0.0.1:8832",
+                "test-model",
+                UNLABELED,
+            ))
+            .unwrap();
+
+        let classic = regular_stage(Arc::clone(&registry));
+        assert_eq!(classic.policy_registry.derive_rid_key(Some(RID)), None);
+        assert_eq!(kept(&classic).await, None, "no retry reads it");
+
+        let sticky = WorkerSelectionStage::new(
+            registry,
+            Arc::new(PolicyRegistry::with_override(
+                PolicyConfig::RoundRobin,
+                RoutingKeyOverrideConfig {
+                    enabled: true,
+                    ..RoutingKeyOverrideConfig::default()
+                },
+            )),
+            WorkerSelectionMode::Regular,
+            None,
+        );
+        let rid = kept(&sticky).await;
+        assert_eq!(rid.as_deref(), Some(RID));
+        // A retry derives the first selection's key from it.
+        assert_eq!(
+            sticky.policy_registry.derive_rid_key(rid.as_deref()),
+            Some("conv")
+        );
+    }
+
     /// The regular entry reads the context demand against its pool's kept
     /// window floor, in the snapshot its candidates come from: a request
     /// every window holds asks no worker, a window that refuses it brings the
@@ -8205,14 +8609,134 @@ mod tests {
     #[test]
     fn the_dispatch_future_fits_its_bound() {
         let mut ctx = dispatch_ctx("test-model", grpc_wire(RuntimeType::Vllm));
+        let stage = regular_stage(Arc::new(WorkerRegistry::new()));
         let future = size_of_val(&execute_plan(
             &mut ctx,
             retained_plan(&[1]),
             false,
             None,
             GroupedDpSticky::Off,
+            &stage,
         ));
         assert!(future <= 2048, "the dispatch future is {future} bytes");
+    }
+
+    /// A decode request is built for the decode the first decision named.
+    /// A second ask moves the pair to a decode that reads it alike alone:
+    /// each difference here refuses the move.
+    #[test]
+    fn a_built_decode_request_moves_to_a_decode_that_reads_it_alike_alone() {
+        use smg_worker::identity::basic::MORIIO_CONNECTOR;
+
+        type Shape = fn(BasicWorkerBuilder) -> BasicWorkerBuilder;
+        let decode = |shape: Shape| {
+            let worker = BasicWorkerBuilder::new("grpc://decode:30000")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm);
+            shape(worker).build()
+        };
+        let first = decode(|worker| worker);
+        assert!(reads_the_request_alike(&first, &decode(|worker| worker)));
+        let others: [(&str, Shape); 6] = [
+            ("another connection", |worker| {
+                worker.connection_mode(ConnectionMode::Zmq)
+            }),
+            ("another runtime", |worker| {
+                worker.runtime_type(RuntimeType::Sglang)
+            }),
+            ("another grammar start", |worker| {
+                worker.label("constrained_decoding_start", "first_token")
+            }),
+            ("no vision encoder", |worker| {
+                worker.label("supports_vision", "false")
+            }),
+            ("the MoRI-IO connector", |worker| {
+                worker.kv_connector(MORIIO_CONNECTOR)
+            }),
+            ("other sampling defaults", |worker| {
+                worker.label(DEFAULT_SAMPLING_PARAMS_LABEL, r#"{"temperature":1.0}"#)
+            }),
+        ];
+        for (what, shape) in others {
+            let other = decode(shape);
+            assert!(!reads_the_request_alike(&first, &other), "{what}");
+        }
+    }
+
+    /// A request's sizes were checked against the first decode's context
+    /// window. A decode the pair moves to holds a window no narrower, or
+    /// states none.
+    #[test]
+    fn a_moved_decode_holds_a_window_no_narrower_than_the_first() {
+        let decode = |window: Option<u32>| {
+            let card = ModelCard::new("m");
+            let card = match window {
+                Some(window) => card.with_context_length(window),
+                None => card,
+            };
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .worker_type(WorkerType::Decode)
+                .model(card)
+                .build()
+        };
+        let holds = |first: Option<u32>, other: Option<u32>| {
+            holds_what_the_first_holds(&decode(first), &decode(other), "m")
+        };
+        assert!(holds(Some(32_768), Some(32_768)));
+        assert!(holds(Some(4_096), Some(32_768)));
+        assert!(!holds(Some(32_768), Some(4_096)), "a narrower window");
+        assert!(holds(Some(32_768), None), "no window stated binds nothing");
+        assert!(!holds(None, Some(4_096)), "the first stated none");
+    }
+
+    /// A decode request can keep the media references its plan forwards. A
+    /// decode the pair moves to takes them as every selection asks of a
+    /// candidate: it processes references, on the side of the wire's
+    /// pipeline pin. Each worker here reads the request as the first does.
+    #[test]
+    fn a_moved_decode_takes_the_media_references_its_wire_forwards() {
+        let decode = |processor: Option<&str>| {
+            let worker = BasicWorkerBuilder::new("grpc://decode:30000")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm);
+            match processor {
+                Some(processor) => worker.label("mm_processor", processor).build(),
+                None => worker.build(),
+            }
+        };
+        let forwards = |pipeline: PipelinePin| WireConstraint {
+            requires_media_refs: true,
+            pipeline,
+            ..grpc_wire(RuntimeType::Vllm)
+        };
+        let first = decode(Some("inprocess"));
+        let takes = |processor: Option<&str>, wire: WireConstraint| {
+            let other = decode(processor);
+            assert!(reads_the_request_alike(&first, &other));
+            takes_the_built_request(&first, &other, "m", wire)
+        };
+        let gateways = Some(multimodal::GATEWAY_PIPELINE_PROCESSOR);
+
+        assert!(takes(Some("inprocess"), forwards(PipelinePin::Any)));
+        assert!(
+            !takes(None, forwards(PipelinePin::Any)),
+            "a decode that processes no references"
+        );
+        assert!(
+            takes(None, grpc_wire(RuntimeType::Vllm)),
+            "a request that forwards none"
+        );
+        assert!(takes(gateways, forwards(PipelinePin::Only)));
+        assert!(
+            !takes(Some("inprocess"), forwards(PipelinePin::Only)),
+            "the engine's own processor, where the gateway's pipeline is pinned"
+        );
+        assert!(
+            !takes(gateways, forwards(PipelinePin::Never)),
+            "the gateway's pipeline, where the engine's processor is pinned"
+        );
     }
 }
 

@@ -49,7 +49,7 @@ mod tokens;
 
 pub use declared::Declared;
 pub use engine::Engine;
-pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
+pub use event::{CallEnd, DropReason, Event, Events, FinishReason, MalformedReason, Text};
 pub use format::{CallId, CallSyntax, Emits, ForcedCall, Format, Whitespace};
 pub use grammar::{
     AddedTokens, Bound, Grammar, GrammarBackend, GrammarStart, Inexpressible, Lark, Output,

@@ -8,7 +8,7 @@
 use std::hint::black_box;
 
 use criterion::{measurement::WallTime, BenchmarkGroup, BenchmarkId};
-use smg_policy_controller::{Constraints, PoolFacts, RequestFacts, Scratch};
+use smg_policy_controller::engine::{Constraints, PoolFacts, RequestFacts, Scratch};
 
 use crate::common::{build_view, engine_of, fleet};
 

@@ -12,8 +12,8 @@
 //! outside the wire), recorded once by the group's primary. Every group whose table is on main is
 //! here, its primary and its other checkpoints under the primary's organisation, spelled in
 //! `groups.json` beside this module (one group per line; the crate's build script writes the file
-//! as the `GROUPS` constant); `tests/readme.rs` writes the README's models table from the same
-//! groups and checks that the two agree.
+//! as the `GROUPS` constant); `tests/readme.rs` reads the README's models table and checks
+//! that it and these groups agree.
 //!
 //! A lookup matches the repository name, the text after the last path separator (either slash),
 //! exactly and without regard to case, under any organisation or path: `Qwen/Qwen3-8B`,
@@ -31,10 +31,10 @@ use std::{
 use rustc_hash::FxBuildHasher;
 
 use super::{
-    deepseek_v3, deepseek_v3_1, deepseek_v3_2, deepseek_v4, deepseek_v4_1, dots3, function_gemma,
-    gemma4, glm, glm4, hy4, hy_v3, inkling, inkling2, iquest, json, k2_horizon, kimi_k2, kimi_k3,
-    lfm2_5, ling, llama4, llama_nemotron, longcat, minicpm5, minimax_m2, minimax_m3, mistral,
-    mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    command, deepseek_v3, deepseek_v3_1, deepseek_v3_2, deepseek_v4, deepseek_v4_1, dots3,
+    function_gemma, gemma4, glm, glm4, hy4, hy_v3, inkling, inkling2, iquest, json, k2_horizon,
+    kimi, kimi_k2, kimi_k3, lfm2_5, ling, llama4, llama_nemotron, longcat, minicpm5, minimax_m2,
+    minimax_m3, mistral, mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -110,6 +110,8 @@ tables! {
     MistralV13 => "mistral_v13", mistral_v13;
     /// [`llama_nemotron()`].
     LlamaNemotron => "llama_nemotron", llama_nemotron;
+    /// [`command()`].
+    Command => "command", command;
     /// [`kimi_k3()`].
     KimiK3 => "kimi_k3", kimi_k3;
     /// [`inkling()`].
@@ -148,6 +150,8 @@ tables! {
     Mistral => "mistral", mistral;
     /// [`kimi_k2()`].
     KimiK2 => "kimi_k2", kimi_k2;
+    /// [`kimi()`].
+    Kimi => "kimi", kimi;
 }
 
 /// A table's row in the registry: the table, its name and the function that builds it. The rows

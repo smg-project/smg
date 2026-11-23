@@ -831,11 +831,12 @@ struct RelayFlags {
     mcp_list_tools_sent: bool,
 }
 
-/// Relays one upstream event stream to the client: every block goes through
-/// the handler and is forwarded, buffered or dropped as it says; the MCP
-/// list-tools items (the loop's, built once with its session; none without
-/// one) go out at the first `in_progress` of the first stream; a tool-call
-/// trigger ends the relay with the calls pending in the handler.
+/// Relays one upstream event stream to the client: every block but the
+/// upstream's end sentinel (the loop ends the client's stream with its own)
+/// goes through the handler and is forwarded, buffered or dropped as it says;
+/// the MCP list-tools items (the loop's, built once with its session; none
+/// without one) go out at the first `in_progress` of the first stream; a
+/// tool-call trigger ends the relay with the calls pending in the handler.
 #[expect(
     clippy::too_many_arguments,
     reason = "The relay reads the loop's client side as the loop's own text did (the sender, the encoder, the sequence number) beside the handler and its two flags; a struct for one call would be a type the loop's other phases do not share."
@@ -861,7 +862,7 @@ async fn relay_upstream_stream(
                     // Parse event
                     let (event_name, data) = parse_sse_block(raw_block);
 
-                    if data.is_empty() {
+                    if data.is_empty() || data == "[DONE]" {
                         continue;
                     }
 
@@ -1979,8 +1980,8 @@ mod tests {
     }
 
     /// The whole interception path against a stub upstream that answers one
-    /// four-event stream: the client reads the stream's events, the loop's
-    /// terminal and the sentinel.
+    /// four-event stream and its own end sentinel: the client reads the
+    /// stream's events, the loop's terminal and one sentinel, the loop's.
     #[tokio::test]
     async fn a_tool_interception_stream_ends_with_the_terminal_and_the_sentinel() {
         use std::sync::Arc;
@@ -2004,7 +2005,7 @@ mod tests {
             .await
             .expect("a listener");
         let port = listener.local_addr().expect("an address").port();
-        let body = [CREATED, IN_PROGRESS, DELTA, COMPLETED].join("\n\n") + "\n\n";
+        let body = [CREATED, IN_PROGRESS, DELTA, COMPLETED, "data: [DONE]"].join("\n\n") + "\n\n";
         #[expect(
             clippy::disallowed_methods,
             reason = "test stub upstream answering one event stream per request; aborted at the test's end"
@@ -2067,6 +2068,8 @@ mod tests {
         );
         assert!(text.contains("event: response.completed\n"), "{text}");
         assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+        // A reader that stops at the first sentinel has read the terminal.
+        assert_eq!(text.matches("data: [DONE]").count(), 1, "{text}");
         upstream.abort();
     }
 

@@ -138,29 +138,6 @@ async fn the_attempt_deadline_is_armed_only_by_grpc_request_timeout_secs() {
     }
 }
 
-/// A store has one policy engine, the context's. The router's stages ask that
-/// one, and the router builds none of its own.
-#[tokio::test]
-async fn a_router_asks_the_policy_engine_of_its_context() {
-    use crate::policy_controller::engine::testing::bed;
-
-    let config = grpc_config(regular_routing_mode()).build_unchecked();
-    let mut ctx = grpc_ctx_from(&config, mcp_orchestrator().await);
-    let (policy_engine, _store, _workers) = bed(&[]);
-    let policy_engine = Arc::new(policy_engine);
-    Arc::get_mut(&mut ctx)
-        .expect("the context is not shared yet")
-        .policy_engine = Some(Arc::clone(&policy_engine));
-    assert_eq!(Arc::strong_count(&policy_engine), 2);
-
-    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
-    assert!(
-        Arc::strong_count(&policy_engine) > 2,
-        "the router's stages hold the context's policy engine"
-    );
-    drop(router);
-}
-
 /// `--grouped-dp-sticky` reaches every pipeline a regular or PD router
 /// builds, so a sticky request is pinned alike on every endpoint (a PD one
 /// through its bootstrap room): off by default, and the configured placement
@@ -881,6 +858,89 @@ async fn max_tokens_zero_is_answered_with_an_empty_message() {
         error::extract_error_code_from_response(&response),
         "context_length_exceeded"
     );
+}
+
+/// count_tokens answers a conversation that does not render as `/v1/messages`
+/// answers it, under the render failure's text. The 400
+/// `process_messages_failed`: where the model's template refuses the
+/// conversation through its own `raise_exception`, and where the render
+/// stops on a value (a second message the conversation does not have; a
+/// number the template iterates over on every conversation, its own bug of a
+/// kind the render cannot tell from a request's value; a macro the template
+/// declares only for a conversation that opens with `hello`). A 500
+/// `chat_template_render_failed`: where the failure is the template's own
+/// whatever the request holds (it asks for another template).
+#[tokio::test]
+async fn count_tokens_tells_a_templates_own_failure_from_a_render_a_value_stops() {
+    use llm_tokenizer::traits::Tokenizer as _;
+
+    for (template, status, code, cause) in [
+        (
+            "{{ raise_exception('the roles must alternate') }}",
+            StatusCode::BAD_REQUEST,
+            "process_messages_failed",
+            "the roles must alternate",
+        ),
+        (
+            "{{ messages[1]['content'] }}",
+            StatusCode::BAD_REQUEST,
+            "process_messages_failed",
+            "Failed to apply chat template: Failed to render template: undefined value",
+        ),
+        (
+            "{% for part in 42 %}{{ part }}{% endfor %}",
+            StatusCode::BAD_REQUEST,
+            "process_messages_failed",
+            "Failed to apply chat template: Failed to render template: invalid operation: ",
+        ),
+        (
+            "{% if messages[0].content == 'hello' %}{% macro greet() %}hi there{% endmacro %}\
+             {% endif %}{{ greet() }}",
+            StatusCode::BAD_REQUEST,
+            "process_messages_failed",
+            "Failed to apply chat template: Failed to render template: unknown function: ",
+        ),
+        (
+            "{% include 'tools.jinja' %}",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "chat_template_render_failed",
+            "Failed to apply chat template: Failed to render template: template not found: ",
+        ),
+    ] {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .expect("tokenizer");
+        tokenizer
+            .set_chat_template(template.to_string())
+            .expect("template");
+        let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(tokenizer);
+        ctx.tokenizer_registry
+            .load("m", "m", "mock", || async move { Ok(tokenizer) })
+            .await
+            .expect("register the tokenizer");
+        ctx.worker_registry
+            .register(grpc_worker_for_m())
+            .expect("register worker");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+            .await;
+
+        assert_eq!(response.status(), status, "{template}");
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            code,
+            "{template}"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains(cause), "{template}: {body}");
+    }
 }
 
 /// count_tokens and `max_tokens: 0` render `output_config.effort` as

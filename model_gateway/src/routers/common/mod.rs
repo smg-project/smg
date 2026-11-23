@@ -18,6 +18,8 @@
 //!   session registry) shared by the OpenAI and HTTP routers
 //! - [`overload`] — shed responses for the absolute worker-overload
 //!   guard, shared by the HTTP and gRPC selection paths
+//! - `pair_classes` — a pair index's partner lists as the policy engine
+//!   reads them: a class on each worker and the table of classes that pair
 //! - `pair_index` — the prefill and decode workers that may pair, decided
 //!   once for a membership generation and read by every placement
 //! - [`pd_admission`] — the disaggregated dispatch's admission gate: never
@@ -63,10 +65,12 @@ pub use smg_external_router::header_utils;
 pub(crate) mod kv_transfer;
 pub use smg_external_router::{mcp_utils, openai_bridge};
 pub mod overload;
+pub(crate) mod pair_classes;
 pub(crate) mod pair_index;
 pub mod pd_admission;
 pub(crate) mod pd_failure;
 pub use smg_external_router::persistence_utils;
+pub(crate) mod place_request;
 pub(crate) mod placement;
 pub mod prefill_admission;
 pub(crate) mod rate_limit_cell;
@@ -225,20 +229,153 @@ pub(crate) fn attach_sized_body(
 pub mod bench_support {
     use std::sync::Arc;
 
-    use smg_worker::identity::basic::Worker;
+    use axum::http::HeaderMap;
+    use smg_worker::{identity::basic::Worker, load::state::LoadReceiver};
 
     use super::{
         attempt_ledger::AttemptLedger,
-        placement::{select_pair, select_single, PlacementInputs},
+        overload,
+        placement::{select_pair, select_single, Placed, PlacementInputs},
     };
     use crate::{
+        config::RouterConfig,
         observability::cache_trace,
-        policies::PolicyRegistry,
+        policies::{PolicyRegistry, Side},
         routers::common::{
             pair_index::{PdPairIndex, PdWire},
             snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
         },
     };
+
+    /// The route a request is placed on: the pool its router places over.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Route {
+        /// The regular HTTP router.
+        Http,
+        /// The gRPC pipeline's regular selection stage.
+        Grpc,
+    }
+
+    impl Route {
+        /// The pool the route's router places a single request over.
+        fn pool(self) -> RoutingPool {
+            match self {
+                Self::Http => RoutingPool::HttpRegular,
+                Self::Grpc => RoutingPool::GrpcPipelineRegular,
+            }
+        }
+    }
+
+    /// Bytes the calling thread has allocated since it started, by the
+    /// allocator's own count of the thread: a free does not subtract.
+    /// `None` in a build that links no such count.
+    pub fn thread_allocated_bytes() -> Option<u64> {
+        #[cfg(all(
+            feature = "jemalloc-stats",
+            not(target_env = "msvc"),
+            not(target_env = "musl")
+        ))]
+        {
+            tikv_jemalloc_ctl::thread::allocatedp::read()
+                .ok()
+                .map(|allocated| allocated.get())
+        }
+        #[cfg(not(all(
+            feature = "jemalloc-stats",
+            not(target_env = "msvc"),
+            not(target_env = "musl")
+        )))]
+        {
+            None
+        }
+    }
+
+    /// The worker a route placed a request on, as a number a bench compares
+    /// with another request's: the place of the worker's object in memory,
+    /// which stands for as long as the worker is registered. Nothing else is
+    /// read of it.
+    fn placed_on(worker: &Arc<dyn Worker>) -> usize {
+        Arc::as_ptr(worker).addr()
+    }
+
+    /// Hands the classic policies the load feed the monitor would publish.
+    pub fn attach_loads(policies: &PolicyRegistry, loads: Option<LoadReceiver>) {
+        policies.set_load_receiver(loads);
+    }
+
+    /// Sets a pair gateway's side policies on `policies` as the router
+    /// factory sets them at the start: each side's own policy of `config`,
+    /// or its main policy.
+    pub fn set_pair_sides(policies: &PolicyRegistry, config: &RouterConfig) {
+        let main = &config.policy;
+        policies.set_side_policy(Side::Prefill, config.mode.get_prefill_policy(main));
+        policies.set_side_policy(Side::Decode, config.mode.get_decode_policy(main));
+    }
+
+    /// One request's routing under the classic policies on `route`: the
+    /// placement over the route's own pool, the dispatch-time read of the
+    /// chosen worker's overload veto, and the worker's load guard from the
+    /// send to the request's end, whose drop tells the model's policy.
+    /// `headers` are the request's, where it carries any: a routing key is
+    /// read from them as a router reads it, for the placement and for the
+    /// load guard. The worker the request went to (`placed_on`), and
+    /// `None` where it had no worker.
+    pub fn route_classic(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        model: &str,
+        route: Route,
+        tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
+    ) -> Option<usize> {
+        let pool = route.pool();
+        let inputs = PlacementInputs {
+            tokens,
+            headers,
+            ..Default::default()
+        };
+        let worker = select_single(registry, policies, model, pool, None, inputs)?;
+        let shed =
+            overload::shed_if_worker_overloaded(&*worker, model, registry.overload_shed_enabled());
+        if shed.is_some() {
+            return None;
+        }
+        let went = placed_on(worker.worker());
+        let guard = worker.into_guard(policies.sticky_key(headers, None));
+        drop(guard);
+        Some(went)
+    }
+
+    /// One request's routing through a pair gateway's classic placement
+    /// on the gRPC wire: the pair index of the model's snapshot, the pair
+    /// placed over it by the registry's two side policies, and each side's
+    /// load guard from the send to the request's end. The prefill worker
+    /// the request went to (`placed_on`), and `None` where it had no
+    /// pair.
+    pub fn route_pair(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        model: &str,
+        tokens: Option<&[u32]>,
+    ) -> Option<usize> {
+        let pairs = registry
+            .get_routing_snapshot(model)
+            .pd_pairs(PdWire::Grpc, policies.pd_pairing_mode());
+        let inputs = PlacementInputs {
+            tokens,
+            ..Default::default()
+        };
+        let pair = select_pair(registry, policies, model, &pairs, None, None, inputs).ok()?;
+        let went = placed_on(pair.prefill.worker());
+        let key = policies.sticky_key(None, None);
+        let prefill = pair.prefill.into_guard(key);
+        // The decode's guard as a pair route makes it: ahead of the decode's
+        // send, and sent behind the prefill.
+        let decode = pair.decode.ahead(key);
+        let decode = pair.decode.sent(decode);
+        drop((prefill, decode));
+        Some(went)
+    }
 
     /// Whether a process switch captures every request's cache trace
     /// (`SMG_CACHE_TRACE=1` or `SMG_CACHE_TRACE_HEADER=1`). A benchmark cell
@@ -315,6 +452,7 @@ pub mod bench_support {
                 None,
                 inputs,
             )
+            .map(Placed::into_worker)
         }
     }
 
@@ -368,7 +506,7 @@ pub mod bench_support {
                     inputs,
                 )
                 .ok()
-                .map(|pair| (pair.prefill, pair.decode))
+                .map(|pair| (pair.prefill.into_worker(), pair.decode.into_worker()))
             })
             .await
         }

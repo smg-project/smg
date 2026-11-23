@@ -20,17 +20,14 @@ use engines::{cpu_seconds, eventually, mock_engine};
 use net::{http_get, loopback, vm_rss_kib};
 use openai_protocol::worker::RuntimeType;
 use smg_policy_controller::{
-    document::spec::{BindingSpec, OverloadSpec},
-    engine::view::{Role, SignalSource, WireModes, WorkerId},
-    service::{
-        controller::{Config, Controller, Election, Listener, Scope},
-        ingest::{
-            loads::{LoadDriver, LoadDriverConfig, LoadProbe, ReadError, Target},
-            probe::EngineProbe,
-        },
+    document::{AppliedSpec, BindingSpec, OverloadSpec, PolicySpec},
+    engine::{Role, SignalSource, WireModes, WorkerId},
+    load::ingest::{
+        loads::{LoadDriver, LoadDriverConfig, LoadProbe, ReadError, Target},
+        probe::EngineProbe,
     },
+    service::controller::{Config, Controller, ElectionConfig, Listener, Scope},
     store::{LoadSink, LoadSource, MemoryStore, Signals, WorkerFacts, WorkerStatus, WorkersStore},
-    AppliedSpec, PolicySpec,
 };
 use tokio::{
     net::TcpListener,
@@ -332,7 +329,7 @@ async fn the_controller_runs_the_driver_and_renders_its_counters() {
         // however slow the host; the first tick polls at once.
         load_poll_interval: Duration::from_secs(10),
         decide_shards: 2,
-        election: Election::default(),
+        election: ElectionConfig::default(),
         discovery: None,
     })
     .await

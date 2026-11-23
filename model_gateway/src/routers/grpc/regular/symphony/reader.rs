@@ -24,7 +24,7 @@ use super::{
 };
 #[cfg(test)]
 use super::{names::reading, template::Templates};
-use crate::routers::grpc::utils::{isolation, CallIdFamily};
+use crate::routers::grpc::utils::{gives_way, isolation, CallIdFamily};
 #[cfg(test)]
 use crate::{config::ParserChoice, routers::grpc::utils::ModelNames};
 
@@ -59,6 +59,8 @@ pub(crate) struct Assignment {
     /// gateway's JSON-schema constraint forces the call and the family numbers its ids by the
     /// conversation ([`CallIdFamily`]). The forced JSON has no header for the table to take an id
     /// from, so the reader gives each of its calls the family's id, as the older forced arm does.
+    /// So it does for every call of a table whose own name gives way ([`gives_way`]: today
+    /// `kimi`): it reads in the place of the legacy parsers, which numbered the family's calls.
     /// `None` for every other request: its ids are the table's.
     pub forced_ids: Option<(CallIdFamily, usize)>,
     /// The request holds the answer to JSON (a `json_object` or `json_schema` response format, a
@@ -272,8 +274,9 @@ pub(crate) fn assign(
 /// ([`Asks::no_calls_for`], [`Asks::no_reasoning`], [`asked`]). A call the conversation
 /// established without a tool inventory comes back as a call under either parser.
 ///
-/// `constraint` is the older registry's where the table built none (`WorkerConstraint::table`);
-/// the table's own is never passed, whatever kind its backend's spelling gave it.
+/// `constraint` is one no table built (`WorkerConstraint::table`): the older registry's where
+/// the table has no tag, or the forced call's JSON schema where the table's tag opens with free
+/// text; the table's own is never passed, whatever kind its backend's spelling gave it.
 ///
 /// Under a JSON-schema constraint (the forced call the older registry writes where the table has
 /// no tag for it) the output has none of the table's call markers: it is the model's thought,
@@ -344,9 +347,11 @@ pub(crate) fn assign_for(
             false,
         )
     };
-    // The forced JSON has no header to read an id from: a family that numbers its ids by the
-    // conversation numbers these too, as the older forced arm does.
-    let forced_ids = is_forced
+    // The forced JSON has no header to read an id from, and a table whose own name gives way
+    // (`GIVING_WAY`: today `kimi`) leaves its ids to the gateway: a family that numbers its ids
+    // by the conversation numbers these too, as the older parsers do. A table read through
+    // another such name (`command`, through `cohere_cmd`) mints its own.
+    let forced_ids = (is_forced || gives_way(format.name()))
         .then(|| CallIdFamily::of(asks.model()))
         .flatten()
         .map(|family| (family, asks.history_tool_calls_count()));
@@ -3501,6 +3506,40 @@ mod tests {
             let events = read_tail(&mut reader, list);
             assert_eq!(ids_of(&events), ids, "{model}: {events:?}");
         }
+    }
+
+    /// The `kimi` table reads in the place of the legacy parsers, which numbered a Kimi model's
+    /// calls by the conversation: each call takes the family's id, counted on from the call the
+    /// history holds, where the model wrote the first number again.
+    #[test]
+    fn the_calls_of_a_table_that_gives_way_take_the_familys_id() {
+        let asked = request(json!({
+            "model": "acme/kimi-tuned",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "lookup", "arguments": "{}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "a", "content": "1"},
+            ],
+            "tools": serde_json::to_value(tools()).expect("tools"),
+        }));
+        let assignment = assign_for(
+            Reading::Table(Table::Kimi.shared(), false),
+            Asks::Chat(&asked),
+            None,
+            "",
+            ProviderProfile::for_model(&asked.model),
+            || GrammarStart::Unknown,
+        )
+        .expect("the table reads the call");
+        let mut replayed = Events::new();
+        let mut reader = Reader::new(&assignment, tools().into(), &mut replayed).expect("a reader");
+        let events = read_tail(
+            &mut reader,
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.lookup:0<|tool_call_argument_begin|>{\"q\": 1}<|tool_call_end|><|tool_calls_section_end|>",
+        );
+        assert_eq!(ids_of(&events), ["functions.lookup:1"], "{events:?}");
     }
 
     /// A forced call's JSON has no header for the table to take an id from. On a family that

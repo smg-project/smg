@@ -3,7 +3,7 @@
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
 
-use std::{fmt::Debug, sync::Arc};
+use std::{any::TypeId, fmt::Debug, sync::Arc};
 
 use openai_protocol::UNKNOWN_MODEL_ID;
 use rand::RngExt as _;
@@ -67,7 +67,7 @@ pub use passthrough::PassthroughPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
-pub use registry::PolicyRegistry;
+pub use registry::{PolicyRegistry, Side};
 pub use round_robin::RoundRobinPolicy;
 // The periodic task lives beside the worker runtime. The path it had here is
 // kept: the policies name it.
@@ -164,6 +164,17 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false
     }
 
+    /// Whether this policy places a request that carries a routing key by
+    /// that key itself, reading the header ahead of the key derived from
+    /// the request id as the sticky routing-key override does (`manual`,
+    /// `consistent_hashing`). The override leaves such a policy its own
+    /// handling and places a keyed request of every other policy. The
+    /// registry asks the policy, and never reads its name for it: a name is
+    /// a label. A constant for the policy's lifetime.
+    fn honors_routing_key(&self) -> bool {
+        false
+    }
+
     /// Drop the state this policy keeps on a removed worker (a load-aware
     /// policy's dispatch tally), so it does not accumulate under worker
     /// churn (autoscaling, rolling updates). Default is a no-op for
@@ -218,15 +229,19 @@ pub(crate) fn as_bucket(policy: &dyn LoadBalancingPolicy) -> Option<&BucketPolic
 
 /// Whether a built-in policy applies the complete [`Worker::is_available`]
 /// predicate before selecting. Other policies keep the caller-side filter.
+///
+/// The policy says its type once and the types are compared as values, so
+/// a type late in the list costs a compare for each type ahead of it and
+/// no call.
 pub(crate) fn policy_filters_unavailable_workers(policy: &dyn LoadBalancingPolicy) -> bool {
-    let policy = policy.as_any();
-    policy.is::<RandomPolicy>()
-        || policy.is::<RoundRobinPolicy>()
-        || policy.is::<LeastLoadPolicy>()
-        || policy.is::<PowerOfTwoPolicy>()
-        || policy.is::<CacheAwarePolicy>()
-        || policy.is::<ManualPolicy>()
-        || policy.is::<PassthroughPolicy>()
+    let policy = policy.as_any().type_id();
+    policy == TypeId::of::<RandomPolicy>()
+        || policy == TypeId::of::<RoundRobinPolicy>()
+        || policy == TypeId::of::<LeastLoadPolicy>()
+        || policy == TypeId::of::<PowerOfTwoPolicy>()
+        || policy == TypeId::of::<CacheAwarePolicy>()
+        || policy == TypeId::of::<ManualPolicy>()
+        || policy == TypeId::of::<PassthroughPolicy>()
 }
 
 /// Whether a built-in policy reads the model's hash ring

@@ -1500,9 +1500,13 @@ pub struct ResilienceUpdate {
     pub cb_success_threshold: Option<u32>,
     /// Seconds to wait before attempting half-open.
     pub cb_timeout_secs: Option<u64>,
-    /// Time window in seconds for failure counting.
+    /// A closed circuit's failure more than this many seconds after the last
+    /// one starts a new streak; 0 is no window.
     pub cb_window_secs: Option<u64>,
-    /// Disable circuit breaker entirely for this worker.
+    /// `true` gives this worker the failure threshold `u32::MAX`, as the
+    /// router's `--disable-circuit-breaker` gives every worker, and wins over
+    /// `cb_failure_threshold`. `false` under the router's flag gives a
+    /// working breaker only together with `cb_failure_threshold`.
     pub disable_circuit_breaker: Option<bool>,
 
     // ── Retryable status codes ──

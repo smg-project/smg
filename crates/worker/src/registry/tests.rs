@@ -3093,6 +3093,39 @@ fn remove_if_removes_the_worker_only_while_its_condition_holds() {
     );
 }
 
+/// A call that names a worker already removed keeps no lock for it: only the
+/// removal that found the worker drops its entry, so a later one would stay.
+#[test]
+fn a_call_that_names_a_removed_worker_keeps_no_lock_for_it() {
+    let registry = WorkerRegistry::new();
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://w1:8080")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build(),
+    );
+    let id = registry
+        .register(Arc::clone(&worker))
+        .expect("the worker registers");
+    registry.remove(&id).expect("the worker is removed");
+    assert!(registry.worker_mutation_locks.is_empty());
+
+    assert_eq!(
+        registry.transition_status_if_revision(&id, worker.revision(), WorkerStatus::NotReady),
+        None
+    );
+    assert!(registry.worker_mutation_locks.is_empty(), "a transition");
+    assert!(!registry.replace(&id, Arc::clone(&worker)));
+    assert!(registry.worker_mutation_locks.is_empty(), "a replacement");
+    assert!(registry.remove_if(&id, |_| true).is_none());
+    assert!(
+        registry.worker_mutation_locks.is_empty(),
+        "a conditional removal"
+    );
+    assert!(registry.remove(&id).is_none());
+    assert!(registry.worker_mutation_locks.is_empty(), "a removal");
+}
+
 /// The lines a rendered scrape holds for the worker at `url`, sorted.
 fn series_of(rendered: &str, url: &str) -> Vec<String> {
     let label = format!("worker=\"{url}\"");

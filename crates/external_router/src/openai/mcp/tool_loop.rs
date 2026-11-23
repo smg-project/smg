@@ -1789,12 +1789,14 @@ mod tests {
                 server_key: "server-ask".to_string(),
                 allowed_tools: Some(vec!["ask_question".to_string()]),
                 list_error: None,
+                pool_key: None,
             },
             McpServerBinding {
                 label: "deepwiki_read".to_string(),
                 server_key: "server-read".to_string(),
                 allowed_tools: Some(vec!["read_wiki_structure".to_string()]),
                 list_error: None,
+                pool_key: None,
             },
         ];
 
@@ -1814,6 +1816,7 @@ mod tests {
             server_key: "server-ask".to_string(),
             allowed_tools: Some(vec!["ask_question".to_string()]),
             list_error: None,
+            pool_key: None,
         }];
 
         let bindings_to_emit = mcp_list_tools_bindings_to_emit(&existing_labels, &bindings);
@@ -2273,6 +2276,7 @@ mod tests {
             server_key: "wiki-server".to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         }];
         (orchestrator, bindings)
     }
@@ -2832,6 +2836,7 @@ mod tests {
             server_key: server_key.to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         };
         let session = McpToolSession::new(
             &orchestrator,
@@ -3067,6 +3072,7 @@ mod tests {
             server_key: "a-server".to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         }];
         let before = counting_alloc::calls();
         let bound_session = McpToolSession::new(&orchestrator, bindings, "test-request");
@@ -3130,6 +3136,7 @@ mod tests {
             server_key: "search-server".to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         }];
 
         let before = counting_alloc::calls();

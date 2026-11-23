@@ -8,8 +8,8 @@ use parking_lot::Mutex;
 
 use crate::{
     document::spec::{AppliedSpec, Digest, PolicySpec, SpecError},
+    stages::StageRegistry,
     store::MemoryStore,
-    Catalog,
 };
 
 /// A document in the form of the design's example: no `generation` line.
@@ -50,8 +50,8 @@ pub(crate) fn long_text_under_aliases(text: usize, aliases: usize) -> String {
 }
 
 /// The stock build's stages.
-pub(crate) fn stock() -> Arc<Catalog> {
-    Arc::new(Catalog::builtin())
+pub(crate) fn stock() -> Arc<StageRegistry> {
+    Arc::new(StageRegistry::builtin())
 }
 
 /// A validator that panics on a document that picks at random, and
@@ -59,7 +59,7 @@ pub(crate) fn stock() -> Arc<Catalog> {
 pub(crate) fn faulting(
     document: &PolicySpec,
     digest: Digest,
-    catalog: &Catalog,
+    catalog: &StageRegistry,
     denied_headers: &[&str],
 ) -> Result<AppliedSpec, SpecError> {
     let random = document
@@ -72,7 +72,7 @@ pub(crate) fn faulting(
 
 /// The number and the digest the store runs.
 pub(crate) fn standing(store: &MemoryStore) -> (u64, Option<Digest>) {
-    let world = store.world();
+    let world = store.snapshot();
     (world.spec().generation(), world.spec().digest())
 }
 

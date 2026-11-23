@@ -5,7 +5,7 @@
 
 // A row lists the kinds of lifecycle event its plugin hears in the
 // lifecycle's own set.
-pub use crate::tracking::lease::{EventKind, EventSet};
+pub(crate) use crate::tracking::lease::EventSet;
 
 /// How a tenant or a session key reaches the plugin: withheld, as its
 /// fingerprint (the default), or in the clear when the host holds it so.
@@ -90,9 +90,9 @@ impl Default for BreakerSpec {
     }
 }
 
-/// A plugin's frame budget per stage call (`0` takes the request's) and the
-/// fuel per microsecond it is metered at: the one place the frame is clamped
-/// to the request's and turned into fuel.
+/// A plugin's frame budget per stage call (`0` takes the default frame,
+/// [`Self::DEFAULT_MICROS`]) and the fuel per microsecond it is metered at:
+/// the one place the frame is clamped to the request's and turned into fuel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameBudget {
     pub micros: u32,
@@ -100,14 +100,25 @@ pub struct FrameBudget {
 }
 
 impl FrameBudget {
+    /// The frame of a plugin that states no budget of its own, in
+    /// microseconds: 100 ms, the frame of a plugin's connect and of a
+    /// guest's `init`. A request in process may state no budget, and a
+    /// stage is then shown the widest one: a call that leaves the engine is
+    /// bounded all the same.
+    ///
+    /// A guest's `observe` call keeps a frame of its own for an unset
+    /// budget: no request stands behind it.
+    pub const DEFAULT_MICROS: u32 = 100_000;
+
     /// The frame of one call under `request_budget_micros` left: the
-    /// plugin's own, clamped to the request's.
+    /// plugin's own, or the default where it states none, clamped to the
+    /// request's.
     pub fn frame_micros(self, request_budget_micros: u32) -> u32 {
-        if self.micros == 0 {
-            request_budget_micros
-        } else {
-            self.micros.min(request_budget_micros)
-        }
+        let own = match self.micros {
+            0 => Self::DEFAULT_MICROS,
+            own => own,
+        };
+        own.min(request_budget_micros)
     }
 
     /// The fuel of one call's frame under `request_budget_micros` left; `0`
@@ -124,7 +135,43 @@ impl FrameBudget {
 
 #[cfg(test)]
 mod tests {
-    use super::HeaderSet;
+    use super::{FrameBudget, HeaderSet};
+
+    /// A plugin that states no budget takes the default frame, clamped to
+    /// the request's as a stated one is: under a request with no budget,
+    /// which a stage is shown as the widest, under a larger frame and under
+    /// a smaller one. A stated budget is the plugin's own on both sides of
+    /// the default, and a request whose budget is gone gets no frame.
+    #[test]
+    fn a_plugin_with_no_budget_takes_the_default_frame_clamped_to_the_requests() {
+        let default = FrameBudget::DEFAULT_MICROS;
+        let unset = FrameBudget {
+            micros: 0,
+            fuel_per_micro: 10,
+        };
+        for (request, frame) in [
+            (u32::MAX, default),
+            (default + 1, default),
+            (default, default),
+            (500, 500),
+            (0, 0),
+        ] {
+            assert_eq!(unset.frame_micros(request), frame, "under {request}");
+            assert_eq!(
+                unset.fuel_for(request),
+                u64::from(frame) * 10,
+                "under {request}"
+            );
+        }
+        for own in [200, default * 3] {
+            let stated = FrameBudget {
+                micros: own,
+                fuel_per_micro: 10,
+            };
+            assert_eq!(stated.frame_micros(u32::MAX), own);
+            assert_eq!(stated.frame_micros(100), 100);
+        }
+    }
 
     #[test]
     fn a_header_set_holds_positions_over_the_whole_byte_range() {

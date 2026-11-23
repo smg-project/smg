@@ -128,8 +128,8 @@ A family of a known call syntax costs a table and evidence, and no engine change
 4. Give it a corpus row in `tests/bellwether_parse_fixtures.rs` (the slug of each recorded set and
    how the template ends the generation prompt); the replay reads the table and the opener from the
    registry.
-5. Regenerate the README's models table (`SYMPHONY_WRITE_README=1 cargo test -p smg-symphony
-   --test readme`); a stale table fails the build.
+5. Add or change the group's row in the README's models table by hand; `cargo test -p
+   smg-symphony --test readme` fails when the table and the registry differ.
 
 A new call syntax costs an assembler (under `json`, `tagged`, `pythonic`, or `gemma`), a
 `CallSyntax` variant, an arm in the engine's assembler factory, and a grammar module under

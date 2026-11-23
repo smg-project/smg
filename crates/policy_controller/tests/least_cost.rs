@@ -7,9 +7,13 @@
 )]
 
 use smg_policy_controller::{
-    document::spec::CostMargin, stages::builtins::score_costs, Candidate, Catalog, Constraints,
-    Engine, Health, Lease, Lifecycle, LoadRow, Pick, PolicySpec, PoolFacts, RequestFacts, Scorer,
-    Scratch, Side, SpecError, Target, TieBand, WorkerId, API_VERSION,
+    document::{CostMargin, PolicySpec, SpecError, API_VERSION},
+    engine::{
+        Candidate, Constraints, Engine, Health, LoadRow, Pick, PoolFacts, RequestFacts, Scorer,
+        Scratch, Target, TieBand, WorkerId,
+    },
+    stages::{score_costs, Lifecycle, StageRegistry},
+    tracking::{Lease, Side},
 };
 
 fn parse(score: &str, pick: &str) -> Result<PolicySpec, serde_yaml::Error> {
@@ -186,6 +190,29 @@ fn a_report_sampled_after_a_send_ends_its_charge() {
 
     rows[1].load_sampled_at_micros = SENT_AT + 1;
     let mut tied = scores_at(&engine, &rows, SENT_AT + 2);
+    tied.sort_unstable_by_key(|&(id, _)| id);
+    assert_eq!(tied, [(1, 1.0), (2, 1.0)]);
+}
+
+#[test]
+fn a_report_sampled_sooner_than_the_profiles_delay_leaves_a_sends_charge() {
+    let mut spec = document("terms: {sent.requests: 1000}");
+    spec.profiles
+        .get_mut("p")
+        .expect("the profile")
+        .sent_report_delay_ms = Some(5);
+    let engine = spec.validate().expect("a reader of sends under a delay");
+    let mut rows = reports([(0, 0), (0, 0)]);
+    send(&engine, &rows[1], 317);
+    // Three milliseconds behind the send: the charge stands.
+    rows[1].load_sampled_at_micros = SENT_AT + 3_000;
+    assert_eq!(
+        scores_at(&engine, &rows, SENT_AT + 9_000),
+        [(1, 1.0), (2, 0.0)]
+    );
+    // Five behind it: the report ends the charge.
+    rows[1].load_sampled_at_micros = SENT_AT + 5_000;
+    let mut tied = scores_at(&engine, &rows, SENT_AT + 9_000);
     tied.sort_unstable_by_key(|&(id, _)| id);
     assert_eq!(tied, [(1, 1.0), (2, 1.0)]);
 }
@@ -957,7 +984,7 @@ fn a_registered_scorer_uses_the_same_tie_and_a_zero_band() {
     assert_eq!(band, TieBand(0.0));
     assert_eq!(out, [1.0, 1.0, 0.0]);
 
-    let mut catalog = Catalog::builtin();
+    let mut catalog = StageRegistry::builtin();
     catalog
         .scorer("own-cost", || Box::new(OwnCost))
         .expect("a new name");

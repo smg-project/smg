@@ -96,8 +96,8 @@ use llm_multimodal::{
     registry::{ModelMetadata, ModelRegistry, Tokenizer},
     types::{ImageDetail, ImageFrame, ImageSize, ImageSource, Modality, TransparencyPolicy},
     vision::{PreProcessorConfig, VideoClipOptions, VisionPreProcessor},
-    webp_native, MediaConnector, MediaConnectorConfig, MediaSource, Parallelism, VideoClip,
-    VideoFetchConfig,
+    webp_native, MediaConnector, MediaConnectorConfig, MediaSource, Parallelism, TransformError,
+    VideoClip, VideoFetchConfig,
 };
 use rustix::time::{clock_gettime, ClockId};
 use rustls::crypto::ring;
@@ -475,8 +475,10 @@ fn preprocess_clip(
     }
     if let Some(rgb) = clip.rgb_video() {
         if let Ok(refs) = rgb.frame_refs() {
-            if let Ok(inputs) = processor.preprocess_video_rgb(&refs, &options) {
-                return Ok(inputs);
+            match processor.preprocess_video_rgb(&refs, &options) {
+                Ok(inputs) => return Ok(inputs),
+                Err(error @ TransformError::ReserveRefused(_)) => return Err(error.to_string()),
+                Err(_) => {}
             }
         }
     }

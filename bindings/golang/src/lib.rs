@@ -5,7 +5,7 @@
 //! to C-compatible languages (e.g., Golang via cgo)
 //!
 //! This module provides C-compatible function signatures for:
-//! - Tokenizer operations (encode, decode, chat template)
+//! - Tokenizer operations (encode, chat template)
 //! - Response conversion (the engine's chunks as the client's deltas, with
 //!   tool calls and reasoning read through the Symphony crate's tables)
 //! - gRPC client SDK (complete request-response flow)
@@ -66,8 +66,7 @@ pub use stream::{sgl_stream_free, sgl_stream_read_next, SglangStreamHandle};
 // Re-export tokenizer functions
 pub use tokenizer::{
     sgl_tokenizer_apply_chat_template, sgl_tokenizer_apply_chat_template_with_tools,
-    sgl_tokenizer_create_from_file, sgl_tokenizer_decode, sgl_tokenizer_encode, sgl_tokenizer_free,
-    TokenizerHandle,
+    sgl_tokenizer_create_from_file, sgl_tokenizer_encode, sgl_tokenizer_free, TokenizerHandle,
 };
 
 // Sub-modules

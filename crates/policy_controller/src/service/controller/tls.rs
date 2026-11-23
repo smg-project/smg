@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use super::config::Tls;
-use crate::service::ingest::probe;
+use crate::load::ingest::probe;
 
 /// The process crypto provider, the one the HTTP client of the load driver's
 /// probe installs too: whichever comes first installs it, the other finds it.

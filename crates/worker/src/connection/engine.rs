@@ -25,6 +25,7 @@ type ConnectionCell = OnceCell<Arc<dyn EngineConnection>>;
 
 /// A worker's connection generation. Compatible replacements adopt the slot
 /// itself so a probe from either worker can retire its observed generation.
+/// The rank workers of one ZMQ engine group hold one cache between them.
 pub struct EngineConnectionCache {
     slot: ArcSwap<ArcSwap<ConnectionCell>>,
 }
@@ -179,6 +180,10 @@ pub struct ZmqLink {
     /// How many engines the link must find; `None` takes the count declared
     /// at the handshake.
     pub engine_count: Option<usize>,
+    /// Whether the link serves rank workers, each of which pins its requests
+    /// to its own rank. A connector refuses engines such a pin would not
+    /// reach.
+    pub pinned_by_rank: bool,
     /// The per-stage silence bound of the startup handshake.
     pub startup: Duration,
     /// The bound on a request over the link, from its dispatch to its last

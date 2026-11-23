@@ -108,12 +108,7 @@ smg-mm-rdma.workspace = true
 smg-wasm = { workspace = true, features = ["storage-hooks"] }
 smg-mesh.workspace = true
 smg-rl.workspace = true
-# The policy document, its presets, and the controller's store, door and
-# handle in this process: every target builds them. The worker-host feature
-# supplies the membership door and the holder of worker objects, and the
-# operator feature the operators' door over the document. The crate's
-# client is two targets': see the end of this file.
-smg-policy-controller = { workspace = true, features = ["operator", "worker-host"] }
+smg-policy-controller = { workspace = true, features = ["in-process", "operator"] }
 smg-grpc-client.workspace = true
 engine-zmq-client.workspace = true
 engine-zmq-adapter.workspace = true
@@ -236,11 +231,6 @@ harness = false
 path = "benches/tokenizer_benchmark.rs"
 
 [[bench]]
-name = "tool_parser_benchmark"
-harness = false
-path = "benches/tool_parser_benchmark.rs"
-
-[[bench]]
 name = "manual_policy_benchmark"
 harness = false
 path = "benches/manual_policy_benchmark.rs"
@@ -325,16 +315,16 @@ name = "symphony_messages_stream"
 harness = false
 path = "benches/symphony_messages_stream.rs"
 
+# One request's routing under the classic policies: a fixed count of
+# decisions a cell, so the same binary counts instructions.
+[[bench]]
+name = "decision_paths"
+harness = false
+path = "benches/decision_paths.rs"
+
 [lints]
 workspace = true
 
 [target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true, features = ["stats"] }
-
-# The controller crate's client, for a gateway that follows a controller
-# (`src/policy_controller/follower.rs`). The client builds on the controller's
-# own runtime, which builds on Linux and macOS. Those two take it, and a
-# controller's address is refused at startup elsewhere.
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-smg-policy-controller = { workspace = true, features = ["client"] }

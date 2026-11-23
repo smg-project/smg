@@ -467,6 +467,7 @@ async fn the_grpc_connector_connects_dials_and_refuses_the_host_local_wire() {
         worker_type: WorkerType::Regular,
         handshake_address: None,
         engine_count: None,
+        pinned_by_rank: false,
         startup: bound,
         request_timeout: None,
     };

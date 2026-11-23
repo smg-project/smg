@@ -103,7 +103,7 @@ pub(crate) mod tests {
     use super::{as_told, principal, Principal, ENTRY, NAME_MAX};
     use crate::{
         service::proto::principal::Method,
-        store::{token, GatewayId, Maker},
+        store::{token, GatewayId, Registrant},
     };
 
     /// The refusal of a call with no principal, word for word.
@@ -133,7 +133,7 @@ pub(crate) mod tests {
         for name in ["cluster", "pods/a-1", "a,b", "a b", ""] {
             let stated = principal(&as_told(stating(name))).is_ok();
             assert_eq!(stated, token(name), "{name:?}");
-            assert_eq!(Maker::provider(name, "k").is_ok(), stated, "{name:?}");
+            assert_eq!(Registrant::provider(name, "k").is_ok(), stated, "{name:?}");
         }
     }
 

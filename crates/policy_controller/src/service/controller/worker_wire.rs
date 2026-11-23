@@ -19,15 +19,15 @@ use prost::Message as _;
 
 use crate::{
     document::operator::snapshot,
-    engine::view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
+    engine::view::{Role, SignalSource, WireModes, WorkerId},
     service::{
         proto::{self, worker_event::Event},
         replication::{Entry, Event as Written},
     },
     store::{
-        membership::blank, GatewayId, HealthPolicy, LoadSample, LoadSource, Maker,
-        MembershipChange, Overload, Position, Reachability, Signals, Unmade, WorkerFacts,
-        WorkerPatch, WorkerRow, WorkerStatus,
+        membership::blank, GatewayId, HealthPolicy, LoadSample, MembershipChange, Overload,
+        Position, ProviderKeyError, Reachability, Registrant, Signals, WorkerFacts, WorkerPatch,
+        WorkerRow, WorkerStatus,
     },
 };
 
@@ -141,10 +141,10 @@ pub(crate) fn row(row: &WorkerRow) -> proto::WorkerRow {
 
 /// The wire's maker of a row's: none for a control call's row, so a row
 /// that crosses with no field reads as one.
-fn maker(by: &Maker) -> Option<proto::Maker> {
+fn maker(by: &Registrant) -> Option<proto::Maker> {
     match by {
-        Maker::Control => None,
-        Maker::Provider(found) => Some(proto::Maker {
+        Registrant::Control => None,
+        Registrant::Provider(found) => Some(proto::Maker {
             provider: found.provider().to_owned(),
             key: found.key().to_owned(),
         }),
@@ -265,7 +265,6 @@ pub(crate) fn status_changed(id: WorkerId, from: WorkerStatus, to: WorkerStatus)
 /// One entry of the answer of a registration that states several ranks: the
 /// event a watcher is told of that row, without a place of its own. `None`
 /// for a case no registration makes of a row.
-#[cfg(feature = "worker-host")]
 pub(crate) fn rank_row(event: Event) -> Option<proto::RankRow> {
     use proto::rank_row::Made;
     let made = match event {
@@ -367,9 +366,9 @@ fn fits(
 
 /// The bytes a row's maker takes on the wire, under the contract's field
 /// numbers: none for a control call's row.
-fn maker_weight(maker: &Maker) -> usize {
+fn maker_weight(maker: &Registrant) -> usize {
     use prost::encoding::{encoded_len_varint, key_len};
-    let Maker::Provider(found) = maker else {
+    let Registrant::Provider(found) = maker else {
         return 0;
     };
     // A length's own bytes, and a text under its tag: neither of a maker's
@@ -388,7 +387,6 @@ fn maker_weight(maker: &Maker) -> usize {
 /// and a zero admission window, block size or port as none. The facts are
 /// written as the log writes them and read back as a standby reads them, so
 /// a fact the wire gains is taken here with no second list.
-#[cfg(feature = "worker-host")]
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "the host's door asks it of each registration")
@@ -452,7 +450,7 @@ pub(crate) fn wire_reach(
 pub(crate) fn room(
     facts: &WorkerFacts,
     labels: &BTreeMap<String, String>,
-    maker: &Maker,
+    maker: &Registrant,
     path: &'static str,
 ) -> Result<(), Refused> {
     let bytes = maker_weight(maker);
@@ -725,11 +723,11 @@ pub(crate) fn told_row(told: &proto::WorkerRow, now: Instant) -> Result<WorkerRo
         ..WorkerFacts::default()
     };
     let maker = match &told.maker {
-        None => Maker::Control,
-        Some(by) => match Maker::provider(by.provider.clone(), by.key.clone()) {
+        None => Registrant::Control,
+        Some(by) => match Registrant::provider(by.provider.clone(), by.key.clone()) {
             Ok(maker) => maker,
-            Err(Unmade::Provider(why)) => return Err(refused("row.maker.provider", why)),
-            Err(Unmade::Key(why)) => return Err(refused("row.maker.key", why)),
+            Err(ProviderKeyError::Provider(why)) => return Err(refused("row.maker.provider", why)),
+            Err(ProviderKeyError::Key(why)) => return Err(refused("row.maker.key", why)),
         },
     };
     let age = Duration::from_millis(told.admitted_age_ms);
@@ -797,69 +795,21 @@ pub(crate) fn told_change(
     Ok((told.membership_epoch, change, row))
 }
 
-/// A load row of the leader's stream as a standby's store takes it: the
-/// worker, the rank, the row with the age it crossed with, and the source
-/// its record is written under. The row's own source is the ingress's in
-/// its narrow form: a row the stream or a relay pushed is recorded as a
-/// pushed one (the relay's name stays with its gateway), any other as its
-/// poll's or its scrape's, so the poll decision reads the leader's.
-pub(crate) fn told_load(
-    told: &proto::LoadSample,
-) -> Result<(WorkerId, u16, LoadRow, LoadSource), Refused> {
-    let row = told.load.as_ref().ok_or_else(|| unknown("load.load"))?;
-    let (source, ingress) = match proto::SignalSource::try_from(row.source) {
-        Ok(proto::SignalSource::None) => (SignalSource::None, LoadSource::Poll),
-        Ok(proto::SignalSource::Events) => (SignalSource::Events, LoadSource::Stream),
-        Ok(proto::SignalSource::Scrape) => (SignalSource::Scrape, LoadSource::Scrape),
-        Ok(proto::SignalSource::Relay) => (SignalSource::Relay, LoadSource::Stream),
-        Ok(proto::SignalSource::Poll) => (SignalSource::Poll, LoadSource::Poll),
-        Ok(proto::SignalSource::Unspecified) | Err(_) => {
-            return Err(unknown("load.load.source"));
-        }
-    };
-    let stored = LoadRow {
-        running: row.running,
-        queued: row.queued,
-        waiting_uncached_tokens: row.waiting_uncached_tokens,
-        kv_usage_permille: narrow(row.kv_usage_permille, "load.load.kv_usage_permille")?,
-        active_kv_permille: narrow(row.active_kv_permille, "load.load.active_kv_permille")?,
-        live_rate: row.live_rate,
-        resident_tokens: row.resident_tokens,
-        resident_counted: told.resident_counted,
-        report_age_ms: row.report_age_ms,
-        source,
-        max_running: row.max_running,
-    };
-    let rank = narrow(told.dp_rank, "load.dp_rank")?;
-    Ok((WorkerId(told.worker_id), rank, stored, ingress))
-}
-
-/// One part of a leader's snapshot, read at `now`, into the rows and the
-/// load rows a standby stages for its restore
+/// One part of a leader's snapshot, read at `now`, into the rows a standby
+/// stages for its restore
 /// ([`crate::store::MemoryStore::restore_from`]). Every instant is `now`
 /// less the age its row crossed with: the leader told each age at the
-/// part's send, so a part is read at its arrival.
+/// part's send, so a part is read at its arrival. A part's load rows are
+/// read past: a leader of this build sends none, and a standby keeps none
+/// of an older leader's.
 pub(crate) fn told_part(
     told: &proto::ReplicationSnapshot,
     now: Instant,
     rows: &mut Vec<WorkerRow>,
-    loads: &mut Vec<(WorkerId, u16, LoadSample)>,
 ) -> Result<(), Refused> {
     rows.reserve(told.workers.len());
     for row in &told.workers {
         rows.push(told_row(row, now)?);
-    }
-    loads.reserve(told.loads.len());
-    for load in &told.loads {
-        let (id, rank, row, source) = told_load(load)?;
-        let age = Duration::from_millis(u64::from(row.report_age_ms));
-        let sample = LoadSample {
-            row,
-            received_at: now,
-            sampled_at: now.checked_sub(age).unwrap_or(now),
-            source,
-        };
-        loads.push((id, rank, sample));
     }
     Ok(())
 }
@@ -925,12 +875,10 @@ pub(crate) fn registration(
 
 /// The most ranks one registration states: a replacement answers two rows a
 /// rank, and the answer stays inside half of a 4 MiB frame.
-#[cfg(feature = "worker-host")]
 pub(crate) const RANKS: u32 = 64;
 
 /// The ranks a registration states: one where it states none, and at most
 /// [`RANKS`].
-#[cfg(feature = "worker-host")]
 pub(crate) fn width(spec: &proto::WorkerSpec) -> Result<u16, Refused> {
     if spec.dp_size > RANKS {
         return Err(refused(
@@ -944,7 +892,6 @@ pub(crate) fn width(spec: &proto::WorkerSpec) -> Result<u16, Refused> {
 /// The facts of one rank of a registration that states `width` ranks, with
 /// the row that stands under the rank's URL. The URL's own rules hold for
 /// the engine's address ([`key`]) and for the rank's.
-#[cfg(feature = "worker-host")]
 pub(crate) fn rank_registration(
     spec: &proto::WorkerSpec,
     (url, rank, width): (&str, u16, u16),
@@ -1291,8 +1238,8 @@ mod tests {
 
     use super::{
         event, load, member, page, patch, refused, registration, removed, replaced, replication,
-        row, start_again, status, status_changed, told_change, told_load, told_part, told_row,
-        Refused, KEY_BYTES, LABELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
+        row, start_again, status, status_changed, told_change, told_part, told_row, Refused,
+        KEY_BYTES, LABELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
     };
     use crate::{
         engine::view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
@@ -1301,8 +1248,8 @@ mod tests {
             replication::{Entry, Event as Written},
         },
         store::{
-            identity, GatewayId, HealthPolicy, LoadSample, LoadSource, Maker, MembershipChange,
-            Overload, Position, Reachability, Signals, WorkerFacts, WorkerRow, WorkerStatus,
+            identity, GatewayId, HealthPolicy, LoadSample, LoadSource, MembershipChange, Overload,
+            Position, Reachability, Registrant, Signals, WorkerFacts, WorkerRow, WorkerStatus,
         },
     };
 
@@ -2686,9 +2633,9 @@ mod tests {
         );
 
         let makers = [
-            Maker::Control,
-            Maker::provider("p", "k").expect("the shortest maker"),
-            Maker::provider(text(128), text(2_048)).expect("the widest maker"),
+            Registrant::Control,
+            Registrant::provider("p", "k").expect("the shortest maker"),
+            Registrant::provider(text(128), text(2_048)).expect("the widest maker"),
         ];
         for long in [false, true] {
             let sized = |least, most| text(if long { most } else { least });
@@ -2846,7 +2793,7 @@ mod tests {
     #[test]
     fn a_row_crosses_with_its_maker() {
         use super::{maker_weight, room};
-        use crate::store::{Maker, Unmade};
+        use crate::store::{ProviderKeyError, Registrant};
 
         let now = Instant::now();
         // A control call's row says no maker, and a row that says none
@@ -2855,11 +2802,11 @@ mod tests {
         let told = row(&by_hand);
         assert_eq!(told.maker, None);
         let back = told_row(&told, now).expect("the row");
-        assert_eq!(back.maker, Maker::Control);
+        assert_eq!(back.maker, Registrant::Control);
         // A provider's row crosses whole: its name and its key for the
         // worker.
         let found = WorkerRow {
-            maker: Maker::provider("cluster", "pods/a").expect("a whole maker"),
+            maker: Registrant::provider("cluster", "pods/a").expect("a whole maker"),
             ..full()
         };
         let told = row(&found);
@@ -2874,7 +2821,7 @@ mod tests {
         // side of a length's second byte, and a row holds them inside its
         // bound.
         for bytes in [1, 110, 127, 128, 300] {
-            let maker = Maker::provider("cluster", "k".repeat(bytes)).expect("a whole maker");
+            let maker = Registrant::provider("cluster", "k".repeat(bytes)).expect("a whole maker");
             let with = WorkerRow {
                 maker: maker.clone(),
                 ..full()
@@ -2882,9 +2829,9 @@ mod tests {
             let grown = row(&with).encoded_len() - row(&by_hand).encoded_len();
             assert_eq!(maker_weight(&maker), grown, "a key of {bytes}");
         }
-        assert_eq!(maker_weight(&Maker::Control), 0);
+        assert_eq!(maker_weight(&Registrant::Control), 0);
         let brim = facts(&weighing(ROW_BYTES), None).expect("a row at its bound");
-        assert!(room(&brim, &brim.labels, &Maker::Control, "spec").is_ok());
+        assert!(room(&brim, &brim.labels, &Registrant::Control, "spec").is_ok());
         assert_eq!(
             room(&brim, &brim.labels, &found.maker, "spec").map_err(|refused| refused.path),
             Err("spec")
@@ -2905,8 +2852,8 @@ mod tests {
         assert!(row(&widest).encoded_len() <= ROW_BYTES);
         // A maker that breaks a part's rule is refused by that part's path,
         // in the words of the routine that makes one: no leader makes it.
-        let wide = "p".repeat(Maker::NAME_BYTES + 1);
-        let long = "k".repeat(Maker::KEY_BYTES + 1);
+        let wide = "p".repeat(Registrant::NAME_BYTES + 1);
+        let long = "k".repeat(Registrant::KEY_BYTES + 1);
         for (provider, key, path) in [
             ("", "pods/a", "row.maker.provider"),
             ("cluster", "", "row.maker.key"),
@@ -2925,8 +2872,8 @@ mod tests {
                 ..told.clone()
             };
             let refusal = told_row(&broken, now).expect_err("refused");
-            let (Unmade::Provider(why) | Unmade::Key(why)) =
-                Maker::provider(provider, key).expect_err("no maker");
+            let (ProviderKeyError::Provider(why) | ProviderKeyError::Key(why)) =
+                Registrant::provider(provider, key).expect_err("no maker");
             assert_eq!((refusal.path, refusal.why), (path, why));
         }
     }
@@ -3098,112 +3045,32 @@ mod tests {
     }
 
     #[test]
-    fn a_restored_load_row_is_as_old_as_it_crossed() {
+    fn a_parts_load_rows_are_read_past() {
         let at = Instant::now();
-        let row = LoadRow {
-            running: 3,
-            queued: 2,
-            waiting_uncached_tokens: 4_096,
-            kv_usage_permille: 870,
-            active_kv_permille: 640,
-            live_rate: 12,
-            resident_tokens: 9_000,
-            resident_counted: true,
-            report_age_ms: 0,
-            source: SignalSource::Poll,
-            max_running: 64,
-        };
         let sample = LoadSample {
-            row,
+            row: LoadRow {
+                running: 3,
+                source: SignalSource::Poll,
+                ..LoadRow::default()
+            },
             received_at: at,
             sampled_at: at,
             source: LoadSource::Poll,
         };
-        // Sent in a snapshot's part 700 ms after its receipt, read later.
-        let sent = load(WorkerId(7), 2, &sample, at + Duration::from_millis(700));
+        // A row no build reads: its source names no ingress. An older
+        // leader's part carries load rows, and this build keeps none.
+        let mut sent = load(WorkerId(7), 2, &sample, at);
+        if let Some(row) = &mut sent.load {
+            row.source = 99;
+        }
         let part = proto::ReplicationSnapshot {
+            workers: vec![row(&full())],
             loads: vec![sent],
             last: true,
             ..proto::ReplicationSnapshot::default()
         };
-        let now = at + Duration::from_secs(5);
-        let (mut rows, mut loads) = (Vec::new(), Vec::new());
-        told_part(&part, now, &mut rows, &mut loads).expect("a part this build holds");
-        assert!(rows.is_empty());
-        let (id, rank, restored) = loads.first().expect("the load row");
-        assert_eq!((*id, *rank), (WorkerId(7), 2));
-        // The restore is its receipt, and its age is the age it crossed
-        // with: a restored row is no fresher than its leader's.
-        assert_eq!(restored.received_at, now);
-        assert_eq!(now - restored.sampled_at, Duration::from_millis(700));
-        assert_eq!(restored.row.report_age_ms, 700);
-    }
-
-    #[test]
-    fn a_load_row_comes_back_with_its_age_and_the_source_it_is_recorded_under() {
-        let at = Instant::now();
-        let stored = |source| LoadRow {
-            running: 3,
-            queued: 2,
-            waiting_uncached_tokens: 4_096,
-            kv_usage_permille: 870,
-            active_kv_permille: 640,
-            live_rate: 12,
-            resident_tokens: 9_000,
-            resident_counted: true,
-            report_age_ms: 40,
-            source,
-            max_running: 64,
-        };
-        for (source, ingress) in [
-            (SignalSource::None, LoadSource::Poll),
-            (SignalSource::Events, LoadSource::Stream),
-            (SignalSource::Relay, LoadSource::Stream),
-            (SignalSource::Scrape, LoadSource::Scrape),
-            (SignalSource::Poll, LoadSource::Poll),
-        ] {
-            let age = Duration::from_millis(40);
-            let sample = LoadSample {
-                row: stored(source),
-                received_at: at,
-                sampled_at: at - age,
-                source: LoadSource::Stream,
-            };
-            // Sent 60 ms after its receipt: the age is the send's.
-            let sent = load(WorkerId(7), 2, &sample, at + Duration::from_millis(60));
-            let aged = LoadRow {
-                report_age_ms: 100,
-                ..stored(source)
-            };
-            assert_eq!(told_load(&sent), Ok((WorkerId(7), 2, aged, ingress)));
-        }
-        let sample = LoadSample {
-            row: stored(SignalSource::Poll),
-            received_at: at,
-            sampled_at: at,
-            source: LoadSource::Poll,
-        };
-        let sent = load(WorkerId(7), 2, &sample, at);
-        let mut unknown = sent;
-        if let Some(row) = &mut unknown.load {
-            row.source = 99;
-        }
-        assert_eq!(
-            told_load(&unknown).map_err(|refused| refused.path),
-            Err("load.load.source")
-        );
-        let rank = proto::LoadSample {
-            dp_rank: 65_536,
-            ..sent
-        };
-        assert_eq!(
-            told_load(&rank).map_err(|refused| refused.path),
-            Err("load.dp_rank")
-        );
-        let none = proto::LoadSample { load: None, ..sent };
-        assert_eq!(
-            told_load(&none).map_err(|refused| refused.path),
-            Err("load.load")
-        );
+        let mut rows = Vec::new();
+        told_part(&part, at, &mut rows).expect("the load rows are read past");
+        assert_eq!(rows.len(), 1, "the part's rows are read");
     }
 }

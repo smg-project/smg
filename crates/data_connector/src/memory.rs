@@ -371,6 +371,11 @@ impl ConversationItemInner {
         item_id: &ConversationItemId,
         added_at: DateTime<Utc>,
     ) {
+        // A link lives and dies with its item (an eviction unlinks through the item), so none
+        // is written for an item the bound has already dropped.
+        if !self.items.contains_key(item_id) {
+            return;
+        }
         let key: LinkKey = (added_at, item_id.0.clone());
         let links = self.links.entry(conversation_id.clone()).or_default();
         let rev = self.rev_index.entry(conversation_id.clone()).or_default();
@@ -2162,6 +2167,48 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// A link is written only for an item the store holds: the bound may have
+    /// dropped the item since its create, and a link without its item would
+    /// never be removed.
+    #[tokio::test]
+    async fn a_link_is_written_only_for_an_item_the_store_holds() {
+        let config = MemoryConfig {
+            max_responses: 10,
+            max_items: 1,
+            retention_secs: None,
+        };
+        let store = MemoryConversationItemStorage::with_config(&config);
+        let conversation: ConversationId = "conv_a".into();
+        let first = store
+            .create_item(make_item("message", Some("user"), json!([])))
+            .await
+            .unwrap();
+        // The second create drops the first: the bound is one item.
+        let second = store
+            .create_item(make_item("message", Some("user"), json!([])))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .link_items(
+                &conversation,
+                &[
+                    (first.id.clone(), now),
+                    (second.id.clone(), now + TimeDelta::microseconds(1)),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(!store
+            .is_item_linked(&conversation, &first.id)
+            .await
+            .unwrap());
+        assert!(store
+            .is_item_linked(&conversation, &second.id)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@ use std::{collections::BTreeMap, fmt, net::SocketAddr, path::PathBuf, thread, ti
 
 #[cfg(feature = "discovery")]
 pub use super::discovery::DiscoverySettings;
-use super::election::Election;
+use super::election::ElectionConfig;
 
 /// Worker discovery's settings in a build without the `discovery` feature:
 /// a type with no value. Such a build runs no provider, so its
@@ -134,7 +134,7 @@ pub struct Config {
     /// The election (design 5.3): where the lease lives, its timing and
     /// this replica's dialable address. The default is one replica that
     /// leads itself over a lease in its own process.
-    pub election: Election,
+    pub election: ElectionConfig,
     /// The worker discovery provider to run while this replica leads. A
     /// build without the `discovery` feature runs none: the type has no
     /// value there, and the field is always `None`.
@@ -429,7 +429,7 @@ pub(crate) mod tests {
 
     use super::{Config, ConfigError, Listener, Scope, Tls};
     use crate::service::{
-        controller::election::{Election, LeasePlace},
+        controller::election::{ElectionConfig, LeasePlace},
         elector::ElectionSettings,
     };
 
@@ -460,7 +460,7 @@ pub(crate) mod tests {
             shutdown_grace: Duration::from_secs(2),
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
             decide_shards: 2,
-            election: Election::default(),
+            election: ElectionConfig::default(),
             discovery: None,
         }
     }

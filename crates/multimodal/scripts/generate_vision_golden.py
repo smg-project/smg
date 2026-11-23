@@ -3,6 +3,9 @@
 
 This script generates reference outputs from HuggingFace transformers
 that are used to verify the Rust image preprocessors produce identical results.
+Every processor read from the hub is read at a pinned commit (llama4_vision
+reads none: it uses transformers' defaults), so a hub repository that moves
+cannot change a reference.
 
 Usage:
     # Generate all golden outputs
@@ -14,6 +17,10 @@ Usage:
     # Use specific image
     python crates/multimodal/scripts/generate_vision_golden.py \
         --image crates/multimodal/tests/fixtures/images/square.jpg
+
+Requires transformers==5.20.2, torch==2.15.0, torchvision==0.29.2, pillow==13.0.0,
+numpy==2.5.4 and scipy==1.18.1: the versions the CI step "Generate vision golden
+fixtures" of .github/workflows/pr-test-rust.yml installs. Change both together.
 """
 
 import argparse
@@ -125,7 +132,9 @@ def generate_golden_llava(image_path: str, output_dir: str) -> dict:
     """
     from transformers import CLIPImageProcessor
 
-    processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14-336")
+    processor = CLIPImageProcessor.from_pretrained(
+        "openai/clip-vit-large-patch14-336", revision="ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
+    )
     image = Image.open(image_path).convert("RGB")
     original_size = image.size
 
@@ -160,7 +169,9 @@ def generate_golden_llava_pad(image_path: str, output_dir: str) -> dict:
     """
     from transformers import CLIPImageProcessor
 
-    processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14-336")
+    processor = CLIPImageProcessor.from_pretrained(
+        "openai/clip-vit-large-patch14-336", revision="ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
+    )
     image = Image.open(image_path).convert("RGB")
     original_size = image.size
 
@@ -196,7 +207,9 @@ def generate_golden_llava_next(image_path: str, output_dir: str) -> dict:
         print("LlavaNextImageProcessor not available, skipping llava_next")
         return None
 
-    processor = LlavaNextImageProcessor.from_pretrained("llava-hf/llava-v1.6-mistral-7b-hf")
+    processor = LlavaNextImageProcessor.from_pretrained(
+        "llava-hf/llava-v1.6-mistral-7b-hf", revision="2424fdd47412fccc66d91719126b420e9fbd7065"
+    )
     image = Image.open(image_path).convert("RGB")
     original_size = image.size
 
@@ -241,7 +254,9 @@ def generate_golden_qwen2_vl(image_path: str, output_dir: str) -> dict:
         print("Qwen2VLImageProcessor not available, skipping qwen2_vl")
         return None
 
-    processor = Qwen2VLImageProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
+    processor = Qwen2VLImageProcessor.from_pretrained(
+        "Qwen/Qwen2-VL-7B-Instruct", revision="eed13092ef92e448dd6875b2a00151bd3f7db0ac"
+    )
     image = Image.open(image_path).convert("RGB")
     original_size = image.size
 
@@ -340,7 +355,11 @@ def generate_golden_qwen3_vl(image_path: str, output_dir: str) -> dict:
     """
     from transformers import AutoProcessor
 
-    processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct", trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(
+        "Qwen/Qwen3-VL-8B-Instruct",
+        revision="0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+        trust_remote_code=True,
+    )
     image = Image.open(image_path).convert("RGB")
     original_size = image.size
 
@@ -410,7 +429,9 @@ def generate_golden_phi3_vision(image_path: str, output_dir: str) -> dict:
     from transformers import AutoImageProcessor
 
     processor = AutoImageProcessor.from_pretrained(
-        "microsoft/Phi-3-vision-128k-instruct", trust_remote_code=True
+        "microsoft/Phi-3-vision-128k-instruct",
+        revision="ed2772fabe9dc9acd0caad54b62761d92520cc44",
+        trust_remote_code=True,
     )
     image = Image.open(image_path).convert("RGB")
     original_size = image.size
@@ -461,7 +482,9 @@ def generate_golden_phi4_vision(image_path: str, output_dir: str) -> dict:
 
     # Image fixtures do not need the tokenizer or its model configuration.
     processor = AutoImageProcessor.from_pretrained(
-        "microsoft/Phi-4-multimodal-instruct", trust_remote_code=True
+        "microsoft/Phi-4-multimodal-instruct",
+        revision="93f923e1a7727d1c4f446756212d9d3e8fcc5d81",
+        trust_remote_code=True,
     )
     image = Image.open(image_path).convert("RGB")
     original_size = image.size
@@ -578,7 +601,9 @@ def generate_golden_pixtral(image_path: str, output_dir: str) -> dict:
     """
     from transformers import PixtralImageProcessor
 
-    processor = PixtralImageProcessor.from_pretrained("mistral-community/pixtral-12b")
+    processor = PixtralImageProcessor.from_pretrained(
+        "mistral-experimental/pixtral-12b", revision="c2756cbbb9422eba9f6c5c439a214b0392dfc998"
+    )
     image = Image.open(image_path).convert("RGB")
     original_size = image.size
 

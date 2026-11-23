@@ -25,7 +25,7 @@
 //! window closes on that worker only, its partner stays selectable, and
 //! when no other worker of the side's kind is available the answer stands.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::{http::StatusCode, response::Response};
 use parking_lot::Mutex;
@@ -61,6 +61,28 @@ pub(crate) fn mark_failed_side(response: &mut Response, worker: &dyn Worker) {
     });
 }
 
+/// Response extension: the worker's stream failed after the worker took the
+/// call, and its breaker is not charged yet. The stream's reader has no
+/// ledger: the dispatch loop charges it ([`AttemptLedger::charge_pending`]).
+#[derive(Clone)]
+pub(crate) struct PendingCharge {
+    worker: Arc<dyn Worker>,
+    status_code: u16,
+}
+
+/// Mark `response` as the failure of `worker`'s stream, which its breaker
+/// samples as `status_code` (see [`PendingCharge`]).
+pub(crate) fn mark_pending_charge(
+    response: &mut Response,
+    worker: &Arc<dyn Worker>,
+    status_code: u16,
+) {
+    response.extensions_mut().insert(PendingCharge {
+        worker: Arc::clone(worker),
+        status_code,
+    });
+}
+
 /// The kind of the worker whose side alone failed, where `response` names
 /// one ([`FailedSide`]).
 pub(crate) fn failed_side_type(response: &Response) -> Option<WorkerType> {
@@ -81,55 +103,61 @@ pub(crate) fn is_definitive_failure(response: &Response) -> bool {
 #[derive(Debug, Default)]
 pub(crate) struct AttemptLedger {
     inner: Mutex<Ledger>,
-    /// Whether the policy engine places the request's attempts.
-    hosted: bool,
+    /// Made at the request's first failure, or for its first holder.
+    charges: OnceLock<Charges>,
+}
+
+/// The workers (by URL) one request already charged a circuit-breaker
+/// failure. A task that outlives its attempt holds a clone, so the outcome it
+/// meets late is counted by the request's rule.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Charges(Arc<Mutex<Vec<String>>>);
+
+impl Charges {
+    /// [`AttemptLedger::record_outcome`], through the request's charges.
+    pub(crate) fn record_outcome(&self, worker: &dyn Worker, status_code: u16) {
+        if worker.is_breaker_failure(status_code) {
+            let mut charged = self.0.lock();
+            if charged.iter().any(|url| url == worker.url()) {
+                return;
+            }
+            charged.push(worker.url().to_string());
+        }
+        worker.record_outcome(status_code);
+    }
 }
 
 #[derive(Debug, Default)]
 struct Ledger {
-    /// Workers (by URL) already charged a circuit-breaker failure.
-    charged: Vec<String>,
     /// Engines (by base URL, so one DP rank's answer stands for its
     /// siblings) that answered the request definitively.
     answered: Vec<String>,
 }
 
 impl AttemptLedger {
-    /// The ledger of a request whose attempts the policy engine
-    /// places where `hosted`, and the classic policies otherwise.
-    pub(crate) fn of(hosted: bool) -> Self {
-        Self {
-            inner: Mutex::default(),
-            hosted,
-        }
-    }
-
-    /// Whether `worker` could take the request's next attempt, as the
-    /// selection of that attempt judges a worker. The classic policies pass
-    /// over a worker that is not available. A policy engine reads the overload
-    /// veto from the controller's rows, and the flag on the object mirrors a
-    /// verdict of any row of the worker: under a policy engine it closes no
-    /// retry window, and the retry's placement answers for the worker.
-    pub(crate) fn takes(&self, worker: &dyn Worker) -> bool {
-        if self.hosted {
-            worker.routing_state().eligible_ignoring_overload()
-        } else {
-            worker.is_available()
-        }
-    }
-
     /// Record an attempt's outcome on `worker`'s circuit breaker: a success or
     /// a capacity pushback as always, a failure only the first time this
     /// request fails on the worker.
     pub(crate) fn record_outcome(&self, worker: &dyn Worker, status_code: u16) {
         if worker.is_breaker_failure(status_code) {
-            let mut ledger = self.inner.lock();
-            if ledger.charged.iter().any(|url| url == worker.url()) {
-                return;
-            }
-            ledger.charged.push(worker.url().to_string());
+            self.charges().record_outcome(worker, status_code);
+        } else {
+            worker.record_outcome(status_code);
         }
-        worker.record_outcome(status_code);
+    }
+
+    /// The request's charges, for a task that outlives the attempt it
+    /// reports on.
+    pub(crate) fn charges(&self) -> &Charges {
+        self.charges.get_or_init(Charges::default)
+    }
+
+    /// Charge the worker whose stream failed under the attempt
+    /// ([`PendingCharge`]), by the rule of [`Self::record_outcome`].
+    pub(crate) fn charge_pending(&self, response: &Response) {
+        if let Some(charge) = response.extensions().get::<PendingCharge>() {
+            self.record_outcome(charge.worker.as_ref(), charge.status_code);
+        }
     }
 
     /// Whether a retry attempt may select `worker`: not after it answered the
@@ -167,9 +195,9 @@ impl AttemptLedger {
     }
 
     /// Close the retry window on a definitive failure. The workers that gave
-    /// the answer take no further attempt of this request; when no worker in
-    /// `pool` is left to take one ([`Self::takes`]), the answer is marked
-    /// terminal and goes back to the client as it is. A failure of one side alone
+    /// the answer take no further attempt of this request; when no available
+    /// worker in `pool` is left to take one, the answer is marked terminal and
+    /// goes back to the client as it is. A failure of one side alone
     /// ([`FailedSide`]) closes the window on that side's worker only, and the
     /// alternative is sought among the workers of its kind. Any other
     /// response passes untouched.
@@ -198,7 +226,7 @@ impl AttemptLedger {
         let alternative = pool.into_iter().any(|worker| {
             side.as_ref()
                 .is_none_or(|side| *worker.worker_type() == side.worker_type)
-                && self.takes(worker.as_ref())
+                && worker.is_available()
                 && self.admits(worker.as_ref())
         });
         if !alternative {
@@ -270,26 +298,6 @@ mod tests {
         ledger.record_outcome(worker.as_ref(), 503);
         ledger.record_outcome(worker.as_ref(), 429);
         assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
-    }
-
-    #[test]
-    fn a_hosted_requests_retry_window_is_not_closed_by_the_overload_flag() {
-        let w1 = worker("http://w1:8080", 5);
-        let w2 = worker("http://w2:8080", 5);
-        w2.set_overloaded(true);
-        let pool = [Arc::clone(&w1), Arc::clone(&w2)];
-
-        // The classic policies pass over the flagged worker: the answer
-        // stands.
-        let mut classic = answered(StatusCode::INTERNAL_SERVER_ERROR);
-        AttemptLedger::default().settle(&mut classic, [&w1], pool.iter());
-        assert!(!is_retryable_response(&classic));
-
-        // A policy engine reads the veto from the controller's rows: the retry
-        // is left to its placement.
-        let mut hosted = answered(StatusCode::INTERNAL_SERVER_ERROR);
-        AttemptLedger::of(true).settle(&mut hosted, [&w1], pool.iter());
-        assert!(is_retryable_response(&hosted));
     }
 
     #[test]

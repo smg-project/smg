@@ -46,14 +46,14 @@ use tonic::Status;
 use tracing::error;
 
 use crate::{
-    engine::{decider::Decider, door, view::WorkerId},
+    engine::{decision_slot::DecisionSlot, store_backed_engine, view::WorkerId},
     service::proto::{
         self,
         completed::Class,
         released::{Reason, What},
     },
-    store::{Dispatch, GatewayId, Hand, MemoryStore, Said, Sides, World},
-    tracking::lease::{LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+    store::{GatewayId, Hand, MemoryStore, Sides, StoreSnapshot},
+    tracking::lease::{Dispatch, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass},
 };
 
 /// A `Dispatched` frame: the gateway's lease moves to dispatched at `now`.
@@ -75,7 +75,7 @@ pub(crate) fn dispatched(
 /// A `Completed` frame: the lease's side ends with its outcome, and the
 /// gateway's completion on the worker is written for the health
 /// precedence, whether or not the lease is on file: the door's one
-/// routine says both ([`door::completed`]).
+/// routine says both ([`store_backed_engine::completed`]).
 ///
 /// # Errors
 ///
@@ -87,7 +87,7 @@ pub(crate) fn completed(
     now: Instant,
 ) -> Result<(), Status> {
     let (lease, outcome) = outcome(frame)?;
-    door::completed(store, hand.gateway(), &outcome, now, |said| {
+    store_backed_engine::completed(store, hand.gateway(), &outcome, now, |said| {
         store.hand(hand, lease, said);
     });
     Ok(())
@@ -128,12 +128,18 @@ pub(crate) fn tells(store: &MemoryStore) {
 }
 
 /// Tells the engine what a frame said of a lease, whoever applies the
-/// frame: the order's own word ([`door::told`]), which holds a stage's call
-/// that panics and counts it on the store
+/// frame: the order's own word ([`store_backed_engine::told`]), which holds a
+/// stage's call that panics and counts it on the store
 /// ([`MemoryStore::lifecycle_faults`]). A streak of faults writes one line
 /// here.
-fn told(store: &MemoryStore, world: &World, found: &Sides, said: Said, by: Option<Decider>) {
-    if door::told(store, world, found, said, by) {
+fn told(
+    store: &MemoryStore,
+    world: &StoreSnapshot,
+    found: &Sides,
+    said: Said,
+    by: Option<DecisionSlot>,
+) {
+    if store_backed_engine::told(store, world, found, said, by) {
         error!(
             lease = found.record.lease.id.0,
             "a lease's lifecycle call panicked: held, and the lease's event stands as applied"
@@ -252,6 +258,9 @@ fn past(field: &'static str, number: u32, most: u32) -> Status {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    // The rule a guard's lease is told by.
+    mod lease_on_file;
+
     use std::{
         cell::RefCell,
         sync::Arc,
@@ -265,12 +274,15 @@ pub(crate) mod tests {
         class, completed, dispatch, dispatched, open, outcome, reason, release, released, side,
     };
     use crate::{
-        document::spec::{AppliedSpec, Assignment, PolicySpec, Recovery},
+        document::spec::{AppliedSpec, Assignment, PolicySpec, Recovery, RulePlaced},
         engine::{
             decision::{Pair, Target, Targets},
             framework::{Picker, TieBand},
+            sticky_sessions::{SessionRule, SessionVerdict},
             view::{Candidate, Health, Phase, RequestFacts, Session, WorkerId},
+            Constraints, PoolFacts, Scratch,
         },
+        policies::random::Random,
         service::{
             controller::gateways::tests::lease,
             proto::{
@@ -279,16 +291,12 @@ pub(crate) mod tests {
                 released::{Reason, What},
             },
         },
-        sessions::{SessionRule, SessionVerdict},
-        stages::{builtins::Random, catalog::Catalog},
+        stages::{lifecycle::Lifecycle, registry::StageRegistry},
         store::{
-            DecodeSide, Dispatch, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore,
-            MemoryStore, Picked, SessionsStore, WorkerFacts, WorkersStore,
+            DecodeSide, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore,
+            PickRecord, SessionsStore, WorkerFacts, WorkersStore,
         },
-        tracking::lease::{
-            Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass,
-        },
-        Constraints, PoolFacts, Scratch,
+        tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
     };
 
     const A: GatewayId = GatewayId(11);
@@ -424,7 +432,7 @@ pub(crate) mod tests {
         let heard = Arc::new(Mutex::new(Vec::new()));
         let indexes = Indexes::default();
         let kept = (Arc::clone(&heard), Arc::clone(&indexes));
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .picker("hears", move || {
                 Box::new(Hears(Arc::clone(&kept.0), Arc::clone(&kept.1)))
@@ -533,7 +541,7 @@ pub(crate) mod tests {
         }
         let side = DecodeSide {
             target: d0,
-            picked: Picked::of_decodes(&targets),
+            picked: PickRecord::of_decodes(&targets),
             session: Session::NONE,
             state: LeaseState::ISSUED,
             tokens: 0,
@@ -549,7 +557,7 @@ pub(crate) mod tests {
             gateway: A,
             request: id,
             target: p,
-            picked: Picked::of(&targets),
+            picked: PickRecord::of(&targets),
             decode: None,
             term: 0,
             issued_at: now,
@@ -668,7 +676,7 @@ pub(crate) mod tests {
     }
 
     /// A pick of the workers 7 and 9, the second at rank 2.
-    fn two_targets() -> Picked {
+    fn two_targets() -> PickRecord {
         let mut targets = Targets::new();
         for (id, dp_rank) in [(7, 0), (9, 2)] {
             targets.push(Target {
@@ -677,7 +685,7 @@ pub(crate) mod tests {
                 ..Target::default()
             });
         }
-        Picked::of(&targets)
+        PickRecord::of(&targets)
     }
 
     #[test]
@@ -701,7 +709,7 @@ pub(crate) mod tests {
         // lease is told the second target, at that target's rank.
         assert_eq!(*indexes.lock(), [(1, 2)]);
         // The key's pin follows the dispatch, and so does the lease.
-        let pins = store.with_world(|world| world.spec().engine().sessions().pins(session));
+        let pins = store.with_snapshot(|world| world.spec().engine().sessions().pins(session));
         assert_eq!(pins, Some([WorkerId(9), WorkerId(0)]));
         let filed = LeasesStore::get(&store, A, LeaseId(1)).expect("on file");
         assert_eq!((filed.target, filed.lease.target_index), (WorkerId(9), 1));
@@ -753,7 +761,7 @@ pub(crate) mod tests {
                 generation: 1,
                 ..PoolFacts::default()
             };
-            store.with_world(|world| {
+            store.with_snapshot(|world| {
                 let engine = world.spec().engine();
                 engine.decide(&facts, &pool, &view, &Constraints::default(), &mut scratch)
             })
@@ -785,9 +793,9 @@ pub(crate) mod tests {
         record.lease.tokens = tokens;
         record.lease.issued_micros = 1_000_000;
         record.target = owner;
-        record.picked = Picked::of(&targets);
+        record.picked = PickRecord::of(&targets);
         let issued = record.lease;
-        store.with_world(|world| {
+        store.with_snapshot(|world| {
             let engine = world.spec().engine();
             engine.on_decision_issued(&issued, &decision);
         });
@@ -831,7 +839,7 @@ pub(crate) mod tests {
         let t0 = Instant::now();
         let _heard = hearing(&store, 1);
         let session = Session::from_raw(41);
-        let pins = || store.with_world(|world| world.spec().engine().sessions().pins(session));
+        let pins = || store.with_snapshot(|world| world.spec().engine().sessions().pins(session));
         let mut record = lease(A, 1, t0);
         record.lease.generation = 1;
         record.lease.session = session;
@@ -913,7 +921,7 @@ pub(crate) mod tests {
         let _second = hearing(&store, 2);
         dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");
         // No engine is told, and the pin names the dispatched worker.
-        let table = store.with_world(|world| world.spec().engine().sessions().len());
+        let table = store.with_snapshot(|world| world.spec().engine().sessions().len());
         assert_eq!((table, pin_of_record(&store)), (0, Some(WorkerId(7))));
     }
 
@@ -926,8 +934,9 @@ pub(crate) mod tests {
             ttl_micros,
             sweep_micros: 0,
             recovery: Recovery::Original,
+            rule_placed: RulePlaced::Told,
         };
-        store.with_world(|world| {
+        store.with_snapshot(|world| {
             let table = world.spec().engine().sessions();
             table.lookup(KEY, store.micros(now), &rule);
         });
@@ -990,7 +999,7 @@ pub(crate) mod tests {
         let at = t0 + Duration::from_millis(3);
         dispatched(&store, &open(&store, A), &a_dispatched(1), at).expect("the frame reads");
         // The engine was told: its table holds the key again.
-        let table = store.with_world(|world| world.spec().engine().sessions().len());
+        let table = store.with_snapshot(|world| world.spec().engine().sessions().len());
         let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
         let ends = store.micros(t0) + 60_000_000;
         assert_eq!((table, pin.worker, pin.ends), (1, WorkerId(7), Some(ends)));
@@ -1020,7 +1029,7 @@ pub(crate) mod tests {
         let issued = LeaseState::issued(Some(60_000_000));
         let side = DecodeSide {
             target: d,
-            picked: Picked::of_decodes(&targets),
+            picked: PickRecord::of_decodes(&targets),
             session: DECODE_KEY,
             state: issued,
             tokens: 0,
@@ -1039,7 +1048,7 @@ pub(crate) mod tests {
             gateway: A,
             request: 1,
             target: p,
-            picked: Picked::of(&targets),
+            picked: PickRecord::of(&targets),
             decode: None,
             term: 0,
             issued_at: t0,

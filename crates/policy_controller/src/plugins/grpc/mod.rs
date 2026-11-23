@@ -84,7 +84,7 @@
 //! ([`GrpcPluginSpec::observes`]), none by default. A row that lists none is
 //! told nothing and has no `Observe` stream. A row that lists any has its
 //! plugin's scorer and picker say they need the lifecycle's calls
-//! ([`crate::Lifecycle::needs_lifecycle`]), so a host that makes none
+//! ([`crate::stages::Lifecycle::needs_lifecycle`]), so a host that makes none
 //! refuses them. One `Observe` stream per such plugin, opened once a
 //! `Decide` stream has settled, carries the events it hears (among issued,
 //! dispatched, completed, released, membership, signals) in order, each
@@ -112,7 +112,7 @@
 //! one outage for its life, and a server that ends every call by age past
 //! a minute says one line an age. The process's panic hook writes its own
 //! line to stderr at every panicked turn. Each profile
-//! that binds the plugin holds one [`Bound`] set, taken from its engine
+//! that binds the plugin holds one [`PluginBinding`] set, taken from its engine
 //! build's [`Binder`]: one adapter of a build forwards, so an event reaches
 //! the plugin once per engine. An `Observe` stream's hello names the
 //! version the plugin's `Decide` streams last fixed: none opens before one
@@ -145,29 +145,25 @@
 //! stream carries many decisions at once (its window holds one decision's
 //! frames today).
 
-pub mod config;
+pub(crate) mod config;
 mod plugin;
 mod runtime;
 mod unit;
 mod view;
 
-pub use config::{
-    BreakerSpec, EventKind, EventSet, Exposure, Failure, GrpcPluginSpec, HeaderSet, Reveal, Tls,
-    Transport,
-};
-pub use plugin::{Binder, Bound, LoadError, Plugin, Stats};
+pub use config::{GrpcPluginSpec, Tls, Transport};
+pub use plugin::{Binder, LoadError, Plugin, PluginBinding, Stats};
 pub use runtime::Runtime;
 
 use crate::plugins::shared;
-pub use crate::plugins::shared::Counters;
 
 /// The plugin's stages over its bound decision: the stage adapters every
-/// plugin kind shares ([`crate::plugins::shared`]), over [`Bound`].
-pub type GrpcFilter = shared::PluginFilter<Bound>;
+/// plugin kind shares ([`crate::plugins::shared`]), over [`PluginBinding`].
+pub type GrpcFilter = shared::PluginFilter<PluginBinding>;
 /// See [`GrpcFilter`].
-pub type GrpcScorer = shared::PluginScorer<Bound>;
+pub type GrpcScorer = shared::PluginScorer<PluginBinding>;
 /// See [`GrpcFilter`].
-pub type GrpcPicker = shared::PluginPicker<Bound>;
+pub type GrpcPicker = shared::PluginPicker<PluginBinding>;
 
 /// The newest protocol version this host speaks. Version 2 added the
 /// membership kind for the models a worker left; a stream that settled on

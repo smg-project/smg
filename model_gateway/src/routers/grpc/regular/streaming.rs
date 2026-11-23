@@ -39,8 +39,11 @@ use tokio::sync::mpsc::error::TrySendError;
 use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser};
 use tracing::{debug, error, warn, Instrument, Span};
 
-use super::symphony::{
-    engine_finish, finished, reasoning_text_tokens, telemetry::Who, Assignment, Delta, Reader,
+use super::{
+    processor::generation_start,
+    symphony::{
+        engine_finish, finished, reasoning_text_tokens, telemetry::Who, Assignment, Delta, Reader,
+    },
 };
 use crate::{
     observability::metrics::{metrics_labels, LocalStopAbort, Metrics, StreamingMetricsParams},
@@ -241,17 +244,11 @@ impl GenerateStreamUsage {
         &self,
         reservation: Option<Arc<SharedReservationHandle>>,
         expected_choices: u32,
-        counts: TokenCounts,
-        source: Option<&utils::StreamSource>,
     ) {
+        let Some(handle) = reservation else { return };
         if self.completed.len() as u32 >= expected_choices {
-            if let Some(handle) = reservation {
-                handle.settle_success(counts.settlement()).await;
-            }
-            if let Some(source) = source {
-                source.completed(counts.prompt, counts.completion);
-            }
-        } else if let Some(handle) = reservation {
+            handle.settle_success(self.counts().settlement()).await;
+        } else {
             handle.close_reserved_only().await;
         }
     }
@@ -485,6 +482,9 @@ struct GenerateStreamContext {
     /// complete -- a clean EOF with fewer `Complete` messages than this has
     /// only partial usage, not authoritative usage for the whole request.
     expected_choices: u32,
+    /// The request's wait ahead of the dispatch the stream's clocks start
+    /// at, recorded with the TTFT (see [`context::dispatch_wait`]).
+    dispatch_wait: context::DispatchWait,
 }
 
 /// The Messages stream's event buffer: every event is split off it to the
@@ -562,6 +562,10 @@ impl StreamingProcessor {
         // frames itself.
         let rechunk = chat_request.wire.rechunk_policy();
 
+        // The request's wait ahead of the dispatch the stream's clocks start
+        // at, read here: the reading runs outside the request's scope (see
+        // `context::dispatch_wait`).
+        let dispatch_wait = context::dispatch_wait(generation_start(&execution_result));
         // The body's channel: the reading parks on it until the body took
         // the frame before (see `driven_channel`).
         let (tx, rx) = driven_channel();
@@ -589,6 +593,7 @@ impl StreamingProcessor {
                     // the task polling the body (see `utils::isolation`).
                     let result = isolated(processor.process_streaming_chunks_inner(
                         dispatch_start,
+                        dispatch_wait,
                         stream,
                         dispatch,
                         tokenizer_clone,
@@ -597,7 +602,6 @@ impl StreamingProcessor {
                         &tx,
                         None,
                         reservation,
-                        Some(&source),
                     ))
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
@@ -634,6 +638,7 @@ impl StreamingProcessor {
                         chat_request,
                         &tx,
                         pd_timing,
+                        dispatch_wait,
                         prefill_guards,
                         reservation,
                     ))
@@ -699,6 +704,7 @@ impl StreamingProcessor {
     ) -> Result<(), utils::StreamFailure> {
         self.process_streaming_chunks_inner(
             Instant::now(),
+            None,
             grpc_stream,
             dispatch,
             tokenizer,
@@ -707,14 +713,15 @@ impl StreamingProcessor {
             tx,
             None,
             reservation,
-            None,
         )
         .await
     }
 
     /// Inner implementation shared by single-mode and PD prefill/decode streaming.
     /// `pd_timing` is `Some` only in PD mode and yields honest PD TTFT
-    /// (prefill start to first decode token).
+    /// (prefill start to first decode token). `dispatch_wait` is the request's
+    /// wait ahead of the dispatch at `start_time`, read by the entry point
+    /// inside the request's scope (see [`context::dispatch_wait`]).
     ///
     /// The stream is a [`ChatStream`]: its set-up, the loop over the engine's
     /// messages, the parser flush, the finish chunks, the usage chunk and the
@@ -723,6 +730,7 @@ impl StreamingProcessor {
     async fn process_streaming_chunks_inner(
         &self,
         start_time: Instant,
+        dispatch_wait: context::DispatchWait,
         mut grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
@@ -731,7 +739,6 @@ impl StreamingProcessor {
         tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
-        source: Option<&utils::StreamSource>,
     ) -> Result<(), utils::StreamFailure> {
         let mut stream = ChatStream::open(
             self,
@@ -742,6 +749,7 @@ impl StreamingProcessor {
             tx,
             pd_timing,
             start_time,
+            dispatch_wait,
         );
         stream.read_engine(&mut grpc_stream).await?;
         // The stream's verdict, before the engine side is released.
@@ -772,7 +780,7 @@ impl StreamingProcessor {
         };
 
         stream
-            .settle_and_record(reservation, client_left || terminal.is_err(), source)
+            .settle_and_record(reservation, client_left || terminal.is_err())
             .await;
         terminal
     }
@@ -789,6 +797,7 @@ impl StreamingProcessor {
         original_request: ChatResponseSpec,
         tx: &SseSender,
         pd_timing: context::PdTiming,
+        dispatch_wait: context::DispatchWait,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
@@ -807,6 +816,7 @@ impl StreamingProcessor {
         let result = self
             .process_streaming_chunks_inner(
                 pd_timing.prefill_start,
+                dispatch_wait,
                 decode_stream,
                 dispatch,
                 tokenizer,
@@ -815,7 +825,6 @@ impl StreamingProcessor {
                 tx,
                 Some(pd_timing),
                 reservation,
-                None,
             )
             .await;
 
@@ -854,6 +863,10 @@ impl StreamingProcessor {
     ) -> Response {
         let source = source.with_backend(self.backend_type);
         let guards = body_guards(load_guards, reservation.as_ref());
+        // The request's wait ahead of the dispatch the stream's clocks start
+        // at, read here: the reading runs outside the request's scope (see
+        // `context::dispatch_wait`).
+        let dispatch_wait = context::dispatch_wait(generation_start(&execution_result));
         // The body's channel (see `driven_channel`).
         let (tx, rx) = driven_channel();
         // Read for this client: the moment the response body is dropped, the
@@ -871,6 +884,7 @@ impl StreamingProcessor {
             backend_type: self.backend_type,
             model: dispatch.model.clone(),
             expected_choices: generate_request.expected_choices,
+            dispatch_wait,
         };
 
         // The reading of the engine's answer, by execution mode; the response
@@ -892,7 +906,6 @@ impl StreamingProcessor {
                         ctx,
                         &tx,
                         reservation,
-                        Some(&source),
                     ))
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.into()));
@@ -974,16 +987,8 @@ impl StreamingProcessor {
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
-        Self::process_generate_streaming_at(
-            Instant::now(),
-            tokenizer,
-            stream,
-            ctx,
-            tx,
-            reservation,
-            None,
-        )
-        .await
+        Self::process_generate_streaming_at(Instant::now(), tokenizer, stream, ctx, tx, reservation)
+            .await
     }
 
     async fn process_generate_streaming_at(
@@ -993,7 +998,6 @@ impl StreamingProcessor {
         ctx: GenerateStreamContext,
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
-        source: Option<&utils::StreamSource>,
     ) -> Result<(), utils::StreamFailure> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
@@ -1200,19 +1204,11 @@ impl StreamingProcessor {
 
         // Record streaming metrics
         let counts = usage.counts();
-        let client_left = stream.client_left();
-        usage
-            .settle(
-                reservation,
-                ctx.expected_choices,
-                counts,
-                source.filter(|_| !client_left),
-            )
-            .await;
+        usage.settle(reservation, ctx.expected_choices).await;
         // The read ended with the client's leaving, not with the engine's end:
         // no terminal router metric for it, as the HTTP router has none for a
         // disconnect (neither a completed request nor a failure).
-        if client_left {
+        if stream.client_left() {
             return Ok(());
         }
         Self::record_generate_metrics(dispatch_start, first_token_time, counts, &ctx);
@@ -1553,9 +1549,7 @@ impl StreamingProcessor {
 
         // Record streaming metrics
         let counts = usage.counts();
-        usage
-            .settle(reservation, ctx.expected_choices, counts, None)
-            .await;
+        usage.settle(reservation, ctx.expected_choices).await;
         // The read ended with the client's leaving, not with the engine's end:
         // no terminal router metric for it, as the HTTP router has none for a
         // disconnect (neither a completed request nor a failure).
@@ -1589,6 +1583,7 @@ impl StreamingProcessor {
             model_id: &ctx.model,
             endpoint: metrics_labels::ENDPOINT_GENERATE,
             ttft: first_token_time.map(|t| t.duration_since(stream_base)),
+            dispatch_wait: ctx.dispatch_wait,
             generation_duration: stream_base.elapsed(),
             input_tokens: Some(u64::from(counts.prompt)),
             cached_tokens: Some(u64::from(counts.cached)),
@@ -2601,6 +2596,10 @@ impl StreamingProcessor {
             false, // ignore_eos — not available in Messages API
         );
 
+        // The request's wait ahead of the dispatch the stream's clocks start
+        // at, read here: the reading runs outside the request's scope (see
+        // `context::dispatch_wait`).
+        let dispatch_wait = context::dispatch_wait(generation_start(&execution_result));
         // The body's channel (see `driven_channel`).
         let (tx, rx) = driven_channel();
         // Read for this client: the moment the response body is dropped, the
@@ -2626,6 +2625,7 @@ impl StreamingProcessor {
                     // the body (see `utils::isolation`).
                     let result = isolated(processor.process_messages_streaming_chunks_inner(
                         dispatch_start,
+                        dispatch_wait,
                         stream,
                         dispatch,
                         tokenizer_clone,
@@ -2634,7 +2634,6 @@ impl StreamingProcessor {
                         &tx,
                         None,
                         reservation,
-                        Some(&source),
                     ))
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
@@ -2676,6 +2675,7 @@ impl StreamingProcessor {
                             messages_request,
                             &tx,
                             pd_timing,
+                            dispatch_wait,
                             prefill_guards,
                             reservation,
                         ))
@@ -2748,6 +2748,7 @@ impl StreamingProcessor {
     ) -> Result<(), utils::StreamFailure> {
         self.process_messages_streaming_chunks_inner(
             Instant::now(),
+            None,
             grpc_stream,
             dispatch,
             tokenizer,
@@ -2756,18 +2757,21 @@ impl StreamingProcessor {
             tx,
             None,
             reservation,
-            None,
         )
         .await
     }
 
     /// Inner implementation shared by single-mode and PD prefill/decode
     /// Messages streaming. `pd_timing` is `Some` only in PD mode and yields
-    /// honest PD TTFT (prefill start to first decode token).
+    /// honest PD TTFT (prefill start to first decode token). `dispatch_wait`
+    /// is the request's wait ahead of the dispatch at `start_time`, read by
+    /// the entry point inside the request's scope (see
+    /// [`context::dispatch_wait`]).
     #[expect(clippy::too_many_arguments)]
     async fn process_messages_streaming_chunks_inner(
         &self,
         start_time: Instant,
+        dispatch_wait: context::DispatchWait,
         mut grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
@@ -2776,7 +2780,6 @@ impl StreamingProcessor {
         tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
-        source: Option<&utils::StreamSource>,
     ) -> Result<(), utils::StreamFailure> {
         let mut stream = MessagesStream::open(
             self,
@@ -2787,6 +2790,7 @@ impl StreamingProcessor {
             tx,
             pd_timing,
             start_time,
+            dispatch_wait,
         )?;
         stream.send_message_start().await?;
         stream.read_engine(&mut grpc_stream).await?;
@@ -2814,7 +2818,7 @@ impl StreamingProcessor {
         };
 
         stream
-            .settle_and_record(reservation, client_left || terminal.is_err(), source)
+            .settle_and_record(reservation, client_left || terminal.is_err())
             .await;
         terminal
     }
@@ -2836,6 +2840,7 @@ impl StreamingProcessor {
         original_request: MessagesResponseSpec,
         tx: &SseSender,
         pd_timing: context::PdTiming,
+        dispatch_wait: context::DispatchWait,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
@@ -2850,6 +2855,7 @@ impl StreamingProcessor {
         let result = self
             .process_messages_streaming_chunks_inner(
                 pd_timing.prefill_start,
+                dispatch_wait,
                 decode_stream,
                 dispatch,
                 tokenizer,
@@ -2858,7 +2864,6 @@ impl StreamingProcessor {
                 tx,
                 Some(pd_timing),
                 reservation,
-                None,
             )
             .await;
 
@@ -2897,6 +2902,10 @@ impl StreamingProcessor {
     ) -> Response {
         let source = source.with_backend(self.backend_type);
         let guards = body_guards(load_guards, reservation.as_ref());
+        // The request's wait ahead of the dispatch the stream's clocks start
+        // at, read here: the reading runs outside the request's scope (see
+        // `context::dispatch_wait`).
+        let dispatch_wait = context::dispatch_wait(generation_start(&execution_result));
         // The body's channel (see `driven_channel`).
         let (tx, rx) = driven_channel();
         // Read for this client: the moment the response body is dropped, the
@@ -3110,15 +3119,13 @@ impl StreamingProcessor {
                     if tx.is_closed() {
                         return ReadingEnd::Complete;
                     }
-                    if all_saw_complete {
-                        source.completed(total_prompt, total_completion);
-                    }
                     Metrics::record_streaming_metrics(StreamingMetricsParams {
                         router_type: metrics_labels::ROUTER_GRPC,
                         backend_type: processor.backend_type,
                         model_id: &dispatch.model,
                         endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
                         ttft: first_token_time.map(|t| t.duration_since(stream_base)),
+                        dispatch_wait,
                         generation_duration: stream_base.elapsed(),
                         input_tokens: Some(total_prompt as u64),
                         cached_tokens: Some(u64::from(total_cached)),
@@ -3512,6 +3519,9 @@ struct ChatStream<'a> {
 
     // Metrics timing
     start_time: Instant,
+    /// The request's wait ahead of the dispatch at `start_time`, recorded
+    /// with the TTFT (see [`context::dispatch_wait`]).
+    dispatch_wait: context::DispatchWait,
     first_token_time: Option<Instant>,
 
     /// The wire's rules for this stream, resolved once when it opened
@@ -3592,6 +3602,7 @@ impl<'a> ChatStream<'a> {
         tx: &'a SseSender,
         pd_timing: Option<context::PdTiming>,
         start_time: Instant,
+        dispatch_wait: context::DispatchWait,
     ) -> Self {
         let model = &dispatch.model;
         let (stop, stop_token_ids, skip_special_tokens, no_stop_trim, ignore_eos) = stop_params;
@@ -3684,6 +3695,7 @@ impl<'a> ChatStream<'a> {
             skip_special_tokens,
             pd_timing,
             start_time,
+            dispatch_wait,
             first_token_time: None,
             shape,
             emit_usage_null: shape.usage_null_placeholder,
@@ -4898,25 +4910,22 @@ impl<'a> ChatStream<'a> {
         self,
         reservation: Option<Arc<SharedReservationHandle>>,
         client_left: bool,
-        source: Option<&utils::StreamSource>,
     ) {
         let model = &self.dispatch.model;
         let counts = self.counts();
         let (total_prompt, total_completion) = (counts.prompt, counts.completion);
-        // `prompt_tokens` has one entry per closed index: from its
-        // `Complete`, or from the chunk the gateway's own stop matched
-        // in. A clean EOF that didn't close every expected `n>1` choice
-        // has only partial usage -- settling with that would understate
-        // the real cost. Keep the reserved amount as final instead.
-        if self.closed_choices() >= self.spec.expected_choices {
-            if let Some(handle) = reservation {
+        if let Some(handle) = reservation {
+            // `prompt_tokens` has one entry per closed index: from its
+            // `Complete`, or from the chunk the gateway's own stop matched
+            // in. A clean EOF that didn't close every expected `n>1` choice
+            // has only partial usage -- settling with that would understate
+            // the real cost. Keep the reserved amount as final instead.
+            let expected_choices = self.spec.expected_choices;
+            if self.closed_choices() < expected_choices {
+                handle.close_reserved_only().await;
+            } else {
                 handle.settle_success(counts.settlement()).await;
             }
-            if let Some(source) = source.filter(|_| !client_left) {
-                source.completed(total_prompt, total_completion);
-            }
-        } else if let Some(handle) = reservation {
-            handle.close_reserved_only().await;
         }
         if client_left {
             return;
@@ -4930,6 +4939,7 @@ impl<'a> ChatStream<'a> {
             model_id: model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: self.first_token_time.map(|t| t.duration_since(stream_base)),
+            dispatch_wait: self.dispatch_wait,
             generation_duration: stream_base.elapsed(),
             input_tokens: Some(total_prompt as u64),
             cached_tokens: Some(u64::from(counts.cached)),
@@ -5213,6 +5223,9 @@ struct MessagesStream<'a> {
 
     // Metrics timing
     start_time: Instant,
+    /// The request's wait ahead of the dispatch at `start_time`, recorded
+    /// with the TTFT (see [`context::dispatch_wait`]).
+    dispatch_wait: context::DispatchWait,
     first_token_time: Option<Instant>,
     /// Whether the frame carrying the first token has left: until it has,
     /// the engine is not polled before a flush, so that frame leaves alone.
@@ -5322,6 +5335,7 @@ impl<'a> MessagesStream<'a> {
         tx: &'a SseSender,
         pd_timing: Option<context::PdTiming>,
         start_time: Instant,
+        dispatch_wait: context::DispatchWait,
     ) -> Result<Self, utils::StreamFailure> {
         let model = &dispatch.model;
         let has_tools = spec.has_tools;
@@ -5440,6 +5454,7 @@ impl<'a> MessagesStream<'a> {
             tx,
             pd_timing,
             start_time,
+            dispatch_wait,
             first_token_time: None,
             first_token_out: false,
             sse_buffer: BytesMut::with_capacity(MESSAGES_FIRST_BLOCK),
@@ -6216,12 +6231,11 @@ impl<'a> MessagesStream<'a> {
         self,
         reservation: Option<Arc<SharedReservationHandle>>,
         client_left: bool,
-        source: Option<&utils::StreamSource>,
     ) {
-        // The usage is settled by the engine's Complete, or by the
-        // gateway's own stop with the counts of the chunk it matched in.
-        if self.saw_complete || self.closed_by_stop {
-            if let Some(handle) = reservation {
+        if let Some(handle) = reservation {
+            // The usage is settled by the engine's Complete, or by the
+            // gateway's own stop with the counts of the chunk it matched in.
+            if self.saw_complete || self.closed_by_stop {
                 handle
                     .settle_success(UsageSettlement {
                         actual_input_tokens: self.prompt_tokens,
@@ -6230,12 +6244,9 @@ impl<'a> MessagesStream<'a> {
                         reasoning_tokens: self.engine_thinking_tokens,
                     })
                     .await;
+            } else {
+                handle.close_reserved_only().await;
             }
-            if let Some(source) = source.filter(|_| !client_left) {
-                source.completed(self.prompt_tokens, self.completion_tokens.total());
-            }
-        } else if let Some(handle) = reservation {
-            handle.close_reserved_only().await;
         }
 
         if client_left {
@@ -6251,6 +6262,7 @@ impl<'a> MessagesStream<'a> {
             model_id: &self.dispatch.model,
             endpoint: metrics_labels::ENDPOINT_MESSAGES,
             ttft: self.first_token_time.map(|t| t.duration_since(stream_base)),
+            dispatch_wait: self.dispatch_wait,
             generation_duration: stream_base.elapsed(),
             input_tokens: Some(u64::from(self.prompt_tokens)),
             cached_tokens: Some(u64::from(self.cached_tokens)),

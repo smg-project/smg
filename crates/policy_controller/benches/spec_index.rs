@@ -17,7 +17,7 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use smg_policy_controller::PolicySpec;
+use smg_policy_controller::document::PolicySpec;
 
 /// The size a spec document may have, in bytes: the controller's
 /// `MAX_DOCUMENT_BYTES`, private to the crate, so written again here. A case

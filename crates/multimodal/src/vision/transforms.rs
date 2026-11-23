@@ -581,14 +581,6 @@ pub(crate) fn to_tensor_then_normalize_table(mean: &[f64; 3], std: &[f64; 3]) ->
     })
 }
 
-/// Rescale tensor by a constant factor.
-///
-/// Used when `do_rescale=True` in HuggingFace configs (typically 1/255).
-pub fn rescale(tensor: &mut Array3<f32>, factor: f64) {
-    let factor = factor as f32;
-    tensor.mapv_inplace(|v| v * factor);
-}
-
 /// Python-compatible rounding (banker's rounding / round half to even).
 /// Matches Python's `round()` where 0.5 rounds to the nearest even number
 /// (`12.5 -> 12`, `13.5 -> 14`), unlike Rust's `f64::round()` which rounds
@@ -2557,15 +2549,25 @@ fn pil_resample_both<const C: usize>(
 /// Pillow-exact BICUBIC resize (RGB8), matching
 /// `PIL.Image.resize(.., BICUBIC)`.
 pub fn resize_bicubic_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let rgb = image.to_rgb8();
-    let (in_w, in_h) = rgb.dimensions();
+    resize_pil_image(image, out_w, out_h, PilResizeFilter::Bicubic)
+}
+
+/// `image` as RGB8 (read where it stands when it already is), resized the
+/// way Pillow resizes it with `filter`.
+fn resize_pil_image(
+    image: &DynamicImage,
+    out_w: u32,
+    out_h: u32,
+    filter: PilResizeFilter,
+) -> DynamicImage {
+    let (in_w, in_h, rgb) = rgb_bytes(image);
     let output = resize_pil_bytes::<3>(
-        rgb.as_raw(),
-        in_w,
-        in_h,
+        &rgb,
+        in_w as u32,
+        in_h as u32,
         out_w,
         out_h,
-        PilResizeFilter::Bicubic,
+        filter,
         KernelQuantization::Pillow,
     );
     #[expect(
@@ -2728,24 +2730,7 @@ fn mul_div_255(value: u8, alpha: u8) -> u8 {
 /// Pillow-exact LANCZOS resize (RGB8), matching
 /// `PIL.Image.resize(.., LANCZOS)`.
 pub fn resize_lanczos_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let rgb = image.to_rgb8();
-    let (in_w, in_h) = rgb.dimensions();
-    let output = resize_pil_bytes::<3>(
-        rgb.as_raw(),
-        in_w,
-        in_h,
-        out_w,
-        out_h,
-        PilResizeFilter::Lanczos,
-        KernelQuantization::Pillow,
-    );
-    #[expect(
-        clippy::expect_used,
-        reason = "output is exactly out_w*out_h*3 bytes by construction"
-    )]
-    DynamicImage::ImageRgb8(
-        RgbImage::from_raw(out_w, out_h, output).expect("pil resize buffer size"),
-    )
+    resize_pil_image(image, out_w, out_h, PilResizeFilter::Lanczos)
 }
 
 /// Pillow-exact BILINEAR resize (RGB8), matching
@@ -2755,23 +2740,7 @@ pub fn resize_lanczos_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> Dynam
 /// interpolation, and so what an image processor that resizes the decoded
 /// image before converting it to a tensor runs.
 pub fn resize_bilinear_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let (in_w, in_h, rgb) = rgb_bytes(image);
-    let output = resize_pil_bytes::<3>(
-        &rgb,
-        in_w as u32,
-        in_h as u32,
-        out_w,
-        out_h,
-        PilResizeFilter::Bilinear,
-        KernelQuantization::Pillow,
-    );
-    #[expect(
-        clippy::expect_used,
-        reason = "output is exactly out_w*out_h*3 bytes by construction"
-    )]
-    DynamicImage::ImageRgb8(
-        RgbImage::from_raw(out_w, out_h, output).expect("pil resize buffer size"),
-    )
+    resize_pil_image(image, out_w, out_h, PilResizeFilter::Bilinear)
 }
 
 /// `data` (`in_w` x `in_h` interleaved pixels of `C` channels) resampled to
@@ -3084,6 +3053,90 @@ pub(crate) fn resize_bicubic_torch_aa_cropped(
     )
 }
 
+/// [`expand_to_square`] of an RGB image followed by [`resize_bicubic_torch_aa`]
+/// to `out` x `out`, with the square never built. The width pass reads a row
+/// alone, so the padding above and below a wide image is one resampled row of
+/// `background` repeated, and a tall image's rows are padded a band at a
+/// time; the height pass then reads the rows the square's width pass gives:
+/// the same bytes. `None` where the square is the road: an image that is
+/// square, empty or already `out` on its longer side, and every target but x86-64,
+/// whose torch rows resample the whole ([`resize_torch_uint8_rgb`]).
+pub(crate) fn resize_bicubic_torch_aa_squared(
+    rgb: &RgbImage,
+    background: Rgb<u8>,
+    out: u32,
+) -> Option<RgbImage> {
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+    let (side, size) = (w.max(h), out as usize);
+    if !cfg!(target_arch = "x86_64") || w == h || side == size || size == 0 || w.min(h) == 0 {
+        return None;
+    }
+    // Both axes go from `side` to `out`: one kernel serves the two passes.
+    let kernel = &FixedKernel::new(
+        side,
+        size,
+        PilResizeFilter::Bicubic,
+        KernelQuantization::TorchUint8,
+    );
+    let pass = &WidthPass::new::<3>(kernel);
+    let data = &rgb.as_raw()[..w * h * 3];
+    let row = size * 3;
+    let mut rows = plain_buffer(side * row);
+    let (above, rest) = rows.split_at_mut((side - h) / 2 * row);
+    let (image, below) = rest.split_at_mut(h * row);
+    // The width pass of the image's rows from `start` on, as many as `dst`
+    // holds.
+    let width_rows = |start: usize, dst: &mut [u8], scratch: &mut BandScratch| {
+        if w > h {
+            return pass.rows::<3>(data, kernel, w, size, start, dst, scratch);
+        }
+        // The square's rows a band at a time: the padding of a row stays,
+        // the image's part of it is copied in.
+        let band_rows = (PIL_BAND_BYTES / (side * 3)).clamp(1, dst.len() / row);
+        let left = (side - w) / 2 * 3;
+        let mut band = background.0.repeat(side * band_rows);
+        for (src, dst) in data[start * w * 3..][..dst.len() / row * w * 3]
+            .chunks(band_rows * w * 3)
+            .zip(dst.chunks_mut(band_rows * row))
+        {
+            for (padded, line) in band.chunks_exact_mut(side * 3).zip(src.chunks_exact(w * 3)) {
+                padded[left..left + w * 3].copy_from_slice(line);
+            }
+            pass.rows::<3>(&band, kernel, side, size, 0, dst, scratch);
+        }
+    };
+    // A row of the width pass reads its own source row alone, so the rows are
+    // banded across the pool on an output the square's resize bands too.
+    let tasks = par_threads(size * row, h.min(size));
+    let scratch = &mut BandScratch::default();
+    if tasks <= 1 {
+        width_rows(0, image, scratch);
+    } else {
+        let task_rows = h.div_ceil(tasks);
+        parallel_scope(|scope| {
+            for (index, band) in image.chunks_mut(task_rows * row).enumerate() {
+                let width_rows = &width_rows;
+                scope.spawn(move |_| {
+                    width_rows(index * task_rows, band, &mut BandScratch::default());
+                });
+            }
+        });
+    }
+    if w > h {
+        let mut pad = plain_buffer(row);
+        let color = background.0.repeat(side);
+        pass.rows::<3>(&color, kernel, side, size, 0, &mut pad, scratch);
+        for line in above
+            .chunks_exact_mut(row)
+            .chain(below.chunks_exact_mut(row))
+        {
+            line.copy_from_slice(&pad);
+        }
+    }
+    let resized = pil_resample_vertical::<3>(&rows, size, size, kernel);
+    RgbImage::from_raw(out, out, resized)
+}
+
 /// Keys' cubic (`a = -0.5`) as torch's compiled CPU kernel evaluates it in
 /// `f32`: `((a + 2) x - (a + 3)) x x + 1` below one and
 /// `((a x - 5a) x + 8a) x - 4a` below two, with the fused multiply-adds its
@@ -3205,6 +3258,23 @@ pub fn resize_bicubic_torch_aa_f32(
     out_w: u32,
     out_h: u32,
 ) -> Result<Vec<f32>> {
+    resize_bicubic_torch_aa_f32_strips(data, width, height, out_w, out_h, out_h as usize, |_| ())
+}
+
+/// [`resize_bicubic_torch_aa_f32`] with its output a strip at a time: the
+/// rows are written into one buffer of `strip` rows, and `full` reads that
+/// buffer each time its rows are done. A `strip` that does not divide `out_h`
+/// is refused. The buffer is returned; it is the whole output when `strip` is
+/// `out_h`.
+pub(crate) fn resize_bicubic_torch_aa_f32_strips(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    out_w: u32,
+    out_h: u32,
+    strip: usize,
+    full: impl FnMut(&[f32]),
+) -> Result<Vec<f32>> {
     let (in_w, in_h, out_w, out_h) = (
         width as usize,
         height as usize,
@@ -3223,14 +3293,19 @@ pub fn resize_bicubic_torch_aa_f32(
             "torch bicubic RGB resize {width}x{height} -> {out_w}x{out_h} must be non-empty"
         )));
     }
+    if strip == 0 || out_h % strip != 0 {
+        return Err(TransformError::ShapeError(format!(
+            "torch bicubic strip of {strip} rows must divide the output height {out_h}"
+        )));
+    }
     Ok(torch_aa_resize(
         data,
-        in_w,
-        in_h,
-        out_w,
-        out_h,
+        (in_w, in_h),
+        (out_w, out_h),
         TorchAaFilter::Bicubic,
         |_, byte| f32::from(byte),
+        strip,
+        full,
     ))
 }
 
@@ -3271,12 +3346,12 @@ pub fn resize_bilinear_torch_aa_normalized(
     }
     Ok(torch_aa_resize(
         data,
-        in_w,
-        in_h,
-        out_w,
-        out_h,
+        (in_w, in_h),
+        (out_w, out_h),
         TorchAaFilter::Bilinear,
         |channel, byte| table[channel][usize::from(byte)],
+        out_h,
+        |_| (),
     ))
 }
 
@@ -3286,12 +3361,12 @@ pub fn resize_bilinear_torch_aa_normalized(
 /// where the processor has the instruction.
 fn torch_aa_resize(
     data: &[u8],
-    in_w: usize,
-    in_h: usize,
-    out_w: usize,
-    out_h: usize,
+    (in_w, in_h): (usize, usize),
+    (out_w, out_h): (usize, usize),
     filter: TorchAaFilter,
     sample: impl Fn(usize, u8) -> f32 + Copy,
+    strip: usize,
+    full: impl FnMut(&[f32]),
 ) -> Vec<f32> {
     let (x_bounds, x_weights) = torch_aa_weights(in_w, out_w, filter);
     let (y_bounds, y_weights) = torch_aa_weights(in_h, out_h, filter);
@@ -3299,15 +3374,19 @@ fn torch_aa_resize(
         bounds: &x_bounds,
         weights: &x_weights,
     };
-    let y = TorchAaAxis {
-        bounds: &y_bounds,
-        weights: &y_weights,
+    let mut y = TorchAaRows {
+        axis: TorchAaAxis {
+            bounds: &y_bounds,
+            weights: &y_weights,
+        },
+        strip,
+        full,
     };
     #[cfg(target_arch = "x86_64")]
-    if let Some(out) = torch_aa_passes_with_fma(data, in_w, &x, &y, sample) {
+    if let Some(out) = torch_aa_passes_with_fma(data, in_w, &x, &mut y, sample) {
         return out;
     }
-    torch_aa_passes(data, in_w, &x, &y, sample)
+    torch_aa_passes(data, in_w, &x, &mut y, sample)
 }
 
 /// One axis of the torch-style resize: per output sample the first source
@@ -3317,81 +3396,167 @@ struct TorchAaAxis<'a> {
     weights: &'a [Vec<f32>],
 }
 
+/// The height axis of the torch-style resize with where its rows go: one
+/// buffer of `strip` rows, which `full` reads each time its rows are done.
+struct TorchAaRows<'a, F> {
+    axis: TorchAaAxis<'a>,
+    strip: usize,
+    full: F,
+}
+
 /// The two passes of [`resize_bicubic_torch_aa_f32`] and
-/// [`resize_bilinear_torch_aa_normalized`]: every source row resampled along
-/// the width, then the rows along the height. A source byte enters as
-/// `sample(channel, byte)`, the float the reference's tensor holds for it.
+/// [`resize_bilinear_torch_aa_normalized`]: the source rows resampled along
+/// the width a band at a time into a window of rows, and each output row
+/// resampled along the height from that window once the band of its last tap
+/// is done. A source byte enters as `sample(channel, byte)`, the float the
+/// reference's tensor holds for it. The output rows go into one buffer of
+/// `strip` rows, which `full` reads each time its rows are done and which is
+/// returned: the whole output when `strip` is the output height.
 /// An output's taps add in the reference's three runs: the first tap is the
 /// bare product, the next [`torch_aa_plain_until`] taps add a rounded product
 /// in a second rounding, and the rest are fused multiply-adds. Inlined into
 /// its callers so that the fused taps compile to the caller's instruction
 /// set.
 #[inline(always)]
-fn torch_aa_passes(
+fn torch_aa_passes<F: FnMut(&[f32])>(
     data: &[u8],
     in_w: usize,
     x: &TorchAaAxis<'_>,
-    y: &TorchAaAxis<'_>,
+    y: &mut TorchAaRows<'_, F>,
     sample: impl Fn(usize, u8) -> f32 + Copy,
 ) -> Vec<f32> {
+    let &mut TorchAaRows {
+        axis: ref y,
+        strip,
+        ref mut full,
+    } = y;
     let (out_w, out_h) = (x.bounds.len(), y.bounds.len());
-    let in_h = data.len() / (in_w * 3);
+    debug_assert_eq!(out_h % strip, 0, "the output is whole strips");
 
-    let mut rows = plain_f32(in_h * out_w * 3);
-    for (src, dst) in data
-        .chunks_exact(in_w * 3)
-        .zip(rows.chunks_exact_mut(out_w * 3))
-    {
-        let (pixels, _) = src.as_chunks::<3>();
-        let (outs, _) = dst.as_chunks_mut::<3>();
-        for (out, (&(start, count), weights)) in outs.iter_mut().zip(x.bounds.iter().zip(x.weights))
+    // The width pass takes the source rows a band at a time. A tap has one
+    // weight and one offset for every row, so with the rows of a band side by
+    // side a tap is a few vector steps over all of them, and a byte goes
+    // through `sample` once instead of once a tap. `band` holds one source
+    // pixel of every row, each as RGB and a fourth value that stays zero:
+    // three values a pixel take fewer instructions and less memory, but
+    // measured slower on downscales. A last band of fewer rows leaves the
+    // rows past its own as the band before filled them; those are summed
+    // and never copied out. A value still adds its own taps in the order
+    // above, so no bit moves.
+    const BAND: usize = 8;
+    // The height pass reads a source row only while the taps of an output
+    // row cover it, and an output row's taps never start or end before those
+    // of the row above. So the width pass keeps a window of `kept` rows, the
+    // longest run of whole bands one output row reads, not the image: a
+    // source row stands in it at its index modulo `kept`.
+    let kept = y
+        .bounds
+        .iter()
+        .map(|&(start, count)| (start + count).next_multiple_of(BAND) - start / BAND * BAND)
+        .fold(BAND, usize::max);
+    debug_assert!(
+        y.bounds
+            .windows(2)
+            .all(|w| w[0].0 + w[0].1 <= w[1].0 + w[1].1),
+        "an output row's taps end no earlier than those of the row above"
+    );
+    let mut rows = plain_f32(kept * out_w * 3);
+    let mut band = plain_f32(in_w * BAND * 4);
+    let (band, _) = band.as_chunks_mut::<4>();
+    let (band, _) = band.as_chunks_mut::<BAND>();
+    let mut sums = plain_f32(out_w * BAND * 4);
+    let (sums, _) = sums.as_chunks_mut::<4>();
+    let (sums, _) = sums.as_chunks_mut::<BAND>();
+    let mut out = plain_f32(strip * out_w * 3);
+    // The output rows done, and how many of them the strip holds.
+    let (mut written, mut in_strip) = (0, 0);
+    for (index, src) in data.chunks(BAND * in_w * 3).enumerate() {
+        let dst = &mut rows[(index * BAND % kept) * out_w * 3..][..src.len() / in_w * out_w];
+        for (src, row) in src.chunks_exact(in_w * 3).zip(0..BAND) {
+            let (pixels, _) = src.as_chunks::<3>();
+            for (values, pixel) in band.iter_mut().zip(pixels) {
+                for (channel, (value, &byte)) in values[row].iter_mut().zip(pixel).enumerate() {
+                    *value = sample(channel, byte);
+                }
+            }
+        }
+        for (sum, (&(start, count), weights)) in sums.iter_mut().zip(x.bounds.iter().zip(x.weights))
         {
-            let mut taps = weights[..count].iter().zip(&pixels[start..start + count]);
-            let mut acc = [0.0_f32; 3];
-            if let Some((&weight, pixel)) = taps.next() {
-                for (channel, (sum, &byte)) in acc.iter_mut().zip(pixel).enumerate() {
-                    *sum = weight * sample(channel, byte);
+            let mut taps = weights[..count].iter().zip(&band[start..start + count]);
+            let mut acc = [[0.0_f32; 4]; BAND];
+            if let Some((&weight, values)) = taps.next() {
+                for (a, &v) in acc.as_flattened_mut().iter_mut().zip(values.as_flattened()) {
+                    *a = weight * v;
                 }
             }
-            for (&weight, pixel) in taps.by_ref().take(torch_aa_plain_until(count)) {
-                for (channel, (sum, &byte)) in acc.iter_mut().zip(pixel).enumerate() {
-                    *sum += weight * sample(channel, byte);
+            for (&weight, values) in taps.by_ref().take(torch_aa_plain_until(count)) {
+                for (a, &v) in acc.as_flattened_mut().iter_mut().zip(values.as_flattened()) {
+                    *a += weight * v;
                 }
             }
-            for (&weight, pixel) in taps {
-                for (channel, (sum, &byte)) in acc.iter_mut().zip(pixel).enumerate() {
-                    *sum = weight.mul_add(sample(channel, byte), *sum);
+            for (&weight, values) in taps {
+                for (a, &v) in acc.as_flattened_mut().iter_mut().zip(values.as_flattened()) {
+                    *a = weight.mul_add(v, *a);
                 }
             }
-            *out = acc;
+            *sum = acc;
         }
-    }
+        for (dst, row) in dst.chunks_exact_mut(out_w * 3).zip(0..BAND) {
+            let (outs, _) = dst.as_chunks_mut::<3>();
+            for (out, sum) in outs.iter_mut().zip(sums.iter()) {
+                let [r, g, b, _] = sum[row];
+                *out = [r, g, b];
+            }
+        }
 
-    let mut out = plain_f32(out_h * out_w * 3);
-    let row = out_w * 3;
-    for (dst, (&(start, count), weights)) in out
-        .chunks_exact_mut(row)
-        .zip(y.bounds.iter().zip(y.weights))
-    {
-        let mut taps = weights[..count]
-            .iter()
-            .zip(rows[start * row..(start + count) * row].chunks_exact(row));
-        if let Some((&weight, src)) = taps.next() {
-            for (d, &v) in dst.iter_mut().zip(src) {
-                *d = weight * v;
+        // The output rows whose last tap this band holds are written now; a
+        // row without taps waits for no source row.
+        let row = out_w * 3;
+        let held = index * BAND + src.len() / (in_w * 3);
+        while let Some(&(start, count)) = y.bounds.get(written) {
+            if count != 0 && start + count > held {
+                break;
             }
-        }
-        for (&weight, src) in taps.by_ref().take(torch_aa_plain_until(count)) {
-            for (d, &v) in dst.iter_mut().zip(src) {
-                *d += weight * v;
+            let dst = &mut out[in_strip * row..][..row];
+            // The taps' rows run to the window's end and on from its start.
+            let first = start % kept;
+            let wrapped = (first + count).saturating_sub(kept);
+            let mut taps = y.weights[written][..count].iter().zip(
+                rows[first * row..(first + count - wrapped) * row]
+                    .chunks_exact(row)
+                    .chain(rows[..wrapped * row].chunks_exact(row)),
+            );
+            match taps.next() {
+                Some((&weight, src)) => {
+                    for (d, &v) in dst.iter_mut().zip(src) {
+                        *d = weight * v;
+                    }
+                }
+                // A strip holds the rows of the strip before.
+                None => dst.fill(0.0),
             }
-        }
-        for (&weight, src) in taps {
-            for (d, &v) in dst.iter_mut().zip(src) {
-                *d = weight.mul_add(v, *d);
+            for (&weight, src) in taps.by_ref().take(torch_aa_plain_until(count)) {
+                for (d, &v) in dst.iter_mut().zip(src) {
+                    *d += weight * v;
+                }
+            }
+            for (&weight, src) in taps {
+                for (d, &v) in dst.iter_mut().zip(src) {
+                    *d = weight.mul_add(v, *d);
+                }
+            }
+            written += 1;
+            in_strip += 1;
+            if in_strip == strip {
+                full(&out);
+                in_strip = 0;
             }
         }
     }
+    debug_assert_eq!(
+        written, out_h,
+        "every output row's taps lie inside the source"
+    );
     out
 }
 
@@ -3402,11 +3567,11 @@ fn torch_aa_passes(
 /// such processors.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "fma")]
-fn torch_aa_passes_fma(
+fn torch_aa_passes_fma<F: FnMut(&[f32])>(
     data: &[u8],
     in_w: usize,
     x: &TorchAaAxis<'_>,
-    y: &TorchAaAxis<'_>,
+    y: &mut TorchAaRows<'_, F>,
     sample: impl Fn(usize, u8) -> f32 + Copy,
 ) -> Vec<f32> {
     torch_aa_passes(data, in_w, x, y, sample)
@@ -3420,11 +3585,11 @@ fn torch_aa_passes_fma(
     unsafe_code,
     reason = "the target-feature function runs only after this function detected its feature"
 )]
-fn torch_aa_passes_with_fma(
+fn torch_aa_passes_with_fma<F: FnMut(&[f32])>(
     data: &[u8],
     in_w: usize,
     x: &TorchAaAxis<'_>,
-    y: &TorchAaAxis<'_>,
+    y: &mut TorchAaRows<'_, F>,
     sample: impl Fn(usize, u8) -> f32 + Copy,
 ) -> Option<Vec<f32>> {
     if !std::arch::is_x86_feature_detected!("fma") {
@@ -3433,23 +3598,6 @@ fn torch_aa_passes_with_fma(
     // SAFETY: `is_x86_feature_detected!("fma")` answered true just above, the
     // only requirement of a `target_feature(enable = "fma")` function.
     Some(unsafe { torch_aa_passes_fma(data, in_w, x, y, sample) })
-}
-
-/// Resize image preserving aspect ratio, fitting within max dimensions.
-pub fn resize_to_fit(
-    image: &DynamicImage,
-    max_width: u32,
-    max_height: u32,
-    filter: FilterType,
-) -> DynamicImage {
-    let (w, h) = image.dimensions();
-    let ratio = (max_width as f64 / w as f64).min(max_height as f64 / h as f64);
-    if ratio >= 1.0 {
-        return image.clone();
-    }
-    let new_w = ((w as f64 * ratio).round() as u32).max(1);
-    let new_h = ((h as f64 * ratio).round() as u32).max(1);
-    resize(image, new_w, new_h, filter)
 }
 
 /// Center crop image to specified dimensions.
@@ -3617,19 +3765,10 @@ pub fn expand_to_square(image: &DynamicImage, background: Rgb<u8>) -> DynamicIma
     }
 }
 
-/// Pillow-exact `ImageOps.pad` with default centering (0.5, 0.5):
-/// aspect-preserving BICUBIC `contain` fit into `(out_w, out_h)`, then a
-/// centered paste onto a `color` canvas. Matches Pillow 12.x source: `contain`
-/// adjusts at most one dimension using Python `round()` (exact
-/// round-half-to-even, so `471.49999999999994` rounds to 471 like Python and
-/// not up like an epsilon tie test would) and `pad` pastes at
-/// `round((size - resized) * 0.5)` along the padded axis.
-///
-/// The image is treated as RGB (`to_rgb8`): an alpha channel is dropped, not
-/// premultiplied; callers that need Pillow's RGBA behaviour must flatten
-/// first. An aspect ratio so extreme that the contained dimension rounds to
-/// zero is an error, as it is in Pillow (`height and width must be > 0`).
-pub fn pad_to_size_pil(
+/// [`pad_to_size_pil_rgb`] over a decoded image, which is treated as RGB
+/// (`to_rgb8`): an alpha channel is dropped, not premultiplied.
+#[cfg(test)]
+fn pad_to_size_pil(
     image: &DynamicImage,
     out_w: u32,
     out_h: u32,
@@ -3639,9 +3778,19 @@ pub fn pad_to_size_pil(
     pad_to_size_pil_rgb(&data, w as u32, h as u32, out_w, out_h, color).map(DynamicImage::ImageRgb8)
 }
 
-/// [`pad_to_size_pil`] over interleaved RGB bytes (`width` x `height`): the
-/// same geometry, the contained image resized once and its rows copied into
-/// the canvas (the paste of an opaque image is a copy).
+/// Pillow-exact `ImageOps.pad` with default centering (0.5, 0.5) over
+/// interleaved RGB bytes (`width` x `height`): aspect-preserving BICUBIC
+/// `contain` fit into `(out_w, out_h)`, then a centered paste onto a `color`
+/// canvas. Matches Pillow 12.x source: `contain` adjusts at most one dimension
+/// using Python `round()` (exact round-half-to-even, so `471.49999999999994`
+/// rounds to 471 like Python and not up like an epsilon tie test would) and
+/// `pad` pastes at `round((size - resized) * 0.5)` along the padded axis.
+///
+/// The contained image is resized once. When the fit leaves room on one axis,
+/// its rows are copied into the canvas (the paste of an opaque image is a
+/// copy); when it fills the target, it is returned without a canvas. An aspect
+/// ratio so extreme that the contained dimension rounds to zero is an error,
+/// as it is in Pillow (`height and width must be > 0`).
 pub fn pad_to_size_pil_rgb(
     data: &[u8],
     width: u32,
@@ -3772,30 +3921,6 @@ pub fn pil_to_filter(resampling: Option<usize>) -> FilterType {
         Some(4) | Some(5) => FilterType::Triangle,
         _ => FilterType::Triangle,
     }
-}
-
-/// Calculate mean color of an image as RGB.
-pub fn calculate_mean_color(image: &DynamicImage) -> Rgb<u8> {
-    let rgb = image.to_rgb8();
-    let (w, h) = (rgb.width() as u64, rgb.height() as u64);
-    let total_pixels = w * h;
-
-    if total_pixels == 0 {
-        return Rgb([128, 128, 128]);
-    }
-
-    let (mut r_sum, mut g_sum, mut b_sum) = (0u64, 0u64, 0u64);
-    for pixel in rgb.pixels() {
-        r_sum += pixel[0] as u64;
-        g_sum += pixel[1] as u64;
-        b_sum += pixel[2] as u64;
-    }
-
-    Rgb([
-        (r_sum / total_pixels) as u8,
-        (g_sum / total_pixels) as u8,
-        (b_sum / total_pixels) as u8,
-    ])
 }
 
 /// Convert normalized mean values [0, 1] to RGB bytes, truncated like the
@@ -4690,6 +4815,32 @@ mod tests {
         }
     }
 
+    /// The squared entry point equals the square followed by the resize, at a
+    /// target the pool bands: a wide image, a tall one of several bands whose
+    /// last is short, and a tall one of a single band. Off x86-64 it leaves
+    /// the square to its caller.
+    #[test]
+    fn the_squared_torch_resize_equals_the_square_and_the_resize() {
+        let background = Rgb([122, 116, 104]);
+        for (seed, &(w, h)) in [(1920, 1079), (1079, 1920), (22, 47)].iter().enumerate() {
+            let data = gradient_rgb(w as usize, h as usize, seed * 11 + 5);
+            let rgb = RgbImage::from_raw(w, h, data).unwrap();
+            let squared = resize_bicubic_torch_aa_squared(&rgb, background, 672);
+            if cfg!(target_arch = "x86_64") {
+                let square = expand_to_square(&DynamicImage::ImageRgb8(rgb), background);
+                assert_same_bytes(
+                    squared.unwrap().as_raw(),
+                    resize_bicubic_torch_aa(&square, 672, 672)
+                        .into_rgb8()
+                        .as_raw(),
+                    &format!("{w}x{h} -> 672x672"),
+                );
+            } else {
+                assert!(squared.is_none(), "{w}x{h}");
+            }
+        }
+    }
+
     /// The torch `uint8` entry points carry the per-sample bytes of the torch
     /// taps on every case, whichever rows this target runs them on (the
     /// Pillow-exact passes on x86-64, the torch module's rows elsewhere), and
@@ -5350,16 +5501,6 @@ mod tests {
         // (0.5 - 0.5) / 0.5 = 0.0
         for val in &tensor {
             assert!(val.abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn test_rescale() {
-        let mut tensor = Array3::<f32>::from_elem((3, 2, 2), 255.0);
-        rescale(&mut tensor, 1.0 / 255.0);
-
-        for val in &tensor {
-            assert!((val - 1.0).abs() < 1e-6);
         }
     }
 
@@ -6042,13 +6183,17 @@ mod tests {
                 bounds: &x_bounds,
                 weights: &x_weights,
             };
-            let y = TorchAaAxis {
-                bounds: &y_bounds,
-                weights: &y_weights,
+            let mut y = TorchAaRows {
+                axis: TorchAaAxis {
+                    bounds: &y_bounds,
+                    weights: &y_weights,
+                },
+                strip: out_h as usize,
+                full: |_: &[f32]| (),
             };
             let bytes_as_floats = |_: usize, byte: u8| f32::from(byte);
             #[cfg(target_arch = "x86_64")]
-            let fma = torch_aa_passes_with_fma(&data, width as usize, &x, &y, bytes_as_floats);
+            let fma = torch_aa_passes_with_fma(&data, width as usize, &x, &mut y, bytes_as_floats);
             #[cfg(not(target_arch = "x86_64"))]
             let fma: Option<Vec<f32>> = None;
             let bodies = [
@@ -6062,7 +6207,7 @@ mod tests {
                         &data,
                         width as usize,
                         &x,
-                        &y,
+                        &mut y,
                         bytes_as_floats,
                     )),
                 ),
@@ -6087,6 +6232,17 @@ mod tests {
                     "{width}x{height} -> {out_w}x{out_h} through {body}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_torch_bicubic_strip_that_does_not_divide_the_height_is_refused() {
+        for strip in [0, 3] {
+            let got = resize_bicubic_torch_aa_f32_strips(&[0; 48], 4, 4, 2, 4, strip, |_| ());
+            assert!(
+                matches!(got, Err(TransformError::ShapeError(_))),
+                "a strip of {strip} rows"
+            );
         }
     }
 
@@ -6251,9 +6407,13 @@ mod tests {
                 bounds: &x_bounds,
                 weights: &x_weights,
             };
-            let y = TorchAaAxis {
-                bounds: &y_bounds,
-                weights: &y_weights,
+            let mut y = TorchAaRows {
+                axis: TorchAaAxis {
+                    bounds: &y_bounds,
+                    weights: &y_weights,
+                },
+                strip: out_h as usize,
+                full: |_: &[f32]| (),
             };
             let bodies = [
                 (
@@ -6263,7 +6423,7 @@ mod tests {
                 ),
                 (
                     "the generic body",
-                    torch_aa_passes(&data, width as usize, &x, &y, |channel, byte| {
+                    torch_aa_passes(&data, width as usize, &x, &mut y, |channel, byte| {
                         table[channel][usize::from(byte)]
                     }),
                 ),

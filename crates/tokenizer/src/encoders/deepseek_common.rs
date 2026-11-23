@@ -3,9 +3,10 @@
 //! the OpenAI-shape readers every one of them uses, the message read
 //! (`Turn`) with the two refusals every dialect spells the same way, the
 //! last-user index predicates, the quick-instruction task tokens, the
-//! tools-and-response-format section of a system or developer turn, and the
+//! tools-and-response-format section of a system or developer turn, the
+//! drop-thinking filter every revision runs with its own kept roles, and the
 //! V4 family's message preprocessing
-//! (tool-message merging, tool-result sorting, drop-thinking, DSML argument
+//! (tool-message merging, tool-result sorting, DSML argument
 //! rendering, the tools template), which V4 and V4.1 run with their own DSML
 //! tag strings (V4 bare `invoke`/`parameter`; V4.1 ` invoke`/` parameter`
 //! with a leading space).
@@ -376,24 +377,36 @@ pub(super) fn sort_tool_results_by_call_order(messages: Vec<Value>) -> Vec<Value
     out
 }
 
+/// The roles V4 and V4.1 keep whole in [`drop_thinking_messages`].
+pub(super) const KEPT_ROLES: &[&str] = &[
+    "user",
+    "system",
+    "tool",
+    "latest_reminder",
+    "direct_search_results",
+];
+
 /// Drop reasoning_content from earlier assistant turns and remove non-essential
 /// developer messages before the last user.
 ///
-/// `last_user_idx` is passed in rather than recomputed because the two
-/// revisions disagree on what the "last user turn" is: V4 counts only
+/// `last_user_idx` is passed in rather than recomputed because the
+/// revisions disagree on what the "last user turn" is: V3.2 and V4 count only
 /// user/developer messages ([`find_last_user_index`]), while V4.1 also counts
-/// mid-conversation system messages. The filtering itself is identical.
+/// mid-conversation system messages.
+///
+/// `kept_roles` are the roles a revision keeps whole wherever they stand:
+/// [`KEPT_ROLES`] for V4 and V4.1; V3.2 has no reminder and search-result
+/// roles and drops such a message before the last user turn. The rest of the
+/// filtering is the same for every revision.
 pub(super) fn drop_thinking_messages(
     messages: &[Value],
     last_user_idx: Option<usize>,
+    kept_roles: &[&str],
 ) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::with_capacity(messages.len());
     for (idx, msg) in messages.iter().enumerate() {
         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        let always_keep = matches!(
-            role,
-            "user" | "system" | "tool" | "latest_reminder" | "direct_search_results"
-        ) || at_or_after_last_user(idx, last_user_idx);
+        let always_keep = kept_roles.contains(&role) || at_or_after_last_user(idx, last_user_idx);
         if always_keep {
             out.push(msg.clone());
             continue;

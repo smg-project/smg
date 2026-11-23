@@ -38,7 +38,6 @@ use smg_grpc_client::{
     tokenspeed_proto, vllm_proto, OutputConstraint, SglangGenerateRequestOptions,
     SglangSchedulerClient, TokenSpeedSchedulerClient, VllmEngineClient,
 };
-use smg_policy_controller::tracking::lease::TransportClass;
 use smg_worker::{
     connection::engine::{
         AdminAnswer, ConnectorDefault, EngineConnection, EngineConnector, HealthAnswer, LoadSource,
@@ -420,7 +419,7 @@ impl EngineConnection for BackendClient {
     async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.get_loads().await,
-            Self::Zmq(client) => Ok(client.get_loads()),
+            Self::Zmq(client) => Ok(client.get_loads_by_rank()),
         }
     }
 
@@ -562,7 +561,11 @@ impl EngineConnector for BackendConnector {
         )
         .await?;
         client.check_declared_role(link.worker_type)?;
-        Ok(Arc::new(BackendClient::Zmq(client)))
+        let client = BackendClient::Zmq(client);
+        if link.pinned_by_rank {
+            check_every_rank_is_pinnable(&client)?;
+        }
+        Ok(Arc::new(client))
     }
 
     /// The client crate's own dial: the channel every runtime's client
@@ -573,6 +576,25 @@ impl EngineConnector for BackendConnector {
             .map(drop)
             .map_err(|e| e.to_string())
     }
+}
+
+/// Refuse a connection whose engines the rank workers it serves cannot all
+/// pin: a vLLM or SGLang group whose ZMQ indices do not run from 0 (see
+/// [`BackendClient::pinnable_ranks`]), where a request pinned to a rank past
+/// the gap would be refused at dispatch.
+fn check_every_rank_is_pinnable(client: &BackendClient) -> Result<(), String> {
+    let (Some(pinnable), Some(connected)) = (client.pinnable_ranks(), client.connected_engines())
+    else {
+        return Ok(());
+    };
+    if pinnable < connected {
+        return Err(format!(
+            "dp-aware routing pins a request to its rank, which reaches only {pinnable} of the \
+             {connected} engines connected: their ZMQ indices do not run from 0. Launch the \
+             group at data-parallel start rank 0, or register it without --dp-aware"
+        ));
+    }
+    Ok(())
 }
 
 /// Connect the gateway's client to the gRPC server of an engine of
@@ -715,7 +737,7 @@ enum Asked {
     NoWire,
     /// No answer of the engine's, with the reason: the status is the
     /// channel's own, as the request path classes it
-    /// ([`TonicStatusExt::transport_class`]).
+    /// ([`TonicStatusExt::is_no_answer`]).
     Lost(String),
 }
 
@@ -728,7 +750,7 @@ enum Asked {
 /// as an engine that speaks the wire, and the call is dropped there.
 async fn asked<T>(ask: impl Future<Output = Result<T, tonic::Status>>) -> Asked {
     match tokio::time::timeout(ASK_BOUND, ask).await {
-        Ok(Err(status)) if status.transport_class() == TransportClass::ConnectFailed => {
+        Ok(Err(status)) if status.is_no_answer() => {
             let reason = status.client_message();
             Asked::Lost(format!("the engine's health call got no answer: {reason}"))
         }

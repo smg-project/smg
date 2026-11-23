@@ -9,7 +9,7 @@ use std::{
 use axum::response::Response;
 use engine_zmq_adapter::stops::encode_single_token_stops;
 use llm_tokenizer::traits::Tokenizer;
-use openai_protocol::common::ResponseFormat;
+use openai_protocol::{common::ResponseFormat, worker::GrammarStart};
 use rand::RngExt;
 use smg_grpc_client::{
     mlx_proto,
@@ -20,7 +20,7 @@ use smg_worker::identity::{
     basic::{Worker, DEFAULT_BOOTSTRAP_PORT},
     sampling_defaults::{SamplingDefaults, DEFAULT_SAMPLING_PARAMS_LABEL},
 };
-use tool_parser::{GrammarStart, ParserFactory as ToolParserFactory};
+use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, error, warn};
 
 use super::pd_protocol::{DpPlacement, PdProtocol, PdRendezvous};
@@ -682,8 +682,8 @@ pub(crate) fn restamp_plan_for_attempt(
 /// flow unchanged.
 fn sampling_defaults_for_request(workers: Option<&WorkerSelection>) -> Option<SamplingDefaults> {
     let worker = match workers? {
-        WorkerSelection::Single { worker } => worker,
-        WorkerSelection::Disaggregated { decode, .. } => decode,
+        WorkerSelection::Single { worker } => worker.worker(),
+        WorkerSelection::Disaggregated { decode, .. } => decode.worker(),
     };
     let json = worker
         .metadata()

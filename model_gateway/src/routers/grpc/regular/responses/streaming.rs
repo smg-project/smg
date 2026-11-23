@@ -56,6 +56,7 @@ use super::{
     conversions,
 };
 use crate::{
+    middleware::RequestStarted,
     observability::metrics::Metrics,
     routers::{
         common::{
@@ -78,6 +79,7 @@ use crate::{
                 },
                 stages::{iteration_charge, RateLimitCell},
             },
+            proto_wrapper::ClientGone,
             regular::symphony,
             utils,
         },
@@ -440,8 +442,8 @@ enum BodyRead {
     ClientLeft,
 }
 
-/// The next frame of the chat body `stream`, read for the client at the
-/// receiving end of `tx`'s channel. The relay that turns the chat stream
+/// The next frame of the chat body `stream`, read for the client
+/// `client_gone` waits for. The relay that turns the chat stream
 /// into the Responses stream holds the chat layer's receiver through that
 /// body: parked on a body that stalled mid-stream, it would learn that its
 /// client left only when the body next yields, and the engine request behind
@@ -449,15 +451,17 @@ enum BodyRead {
 /// client's leaving, looked at first so a busy body cannot outrun it; on
 /// [`BodyRead::ClientLeft`] the caller ends its read and drops the body,
 /// and the chat layer ends the engine request the way it does for its own
-/// clients. A background response's `tx` is the sender of its relay, which
+/// clients. A background response's wait is on the sender of its relay, which
 /// closes with the work and not with the client: its reads are the body's
-/// own, and the work outlives the client as it is meant to.
-async fn next_frame(stream: &mut BodyDataStream, tx: &SseSender) -> BodyRead {
-    tokio::select! {
-        biased;
-        () = tx.closed() => BodyRead::ClientLeft,
-        frame = stream.next() => frame.map_or(BodyRead::End, BodyRead::Frame),
-    }
+/// own, and the work outlives the client as it is meant to. `client_gone`
+/// is the wait the relay keeps for one chat body; the order of a read is
+/// [`ClientGone::poll_read`]'s.
+async fn next_frame(stream: &mut BodyDataStream, client_gone: &mut ClientGone) -> BodyRead {
+    std::future::poll_fn(|cx| client_gone.poll_read(cx, |cx| stream.poll_next_unpin(cx)))
+        .await
+        .map_or(BodyRead::ClientLeft, |frame| {
+            frame.map_or(BodyRead::End, BodyRead::Frame)
+        })
 }
 
 /// The record of a stored foreground stream whose client left mid-stream, as
@@ -566,6 +570,7 @@ async fn process_and_transform_sse_stream(
 
     // Convert body to data stream
     let mut stream = body.into_data_stream();
+    let mut client_gone = ClientGone::of(&tx);
 
     let mut terminal_error = None;
     // The client left: met by the body read, by an event it no longer takes,
@@ -573,7 +578,7 @@ async fn process_and_transform_sse_stream(
     let mut client_left = false;
     // Process the stream frame by frame; a frame holds one or more SSE events.
     'frames: loop {
-        let chunk = match next_frame(&mut stream, &tx).await {
+        let chunk = match next_frame(&mut stream, &mut client_gone).await {
             BodyRead::Frame(Ok(chunk)) => chunk,
             BodyRead::Frame(Err(error)) => {
                 terminal_error = Some(stream_read_error(&error));
@@ -706,6 +711,11 @@ pub(super) async fn execute_tool_loop_streaming(
     mcp_servers: Vec<McpServerBinding>,
     background: Option<BackgroundStream>,
 ) -> Response {
+    // The request's entry stamp, read here in the request's task: the loop
+    // runs in a task of its own, where the stamp's scope is gone, and
+    // dispatches its first generation under this stamp again.
+    let entered = RequestStarted::current().map(RequestStarted::at);
+
     // Create SSE channel for client
     let (tx, rx) = sse_channel();
     let (startup_tx, startup_rx) = stream_startup_channel();
@@ -731,6 +741,7 @@ pub(super) async fn execute_tool_loop_streaming(
             mcp_servers,
             tx.clone(),
             Some(startup_tx),
+            entered,
         )
         .await
         {
@@ -960,6 +971,16 @@ impl Turns {
 }
 
 /// Internal streaming tool loop implementation
+///
+/// `entered` is the request's entry stamp, when it came in under one. Every
+/// turn's generation is dispatched under a stamp, so its dispatch wait is
+/// recorded with its time to first token (see `context::dispatch_wait`): the
+/// first turn's under `entered`, a later turn's under one taken where that
+/// turn starts.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the streamed loop needs the request state, the channel, the startup barrier and the entry stamp"
+)]
 async fn execute_tool_loop_streaming_internal(
     ctx: &ResponsesContext,
     mut current_request: ResponsesRequest,
@@ -968,6 +989,7 @@ async fn execute_tool_loop_streaming_internal(
     mcp_servers: Vec<McpServerBinding>,
     tx: SseSender,
     mut startup: Option<StreamStartupSender>,
+    entered: Option<RequestStarted>,
 ) -> Result<(), String> {
     // The loop is rebuilt on the loaded request: a stored turn's tool calls
     // and outputs stay in front of the calls this loop executes.
@@ -1011,6 +1033,11 @@ async fn execute_tool_loop_streaming_internal(
 
     // Flag to track if mcp_list_tools has been emitted
     let mut mcp_list_tools_emitted = false;
+
+    // The stamp the turn under way dispatches its generation under: the
+    // request's own for the first turn. A request that came in outside a
+    // stamp has none on any turn.
+    let mut turn_entered = entered;
 
     let turns = 'turns: loop {
         trace!("Streaming MCP tool loop iteration {}", state.iteration);
@@ -1066,20 +1093,23 @@ async fn execute_tool_loop_streaming_internal(
         // it ends, a refused or failed start closes it with its debit kept.
         let startup_pending = startup.is_some();
         let reservation = Arc::new(RateLimitCell::new());
-        let response = ctx
-            .pipeline
-            .execute_chat(
-                Arc::new(chat_request),
-                params.headers.clone(),
-                params.model_id.clone(),
-                ctx.components.clone(),
-                Some(iteration_charge(&params.tenant_request_meta)),
-                Some(reservation.clone()),
-                // Tool-loop iterations are not retried.
-                None,
-                startup.take(),
-            )
-            .await;
+        let generation = ctx.pipeline.execute_chat(
+            Arc::new(chat_request),
+            params.headers.clone(),
+            params.model_id.clone(),
+            ctx.components.clone(),
+            Some(iteration_charge(&params.tenant_request_meta)),
+            Some(reservation.clone()),
+            // Tool-loop iterations are not retried.
+            None,
+            startup.take(),
+        );
+        // Dispatched under the turn's stamp: the chat stream reads its
+        // dispatch wait from it where it is built.
+        let response = match turn_entered {
+            Some(entered) => entered.scope(generation).await,
+            None => generation.await,
+        };
 
         if !response.status().is_success() {
             reservation.close_unsettled().await;
@@ -1168,6 +1198,12 @@ async fn execute_tool_loop_streaming_internal(
             }
 
             state.final_turn = tool_call_limit == Some(McpToolCallLimit::User);
+
+            // The next turn starts here, and its stamp is taken here: its
+            // dispatch wait is the gateway's time from this instant to its
+            // dispatch. Counted from the request's entry it would hold every
+            // generation and tool call before it.
+            turn_entered = turn_entered.map(|_| RequestStarted::now());
 
             // Build next request with conversation history
             current_request = build_next_request(&mut state, current_request);
@@ -1271,6 +1307,7 @@ async fn convert_and_accumulate_stream(
 ) -> Result<ChatCompletionResponse, Value> {
     let mut accumulator = ChatResponseAccumulator::new();
     let mut stream = body.into_data_stream();
+    let mut client_gone = ClientGone::of(tx);
     // The parser supplies a complete name before argument deltas. Retain any
     // preceding id-only deltas until that name tells us who executes the call.
     let mut mcp_indices: HashMap<u32, bool> = HashMap::new();
@@ -1278,7 +1315,7 @@ async fn convert_and_accumulate_stream(
 
     // A frame holds one or more SSE events; every one of them counts.
     'frames: loop {
-        let chunk = match next_frame(&mut stream, tx).await {
+        let chunk = match next_frame(&mut stream, &mut client_gone).await {
             BodyRead::Frame(frame) => frame.map_err(|error| stream_read_error(&error))?,
             BodyRead::End => break,
             // The chat body goes with this return, which ends the generation
@@ -2413,6 +2450,60 @@ mod tests {
         assert!(
             body_tx.is_closed(),
             "the chat body is dropped with the read"
+        );
+    }
+
+    /// The client leaves between two reads of the chat body (while a call is
+    /// named): only a wait the relay kept from its parked read wakes it then.
+    #[test]
+    fn the_wait_a_parked_read_registered_wakes_the_reader_after_that_read() {
+        use std::{
+            cell::Cell,
+            future::Future,
+            sync::atomic::{AtomicUsize, Ordering},
+            task::{Context, Poll, Wake, Waker},
+        };
+
+        struct Wakes(AtomicUsize);
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
+
+        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let body = Body::from_stream(ReceiverStream::new(body_rx));
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        let (tx, rx) = mpsc::channel(64);
+        let rx = Cell::new(Some(rx));
+        let mut read = std::pin::pin!(convert_and_accumulate_stream(
+            body,
+            &mut emitter,
+            &tx,
+            |_| {
+                drop(rx.take());
+                true
+            }
+        ));
+        assert!(read.as_mut().poll(&mut cx).is_pending());
+        let call = json!({"tool_calls":[{"index":0,"id":"call_server","type":"function",
+            "function":{"name":"server_tool","arguments":""}}]});
+        body_tx
+            .try_send(Ok(Bytes::from(chat_event(call, None))))
+            .unwrap();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1, "the frame's wake");
+        let Poll::Ready(Err(error)) = read.as_mut().poll(&mut cx) else {
+            panic!("the read ends at the first read after the client left");
+        };
+        assert_eq!(error["message"], "Client disconnected");
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            2,
+            "the client's leaving wakes the reader through the kept wait"
         );
     }
 

@@ -1251,7 +1251,9 @@ fn an_inline_encode_assembly_writes_no_shared_memory() {
         })
         .build(),
     );
-    let workers = WorkerSelection::Single { worker };
+    let workers = WorkerSelection::Single {
+        worker: worker.into(),
+    };
     let intermediate = MultimodalIntermediate::try_new(vec![single_image_intermediate()]).unwrap();
 
     let inline = assemble_tokenspeed_for_encode(&intermediate, Some(&workers), true).unwrap();
@@ -1589,7 +1591,7 @@ fn sglang_assembly_honors_worker_dtype_for_all_batches() {
             builder = builder.label("multimodal_encoder_dtype", dtype);
         }
         let workers = WorkerSelection::Single {
-            worker: Arc::new(builder.build()),
+            worker: Arc::new(builder.build()).into(),
         };
         let expected_image =
             assemble_sglang_with_dtype(single_image_intermediate(), expected).unwrap();

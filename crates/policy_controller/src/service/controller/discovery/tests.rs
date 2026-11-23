@@ -58,7 +58,7 @@ struct Bed {
     file: ManifestFile,
     settings: RuntimeDiscoveryConfig,
     elector: Elector,
-    standing: watch::Sender<Standing>,
+    standing: watch::Sender<ElectionObservation>,
     stop: watch::Sender<bool>,
     workers: WorkerObjects,
     store: Arc<MemoryStore>,
@@ -82,7 +82,7 @@ impl Bed {
         let file = ManifestFile(tempfile::tempdir()?);
         let settings = RuntimeDiscoveryConfig::from_config(&file.settings(), Some(Roles::Regular))?;
         let elector = Elector::alone("controller", lease)?;
-        let (standing, _) = watch::channel(Standing::default());
+        let (standing, _) = watch::channel(ElectionObservation::default());
         let (stop, _) = watch::channel(false);
         let store = Arc::new(MemoryStore::new());
         let workers = WorkerObjects::new(Arc::clone(&store), ObjectsWake::default());
@@ -107,13 +107,13 @@ impl Bed {
 
     fn take(&mut self) -> Result<(), ElectError> {
         self.elector.tick(Instant::now())?;
-        self.standing.send_replace(Standing::default());
+        self.standing.send_replace(ElectionObservation::default());
         Ok(())
     }
 
     fn leave(&mut self) -> Result<(), ElectError> {
         self.elector.step_down(None, Instant::now())?;
-        self.standing.send_replace(Standing::default());
+        self.standing.send_replace(ElectionObservation::default());
         Ok(())
     }
 
@@ -231,7 +231,7 @@ async fn a_replica_that_follows_starts_no_provider() -> Result<(), Box<dyn Error
     let mut bed = Bed::new()?;
     bed.file.publish(&[WORKER])?;
     assert!(bed.install_queue());
-    bed.standing.send_replace(Standing {
+    bed.standing.send_replace(ElectionObservation {
         holder: "controller".to_owned(),
         term: 1,
         looked: true,
@@ -287,7 +287,7 @@ async fn a_closed_watch_ends_the_provider_and_the_runner_stays_until_the_stop(
 
     // The thread's end drops its sender. The provider's hold on the host
     // goes; the runner's own stays while it lives.
-    let (gone, _) = watch::channel(Standing::default());
+    let (gone, _) = watch::channel(ElectionObservation::default());
     drop(std::mem::replace(&mut bed.standing, gone));
     let ended = until(PASS, || (Arc::strong_count(&bed.host) <= 2).then_some(())).await;
     assert!(

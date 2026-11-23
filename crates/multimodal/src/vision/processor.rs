@@ -31,17 +31,6 @@ fn dim_for_ndim(
 }
 
 impl PreprocessedEncoderInputs {
-    /// Get the number of channels.
-    ///
-    /// For 4D tensors `[B, C, H, W]`, returns `shape[1]`.
-    /// For 5D tensors `[B, N, C, H, W]` (Phi3-Vision), returns `shape[2]`.
-    ///
-    /// # Errors
-    /// Returns `TransformError::InvalidShape` if encoder_input is not 4D or 5D.
-    pub fn channels(&self) -> Result<usize, TransformError> {
-        dim_for_ndim(self.encoder_input.ndim(), 1, 2, self.encoder_input.shape())
-    }
-
     /// Get the height of processed images.
     ///
     /// For 4D tensors `[B, C, H, W]`, returns `shape[2]`.
@@ -181,19 +170,6 @@ pub trait VisionPreProcessor: Send + Sync {
         self.preprocess(images)
     }
 
-    /// [`preprocess_with_context`](Self::preprocess_with_context) split into
-    /// consecutive batches whose items, in order, are the call's images. A
-    /// processor whose items cannot share one encoder tensor (images of
-    /// different sizes kept whole) returns one batch per image, still planned
-    /// together under the context; the default is the single batch.
-    fn preprocess_items_with_context(
-        &self,
-        images: &[&DynamicImage],
-        context: &VisionPreprocessingContext,
-    ) -> Result<Vec<PreprocessedEncoderInputs>, TransformError> {
-        Ok(vec![self.preprocess_with_context(images, context)?])
-    }
-
     /// Preprocess a batch of images straight into `dtype`, the wire's dtype,
     /// when the processor can lay the patches out and normalize them in one
     /// pass (an [`EncoderInput::Wire`](crate::encoder_inputs::EncoderInput::Wire)
@@ -297,7 +273,6 @@ mod tests {
             vec![(640, 480), (800, 600)],
         );
 
-        assert_eq!(inputs.channels().unwrap(), 3);
         assert_eq!(inputs.height().unwrap(), 336);
         assert_eq!(inputs.width().unwrap(), 336);
     }

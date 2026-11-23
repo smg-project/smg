@@ -53,7 +53,7 @@ use tracing::{debug, info, warn};
 use super::{
     decide,
     floor::{unbelieved, Told, FLOORS_SPENT_MAX, FLOOR_REACH},
-    gateways::{over_kinds, Refused, Seat, Vetoed, KINDS_MAX, VETOES_MAX},
+    gateways::{over_kinds, Refused, SessionPlace, Vetoed, KINDS_MAX, VETOES_MAX},
     lifecycle,
     principal::Principal,
     service::Shared,
@@ -63,7 +63,8 @@ use super::{
 use crate::{
     engine::view::WorkerId,
     service::proto::{self, controller_frame, gateway_frame::Frame},
-    store::{leases::DISPATCH_TTL, Hand},
+    store::Hand,
+    tracking::lease::DISPATCH_TTL,
 };
 
 /// The stream rule's grace period (design 4.3): how long a gateway stays
@@ -528,7 +529,7 @@ fn listed(hello: &proto::Hello) -> Option<Status> {
 /// lifted by `clear`. A duration of zero ends at that instant, which the
 /// table reads as no veto: it lifts as `clear` does. `Some` ends the
 /// session: a veto of no kind is neither kept nor dropped in silence.
-fn vetoed(seat: &Seat, veto: &proto::GatewayVeto, now: Instant) -> Option<Status> {
+fn vetoed(seat: &SessionPlace, veto: &proto::GatewayVeto, now: Instant) -> Option<Status> {
     if veto.kind == 0 {
         return Some(Status::invalid_argument(
             "GatewayVeto names no kind: KIND_UNSPECIFIED is not a veto",
@@ -567,7 +568,7 @@ async fn judge(
     subject: &str,
     hand: &Hand,
     term: u64,
-    seat: &Seat,
+    seat: &SessionPlace,
     frame: &proto::GatewayFrame,
     answers: &mut Answers,
 ) -> Option<Status> {
@@ -638,7 +639,8 @@ mod tests {
         service::{
             controller::{
                 config::Scope,
-                election::{LeasePlace, Said, Standing},
+                decision_slots::tests::followed,
+                election::{ElectionObservation, LeasePlace, Said},
                 floor::{FLOORS_SPENT_MAX, FLOOR_BELIEVED, FLOOR_REACH},
                 gateways::{
                     tests::{lease, PATIENT},
@@ -650,7 +652,7 @@ mod tests {
                 service::{Service, Shared},
                 PROTOCOL_VERSION,
             },
-            elector::{ElectionSettings, Elector, Tick},
+            elector::{ElectionSettings, Elector, TickOutcome},
             proto::{
                 self, controller_frame, gateway_frame::Frame,
                 policy_controller_client::PolicyControllerClient,
@@ -669,7 +671,7 @@ mod tests {
     /// candidate's fence, with the election's writer in the case's hand.
     struct Bed {
         elector: Elector,
-        standing: watch::Sender<Standing>,
+        standing: watch::Sender<ElectionObservation>,
         shared: Arc<Shared>,
         addr: SocketAddr,
         /// Aborted at its drop, at the case's end.
@@ -688,14 +690,14 @@ mod tests {
         hello_deadline: Option<Duration>,
     ) -> Bed {
         let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let mut shared = Shared::new(
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
             stood,
-            journaled_for(&LeasePlace::Process, 0, 2),
-            Arc::new(crate::Catalog::builtin()),
+            followed(journaled_for(&LeasePlace::Process, 0, 2)),
+            Arc::new(crate::stages::StageRegistry::builtin()),
             2,
         )
         .expect("the deciders start");
@@ -740,7 +742,7 @@ mod tests {
             if self.elector.is_holder() || self.elector.observed().is_some() {
                 let tick = self.elector.tick(now).expect("a step");
                 assert!(
-                    tick == Tick::Acquired { term } || tick == Tick::Renewed { term },
+                    tick == TickOutcome::Acquired { term } || tick == TickOutcome::Renewed { term },
                     "{tick:?}"
                 );
             } else {
@@ -753,7 +755,7 @@ mod tests {
         /// One step of the election as a session sees it: the look is
         /// published.
         fn step(&self, holder: &str, term: u64) {
-            self.standing.send_replace(Standing {
+            self.standing.send_replace(ElectionObservation {
                 holder: holder.to_owned(),
                 term,
                 looked: true,

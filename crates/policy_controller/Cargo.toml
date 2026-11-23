@@ -72,6 +72,8 @@ smg-grpc-client = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 smg-worker = { workspace = true, optional = true }
 wfaas = { workspace = true, optional = true }
+# The header map a request's headers are read from (the `in-process` feature).
+http = { workspace = true, optional = true }
 # Worker discovery (the `discovery` feature): the discovery crate with its
 # four providers, each of which the controller's flags can select.
 smg-service-discovery = { workspace = true, features = ["consul", "file", "kubernetes", "slurm"], optional = true }
@@ -157,14 +159,17 @@ operator = [
 ]
 # The standalone controller: the ingestion drivers, the listeners with their
 # scopes, the protocol's generated service and client, the election, the gRPC
-# health service and the admin endpoints. The stock binary also needs
-# `worker-host` to read cache events.
+# health service and the admin endpoints. It turns on `worker-host`, so every
+# controller keeps its worker objects, probes them and reads cache events,
+# and `in-process`, the engine over worker objects.
 # Off by default: the engine alone has no server dependency. It builds on
 # Linux and macOS: the gRPC plugin kind dials a Unix socket and reads its
 # peer's user through `rustix`, which is declared for those two.
 controller = [
     "ingest",
     "operator",
+    "in-process",
+    "worker-host",
     "dep:axum",
     "dep:clap",
     "dep:hyper-util",
@@ -188,9 +193,9 @@ controller = [
 ]
 
 # The gateway's side of the controller's protocol: the reference client, the
-# link a host's requests share and the watcher. It adds no dependency to the
-# controller's. The gateway builds it on the targets the controller builds
-# on, to follow a controller.
+# link a host's requests share, the watcher and the worker follower. It adds
+# no dependency to the controller's. The gateway builds it on the targets
+# the controller builds on, to follow a controller.
 client = ["controller"]
 
 # The Kubernetes Lease backend of the elector.
@@ -217,7 +222,21 @@ worker-host = [
 
 # Worker discovery on the leading controller, over the replica's worker
 # objects. Off by default.
-discovery = ["controller", "worker-host", "dep:smg-service-discovery"]
+discovery = ["controller", "dep:smg-service-discovery"]
+
+# The engine in a gateway's own process: one front over the gateway's worker
+# objects, which reads a worker's health where the worker crate keeps it. It
+# names nothing of the store. Off by default: it brings the worker crate's
+# runtime. The engine's own task takes Tokio's timer, which that runtime
+# builds already.
+in-process = [
+    "dep:http",
+    "dep:smg-worker",
+    "dep:tokio",
+    "smg-worker/runtime",
+    "tokio/macros",
+    "tokio/time",
+]
 
 default = ["wasm"]
 # The WebAssembly plugin host over the committed `smg:policy` worlds.
@@ -239,12 +258,18 @@ test-util = ["smg-worker?/test-util"]
 smg-policy-controller-test-util = { package = "smg-policy-controller", path = ".", default-features = false, features = ["test-util"] }
 # The discovery cases record the jobs a provider submits.
 smg-service-discovery = { workspace = true, features = ["test-util"] }
+# The in-process engine's cases set a worker's status.
+openai-protocol = { workspace = true }
 criterion = "0.8"
 # The Kubernetes elector's tests run its client against a service in the
 # test's process that plays one Lease, and its three-process cell against
 # the same stand-in served over HTTP.
 axum = { workspace = true }
 http = { workspace = true }
+# The worker follower's tests answer as a controller would: a body of frames
+# that ends with trailers, or never ends.
+http-body = "1.0"
+http-body-util = { workspace = true }
 # The load driver's unit tests add the test macro and tokio's paused clock.
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
 # The spec store cases collect the lines the source logs.
@@ -281,14 +306,24 @@ mock-worker = { path = "../mock_worker" }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 rustix = { version = "1", default-features = false, features = ["pty"] }
 
+# The in-process bench's allocator: the gateway binary's, on the gateway's targets.
+[target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dev-dependencies]
+tikv-jemallocator = { workspace = true }
+
 [[bin]]
 name = "smg-policy-controller"
 path = "src/bin/smg-policy-controller.rs"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
+
+# A program that decides in its own process: it starts the engine and
+# serves each request by the one call the engine has for a request.
+[[example]]
+name = "in_process"
+required-features = ["in-process"]
 
 [[test]]
 name = "binary"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
 [[test]]
 name = "operator_door"
@@ -296,16 +331,23 @@ required-features = ["operator"]
 
 [[test]]
 name = "spec_file"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
 [[test]]
 name = "spec_store"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
-# Replays recorded rows through the load report conversion under `ingest`.
+# The program of the `in_process` example, driven by cases: the example's
+# own module, taken in as it stands.
+[[test]]
+name = "caller"
+required-features = ["in-process"]
+
+# Replays recorded rows through the load report conversion under `ingest`,
+# and the hard-demand rows over worker objects under `in-process`.
 [[test]]
 name = "classic_rows"
-required-features = ["ingest"]
+required-features = ["ingest", "in-process"]
 
 [[test]]
 name = "controller"
@@ -317,7 +359,7 @@ required-features = ["kubernetes"]
 
 [[test]]
 name = "failover"
-required-features = ["client", "worker-host"]
+required-features = ["client"]
 
 [[test]]
 name = "fleet"
@@ -337,12 +379,12 @@ name = "ingest"
 required-features = ["controller"]
 
 [[test]]
-name = "membership_door"
-required-features = ["controller", "worker-host"]
+name = "membership_calls"
+required-features = ["controller"]
 
 [[test]]
 name = "replicas"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
 [[test]]
 name = "replication"
@@ -350,7 +392,7 @@ required-features = ["controller"]
 
 [[test]]
 name = "watch_workers"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
 [[bench]]
 name = "decision"
@@ -375,7 +417,7 @@ name = "affinity"
 harness = false
 
 [[bench]]
-name = "affinity_named"
+name = "affinity_rows"
 harness = false
 
 [[bench]]
@@ -413,14 +455,6 @@ name = "store_view"
 harness = false
 
 [[bench]]
-name = "store_pair"
-harness = false
-
-[[bench]]
-name = "store_lent"
-harness = false
-
-[[bench]]
 name = "store"
 harness = false
 
@@ -430,10 +464,6 @@ harness = false
 
 [[bench]]
 name = "store_journal"
-harness = false
-
-[[bench]]
-name = "store_named"
 harness = false
 
 [[bench]]
@@ -485,7 +515,7 @@ name = "predictor"
 harness = false
 
 [[bench]]
-name = "sent"
+name = "dispatch_credit"
 harness = false
 
 [[bench]]
@@ -501,8 +531,14 @@ harness = false
 # A registered scorer's read of a row's report through the view's
 # reading, beside the same scorer reading the row's field.
 [[bench]]
-name = "reports"
+name = "load_report_reader"
 harness = false
+
+# The in-process engine over a host's worker objects: a binary with switches.
+[[bench]]
+name = "in_process"
+harness = false
+required-features = ["in-process"]
 
 [lints]
 workspace = true

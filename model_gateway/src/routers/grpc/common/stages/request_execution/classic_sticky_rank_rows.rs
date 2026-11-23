@@ -100,7 +100,7 @@ fn worker(ranks: Option<usize>) -> WorkerSelection {
         None => builder,
     };
     WorkerSelection::Single {
-        worker: Arc::new(builder.build()),
+        worker: Arc::new(builder.build()).into(),
     }
 }
 

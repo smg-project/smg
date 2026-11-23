@@ -1,16 +1,10 @@
-//! The cost of signal cells through the store, under a scorer a host
-//! registers that reads two signals of every row:
+//! The cost of a signal's write through the store:
 //!
-//! - `policy_store_signals/decide/lent/<n>`: one decision's view and the
-//!   engine's answer over a publication's own rows, its block of cells lent
-//!   beside them (`World::view`), at 8, 64 and 512 members of one pool;
-//! - `policy_store_signals/decide/written/<n>`: the same over rows written
-//!   for the decision, their cells written beside them;
 //! - `policy_store_signals/write/row_alone`: one rank's load record;
 //! - `policy_store_signals/write/four_values`: one rank's load record and
 //!   the four named values behind it, as a source writes one report.
 //!
-//! The document declares four signals, so a row holds four cells and the
+//! The document declares four signals, so a row holds four cells, and its
 //! scorer reads two of them. No gate reads these rows yet.
 
 #![expect(
@@ -28,28 +22,27 @@ use std::{
     time::{Duration, Instant},
 };
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use smg_policy_controller::{
+    document::{AppliedSpec, PolicySpec, API_VERSION},
+    engine::{LoadRow, Role, SignalSource, WorkerId},
+    stages::StageRegistry,
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, SignalSink, Taken, ViewBuffers,
-        WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        LoadSink, LoadSource, MemoryStore, SignalSink, SignalWriteOutcome, WorkerFacts,
+        WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    AppliedSpec, Catalog, Constraints, LoadRow, PolicySpec, RequestFacts, Role, Scratch,
-    SignalSource, WorkerId, API_VERSION,
 };
 
 use crate::reads_two::ReadsTwo;
 
-const SIZES: [usize; 3] = [8, 64, 512];
 const MODEL: &str = "m";
-const ASKER: GatewayId = GatewayId(1);
 /// The declared signals, in name order: a row's cells stand in it.
 const NAMES: [&str; 4] = ["pending", "spare_one", "spare_two", "used"];
 const UNIT: &str = "tokens";
 
 /// The document every cell runs under: four signals, two of them read.
 fn applied() -> AppliedSpec {
-    let mut catalog = Catalog::builtin();
+    let mut catalog = StageRegistry::builtin();
     catalog
         .scorer_with("reads-two", |build| {
             let used = build.signal_column("used")?;
@@ -90,7 +83,7 @@ fn state(store: &MemoryStore, id: WorkerId, index: usize, at: Instant) {
     for (nth, column) in columns.iter().enumerate() {
         let value = ((index * 7 + nth * 3) % 23) as f64;
         let taken = store.signal_value(id, 0, column, UNIT, value, at);
-        assert_eq!(taken, Taken::Written, "{}", column.name());
+        assert_eq!(taken, SignalWriteOutcome::Written, "{}", column.name());
     }
 }
 
@@ -133,57 +126,6 @@ fn pool_of(n: usize) -> (MemoryStore, Vec<WorkerId>, Instant) {
     (store, ids, opened)
 }
 
-/// The whole decision over lent rows and over written ones, in turn.
-fn decide_cells(c: &mut Criterion) {
-    let mut group = c.benchmark_group("policy_store_signals/decide");
-    for n in SIZES {
-        let (store, _, opened) = pool_of(n);
-        let ask = Ask {
-            gateway: ASKER,
-            now: opened + Duration::from_secs(1),
-            pinned: None,
-            affinity: false,
-            signal_cells: true,
-        };
-        let mut out = ViewBuffers::default();
-        let mut holds = Vec::new();
-        let mut scratch = Scratch::new();
-        let mut seed = 1u64;
-        for (door, written) in [("lent", false), ("written", true)] {
-            group.bench_with_input(BenchmarkId::new(door, n), &n, |b, _| {
-                b.iter(|| {
-                    seed = seed.wrapping_add(1);
-                    store.with_world(|world| {
-                        let view =
-                            world.view(MODEL, Role::Single, black_box(&ask), written, &mut out);
-                        let view = view.expect("the pool");
-                        let facts = RequestFacts {
-                            model: MODEL,
-                            prompt_tokens: 512,
-                            seed,
-                            now_micros: view.built.now_micros,
-                            pinned_at: view.pinned_at,
-                            affinity: view.affinity,
-                            lent_in_flight: view.in_flight.as_ref(),
-                            signal_cells: view.signal_cells,
-                            ..RequestFacts::default()
-                        };
-                        let cx = Constraints {
-                            stalled: view.stalled,
-                            held: world.held(&view, &ask, &mut holds),
-                            ..Constraints::default()
-                        };
-                        let engine = world.spec().engine();
-                        let pool = view.pool_facts();
-                        black_box(engine.decide(&facts, &pool, view.candidates, &cx, &mut scratch))
-                    })
-                });
-            });
-        }
-    }
-    group.finish();
-}
-
 /// One report's write: the row alone, and the row with four values behind
 /// it. Each write is a microsecond past the last, so the window publishes
 /// as a host's loop would have it.
@@ -209,5 +151,5 @@ fn write_cells(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, decide_cells, write_cells);
+criterion_group!(benches, write_cells);
 criterion_main!(benches);

@@ -50,14 +50,14 @@ use tonic::{
 use super::{
     config::Scope,
     decide::{self, Streams},
-    deciders::{self, Deciders, Reads},
-    election::{self, split_identity, Running, Standing},
+    decision_slots::{self, DecisionSlots, Reads},
+    election::{self, split_identity, ElectionObservation, Running},
     floor::Floors,
     gateways::Gateways,
     generations::{
         Format, Generations, SpecRejected, Unanswered, DRY_RUNS_WAITING, WRITES_WAITING,
     },
-    membership::Door,
+    membership::MembershipCalls,
     principal::{self, Layer, Principal},
     replication::{Batches, Replication},
     session, snapshot,
@@ -67,20 +67,21 @@ use super::{
 };
 use crate::{
     document::{
-        operator::{DryRun, Enforced, NeedsRow, Turn, Unanswered as DoorUnanswered},
+        operator::{DryRun, EnforceOutcome, EnforceRefused, NeedsRow, SerialTurn},
         spec::Digest,
     },
-    engine::{door::DecisionRecord, framework::Engine},
+    engine::{explain::DecisionRecord, framework::Engine},
     service::{
         elector::{Elector, Fence},
         proto::{
             self,
             policy_controller_server::{PolicyController, PolicyControllerServer},
         },
-        replication::Unled,
+        replication::NotLeading,
     },
-    stages::catalog::Catalog,
+    stages::registry::StageRegistry,
     store::MemoryStore,
+    worker_host::{Members, Objects},
 };
 
 /// A leader's refusal in the instant between its take of the lease and its
@@ -155,7 +156,7 @@ pub(crate) struct Shared {
     /// The controller's one fence: the judge of "leader" at every answer.
     pub(crate) fence: Arc<Fence>,
     /// The election's last sight of the lease.
-    pub(crate) standing: watch::Receiver<Standing>,
+    pub(crate) standing: watch::Receiver<ElectionObservation>,
     /// The controller's store: what the calls feed and read, and the run
     /// loop's drivers with them.
     pub(crate) store: Arc<MemoryStore>,
@@ -169,11 +170,11 @@ pub(crate) struct Shared {
     pub(crate) hello_deadline: Duration,
     /// The membership door over that store: the control scope's
     /// registration calls.
-    pub(crate) door: Door,
+    pub(crate) door: MembershipCalls,
     /// The replication scope's calls over that store and its log.
     pub(crate) replication: Replication,
     /// The threads the decisions run on, a model's on one.
-    pub(crate) deciders: Deciders,
+    pub(crate) deciders: DecisionSlots,
     /// The decide streams each gateway holds open.
     pub(crate) streams: Arc<Streams>,
     /// The run loop's word that the listeners close: `true` from the end
@@ -198,7 +199,7 @@ pub(crate) struct Shared {
     pub(crate) lag: Arc<Lag>,
     /// The turn of the operators' snapshots: one is taken at a time, off
     /// the runtime's workers.
-    pub(crate) snapshots: Turn,
+    pub(crate) snapshots: SerialTurn,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -221,7 +222,9 @@ impl Shared {
     /// another fence guards. A spec document names the stages `catalog`
     /// holds. `deciders` is how many threads decide. The store comes with
     /// the feed of the log it journals to, the one value one place builds
-    /// ([`journaled_waking`](super::replication::journaled_waking)).
+    /// ([`journaled_waking`](super::replication::journaled_waking)), and
+    /// with the holder of the replica's worker objects, which follow that
+    /// store: the deciders decide over their lists.
     ///
     /// # Errors
     ///
@@ -230,9 +233,9 @@ impl Shared {
         controller_id: String,
         address: String,
         elector: &Elector,
-        standing: watch::Receiver<Standing>,
-        (store, feed): (Arc<MemoryStore>, Feed),
-        catalog: Arc<Catalog>,
+        standing: watch::Receiver<ElectionObservation>,
+        (store, feed, objects): (Arc<MemoryStore>, Feed, Arc<Objects<Members>>),
+        catalog: Arc<StageRegistry>,
         deciders: usize,
     ) -> io::Result<Self> {
         let gateways = Arc::new(Gateways::new(
@@ -241,11 +244,12 @@ impl Shared {
             elector.fence(),
             Arc::clone(&store),
         ));
-        let deciders = Deciders::start(
+        let deciders = DecisionSlots::start(
             deciders,
-            deciders::QUEUE_DEPTH,
+            decision_slots::QUEUE_DEPTH,
             &Reads {
                 store: Arc::clone(&store),
+                objects: Arc::clone(&objects),
                 fence: elector.fence(),
                 standing: standing.clone(),
                 clock: Arc::new(Instant::now),
@@ -260,7 +264,10 @@ impl Shared {
             fence: elector.fence(),
             standing,
             generations: Arc::clone(&generations),
-            door: Door::new(Arc::clone(&store), Arc::clone(&feed.log)),
+            // The door leaves the worker objects its deciding threads read
+            // holding each call's write.
+            door: MembershipCalls::new(Arc::clone(&store), Arc::clone(&feed.log))
+                .following(objects),
             replication: Replication::new(
                 Arc::clone(&store),
                 Arc::clone(&feed.log),
@@ -278,7 +285,7 @@ impl Shared {
             role: watch::channel(None).0,
             watchers: Arc::new(Watchers::new(session::PRESENT_MAX)),
             floors: Floors::default(),
-            snapshots: Turn::new(snapshot::SNAPSHOTS_WAITING),
+            snapshots: SerialTurn::new(snapshot::SNAPSHOTS_WAITING),
         })
     }
 
@@ -294,7 +301,7 @@ impl Shared {
     pub(crate) fn elect(
         &self,
         mut elector: Elector,
-        standing: watch::Sender<Standing>,
+        standing: watch::Sender<ElectionObservation>,
     ) -> io::Result<Running> {
         // At a take the door is its source's again, and a replica that
         // deferred its start's document applies it at its first one, behind
@@ -601,9 +608,9 @@ impl Service {
         if let Some(term) = self.shared.fence.leader_term(now) {
             return match self.shared.feed.log.leads(term) {
                 Ok(()) => Ok(term),
-                Err(Unled::NotYet) => Err(Status::unavailable(NOT_IN_TERM)),
-                Err(Unled::Follows(_)) => Err(Status::unavailable(NO_TERM_LED)),
-                Err(Unled::Past(_)) => Err(Status::unavailable(TAKE_OVER)),
+                Err(NotLeading::NotYet) => Err(Status::unavailable(NOT_IN_TERM)),
+                Err(NotLeading::Follows(_)) => Err(Status::unavailable(NO_TERM_LED)),
+                Err(NotLeading::Past(_)) => Err(Status::unavailable(TAKE_OVER)),
             };
         }
         let holder = self.leader_info(now).address;
@@ -735,7 +742,7 @@ fn verdict(
 /// end or a file that was not read as internal.
 fn unanswered(unanswered: Unanswered) -> Status {
     match unanswered {
-        Unanswered::Door(door @ DoorUnanswered::Guarded(..)) => {
+        Unanswered::Manager(door @ EnforceRefused::Guarded(..)) => {
             Status::failed_precondition(door.to_string())
         }
         Unanswered::Full => Status::resource_exhausted(format!(
@@ -746,7 +753,7 @@ fn unanswered(unanswered: Unanswered) -> Status {
             "{WRITES_WAITING} applies wait their turn: ask again later"
         )),
         Unanswered::Unwritten(join) => Status::internal(format!("the apply did not end: {join}")),
-        Unanswered::Door(DoorUnanswered::NotHeld(not_held)) => {
+        Unanswered::Manager(EnforceRefused::NotHeld(not_held)) => {
             Status::not_found(not_held.to_string())
         }
         Unanswered::Unread { generation, why } => Status::internal(format!(
@@ -855,7 +862,7 @@ impl PolicyController for Service {
     /// field refused by its name, the spec slice of a controller with no
     /// spec source among them, and a refused request takes no turn. One
     /// snapshot is taken at a time, off the runtime's workers
-    /// ([`Turn`]), and its rows come by one of the roads of
+    /// ([`SerialTurn`]), and its rows come by one of the roads of
     /// [`snapshot::read`]. The lead is read again behind that wait: the
     /// answer is told while this replica still leads the term the call was
     /// admitted under. A standby is restored on its `Replicate` stream,
@@ -994,7 +1001,7 @@ impl PolicyController for Service {
         // The guard is the door's to read, behind the turn its pass waits.
         let (expected, document) = (apply.expected_digest, apply.document);
         let answer = if enforce {
-            let Enforced {
+            let EnforceOutcome {
                 standing,
                 ran,
                 needs,
@@ -1066,7 +1073,7 @@ impl PolicyController for Service {
                 "generation: a rollback names a generation on file",
             ));
         }
-        let Enforced {
+        let EnforceOutcome {
             standing,
             ran,
             needs,
@@ -1142,13 +1149,13 @@ mod tests {
 
     use super::{unanswered, Call, RpcStatus, Service, Shared};
     use crate::{
-        engine::door::TERM_MARK,
+        engine::store_backed_engine::TERM_MARK,
         service::{
             controller,
             controller::{
                 config::Scope,
-                deciders::{tests as bed, Job},
-                election::{self, LeasePlace, Standing},
+                decision_slots::{tests as bed, Job},
+                election::{self, ElectionObservation, LeasePlace},
                 gateways::tests::PATIENT,
                 generations::{tests::LEAST_LOAD, Format, Unanswered},
                 principal::{
@@ -1162,13 +1169,13 @@ mod tests {
                 PROTOCOL_VERSION,
             },
             elector::{
-                ElectError, ElectionSettings, Elector, FileLease, LeaseBackend, LeaseRecord,
-                MemoryLease, Tick, Written,
+                ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, FileLease,
+                LeaseBackend, LeaseRecord, MemoryLease, TickOutcome,
             },
             proto::{self, busy::Reason, policy_controller_server::PolicyController},
         },
-        stages::catalog::Catalog,
-        store::{Kinds, LeasesStore, Position, WorkersStore},
+        stages::registry::StageRegistry,
+        store::{JournalKinds, LeasesStore, Position, WorkersStore},
         tracking::lease::{LeaseId, ReleaseReason},
     };
 
@@ -1178,7 +1185,7 @@ mod tests {
 
     /// A candidate over a lease of its own, the election's writer and one
     /// listener's service over that candidate's fence.
-    fn service(scopes: &[Scope]) -> (Elector, watch::Sender<Standing>, Service) {
+    fn service(scopes: &[Scope]) -> (Elector, watch::Sender<ElectionObservation>, Service) {
         let elector = Elector::new(
             Box::new(MemoryLease::new()),
             IDENTITY,
@@ -1190,31 +1197,34 @@ mod tests {
 
     /// The same over a candidate alone over its lease: its take leads at
     /// once, by the clock a call reads.
-    fn service_alone(scopes: &[Scope]) -> (Elector, watch::Sender<Standing>, Service) {
+    fn service_alone(scopes: &[Scope]) -> (Elector, watch::Sender<ElectionObservation>, Service) {
         let elector = Elector::alone(IDENTITY, PATIENT).expect("the settings are in order");
         over(elector, scopes)
     }
 
     /// The election's writer and one listener's service over the fence of
     /// `elector`, handed back beside them.
-    fn over(elector: Elector, scopes: &[Scope]) -> (Elector, watch::Sender<Standing>, Service) {
-        over_in(elector, scopes, Catalog::builtin())
+    fn over(
+        elector: Elector,
+        scopes: &[Scope],
+    ) -> (Elector, watch::Sender<ElectionObservation>, Service) {
+        over_in(elector, scopes, StageRegistry::builtin())
     }
 
     /// [`over`]'s service, its documents naming the stages of `catalog`.
     fn over_in(
         elector: Elector,
         scopes: &[Scope],
-        catalog: Catalog,
-    ) -> (Elector, watch::Sender<Standing>, Service) {
-        let (standing, stood) = watch::channel(Standing::default());
+        catalog: StageRegistry,
+    ) -> (Elector, watch::Sender<ElectionObservation>, Service) {
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let shared = Arc::new(
             Shared::new(
                 ID.to_owned(),
                 ADDRESS.to_owned(),
                 &elector,
                 stood,
-                journaled_for(&LeasePlace::Process, 0, 2),
+                bed::followed(journaled_for(&LeasePlace::Process, 0, 2)),
                 Arc::new(catalog),
                 2,
             )
@@ -1264,15 +1274,15 @@ mod tests {
             renew_deadline: Duration::from_millis(400),
         };
         let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let (store, feed) = journaled_from(&LeasePlace::Process, 0);
         let shared = Shared::new(
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
             stood,
-            (Arc::clone(&store), feed),
-            Arc::new(Catalog::builtin()),
+            bed::followed((Arc::clone(&store), feed)),
+            Arc::new(StageRegistry::builtin()),
             1,
         )
         .expect("the decider starts");
@@ -1351,15 +1361,15 @@ mod tests {
             renew_deadline: Duration::from_millis(400),
         };
         let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let (store, feed) = journaled_from(&LeasePlace::Process, 0);
         let shared = Shared::new(
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
             stood,
-            (store, feed),
-            Arc::new(Catalog::builtin()),
+            bed::followed((store, feed)),
+            Arc::new(StageRegistry::builtin()),
             1,
         )
         .expect("the decider starts");
@@ -1393,15 +1403,15 @@ mod tests {
             renew_deadline: Duration::from_millis(400),
         };
         let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let (store, feed) = journaled_from(&LeasePlace::Process, 0);
         let shared = Shared::new(
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
             stood,
-            (store, feed),
-            Arc::new(Catalog::builtin()),
+            bed::followed((store, feed)),
+            Arc::new(StageRegistry::builtin()),
             1,
         )
         .expect("the decider starts");
@@ -1410,18 +1420,18 @@ mod tests {
             .generations
             .defer(LEAST_LOAD.into(), Format::Yaml)
             .expect("a valid document");
-        assert_eq!(shared.store.world().spec().generation(), 0);
+        assert_eq!(shared.store.snapshot().spec().generation(), 0);
 
         let mut running = shared.elect(elector, standing).expect("a thread");
         let stands = async {
-            while shared.store.world().spec().generation() == 0 {
+            while shared.store.snapshot().spec().generation() == 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         };
         tokio::time::timeout(Duration::from_secs(20), stands)
             .await
             .expect("the first take applies the start's document within 20 s");
-        assert_eq!(shared.store.world().spec().generation(), 1);
+        assert_eq!(shared.store.snapshot().spec().generation(), 1);
         assert_eq!(shared.fence.term(), 1, "under its first term");
 
         running.stop();
@@ -1459,15 +1469,15 @@ mod tests {
             }
         }
         .expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let (store, feed) = journaled_from(&LeasePlace::Process, 0);
         let shared = Shared::new(
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
             stood,
-            (Arc::clone(&store), feed),
-            Arc::new(Catalog::builtin()),
+            bed::followed((Arc::clone(&store), feed)),
+            Arc::new(StageRegistry::builtin()),
             1,
         )
         .expect("the decider starts");
@@ -1485,7 +1495,7 @@ mod tests {
             let other = Elector::new(Box::new(FileLease::new(&lease)), other, settings)
                 .expect("the settings are in order");
             let fence = other.fence();
-            let (standing, mut stood) = watch::channel(Standing::default());
+            let (standing, mut stood) = watch::channel(ElectionObservation::default());
             let store = journaled_from(&LeasePlace::Process, 0).0;
             let running = election::start(other, store, standing).expect("a thread");
             let follows = stood.wait_for(|standing| standing.holder == IDENTITY);
@@ -1586,7 +1596,7 @@ mod tests {
         };
         let elector = Elector::new(Box::new(FileLease::new(&path)), IDENTITY, settings)
             .expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let (store, feed) = journaled_for(&LeasePlace::Process, 0, 2);
         let shared = Arc::new(
             Shared::new(
@@ -1594,8 +1604,8 @@ mod tests {
                 ADDRESS.to_owned(),
                 &elector,
                 stood,
-                (Arc::clone(&store), feed),
-                Arc::new(Catalog::builtin()),
+                bed::followed((Arc::clone(&store), feed)),
+                Arc::new(StageRegistry::builtin()),
                 2,
             )
             .expect("the deciders start"),
@@ -1659,8 +1669,8 @@ mod tests {
             .expect("the election thread ends within 20 s of its stop");
     }
 
-    fn saw(holder: &str, term: u64) -> Standing {
-        Standing {
+    fn saw(holder: &str, term: u64) -> ElectionObservation {
+        ElectionObservation {
             holder: holder.to_owned(),
             term,
             looked: true,
@@ -2127,7 +2137,7 @@ mod tests {
             &mut self,
             expected: Option<&LeaseRecord>,
             record: &LeaseRecord,
-        ) -> Result<Written, ElectError> {
+        ) -> Result<ConditionalWriteOutcome, ElectError> {
             thread::sleep(self.slow);
             self.lease.write(expected, record)
         }
@@ -2160,7 +2170,7 @@ mod tests {
             settings,
         )
         .expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let (store, feed) = journaled_for(&LeasePlace::Process, 0, 2);
         let service = Service::new(
             vec![Scope::Gateway],
@@ -2170,8 +2180,8 @@ mod tests {
                     ADDRESS.to_owned(),
                     &elector,
                     stood,
-                    (store, feed),
-                    Arc::new(Catalog::builtin()),
+                    bed::followed((store, feed)),
+                    Arc::new(StageRegistry::builtin()),
                     2,
                 )
                 .expect("the deciders start"),
@@ -2182,11 +2192,11 @@ mod tests {
         // saw it and is published.
         assert_eq!(
             other.tick(Instant::now()).expect("the take"),
-            Tick::Acquired { term: 1 }
+            TickOutcome::Acquired { term: 1 }
         );
         assert_eq!(
             elector.tick(Instant::now()).expect("a look"),
-            Tick::Following {
+            TickOutcome::Following {
                 holder: OTHER.to_owned(),
                 term: 1
             }
@@ -2204,7 +2214,7 @@ mod tests {
         thread::sleep(settings.duration + Duration::from_millis(20));
         assert_eq!(
             elector.tick(Instant::now()).expect("the take"),
-            Tick::Acquired { term: 2 }
+            TickOutcome::Acquired { term: 2 }
         );
         assert_eq!(
             service.leader_info(Instant::now()),
@@ -2236,14 +2246,14 @@ mod tests {
         let took = Instant::now() + ElectionSettings::default().renew_period;
         assert_eq!(
             elector.tick(took).expect("the take"),
-            Tick::Acquired { term: 1 }
+            TickOutcome::Acquired { term: 1 }
         );
         standing.send_replace(saw(IDENTITY, 1));
         assert_eq!(service.leader_info(took), answer("", "", 1, false));
         let taken = took + ElectionSettings::default().renew_deadline;
         assert_eq!(
             elector.tick(taken).expect("the renewal"),
-            Tick::Renewed { term: 1 }
+            TickOutcome::Renewed { term: 1 }
         );
         assert_eq!(service.leader_info(taken), answer(ID, ADDRESS, 1, true));
 
@@ -2254,7 +2264,7 @@ mod tests {
 
         // The answer reads the fence, never the standing: a standing that
         // lags the take still answers as the leader.
-        standing.send_replace(Standing::default());
+        standing.send_replace(ElectionObservation::default());
         assert_eq!(service.leader_info(taken), answer(ID, ADDRESS, 1, true));
     }
 
@@ -2318,7 +2328,7 @@ mod tests {
         // term seen.
         standing.send_replace(saw("", 5));
         assert_eq!(service.leader_info(now), answer("", "", 5, false));
-        standing.send_replace(Standing {
+        standing.send_replace(ElectionObservation {
             holder: String::new(),
             term: 5,
             looked: false,
@@ -2432,12 +2442,15 @@ mod tests {
     /// A control listener's service over an election no case outlasts (an
     /// hour's deadline), with no spec source: the leader where `leads`,
     /// else a follower whose last look saw `controller-1` hold the lease.
-    fn electing(leads: bool) -> (Elector, watch::Sender<Standing>, Service) {
-        electing_in(leads, Catalog::builtin())
+    fn electing(leads: bool) -> (Elector, watch::Sender<ElectionObservation>, Service) {
+        electing_in(leads, StageRegistry::builtin())
     }
 
     /// [`electing`]'s service, its documents naming the stages of `catalog`.
-    fn electing_in(leads: bool, catalog: Catalog) -> (Elector, watch::Sender<Standing>, Service) {
+    fn electing_in(
+        leads: bool,
+        catalog: StageRegistry,
+    ) -> (Elector, watch::Sender<ElectionObservation>, Service) {
         let hour = Duration::from_secs(3600);
         let settings = ElectionSettings {
             duration: 2 * hour,
@@ -2525,11 +2538,26 @@ mod tests {
             assert_eq!((record.generation, record.binding), (1, 1));
             assert_eq!(record.decision, Some(decided));
             assert!(record.at_unix_micros > 0);
-            assert_eq!(record.profile_name, "z-first");
-            assert_eq!(record.plan_name, "single");
-            assert_eq!(record.picker_name, "best");
-            assert_eq!(record.filter_names, ["healthy"]);
-            assert_eq!(record.scorer_names, ["least-load"]);
+            // A model no worker serves is shed before a profile is chosen:
+            // its record names none.
+            let served = model == bed::MODEL;
+            let (profile, picker): (&str, &str) = if served {
+                ("z-first", "best")
+            } else {
+                ("", "")
+            };
+            let (filters, scorers): (&[&str], &[&str]) = if served {
+                (&["healthy"], &["least-load"])
+            } else {
+                (&[], &[])
+            };
+            assert_eq!(record.profile_name, profile);
+            assert_eq!(record.picker_name, picker);
+            assert_eq!(record.filter_names, filters);
+            assert_eq!(record.scorer_names, scorers);
+            if served {
+                assert_eq!(record.plan_name, "single");
+            }
             assert_eq!((record.decision_id, record.view_digest), (0, 0));
             assert!(record.candidates.is_empty() && record.projections.is_empty());
             assert!(record.request.is_none() && record.outcome.is_none());
@@ -2692,7 +2720,7 @@ mod tests {
 
     /// [`electing`]'s service, its spec source a file's document:
     /// `LEAST_LOAD`, applied as generation 1.
-    fn sourced(leads: bool) -> (Elector, watch::Sender<Standing>, Service) {
+    fn sourced(leads: bool) -> (Elector, watch::Sender<ElectionObservation>, Service) {
         let (elector, standing, control) = electing(leads);
         control
             .shared
@@ -2823,28 +2851,32 @@ mod tests {
             slots: u32,
         }
 
-        impl crate::Filter for MinFree {
+        impl crate::engine::Filter for MinFree {
             fn name(&self) -> &'static str {
                 "min-free"
             }
 
             fn keep(
                 &self,
-                _: &crate::RequestFacts<'_>,
-                candidate: &crate::Candidate,
-                _: &crate::Constraints<'_>,
+                _: &crate::engine::RequestFacts<'_>,
+                candidate: &crate::engine::Candidate,
+                _: &crate::engine::Constraints<'_>,
             ) -> bool {
                 candidate.in_flight.saturating_add(self.slots) <= 8
             }
         }
 
         const FIELD: &str = "profiles.default.filter[1].min-free.slots";
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .filter_with("min-free", |build| {
                 let rule: MinFree = build.params()?;
                 if rule.slots == 0 {
-                    return Err(crate::StageError::bad("slots", rule.slots, "above zero"));
+                    return Err(crate::stages::StageError::bad(
+                        "slots",
+                        rule.slots,
+                        "above zero",
+                    ));
                 }
                 Ok(Box::new(rule))
             })
@@ -3011,7 +3043,7 @@ mod tests {
             refused(service.deregister_worker(removal).await.err(), "a removal");
             let snapshot = from("operator-a", proto::SnapshotRequest::default());
             refused(service.get_snapshot(snapshot).await.err(), "a snapshot");
-            assert_eq!(service.shared.feed.log.head(Kinds::Watched), place);
+            assert_eq!(service.shared.feed.log.head(JournalKinds::Watched), place);
         }
     }
 
@@ -3264,7 +3296,14 @@ mod tests {
 
     /// [`electing`]'s service, its spec source a store over a new, empty
     /// directory, handed back beside it.
-    fn stored(leads: bool) -> (tempfile::TempDir, Elector, watch::Sender<Standing>, Service) {
+    fn stored(
+        leads: bool,
+    ) -> (
+        tempfile::TempDir,
+        Elector,
+        watch::Sender<ElectionObservation>,
+        Service,
+    ) {
         let dir = tempfile::tempdir().expect("a temp dir");
         let (elector, standing, control) = electing(leads);
         let opened = SpecStore::open(dir.path().to_owned()).expect("the directory opens");
@@ -3956,7 +3995,7 @@ mod tests {
         assert!(elector.step_down(None, now).expect("the release"));
         assert_eq!(
             elector.tick(now).expect("the take"),
-            Tick::Acquired { term: 2 }
+            TickOutcome::Acquired { term: 2 }
         );
         control.shared.store.set_term(2);
         assert_eq!(control.watched(Instant::now()).ok(), Some(2));

@@ -15,8 +15,10 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
-    Candidate, Catalog, Constraints, Engine, PolicySpec, PoolFacts, RequestFacts, Scratch,
-    SignalCell, SignalCells, WorkerId, API_VERSION,
+    document::{PolicySpec, API_VERSION},
+    engine::{Candidate, Constraints, Engine, PoolFacts, RequestFacts, Scratch, WorkerId},
+    load::{SignalCell, SignalCells},
+    stages::StageRegistry,
 };
 
 use crate::reads_two::ReadsTwo;
@@ -25,7 +27,7 @@ use crate::reads_two::ReadsTwo;
 const NOW: u64 = 1_000_000;
 
 fn engine() -> Engine {
-    let mut catalog = Catalog::builtin();
+    let mut catalog = StageRegistry::builtin();
     catalog
         .scorer_with("reads-two", |build| {
             let used = build.signal_column("used")?;

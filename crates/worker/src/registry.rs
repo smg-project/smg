@@ -1287,8 +1287,10 @@ impl<G: Generation> WorkerRegistry<G> {
     /// worker on this node, so the worker must be published to the mesh and
     /// must not be deleted by a peer tombstone.
     ///
-    /// Used by `PUT /workers/{worker_id}`, which answers 202 and registers
-    /// later, so other writes for the same URL can land in between. Both
+    /// Used by a metadata update of `/workers/{worker_id}`, which answers 202
+    /// and registers later, so other writes for the same URL can land in
+    /// between (a `PUT` goes through
+    /// [`Self::replace_claiming_local_unless_draining`]). Both
     /// preconditions are checked under the per-worker mutation lock and the
     /// call returns `false` if either fails:
     ///
@@ -1308,7 +1310,33 @@ impl<G: Generation> WorkerRegistry<G> {
             worker_id,
             new_worker,
             Some(WorkerOrigin::Local),
-            Some(expected_revision),
+            Some(Expected {
+                revision: expected_revision,
+                refuse_draining: false,
+            }),
+            None,
+        )
+    }
+
+    /// [`Self::replace_claiming_local`] for `PUT /workers/{worker_id}`: it
+    /// also returns `false` when the worker reads `Draining`, checked under
+    /// the same lock. A removal's mark leaves the revision as it is, so a
+    /// `PUT` answered before the mark would otherwise write its replacement
+    /// onto a worker that is leaving.
+    pub fn replace_claiming_local_unless_draining(
+        &self,
+        worker_id: &WorkerId,
+        new_worker: Arc<dyn Worker>,
+        expected_revision: u64,
+    ) -> bool {
+        self.replace_inner(
+            worker_id,
+            new_worker,
+            Some(WorkerOrigin::Local),
+            Some(Expected {
+                revision: expected_revision,
+                refuse_draining: true,
+            }),
             None,
         )
     }
@@ -1325,13 +1353,15 @@ impl<G: Generation> WorkerRegistry<G> {
     /// the replacement, as a removal does for `remove_inner`; a replacement
     /// without a usable spec keeps an import built from one), and the record
     /// is written before the lock is released, so the compare and the write
-    /// are one step.
+    /// are one step. `expected` is what the caller asks of the worker it
+    /// replaces ([`Expected`]), tested under the same lock: a miss aborts
+    /// the replacement.
     fn replace_inner(
         &self,
         worker_id: &WorkerId,
         new_worker: Arc<dyn Worker>,
         promote_origin: Option<WorkerOrigin>,
-        expected_revision: Option<u64>,
+        expected: Option<Expected>,
         import: Option<ImportRecord>,
     ) -> bool {
         // Serialize concurrent replacements for the same worker ID.
@@ -1345,19 +1375,29 @@ impl<G: Generation> WorkerRegistry<G> {
 
         if let Some(record) = import {
             if !self.import_rebuild_wanted(worker_id, record) {
+                drop(_guard);
+                self.forget_lock_of_missing(worker_id, lock);
                 return false;
             }
         }
 
         let old_worker = match self.workers.get(worker_id) {
             Some(entry) => entry.clone(),
-            None => return false,
+            None => {
+                drop(_guard);
+                self.forget_lock_of_missing(worker_id, lock);
+                return false;
+            }
         };
 
         // Each replacement bumps the revision (see `inherit_shared_state_from`
         // below), so a caller that captured the revision before it started can
         // detect that another replacement landed first and give up.
-        if let Some(expected) = expected_revision {
+        if let Some(Expected {
+            revision: expected,
+            refuse_draining,
+        }) = expected
+        {
             let current = old_worker.revision();
             if current != expected {
                 tracing::warn!(
@@ -1366,6 +1406,15 @@ impl<G: Generation> WorkerRegistry<G> {
                     expected,
                     current,
                     "Aborting replacement: worker was replaced before the lock was acquired"
+                );
+                return false;
+            }
+            // Under the lock the removal's drain writes its mark under.
+            if refuse_draining && old_worker.status() == WorkerStatus::Draining {
+                tracing::warn!(
+                    worker_id = %worker_id.as_str(),
+                    worker_url = old_worker.redacted_url(),
+                    "Aborting replacement: a removal is draining the worker"
                 );
                 return false;
             }
@@ -1643,7 +1692,11 @@ impl<G: Generation> WorkerRegistry<G> {
 
         let _guard = lock.lock();
 
-        let worker = self.workers.get(worker_id)?.clone();
+        let Some(worker) = self.workers.get(worker_id).map(|entry| entry.clone()) else {
+            drop(_guard);
+            self.forget_lock_of_missing(worker_id, lock);
+            return None;
+        };
         if expected_revision.is_some_and(|revision| worker.revision() != revision) {
             return None;
         }
@@ -1889,6 +1942,8 @@ impl<G: Generation> WorkerRegistry<G> {
                 .get(worker_id)
                 .map(|entry| condition(entry.value()));
             if holds != Some(true) {
+                drop(_guard);
+                self.forget_lock_of_missing(worker_id, lock);
                 return None;
             }
         }
@@ -1899,6 +1954,8 @@ impl<G: Generation> WorkerRegistry<G> {
                     worker_id = %worker_id.as_str(),
                     "Aborting removal: worker origin changed before the lock was acquired"
                 );
+                drop(_guard);
+                self.forget_lock_of_missing(worker_id, lock);
                 return None;
             }
         }
@@ -1979,8 +2036,27 @@ impl<G: Generation> WorkerRegistry<G> {
 
             Some(worker)
         } else {
+            drop(_guard);
+            self.forget_lock_of_missing(worker_id, lock);
             None
         }
+    }
+
+    /// Gives up `lock`, the mutation lock of `worker_id` that a call has
+    /// released, and takes its entry out of the map when no worker stands
+    /// under the id and no other call holds it. Only the removal that finds
+    /// a worker drops its entry, so one a later call makes would stay.
+    fn forget_lock_of_missing(&self, worker_id: &WorkerId, lock: Arc<parking_lot::Mutex<()>>) {
+        // Dropped first: of several late calls the last one out then finds
+        // the map's reference alone.
+        drop(lock);
+        if self.workers.contains_key(worker_id) {
+            return;
+        }
+        // References are made under the map's entry lock only, so the map's
+        // alone means no call holds this lock or waits on it.
+        self.worker_mutation_locks
+            .remove_if(worker_id, |_, current| Arc::strong_count(current) == 1);
     }
 
     /// Remove a worker by URL.
@@ -2593,6 +2669,15 @@ impl<G: Generation> Default for WorkerRegistry<G> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// What a replacement asks of the worker it replaces, tested under the
+/// worker's mutation lock.
+struct Expected {
+    /// The revision the caller read: it moves when another replacement lands.
+    revision: u64,
+    /// Whether a worker that reads `Draining` is refused too (a `PUT`).
+    refuse_draining: bool,
 }
 
 /// What a mesh import was last built from: its owner's publication

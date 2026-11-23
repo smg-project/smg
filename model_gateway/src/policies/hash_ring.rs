@@ -17,6 +17,8 @@ use std::{
     sync::Arc,
 };
 
+use smg_policy_controller::policies::consistent_hashing::LentRing;
+
 /// Number of virtual nodes per physical worker for even distribution.
 /// 150 is a common choice that provides good balance between memory and distribution.
 const VIRTUAL_NODES_PER_WORKER: usize = 150;
@@ -261,13 +263,23 @@ impl HashRing {
     where
         F: Fn(&str) -> bool,
     {
+        self.walk_from(Self::hash_position(key), is_healthy)
+    }
+
+    /// The walk behind every lookup: the ring's workers clockwise from
+    /// `position`, each asked once by its URL until `take` takes one. The
+    /// URL taken, `None` where the ring is empty or none is taken.
+    /// [`Self::find_healthy_url`] starts it where its key stands, and the
+    /// policy engine starts it at the place a request states
+    /// ([`LentRing::walk`]): one walk, so the two visit the workers in one
+    /// order.
+    #[inline]
+    fn walk_from(&self, position: u64, mut take: impl FnMut(&str) -> bool) -> Option<&str> {
         if self.entries.is_empty() {
             return None;
         }
 
-        let key_pos = Self::hash_position(key);
-
-        let start = self.entries.partition_point(|(pos, _)| *pos < key_pos);
+        let start = self.entries.partition_point(|(pos, _)| *pos < position);
 
         // Walk clockwise from start, wrapping around. A worker is asked once
         // whatever its virtual nodes: the entries index the URLs, so a bit per
@@ -281,7 +293,7 @@ impl HashRing {
             }
 
             let url_str: &str = &self.urls[index as usize];
-            if is_healthy(url_str) {
+            if take(url_str) {
                 return Some(url_str);
             }
         }
@@ -305,9 +317,78 @@ impl HashRing {
     }
 }
 
+/// The ring as the policy engine asks it, for a request its caller lends
+/// the ring with: where a key's text stands, and the walk from a stated
+/// place. Nothing of the ring is copied. The position is the one a lookup
+/// starts from and the walk is the lookup's own (`HashRing::walk_from`),
+/// so the engine places a key on the worker a ring policy finds for it.
+impl LentRing for HashRing {
+    fn position(&self, key: &str) -> u64 {
+        Self::hash_position(key)
+    }
+
+    fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
+        self.walk_from(position, take);
+    }
+}
+
+/// A model's ring before it is filled, as the policy engine is lent it: a
+/// key has its position and no worker to walk to. The engine then places
+/// the key at that position over the workers it keeps, as a ring policy
+/// does with no ring (`ConsistentHashingPolicy::find_by_consistent_hash`:
+/// the key's position modulo the eligible workers).
+#[derive(Debug)]
+pub(crate) struct Unfilled;
+
+impl LentRing for Unfilled {
+    fn position(&self, key: &str) -> u64 {
+        HashRing::hash_position(key)
+    }
+
+    fn walk(&self, _: u64, _: &mut dyn FnMut(&str) -> bool) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The engine's walk from where a key stands asks the workers a lookup
+    /// of that key asks, in the lookup's order, and ends at the worker
+    /// taken. An empty ring and an unfilled one answer a position and ask
+    /// nobody.
+    #[test]
+    fn the_lent_walk_from_a_keys_position_is_the_lookups_own() {
+        let urls: Vec<String> = (0..40).map(|i| format!("http://w{i}:8000")).collect();
+        let ring = HashRing::new(&urls);
+        for key in ["routing-key", "conversation-7", ""] {
+            let lookup = std::cell::RefCell::new(Vec::new());
+            let found = ring.find_healthy_url(key, |url| {
+                lookup.borrow_mut().push(url.to_owned());
+                false
+            });
+            assert_eq!(found, None);
+            let mut walk = Vec::new();
+            LentRing::walk(&ring, LentRing::position(&ring, key), &mut |url| {
+                walk.push(url.to_owned());
+                false
+            });
+            assert_eq!(walk, lookup.into_inner(), "{key}");
+            assert_eq!(walk.len(), 40);
+        }
+        let mut asked = 0;
+        LentRing::walk(&ring, 0, &mut |_| {
+            asked += 1;
+            asked == 3
+        });
+        assert_eq!(asked, 3);
+        let empty = HashRing::new(std::iter::empty::<&str>());
+        LentRing::walk(&empty, 7, &mut |_| panic!("nobody to ask"));
+        assert_eq!(
+            LentRing::position(&Unfilled, "k"),
+            HashRing::hash_position("k")
+        );
+        LentRing::walk(&Unfilled, 7, &mut |_| panic!("nobody to ask"));
+    }
 
     fn assert_same_selection(a: &HashRing, b: &HashRing, keys: usize) {
         for i in 0..keys {

@@ -309,6 +309,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn load_monitor_interval_ms(mut self, interval: Option<u64>) -> Self {
+        self.config.load_monitor_interval_ms = interval;
+        self
+    }
+
     pub fn worker_stall_secs(mut self, secs: u64) -> Self {
         self.config.worker_stall_secs = secs;
         self
@@ -1131,7 +1136,7 @@ impl RouterConfig {
 mod tests {
     use std::collections::HashMap;
 
-    use smg_policy_controller::PolicySpec;
+    use smg_policy_controller::document::PolicySpec;
     use tempfile::tempdir;
 
     use super::*;

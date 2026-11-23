@@ -4,9 +4,15 @@
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
 
 use smg_policy_controller::{
-    document::spec::{Capacity, FilterSpec, FilterStage, HasRoomParams},
-    Candidate, Constraints, Decision, Engine, Health, Lease, Lifecycle, LoadRow, PolicySpec,
-    PoolFacts, RequestFacts, Scratch, Side, SpecError, Target, WorkerId, API_VERSION,
+    document::{
+        Capacity, FilterSpec, FilterStage, HasRoomParams, PolicySpec, SpecError, API_VERSION,
+    },
+    engine::{
+        Candidate, Constraints, Decision, Engine, Health, LoadRow, PoolFacts, RequestFacts,
+        Scratch, Target, WorkerId,
+    },
+    stages::Lifecycle,
+    tracking::{Lease, Side},
 };
 
 const NOW: u64 = 1_000_000;
@@ -51,6 +57,14 @@ fn request(prompt_tokens: u32) -> RequestFacts<'static> {
         now_micros: NOW,
         prompt_tokens,
         ..RequestFacts::default()
+    }
+}
+
+/// A request of `prompt_tokens` whose answer may hold `limit` tokens.
+fn with_limit(prompt_tokens: u32, limit: u32) -> RequestFacts<'static> {
+    RequestFacts {
+        max_output_tokens: limit,
+        ..request(prompt_tokens)
     }
 }
 
@@ -135,9 +149,83 @@ fn the_requests_size_counts_where_the_rule_names_it() {
     assert_eq!(kept(&policy, 0, &request(100), &rows), [0, 1]);
     assert_eq!(kept(&policy, 0, &request(101), &rows), [0]);
     assert_eq!(kept(&policy, 0, &request(301), &rows), [0u32; 0]);
-    // A rule that does not name the size reads the same rows for any request.
+    // A rule that names no value of the request reads the same rows for any
+    // request.
     let unsized_rule = self::policy(RESIDENT);
     assert_eq!(kept(&unsized_rule, 0, &request(301), &rows), [0, 1]);
+}
+
+/// A rule that names the request's output limit reserves room for the
+/// answer: the limit times its coefficient counts on every row, beside the
+/// request's size. A request that states no limit reserves nothing.
+#[test]
+fn the_requests_output_limit_reserves_room_where_the_rule_names_it() {
+    let policy = policy(
+        r#"{"has-room":{"used":{"load.resident_tokens":1,"request.max_output_tokens":0.5,"request.prompt_tokens":1},"capacity":1000}}"#,
+    );
+    let rows = [row(0, 700), row(1, 800)];
+    // A prompt of 100 and half of an answer of 200 put the fuller row on
+    // the bound.
+    assert_eq!(kept(&policy, 0, &with_limit(100, 200), &rows), [0, 1]);
+    // Two tokens more of answer are one token over it.
+    assert_eq!(kept(&policy, 0, &with_limit(100, 202), &rows), [0]);
+    // With no limit stated the size alone counts: a prompt of 200 puts the
+    // fuller row on the same bound.
+    assert_eq!(kept(&policy, 0, &with_limit(200, 0), &rows), [0, 1]);
+}
+
+/// The limit's coefficient counts with its sign, as every coefficient of
+/// the rule does: under one below zero a larger limit leaves a row more
+/// room.
+#[test]
+fn the_output_limits_coefficient_counts_with_its_sign() {
+    let policy = policy(
+        r#"{"has-room":{"used":{"load.resident_tokens":1,"request.max_output_tokens":-1},"capacity":1000}}"#,
+    );
+    let rows = [row(0, 1_100)];
+    assert_eq!(kept(&policy, 0, &with_limit(0, 100), &rows), [0]);
+    assert_eq!(kept(&policy, 0, &with_limit(0, 99), &rows), [0u32; 0]);
+}
+
+/// A rule that names no output limit reserves nothing for an answer: a row
+/// on the bound stands, and a row a token over it goes, whatever limit the
+/// request states.
+#[test]
+fn a_rule_that_names_no_output_limit_keeps_its_rows_under_any_limit() {
+    let policy = policy(
+        r#"{"has-room":{"used":{"load.resident_tokens":1,"request.prompt_tokens":1},"capacity":1000}}"#,
+    );
+    // With a prompt of 100 the second row sits on the bound, and the third
+    // a token over it.
+    let rows = [row(0, 899), row(1, 900), row(2, 901)];
+    for limit in [0, 1, 4_096, u32::MAX] {
+        let asks = with_limit(100, limit);
+        assert_eq!(kept(&policy, 0, &asks, &rows), [0, 1], "limit {limit}");
+    }
+}
+
+/// Under the view's report age limit the rule reads its reports through
+/// the limit, and reserves the answer's room as it does with none: a row
+/// whose report is past the limit has no room, and of the two fresh rows
+/// the one the answer puts over the bound goes.
+#[test]
+fn the_output_limit_reserves_room_under_the_views_report_age_limit() {
+    const LIMIT_MS: u64 = 27;
+    let mut spec = document(
+        r#"{"has-room":{"used":{"load.resident_tokens":1,"request.max_output_tokens":2},"capacity":1000}}"#,
+    );
+    spec.view.max_report_age_ms = Some(LIMIT_MS);
+    let limited = spec.validate().expect("a valid policy");
+    let stale = Candidate {
+        load_sampled_at_micros: NOW - LIMIT_MS * 1_000 - 1,
+        ..row(2, 10)
+    };
+    let rows = [row(0, 600), row(1, 601), stale];
+    // Twice an answer of 199 leaves both fresh rows under the bound.
+    assert_eq!(kept(&limited, 0, &with_limit(0, 199), &rows), [0, 1]);
+    // Twice an answer of 200 puts the first row on the bound and the
+    // second a token over it.
+    assert_eq!(kept(&limited, 0, &with_limit(0, 200), &rows), [0]);
 }
 
 #[test]
@@ -199,8 +287,10 @@ fn a_row_that_lacks_a_named_value_has_no_room() {
 }
 
 /// The rule asks for load reports where a term reads one, or where it reads
-/// the sends a report ends. It is soft and row-wise, and it refuses by
-/// nothing a late report writes.
+/// the sends a report ends. It asks for the request's size where it names
+/// it, and for nothing where it names the output limit, which a request
+/// states. It is soft and row-wise, and it refuses by nothing a late report
+/// writes.
 #[test]
 fn the_rule_needs_reports_where_a_term_reads_them_or_the_sends() {
     for (used, loads) in [
@@ -210,12 +300,18 @@ fn the_rule_needs_reports_where_a_term_reads_them_or_the_sends() {
             r#"{"candidate.in_flight":1,"request.prompt_tokens":1}"#,
             false,
         ),
+        (
+            r#"{"candidate.in_flight":1,"request.max_output_tokens":1}"#,
+            false,
+        ),
     ] {
         let policy = policy(&format!(
             r#"{{"has-room":{{"used":{used},"capacity":10}}}}"#
         ));
         let filter = &policy.profiles()[0].filters[0];
         assert_eq!(filter.needs().loads, loads, "{used}");
+        let sized = used.contains("request.prompt_tokens");
+        assert_eq!(filter.needs().prompt_size, sized, "{used}");
         assert!(filter.soft() && filter.row_wise() && !filter.refuses_by_reports());
     }
 }
@@ -315,6 +411,42 @@ fn a_send_takes_room_until_a_report_or_the_profiles_limit_ends_it() {
 }
 
 #[test]
+fn a_send_takes_room_past_a_report_sampled_sooner_than_the_profiles_delay() {
+    const SENT_AT: u64 = 91_347;
+    let document: PolicySpec = serde_json::from_str(&format!(
+        r#"{{"apiVersion":"{API_VERSION}","profiles":{{"p":{{"sent_report_delay_ms":5,
+            "filter":[{{"has-room":{{"used":{{"sent.tokens":1}},"capacity":300}}}}],"pick":"random"}}}}}}"#
+    ))
+    .expect("a policy document");
+    let policy = document
+        .validate()
+        .expect("the rule reads the sends the delay holds");
+    let mut a = row(0, 0);
+    let b = row(1, 0);
+    let lease = Lease {
+        issued_micros: SENT_AT,
+        tokens: 317,
+        ..Lease::default()
+    };
+    let target = Target {
+        id: a.id,
+        dp_rank: a.dp_rank,
+        ..Target::default()
+    };
+    policy.on_dispatched(&lease, &target, Side::Single, 0);
+    let facts = RequestFacts {
+        now_micros: SENT_AT + 9_000,
+        ..RequestFacts::default()
+    };
+    // Three milliseconds behind the send: its 317 tokens are over 300.
+    a.load_sampled_at_micros = SENT_AT + 3_000;
+    assert_eq!(kept(&policy, 0, &facts, &[a, b]), [1]);
+    // Five behind it: the report ends the send.
+    a.load_sampled_at_micros = SENT_AT + 5_000;
+    assert_eq!(kept(&policy, 0, &facts, &[a, b]), [0, 1]);
+}
+
+#[test]
 fn a_sends_request_and_its_tokens_each_take_room_by_their_own_coefficient() {
     let policy =
         policy(r#"{"has-room":{"used":{"sent.requests":100,"sent.tokens":1},"capacity":250}}"#);
@@ -373,6 +505,8 @@ fn each_part_of_the_rule_is_refused_at_its_path() {
     };
     const AT: &str = "profiles.p.filter[1].has-room";
     const COEFFICIENT: &str = "a finite number other than zero, of magnitude at most 1e15";
+    const OF_A_WORKER: &str =
+        "at least one field or signal of the worker beside the request's own values";
     for (rule, field, written, why) in [
         (
             r#"{"used":{},"capacity":10}"#,
@@ -386,7 +520,31 @@ fn each_part_of_the_rule_is_refused_at_its_path() {
             r#"{"used":{"request.prompt_tokens":1},"capacity":10}"#,
             "used",
             "request.prompt_tokens",
-            "at least one field or signal of the worker beside the request's size",
+            OF_A_WORKER,
+        ),
+        // The limit's coefficient is a coefficient of the map: zero is
+        // refused at its own path.
+        (
+            r#"{"used":{"load.running":1,"request.max_output_tokens":0},"capacity":10}"#,
+            "used.request.max_output_tokens",
+            "0",
+            COEFFICIENT,
+        ),
+        // The request's output limit alone asks nothing of a worker
+        // either, at any coefficient, nor do the two together. The refusal
+        // names the first of them in name order, whichever the document
+        // writes first.
+        (
+            r#"{"used":{"request.max_output_tokens":-1},"capacity":10}"#,
+            "used",
+            "request.max_output_tokens",
+            OF_A_WORKER,
+        ),
+        (
+            r#"{"used":{"request.prompt_tokens":1,"request.max_output_tokens":1},"capacity":10}"#,
+            "used",
+            "request.max_output_tokens",
+            OF_A_WORKER,
         ),
         // The capacity is settled first: under a name that is no signal's
         // the refusal is the capacity's.

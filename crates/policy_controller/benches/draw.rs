@@ -21,7 +21,7 @@ use std::hint::black_box;
 
 use common::{build_view, engine_of, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use smg_policy_controller::{Candidate, Constraints, PoolFacts, RequestFacts, Scratch};
+use smg_policy_controller::engine::{Candidate, Constraints, PoolFacts, RequestFacts, Scratch};
 
 const SIZES: [usize; 6] = [4, 8, 16, 32, 64, 512];
 

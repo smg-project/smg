@@ -28,40 +28,43 @@
 //! the shutdown future resolves, then gives the lease up, settles, drains
 //! and returns.
 //!
-//! Every replica runs the same loop, the load driver included: a follower
-//! that waited for a leader's log nobody writes yet would be cold at its
-//! promotion. The standby turns a follower's polls into that log.
+//! Every replica runs the same loop, the load driver included. A follower
+//! polls no engine, is sent no load row and holds none: the rows of a lead
+//! are dropped where the lead ends. Its first poll goes out at its
+//! promotion. A decision reads none of the store's load rows yet.
 //!
 //! Every socket a listener accepts is set to send at once: a small answer
 //! never waits for the peer's acknowledgement of the write before it.
 
-pub mod admin;
-pub mod config;
+pub(crate) mod admin;
+pub(crate) mod config;
 mod decide;
-mod deciders;
+mod decision_slots;
 #[cfg(feature = "discovery")]
 mod discovery;
-pub mod election;
+pub(crate) mod election;
 mod floor;
+mod frame_decision;
+mod frame_request;
+mod gateway_places;
 mod gateways;
 mod generations;
-#[cfg(all(test, feature = "worker-host"))]
+#[cfg(test)]
 mod kv_feed;
 mod lifecycle;
 mod membership;
 pub mod metrics;
 mod principal;
-pub mod readiness;
+pub(crate) mod readiness;
 mod replication;
 mod run;
 mod service;
 mod session;
 mod snapshot;
 mod spec_file;
-pub(crate) use crate::document::operator::spec_store;
-pub use crate::document::operator::SpecRejected;
+pub(crate) use crate::document::operator::{spec_store, SpecRejected};
 mod standby;
-pub mod tls;
+pub(crate) mod tls;
 mod watch_workers;
 pub(crate) mod wire;
 mod worker_objects;
@@ -88,8 +91,8 @@ use tracing::{error, info, warn};
 pub(crate) use self::wire::{MAX_FRAME, MAX_REQUEST_ID};
 pub use self::{
     admin::{Version, VERSION},
-    config::{Config, ConfigError, Listener, Scope, Tls},
-    election::{Election, LeaseError, LeasePlace},
+    config::{Config, ConfigError, DiscoverySettings, Listener, Scope, Tls},
+    election::{ElectionConfig, LeaseError, LeasePlace},
     principal::ENTRY as PRINCIPAL_ENTRY,
     readiness::{Readiness, State},
     run::run,
@@ -97,7 +100,7 @@ pub use self::{
     tls::TlsError,
 };
 use self::{
-    election::Standing,
+    election::ElectionObservation,
     principal::Layer,
     readiness::Phase,
     service::{Service, Shared},
@@ -105,18 +108,15 @@ use self::{
     spec_store::SpecStore,
     standby::{Lag, Standby},
 };
-#[cfg(feature = "worker-host")]
-use crate::worker_host::{KvFeed, Members};
 use crate::{
-    service::{
-        elector::{Elector, Fence},
-        ingest::{
-            loads::{LoadDriver, LoadDriverConfig},
-            probe::EngineProbe,
-        },
+    load::ingest::{
+        loads::{LoadDriver, LoadDriverConfig},
+        probe::EngineProbe,
     },
-    stages::catalog::Catalog,
+    service::elector::{Elector, Fence},
+    stages::registry::StageRegistry,
     store::{MemoryStore, WorkersStore},
+    worker_host::{KvFeed, Members},
 };
 
 /// The protobuf package of the controller's API.
@@ -142,7 +142,7 @@ pub struct Controller {
     config: Config,
     /// The stages a policy document may name, fixed at the bind: the stock
     /// build's, or the host's own.
-    catalog: Arc<Catalog>,
+    catalog: Arc<StageRegistry>,
     phase: watch::Sender<Phase>,
     readiness: Readiness,
     metrics: Arc<metrics::Metrics>,
@@ -151,7 +151,7 @@ pub struct Controller {
     /// This replica's candidate: the election thread steps it once served.
     elector: Elector,
     /// The election's sight of the lease, written by its thread.
-    standing: watch::Sender<Standing>,
+    standing: watch::Sender<ElectionObservation>,
     /// What every listener's instance of the service reads; the store is
     /// its field, the run loop's drivers read the same one.
     shared: Arc<Shared>,
@@ -163,13 +163,10 @@ pub struct Controller {
     admin_addr: SocketAddr,
     /// The replica's worker objects: one object of the worker crate a row
     /// of the store, followed by one task of the serve.
-    #[cfg(feature = "worker-host")]
     workers: Arc<worker_objects::WorkerObjects>,
-    #[cfg(feature = "worker-host")]
     kv_feed: KvFeed<Members>,
     /// The health probes of the replica's workers: one task of the serve,
     /// which probes while this replica leads.
-    #[cfg(feature = "worker-host")]
     prober: worker_objects::Prober,
     /// Worker discovery, where the configuration names a provider: one task
     /// of the serve, which runs the provider while this replica leads.
@@ -325,15 +322,15 @@ pub enum Error {
     ElectionThread(#[source] io::Error),
     /// A deciding thread could not be started.
     #[error("the deciding threads: {0}")]
-    Deciders(#[source] io::Error),
+    DecisionThreads(#[source] io::Error),
     /// The election thread ended before the shutdown: nothing renews the
     /// lease, so the controller stops.
     #[error("the election thread ended before the shutdown")]
     ElectionEnded,
     /// A deciding thread ended before the shutdown: the models it decided
-    /// have no decider, so the controller stops and gives the lead up.
+    /// have no decision slot, so the controller stops and gives the lead up.
     #[error("a deciding thread ended before the shutdown")]
-    DeciderEnded,
+    DecisionThreadEnded,
     /// A listener returned before the shutdown signal.
     #[error("a listener stopped before the shutdown")]
     Stopped,
@@ -345,7 +342,7 @@ pub enum Error {
 impl Controller {
     /// [`Controller::bind_with`] over the stock build's stages.
     pub async fn bind(config: Config) -> Result<Self, Error> {
-        Self::bind_with(config, Catalog::builtin()).await
+        Self::bind_with(config, StageRegistry::builtin()).await
     }
 
     /// Validates the configuration, installs the process crypto provider,
@@ -354,13 +351,13 @@ impl Controller {
     /// and no lease is taken, so a refusal arrives before a client can
     /// connect. A policy document names the stages `catalog` holds: the
     /// stock build's and the ones the host added. One that needs the
-    /// lifecycle's calls ([`crate::Lifecycle::needs_lifecycle`]) is refused
-    /// as not in this build: the controller makes the membership call, and a
-    /// stage hears a lease's issue, its dispatch, completion and release at
-    /// its gateway's word and its end at the dispatch deadline or where its
-    /// answer does not leave here, and not yet the end of a lease whose
-    /// gateway was let go.
-    pub async fn bind_with(config: Config, catalog: Catalog) -> Result<Self, Error> {
+    /// lifecycle's calls ([`crate::stages::Lifecycle::needs_lifecycle`]) is
+    /// refused as not in this build: the controller makes the membership call,
+    /// and a stage hears a lease's issue, its dispatch, completion and release
+    /// at its gateway's word and its end at the dispatch deadline or where its
+    /// answer does not leave here, and not yet the end of a lease whose gateway
+    /// was let go.
+    pub async fn bind_with(config: Config, catalog: StageRegistry) -> Result<Self, Error> {
         config.validate()?;
         tls::install_crypto_provider();
         // The stages a policy document may name in this build, the host's
@@ -455,34 +452,30 @@ impl Controller {
             renew_deadline = ?settings.renew_deadline,
             "election"
         );
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let steps = stood.clone();
         // What a watched write wakes beside the feed: the follower of the
-        // replica's worker objects, where the build has one.
+        // replica's worker objects.
         let objects = worker_objects::ObjectsWake::default();
-        #[cfg(feature = "worker-host")]
         let woken = objects.clone();
         let journal =
             replication::journaled_waking(&config.election.lease, config.decide_shards, objects);
-        #[cfg(feature = "worker-host")]
         let workers = Arc::new(worker_objects::WorkerObjects::new(
             Arc::clone(&journal.0),
             woken,
         ));
-        #[cfg(feature = "worker-host")]
         let kv_feed = KvFeed::new(Arc::clone(&journal.0), workers.holder());
-        #[cfg(feature = "worker-host")]
         let prober = worker_objects::Prober::new(Arc::clone(&workers), elector.fence());
         let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
             &elector,
             stood,
-            journal,
+            (journal.0, journal.1, workers.holder()),
             Arc::clone(&catalog),
             config.decide_shards,
         )
-        .map_err(Error::Deciders)?;
+        .map_err(Error::DecisionThreads)?;
         shared.lag = Arc::new(Lag::new(standby::synced_within(config.load_poll_interval)));
         let (phase, readiness) =
             readiness::channel(elector.fence(), steps, Arc::clone(&shared.lag));
@@ -514,11 +507,8 @@ impl Controller {
             listeners,
             admin,
             admin_addr,
-            #[cfg(feature = "worker-host")]
             workers,
-            #[cfg(feature = "worker-host")]
             kv_feed,
-            #[cfg(feature = "worker-host")]
             prober,
             #[cfg(feature = "discovery")]
             discovery,
@@ -609,7 +599,7 @@ impl Controller {
     /// The stages a policy document may name in this controller, fixed at
     /// the bind: a spec file's document is validated against them
     /// ([`Controller::spec_file`]).
-    pub fn catalog(&self) -> &Catalog {
+    pub fn stage_registry(&self) -> &StageRegistry {
         &self.catalog
     }
 
@@ -639,7 +629,7 @@ impl Controller {
     ///
     /// A file that cannot be read, or a document the validator refuses, is
     /// refused here, before anything serves. The document names the stages
-    /// the bind was handed ([`Controller::catalog`]), a host's own among
+    /// the bind was handed ([`Controller::stage_registry`]), a host's own among
     /// them. A controller that takes no spec source serves no spec call,
     /// watches nothing and renders no spec series, and one that took a spec
     /// store takes no file ([`SpecRejected::SecondSource`]).
@@ -837,17 +827,18 @@ impl Controller {
             spec_file,
             listeners,
             admin,
-            #[cfg(feature = "worker-host")]
             workers,
-            #[cfg(feature = "worker-host")]
             kv_feed,
-            #[cfg(feature = "worker-host")]
             prober,
             #[cfg(feature = "discovery")]
             discovery,
             ..
         } = self;
         let store = Arc::clone(&shared.store);
+        // The worker objects stand at the store's end before a listener
+        // serves: a controller that starts over standing rows decides its
+        // first request over them. The follower's task goes on from here.
+        workers.holder().follow(&*store);
         // The listeners' close is one word, and an open decide stream hears
         // it too: the word is `Shared`'s.
         let stop = shared.stop.clone();
@@ -920,11 +911,11 @@ impl Controller {
         ));
         let loads = driver.stats();
         let driver_stop = stop.subscribe();
-        // A replica that follows polls no engine: its applier is the load
-        // table's one writer then, and a poll's row between two of the
-        // leader's would take the place of the log the leader's next event
-        // needs. The loop itself runs on every replica: it pays the store's
-        // publications, so a followed row reaches the published world.
+        // A replica that follows polls no engine: it decides no request, and
+        // it is sent no load row. The driver drops the rows of its own lead
+        // at the word that the lead ended. The loop itself runs on every
+        // replica: it pays the store's publications, so a followed row
+        // reaches the published world.
         let polls = follows.map(|_| shared.role.subscribe());
         tasks.spawn(async move {
             match polls {
@@ -953,7 +944,6 @@ impl Controller {
         }
         // The worker objects follow the store on every replica alike: a
         // standby holds the objects its leader's rows make, there at a take.
-        #[cfg(feature = "worker-host")]
         {
             let workers_stop = stop.subscribe();
             tasks.spawn(async move {
@@ -1021,7 +1011,7 @@ impl Controller {
                 let _ = deciders_stop.wait_for(|stop| *stop).await;
             };
             tokio::select! {
-                true = told => Err(Error::DeciderEnded),
+                true = told => Err(Error::DecisionThreadEnded),
                 () = stopped => Ok(()),
             }
         });
@@ -1372,8 +1362,8 @@ mod tests {
 
     use super::{
         config::tests::valid,
-        deciders::tests as bed,
-        election::{self, Standing},
+        decision_slots::tests as bed,
+        election::{self, ElectionObservation},
         following,
         membership::tests::Logged,
         principal::Layer,
@@ -1382,21 +1372,17 @@ mod tests {
         tell_readiness, tell_role, unnamed_port, Bound, ConfigError, Controller, EngineProbe,
         Error, NoFollow, Scope,
     };
-    #[cfg(feature = "worker-host")]
-    use crate::store::{HealthPolicy, WorkerFacts, WorkerStatus, WorkersStore};
     use crate::{
-        engine::door::TERM_MARK,
-        service::{
-            elector::{
-                ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease,
-                Tick, Written,
-            },
-            ingest::{
-                loads::{LoadProbe, ReadError},
-                probe::unbuildable,
-            },
+        engine::store_backed_engine::TERM_MARK,
+        load::ingest::{
+            loads::{LoadProbe, ReadError},
+            probe::unbuildable,
         },
-        store::Kinds,
+        service::elector::{
+            ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, LeaseBackend,
+            LeaseRecord, MemoryLease, TickOutcome,
+        },
+        store::{HealthPolicy, JournalKinds, WorkerFacts, WorkerStatus, WorkersStore},
     };
 
     /// A lease that stores `writes` writes: the thread that steps it panics
@@ -1415,7 +1401,7 @@ mod tests {
             &mut self,
             expected: Option<&LeaseRecord>,
             record: &LeaseRecord,
-        ) -> Result<Written, ElectError> {
+        ) -> Result<ConditionalWriteOutcome, ElectError> {
             assert!(self.writes > 0, "the lease gave way");
             self.writes -= 1;
             self.lease.write(expected, record)
@@ -1521,10 +1507,39 @@ mod tests {
         let mut starts = Vec::new();
         for _ in 0..2 {
             let controller = Controller::bind(valid()).await.expect("the listeners bind");
-            starts.push(controller.shared.feed.log.head(Kinds::Watched));
+            starts.push(controller.shared.feed.log.head(JournalKinds::Watched));
         }
         assert_ne!(starts[0].seq, starts[1].seq, "two runs start apart");
         assert!(starts.iter().all(|start| start.seq != 0 && start.term == 0));
+    }
+
+    /// A controller that starts over standing rows holds their worker
+    /// objects before a listener serves. The serve follows the store to its
+    /// end ahead of its listeners' tasks: one poll of it, which runs no task
+    /// it spawned, leaves the holder with the standing worker, and a
+    /// decision over the list the holder lends names it. Left to the
+    /// follower's task alone, a start over a large fleet answered its first
+    /// requests no worker.
+    #[tokio::test]
+    async fn a_start_over_standing_rows_holds_their_worker_objects_before_it_serves() {
+        use crate::engine::view::{Role, WireModes};
+
+        let controller = Controller::bind(valid()).await.expect("the listeners bind");
+        let store = Arc::clone(&controller.shared.store);
+        let objects = controller.workers.holder();
+        store
+            .apply(bed::preset("round_robin", 1))
+            .expect("above the unbound start");
+        let standing = bed::ready(&store, "w0", bed::MODEL, Role::Single, WireModes::NONE);
+        assert!(objects.is_empty(), "no object stands before the serve");
+        let mut serve = std::pin::pin!(controller.serve(pending()));
+        tokio::select! {
+            biased;
+            served = &mut serve => panic!("the serve stands: {served:?}"),
+            () = std::future::ready(()) => {}
+        }
+        let named = bed::lent_pick(&store, &objects, bed::frame(1, 1));
+        assert_eq!(named, Some(standing));
     }
 
     /// The thread gone at its take, before the serve read ready, and at its
@@ -1600,7 +1615,6 @@ mod tests {
     /// The serve starts the follower of the replica's worker objects, on
     /// the wake the store's log tells: a row written while the controller
     /// leads has its object, and a row removed has none.
-    #[cfg(feature = "worker-host")]
     #[tokio::test]
     async fn a_served_controller_holds_the_worker_objects_of_its_stores_rows() {
         let controller = Controller::bind(valid()).await.expect("the listeners bind");
@@ -1647,7 +1661,6 @@ mod tests {
     /// The serve starts the probes of the replica's workers: a row written
     /// while the controller leads is readied by the first probe its engine
     /// passes, with no hand on its status.
-    #[cfg(feature = "worker-host")]
     #[tokio::test]
     async fn a_served_controller_probes_its_rows_while_it_leads() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
@@ -1765,7 +1778,7 @@ mod tests {
             .await
             .expect("the serve ends within twenty seconds");
             assert!(
-                matches!(served, Err(Error::DeciderEnded)),
+                matches!(served, Err(Error::DecisionThreadEnded)),
                 "told {told:?}: {served:?}"
             );
         }
@@ -1786,7 +1799,7 @@ mod tests {
             &mut self,
             expected: Option<&LeaseRecord>,
             record: &LeaseRecord,
-        ) -> Result<Written, ElectError> {
+        ) -> Result<ConditionalWriteOutcome, ElectError> {
             if record.holder.is_empty() {
                 thread::sleep(self.slow);
             }
@@ -1924,7 +1937,7 @@ mod tests {
     async fn the_role_is_told_at_each_change_and_as_left_at_the_stop() {
         let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
             .expect("the default settings are in order");
-        let (steps, stepped) = watch::channel(Standing::default());
+        let (steps, stepped) = watch::channel(ElectionObservation::default());
         let (phase, readiness) =
             readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (stop, stopped) = watch::channel(false);
@@ -1947,20 +1960,20 @@ mod tests {
         phase.send_replace(Phase::Serving);
         assert!(matches!(
             elector.tick(Instant::now()),
-            Ok(Tick::Acquired { .. })
+            Ok(TickOutcome::Acquired { .. })
         ));
-        steps.send_replace(Standing::default());
+        steps.send_replace(ElectionObservation::default());
         told_as(true).await;
         // The lease let go with no stop: told at the next step.
         assert!(elector.release().expect("a release"));
-        steps.send_replace(Standing::default());
+        steps.send_replace(ElectionObservation::default());
         told_as(false).await;
         // Taken again, then the stop: the replica left, and the teller ends.
         assert!(matches!(
             elector.tick(Instant::now()),
-            Ok(Tick::Acquired { .. })
+            Ok(TickOutcome::Acquired { .. })
         ));
-        steps.send_replace(Standing::default());
+        steps.send_replace(ElectionObservation::default());
         told_as(true).await;
         stop.send_replace(true);
         told_as(false).await;
@@ -1983,7 +1996,7 @@ mod tests {
         };
         let mut elector = Elector::alone("controller-0@127.0.0.1:1", settings)
             .expect("the settings are in order");
-        let (steps, stepped) = watch::channel(Standing::default());
+        let (steps, stepped) = watch::channel(ElectionObservation::default());
         let (phase, readiness) =
             readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (_stop, stopped) = watch::channel(false);
@@ -2008,13 +2021,19 @@ mod tests {
         // narrow window.
         phase.send_replace(Phase::Serving);
         let taken = Instant::now();
-        assert!(matches!(elector.tick(taken), Ok(Tick::Acquired { .. })));
+        assert!(matches!(
+            elector.tick(taken),
+            Ok(TickOutcome::Acquired { .. })
+        ));
         let mut renewed = taken;
         for _ in 0..2 {
             renewed += settings.renew_deadline - Duration::from_millis(10);
-            assert!(matches!(elector.tick(renewed), Ok(Tick::Renewed { .. })));
+            assert!(matches!(
+                elector.tick(renewed),
+                Ok(TickOutcome::Renewed { .. })
+            ));
         }
-        steps.send_replace(Standing::default());
+        steps.send_replace(ElectionObservation::default());
         told_as(true).await;
         // No renewal and no step from here: the clock closes the fence one
         // renew deadline after the last renewal, and the teller says so.
@@ -2040,7 +2059,7 @@ mod tests {
         }
         let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
             .expect("the default settings are in order");
-        let (steps, stepped) = watch::channel(Standing::default());
+        let (steps, stepped) = watch::channel(ElectionObservation::default());
         let (phase, readiness) =
             readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (_stop, stopped) = watch::channel(false);
@@ -2051,14 +2070,14 @@ mod tests {
         phase.send_replace(Phase::Serving);
         assert!(matches!(
             elector.tick(Instant::now()),
-            Ok(Tick::Acquired { .. })
+            Ok(TickOutcome::Acquired { .. })
         ));
-        steps.send_replace(Standing::default());
+        steps.send_replace(ElectionObservation::default());
         told_as(&mut role, true).await;
         // Three steps under the standing leader, each taken by the teller:
         // turns of the runtime and no clock.
         for _ in 0..3 {
-            steps.send_replace(Standing::default());
+            steps.send_replace(ElectionObservation::default());
             for _ in 0..100 {
                 tokio::task::yield_now().await;
             }
@@ -2069,7 +2088,7 @@ mod tests {
         );
         // The teller took those steps: the one after the lead's loss is told.
         assert!(elector.release().expect("a release"));
-        steps.send_replace(Standing::default());
+        steps.send_replace(ElectionObservation::default());
         told_as(&mut role, false).await;
     }
 
@@ -2086,7 +2105,7 @@ mod tests {
         }
         let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
             .expect("the default settings are in order");
-        let (steps, stepped) = watch::channel(Standing::default());
+        let (steps, stepped) = watch::channel(ElectionObservation::default());
         let (phase, readiness) =
             readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (_stop, stopped) = watch::channel(false);
@@ -2097,9 +2116,9 @@ mod tests {
         phase.send_replace(Phase::Serving);
         assert!(matches!(
             elector.tick(Instant::now()),
-            Ok(Tick::Acquired { .. })
+            Ok(TickOutcome::Acquired { .. })
         ));
-        steps.send_replace(Standing::default());
+        steps.send_replace(ElectionObservation::default());
         let first = elector.fence().term();
         names(&mut role, first).await;
         // The release and the take with nothing awaited between them: the
@@ -2107,11 +2126,11 @@ mod tests {
         assert!(elector.release().expect("a release"));
         assert!(matches!(
             elector.tick(Instant::now()),
-            Ok(Tick::Acquired { .. })
+            Ok(TickOutcome::Acquired { .. })
         ));
         let second = elector.fence().term();
         assert_ne!(second, first, "a take is another term");
-        steps.send_replace(Standing::default());
+        steps.send_replace(ElectionObservation::default());
         names(&mut role, second).await;
     }
 
@@ -2122,7 +2141,7 @@ mod tests {
     /// leads here.
     struct Unstepped {
         elector: Elector,
-        steps: watch::Sender<Standing>,
+        steps: watch::Sender<ElectionObservation>,
         phase: watch::Sender<Phase>,
         /// The role's word, as a watch admitted now holds it.
         watch: watch::Receiver<Option<u64>>,
@@ -2143,7 +2162,7 @@ mod tests {
                 settings,
             )
             .expect("the settings are in order");
-            let (steps, stepped) = watch::channel(Standing::default());
+            let (steps, stepped) = watch::channel(ElectionObservation::default());
             let (phase, readiness) =
                 readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
             let (stop, stopped) = watch::channel(false);
@@ -2161,17 +2180,17 @@ mod tests {
             let taken = Instant::now();
             assert_eq!(
                 elector.tick(taken).expect("the take"),
-                Tick::Acquired { term: 1 }
+                TickOutcome::Acquired { term: 1 }
             );
             let mut renewed = taken;
             for _ in 0..10 {
                 renewed += settings.renew_deadline - Duration::from_millis(10);
                 assert_eq!(
                     elector.tick(renewed).expect("the renewal"),
-                    Tick::Renewed { term: 1 }
+                    TickOutcome::Renewed { term: 1 }
                 );
             }
-            steps.send_replace(Standing::default());
+            steps.send_replace(ElectionObservation::default());
             let mut first = role.clone();
             first.changed().await.expect("the teller tells the step");
             assert!(first.borrow().is_none());
@@ -2219,7 +2238,7 @@ mod tests {
     async fn a_watch_admitted_before_the_role_was_told_as_leading_hears_the_loss_of_its_lead() {
         let mut serve = Unstepped::new().await;
         assert!(serve.elector.release().expect("a release"));
-        serve.steps.send_replace(Standing::default());
+        serve.steps.send_replace(ElectionObservation::default());
         serve.hears("the lead's loss").await;
     }
 
@@ -2379,7 +2398,7 @@ mod tests {
         let bound = Duration::from_secs(1);
         let lag = Arc::new(Lag::new(bound));
         lag.follow();
-        let (_standing, stepped) = watch::channel(Standing::default());
+        let (_standing, stepped) = watch::channel(ElectionObservation::default());
         let (phase, role) = readiness::channel(elector.fence(), stepped, Arc::clone(&lag));
         phase.send_replace(Phase::Serving);
         let (reporter, _server) = health_reporter();

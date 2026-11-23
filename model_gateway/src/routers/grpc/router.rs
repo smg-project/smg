@@ -55,7 +55,7 @@ use crate::{
     observability::metrics::metrics_labels,
     routers::{
         common::{
-            json_response, placement,
+            json_response,
             snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
         },
         error,
@@ -174,10 +174,6 @@ impl GrpcRouter {
                 Mode::EncodePrefillDecode => {}
             }
         }
-        // No role policy is built under the policy controller, so the
-        // selection stage is told what the pair's settings keep.
-        let settings = &ctx.router_config;
-        let pair_keeps_target = placement::pair_keeps_target(&settings.mode, &settings.policy);
         // Deps for the parser-consuming endpoints (chat/messages/harmony).
         let configured_deps = PipelineDeps::new(
             worker_registry.clone(),
@@ -191,9 +187,7 @@ impl GrpcRouter {
             queue_timeout,
         )
         .with_request_timeout(request_timeout)
-        .with_grouped_dp_sticky(grouped_dp_sticky)
-        .with_policy_engine(ctx.policy_engine.clone())
-        .with_pair_keeps_target(pair_keeps_target);
+        .with_grouped_dp_sticky(grouped_dp_sticky);
         // Deps for the parser-free endpoints (completion/embeddings/classify/
         // decisions/transcription).
         let pair_deps = PipelineDeps::pair(
@@ -204,9 +198,7 @@ impl GrpcRouter {
             queue_timeout,
         )
         .with_request_timeout(request_timeout)
-        .with_grouped_dp_sticky(grouped_dp_sticky)
-        .with_policy_engine(ctx.policy_engine.clone())
-        .with_pair_keeps_target(pair_keeps_target);
+        .with_grouped_dp_sticky(grouped_dp_sticky);
 
         // Present in every mode: chat/generate, messages, completion.
         let pipeline = RequestPipeline::build(Endpoint::Chat, mode, &configured_deps)
@@ -868,7 +860,8 @@ impl GrpcRouter {
     /// failed for good will not get one on its own (503 without); a served
     /// model with no tokenizer when the gateway does not load tokenizers
     /// itself is a gateway fault (500), as is a prompt that does not encode;
-    /// a prompt that does not render is a 400.
+    /// a prompt that does not render is a 400, and a 500 where the model's
+    /// chat template failed on its own account whatever the request holds.
     /// `record_media` says whether the prompt's media counts in the
     /// per-request media series: the `max_tokens: 0` answer is a Messages
     /// request, a token count is not.
@@ -917,8 +910,16 @@ impl GrpcRouter {
         .await
         .map_err(|e| match e {
             message_utils::CountError::Render(e) => {
-                debug!(model = %model_id, error = %e, "the request does not render");
-                error::bad_request("process_messages_failed", e)
+                // A failure that is the template's own whatever the request
+                // holds is the deployment's to fix and gets a line an
+                // operator reads; any other render failure may be the
+                // client's.
+                if e.is_template_failure() {
+                    tracing::error!(model = %model_id, error = %e, "the chat template failed to render");
+                } else {
+                    debug!(model = %model_id, error = %e, "the request does not render");
+                }
+                e.answer()
             }
             message_utils::CountError::Encode(e) => {
                 tracing::error!(model = %model_id, error = %e, "tokenization failed");

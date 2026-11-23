@@ -274,6 +274,7 @@ impl MiniMaxM3VisionProcessor {
         layered.inner = layered.inner.with_preprocessor_config(config);
         layered.sglang_resize = config.get_extra::<bool>(SGLANG_RESIZE_KEY).unwrap_or(false);
         layered.explicit_max_pixels = self.explicit_max_pixels || config.max_pixels.is_some();
+        layered.inner.validate()?;
         Ok(layered)
     }
 

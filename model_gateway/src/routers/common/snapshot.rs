@@ -10,6 +10,7 @@ use std::{
 };
 
 use openai_protocol::{worker::TagVocabulary, UNKNOWN_MODEL_ID};
+use smg_policy_controller::engine::{LentList, ListCell};
 use smg_worker::{
     identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
     load,
@@ -20,7 +21,10 @@ use symphony::grammar::GrammarStart;
 
 use crate::{
     policies::hash_ring::HashRing,
-    routers::common::pair_index::{PdPairIndex, PdWire},
+    routers::{
+        common::pair_index::{PdPairIndex, PdWire},
+        grpc::multimodal::MediaFacts,
+    },
 };
 
 /// Static routing pool inside a model snapshot.
@@ -73,8 +77,7 @@ impl RoutingPool {
     }
 
     /// Whether `worker` is a member of this pool: the one rule of
-    /// membership. The snapshot projects its pools by it, and a route asks
-    /// it of a worker handed to it from outside the snapshot.
+    /// membership. The snapshot projects its pools by it.
     pub(crate) fn matches(self, worker: &dyn Worker) -> bool {
         match self {
             Self::HttpRegular => {
@@ -161,10 +164,21 @@ pub(crate) struct ModelLabels {
 /// Multi-role selection (PD/EPD) must derive every role from ONE snapshot: two
 /// separate registry lookups can straddle a concurrent membership change and
 /// pair workers that never coexisted.
+///
+/// A snapshot stands on cache lines of its own, apart from the count of its
+/// handles. Every request takes a handle of its model's snapshot and drops
+/// it, so the count's line is one every caller writes, and a selection
+/// borrows its pool from the snapshot: a field beside the count would be
+/// read from that line all through the selection.
 #[derive(Debug)]
+#[repr(align(128))]
 pub struct ModelWorkerSnapshot {
     all: WorkerSnapshot,
     pools: [LazyRoutingPool; RoutingPool::COUNT],
+    /// The cell beside each pool's list, empty until the policy engine is
+    /// asked over that list (see [`Self::lent`]). A gateway that starts no
+    /// engine leaves every cell empty.
+    cells: [ListCell; RoutingPool::COUNT],
     /// The compatible prefill/decode pairs per wire and pairing mode, built
     /// once from the pools above (see [`PdPairIndex`]).
     pd_pairs: [[OnceLock<Arc<PdPairIndex>>; PdPairingMode::COUNT]; PdWire::COUNT],
@@ -177,6 +191,10 @@ pub struct ModelWorkerSnapshot {
     /// What the workers of this generation say together, kept with the
     /// model id it was read for (see [`Self::labels`]).
     labels: OnceLock<(Box<str>, ModelLabels)>,
+    /// What the media gates read from the workers of this generation
+    /// together (see [`Self::media`]). `MediaFacts` stays with the gates in
+    /// `routers::grpc::multimodal`, so this module depends on that one.
+    media: OnceLock<MediaFacts>,
     /// The consistent-hash ring over the URLs of this generation's members
     /// (see [`Self::hash_ring`]).
     hash_ring: OnceLock<Arc<HashRing>>,
@@ -187,10 +205,12 @@ impl ModelWorkerSnapshot {
         Self {
             all,
             pools: std::array::from_fn(|_| OnceLock::new()),
+            cells: std::array::from_fn(|_| ListCell::default()),
             pd_pairs: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
             harmony: OnceLock::new(),
             window_floors: std::array::from_fn(|_| OnceLock::new()),
             labels: OnceLock::new(),
+            media: OnceLock::new(),
             hash_ring: OnceLock::new(),
         }
     }
@@ -264,6 +284,17 @@ impl ModelWorkerSnapshot {
             .labels
             .get_or_init(|| (model_id.into(), read(&self.all)));
         (**spelling == *model_id).then_some(labels)
+    }
+
+    /// What the media gates read from the snapshot's workers together:
+    /// `read` reads them on the first media request after the membership
+    /// change, every request after it reads the kept answers. They hang on
+    /// the workers' labels, connection modes and engines, which a worker
+    /// holds from its construction (see [`Self::labels`]), and on no model
+    /// id as spelled, so one snapshot keeps one value. The rules stay with
+    /// the media gates.
+    pub(crate) fn media(&self, read: impl FnOnce(&[Arc<dyn Worker>]) -> MediaFacts) -> &MediaFacts {
+        self.media.get_or_init(|| read(&self.all))
     }
 
     /// The consistent-hash ring over the URLs of this generation's members,
@@ -360,6 +391,20 @@ impl ModelWorkerSnapshot {
                 .cloned()
                 .collect()
         })
+    }
+
+    /// The list of `pool` as the policy engine is lent it: the pool's own
+    /// list ([`Self::pool`]) with the cell that stands beside it. The engine
+    /// keeps its value of the list in that cell from the list's first
+    /// request on, and the value falls with this snapshot, as the list
+    /// does: a membership change publishes the next one with empty cells.
+    /// The gateway states no fact of a worker beside its object.
+    pub(crate) fn lent(&self, pool: RoutingPool) -> LentList<'_> {
+        LentList {
+            workers: self.pool(pool),
+            cell: &self.cells[pool.index()],
+            facts: None,
+        }
     }
 }
 

@@ -1,12 +1,16 @@
-//! The bed the hard-demand rows replay on. A row's workers are registered
-//! in a store, each with its wire, its state and the facts it states for a
-//! request's demands, and each request is decided through the door a host
-//! in process decides through ([`Door`]), under `round_robin`. A request is
+//! The bed the hard-demand rows replay on. A row's workers are worker
+//! objects in one list, each with its wire and its state, and the facts
+//! each states for a request's demands stand beside the list
+//! ([`FixedFacts`]). Each request is decided by the engine over worker
+//! lists ([`PolicyEngine`]), whole, under `round_robin`. A request is
 //! decided sixteen times the pool's size, as its recorder placed it, and
 //! `placed` is the set of workers those decisions named.
 //!
 //! A worker states its runtime as a number: the numbers are the replay's
-//! own, as they are a registering host's, one a spelling.
+//! own, as they are a registering host's, one a spelling. The bed gives one
+//! number to each runtime and transport, as a host of this engine does: a
+//! retry stays on its wire by its demand alone, and its list is handed
+//! whole, whatever wires its workers dial.
 //!
 //! A refusal replays by its status and its code. The crate sheds under a
 //! reason and a stage's name, and the gateway keeps its own words for each:
@@ -18,22 +22,24 @@ use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
 use serde::{de::DeserializeOwned, Deserialize};
 use smg_policy_controller::{
-    document::spec::{BindingSpec, OverloadSpec},
-    engine::door::{Door, Request},
-    store::{
-        GatewayId, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore,
+    document::{AppliedSpec, BindingSpec, OverloadSpec, PolicySpec},
+    engine::{
+        Constraints, Decision, DecisionEngine, DemandFacts, FixedFacts, LentList, ListCell,
+        PolicyEngine, Request, RequestFacts, RequestMaker, ShedReason, WireModes, WorkerId,
+        WorkerLists,
     },
-    AppliedSpec, Constraints, Decision, DemandFacts, LoadRow, PolicySpec, RequestFacts, ShedReason,
-    WireModes, WorkerId,
+    store::GatewayId,
+};
+use smg_worker::{
+    identity::{basic::Worker, builder::BasicWorkerBuilder},
+    model_card::ModelCard,
+    worker::{ConnectionMode, HealthCheckConfig, WorkerStatus},
 };
 
 const MODEL: &str = "m";
 
 /// A request is decided this many times the pool's size.
 const ROUNDS: usize = 16;
-
-/// The queue of a worker over its thresholds: above the default bound.
-const QUEUED_OVER: u32 = 64;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -123,21 +129,102 @@ pub fn pool_refusal(reason: ShedReason, emptied_by: &str) -> Refusal {
     }
 }
 
-/// One worker of a row as the bed registers it.
+/// One worker of a row as the bed makes it.
 pub struct Pooled {
     pub wire_modes: WireModes,
     pub state: State,
-    /// Whether it takes images: its row's own bit.
+    /// Whether it takes images: its record's own bit.
     pub vision: bool,
     pub facts: DemandFacts,
+    /// The rank it registered and its group's size, where its row records
+    /// the two.
+    pub rank: Option<(usize, usize)>,
 }
 
-/// A row's pool behind the door, with each worker's id by its place.
+/// A row's pool: the engine, the row's one list, what its workers state
+/// beside their objects and the cell kept beside the list, as a host of
+/// this engine keeps the three.
 pub struct Bed {
-    door: Door,
-    ids: Vec<WorkerId>,
+    engine: PolicyEngine,
+    list: Arc<[Arc<dyn Worker>]>,
+    facts: Vec<FixedFacts>,
+    cell: ListCell,
     now: Instant,
     seed: u64,
+}
+
+/// One request of a bed, over the bed's list as it is lent.
+struct Asked<'a> {
+    request: Request<'a>,
+    lent: LentList<'a>,
+}
+
+impl RequestMaker for Asked<'_> {
+    fn model(&self) -> &str {
+        self.request.facts.model
+    }
+
+    fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
+        self.request
+    }
+
+    fn workers(&self) -> WorkerLists<'_> {
+        WorkerLists::Single(self.lent)
+    }
+}
+
+/// The one wire `wires` names, as a worker object dials one.
+fn dialed(wires: WireModes) -> Result<ConnectionMode, String> {
+    match wires {
+        WireModes::HTTP => Ok(ConnectionMode::Http),
+        WireModes::GRPC => Ok(ConnectionMode::Grpc),
+        WireModes::ZMQ => Ok(ConnectionMode::Zmq),
+        other => Err(format!("one wire is dialed, not {other:?}")),
+    }
+}
+
+/// The number of `runtime` on `wire`, as a host of this engine states it:
+/// one number to each runtime and transport it dials, written as a worker's
+/// fact and as a retry's demand alike. No runtime states none.
+fn on_wire(runtime: u32, wire: ConnectionMode) -> u32 {
+    let transport = match wire {
+        ConnectionMode::Http => 0,
+        ConnectionMode::Grpc => 1,
+        ConnectionMode::Zmq => 2,
+    };
+    if runtime == 0 {
+        0
+    } else {
+        runtime.saturating_mul(3).saturating_add(transport)
+    }
+}
+
+/// The worker object of `worker`, at `place` of its row: its wire is the
+/// one its object dials, its state is its object's own, and a rank it
+/// registered is its object's to say, with the rank and the group size
+/// its row records.
+fn object(place: usize, worker: &Pooled) -> Result<Arc<dyn Worker>, String> {
+    let mut built = <BasicWorkerBuilder>::new(format!("http://w{place}:8000"))
+        .connection_mode(dialed(worker.wire_modes)?)
+        .model(ModelCard::new(MODEL))
+        .health_config(HealthCheckConfig {
+            disable_health_check: true,
+            ..HealthCheckConfig::default()
+        });
+    match (worker.facts.ranked, worker.rank) {
+        (true, Some((rank, size))) => built = built.dp_config(rank, size),
+        (false, None) => {}
+        _ => return Err(format!("place {place} states a rank and its numbers apart")),
+    }
+    let object = built.build();
+    object.set_status(match worker.state {
+        State::Down => WorkerStatus::NotReady,
+        State::Free | State::Over => WorkerStatus::Ready,
+    });
+    if worker.state == State::Over {
+        object.set_overloaded(true);
+    }
+    Ok(Arc::new(object))
 }
 
 impl Bed {
@@ -157,56 +244,28 @@ impl Bed {
             ..BindingSpec::default()
         }];
         let applied = AppliedSpec::validate(&document).map_err(|err| err.to_string())?;
-        let store = Arc::new(MemoryStore::new());
-        let now = Instant::now();
-        let mut ids = Vec::with_capacity(workers.len());
-        for (place, worker) in workers.iter().enumerate() {
-            let url = format!("http://w{place}:8000");
-            let id = store
-                .upsert(WorkerFacts {
-                    key: url.clone(),
-                    engine: url,
-                    incarnation: 1,
-                    models: vec![MODEL.to_string()],
-                    dp_size: 1,
-                    wire_modes: worker.wire_modes,
-                    vision: worker.vision,
-                    demand_facts: worker.facts,
-                    ..WorkerFacts::default()
-                })
-                .id();
-            let revision = WorkersStore::get(&*store, id).ok_or("the row")?.revision;
-            let status = match worker.state {
-                State::Down => WorkerStatus::NotReady,
-                State::Free | State::Over => WorkerStatus::Ready,
-            };
-            store
-                .set_status(id, status, revision)
-                .ok_or("the row's status")?;
-            ids.push(id);
-        }
-        // The bed's host runs no loop: it asks the build its registrations
-        // owe, so the rows stand before the first record and request.
-        store.publish_now();
-        store.apply(applied).map_err(|err| format!("{err:?}"))?;
-        for (id, worker) in ids.iter().zip(workers) {
-            if worker.state == State::Over {
-                let over = LoadRow {
-                    queued: QUEUED_OVER,
-                    ..LoadRow::default()
-                };
-                store.record(*id, 0, over, now, LoadSource::Stream);
-                // A record inside the window of the one before waits for
-                // the window's end: the bed shows it there.
-                if let Some(due) = store.publish_due() {
-                    store.publish(due);
-                }
-            }
-        }
+        let engine = PolicyEngine::new(applied);
+        let objects: Result<Vec<_>, String> = (0..)
+            .zip(workers)
+            .map(|(place, worker)| object(place, worker))
+            .collect();
+        let list: Arc<[Arc<dyn Worker>]> = objects?.into();
+        // One fact a worker, in the list's order. A worker states its
+        // runtime on the wire its object dials.
+        let stated = |(worker, object): (&Pooled, &Arc<dyn Worker>)| {
+            let mut facts = FixedFacts::default();
+            facts.vision = worker.vision;
+            facts.demands = worker.facts;
+            facts.demands.runtime = on_wire(worker.facts.runtime, *object.connection_mode());
+            facts
+        };
+        let facts = workers.iter().zip(list.iter()).map(stated).collect();
         Ok(Self {
-            door: Door::new(store),
-            ids,
-            now,
+            engine,
+            list,
+            facts,
+            cell: ListCell::default(),
+            now: Instant::now(),
             seed: 0,
         })
     }
@@ -216,30 +275,61 @@ impl Bed {
     /// the words `refusal` keeps for a shed's reason and stage.
     pub fn answer(
         &mut self,
-        constraints: Constraints<'_>,
+        mut constraints: Constraints<'_>,
         refusal: impl Fn(ShedReason, &str) -> Refusal,
     ) -> Result<Answer, String> {
+        // A host of this engine holds a retry to its wire by its demand
+        // alone, the number of its runtime on that wire, and states no wire
+        // modes for a list it dials whole. A retry states the two together:
+        // one without the other has no number here.
+        match (
+            constraints.demands.runtime,
+            constraints.wire_modes.is_empty(),
+        ) {
+            (0, true) => {}
+            (0, false) => return Err("a transport stated with no runtime".to_string()),
+            (_, true) => return Err("a runtime stated with no transport".to_string()),
+            (runtime, false) => {
+                let wire = dialed(constraints.wire_modes)?;
+                constraints.demands.runtime = on_wire(runtime, wire);
+                constraints.wire_modes = WireModes::NONE;
+            }
+        }
         let mut placed = BTreeSet::new();
-        for _ in 0..ROUNDS * self.ids.len().max(1) {
+        for _ in 0..ROUNDS * self.list.len().max(1) {
             self.seed += 1;
             let id = self.seed.to_le_bytes();
-            let request = Request {
-                id: &id,
-                facts: RequestFacts {
-                    model: MODEL,
-                    seed: self.seed,
-                    ..RequestFacts::default()
+            let asked = Asked {
+                request: Request {
+                    id: &id,
+                    facts: RequestFacts {
+                        model: MODEL,
+                        seed: self.seed,
+                        ..RequestFacts::default()
+                    },
+                    constraints,
                 },
-                constraints,
+                lent: LentList {
+                    workers: &self.list,
+                    cell: &self.cell,
+                    facts: Some(&self.facts),
+                },
             };
-            let decided = self.door.decide(GatewayId::LOCAL, &request, self.now);
+            // A maker that says no request plain is answered whole.
+            let decided = self.engine.decide_under(GatewayId::LOCAL, &asked, self.now);
             let decided = decided.map_err(|refused| format!("no decision: {refused:?}"))?;
+            let (decided, _) = decided.whole().ok_or("a place alone")?;
             match decided.decision {
                 Decision::Pick(pick) => {
-                    let target = pick.targets.first().map(|target| target.id);
-                    let target = target.ok_or("a pick that names no worker")?;
-                    let place = self.ids.iter().position(|id| *id == target);
-                    placed.insert(place.ok_or("a worker of no place")?);
+                    let target = pick.targets.first().ok_or("a pick that names no worker")?;
+                    let place = target.position as usize;
+                    // A target names its worker twice: by its place in the
+                    // list and by the id of the object there.
+                    let object = self.list.get(place).ok_or("a worker of no place")?;
+                    if target.id != WorkerId::from_address(object.url()) {
+                        return Err(format!("place {place} under another worker's id"));
+                    }
+                    placed.insert(place);
                 }
                 Decision::Shed(shed) if placed.is_empty() => {
                     return Ok(Answer::Refused(refusal(shed.reason, shed.emptied_by)));

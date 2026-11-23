@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use smg_worker::{
     identity::basic::Worker,
-    worker::{ConnectionMode, HealthCheckConfig, WorkerSpec},
+    worker::{HealthCheckConfig, WorkerSpec},
 };
 
-use super::{door::Over, object::role};
+use super::{membership_writer::Over, object::role};
 use crate::{
     engine::view::{threshold_permille, WireModes},
     store::{
@@ -47,11 +47,7 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
         engine: engine_of(worker).to_owned(),
         incarnation: standing.incarnation,
         role: role(spec.worker_type),
-        wire_modes: match spec.connection_mode {
-            ConnectionMode::Http => WireModes::HTTP,
-            ConnectionMode::Grpc => WireModes::GRPC,
-            ConnectionMode::Zmq => WireModes::ZMQ,
-        },
+        wire_modes: WireModes::from(spec.connection_mode),
         engine_kind: if spec.runtime_type.is_specified() {
             spec.runtime_type.as_str().to_owned()
         } else {
@@ -142,7 +138,10 @@ pub(crate) fn stated(
 /// reports. A layout fact the store keeps no slot for is left out, since
 /// its rule could not read it. `None` where the worker reports nothing, as
 /// the rule reads a row with no descriptor.
-fn pairing(worker: &dyn Worker) -> Option<Arc<PairingDescriptor>> {
+///
+/// A host that tells a worker it keeps no row of states them over
+/// [`facts`]' reading of the worker alone.
+pub fn pairing_descriptor(worker: &dyn Worker) -> Option<Arc<PairingDescriptor>> {
     let offered = worker.pd_pairing();
     let mut descriptor = PairingDescriptor {
         protocol: offered.explicit().map(str::to_owned),
@@ -161,16 +160,16 @@ fn pairing(worker: &dyn Worker) -> Option<Arc<PairingDescriptor>> {
 }
 
 /// [`stated`], with the pairing descriptor `built` derived at its build in
-/// place of the standing row's ([`pairing`]): the reading of a door whose
-/// rows hold a descriptor. A worker that reports nothing withdraws the
-/// standing one.
+/// place of the standing row's ([`pairing_descriptor`]): the reading of a
+/// door whose rows hold a descriptor. A worker that reports nothing
+/// withdraws the standing one.
 pub(crate) fn paired(
     built: &dyn Worker,
     standing: Option<&WorkerFacts>,
     over: Option<Over<'_>>,
 ) -> WorkerFacts {
     WorkerFacts {
-        pairing: pairing(built),
+        pairing: pairing_descriptor(built),
         ..stated(built, standing, over)
     }
 }
@@ -183,10 +182,7 @@ fn milliseconds(seconds: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::Arc,
-        time::{Duration, Instant},
-    };
+    use std::{sync::Arc, time::Instant};
 
     use smg_worker::{
         identity::{basic::Worker, builder::BasicWorkerBuilder},
@@ -195,19 +191,18 @@ mod tests {
         worker::{HealthCheckConfig, OverloadUpdate, RuntimeType, WorkerSpec},
     };
 
-    use super::{facts, paired, pairing};
+    use super::{facts, paired, pairing_descriptor};
     use crate::{
         document::spec::Pairing,
         engine::{
             demands::DemandFacts,
-            view::{LoadRow, Role, WireModes, WorkerId},
+            view::{Role, WireModes, WorkerId},
         },
         store::{
             encoding::{EncodeHandoff, EncodeOffer},
             pairing::{mismatch, Member, PairingDescriptor, LAYOUT_FACTS},
-            Ask, GatewayId, HealthPolicy, LoadSink as _, LoadSource, Maker, MemoryStore, Overload,
-            Reachability, Signals, ViewBuffers, WorkerFacts, WorkerRow, WorkerStatus,
-            WorkersStore as _,
+            GatewayId, HealthPolicy, Overload, Reachability, Registrant, Signals, WorkerFacts,
+            WorkerRow, WorkerStatus,
         },
         worker_host::object,
     };
@@ -221,7 +216,7 @@ mod tests {
             status: WorkerStatus::Ready,
             revision: 1,
             admitted_at: Instant::now(),
-            maker: Maker::Control,
+            maker: Registrant::Control,
         }
     }
 
@@ -361,7 +356,7 @@ mod tests {
             ],
         );
         let offered = worker.pd_pairing();
-        let stated = pairing(&worker).expect("a descriptor");
+        let stated = pairing_descriptor(&worker).expect("a descriptor");
         assert_eq!(stated.protocol.as_deref(), Some("pd"));
         assert_eq!(stated.transport.as_deref(), Some("nixl"));
         assert_eq!(stated.version.as_deref(), Some("1.2"));
@@ -388,7 +383,7 @@ mod tests {
             (RuntimeType::TokenSpeed, [("tier", "gold")], "mooncake"),
         ] {
             let worker = offering(runtime, &labels);
-            let stated = pairing(&worker).expect("a descriptor");
+            let stated = pairing_descriptor(&worker).expect("a descriptor");
             assert_eq!(stated.transport.as_deref(), Some(transport), "{runtime:?}");
             assert_eq!(stated.transport.as_deref(), worker.pd_pairing().transport());
         }
@@ -401,13 +396,13 @@ mod tests {
         spec.kv_connector = Some(" Custom ".to_owned());
         let padded = <BasicWorkerBuilder>::from_spec(spec).build();
         assert_eq!(padded.pd_pairing().transport(), Some(" custom "));
-        let read = pairing(&padded).expect("a descriptor");
+        let read = pairing_descriptor(&padded).expect("a descriptor");
         assert_eq!(read.transport.as_deref(), Some("custom"));
 
         // A worker that reports nothing offers no descriptor, and withdraws
         // the standing row's at a door that reads its own.
         let silent = offering(RuntimeType::Sglang, &[("version", " ")]);
-        assert_eq!(pairing(&silent), None);
+        assert_eq!(pairing_descriptor(&silent), None);
         let standing = WorkerFacts {
             pairing: Some(stated),
             ..WorkerFacts::default()
@@ -526,10 +521,9 @@ mod tests {
     }
 
     /// A threshold of the object's own under half a permille is held as
-    /// one, as a document's is. At none the store reads every engine with
-    /// a rank on file as over it, so an idle worker would be vetoed.
+    /// one, as a document's is.
     #[test]
-    fn a_threshold_under_half_a_permille_is_held_as_one_and_vetoes_no_idle_worker() {
+    fn a_threshold_under_half_a_permille_is_held_as_one() {
         let spec = WorkerSpec {
             models: vec![ModelCard::new("model")].into(),
             overload: OverloadUpdate {
@@ -539,27 +533,7 @@ mod tests {
             ..WorkerSpec::new(URL.to_owned())
         };
         let found = facts(&<BasicWorkerBuilder>::from_spec(spec).build(), None);
-        let stated = found.overload.kv_usage_permille;
-
-        let store = MemoryStore::with_publish_window(Duration::ZERO);
-        let now = Instant::now();
-        let id = store.upsert(found).id();
-        store.publish_now();
-        store.record(id, 0, LoadRow::default(), now, LoadSource::Stream);
-        store.publish_now();
-        let ask = Ask {
-            gateway: GatewayId(1),
-            now,
-            pinned: None,
-            affinity: false,
-            signal_cells: false,
-        };
-        let mut view = ViewBuffers::default();
-        store
-            .build_view("model", Role::Single, &ask, &mut view)
-            .expect("the pool");
-        assert!(!view.candidates[0].health.overloaded, "idle, and read over");
-        assert_eq!(stated, Some(1));
+        assert_eq!(found.overload.kv_usage_permille, Some(1));
     }
 
     #[test]

@@ -67,6 +67,9 @@ const DEFAULT_VIDEO_MAX_DECODE_PIXELS: u64 = 1_000_000_000_000;
 /// overhead of frames to itself, so a denser sampling is not looked into.
 const SEEK_PLAN_MIN_FRAMES: usize = 1024;
 const SEEK_PLAN_MIN_FRAMES_PER_PICK: usize = 128;
+/// What is kept of a decoder or probe command's diagnostics, and what is
+/// read of a command that answers on standard output in a short text.
+const VIDEO_COMMAND_TEXT_BYTES: usize = 1024 * 1024;
 const DEFAULT_AUDIO_MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const _: () = assert!(DEFAULT_VIDEO_MAX_INPUT_BYTES < DEFAULT_VIDEO_MAX_DECODED_BYTES);
 static VIDEO_DECODE_BACKEND: OnceLock<Option<String>> = OnceLock::new();
@@ -989,11 +992,12 @@ impl MediaConnector {
         // The header is enough to plan the request by; the pixels are decoded
         // when preprocessing first asks for them, which a pixel-cache hit
         // never does.
-        let size = encoded_image_size(&bytes, max_long_side_pixel)?;
+        let (size, orientation) = encoded_image_size(&bytes, max_long_side_pixel)?;
 
         Ok(Arc::new(
             ImageFrame::encoded(bytes, detail, source, hash, size, max_long_side_pixel)
-                .with_transparency(transparency),
+                .with_transparency(transparency)
+                .with_header_orientation(Some(orientation)),
         ))
     }
 
@@ -2801,8 +2805,9 @@ async fn decode_video_with_ffmpeg(
     // ends right after its last pick, so a seek that lands elsewhere costs
     // its own segment and comes back short at once. The sequential decode
     // answers that, and anything else that goes wrong with the seeks, but a
-    // run past the process budget: the plan is at most half the sequential
-    // decode's work, so that would run past it as well. A probe that states
+    // run past the process budget (the plan is at most half the sequential
+    // decode's work, so that would run past it as well) and a run refused
+    // its memory, which ends the decode by rule. A probe that states
     // no size (ffprobe's `0x0` for a stream whose codec parameters it could
     // not find) frames nothing for the seek runner, as for the headed and
     // raw ones: such a clip takes the sequential route, where the runner
@@ -2850,6 +2855,9 @@ async fn decode_video_with_ffmpeg(
                         probed,
                         plan.decoded_frames(),
                     ));
+                }
+                if is_out_of_memory(&error) {
+                    return Err(error);
                 }
             }
         }
@@ -2917,6 +2925,9 @@ async fn decode_video_with_ffmpeg(
                 {
                     Ok(decoded) => return Ok(decoded),
                     Err(error) => {
+                        if is_out_of_memory(&error) {
+                            return Err(error);
+                        }
                         if log_video_decode_timing_enabled() {
                             info!(
                                 error = %error,
@@ -3397,7 +3408,8 @@ const VIDEO_MAX_DECODE_PIXELS_KNOB: &str = "SMG_VIDEO_MAX_DECODE_PIXELS";
 /// refusals: the bytes it would decode to, the frame list its picks need) or
 /// its work (named in the decoder's message), or ended for its time: a budget
 /// no other runner over the same stream, and no resampling of it, can answer,
-/// so it ends the decode instead of starting the next runner.
+/// so it ends the decode instead of starting the next runner. So does a
+/// command refused its memory ([`is_out_of_memory`]), by rule.
 fn is_video_budget_error(error: &MediaConnectorError) -> bool {
     is_video_command_timeout(error)
         || matches!(
@@ -3406,6 +3418,28 @@ fn is_video_budget_error(error: &MediaConnectorError) -> bool {
                 | MediaConnectorError::FrameListTooLong { .. }
         )
         || matches!(error, MediaConnectorError::VideoDecode(message) if message.contains(VIDEO_MAX_DECODE_PIXELS_KNOB))
+        || is_out_of_memory(error)
+}
+
+/// `true` for a decode that was refused memory: one of its reservations
+/// ([`out_of_memory`]), or a pipe the system could not serve. Where the error
+/// of a frame runner decides a fallback, this one ends the decode by rule: no
+/// next runner, no sequential pass after the seeks, no resampling after a
+/// resized selection. The probes handle their own errors. It reads the kind,
+/// which is what [`MediaConnectorError::fallback_failed`] keeps of such an
+/// error.
+fn is_out_of_memory(error: &MediaConnectorError) -> bool {
+    matches!(error, MediaConnectorError::DecodeIo(io) if io.kind() == std::io::ErrorKind::OutOfMemory)
+}
+
+/// The error of a reservation the allocator refused, which is this process's:
+/// a command's output, the joined output of the seek runs, the raw runner's
+/// frame records.
+fn out_of_memory(message: String) -> MediaConnectorError {
+    MediaConnectorError::DecodeIo(std::io::Error::new(
+        std::io::ErrorKind::OutOfMemory,
+        message,
+    ))
 }
 
 /// Runs a decoder command to completion under the video process timeout. A
@@ -3413,16 +3447,45 @@ fn is_video_budget_error(error: &MediaConnectorError) -> bool {
 /// process's ([`MediaConnectorError::DecoderUnavailable`]), reported in the
 /// operator's terms, and so is the command's own I/O (a pipe that breaks:
 /// [`MediaConnectorError::DecodeIo`]); only what the decoder says about the
-/// clip is the media's.
+/// clip is the media's. `stdout_bytes` is the size the caller expects on
+/// stdout (0: not known): the output is read into memory reserved once at
+/// that size, so what arrived is not moved each time a growing buffer fills.
+/// A reservation the allocator refuses is this process's and ends the decode
+/// ([`is_out_of_memory`]). `stdout_limit` is the most the caller can use: a
+/// command that writes more is ended there, refused as a decode over the
+/// decoded byte limit when its output passed that as well. Of its
+/// diagnostics the first [`VIDEO_COMMAND_TEXT_BYTES`] are kept.
 async fn run_video_command_output(
     mut command: Command,
     program: &'static str,
+    stdout_bytes: usize,
+    stdout_limit: usize,
 ) -> Result<Output, MediaConnectorError> {
+    async fn read_pipe(
+        pipe: &mut Option<impl AsyncReadExt + Unpin>,
+        bytes: &mut Vec<u8>,
+        limit: usize,
+    ) -> Result<(), MediaConnectorError> {
+        if let Some(pipe) = pipe {
+            pipe.take(u64::try_from(limit).unwrap_or(u64::MAX))
+                .read_to_end(bytes)
+                .await
+                .map_err(MediaConnectorError::DecodeIo)?;
+        }
+        Ok(())
+    }
+
+    let mut stdout = Vec::new();
+    stdout.try_reserve_exact(stdout_bytes).map_err(|e| {
+        out_of_memory(format!(
+            "failed to reserve {stdout_bytes} bytes for the {program} output: {e}"
+        ))
+    })?;
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let child = command.spawn().map_err(|e| {
+    let mut child = command.spawn().map_err(|e| {
         let message = if e.kind() == std::io::ErrorKind::NotFound {
             format!("{program} executable not found; install {program} to decode video_url inputs")
         } else {
@@ -3431,10 +3494,53 @@ async fn run_video_command_output(
         MediaConnectorError::DecoderUnavailable(std::io::Error::new(e.kind(), message))
     })?;
 
+    // Both pipes are read beside the wait and dropped after it, as
+    // `Child::wait_with_output` does.
+    let (mut stdout_pipe, mut stderr_pipe) = (child.stdout.take(), child.stderr.take());
+    let mut stderr = Vec::new();
+    let run = futures::future::try_join3(
+        async { child.wait().await.map_err(MediaConnectorError::DecodeIo) },
+        async {
+            // One byte past the limit tells a longer output, and ends the run.
+            read_pipe(
+                &mut stdout_pipe,
+                &mut stdout,
+                stdout_limit.saturating_add(1),
+            )
+            .await?;
+            if stdout.len() > stdout_limit {
+                ensure_decoded_byte_limit(stdout.len())?;
+                return Err(MediaConnectorError::VideoDecode(format!(
+                    "{program} wrote more than the {stdout_limit} bytes its caller reads"
+                )));
+            }
+            Ok(())
+        },
+        async {
+            read_pipe(&mut stderr_pipe, &mut stderr, VIDEO_COMMAND_TEXT_BYTES).await?;
+            match &mut stderr_pipe {
+                // A text that fills what is kept may go on: the rest is read
+                // and dropped, as a full pipe nobody reads holds the command
+                // until the timeout.
+                Some(rest) if stderr.len() >= VIDEO_COMMAND_TEXT_BYTES => {
+                    tokio::io::copy(rest, &mut tokio::io::sink())
+                        .await
+                        .map(|_| ())
+                        .map_err(MediaConnectorError::DecodeIo)
+                }
+                _ => Ok(()),
+            }
+        },
+    );
     let timeout = video_process_timeout();
-    match time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(error)) => Err(MediaConnectorError::DecodeIo(error)),
+    let ended = time::timeout(timeout, run).await;
+    match ended {
+        Ok(Ok((status, (), ()))) => Ok(Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        Ok(Err(error)) => Err(error),
         Err(_) => Err(MediaConnectorError::VideoDecode(format!(
             "{program} {VIDEO_COMMAND_TIMED_OUT} {:.3} seconds",
             timeout.as_secs_f64()
@@ -3448,8 +3554,10 @@ async fn run_video_command_output(
 async fn run_video_command_checked(
     command: Command,
     program: &'static str,
+    stdout_bytes: usize,
+    stdout_limit: usize,
 ) -> Result<Output, MediaConnectorError> {
-    let output = run_video_command_output(command, program).await?;
+    let output = run_video_command_output(command, program, stdout_bytes, stdout_limit).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(MediaConnectorError::VideoDecode(format!(
@@ -3467,23 +3575,22 @@ async fn decode_video_with_ffmpeg_ppm(
 ) -> Result<DecodedRgbVideo, MediaConnectorError> {
     let frame_args = FfmpegFrameArgs::for_metadata(selection, metadata, cfg).await?;
     let frame_size = rawvideo_frame_size(metadata.width, metadata.height)?;
-    let target_frames = selection.map_or_else(
-        || expected_sampled_frame_count(metadata, cfg),
-        FrameSelection::unique_count,
-    );
+    let counted = selection
+        .map(FrameSelection::unique_count)
+        .or_else(|| expected_sampled_frame_count(metadata, cfg));
+    let target_frames = counted.unwrap_or(cfg.max_frames);
     let decoded_bytes = checked_decoded_rgb_bytes(target_frames, frame_size)?;
     let output_limit = decoded_bytes
         .checked_add(target_frames.saturating_mul(64))
         .unwrap_or_else(video_max_decoded_bytes)
-        .min(video_max_decoded_bytes())
-        .to_string();
+        .min(video_max_decoded_bytes());
     let active_decode = ActiveVideoDecode::enter_async().await;
     let mut command = ffmpeg_decode_command(decoder_threads(active_decode.count()), true);
     command.arg(input_path);
     frame_args.apply(&mut command);
     command.args([
         "-fs",
-        &output_limit,
+        &output_limit.to_string(),
         "-f",
         "image2pipe",
         "-vcodec",
@@ -3492,7 +3599,30 @@ async fn decode_video_with_ffmpeg_ppm(
         "rgb24",
         "pipe:1",
     ]);
-    let output = run_video_command_checked(command, "ffmpeg").await?;
+    // A count that is only the frame ceiling states no size, so that a few
+    // frames do not reserve the ceiling. Without a selection the decoder's
+    // frame count is that ceiling, and it ends at the output limit only after
+    // the frame that reaches it: below the ceiling, one frame past the limit
+    // can arrive.
+    let past_limit = if selection.is_none() && target_frames < cfg.max_frames {
+        frame_size.saturating_add(64)
+    } else {
+        0
+    };
+    let stdout_bytes = counted.map_or(0, |_| {
+        output_limit
+            .saturating_add(past_limit)
+            .min(video_max_decoded_bytes())
+    });
+    // Past the decoded byte limit and the frames' headers, the frames
+    // parsed below pass the limit: the run ends there with that refusal. A
+    // frame is three bytes at least, which bounds the headers.
+    let headers = target_frames
+        .max(cfg.max_frames)
+        .min(video_max_decoded_bytes() / 3)
+        .saturating_mul(64);
+    let stdout_limit = video_max_decoded_bytes().saturating_add(headers);
+    let output = run_video_command_checked(command, "ffmpeg", stdout_bytes, stdout_limit).await?;
 
     let mut video = parse_ppm_rgb_video(Bytes::from(output.stdout))?;
     if let Some(frame) = video.frames.first() {
@@ -3521,10 +3651,10 @@ async fn decode_video_with_ffmpeg_raw(
 ) -> Result<DecodedRgbVideo, MediaConnectorError> {
     let frame_args = FfmpegFrameArgs::for_metadata(selection, metadata, cfg).await?;
     let frame_size = rawvideo_frame_size(metadata.width, metadata.height)?;
-    let target_frames = selection.map_or_else(
-        || expected_sampled_frame_count(metadata, cfg),
-        FrameSelection::unique_count,
-    );
+    let counted = selection
+        .map(FrameSelection::unique_count)
+        .or_else(|| expected_sampled_frame_count(metadata, cfg));
+    let target_frames = counted.unwrap_or(cfg.max_frames);
     let decoded_bytes = checked_decoded_rgb_bytes(target_frames, frame_size)?;
     let output_limit = decoded_bytes.to_string();
     // Rawvideo has no per-frame header, so stdout is framed by the metadata's
@@ -3548,13 +3678,18 @@ async fn decode_video_with_ffmpeg_raw(
         "rgb24",
         "pipe:1",
     ]);
-    let output = run_video_command_checked(command, "ffmpeg").await?;
+    // Headerless output ends at its limit, which is its size: nothing passes it.
+    let stdout_bytes = counted.map_or(0, |_| decoded_bytes);
+    // Past the decoded byte limit and one frame, the frames counted below
+    // pass the limit.
+    let stdout_limit = video_max_decoded_bytes().saturating_add(frame_size);
+    let output = run_video_command_checked(command, "ffmpeg", stdout_bytes, stdout_limit).await?;
 
     let frame_count = output.stdout.len() / frame_size;
     checked_decoded_rgb_bytes(frame_count, frame_size)?;
     let mut frames = Vec::new();
     frames.try_reserve(frame_count).map_err(|e| {
-        MediaConnectorError::VideoDecode(format!(
+        out_of_memory(format!(
             "failed to reserve {frame_count} decoded video frame records: {e}"
         ))
     })?;
@@ -3613,7 +3748,13 @@ async fn decode_video_with_ffmpeg_png(
         "png",
         "pipe:1",
     ]);
-    let output = run_video_command_checked(command, "ffmpeg").await?;
+    // The decoder's limit lets the frame that crosses it through, and a
+    // frame whose PNG is three times the limit and its fixed framing long
+    // decodes past the limit.
+    let stdout_limit = video_max_decoded_bytes()
+        .saturating_mul(4)
+        .saturating_add(VIDEO_COMMAND_TEXT_BYTES);
+    let output = run_video_command_checked(command, "ffmpeg", 0, stdout_limit).await?;
 
     let pngs = split_png_stream(&output.stdout)?;
     let mut frames = Vec::with_capacity(pngs.len());
@@ -3785,7 +3926,7 @@ async fn probe_video_info(input_path: &Path) -> Result<ProbedVideoInfo, MediaCon
             "json",
         ])
         .arg(input_path);
-    let output = run_video_command_checked(command, "ffprobe").await?;
+    let output = run_video_command_checked(command, "ffprobe", 0, VIDEO_COMMAND_TEXT_BYTES).await?;
 
     parse_ffprobe_video_info(&output.stdout)
 }
@@ -3807,7 +3948,7 @@ async fn probe_decoded_frame_count(input_path: &Path) -> Result<usize, MediaConn
             "json",
         ])
         .arg(input_path);
-    let output = run_video_command_checked(command, "ffprobe").await?;
+    let output = run_video_command_checked(command, "ffprobe", 0, VIDEO_COMMAND_TEXT_BYTES).await?;
 
     let probe: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
         MediaConnectorError::VideoDecode(format!("failed to parse ffprobe output: {error}"))
@@ -3825,8 +3966,12 @@ async fn probe_decoded_frame_count(input_path: &Path) -> Result<usize, MediaConn
 
 /// The stream's frames in presentation order, listed by the probe tool
 /// without decoding anything; `None` when the listing is not one a seek plan
-/// can be built on.
-async fn probe_frame_table(input_path: &Path) -> Result<Option<FrameTable>, MediaConnectorError> {
+/// can be built on. A plan is built only on a listing of `frames` packets,
+/// so a longer one is not read to its end.
+async fn probe_frame_table(
+    input_path: &Path,
+    frames: usize,
+) -> Result<Option<FrameTable>, MediaConnectorError> {
     let mut command = Command::new("ffprobe");
     command
         .args([
@@ -3840,7 +3985,13 @@ async fn probe_frame_table(input_path: &Path) -> Result<Option<FrameTable>, Medi
             "csv",
         ])
         .arg(input_path);
-    let output = run_video_command_checked(command, "ffprobe").await?;
+    // A packet's line (`packet,<pts>,<flags>`) fits 32 bytes; a listing
+    // past a quarter of the largest clip is of no stream a plan serves.
+    let listing_limit = frames
+        .saturating_mul(32)
+        .min(video_max_input_bytes() / 4)
+        .saturating_add(VIDEO_COMMAND_TEXT_BYTES);
+    let output = run_video_command_checked(command, "ffprobe", 0, listing_limit).await?;
 
     Ok(FrameTable::parse(&output.stdout))
 }
@@ -3856,7 +4007,7 @@ async fn seek_plan_for(input_path: &Path, selection: &FrameSelection) -> Option<
     {
         return None;
     }
-    let table = match probe_frame_table(input_path).await {
+    let table = match probe_frame_table(input_path, selection.total_frames).await {
         Ok(table) => table?,
         Err(error) => {
             if log_video_decode_timing_enabled() {
@@ -3902,7 +4053,10 @@ async fn decode_video_with_ffmpeg_seek(
                 .saturating_add(picks.saturating_mul(64))
                 .min(video_max_decoded_bytes());
             let command = ffmpeg_seek_run_command(input_path, segment, output_limit, passthrough);
-            let output = run_video_command_checked(command, "ffmpeg").await?;
+            // The decoder ends at its limit only after the frame that reaches it.
+            let stdout_limit = output_limit.saturating_add(frame_size).saturating_add(64);
+            let output =
+                run_video_command_checked(command, "ffmpeg", output_limit, stdout_limit).await?;
             // A run that comes back short ends the decode here, before the
             // other runs finish: its seek did not land where the plan says.
             let frames = if output.stdout.is_empty() {
@@ -3947,13 +4101,13 @@ async fn decode_video_with_ffmpeg_seek(
     };
     drop(active_decode);
 
+    let joined_bytes = expected_bytes.saturating_add(selection.unique_count().saturating_mul(64));
     let mut data = Vec::new();
-    data.try_reserve(expected_bytes.saturating_add(selection.unique_count().saturating_mul(64)))
-        .map_err(|e| {
-            MediaConnectorError::VideoDecode(format!(
-                "failed to reserve {expected_bytes} bytes for the decoded video frames: {e}"
-            ))
-        })?;
+    data.try_reserve(joined_bytes).map_err(|e| {
+        out_of_memory(format!(
+            "failed to reserve {joined_bytes} bytes for the decoded video frames: {e}"
+        ))
+    })?;
     let mut frames = Vec::with_capacity(selection.unique_count());
     for (stdout, run_frames) in outputs {
         let base = data.len();
@@ -4077,15 +4231,17 @@ fn fps_filter_for_metadata(metadata: VideoMetadata, cfg: VideoFetchConfig) -> St
         .unwrap_or_else(|| format!("fps={}", cfg.sample_fps))
 }
 
-fn expected_sampled_frame_count(metadata: VideoMetadata, cfg: VideoFetchConfig) -> usize {
-    if let Some(duration) = metadata.duration_seconds {
-        if duration.is_finite() && duration > 0.0 {
-            return (duration * cfg.sample_fps)
-                .round()
-                .clamp(cfg.min_frames as f64, cfg.max_frames as f64) as usize;
-        }
-    }
-    cfg.max_frames
+/// The frames a clip is resampled to by its duration; `None` for a clip whose
+/// length the probe did not give, which is held to the frame ceiling alone.
+fn expected_sampled_frame_count(metadata: VideoMetadata, cfg: VideoFetchConfig) -> Option<usize> {
+    let duration = metadata
+        .duration_seconds
+        .filter(|duration| duration.is_finite() && *duration > 0.0)?;
+    Some(
+        (duration * cfg.sample_fps)
+            .round()
+            .clamp(cfg.min_frames as f64, cfg.max_frames as f64) as usize,
+    )
 }
 
 fn effective_sample_fps(duration_seconds: Option<f64>, cfg: VideoFetchConfig) -> f64 {
@@ -4681,7 +4837,8 @@ async fn ffmpeg_passthrough_flag() -> [&'static str; 2] {
     }
     let mut command = Command::new("ffmpeg");
     command.arg("-version");
-    let output = match run_video_command_output(command, "ffmpeg").await {
+    let run = run_video_command_output(command, "ffmpeg", 0, VIDEO_COMMAND_TEXT_BYTES);
+    let output = match run.await {
         Ok(output) => output,
         // A probe that did not run says nothing about the build: the current
         // flag for this decode, and the next decode probes again.
@@ -4772,7 +4929,7 @@ async fn probe_video_duration_seconds_with_ffmpeg(
     command
         .args(["-hide_banner", "-nostdin", "-i"])
         .arg(input_path);
-    let output = run_video_command_output(command, "ffmpeg").await?;
+    let output = run_video_command_output(command, "ffmpeg", 0, VIDEO_COMMAND_TEXT_BYTES).await?;
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     parse_ffmpeg_duration_seconds(&stderr).ok_or_else(|| {
@@ -5015,7 +5172,7 @@ mod tests;
 
 /// The vision patch factor MiniMax-M3's `max_long_side_pixel` must align to
 /// (patch_size 14 * spatial merge 2).
-pub const MAX_LONG_SIDE_PIXEL_FACTOR: u32 = 28;
+pub(crate) const MAX_LONG_SIDE_PIXEL_FACTOR: u32 = 28;
 
 /// Reject a `max_long_side_pixel` that is zero or not a multiple of the patch
 /// factor, so the value cannot silently round to a different resolution tier.
@@ -5064,10 +5221,15 @@ fn validate_max_long_side_pixel(value: Option<u32>) -> Result<(), MediaConnector
 /// (`ico_png_entry`). AVIF is not decoded: no decoder for it is among the
 /// crate's dependencies, and such a file is refused with a typed error that
 /// names the format.
-pub(crate) fn decode_image_bytes(
+///
+/// `header_orientation` is the tag [`encoded_image_size`] read from these
+/// bytes, when the caller holds it: the JPEG path then applies it without
+/// parsing the header again.
+pub(crate) fn decode_frame_bytes(
     bytes: &[u8],
     max_long_side_pixel: Option<u32>,
     transparency: TransparencyPolicy,
+    header_orientation: Option<image::metadata::Orientation>,
 ) -> Result<image::DynamicImage, MediaConnectorError> {
     // An icon file whose chosen entry is a PNG is that PNG from here on
     // (`ico_png_entry`): the entry's own colour type and chunks then drive
@@ -5078,7 +5240,10 @@ pub(crate) fn decode_image_bytes(
     let mut image = match decode_jpeg_rgb(bytes) {
         Some(image) => {
             // libjpeg-turbo yields pixels only; the tag comes from the header.
-            oriented(image, jpeg_orientation(bytes))
+            oriented(
+                image,
+                header_orientation.unwrap_or_else(|| jpeg_orientation(bytes)),
+            )
         }
         None => {
             // A JPEG that ends where the reference loader refuses it (a scan
@@ -5443,12 +5608,23 @@ fn composite_over_white(rgba: &image::RgbaImage) -> image::RgbImage {
     image::RgbImage::from_raw(width, height, out).expect("buffer matches image dimensions")
 }
 
+/// [`decode_frame_bytes`] for bytes whose header nobody read first.
+#[cfg(test)]
+pub(crate) fn decode_image_bytes(
+    bytes: &[u8],
+    max_long_side_pixel: Option<u32>,
+    transparency: TransparencyPolicy,
+) -> Result<image::DynamicImage, MediaConnectorError> {
+    decode_frame_bytes(bytes, max_long_side_pixel, transparency, None)
+}
+
 /// The dimensions the decode will produce, from the header alone (after the
-/// orientation tag, which swaps the axes for the 90-degree rotations).
+/// orientation tag, which swaps the axes for the 90-degree rotations), and
+/// that tag.
 pub(crate) fn encoded_image_size(
     bytes: &[u8],
     max_long_side_pixel: Option<u32>,
-) -> Result<ImageSize, MediaConnectorError> {
+) -> Result<(ImageSize, image::metadata::Orientation), MediaConnectorError> {
     // The same entry the decode reads, so the two agree on an icon.
     let bytes = ico_png_entry(bytes).unwrap_or(bytes);
     let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
@@ -5467,7 +5643,7 @@ pub(crate) fn encoded_image_size(
     let (width, height) = max_long_side_pixel
         .and_then(|cap| capped_dimensions(width, height, cap))
         .unwrap_or((width, height));
-    Ok(ImageSize::new(width, height))
+    Ok((ImageSize::new(width, height), orientation))
 }
 
 /// The EXIF orientation of a JPEG, from its header alone; absent or

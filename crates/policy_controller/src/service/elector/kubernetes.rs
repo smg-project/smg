@@ -33,7 +33,7 @@ use k8s_openapi::{
 use kube::{api::PostParams, Api, Client};
 use tokio::runtime::Handle;
 
-use super::{ElectError, LeaseBackend, LeaseRecord, Written};
+use super::{ConditionalWriteOutcome, ElectError, LeaseBackend, LeaseRecord};
 
 /// The annotation on the `Lease` object that carries the fencing term.
 pub const TERM_ANNOTATION: &str = "smg.policy/term";
@@ -111,7 +111,7 @@ impl KubernetesLease {
         Ok(record)
     }
 
-    fn create(&mut self, record: &LeaseRecord) -> Result<Written, ElectError> {
+    fn create(&mut self, record: &LeaseRecord) -> Result<ConditionalWriteOutcome, ElectError> {
         let object = Lease {
             metadata: ObjectMeta {
                 name: Some(self.name.clone()),
@@ -130,10 +130,10 @@ impl KubernetesLease {
         {
             Ok(stored) => {
                 self.seen = Some(stored);
-                Ok(Written::Done)
+                Ok(ConditionalWriteOutcome::Done)
             }
             // Another candidate created the object first.
-            Err(err) if status_code(&err) == Some(CONFLICT) => Ok(Written::Moved),
+            Err(err) if status_code(&err) == Some(CONFLICT) => Ok(ConditionalWriteOutcome::Moved),
             Err(err) => Err(self.io(err)),
         }
     }
@@ -214,24 +214,24 @@ impl LeaseBackend for KubernetesLease {
         &mut self,
         expected: Option<&LeaseRecord>,
         record: &LeaseRecord,
-    ) -> Result<Written, ElectError> {
+    ) -> Result<ConditionalWriteOutcome, ElectError> {
         let Some(expected) = expected else {
             return match self.seen {
                 None => self.create(record),
-                Some(_) => Ok(Written::Moved),
+                Some(_) => Ok(ConditionalWriteOutcome::Moved),
             };
         };
         for _ in 0..MOVES_UNDER_AN_UNCHANGED_RECORD {
             let Some(seen) = self.seen.clone() else {
-                return Ok(Written::Moved);
+                return Ok(ConditionalWriteOutcome::Moved);
             };
             if self.record_of(&seen)? != *expected {
-                return Ok(Written::Moved);
+                return Ok(ConditionalWriteOutcome::Moved);
             }
             match self.replace(&seen, record)? {
                 Some(stored) => {
                     self.seen = Some(stored);
-                    return Ok(Written::Done);
+                    return Ok(ConditionalWriteOutcome::Done);
                 }
                 // The object moved: by its record, which the next round
                 // answers `Moved` for, or by its metadata alone, which the
@@ -323,7 +323,7 @@ pub(in crate::service::elector) mod tests {
     use tokio::runtime::Runtime;
 
     use super::*;
-    use crate::service::elector::{ElectionSettings, Elector, Tick};
+    use crate::service::elector::{ElectionSettings, Elector, TickOutcome};
 
     const S: Duration = Duration::from_secs(1);
 
@@ -530,7 +530,10 @@ pub(in crate::service::elector) mod tests {
         let mut backend = cell.backend();
         assert_eq!(backend.read().expect("read"), None);
         let first = record("a@host:1", 1, 1_700_000_000_000_002);
-        assert_eq!(backend.write(None, &first).expect("create"), Written::Done);
+        assert_eq!(
+            backend.write(None, &first).expect("create"),
+            ConditionalWriteOutcome::Done
+        );
         assert_eq!(backend.read().expect("read"), Some(first.clone()));
         let object = cell.server.object();
         let spec = object.spec.clone().expect("a spec");
@@ -565,7 +568,7 @@ pub(in crate::service::elector) mod tests {
         };
         assert_eq!(
             backend.write(Some(&first), &released).expect("release"),
-            Written::Done
+            ConditionalWriteOutcome::Done
         );
         assert_eq!(backend.read().expect("read"), Some(released));
         let spec = cell.server.object().spec.expect("a spec");
@@ -596,7 +599,7 @@ pub(in crate::service::elector) mod tests {
         assert_eq!(empty.term, 0);
         let mut a = cell.candidate("a@host:1");
         let t0 = Instant::now() + AHEAD;
-        assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+        assert_eq!(a.tick(t0).expect("take"), TickOutcome::Acquired { term: 1 });
         // Term zero is no holder's word, and an apply that replaces the
         // object leaves this shape under a live leader: the fence stays
         // closed for one renew deadline, as over no record.
@@ -614,22 +617,25 @@ pub(in crate::service::elector) mod tests {
         assert_eq!(a.read().expect("read"), None);
         assert_eq!(b.read().expect("read"), None);
         let first = record("a@host:1", 1, 10);
-        assert_eq!(a.write(None, &first).expect("create"), Written::Done);
+        assert_eq!(
+            a.write(None, &first).expect("create"),
+            ConditionalWriteOutcome::Done
+        );
         assert_eq!(
             b.write(None, &record("b@host:2", 1, 11)).expect("create"),
-            Written::Moved,
+            ConditionalWriteOutcome::Moved,
             "the object exists"
         );
         assert_eq!(b.read().expect("read"), Some(first.clone()));
         let second = record("a@host:1", 1, 12);
         assert_eq!(
             a.write(Some(&first), &second).expect("renew"),
-            Written::Done
+            ConditionalWriteOutcome::Done
         );
         assert_eq!(
             b.write(Some(&first), &record("b@host:2", 2, 13))
                 .expect("take"),
-            Written::Moved,
+            ConditionalWriteOutcome::Moved,
             "the record moved under b's version"
         );
         assert_eq!(b.read().expect("read"), Some(second));
@@ -640,7 +646,10 @@ pub(in crate::service::elector) mod tests {
         let cell = Cell::new();
         let mut a = cell.backend();
         let first = record("a@host:1", 1, 10);
-        assert_eq!(a.write(None, &first).expect("create"), Written::Done);
+        assert_eq!(
+            a.write(None, &first).expect("create"),
+            ConditionalWriteOutcome::Done
+        );
         assert_eq!(a.read().expect("read"), Some(first.clone()));
         // An operator deletes the object under the holder: the renewal's
         // replace answers 404, the re-read finds nothing, and the write is
@@ -649,7 +658,7 @@ pub(in crate::service::elector) mod tests {
         assert_eq!(
             a.write(Some(&first), &record("a@host:1", 1, 11))
                 .expect("renew"),
-            Written::Moved
+            ConditionalWriteOutcome::Moved
         );
         let methods: Vec<String> = cell
             .server
@@ -661,7 +670,7 @@ pub(in crate::service::elector) mod tests {
         assert_eq!(a.read().expect("read"), None);
         assert_eq!(
             a.write(None, &record("a@host:1", 2, 12)).expect("take"),
-            Written::Done,
+            ConditionalWriteOutcome::Done,
             "the next take creates the object afresh"
         );
     }
@@ -671,13 +680,16 @@ pub(in crate::service::elector) mod tests {
         let cell = Cell::new();
         let mut a = cell.backend();
         let first = record("a@host:1", 1, 10);
-        assert_eq!(a.write(None, &first).expect("create"), Written::Done);
+        assert_eq!(
+            a.write(None, &first).expect("create"),
+            ConditionalWriteOutcome::Done
+        );
         assert_eq!(a.read().expect("read"), Some(first.clone()));
         cell.server.touch();
         let second = record("a@host:1", 1, 12);
         assert_eq!(
             a.write(Some(&first), &second).expect("renew"),
-            Written::Done
+            ConditionalWriteOutcome::Done
         );
         let object = cell.server.object();
         assert_eq!(
@@ -722,7 +734,10 @@ pub(in crate::service::elector) mod tests {
             Some("a@host:1"),
             "the take landed"
         );
-        assert_eq!(a.tick(t0 + S).expect("own"), Tick::Acquired { term: 1 });
+        assert_eq!(
+            a.tick(t0 + S).expect("own"),
+            TickOutcome::Acquired { term: 1 }
+        );
         // No Lease record stood at the attempt, and an attempt in doubt
         // dates nothing: the fence opens one renew deadline after the write
         // that made the take this run's own. The take alone carries it
@@ -731,7 +746,7 @@ pub(in crate::service::elector) mod tests {
         assert_eq!(a.fence().leader_term(t0 + 3 * S), None);
         assert_eq!(
             a.tick(t0 + 2 * S).expect("renew"),
-            Tick::Renewed { term: 1 }
+            TickOutcome::Renewed { term: 1 }
         );
         assert_eq!(a.fence().leader_term(t0 + 2 * S), None);
         assert_eq!(a.fence().leader_term(t0 + 3 * S), Some(1));
@@ -772,8 +787,11 @@ pub(in crate::service::elector) mod tests {
         let mut a = Elector::new(Box::new(cell.backend()), "a@host:1", settings).expect("settings");
         // A minute ahead of the clock: each write here crosses a socket.
         let t0 = Instant::now() + 60 * S;
-        assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
-        assert_eq!(a.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
+        assert_eq!(a.tick(t0).expect("take"), TickOutcome::Acquired { term: 1 });
+        assert_eq!(
+            a.tick(t0 + S).expect("renew"),
+            TickOutcome::Renewed { term: 1 }
+        );
         assert!(a.waits_to_lead());
         assert!(a.release().expect("release"));
         let spec = cell.server.object().spec.expect("a spec");
@@ -788,35 +806,38 @@ pub(in crate::service::elector) mod tests {
         let mut a = cell.candidate("a@host:1");
         let mut b = cell.candidate("b@host:2");
         let t0 = Instant::now() + AHEAD;
-        assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+        assert_eq!(a.tick(t0).expect("take"), TickOutcome::Acquired { term: 1 });
         assert_eq!(
             b.tick(t0 + S / 2).expect("follow"),
-            Tick::Following {
+            TickOutcome::Following {
                 holder: "a@host:1".to_string(),
                 term: 1
             }
         );
-        assert_eq!(a.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
+        assert_eq!(
+            a.tick(t0 + S).expect("renew"),
+            TickOutcome::Renewed { term: 1 }
+        );
         // The holder stalls; b takes the lease once the record stood still
         // for its duration from b's first sight of the renewal.
         let first_sight = t0 + S + S / 2;
         assert!(matches!(
             b.tick(first_sight).expect("follow"),
-            Tick::Following { .. }
+            TickOutcome::Following { .. }
         ));
         assert!(matches!(
             b.tick(first_sight + 3 * S - Duration::from_micros(1))
                 .expect("follow"),
-            Tick::Following { .. }
+            TickOutcome::Following { .. }
         ));
         assert_eq!(
             b.tick(first_sight + 3 * S).expect("take"),
-            Tick::Acquired { term: 2 }
+            TickOutcome::Acquired { term: 2 }
         );
         assert_eq!(a.fence().leader_term(first_sight + 3 * S), None);
         assert_eq!(
             a.tick(first_sight + 4 * S).expect("look"),
-            Tick::Lost {
+            TickOutcome::Lost {
                 term: 1,
                 holder: "b@host:2".to_string()
             }

@@ -281,7 +281,8 @@ fn symphony_table_of(
 }
 
 /// Under `--parser symphony`, the registry's table reads a model it knows for every worker whose
-/// labels select no reader (none, or a reasoning name alone that no table answers to), whatever the
+/// labels select no reader (none, or a reasoning name alone that no table answers to or that gives
+/// way), whatever the
 /// gateway's `--tool-call-parser` and `--reasoning-parser` name (`regular::symphony::names::reads`). When
 /// they name another reader, the registration of the model's first worker says so: `Some(message)`
 /// while no worker of the model is registered, naming the model, both readers and the one used;
@@ -1276,8 +1277,8 @@ mod tests {
     /// carries no override, and its grammar start reads as advertised.
     #[test]
     fn an_engines_advertised_reasoning_parser_is_not_a_parser_override() {
+        use openai_protocol::worker::GrammarStart;
         use smg_grpc_client::engine_labels::ServerInfo;
-        use tool_parser::GrammarStart;
 
         let tool_factory = tool_parser::ParserFactory::default();
         let reasoning_factory = reasoning_parser::ParserFactory::default();

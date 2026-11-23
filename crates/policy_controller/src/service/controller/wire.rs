@@ -53,7 +53,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub(crate) use crate::engine::door::Viewed;
+pub(crate) use crate::engine::store_backed_engine::Viewed;
 use crate::{
     document::{
         operator::{Document, NeedsRow, Status},
@@ -62,17 +62,17 @@ use crate::{
     engine::{
         decision::{Decision, ShedReason, Target},
         demands::Demands,
-        door::Asked,
+        store_backed_engine::RequestForm,
         view::{
-            fingerprint, key_of_session, Constraints, HashKind, Header, Identity, MediaCounts,
-            ModelFingerprint, NamedAffinity, Phase, RequestFacts, Session, WireModes, WorkerId,
+            fingerprint, key_of_session, AffinityRows, Constraints, HashKind, Header, Identity,
+            MediaCounts, ModelFingerprint, Phase, RequestFacts, Session, WireModes, WorkerId,
         },
     },
     service::proto::{
         self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form,
     },
-    store::{DecodeIssue, Hand, MemoryStore, Said},
-    tracking::lease::{Lease, LeaseId, ReleaseReason, Side},
+    store::{DecodeIssue, Hand, MemoryStore},
+    tracking::lease::{Lease, LeaseId, ReleaseReason, Said, Side},
 };
 
 /// Why a frame is refused before any decision: the field, by its path in
@@ -344,33 +344,26 @@ impl Checked {
         &self.facts.block_hashes
     }
 
-    /// Hands `decide` the request as the engine reads it, with what the
-    /// decision's `view` adds to the frame, and returns its answer. The
-    /// request borrows the frame and `lists`, for the time of `decide`.
-    /// `name` is asked first, over that request with no row named: what it
-    /// answers stands as the request's named rows for `decide`.
-    pub(crate) fn read<'n, R>(
-        &self,
-        lists: &mut Lists,
-        view: Viewed<'_>,
-        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
-        decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
-    ) -> R {
-        let (facts, constraints) = (&self.facts, &self.constraints);
-        lists.tried.clear();
-        lists
-            .tried
-            .extend(facts.tried.iter().copied().map(WorkerId));
-        lists.excluded.clear();
-        lists
-            .excluded
-            .extend(constraints.excluded.iter().copied().map(WorkerId));
-        let mut headers = emptied(mem::take(&mut lists.headers));
-        headers.extend(facts.headers.iter().map(|header| Header {
-            // Checked: a name is a position below 256.
-            name: u8::try_from(header.name).unwrap_or(u8::MAX),
-            value: &header.value,
-        }));
+    /// The frame's facts in the engine's form: every fact the frame
+    /// carries, its block hashes as deep as `depth` and its budget as
+    /// `budget_micros`, what is left of it at the decision. The request
+    /// borrows the frame and `lists`, the frame's own as its decider read
+    /// them ([`Lists::of`]).
+    ///
+    /// A fact that is the deciding program's own stands at rest: the
+    /// decision's instant, the rows the program names and what it lends
+    /// beside its candidates. A program that holds one writes it over this.
+    ///
+    /// The one reader of a frame's facts: whichever engine decides, its
+    /// request is made of this.
+    #[inline]
+    pub(crate) fn facts<'a>(
+        &'a self,
+        lists: &'a FrameLists<'_>,
+        depth: usize,
+        budget_micros: u32,
+    ) -> RequestFacts<'a> {
+        let facts = &self.facts;
         let media = facts
             .media
             .as_ref()
@@ -381,80 +374,130 @@ impl Checked {
                 bytes: media.bytes,
             })
             .unwrap_or_default();
+        RequestFacts {
+            model: &facts.model,
+            namespace_seed: facts.namespace_seed,
+            tenant: identity(facts.tenant.as_ref()),
+            priority: facts.priority,
+            streaming: facts.streaming,
+            max_output_tokens: facts.max_output_tokens,
+            prompt_tokens: facts.prompt_tokens,
+            // The first hashes, as deep as the generation reads.
+            block_hashes: facts
+                .block_hashes
+                .get(..depth)
+                .unwrap_or(&facts.block_hashes),
+            hash_kind: self.hash_kind,
+            session_key: match facts.session_key.as_ref().and_then(|key| key.form.as_ref()) {
+                Some(Form::Plain(key)) if !key.is_empty() => Identity::plain(key),
+                Some(Form::Hash(_)) => Identity::hashed(self.session_key),
+                Some(Form::Plain(_)) | None => Identity::NONE,
+            },
+            phase: self.phase,
+            attempt: u8::try_from(facts.attempt).unwrap_or(u8::MAX),
+            tried: &lists.lists.tried,
+            budget_micros,
+            headers: &lists.headers,
+            media,
+            seed: facts.seed,
+            block_size: facts.block_size,
+            // The decision's instant and the candidates' column are its
+            // deciding program's own.
+            now_micros: 0,
+            affinity: &[],
+            // In-process only: the rows the deciding host names.
+            named: None,
+            // The wire carries the name: each read of the request's
+            // session fingerprints it.
+            model_fingerprint: ModelFingerprint::NONE,
+            // No decider asks its view for a pinned worker's row.
+            pinned_at: 0,
+            // What the leases book stands beside rows a view lent: no
+            // frame carries it.
+            lent_in_flight: None,
+            // The frame carries no count of the key's requests: the
+            // door hands the store's beside the rows, for a request
+            // whose rule has an in-flight cap.
+            lent_session_in_flight: None,
+            session_counted: false,
+            // The frame carries no signal cells: they stand beside the
+            // candidates of the program that decides.
+            signal_cells: None,
+            client_key: facts.client_key,
+            // No frame carries a ring: the ring stage places by its own,
+            // as it learns it from the rows.
+            ring: None,
+            ring_positions: &[],
+        }
+    }
+
+    /// The frame's constraints in the engine's form: the workers its
+    /// gateway just missed, the wires it states, the lifted veto, the later
+    /// decode and the subset hint. What the deciding program adds of its
+    /// own stands at rest: no position is held back, no pins are lent and
+    /// the request may take every place of its list.
+    ///
+    /// The one reader of a frame's constraints, as [`Self::facts`] is of
+    /// its facts.
+    #[inline]
+    pub(crate) fn constraints<'a>(&'a self, lists: &'a FrameLists<'_>) -> Constraints<'a> {
+        let constraints = &self.constraints;
+        Constraints {
+            excluded: &lists.lists.excluded,
+            wire_modes: self.wires().unwrap_or_default(),
+            overload_lifted: constraints.overload_lifted,
+            decode_later: self.decode_later(),
+            subset_hint: constraints.subset_hint,
+            demands: Demands::default(),
+            stalled: &[],
+            held: &[],
+            pins: None,
+            // No frame holds a request to places.
+            places: None,
+        }
+    }
+
+    /// Hands `decide` the request as the engine reads it, with what the
+    /// decision's `view` adds to the frame, and returns its answer. The
+    /// request borrows the frame and `lists`, for the time of `decide`.
+    /// `name` is asked first, over that request with no row named: what it
+    /// answers stands as the request's named rows for `decide`.
+    pub(crate) fn read<'n, R>(
+        &self,
+        lists: &mut Lists,
+        view: Viewed<'_>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<AffinityRows<'n>>,
+        decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
+    ) -> R {
+        let lists = lists.of(self);
         // The request and the constraints in the engine's form, built once:
         // the naming's answer is written into the request below.
         let (mut request, cx) = (
             RequestFacts {
-                model: &facts.model,
-                namespace_seed: facts.namespace_seed,
-                tenant: identity(facts.tenant.as_ref()),
-                priority: facts.priority,
-                streaming: facts.streaming,
-                max_output_tokens: facts.max_output_tokens,
-                prompt_tokens: facts.prompt_tokens,
-                // The first hashes, as deep as the generation reads.
-                block_hashes: facts
-                    .block_hashes
-                    .get(..view.max_block_hashes)
-                    .unwrap_or(&facts.block_hashes),
-                hash_kind: self.hash_kind,
-                session_key: match facts.session_key.as_ref().and_then(|key| key.form.as_ref()) {
-                    Some(Form::Plain(key)) if !key.is_empty() => Identity::plain(key),
-                    Some(Form::Hash(_)) => Identity::hashed(self.session_key),
-                    Some(Form::Plain(_)) | None => Identity::NONE,
-                },
-                phase: self.phase,
-                attempt: u8::try_from(facts.attempt).unwrap_or(u8::MAX),
-                tried: &lists.tried,
-                budget_micros: view.budget_micros,
-                headers: &headers,
-                media,
-                seed: facts.seed,
-                block_size: facts.block_size,
                 now_micros: view.now_micros,
                 affinity: view.affinity,
-                // In-process only: the rows the deciding host names,
-                // written below by the naming's answer.
-                named: None,
-                // The wire carries the name: each read of the request's
-                // session fingerprints it.
-                model_fingerprint: ModelFingerprint::NONE,
-                // No decider asks its view for a pinned worker's row.
-                pinned_at: 0,
                 // What the leases book, beside rows a view lent.
                 lent_in_flight: view.in_flight.as_ref(),
-                // The frame carries no count of the key's requests: the
-                // door hands the store's beside the rows, for a request
-                // whose rule has an in-flight cap.
-                lent_session_in_flight: None,
-                session_counted: false,
-                // The frame carries no signal cells: they stand beside
-                // the rows of the host that decides, whose view hands them.
+                // The signal cells stand beside the rows of the host that
+                // decides, whose view hands them.
                 signal_cells: view.signal_cells,
-                client_key: facts.client_key,
+                ..self.facts(&lists, view.max_block_hashes, view.budget_micros)
             },
             Constraints {
-                excluded: &lists.excluded,
-                wire_modes: self.wires().unwrap_or_default(),
-                overload_lifted: constraints.overload_lifted,
-                decode_later: self.decode_later(),
-                subset_hint: constraints.subset_hint,
-                demands: Demands::default(),
                 // The asking gateway's standing vetoes beside lent rows,
                 // and nothing where each row carries its own bit.
                 stalled: view.stalled,
                 held: view.held,
                 pins: view.pins,
+                ..self.constraints(&lists)
             },
         );
         request.named = name(&request, &cx);
-        let answer = decide(&request, &cx);
-        lists.headers = emptied(headers);
-        answer
+        decide(&request, &cx)
     }
 }
 
-impl Asked for Checked {
+impl RequestForm for Checked {
     type Lists = Lists;
 
     fn model(&self) -> &str {
@@ -515,7 +558,7 @@ impl Asked for Checked {
         &self,
         lists: &mut Lists,
         viewed: Viewed<'_>,
-        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<AffinityRows<'n>>,
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R {
         Self::read(self, lists, viewed, name, decide)
@@ -530,6 +573,49 @@ pub(crate) struct Lists {
     excluded: Vec<WorkerId>,
     /// Empty between reads: a request's headers borrow its frame.
     headers: Vec<Header<'static>>,
+}
+
+impl Lists {
+    /// Reads `frame`'s three lists onto these buffers, in the engine's
+    /// form: the tried and the excluded ids, and the headers, which borrow
+    /// the frame. The lists stand for as long as the answer is held
+    /// ([`FrameLists`]): what an earlier frame left here is gone.
+    #[inline]
+    pub(crate) fn of<'a>(&'a mut self, frame: &'a Checked) -> FrameLists<'a> {
+        let (facts, constraints) = (&frame.facts, &frame.constraints);
+        self.tried.clear();
+        self.tried.extend(facts.tried.iter().copied().map(WorkerId));
+        self.excluded.clear();
+        self.excluded
+            .extend(constraints.excluded.iter().copied().map(WorkerId));
+        let mut headers = emptied(mem::take(&mut self.headers));
+        headers.extend(facts.headers.iter().map(|header| Header {
+            // Checked: a name is a position below 256.
+            name: u8::try_from(header.name).unwrap_or(u8::MAX),
+            value: &header.value,
+        }));
+        FrameLists {
+            lists: self,
+            headers,
+        }
+    }
+}
+
+/// One frame's lists in the engine's form ([`Lists::of`]), lent to the
+/// frame's request for as long as the request is read
+/// ([`Checked::facts`], [`Checked::constraints`]). The headers borrow the
+/// frame. Their buffer goes back to the decider's where this is dropped,
+/// emptied: the next frame's headers take it.
+#[derive(Debug)]
+pub(crate) struct FrameLists<'a> {
+    lists: &'a mut Lists,
+    headers: Vec<Header<'a>>,
+}
+
+impl Drop for FrameLists<'_> {
+    fn drop(&mut self) {
+        self.lists.headers = emptied(mem::take(&mut self.headers));
+    }
 }
 
 /// `spent`'s buffer, emptied, for the headers of another frame. Nothing is
@@ -571,10 +657,21 @@ pub(crate) enum Beside {
     /// The session key of the decode side's lease of a pair's pick. That
     /// lease is the prefill side's under this key: one id, one record, and
     /// at the answer one index and one count of tokens.
+    #[cfg_attr(
+        not(all(test, feature = "client")),
+        expect(
+            dead_code,
+            reason = "a pair's lease is handed over again once a pair is decided over worker lists"
+        )
+    )]
     Decode(Session),
     /// The issue of a decode call's pick. Where the answer does not leave,
     /// its sender takes this one issue back: the prefill that runs under
     /// the same lease keeps its booking ([`Leased::given_up`]).
+    #[expect(
+        dead_code,
+        reason = "a decode call's lease is handed over again once it is decided over worker lists"
+    )]
     Issue(DecodeIssue),
 }
 
@@ -890,7 +987,7 @@ pub(super) fn unix_micros(at: SystemTime) -> i64 {
 
 /// What a host must feed for these rows, as the contract writes it: a row
 /// for each of the engine's rows that has a flag to set
-/// ([`crate::Engine::needs_rows`]), in their order. A need the contract's row has
+/// ([`crate::engine::Engine::needs_rows`]), in their order. A need the contract's row has
 /// no flag for is not told here: a worker's requests in flight, the
 /// sessions in flight, a key's in-flight count, the affinity column and
 /// the signal cells are the controller's own to hold.
@@ -940,24 +1037,25 @@ const fn role(phase: Phase) -> proto::Role {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{busy, credit, decided, emptied, Checked, Lists, Refusal, Viewed, MAX_FRAME};
     use crate::{
-        document::spec::MAX_BLOCK_HASHES,
+        document::spec::{AppliedSpec, MAX_BLOCK_HASHES},
         engine::{
             decision::{
-                Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
-                Trace,
+                self, Decision, LiftedVeto, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target,
+                Targets, Trace,
             },
-            door,
-            door::unnamed,
+            decision_engine::{Request, RequestMaker, WorkerLists},
+            store_backed_engine::unnamed,
             view::{
                 fingerprint, AffinityFacts, Constraints, HashKind, Header, Identity, MediaCounts,
                 ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
             },
         },
-        service::proto::{
-            self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form,
+        service::{
+            controller::frame_request::FrameRequest,
+            proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
         },
     };
 
@@ -967,11 +1065,9 @@ mod tests {
 
         use prost::Message as _;
 
-        use crate::{
-            document::{
-                operator::{Document, Format, NeedsRow, Status},
-                spec::PolicySpec,
-            },
+        use crate::document::{
+            operator::{Document, Format, NeedsRow, Status},
+            spec::PolicySpec,
             Needs,
         };
 
@@ -1107,7 +1203,8 @@ mod tests {
             operator::{needs_rows, test_support::LEAST_LOAD},
             spec::PolicySpec,
         },
-        Candidate, Catalog, Filter,
+        engine::{Candidate, Filter},
+        stages::StageRegistry,
     };
 
     /// A need the contract's row has no flag for writes no row: the engine
@@ -1127,15 +1224,15 @@ mod tests {
                 true
             }
 
-            fn needs(&self) -> crate::Needs {
-                crate::Needs {
+            fn needs(&self) -> crate::document::Needs {
+                crate::document::Needs {
                     affinity: true,
-                    ..crate::Needs::default()
+                    ..crate::document::Needs::default()
                 }
             }
         }
 
-        let mut stages = Catalog::builtin();
+        let mut stages = StageRegistry::builtin();
         stages
             .filter("held", || Box::new(Held))
             .expect("a free name");
@@ -1166,7 +1263,7 @@ mod tests {
     fn the_summary_tells_each_role_and_each_flag_apart() {
         /// Keeps every worker and reads what it is built to read.
         #[derive(Debug)]
-        struct Reads(&'static str, crate::Needs);
+        struct Reads(&'static str, crate::document::Needs);
 
         impl Filter for Reads {
             fn name(&self) -> &'static str {
@@ -1177,20 +1274,20 @@ mod tests {
                 true
             }
 
-            fn needs(&self) -> crate::Needs {
+            fn needs(&self) -> crate::document::Needs {
                 self.1
             }
         }
 
-        let tokens = crate::Needs {
+        let tokens = crate::document::Needs {
             token_hashes: true,
-            ..crate::Needs::default()
+            ..crate::document::Needs::default()
         };
-        let media = crate::Needs {
+        let media = crate::document::Needs {
             media: true,
-            ..crate::Needs::default()
+            ..crate::document::Needs::default()
         };
-        let mut stages = Catalog::builtin();
+        let mut stages = StageRegistry::builtin();
         stages
             .filter("tokens", move || Box::new(Reads("tokens", tokens)))
             .expect("a free name")
@@ -1261,7 +1358,7 @@ mod tests {
     }
 
     /// A frame whose every field holds a value of its own.
-    fn full() -> proto::DecideRequest {
+    pub(crate) fn full() -> proto::DecideRequest {
         proto::DecideRequest {
             request_id: vec![7, 8, 9],
             facts: Some(proto::RequestFacts {
@@ -1309,6 +1406,43 @@ mod tests {
             again: false,
             ..Default::default()
         }
+    }
+
+    /// The room of `lists`' three buffers, and how many headers stand in
+    /// theirs: what a case reads of a decider's buffers between two frames.
+    pub(crate) fn kept(lists: &Lists) -> ([usize; 3], usize) {
+        let room = [
+            lists.tried.capacity(),
+            lists.excluded.capacity(),
+            lists.headers.capacity(),
+        ];
+        (room, lists.headers.len())
+    }
+
+    /// Makes `frame`'s request as a controller's maker makes it
+    /// ([`FrameRequest`]), on `lists` and with `left` of the frame's
+    /// budget, and hands `check` its facts and its constraints. The
+    /// request bears the frame's id whole: that is held here, for every
+    /// frame a case makes a request of. The document it is made under has
+    /// a ring keyed by the prompt: it reads a prompt's hashes of either
+    /// kind 256 tokens deep, past the three a case's frame carries.
+    pub(crate) fn made<R>(
+        frame: &Checked,
+        lists: &mut Lists,
+        left: std::time::Duration,
+        check: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
+    ) -> R {
+        let document = PolicySpec::preset("prefix_hash").expect("a built-in preset");
+        let spec = AppliedSpec::validate(&document).expect("the preset validates");
+        let lists = lists.of(frame);
+        let maker = FrameRequest::new(frame, &lists, left, WorkerLists::None);
+        let Request {
+            id,
+            facts,
+            constraints,
+        } = maker.make(&spec);
+        assert_eq!(id, frame.id(), "a request bears its frame's id whole");
+        check(&facts, &constraints)
     }
 
     /// The full frame with its facts edited.
@@ -1713,12 +1847,12 @@ mod tests {
     /// its facts say, and is no pair's first request: its bit is not read.
     #[test]
     fn a_frame_keeps_its_decode_later_bit_and_its_decode_of_id() {
-        use crate::engine::{door::Asked, view::Phase};
+        use crate::engine::{store_backed_engine::RequestForm, view::Phase};
         let said = |later: bool, of: Option<u64>| {
             let mut frame = with(|facts| facts.phase = proto::Phase::Prefill.into());
             (frame.decode_later, frame.decode_of) = (later, of);
             let frame = Checked::new(frame).expect("no word is a field out of its range");
-            assert_eq!(Asked::decode_later(&frame), frame.decode_later());
+            assert_eq!(RequestForm::decode_later(&frame), frame.decode_later());
             let of = frame.decode_of().map(|lease| lease.0);
             assert_eq!(frame.asks_decode(), of.is_some());
             (frame.says_more(), frame.decode_later(), of, frame.phase())
@@ -1847,7 +1981,7 @@ mod tests {
     #[test]
     fn the_wire_carries_the_lifted_veto() {
         let steered = Trace {
-            lifted: Lifted::Overload,
+            lifted: LiftedVeto::Overload,
             ..Trace::default()
         };
         assert_eq!(steered.wire().lifted, proto::LiftedVeto::Overload as i32);
@@ -1922,7 +2056,7 @@ mod tests {
             },
             ..Pick::default()
         });
-        let shed = door::shed(ShedReason::NoEndpoints, "wires", 0, 6);
+        let shed = decision::shed(ShedReason::NoEndpoints, "wires", 0, 6);
         let encoded = |decision| {
             super::decision(decision)
                 .trace
@@ -1944,6 +2078,7 @@ mod tests {
                 decode_position: 1,
                 decode_id: WorkerId(52),
                 decode_dp_rank: 3,
+                ..Pair::default()
             }),
         });
         targets.push(Target {

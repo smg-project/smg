@@ -24,7 +24,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{ElectError, LeaseBackend, LeaseRecord, Written};
+use super::{ConditionalWriteOutcome, ElectError, LeaseBackend, LeaseRecord};
 
 /// The lease at a path; see the module documentation.
 #[derive(Debug)]
@@ -92,7 +92,7 @@ impl LeaseBackend for FileLease {
         &mut self,
         expected: Option<&LeaseRecord>,
         record: &LeaseRecord,
-    ) -> Result<Written, ElectError> {
+    ) -> Result<ConditionalWriteOutcome, ElectError> {
         // Opened, never truncated: a truncate rewrites the lock file's inode
         // at every write of the lease, and on a disk under load that waits
         // for the filesystem where an open of a file that exists does not.
@@ -105,7 +105,7 @@ impl LeaseBackend for FileLease {
         // Released when `lock` drops, on every path out of here.
         lock.lock().map_err(|err| self.io(err))?;
         if self.read_record()?.as_ref() != expected {
-            return Ok(Written::Moved);
+            return Ok(ConditionalWriteOutcome::Moved);
         }
         let mut line = serde_json::to_vec(record).map_err(|err| ElectError::Malformed {
             place: self.place(),
@@ -124,7 +124,7 @@ impl LeaseBackend for FileLease {
         // sync a directory would otherwise report every landed write as
         // failed.
         let _ = File::open(directory_of(&self.path)).and_then(|dir| dir.sync_all());
-        Ok(Written::Done)
+        Ok(ConditionalWriteOutcome::Done)
     }
 
     fn place(&self) -> String {
@@ -153,7 +153,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::service::elector::{ElectionSettings, Elector, Tick};
+    use crate::service::elector::{ElectionSettings, Elector, TickOutcome};
 
     const S: Duration = Duration::from_secs(1);
 
@@ -200,7 +200,10 @@ mod tests {
         assert_eq!(lease.path(), path);
         assert_eq!(lease.read().expect("read"), None, "no file yet");
         let first = record("a@host:1", 1, 5);
-        assert_eq!(lease.write(None, &first).expect("write"), Written::Done);
+        assert_eq!(
+            lease.write(None, &first).expect("write"),
+            ConditionalWriteOutcome::Done
+        );
         let text = fs::read_to_string(&path).expect("the file");
         assert_eq!(
             text,
@@ -229,7 +232,10 @@ mod tests {
         let lock = dir.path().join("policy.lease.lock");
         let mut lease = FileLease::new(&path);
         let first = record("a@host:1", 1, 5);
-        assert_eq!(lease.write(None, &first).expect("write"), Written::Done);
+        assert_eq!(
+            lease.write(None, &first).expect("write"),
+            ConditionalWriteOutcome::Done
+        );
         assert_eq!(fs::read(&lock).expect("the lock file"), b"", "made empty");
         // What stands in the lock file is no part of the lease: the mark
         // shows a write that rewrites it.
@@ -237,13 +243,13 @@ mod tests {
         let second = record("a@host:1", 1, 6);
         assert_eq!(
             lease.write(Some(&first), &second).expect("write"),
-            Written::Done
+            ConditionalWriteOutcome::Done
         );
         assert_eq!(fs::read(&lock).expect("the lock file"), b"kept");
         let theirs = record("b@host:2", 2, 7);
         assert_eq!(
             lease.write(Some(&first), &theirs).expect("write"),
-            Written::Moved
+            ConditionalWriteOutcome::Moved
         );
         assert_eq!(fs::read(&lock).expect("the lock file"), b"kept");
         assert_eq!(lease.read().expect("read"), Some(second));
@@ -257,7 +263,7 @@ mod tests {
         let mut a = candidate(&path, "a@host:1");
         assert_eq!(
             a.tick(Instant::now()).expect("tick"),
-            Tick::Acquired { term: 1 }
+            TickOutcome::Acquired { term: 1 }
         );
 
         fs::write(&path, "{\"holder\":").expect("a torn line by hand");
@@ -296,10 +302,10 @@ mod tests {
         let mut a = candidate(&path, "a@host:1");
         let mut b = candidate(&path, "b@host:2");
         let t0 = Instant::now() + AHEAD;
-        assert_eq!(a.tick(t0).expect("tick"), Tick::Acquired { term: 1 });
+        assert_eq!(a.tick(t0).expect("tick"), TickOutcome::Acquired { term: 1 });
         assert_eq!(
             b.tick(t0).expect("tick"),
-            Tick::Following {
+            TickOutcome::Following {
                 holder: "a@host:1".to_string(),
                 term: 1
             }
@@ -307,23 +313,23 @@ mod tests {
         for i in 1..=3u32 {
             assert_eq!(
                 a.tick(t0 + i * S).expect("renew"),
-                Tick::Renewed { term: 1 }
+                TickOutcome::Renewed { term: 1 }
             );
             assert!(matches!(
                 b.tick(t0 + i * S).expect("follow"),
-                Tick::Following { .. }
+                TickOutcome::Following { .. }
             ));
         }
         // a stalls; b's sight of the last renewal is three seconds old.
         assert_eq!(
             b.tick(t0 + 6 * S).expect("take"),
-            Tick::Acquired { term: 2 }
+            TickOutcome::Acquired { term: 2 }
         );
         assert_eq!(a.fence().leader_term(t0 + 6 * S), None);
         assert_eq!(b.fence().leader_term(t0 + 6 * S), Some(2));
         assert_eq!(
             a.tick(t0 + 6 * S).expect("the stalled renewal"),
-            Tick::Lost {
+            TickOutcome::Lost {
                 term: 1,
                 holder: "b@host:2".to_string()
             }
@@ -362,7 +368,7 @@ mod tests {
             let next = record("w@host:1", 1, i);
             assert_eq!(
                 writer.write(previous.as_ref(), &next).expect("write"),
-                Written::Done
+                ConditionalWriteOutcome::Done
             );
             previous = Some(next);
         }
@@ -403,7 +409,8 @@ mod tests {
                                 break;
                             }
                             let next = record(&format!("w{w}"), term + 1, round);
-                            if lease.write(current.as_ref(), &next).expect("write") == Written::Done
+                            if lease.write(current.as_ref(), &next).expect("write")
+                                == ConditionalWriteOutcome::Done
                             {
                                 won += 1;
                                 break;

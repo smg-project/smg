@@ -18,11 +18,10 @@ use crate::routers::{
     },
 };
 
-/// Acquire backend clients for the selected workers. Where `shed` is set
-/// the call re-checks overload at dispatch: one relaxed atomic read per
-/// already-chosen worker, closing the window between selection and dispatch
-/// in which a load report can flip the veto. The caller sets `shed` for a
-/// selection the classic policies made, under `--worker-overload-shed`.
+/// Acquire backend clients for the selected workers, with a dispatch-time
+/// overload re-check: one relaxed atomic read per already-chosen worker,
+/// closing the window between selection and dispatch in which a load report
+/// can flip the veto.
 pub(crate) async fn acquire_clients(
     workers: &WorkerSelection,
     model_id: &str,
@@ -30,6 +29,7 @@ pub(crate) async fn acquire_clients(
 ) -> Result<ClientSelection, Response> {
     match workers {
         WorkerSelection::Single { worker } => {
+            let worker = worker.worker();
             if let Some(shed) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id, shed)
             {
                 return Err(shed);
@@ -49,9 +49,7 @@ pub(crate) async fn acquire_clients(
             // to a worker known to be over the ceiling.
             if let Some(shed) =
                 overload::shed_if_worker_overloaded(prefill.as_ref(), model_id, shed)
-                    .or_else(|| {
-                        overload::shed_if_worker_overloaded(decode.as_ref(), model_id, shed)
-                    })
+                    .or_else(|| overload::shed_if_worker_overloaded(&**decode, model_id, shed))
                     .or_else(|| {
                         encode_assignments.iter().flatten().find_map(|assignment| {
                             overload::shed_if_worker_overloaded(
@@ -65,7 +63,7 @@ pub(crate) async fn acquire_clients(
                 return Err(shed);
             }
             let prefill_client = get_backend_client_from_worker(prefill).await?;
-            let decode_client = get_backend_client_from_worker(decode).await?;
+            let decode_client = get_backend_client_from_worker(decode.worker()).await?;
 
             Ok(ClientSelection::Disaggregated {
                 prefill: prefill_client,

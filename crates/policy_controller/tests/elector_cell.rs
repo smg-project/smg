@@ -27,7 +27,7 @@ use std::{
 };
 
 use smg_policy_controller::service::elector::{
-    ElectionSettings, Elector, FileLease, LeaseBackend, Tick,
+    ElectionSettings, Elector, FileLease, LeaseBackend, TickOutcome,
 };
 
 const ROLE: &str = "SMG_ELECTOR_CELL_ROLE";
@@ -50,15 +50,15 @@ fn wall_micros() -> u64 {
         .unwrap_or(0)
 }
 
-fn word(tick: &Tick) -> String {
+fn word(tick: &TickOutcome) -> String {
     match tick {
-        Tick::Acquired { term } => format!("acquired:{term}"),
-        Tick::Renewed { term } => format!("renewed:{term}"),
-        Tick::Lost { term, .. } => format!("lost:{term}"),
-        Tick::Following { term, .. } => format!("following:{term}"),
-        Tick::Gone { term } => format!("gone:{term}"),
-        Tick::Waiting { term } => format!("waiting:{term}"),
-        Tick::Raced => "raced".to_string(),
+        TickOutcome::Acquired { term } => format!("acquired:{term}"),
+        TickOutcome::Renewed { term } => format!("renewed:{term}"),
+        TickOutcome::Lost { term, .. } => format!("lost:{term}"),
+        TickOutcome::Following { term, .. } => format!("following:{term}"),
+        TickOutcome::Gone { term } => format!("gone:{term}"),
+        TickOutcome::Waiting { term } => format!("waiting:{term}"),
+        TickOutcome::Raced => "raced".to_string(),
     }
 }
 
@@ -67,7 +67,7 @@ fn word(tick: &Tick) -> String {
 /// counts from `now`, taken just before the wall time, so `before` plus the
 /// deadline is at or past the close: a strict bound, however long the tick
 /// itself takes.
-fn step(elector: &mut Elector, lines: &mut Vec<String>) -> Tick {
+fn step(elector: &mut Elector, lines: &mut Vec<String>) -> TickOutcome {
     let now = Instant::now();
     let before = wall_micros();
     let tick = elector.tick(now).expect("a tick over the file");
@@ -124,7 +124,7 @@ fn run_child(role: &str, path: &Path) -> Vec<String> {
         _ => {
             let mut renewals = 0;
             for _ in 0..100 {
-                if let Tick::Renewed { .. } = step(&mut elector, &mut lines) {
+                if let TickOutcome::Renewed { .. } = step(&mut elector, &mut lines) {
                     renewals += 1;
                     if renewals == 5 {
                         break;

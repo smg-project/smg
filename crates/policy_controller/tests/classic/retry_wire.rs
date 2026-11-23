@@ -11,7 +11,7 @@
 //! ([`pool_refusal`]): no demand of this sheet has words of its own.
 
 use serde::Deserialize;
-use smg_policy_controller::{Constraints, DemandFacts, Demands};
+use smg_policy_controller::engine::{Constraints, DemandFacts, Demands};
 
 use super::demand_bed::{
     self, pool_refusal, wire_of, Answer, Bed, Pooled, Replayed, Runtimes, State, Wire,
@@ -65,6 +65,7 @@ impl Replayed for Row {
                     runtime: runtimes.number(&worker.runtime),
                     ..DemandFacts::default()
                 },
+                rank: None,
             });
         }
         let mut bed = Bed::new(self.shed, &pooled)?;

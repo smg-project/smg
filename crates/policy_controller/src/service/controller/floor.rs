@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 
-use super::election::Door;
+use super::election::ElectionNotifier;
 use crate::service::elector::{term_said, TERM_CEILING};
 
 /// How far above the term a gateway's floor is believed. A floor counts the
@@ -104,7 +104,7 @@ struct Words {
 pub(crate) struct Floors {
     /// The election's door, set once the election runs. A floor that comes
     /// before it is remembered nowhere: the gateway's next frame says it.
-    door: OnceLock<Door>,
+    door: OnceLock<ElectionNotifier>,
     /// What was said. Locked by a floor above the term alone: a frame at
     /// or under the term never comes here.
     words: Mutex<Words>,
@@ -113,7 +113,7 @@ pub(crate) struct Floors {
 impl Floors {
     /// The election runs: `door` is its door. A second call changes
     /// nothing.
-    pub(crate) fn open(&self, door: Door) {
+    pub(crate) fn open(&self, door: ElectionNotifier) {
         let _ = self.door.set(door);
     }
 

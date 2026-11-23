@@ -915,6 +915,78 @@ async fn bf16_batch_cache_reuses_large_batches_across_image_families() {
     }
 }
 
+/// A budget between a wire's length and its pooled class stores the batch
+/// once: the replay views the allocation of the fill, without a gather. The
+/// joined output of a growing request, a pooled buffer too, is stored at its
+/// exact length the same way.
+#[tokio::test]
+async fn a_pooled_buffer_is_cached_at_its_exact_length() {
+    let batch = MediaBatch::Images(
+        (0..8u8)
+            .map(|id| {
+                Arc::new(ImageFrame::new(
+                    image::RgbImage::from_pixel(224, 224, image::Rgb([id, 21, 203])).into(),
+                    Default::default(),
+                    Default::default(),
+                    ImageSource::InlineBytes,
+                    id.to_string(),
+                ))
+            })
+            .collect(),
+    );
+    let model = "qwen3_vl";
+    let (mut components, _, _) = setup(true, false);
+    let config = MultimodalModelConfig::new(
+        serde_json::json!({"model_type": model, "image_token_id": 100}),
+        PreProcessorConfig::default(),
+        None,
+    );
+    let registry = Arc::clone(&components.model_registry);
+    let spec = registry
+        .lookup(&ModelMetadata {
+            model_id: model,
+            tokenizer: &NoTokenizer,
+            config: &config.config,
+        })
+        .unwrap();
+    let wire = Some(EncoderDtype::BFloat16);
+    let ctx = context(&components, &config, spec, model, model, wire, None);
+    let uncached = preprocess_batch(&batch, &ctx).await.unwrap();
+    let len = uncached.encoder_input.nbytes();
+    // Room for the entries' metadata beside the bytes, still under the class.
+    let budget = len + 64 * 1024;
+    assert!(llm_multimodal::buffer_pool::allocation_capacity(len) > budget);
+    components.pixel_cache = Some(Arc::new(PixelCache::new(budget)));
+    let ctx = context(&components, &config, spec, model, model, wire, None);
+
+    let fill = preprocess_modality(&batch, &ctx).await.unwrap();
+    let replay = preprocess_modality(&batch, &ctx).await.unwrap();
+    let stored = fill.encoder_input.shared_allocation();
+    assert_eq!(stored.map(|(_, capacity)| capacity), Some(len));
+    assert_eq!(replay.encoder_input.shared_allocation(), stored);
+    let expected = uncached.encoder_input.write_as(EncoderDtype::BFloat16);
+    for output in [fill, replay] {
+        let bytes = output.encoder_input.write_as(EncoderDtype::BFloat16);
+        assert_eq!(bytes, expected);
+    }
+
+    // A request that grows from four of the images to all eight is answered
+    // by a join of two allocations, which the cache then keeps.
+    components.pixel_cache = Some(Arc::new(PixelCache::new(4 * len)));
+    let ctx = context(&components, &config, spec, model, model, wire, None);
+    let MediaBatch::Images(images) = &batch else {
+        panic!("an image batch");
+    };
+    let prefix = MediaBatch::Images(images[..4].to_vec());
+    preprocess_modality(&prefix, &ctx).await.unwrap();
+    let grown = preprocess_modality(&batch, &ctx).await.unwrap();
+    let stored = grown.encoder_input.shared_allocation();
+    assert_eq!(stored.map(|(_, capacity)| capacity), Some(len));
+    // The cache kept it: the replay views the joined allocation, without a gather.
+    let replay = preprocess_modality(&batch, &ctx).await.unwrap();
+    assert_eq!(replay.encoder_input.shared_allocation(), stored);
+}
+
 /// Keep newly computed images when an overlapping request cannot replace its old backing.
 #[tokio::test]
 async fn bf16_recompute_caches_misses_without_replacing_a_partial_backing() {

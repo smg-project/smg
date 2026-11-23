@@ -1,9 +1,12 @@
 //! A document supplies the parameters of a picker registered by its host.
 
 use smg_policy_controller::{
-    stages::builtins::Best, Candidate, Catalog, Constraints, Health, Lifecycle, Picker, PolicySpec,
-    PoolFacts, RequestFacts, Scratch, StageBuild, StageError, Targets, TieBand, WorkerId,
-    API_VERSION,
+    document::{PolicySpec, API_VERSION},
+    engine::{
+        Candidate, Constraints, Health, Picker, PoolFacts, RequestFacts, Scratch, Targets, TieBand,
+        WorkerId,
+    },
+    stages::{Best, Lifecycle, StageBuild, StageError, StageRegistry},
 };
 
 /// Passes over the first `rows` of the workers the filters left and picks
@@ -37,7 +40,7 @@ impl Picker for PastFirst {
 
 #[test]
 fn a_yaml_parameter_moves_the_pick() {
-    let mut catalog = Catalog::builtin();
+    let mut catalog = StageRegistry::builtin();
     catalog
         .picker_with("past-first", |build: &mut StageBuild<'_>| {
             let rule: PastFirst = build.params()?;

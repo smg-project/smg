@@ -8,7 +8,7 @@ use std::{
     process::{Command, Output},
 };
 
-use smg_policy_controller::PolicySpec;
+use smg_policy_controller::document::PolicySpec;
 
 /// The binary's whole answer to `args` and the print option.
 fn print(args: &[&str]) -> io::Result<Output> {
@@ -20,6 +20,17 @@ fn print(args: &[&str]) -> io::Result<Output> {
 
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Whether `stderr` is the binary's one sentence of error that begins with
+/// `head`: one line, ended by one line break. The words behind the head are
+/// the policy crate's, and no case of the gateway holds them.
+fn is_one_sentence_headed(stderr: &str, head: &str) -> bool {
+    stderr
+        .strip_prefix("error: ")
+        .and_then(|sentence| sentence.strip_prefix(head))
+        .and_then(|words| words.strip_suffix('\n'))
+        .is_some_and(|words| !words.is_empty() && !words.contains('\n'))
 }
 
 #[test]
@@ -49,10 +60,10 @@ fn a_setting_no_document_says_is_one_sentence_on_stderr_and_a_failing_exit() {
     let answer = print(&["--routing-key-override"]).expect("the binary runs");
     assert_eq!(answer.status.code(), Some(1));
     assert_eq!(text(&answer.stdout), "");
-    assert_eq!(
-        text(&answer.stderr),
-        "error: routing_key_override.enabled = true: the controller holds no recorded form of \
-         the sticky sessions' rule yet\n"
+    let stderr = text(&answer.stderr);
+    assert!(
+        is_one_sentence_headed(&stderr, "routing_key_override.enabled = true: "),
+        "{stderr}"
     );
 }
 
@@ -66,10 +77,10 @@ fn a_document_this_build_does_not_run_prints_with_the_controllers_word() {
         document,
         PolicySpec::preset("cache_aware").expect("a preset")
     );
-    assert_eq!(
-        text(&answer.stderr),
-        "error: profiles.cache_aware.score[1].prefix-affinity: the prefix-affinity decay is \
-         not in this build\n"
+    let stderr = text(&answer.stderr);
+    assert!(
+        is_one_sentence_headed(&stderr, "profiles.cache_aware.score[1].prefix-affinity: "),
+        "{stderr}"
     );
 }
 

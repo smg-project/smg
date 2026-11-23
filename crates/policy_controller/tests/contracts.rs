@@ -25,10 +25,15 @@ use prost_types::{
     DescriptorProto, FileDescriptorProto, FileDescriptorSet, ServiceDescriptorProto,
 };
 use smg_policy_controller::{
-    document::spec::DENIED_HEADERS, fingerprint, AffinityFacts, Candidate, Constraints, HashKind,
-    Health, Identity, Lease, LeaseKind, Lifted, LoadRow, MediaCounts, Membership, Outcome,
-    OverloadRegime, Pair, Phase, PolicySpec, PoolFacts, Queue, ReleaseReason, RequestFacts, Role,
-    Shed, ShedReason, Side, Signal, SignalSource, Target, Trace, TransportClass, ZoneCapacity,
+    document::{PolicySpec, DENIED_HEADERS},
+    engine::{
+        fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Health, Identity, LiftedVeto,
+        LoadRow, MediaCounts, OverloadRegime, Pair, Phase, PoolFacts, Queue, RequestFacts, Role,
+        Shed, ShedReason, SignalSource, Target, Trace, ZoneCapacity,
+    },
+    tracking::{
+        Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass,
+    },
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
@@ -121,6 +126,7 @@ fn candidate_record() -> &'static [&'static str] {
             host_local,
             active_sessions,
             key,
+            engine,
         }
     )
 }
@@ -173,6 +179,8 @@ fn request_record() -> &'static [&'static str] {
             model_fingerprint,
             signal_cells,
             client_key,
+            ring,
+            ring_positions,
         }
     )
 }
@@ -208,7 +216,8 @@ fn constraints_record() -> &'static [&'static str] {
             demands,
             stalled,
             held,
-            pins
+            pins,
+            places
         }
     )
 }
@@ -226,6 +235,7 @@ fn pool_record() -> &'static [&'static str] {
             reach,
             reported,
             engines,
+            word,
         }
     )
 }
@@ -284,7 +294,8 @@ fn pair_record() -> &'static [&'static str] {
         Pair {
             decode_position,
             decode_id,
-            decode_dp_rank
+            decode_dp_rank,
+            decode_verdict
         }
     )
 }
@@ -551,7 +562,8 @@ struct ProtoMirror {
     /// Record fields the wire does not carry: a host instant, a host-local
     /// position, the in-process length of a fixed array, the trace the wire
     /// hoists into `Decision`, whether a report counts resident tokens, a
-    /// fingerprint the host carries of a name the wire carries.
+    /// fingerprint the host carries of a name the wire carries, the place
+    /// of a row's engine among the engines of its host's list.
     host_only: &'static [&'static str],
     /// Wire fields outside the record, in the wire's order: an event's key
     /// before it, controller facts, a wire-only input, the observability
@@ -606,7 +618,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Candidate",
             record: candidate_record(),
-            host_only: &["position", "load_sampled_at_micros"],
+            host_only: &["position", "load_sampled_at_micros", "engine"],
             wire_only: affinity_record(),
             wire: &[
                 ("id", Type::Fixed64),
@@ -655,6 +667,8 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "named",
                 "model_fingerprint",
                 "signal_cells",
+                "ring",
+                "ring_positions",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -685,7 +699,14 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Constraints",
             record: constraints_record(),
-            host_only: &["decode_later", "demands", "stalled", "held", "pins"],
+            host_only: &[
+                "decode_later",
+                "demands",
+                "stalled",
+                "held",
+                "pins",
+                "places",
+            ],
             wire_only: &[],
             wire: &[
                 ("excluded", Type::Fixed64),
@@ -699,7 +720,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "PoolFacts",
             record: pool_record(),
-            host_only: &["reach", "reported", "engines"],
+            host_only: &["reach", "reported", "engines", "word"],
             wire_only: &[],
             wire: &[
                 ("pool_size", Type::Uint32),
@@ -741,7 +762,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Pair",
             record: pair_record(),
-            host_only: &["decode_position"],
+            host_only: &["decode_position", "decode_verdict"],
             wire_only: &[],
             wire: &[
                 ("decode_id", Type::Fixed64),
@@ -875,7 +896,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "candidate",
             crate_record: candidate_record(),
-            host_only: &["position", "load_sampled_at_micros"],
+            host_only: &["position", "load_sampled_at_micros", "engine"],
             before: &[],
             beside: affinity_record(),
         },
@@ -900,6 +921,8 @@ fn wit_mirrors() -> Vec<WitMirror> {
                 "model_fingerprint",
                 "signal_cells",
                 "client_key",
+                "ring",
+                "ring_positions",
             ],
             before: &[],
             beside: &[],
@@ -914,7 +937,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pool",
             crate_record: pool_record(),
-            host_only: &["reach", "reported", "engines"],
+            host_only: &["reach", "reported", "engines", "word"],
             before: &[],
             beside: &[],
         },
@@ -928,7 +951,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pair",
             crate_record: pair_record(),
-            host_only: &["decode_position"],
+            host_only: &["decode_position", "decode_verdict"],
             before: &[],
             beside: &[],
         },
@@ -1531,8 +1554,8 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
     // Its zero is none, a case, on purpose: the enum's comment says why.
     let found = enum_values(plugin, "LiftedVeto").expect("LiftedVeto is an enum");
     let expected: Vec<(String, i32)> = cases!(
-        Lifted,
-        Lifted {
+        LiftedVeto,
+        LiftedVeto {
             None,
             Overload,
             Liveness

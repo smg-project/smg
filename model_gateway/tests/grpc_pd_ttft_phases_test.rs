@@ -14,6 +14,12 @@
 //! alone. A collected answer, with no first token to time, anchors its one
 //! generation record there too.
 //!
+//! The request's wait ahead of the prefill dispatch
+//! (`smg_router_dispatch_wait_seconds`) is recorded with a route's time to
+//! first token: once, under its labels, counted from the entry stamp the
+//! request's handler runs under. The body is read outside the stamp, as the
+//! connection reads it.
+//!
 //! Each case runs on a current-thread runtime under a thread-local Prometheus
 //! recorder, so the request path's emissions land in the rendered text.
 
@@ -28,7 +34,11 @@ use common::{
     },
     metrics_capture::{self, render_after},
 };
-use smg::{middleware::TenantRequestMeta, routers::RouterTrait, tenant::TenantKey};
+use smg::{
+    middleware::{RequestStarted, TenantRequestMeta},
+    routers::RouterTrait,
+    tenant::TenantKey,
+};
 use smg_test_harness as common;
 use smg_worker::identity::basic::{RuntimeType, WorkerType};
 
@@ -42,6 +52,12 @@ const DECODE_DELAY: Duration = Duration::from_millis(400);
 /// Scheduling slack for a loaded machine. Below either delay, so a phase that
 /// absorbed the other worker's delay fails its upper bound.
 const SLACK: Duration = Duration::from_millis(250);
+
+/// How long before its handler runs a stamped request entered at the edge:
+/// the dispatch wait must reach it, so a wait counted from anywhere at or
+/// after the dispatch fails its lower bound.
+const ENTRY_LEAD: Duration = Duration::from_millis(100);
+const DISPATCH_WAIT: &str = "smg_router_dispatch_wait_seconds";
 
 /// Serve a sequential-dispatch mock engine in-process; returns its port. The
 /// engine answers every generate call with `OUTPUT_TOKENS` chunks and a
@@ -105,14 +121,14 @@ impl Route {
     }
 }
 
-/// One streaming request on `route` through `router`, read to its end.
+/// The answer of one streaming request on `route` through `router`: what the
+/// route's handler returns, its body unread.
 #[expect(
     clippy::unwrap_used,
-    clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
-async fn one_streaming_request(router: &dyn RouterTrait, route: Route) -> String {
-    let response = match route {
+async fn route_streaming(router: &dyn RouterTrait, route: Route) -> axum::response::Response {
+    match route {
         Route::Chat => {
             let request = serde_json::from_value(serde_json::json!({
                 "model": MODEL,
@@ -150,6 +166,31 @@ async fn one_streaming_request(router: &dyn RouterTrait, route: Route) -> String
                 .route_completion(None, &tenant(), request, MODEL)
                 .await
         }
+    }
+}
+
+/// One streaming request on `route` through `router`, read to its end.
+async fn one_streaming_request(router: &dyn RouterTrait, route: Route) -> String {
+    streaming_request(router, route, None).await
+}
+
+/// One streaming request on `route` through `router`, read to its end. With
+/// `entered` the route's handler runs under that entry stamp, as the edge
+/// runs every request; the body is read outside it either way, as the
+/// connection reads it.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+async fn streaming_request(
+    router: &dyn RouterTrait,
+    route: Route,
+    entered: Option<RequestStarted>,
+) -> String {
+    let handler = route_streaming(router, route);
+    let response = match entered {
+        Some(entered) => entered.scope(handler).await,
+        None => handler.await,
     };
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
@@ -247,6 +288,54 @@ fn within(value: f64, at_least: Duration, slack: Duration) -> bool {
     value >= at_least.as_secs_f64() && value < (at_least + slack).as_secs_f64()
 }
 
+/// The entry stamp of a request that came in at the edge `ENTRY_LEAD` ago.
+fn entered_a_lead_ago() -> RequestStarted {
+    RequestStarted::at(std::time::Instant::now() - ENTRY_LEAD)
+}
+
+/// The label set of `family`'s `_count` series on `endpoint`.
+fn count_labels<'a>(rendered: &'a str, family: &str, endpoint: &str) -> Option<&'a str> {
+    let prefix = format!("{family}_count{{");
+    let endpoint = format!("endpoint=\"{endpoint}\"");
+    rendered
+        .lines()
+        .find(|line| line.starts_with(&prefix) && line.contains(&endpoint))
+        .and_then(|line| line.strip_prefix(&prefix))
+        .and_then(|rest| rest.split('}').next())
+}
+
+/// The dispatch wait of the one stamped request on `endpoint`, in seconds:
+/// recorded once, as its route's TTFT is, and under the TTFT's labels. It
+/// reaches the stamp's lead (a wait counted from the dispatch reads zero) and
+/// stays within the slack of it.
+#[expect(
+    clippy::panic,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn assert_dispatch_wait(rendered: &str, endpoint: &str) -> f64 {
+    let label = format!("endpoint=\"{endpoint}\"");
+    let labels = [label.as_str()];
+    let router =
+        |family: &str, field: &str| metrics_capture::sample(rendered, family, field, &labels);
+    let (Some(wait), Some(1.0), Some(1.0)) = (
+        router(DISPATCH_WAIT, "sum"),
+        router(DISPATCH_WAIT, "count"),
+        router("smg_router_ttft_seconds", "count"),
+    ) else {
+        panic!("{endpoint}: one dispatch wait beside one TTFT:\n{rendered}");
+    };
+    assert_eq!(
+        count_labels(rendered, DISPATCH_WAIT, endpoint),
+        count_labels(rendered, "smg_router_ttft_seconds", endpoint),
+        "{endpoint}: the dispatch wait carries the TTFT's labels:\n{rendered}"
+    );
+    assert!(
+        within(wait, ENTRY_LEAD, SLACK),
+        "{endpoint}: dispatch wait {wait} s runs from the entry stamp to the prefill dispatch"
+    );
+    wait
+}
+
 /// Print one case's phases: the measured values are the evidence this suite
 /// produces, next to its pass/fail.
 #[expect(
@@ -337,18 +426,33 @@ fn a_held_header_decode_side_stays_in_the_decode_phase() {
         (ttft - (prefill + relay + decode)).abs() < 1e-6,
         "ttft {ttft} != prefill {prefill} + relay {relay} + decode {decode}"
     );
+    // This request ran outside an entry stamp, so its route's TTFT is
+    // recorded alone: the dispatch wait has no start to count from.
+    let labels = ["endpoint=\"chat\""];
+    assert_eq!(
+        metrics_capture::sample(&rendered, "smg_router_ttft_seconds", "count", &labels),
+        Some(1.0),
+        "{rendered}"
+    );
+    assert_eq!(
+        metrics_capture::sample(&rendered, DISPATCH_WAIT, "count", &labels),
+        None,
+        "{rendered}"
+    );
 }
 
 /// Parallel dispatch sends both sides together: the decode phase is the TTFT
 /// itself, and the prefill and relay phases of the sequential shape are not
-/// recorded.
+/// recorded. The request's handler runs under an entry stamp taken
+/// `ENTRY_LEAD` ago, and its wait ahead of that one dispatch is recorded once,
+/// with the route's TTFT and under its labels.
 #[test]
 fn parallel_dispatch_reports_the_decode_phase_as_the_whole_ttft() {
     let rendered = render_after(|| async {
         let prefill = start_mock_grpc_worker(DECODE_DELAY).await;
         let decode = start_mock_grpc_worker(DECODE_DELAY).await;
         let router = build_pd_router(prefill, decode, RuntimeType::TokenSpeed).await;
-        one_streaming_chat(router.as_ref()).await;
+        streaming_request(router.as_ref(), Route::Chat, Some(entered_a_lead_ago())).await;
     });
     let phases = Phases::of(&rendered, RuntimeType::TokenSpeed.as_str());
     report("parallel", &phases);
@@ -364,6 +468,7 @@ fn parallel_dispatch_reports_the_decode_phase_as_the_whole_ttft() {
         phases.prefill.is_none() && phases.relay.is_none(),
         "parallel dispatch has no prefill or relay phase:\n{rendered}"
     );
+    assert_dispatch_wait(&rendered, Route::Chat.endpoint());
 }
 
 /// A streaming route anchors its own time to first token and generation
@@ -373,6 +478,8 @@ fn parallel_dispatch_reports_the_decode_phase_as_the_whole_ttft() {
 /// would read the time to the decode side's first buffered chunk alone. With
 /// `decode_holds` the decode worker holds its response headers through its
 /// delay, so the hold sits inside the RPC await and not inside the stream.
+/// The request's handler runs under an entry stamp taken `ENTRY_LEAD` ago, and
+/// its wait ahead of the prefill dispatch is recorded with the route's TTFT.
 #[expect(
     clippy::panic,
     reason = "test helper - panicking on failure is intentional"
@@ -388,7 +495,7 @@ fn route_anchors_at_the_prefill_dispatch(route: Route, decode_holds: bool) {
         };
         let decode = start_mock_engine(decode_engine).await;
         let router = build_pd_router(prefill, decode, RuntimeType::Vllm).await;
-        one_streaming_request(router.as_ref(), route).await;
+        streaming_request(router.as_ref(), route, Some(entered_a_lead_ago())).await;
     });
     let endpoint = route.endpoint();
     let label = format!("endpoint=\"{endpoint}\"");
@@ -439,6 +546,12 @@ fn route_anchors_at_the_prefill_dispatch(route: Route, decode_holds: bool) {
         (tpot - expected).abs() < 1e-6,
         "{endpoint}: TPOT {tpot} != (generation {generation} - TTFT {ttft}) / {}",
         OUTPUT_TOKENS - 1
+    );
+    let wait = assert_dispatch_wait(&rendered, endpoint);
+    let floor = (ENTRY_LEAD + PREFILL_DELAY + DECODE_DELAY).as_secs_f64();
+    assert!(
+        wait + ttft >= floor,
+        "{endpoint}: dispatch wait {wait} s and TTFT {ttft} s add up to the time to first token from the request's entry ({floor} s)"
     );
 }
 
@@ -491,8 +604,8 @@ fn a_collected_chat_answer_anchors_its_generation_at_the_prefill_dispatch() {
             "max_tokens": 8,
         }))
         .unwrap();
-        let response = router
-            .route_chat(None, &tenant(), Arc::new(request), MODEL)
+        let response = RequestStarted::now()
+            .scope(router.route_chat(None, &tenant(), Arc::new(request), MODEL))
             .await;
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
@@ -532,4 +645,14 @@ fn a_collected_chat_answer_anchors_its_generation_at_the_prefill_dispatch() {
         generation >= floor,
         "chat: generation duration {generation} s carries both workers' delays ({floor} s)"
     );
+    // A collected answer records no time to first token, so it records no
+    // dispatch wait either, though its handler ran under an entry stamp: the
+    // two families count the same requests.
+    for family in ["smg_router_ttft_seconds", DISPATCH_WAIT] {
+        assert_eq!(
+            metrics_capture::sample(&rendered, family, "count", &labels),
+            None,
+            "{family}:\n{rendered}"
+        );
+    }
 }

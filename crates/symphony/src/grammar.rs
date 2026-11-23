@@ -760,7 +760,9 @@ impl Format {
     /// either way; so is xLAM's list, whose table has no thought. With the thought left to the
     /// model (the turn's own state opens it and closes an empty one: MiniMax M3), the tag admits
     /// the thought, or the bare close, or nothing, before the calls, since a forced call is
-    /// written at once (`Self::led`). The tag for any number of calls:
+    /// written at once (`Self::led`). Where the template opens no turn (Inkling 2's), the opener
+    /// the model writes itself leads a call owed at once: owed where the engine starts the
+    /// grammar at the first token, optional otherwise. The tag for any number of calls:
     /// [`Self::grammar_for`] with these two and [`Options::one_call`] unset.
     pub fn grammar(
         &self,
@@ -912,15 +914,26 @@ impl Format {
         // there; an answer's keeps the schema alone, the engine's own constraint
         // ([`Self::answer_grammar_for`]).
         let after = self.around(|layout| layout.thought.as_ref()).1;
-        self.led(
+        let tag = self.led(
             calls,
             options.reasoning_open,
             options.thought_closed,
             prefixed,
             options.start,
             after,
-        )
-        .map(|grammar| self.bounded(grammar))
+        )?;
+        // Where the template opens no turn (Inkling 2's), a call owed at once starts between
+        // the messages: the opener the model writes itself leads it, as in the answer's tag.
+        let lead = (options.at_least_one && !options.reasoning_open)
+            .then(|| self.unopened_lead())
+            .flatten()
+            .map(Grammar::ConstString);
+        let tag = match (lead, options.start) {
+            (Some(lead), GrammarStart::FirstToken) => Grammar::Sequence(vec![lead, tag]),
+            (Some(lead), _) => Grammar::Sequence(vec![Grammar::Optional(Box::new(lead)), tag]),
+            (None, _) => tag,
+        };
+        Some(self.bounded(tag))
     }
 
     /// The structural tag for an answer that is JSON `schema` accepts (`response_format`
@@ -1760,7 +1773,8 @@ impl Format {
     /// whose unopened row names a state between the template's messages (Inkling 2's: the
     /// template opens no turn for the model, so every generation prompt leaves the turn
     /// unopened and the model writes the message's opener itself). The answer's tag leads with
-    /// them. `None` for a table without the row, with no rows from its state to the turn's own,
+    /// them, and so does the tag of a call the request owes at once. `None` for a table without
+    /// the row, with no rows from its state to the turn's own,
     /// or whose unopened turn starts in a body (DeepSeek V4's thought, which `reasoning_open`
     /// carries).
     fn unopened_lead(&self) -> Option<String> {

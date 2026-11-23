@@ -8,10 +8,15 @@ use std::sync::Arc;
 
 use openai_protocol::{
     model_card::ModelCard,
-    worker::{WorkerSpec, WorkerUpdateRequest},
+    worker::{
+        ConnectionMode, HealthCheckConfig, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
+    },
 };
 use smg_worker::{
-    identity::basic::Worker, jobs::WorkerJobAsker, workflow::RemoveFromWorkerRegistryStep,
+    identity::basic::Worker,
+    jobs::WorkerJobAsker,
+    kv_events::{SubscriptionKind, MAX_CONCURRENT_SINK_REMOVALS, SINK_REMOVAL_PERMITS},
+    workflow::RemoveFromWorkerRegistryStep,
 };
 use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
@@ -23,7 +28,7 @@ use super::{
 use crate::{
     app_context::{testing::app_context_for_tests, AppContext},
     config::RouterConfig,
-    policies::CacheAwarePolicy,
+    policies::{kv_index::event_monitor::KvEventMonitor, CacheAwarePolicy},
     routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
     workflow::data::WorkerRegistrationMode,
 };
@@ -134,6 +139,73 @@ async fn remove(app_context: &Arc<AppContext>, worker: Arc<dyn Worker>) {
         .execute(&mut context)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_batch_removal_starts_all_its_kv_cleanups_in_one_poll() {
+    let monitor = Arc::new(KvEventMonitor::new());
+    let mut context_with_monitor = (*app_context()).clone();
+    context_with_monitor.kv_event_monitor = Some(Arc::clone(&monitor));
+    let app_context = Arc::new(context_with_monitor);
+    let workers: Vec<Arc<dyn Worker>> = (0..8)
+        .map(|rank| {
+            Arc::new(
+                BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{}", rank + 10))
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .model(ModelCard::new(format!("model-{rank}")))
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            ) as Arc<dyn Worker>
+        })
+        .collect();
+    for worker in &workers {
+        monitor
+            .on_worker_added(worker, SubscriptionKind::Events)
+            .await;
+    }
+
+    // Hold the monitor's purge permits, so every cleanup the step's one
+    // poll starts waits at that bound.
+    let permits = SINK_REMOVAL_PERMITS
+        .acquire_many(MAX_CONCURRENT_SINK_REMOVALS as u32)
+        .await
+        .expect("the sink-removal semaphore is open");
+    let mut data = create_worker_removal_workflow_data(
+        workers[0].url().to_string(),
+        None,
+        Arc::clone(&app_context),
+        WorkerJobAsker::Api,
+    );
+    data.actual_workers_to_remove = Some(workers);
+    let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+    let remaining = || {
+        (0..8)
+            .filter(|rank| monitor.get_indexer(&format!("model-{rank}")).is_some())
+            .count()
+    };
+    let removal = RemoveFromPolicyRegistryStep.execute(&mut context);
+    tokio::pin!(removal);
+    assert!(
+        futures::poll!(removal.as_mut()).is_pending(),
+        "the cleanups wait at the monitor's bound"
+    );
+    drop(permits);
+
+    // The step is not polled again: a cleanup it had not started stays.
+    for _ in 0..200 {
+        if remaining() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(remaining(), 0, "the one poll started every cleanup");
+    removal.await.expect("the removal step succeeds");
+    monitor.stop().await;
 }
 
 #[tokio::test]
@@ -453,4 +525,47 @@ async fn a_mesh_import_removed_here_leaves_the_local_workers_policy() {
 
     remove(&app_context, import).await;
     assert_eq!(policy_of(&app_context, "llama"), Some("cache_aware"));
+}
+
+#[tokio::test]
+async fn a_removal_closes_the_encode_connection_pooled_to_its_worker() {
+    use std::time::Duration;
+
+    use smg_grpc_client::tokenspeed_encoder::tokenspeed_encoder_proto::EncodeRequest;
+    use tokio::io::AsyncReadExt;
+
+    use crate::routers::grpc::backend_client::send_tokenspeed_encode_rpc;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback listener");
+    let url = format!("grpc://{}", listener.local_addr().expect("its address"));
+    let app_context = app_context();
+    let encoder = worker(&url, "vision");
+    register(&app_context, Arc::clone(&encoder), "random").await;
+    // The peer answers nothing: the send ends at its bound and leaves the
+    // connection it dialled in the pool.
+    let send = tokio::time::timeout(
+        Duration::from_millis(200),
+        send_tokenspeed_encode_rpc(url.clone(), EncodeRequest::default()),
+    );
+    let (_, dialled) = tokio::join!(send, listener.accept());
+    let (mut pooled, _) = dialled.expect("the dialled connection");
+    // Open before the removal (past the client preface), so the close below
+    // is the removal's.
+    let mut preface = Vec::new();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), pooled.read_to_end(&mut preface))
+            .await
+            .is_err(),
+        "the pooled connection is open before the removal"
+    );
+
+    remove(&app_context, encoder).await;
+
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), pooled.read_to_end(&mut received))
+        .await
+        .expect("the removal closes the pooled connection")
+        .expect("a read to its end");
 }

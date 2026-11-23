@@ -19,7 +19,7 @@ use smg::{
 };
 use smg_worker::{
     identity::basic::{Worker, WorkerType},
-    metrics::writers::Metrics,
+    metrics::writers::{Metrics, WorkerHandles},
 };
 
 use crate::{common::test_app::scrape, metrics::recorder};
@@ -88,7 +88,7 @@ async fn removed_worker_series_leave_the_scrape() {
     // worker, as every path that can write for an address does; the store
     // keeps the address retired while any of them can.
     Metrics::set_worker_health(URL, true);
-    Metrics::record_worker_cb_outcome(URL, "failure");
+    Metrics::record_worker_cb_outcome(&WorkerHandles::new(URL), "failure");
     let body = scrape(addr).await;
     assert!(
         worker_lines(&body).is_empty(),

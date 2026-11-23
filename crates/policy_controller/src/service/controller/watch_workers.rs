@@ -73,9 +73,9 @@ use crate::{
     service::{
         elector::Fence,
         proto,
-        replication::{Entry, Event, Log, Stamp},
+        replication::{Entry, Event, Log, ReadStamp},
     },
-    store::{Cut, GatewayId, Kinds, MemoryStore, Position, WorkerRow},
+    store::{GatewayId, JournalKinds, MemoryStore, Position, StoreCheckpoint, WorkerRow},
 };
 
 /// The rows of one snapshot page.
@@ -116,7 +116,7 @@ pub(crate) struct Feed {
     /// is let go when a write moves the log past that place, when the last
     /// watch leaves, and by the last snapshot call out with no watch open:
     /// a copy of every row is held only while a reader can share it.
-    rows: Arc<Mutex<Option<Arc<Cut>>>>,
+    rows: Arc<Mutex<Option<Arc<StoreCheckpoint>>>>,
     /// The cuts of every row this feed took, for a case.
     #[cfg(test)]
     cuts: Arc<AtomicUsize>,
@@ -192,7 +192,7 @@ impl Feed {
         };
         if kept
             .as_ref()
-            .is_some_and(|cut| cut.at != self.log.head(Kinds::Watched))
+            .is_some_and(|cut| cut.at != self.log.head(JournalKinds::Watched))
         {
             *kept = None;
         }
@@ -204,16 +204,16 @@ impl Feed {
     /// starts there shares it: a watch's start, and the operators'
     /// snapshot. Reads that come together or in a loop hold that lock once
     /// a write, and the feed keeps one copy of the rows while a reader can
-    /// share it ([`Feed::let_go`], [`Seat`], [`Watchers::unshared`]). The
+    /// share it ([`Feed::let_go`], [`WatchPlace`], [`Watchers::unshared`]). The
     /// kept cut is named by its place with its term, never by a sequence
     /// alone: a restore can leave one sequence over other rows.
-    pub(crate) fn rows_at_head(&self, store: &MemoryStore) -> Arc<Cut> {
+    pub(crate) fn rows_at_head(&self, store: &MemoryStore) -> Arc<StoreCheckpoint> {
         let mut kept = self.rows.lock();
-        let head = self.log.head(Kinds::Watched);
+        let head = self.log.head(JournalKinds::Watched);
         if let Some(cut) = kept.as_ref().filter(|cut| cut.at == head) {
             return Arc::clone(cut);
         }
-        let cut = Arc::new(store.cut(Kinds::Watched));
+        let cut = Arc::new(store.checkpoint(JournalKinds::Watched));
         #[cfg(test)]
         self.cuts.fetch_add(1, Ordering::Relaxed);
         *kept = Some(Arc::clone(&cut));
@@ -223,9 +223,9 @@ impl Feed {
     /// The kept cut where it stands at the log's last watched write: what a
     /// read shares with no copy. None where a write moved the log past it,
     /// and where none is kept.
-    pub(crate) fn kept_at_head(&self) -> Option<Arc<Cut>> {
+    pub(crate) fn kept_at_head(&self) -> Option<Arc<StoreCheckpoint>> {
         let kept = self.rows.lock();
-        let head = self.log.head(Kinds::Watched);
+        let head = self.log.head(JournalKinds::Watched);
         kept.as_ref().filter(|cut| cut.at == head).cloned()
     }
 
@@ -237,7 +237,7 @@ impl Feed {
 
     /// The kept cut, for a case.
     #[cfg(test)]
-    pub(crate) fn kept(&self) -> Option<Arc<Cut>> {
+    pub(crate) fn kept(&self) -> Option<Arc<StoreCheckpoint>> {
         self.rows.lock().clone()
     }
 
@@ -329,7 +329,7 @@ impl Source {
 
     /// The rows a watch starts from: the feed's cut at the log's last
     /// watched write ([`Feed::rows_at_head`]).
-    fn rows(&self) -> Arc<Cut> {
+    fn rows(&self) -> Arc<StoreCheckpoint> {
         self.feed.rows_at_head(&self.store)
     }
 }
@@ -383,10 +383,13 @@ enum At {
     /// Before its first poll: the start its watcher asked for.
     Start(Start),
     /// In the snapshot: the cut, and the first of its rows not told yet.
-    Snapshot { cut: Arc<Cut>, next: usize },
+    Snapshot {
+        cut: Arc<StoreCheckpoint>,
+        next: usize,
+    },
     /// In the tail: the place of the last entry it took out of a read,
     /// and the stamp of its last read of the log.
-    Tail(Position, Stamp),
+    Tail(Position, ReadStamp),
     /// Told its last word, or ended with none: the next poll ends it.
     Ended,
 }
@@ -408,7 +411,7 @@ pub(crate) struct Watching {
     /// parks: a watcher that takes nothing for [`STALL`] from then is ended.
     handed: Option<time::Instant>,
     /// The watch's seat, given back when the transport lets the stream go.
-    _seat: Seat,
+    _seat: WatchPlace,
 }
 
 impl Watching {
@@ -431,7 +434,7 @@ impl Watching {
 
     /// The word to a watcher that cannot continue from its place.
     fn start_again(&mut self) -> Poll<Option<Told>> {
-        let floor = self.source.feed.log.floor(Kinds::Watched);
+        let floor = self.source.feed.log.floor(JournalKinds::Watched);
         self.last(Ok(worker_wire::start_again(floor)))
     }
 }
@@ -448,14 +451,14 @@ pub(crate) struct Watchers {
     principals: usize,
 }
 
-/// One open watch's seat in the table, held by its stream and given back
-/// when the transport lets the stream go. The last seat given back lets
+/// One open watch's place in the table, held by its stream and given back
+/// when the transport lets the stream go. The last place given back lets
 /// the feed's kept cut go: no watch shares it.
 #[derive(Debug)]
-struct Seat {
+struct WatchPlace {
     watchers: Arc<Watchers>,
     of: GatewayId,
-    kept: Arc<Mutex<Option<Arc<Cut>>>>,
+    kept: Arc<Mutex<Option<Arc<StoreCheckpoint>>>>,
 }
 
 impl Watchers {
@@ -469,7 +472,7 @@ impl Watchers {
 
     /// A seat for one more watch of `by`, or the refusal by name. The table
     /// has no gauge yet: the refusal and its line are its signal.
-    fn seat(self: &Arc<Self>, by: &Principal, feed: &Feed) -> Result<Seat, Status> {
+    fn seat(self: &Arc<Self>, by: &Principal, feed: &Feed) -> Result<WatchPlace, Status> {
         let of = by.gateway();
         let mut held = self.held.lock();
         let open = held.get(&of).copied().unwrap_or(0);
@@ -495,7 +498,7 @@ impl Watchers {
             )));
         }
         held.insert(of, open + 1);
-        Ok(Seat {
+        Ok(WatchPlace {
             watchers: Arc::clone(self),
             of,
             kept: Arc::clone(&feed.rows),
@@ -504,7 +507,7 @@ impl Watchers {
 
     /// Lets the feed's kept cut go where no watch is open: what the last
     /// snapshot call out does, once no other call is let in to share it.
-    /// The last seat given back does the same ([`Seat`]): a copy of every
+    /// The last seat given back does the same ([`WatchPlace`]): a copy of every
     /// row is held only while a reader can share it. The table's lock is
     /// given back first, as there: a watch that opens now takes a cut of
     /// its own at worst.
@@ -526,7 +529,7 @@ impl Watchers {
     }
 }
 
-impl Drop for Seat {
+impl Drop for WatchPlace {
     fn drop(&mut self) {
         let last = {
             let mut held = self.watchers.held.lock();
@@ -611,7 +614,7 @@ impl Asked {
     /// The page of `cut` that starts at its row `from`, of the rows that
     /// serve: the page, the row after its last, and whether it ends the
     /// snapshot. An empty fleet is one empty page, which ends it.
-    fn page(&self, cut: &Cut, from: usize) -> (Vec<proto::WorkerRow>, usize, bool) {
+    fn page(&self, cut: &StoreCheckpoint, from: usize) -> (Vec<proto::WorkerRow>, usize, bool) {
         // One row more than a page holds: whether a page follows.
         let mut rows = Vec::with_capacity(PAGE + 1);
         let mut after = Vec::with_capacity(PAGE + 1);
@@ -703,10 +706,10 @@ impl Watching {
                 At::Ended => return Poll::Ready(None),
                 At::Start(Start::After(place)) => {
                     let place = *place;
-                    if !self.source.feed.log.holds(Kinds::Watched, place) {
+                    if !self.source.feed.log.holds(JournalKinds::Watched, place) {
                         return self.start_again();
                     }
-                    self.at = At::Tail(place, Stamp::default());
+                    self.at = At::Tail(place, ReadStamp::default());
                 }
                 At::Start(Start::Snapshot) => {
                     self.at = At::Snapshot {
@@ -718,7 +721,7 @@ impl Watching {
                     let (page, reached, last) = self.asked.page(cut, *next);
                     let (at, epoch) = (cut.at, cut.epoch);
                     if last {
-                        self.at = At::Tail(at, Stamp::default());
+                        self.at = At::Tail(at, ReadStamp::default());
                     } else {
                         *next = reached;
                     }
@@ -842,12 +845,12 @@ pub(crate) mod tests {
                 replication::{journaled, journaled_from, FIRST_PLACES, WATCHED_EVENTS},
                 worker_wire,
             },
-            elector::{Elector, Tick},
+            elector::{Elector, TickOutcome},
             proto::{self, worker_event::Event},
         },
         store::{
-            Journal, Kinds, LeasesStore, LoadSink, LoadSource, MembershipChange, MemoryStore,
-            Position, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+            Journal, JournalKinds, LeasesStore, LoadSink, LoadSource, MembershipChange,
+            MemoryStore, Position, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
         },
     };
 
@@ -875,7 +878,7 @@ pub(crate) mod tests {
             Elector::alone("controller-0@127.0.0.1:1", PATIENT).expect("the settings are in order");
         assert_eq!(
             elector.tick(Instant::now()).expect("a tick"),
-            Tick::Acquired { term: 1 }
+            TickOutcome::Acquired { term: 1 }
         );
         store.set_term(1);
         let (role, _) = watch::channel(Some(1));
@@ -946,7 +949,7 @@ pub(crate) mod tests {
         }
 
         fn head(&self) -> Position {
-            self.feed.log.head(Kinds::Watched)
+            self.feed.log.head(JournalKinds::Watched)
         }
     }
 
@@ -1136,7 +1139,7 @@ pub(crate) mod tests {
         assert_eq!((first.workers.len(), first.last), (PAGE, false));
         assert_eq!((second.workers.len(), second.last), (2, true));
         // Every row of the store once, by registration key.
-        let (_, rows) = leader.store.snapshot();
+        let (_, rows) = leader.store.all_rows();
         let mut keys: Vec<String> = rows.into_iter().map(|row| row.facts.key).collect();
         keys.sort();
         let paged: Vec<String> = first
@@ -1305,7 +1308,7 @@ pub(crate) mod tests {
             run.register(1, 1, "model-a");
             run.register(2, 1, "model-a");
             assert_eq!(held.term, run.head().term, "one term, two runs");
-            let floor = run.feed.log.floor(Kinds::Watched);
+            let floor = run.feed.log.floor(JournalKinds::Watched);
             let mut stream = run.watch(Start::After(held), &[]);
             let word = next(&mut stream).await;
             assert_eq!(
@@ -1326,7 +1329,7 @@ pub(crate) mod tests {
                 journaled(&LeasePlace::Process, 1)
                     .1
                     .log
-                    .head(Kinds::Watched)
+                    .head(JournalKinds::Watched)
                     .seq
             })
             .collect();
@@ -1388,7 +1391,7 @@ pub(crate) mod tests {
         assert_eq!((row.id, event.seq), (second.0, held.seq + 1));
         drop(stream);
 
-        let floor = leader.feed.log.floor(Kinds::Watched);
+        let floor = leader.feed.log.floor(JournalKinds::Watched);
         let lost = [
             // Another term at the position.
             Position {
@@ -1506,7 +1509,7 @@ pub(crate) mod tests {
         assert!(leader.elector.release().expect("a release"));
         assert_eq!(
             leader.elector.tick(Instant::now()).expect("a tick"),
-            Tick::Acquired { term: 2 }
+            TickOutcome::Acquired { term: 2 }
         );
         leader.store.set_term(2);
         leader.register(0, 1, "model-a");
@@ -1574,7 +1577,7 @@ pub(crate) mod tests {
         turns().await;
         let (woken, waker) = Woken::waker();
         parks(&mut stream, &waker);
-        let before = (leader.head(), leader.feed.log.head(Kinds::All));
+        let before = (leader.head(), leader.feed.log.head(JournalKinds::All));
         let now = Instant::now();
         for _ in 0..10_000 {
             leader
@@ -1584,7 +1587,10 @@ pub(crate) mod tests {
         // The journal's kinds were fixed where the store was built, the
         // watched kinds alone: a load row is no position of this log, wakes
         // no task and hands the watcher nothing.
-        assert_eq!((leader.head(), leader.feed.log.head(Kinds::All)), before);
+        assert_eq!(
+            (leader.head(), leader.feed.log.head(JournalKinds::All)),
+            before
+        );
         turns().await;
         assert_eq!(woken.wakes(), 0, "a load row woke the stream");
         parks(&mut stream, &waker);
@@ -2199,7 +2205,7 @@ pub(crate) mod tests {
     #[test]
     fn the_draw_is_made_wherever_the_lease_lives() {
         for place in [LeasePlace::Process, LeasePlace::File("lease".into())] {
-            let first = journaled(&place, 1).1.log.head(Kinds::Watched);
+            let first = journaled(&place, 1).1.log.head(JournalKinds::Watched);
             assert!(
                 first.seq != 0 && first.term == 0,
                 "a drawn start: {first:?}"

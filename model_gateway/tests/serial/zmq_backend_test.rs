@@ -1114,6 +1114,7 @@ async fn usage_prompt_count_over_zmq_is_the_gateways_until_the_engine_reports_on
 /// `fixture`'s sockets, as the worker's handshake driver fills it in.
 fn zmq_link(fixture: &ZmqFixture, worker_type: WorkerType, engines: Option<usize>) -> ZmqLink {
     ZmqLink {
+        pinned_by_rank: false,
         base_url: fixture.worker_url.clone(),
         model_id: MODEL.to_string(),
         runtime: RuntimeType::Vllm,
@@ -1162,4 +1163,44 @@ async fn the_gateways_connector_hands_the_engine_count_to_the_handshake() {
         .downcast_arc::<BackendClient>()
         .expect("the gateway's own client");
     assert_eq!(client.connected_engines(), Some(2));
+}
+
+/// Rank workers pin each request to their rank, and vLLM matches a pin
+/// against the engine's ZMQ index. A group indexed from 2 has no engine a
+/// pin to rank 0 or 1 reaches, so the connector refuses it for rank workers
+/// and still connects it for a grouped worker.
+#[tokio::test]
+#[serial]
+async fn the_gateways_connector_refuses_rank_workers_a_group_their_pins_do_not_reach() {
+    let fixture = zmq_fixture();
+    start_mock_zmq_engines_from(&fixture.handshake, 2, 2, Duration::ZERO);
+    let refusal = BackendConnector
+        .connect_zmq(ZmqLink {
+            pinned_by_rank: true,
+            ..zmq_link(&fixture, WorkerType::Regular, Some(2))
+        })
+        .await
+        .err()
+        .expect("rank workers behind a group indexed from 2");
+    assert!(
+        refusal.contains("reaches only 0 of the 2 engines"),
+        "{refusal}"
+    );
+
+    let fixture = zmq_fixture();
+    start_mock_zmq_engines_from(&fixture.handshake, 2, 2, Duration::ZERO);
+    BackendConnector
+        .connect_zmq(zmq_link(&fixture, WorkerType::Regular, Some(2)))
+        .await
+        .expect("a grouped worker takes the same group");
+
+    let fixture = zmq_fixture();
+    start_mock_zmq_engines(&fixture.handshake, 2);
+    BackendConnector
+        .connect_zmq(ZmqLink {
+            pinned_by_rank: true,
+            ..zmq_link(&fixture, WorkerType::Regular, Some(2))
+        })
+        .await
+        .expect("rank workers behind a group indexed from 0");
 }

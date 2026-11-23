@@ -509,6 +509,9 @@ class RouterArgs:
     least_load_kv_pressure_weight: float = 0.15
     least_load_mean_prefill_tokens: int = 1024
     load_monitor_interval: int = 10
+    # The interval in milliseconds, 100 at the least; set, it is the interval
+    # and load_monitor_interval is not read for it
+    load_monitor_interval_ms: int | None = None
     log_dir: str | None = None
     log_json: bool = False
     log_level: str | None = None
@@ -599,12 +602,6 @@ class RouterArgs:
     pd_pairing_mode: str = "lenient"
     policy: str | None = None
     policy_controller: str = "off"
-    # The policy controller this gateway follows, as host:port, and the PEM
-    # files of the connection to it
-    policy_controller_address: str | None = None
-    policy_controller_tls_ca_cert: str | None = None
-    policy_controller_tls_cert: str | None = None
-    policy_controller_tls_key: str | None = None
     policy_spec: str | None = None
     postgres_db_url: str | None = None
     # The bound on one Postgres history-store call (pool wait, connect and the
@@ -947,6 +944,10 @@ class RouterArgs:
                 "Idle timeout in seconds for pooled upstream connections. Must"
                 " stay below the backend HTTP server's keep-alive timeout (vLLM"
                 " and SGLang default to 5). 0 keeps idle connections forever."
+                " While a nonzero value is below the load monitor interval, an"
+                " idle HTTP worker is connected anew for every load poll; where"
+                " the server's keep-alive can be raised above that interval, a"
+                " value between the two keeps the connection."
                 " Defaults to 3."
             ),
         )
@@ -1023,7 +1024,7 @@ class RouterArgs:
             default=RouterArgs.policy_controller,
             help=(
                 "Choose off for the classic routing policies or on for the policy controller."
-                " Requests the controller cannot decide are refused by name."
+                " With on, the routing options keep their meaning through a policy document."
             ),
         )
         routing_group.add_argument(
@@ -1035,33 +1036,6 @@ class RouterArgs:
                 " The document replaces the routing options: one that is not at its"
                 " default is refused beside it by name."
             ),
-        )
-        routing_group.add_argument(
-            f"--{prefix}policy-controller-address",
-            metavar="host:port",
-            default=RouterArgs.policy_controller_address,
-            help=(
-                "Follow workers from the policy controller's gateway listener"
-                " (requires --policy-controller on)."
-            ),
-        )
-        routing_group.add_argument(
-            f"--{prefix}policy-controller-tls-ca-cert",
-            metavar="path",
-            default=RouterArgs.policy_controller_tls_ca_cert,
-            help="PEM certificate authority file for the controller connection.",
-        )
-        routing_group.add_argument(
-            f"--{prefix}policy-controller-tls-cert",
-            metavar="path",
-            default=RouterArgs.policy_controller_tls_cert,
-            help="PEM client certificate file for the controller connection.",
-        )
-        routing_group.add_argument(
-            f"--{prefix}policy-controller-tls-key",
-            metavar="path",
-            default=RouterArgs.policy_controller_tls_key,
-            help="PEM client private key file for the controller connection.",
         )
         routing_group.add_argument(
             f"--{prefix}encode-policy",
@@ -1338,8 +1312,7 @@ class RouterArgs:
                 " consistent_hashing places by its routing key, by its policy);"
                 " also sheds"
                 " a worker that crossed a threshold between selection"
-                " and dispatch, except for a request the policy controller"
-                " placed. Off by default."
+                " and dispatch. Off by default."
             ),
         )
         routing_group.add_argument(
@@ -1772,6 +1745,16 @@ class RouterArgs:
             type=int,
             default=RouterArgs.load_monitor_interval,
             help="Interval in seconds between load monitor checks for PowerOfTwo routing (default: 10)",
+        )
+        parser.add_argument(
+            f"--{prefix}load-monitor-interval-ms",
+            type=int,
+            default=RouterArgs.load_monitor_interval_ms,
+            help=(
+                "Interval in milliseconds between load monitor checks, 100 at the least."
+                " When set it is the interval, and --load-monitor-interval is not read for it"
+                " (default: unset)"
+            ),
         )
         parser.add_argument(
             f"--{prefix}disable-load-monitoring",
@@ -2832,7 +2815,9 @@ class RouterArgs:
                 "DP engines per startup ZMQ worker: each ipc:// or tcp:// worker becomes "
                 "a grouped worker whose handshake awaits this many engines on one "
                 "socket set (vLLM and TokenSpeed; default: as many as the first "
-                "engine to dial declares, one for an engine that declares none)"
+                "engine to dial declares, one for an engine that declares none). "
+                "Under --dp-aware a worker given this count registers as one worker "
+                "per engine, which share the socket set"
             ),
         )
         backend_group.add_argument(

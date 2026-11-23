@@ -2,13 +2,13 @@
 //! spec's `plugins` section (a row naming an address beside a module's)
 //! deserializes into these; until that row lands a host builds them
 //! directly. The parts a row has whatever its kind are the shared ones of
-//! [`crate::plugins::shared::config`], re-exported here.
+//! [`crate::plugins::shared`], re-exported here.
 
 use std::{fmt, path::PathBuf};
 
 use crate::document::spec::Needs;
-pub use crate::plugins::shared::config::{
-    BreakerSpec, EventKind, EventSet, Exposure, Failure, FrameBudget, HeaderSet, Reveal,
+pub(crate) use crate::plugins::shared::config::{
+    BreakerSpec, EventSet, Exposure, Failure, FrameBudget,
 };
 
 /// The client side of mutual TLS: the authority that signed the plugin's
@@ -59,11 +59,11 @@ pub struct GrpcPluginSpec {
     /// Passed in the hello, opaque to the host.
     pub config: Vec<u8>,
     /// The plugin's own budget per decision, in microseconds; `0` takes the
-    /// decision's remaining budget. The host clamps it to at most the
-    /// decision's; the frame names it as the plugin's deadline. A missed
-    /// deadline of a budget no longer than the I/O thread's promise (four
-    /// milliseconds) is never counted as the plugin's failure: the latency
-    /// rule alone judges it.
+    /// default frame ([`FrameBudget::DEFAULT_MICROS`]). The host clamps it to
+    /// at most the decision's; the frame names it as the plugin's deadline. A
+    /// missed deadline of a budget no longer than the I/O thread's promise
+    /// (four milliseconds) is never counted as the plugin's failure: the
+    /// latency rule alone judges it.
     pub budget_micros: u32,
     /// The connect and the hello run under this: at the apply, and on the
     /// I/O thread behind a cold thread's first decision, which takes its
@@ -84,8 +84,8 @@ pub struct GrpcPluginSpec {
     /// none by default: a row that lists none is told nothing, and no such
     /// stream is opened. A row that lists any has the plugin's scorer and
     /// picker say they need the lifecycle's calls
-    /// ([`crate::Lifecycle::needs_lifecycle`]). Bound as a filter alone a
-    /// plugin hears nothing, whatever this lists: the engine forwards the
+    /// ([`crate::stages::Lifecycle::needs_lifecycle`]). Bound as a filter alone
+    /// a plugin hears nothing, whatever this lists: the engine forwards the
     /// lifecycle to scorers and pickers.
     pub observes: EventSet,
     pub failure: Failure,

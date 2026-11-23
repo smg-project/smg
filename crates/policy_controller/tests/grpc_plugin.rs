@@ -39,20 +39,22 @@ use rcgen::{
 #[cfg(feature = "wasm")]
 use smg_policy_controller::plugins::wasm;
 use smg_policy_controller::{
+    document::Needs,
+    engine::{
+        Binding, Candidate, Constraints, Decision, Engine, Filter, Header, Health, Identity,
+        PairPools, Picker, Plan, PoolFacts, Profile, RequestFacts, Scorer, Scratch, ShedReason,
+        Target, Targets, TieBand, WeightedScorer, WorkerId,
+    },
     plugins::{
         grpc::{
-            Bound, BreakerSpec, EventKind, EventSet, Exposure, Failure, GrpcFilter, GrpcPicker,
-            GrpcPluginSpec, GrpcScorer, HeaderSet, LoadError, Plugin, Reveal, Runtime, Tls,
-            Transport,
+            GrpcFilter, GrpcPicker, GrpcPluginSpec, GrpcScorer, LoadError, Plugin, PluginBinding,
+            Runtime, Tls, Transport,
         },
-        shared::OpenDecisions,
+        shared::{BreakerSpec, Exposure, Failure, FrameBudget, HeaderSet, OpenDecisions, Reveal},
     },
     service::proto,
-    stages::builtins::{Best, Healthy, LeastRequests},
-    Binding, Candidate, Constraints, Decision, Engine, Filter, Header, Health, Identity, Lease,
-    Lifecycle, Membership, Needs, PairPools, Picker, Plan, PoolFacts, Profile, ReleaseReason,
-    RequestFacts, Scorer, Scratch, ShedReason, Side, Signal, Target, Targets, TieBand, Weighted,
-    WorkerId,
+    stages::{Best, Healthy, LeastRequests, Lifecycle},
+    tracking::{EventKind, EventSet, Lease, Membership, ReleaseReason, Side, Signal},
 };
 use support::{
     grpc_plugin::{eventually, Behaviour, Gate, ServerTls, TestPlugin, ALL, FILTER, PICK, SCORE},
@@ -79,6 +81,10 @@ fn unix(served: &TestPlugin) -> Transport {
 fn spec(served: &TestPlugin, name: &str) -> GrpcPluginSpec {
     let mut spec = GrpcPluginSpec::new(name, unix(served));
     spec.connect_micros = BUDGET_MICROS;
+    // The plugin states its frame, as wide as an answered case's budget. A
+    // plugin that states none takes the default frame, which has a case of
+    // its own.
+    spec.budget_micros = BUDGET_MICROS;
     // Every kind of event: the lifecycle's cases tell them, and a decision
     // reads none of it.
     spec.observes = EventSet::ALL;
@@ -142,7 +148,7 @@ fn profile_of(plugin: &Arc<Plugin>, stages: u32, fallbacks: bool) -> Profile {
 }
 
 /// `profile_of` over a bound set the caller took.
-fn bound_profile(bound: Arc<Bound>, stages: u32, fallbacks: bool) -> Profile {
+fn bound_profile(bound: Arc<PluginBinding>, stages: u32, fallbacks: bool) -> Profile {
     let filter: Box<dyn Filter> = if stages & FILTER != 0 {
         let fallback: Option<Box<dyn Filter>> = fallbacks.then(|| Box::new(Healthy) as _);
         Box::new(GrpcFilter::new(Arc::clone(&bound), fallback))
@@ -164,7 +170,7 @@ fn bound_profile(bound: Arc<Bound>, stages: u32, fallbacks: bool) -> Profile {
     Profile {
         name: "plugin".into(),
         filters: vec![filter],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer,
             weight: 1.0,
         }],
@@ -185,7 +191,7 @@ fn filter_then_picker(filter: &Arc<Plugin>, picker: &Arc<Plugin>) -> Profile {
     Profile {
         name: "two-plugins".into(),
         filters: vec![Box::new(GrpcFilter::new(filter.bind(), healthy))],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -1192,7 +1198,7 @@ fn a_pair_decision_over_both_kinds_is_one_decision_to_every_plugin() {
         vec![Profile {
             name: "both-kinds".into(),
             filters: vec![Box::new(wasm::WasmFilter::new(guest.bind(), healthy))],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(GrpcScorer::new(remote.bind(), least)),
                 weight: 1.0,
             }],
@@ -1577,6 +1583,52 @@ fn a_missed_deadline_under_the_plugins_own_bound_is_one_failure_of_its_decision(
         (stats.invalid, stats.failed_streams, stats.breaker_opens),
         (0, 0, 1),
         "the miss is the plugin's failure: {stats:?}"
+    );
+}
+
+/// A plugin that states no budget takes the default frame, under a request
+/// that states none too: a stage is shown the widest budget there, the
+/// frame names the default as the plugin's deadline, and a plugin that
+/// answers nothing is waited for that long and no longer. The fallbacks
+/// decide.
+#[test]
+fn a_plugin_with_no_budget_is_waited_for_the_default_frame_under_a_request_with_none() {
+    let served = TestPlugin::serve();
+    served.behave(Behaviour::Silent);
+    let runtime = runtime();
+    let mut unset = spec(&served, "unbudgeted");
+    unset.budget_micros = 0;
+    let plugin = Plugin::load(&runtime, unset).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
+    // What a stage is shown for a request that states no budget.
+    let widest = RequestFacts {
+        budget_micros: u32::MAX,
+        ..facts(1)
+    };
+    let default = FrameBudget::DEFAULT_MICROS;
+    let started = Instant::now();
+    assert_eq!(
+        lead(&decide_with(&engine, &widest, &pool(4))),
+        Some(103),
+        "the fallbacks decide"
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_micros(u64::from(default)),
+        "the first stage waited out the default frame: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_micros(u64::from(BUDGET_MICROS)),
+        "and nothing like a request's budget: {waited:?}"
+    );
+    assert!(eventually(|| served.frames() == 1));
+    let seen = served.seen();
+    let frame = &seen.frames[0];
+    assert_eq!(frame.budget_micros, default, "the deadline the frame named");
+    assert_eq!(
+        frame.request.as_ref().map(|request| request.budget_micros),
+        Some(u32::MAX),
+        "the request's own budget, as a stage is shown it"
     );
 }
 
@@ -1980,7 +2032,7 @@ fn filters_of(plugins: &[&Arc<Plugin>]) -> Profile {
                 Box::new(GrpcFilter::new(plugin.bind(), healthy)) as Box<dyn Filter>
             })
             .collect(),
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -2380,7 +2432,7 @@ fn a_frame_past_the_window_is_refused_without_a_fault() {
     let scorers = (0..9)
         .map(|_| {
             let fallback: Option<Box<dyn Scorer>> = Some(Box::new(LeastRequests));
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(GrpcScorer::new(binder.bind(), fallback)) as Box<dyn Scorer>,
                 weight: 1.0,
             }
@@ -3220,7 +3272,7 @@ fn an_adapter_needs_the_lifecycle_where_its_row_or_its_fallback_does() {
         single_engine(Profile {
             name: "adapted".into(),
             filters: vec![],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(adapter(fallback)),
                 weight: 1.0,
             }],
@@ -3454,6 +3506,7 @@ fn a_plugin_hears_the_kinds_of_event_its_row_lists_and_no_other() {
     // The default row lists nothing.
     let mut unlisted = GrpcPluginSpec::new("unlisted", unix(&served));
     unlisted.connect_micros = BUDGET_MICROS;
+    unlisted.budget_micros = BUDGET_MICROS;
     assert_eq!(unlisted.observes, EventSet::NONE);
     let deaf = Plugin::load(&runtime, unlisted).expect("the plugin loads");
     assert_eq!(deaf.observes(), EventSet::NONE);
@@ -4177,6 +4230,7 @@ fn mutual_tls_with_the_pinned_server_name() {
     let runtime = runtime();
     let mut spec = GrpcPluginSpec::new("remote", tls("plugin.test", &client_cert, &client_key));
     spec.connect_micros = BUDGET_MICROS;
+    spec.budget_micros = BUDGET_MICROS;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads over mutual TLS");
     let engine = single_engine(profile(&plugin, ALL));
     assert_eq!(lead(&decide(&engine, &pool(4), 1)), Some(103));

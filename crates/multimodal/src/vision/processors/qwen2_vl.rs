@@ -108,7 +108,8 @@ impl Qwen2VLProcessor {
     }
 
     /// Create a processor with custom settings.
-    pub fn with_config(
+    #[cfg(test)]
+    fn with_config(
         patch_size: usize,
         merge_size: usize,
         min_pixels: usize,
@@ -133,17 +134,26 @@ impl Qwen2VLProcessor {
     }
 
     /// Create a processor from preprocessor config, resolving its geometry
-    /// and transforms once.
+    /// and transforms once. The pixel bounds are `min_pixels` / `max_pixels`,
+    /// else the `size` edges the reference saves them under today.
     pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
+        let min_pixels = config
+            .min_pixels
+            .or_else(|| config.get_shortest_edge())
+            .unwrap_or(DEFAULT_MIN_PIXELS);
+        let max_pixels = config
+            .max_pixels
+            .or_else(|| config.get_longest_edge())
+            .unwrap_or(DEFAULT_MAX_PIXELS);
         Self {
             inner: QwenVLProcessorBase::from_configs(
                 QwenVLConfig {
                     patch_size: config.get_patch_size(DEFAULT_PATCH_SIZE),
                     merge_size: config.merge_size.unwrap_or(DEFAULT_MERGE_SIZE),
-                    min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
-                    max_pixels: config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS),
-                    video_min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
-                    video_max_pixels: config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS),
+                    min_pixels,
+                    max_pixels,
+                    video_min_pixels: min_pixels,
+                    video_max_pixels: max_pixels,
                     video_resize_mode: QwenVideoResizeMode::TotalVolume,
                     temporal_patch_size: config
                         .temporal_patch_size
@@ -208,37 +218,6 @@ impl Qwen2VLProcessor {
         }
     }
 
-    /// Get the patch size.
-    pub fn patch_size(&self) -> usize {
-        self.inner.patch_size()
-    }
-
-    /// Get the merge size.
-    pub fn merge_size(&self) -> usize {
-        self.inner.merge_size()
-    }
-
-    /// Get the minimum pixels.
-    pub fn min_pixels(&self) -> usize {
-        self.inner.min_pixels()
-    }
-
-    /// Get the maximum pixels.
-    pub fn max_pixels(&self) -> usize {
-        self.inner.max_pixels()
-    }
-
-    /// Get the temporal patch size.
-    pub fn temporal_patch_size(&self) -> usize {
-        self.inner.temporal_patch_size()
-    }
-
-    /// Get the factor for dimension alignment.
-    #[inline]
-    pub fn get_factor(&self) -> usize {
-        self.inner.get_factor()
-    }
-
     /// Smart resize algorithm for Qwen2-VL.
     pub fn smart_resize(
         &self,
@@ -246,22 +225,6 @@ impl Qwen2VLProcessor {
         width: usize,
     ) -> Result<(usize, usize), TransformError> {
         self.inner.smart_resize(height, width)
-    }
-
-    /// Calculate the grid dimensions (T, H, W) for an image.
-    pub fn calculate_grid_thw(
-        &self,
-        height: usize,
-        width: usize,
-        num_frames: usize,
-    ) -> (usize, usize, usize) {
-        self.inner.calculate_grid_thw(height, width, num_frames)
-    }
-
-    /// Calculate the number of image tokens after merge.
-    pub fn calculate_tokens_from_grid(&self, grid_t: usize, grid_h: usize, grid_w: usize) -> usize {
-        self.inner
-            .calculate_tokens_from_grid(grid_t, grid_h, grid_w)
     }
 }
 
@@ -609,6 +572,19 @@ mod tests {
         assert_eq!(processor.min_pixels(), 100000);
         assert_eq!(processor.max_pixels(), 500000);
         assert_eq!(processor.temporal_patch_size(), 4);
+    }
+
+    #[test]
+    fn size_edges_bound_an_image_without_the_pixel_keys() {
+        let config = PreProcessorConfig::from_json(
+            r#"{"size": {"shortest_edge": 3136, "longest_edge": 12845056}}"#,
+        )
+        .unwrap();
+        let processor = Qwen2VLProcessor::from_preprocessor_config(&config);
+
+        // 4x4 and 214x286 patches; the defaults would give 32x32 and 60x82.
+        assert_eq!(processor.smart_resize(64, 64).unwrap(), (56, 56));
+        assert_eq!(processor.smart_resize(3000, 4000).unwrap(), (2996, 4004));
     }
 
     #[test]

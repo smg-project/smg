@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use rand::{distr::Alphanumeric, RngExt};
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::{MTLSConfig, MeshServerConfig};
+use smg_policy_controller::stages::StageRegistry;
 use smg_service_discovery::RuntimeDiscoveryConfig;
 use smg_worker::identity::{
     basic::{ConnectionMode, RuntimeType},
@@ -38,7 +39,6 @@ use crate::{
     mesh::discovery::MeshDiscoveryConfig,
     observability::metrics::PrometheusConfig,
     policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
-    policy_controller,
     secrets::SecretFiles,
     server::{
         posture::{SecretSource, SecretSources},
@@ -1163,31 +1163,16 @@ impl CliArgs {
     }
 
     /// The router configuration of the flags. A refusal is raised in this
-    /// order: flag shapes, controller and worker sources, discovery flags,
-    /// the schema file, tenant keys, the history store, model aliases, and
-    /// the shared validator over the built configuration.
+    /// order: the flag shapes, the discovery flags, the schema file, the
+    /// tenant keys, the history store, the model aliases, and last the
+    /// shared validator over the built configuration, which the builder
+    /// runs.
     pub(crate) fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
         encode_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         self.validate_flag_formats()?;
-        if self.routing.policy_controller_address.is_some() {
-            if !self.routing.worker_urls.is_empty()
-                || !encode_urls.is_empty()
-                || !prefill_urls.is_empty()
-                || !self.workers.decode.is_empty()
-            {
-                return Err(ConfigError::IncompatibleConfig {
-                    reason: "--policy-controller-address supplies the workers and conflicts with --worker-urls, --encode, --prefill and --decode".to_owned(),
-                });
-            }
-            if self.selected_discovery_provider().is_some() {
-                return Err(ConfigError::IncompatibleConfig {
-                    reason: "--policy-controller-address supplies the workers and conflicts with --service-discovery and --discovery-provider".to_owned(),
-                });
-            }
-        }
         self.warn_ignored_companions(&prefill_urls, &encode_urls);
 
         let mode = self.routing_mode(prefill_urls, encode_urls);
@@ -1253,6 +1238,7 @@ impl CliArgs {
             .job_queue_capacity(self.routing.job_queue_capacity)
             .job_queue_concurrency(self.routing.job_queue_concurrency)
             .load_monitor_interval_secs(self.workers.load_monitor_interval)
+            .load_monitor_interval_ms(self.workers.load_monitor_interval_ms)
             .worker_stall_secs(self.workers.worker_stall_secs)
             .worker_wedge_secs(self.workers.worker_wedge_secs)
             .worker_stale_secs(self.workers.worker_stale_secs)
@@ -1385,15 +1371,7 @@ impl CliArgs {
                 self.integrations.tls_key_path.as_ref(),
             );
 
-        let config = RouterConfig {
-            policy_controller_address: self.routing.policy_controller_address.clone(),
-            policy_controller_tls_ca_cert: self.routing.policy_controller_tls_ca_cert.clone(),
-            policy_controller_tls_cert: self.routing.policy_controller_tls_cert.clone(),
-            policy_controller_tls_key: self.routing.policy_controller_tls_key.clone(),
-            ..builder.build_with_validation(false)?
-        };
-        config.validate()?;
-        Ok(config)
+        builder.build()
     }
 
     /// Combine validated router settings with listener, discovery, and authentication flags.
@@ -1551,10 +1529,11 @@ impl CliArgs {
         lines
     }
 
-    /// Phase 3, configure: assemble the validated router configuration and
-    /// wrap it in the server configuration. A refusal names the flag before
-    /// any listener binds or task starts. Startup also validates configurations
-    /// built by library callers.
+    /// Phase 3, configure: the router configuration, validated once by the
+    /// builder's `build()`, wrapped in the server configuration. Every
+    /// refusal is a [`ConfigError`] naming the flag; nothing has been bound
+    /// or spawned when one is raised. (`startup` validates once more, for a
+    /// library caller that never went through the builder.)
     pub(crate) fn configure(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -1581,10 +1560,14 @@ impl CliArgs {
     }
 
     /// The answer of `--print-policy-spec`: the policy document this command
-    /// line means, as YAML, checked by the function a start hands its own
-    /// document to ([`policy_controller::hosted`]): the operators' door over
-    /// the stock stages. The routing part of the line is read alone
-    /// ([`Self::routing_config`]). Nothing is bound or spawned.
+    /// line means, as YAML, checked as the gateway checks a document it
+    /// hosts ([`RouterConfig::hosted_policy`]), over the stock stages. The
+    /// document is the one the routing flags mean, which names stock
+    /// stages alone: a supplied document is refused beside the print. A
+    /// host's table holds every stock stage beside the host's own, so it
+    /// answers this document as the stock table does. The routing part of
+    /// the line is read alone ([`Self::routing_config`]). Nothing is bound
+    /// or spawned.
     pub(crate) fn policy_spec_print(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -1604,7 +1587,7 @@ impl CliArgs {
         };
         // A document this gateway's check refuses is still the one the flags
         // mean: it prints, with the check's word for what it refuses.
-        match policy_controller::hosted(&config, None, &yaml) {
+        match config.hosted_policy(&document, &StageRegistry::builtin()) {
             Ok(_) => PolicySpecPrint::Document(yaml),
             Err(refusal) => PolicySpecPrint::DocumentRefused {
                 document: yaml,

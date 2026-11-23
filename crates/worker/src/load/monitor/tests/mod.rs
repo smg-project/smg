@@ -632,6 +632,275 @@ async fn spawned_tasks_use_weak_references() {
     );
 }
 
+/// A host that reads its workers' loads for a part of its life stops the
+/// monitor and starts it again. The stop ends every task the start made
+/// and the publisher a pushed record started, each awaited, so none holds
+/// the monitor behind it. The monitor's receivers stay subscribed and read
+/// the empty snapshot, and the sink's reset takes the overload veto off. A
+/// later start polls the registry as it stands then, a worker registered
+/// while the monitor was stopped among it.
+#[tokio::test]
+async fn a_stopped_monitor_ends_its_tasks_and_starts_again_over_the_registry() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w1:8080", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let reports = monitor.subscribe();
+    monitor.start_event_loop();
+    assert_eq!(monitor.group_handles.lock().len(), 1);
+
+    // A pushed record starts the publisher of pushed reports, the one task
+    // of the monitor that its start does not make.
+    monitor.apply_pushed_load(&worker, 0, &pushed(1), Instant::now());
+    assert!(monitor.pushed_flush_task.lock().is_some());
+
+    // What a tick leaves: a published report and a veto.
+    let _ = monitor.load_state.publish_group(
+        &[],
+        vec![(Arc::clone(&worker), Arc::new(WorkerLoadResponse::default()))],
+    );
+    assert!(reports.borrow().contains(worker.url()));
+    assert!(registry.set_worker_overloaded(&worker, true));
+
+    monitor.stop().await;
+
+    assert!(monitor.group_handles.lock().is_empty());
+    for task in [
+        &monitor.event_task,
+        &monitor.eviction_flush_task,
+        &monitor.liveness_sweep_task,
+        &monitor.pushed_flush_task,
+    ] {
+        assert!(task.lock().is_none(), "a task of the monitor stands");
+    }
+    assert_eq!(
+        Arc::weak_count(&monitor),
+        0,
+        "a task of the stopped monitor still holds it"
+    );
+    assert!(
+        reports.borrow().is_empty(),
+        "a receiver subscribed before the stop reads the empty snapshot"
+    );
+    assert!(!worker.is_overloaded(), "the reset takes the veto off");
+
+    // A second stop finds nothing to end.
+    monitor.stop().await;
+
+    // A worker registered while the monitor is stopped starts no group.
+    registry
+        .register(ready_worker("http://w2:8080", "gpt-4"))
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert!(monitor.group_handles.lock().is_empty());
+
+    monitor.start_event_loop();
+    assert_eq!(monitor.group_handles.lock().len(), 2);
+    assert!(monitor.event_task.lock().is_some());
+}
+
+/// A ready HTTP worker at one URL that serves `models`.
+fn serving(models: &[&str]) -> Arc<dyn Worker> {
+    let cards: Vec<ModelCard> = models.iter().copied().map(ModelCard::new).collect();
+    let worker = BasicWorkerBuilder::new("http://w:1")
+        .worker_type(WorkerType::Regular)
+        .connection_mode(ConnectionMode::Http)
+        .models(cards)
+        .health_config(crate::test_support::no_health_check())
+        .build();
+    worker.set_status(WorkerStatus::Ready);
+    Arc::new(worker)
+}
+
+/// Poll a stop once: whether it ended.
+async fn polled_once(stop: std::pin::Pin<&mut impl std::future::Future<Output = ()>>) -> bool {
+    tokio::select! {
+        biased;
+        () = stop => true,
+        () = std::future::ready(()) => false,
+    }
+}
+
+/// A start keeps the eviction flusher that stands. The flusher may have
+/// taken the one wakeup of an eviction and not applied it yet: a start
+/// that ended it there would leave that eviction queued until the next
+/// one. Behind a stop dropped at its first wait and a second start, the
+/// slot's task is the one the first start spawned.
+#[tokio::test]
+async fn a_start_keeps_the_eviction_flusher_that_stands() {
+    let (registry, monitor) = build_monitor();
+    registry
+        .register(ready_worker("http://w1:8080", "llama-3"))
+        .unwrap();
+    let flusher = || {
+        let slot = monitor.eviction_flush_task.lock();
+        slot.as_ref().map(JoinHandle::id)
+    };
+    monitor.start_event_loop();
+    let stood = flusher().expect("the first start's flusher");
+    {
+        let stop = monitor.stop();
+        tokio::pin!(stop);
+        assert!(!polled_once(stop.as_mut()).await, "the stop ended");
+    }
+
+    monitor.start_event_loop();
+    assert_eq!(
+        flusher(),
+        Some(stood),
+        "the start replaced a flusher that stood"
+    );
+    monitor.stop().await;
+}
+
+/// A group's loop that another is spawned over is told to end. Two
+/// reconciles of one group can each find no loop and each spawn one, and
+/// the second handle goes over the first: a loop with no handle would
+/// poll on behind every stop. Here the stop ends the loop that holds the
+/// handle, and no loop holds the monitor.
+#[tokio::test]
+async fn a_group_loop_another_is_spawned_over_is_told_to_end() {
+    let (_registry, monitor) = build_monitor();
+    let key = WorkerGroupKey {
+        model_id: "llama-3".to_string(),
+        worker_type: WorkerType::Regular,
+        connection_mode: ConnectionMode::Http,
+    };
+    monitor.spawn_group_loop(key.clone(), Duration::from_secs(10));
+    monitor.spawn_group_loop(key, Duration::from_secs(10));
+
+    monitor.stop().await;
+    assert_eq!(
+        Arc::weak_count(&monitor),
+        0,
+        "the loop written over outlived the stop"
+    );
+}
+
+/// A start behind a stop that was dropped at its first wait ends what it
+/// replaces of the tasks that stop left standing: the first start's
+/// liveness sweep, whose handle it writes over, and the event task whose
+/// handle the stop put back. The next stop ends every task that stands,
+/// the first start's eviction flusher among them, and no task of either
+/// start holds the monitor.
+#[tokio::test]
+async fn a_start_behind_a_dropped_stop_ends_the_tasks_it_replaces() {
+    let (registry, monitor) = build_monitor();
+    registry
+        .register(ready_worker("http://w1:8080", "llama-3"))
+        .unwrap();
+    monitor.start_event_loop();
+    {
+        let stop = monitor.stop();
+        tokio::pin!(stop);
+        assert!(!polled_once(stop.as_mut()).await, "the stop ended");
+    }
+
+    monitor.start_event_loop();
+    monitor.stop().await;
+    assert_eq!(
+        Arc::weak_count(&monitor),
+        0,
+        "a task of the first start outlived the stop"
+    );
+}
+
+/// A start made while a stop waits writes its event task's handle into the
+/// slot, and the stop, dropped then, leaves it there: the next stop ends
+/// the task that start made. The stop is polled once: the event task is
+/// told to end, and ends at its next turn.
+#[tokio::test]
+async fn a_stop_dropped_behind_a_start_leaves_the_starts_event_task_its_slot() {
+    let (registry, monitor) = build_monitor();
+    registry
+        .register(ready_worker("http://w1:8080", "llama-3"))
+        .unwrap();
+    monitor.start_event_loop();
+
+    let started = {
+        let stop = monitor.stop();
+        tokio::pin!(stop);
+        assert!(!polled_once(stop.as_mut()).await, "the stop ended");
+        monitor.start_event_loop();
+        let slot = monitor.event_task.lock();
+        slot.as_ref().map(JoinHandle::abort_handle)
+    };
+    let started = started.expect("the start's event task");
+
+    monitor.stop().await;
+    assert!(
+        started.is_finished(),
+        "the event task a start made beside a dropped stop outlived the next stop"
+    );
+}
+
+/// A stop dropped at its first wait keeps the event task's handle, so the
+/// stop behind it waits for that task's end too. The event task's poll of
+/// a replacement is held inside the sink while both stops are polled:
+/// neither takes a group's loop while that poll runs. The poll then starts
+/// the loop of the group the replacement adds, and the second stop ends it
+/// with every other task. While the poll is held the case waits on its
+/// own thread alone, and the sink lets no poll of a worker run: no timer
+/// of the runtime is needed, and no task waits for the reports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_behind_one_dropped_at_its_first_wait_waits_for_the_event_task() {
+    let (entered, in_forget) = mpsc::channel();
+    let (resume, at_resume) = mpsc::channel();
+    let registry = Arc::new(WorkerRegistry::new());
+    let sink = Arc::new(StoppedAtForget {
+        classic: ClassicLoadSink::new(
+            Arc::clone(&registry),
+            Arc::new(LoadReaders::Blind),
+            Arc::new(WorkerLoadManager::new()),
+        ),
+        entered,
+        resume: Mutex::new(at_resume),
+    });
+    let monitor = Arc::new(WorkerMonitor::with_sink(
+        Arc::clone(&registry),
+        sink,
+        5,
+        false,
+        false,
+    ));
+    let id = registry.register(serving(&["a"])).unwrap();
+    monitor.start_event_loop();
+    let groups = || monitor.group_handles.lock().len();
+    assert_eq!(groups(), 1);
+
+    // The event task's poll of the replacement stands inside the sink.
+    assert!(registry.replace(&id, serving(&["a", "b"])));
+    in_forget.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    {
+        let stop = monitor.stop();
+        tokio::pin!(stop);
+        assert!(!polled_once(stop.as_mut()).await, "the stop ended");
+    }
+    assert_eq!(groups(), 1, "a stop at its first wait took a group's loop");
+
+    let stop = monitor.stop();
+    tokio::pin!(stop);
+    assert!(!polled_once(stop.as_mut()).await, "the stop ended");
+    assert_eq!(
+        groups(),
+        1,
+        "the stop took a group's loop ahead of the event task's end"
+    );
+
+    // The poll goes on, and starts the loop of the group the replacement
+    // adds.
+    resume.send(()).unwrap();
+    assert!(within_two_seconds(|| groups() == 2).await);
+
+    stop.await;
+    assert_eq!(groups(), 0, "a group's loop outlived the stop");
+    assert_eq!(
+        Arc::weak_count(&monitor),
+        0,
+        "a task of the stopped monitor still holds it"
+    );
+}
+
 fn pushed(running: i32) -> PushedRecord {
     PushedRecord {
         snapshot: SchedulerLoadSnapshot {
@@ -2491,7 +2760,9 @@ async fn a_replaced_workers_late_eviction_leaves_its_successors_report() {
 }
 
 /// The monitor's own sink with a stop inside `forget`: a case holds the
-/// collector there while another thread pushes a record.
+/// collector there while another thread pushes a record. It asks no
+/// worker for its load, so a monitor started over it runs no poll: a poll
+/// that ends while the stop stands would wait for the reports it holds.
 struct StoppedAtForget {
     classic: ClassicLoadSink<crate::test_support::Members>,
     entered: mpsc::Sender<()>,
@@ -2538,6 +2809,10 @@ impl LoadSink for StoppedAtForget {
 
     fn reset(&self) {
         self.classic.reset();
+    }
+
+    fn polls(&self, _worker: &dyn Worker) -> bool {
+        false
     }
 }
 
@@ -3202,7 +3477,7 @@ async fn the_batchs_sentinel_covers_every_rank_of_the_row() {
 fn polled(monitor: &WorkerMonitor, worker: &Arc<dyn Worker>, answer: WorkerLoadResponse) {
     let _ = monitor.apply_polled_load("http://w:1", &answer, Instant::now());
     Metrics::record_engine_load(
-        "http://w:1",
+        worker.as_ref(),
         worker.model_id(),
         registered_engine_role(*worker.worker_type()),
         &answer,
@@ -3842,7 +4117,7 @@ async fn a_far_rank_has_its_own_sentinel_and_no_rank_between() {
         let (registry, monitor) = build_monitor();
         let worker = ready_worker("http://w:1", "m");
         let id = registry.register(Arc::clone(&worker)).unwrap();
-        for rank in [0, 1_000] {
+        for rank in [0, 63] {
             monitor.apply_pushed_load(&worker, rank, &pushed(7), Instant::now());
         }
         registry.transition_status(&id, WorkerStatus::NotReady);
@@ -3850,10 +4125,10 @@ async fn a_far_rank_has_its_own_sentinel_and_no_rank_between() {
         monitor.evict_worker_loads(&worker);
     });
     assert!(
-        running_series_of(&rendered, 1_000).ends_with(" -1"),
+        running_series_of(&rendered, 63).ends_with(" -1"),
         "the far rank"
     );
-    assert!(!rendered.contains("dp_rank=\"999\""), "a rank between");
+    assert!(!rendered.contains("dp_rank=\"62\""), "a rank between");
 }
 
 /// A report held through a flush: the worker at `http://w:1` reported 7,

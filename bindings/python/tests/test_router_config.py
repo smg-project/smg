@@ -124,6 +124,18 @@ class TestRouterConfigValidation:
         args = RouterArgs(cache_threshold=1.0)
         assert args.cache_threshold == 1.0
 
+    def test_a_line_with_no_policy_builds_cache_aware(self, tmp_path):
+        args = parse_router_args(["--cache-threshold", "2"])
+        args.storage_hook_wasm_path = str(tmp_path / "missing.wasm")
+        with pytest.raises(ValueError, match="cache_threshold"):
+            Router.from_args(args).start()
+        with pytest.raises(ValueError, match="cache_threshold"):
+            _Router(
+                worker_urls=[],
+                cache_threshold=2,
+                storage_hook_wasm_path=args.storage_hook_wasm_path,
+            ).start()
+
     def test_balance_threshold_validation(self):
         """Test load balancing threshold validation."""
         # Valid thresholds
@@ -635,11 +647,14 @@ def policy_document(tmp_path):
 
 
 class TestPolicyDocument:
-    """A missing storage hook stops an accepted start before anything binds."""
+    """The plain start runs the policy document it was given, and a routing option
+    beside a document is refused by its name."""
 
     @staticmethod
-    def assert_start_refusal(path, reason, *flags):
-        # Each start installs a process-wide metrics recorder.
+    def assert_start_refusal(path, named, *flags):
+        # Each start installs a process-wide metrics recorder, so each runs in a
+        # process of its own. A storage hook that is not there stops a start that
+        # accepted its document before anything binds.
         code = dedent("""
             import sys
             from pathlib import Path
@@ -662,7 +677,15 @@ class TestPolicyDocument:
             timeout=30,
         )
         assert result.returncode == 1, result.stderr
-        assert f"RuntimeError: {reason}" in result.stderr, result.stderr
+        # The start ends in the policy controller's refusal of the document, which
+        # names what the document wrote. The words between are the policy crate's,
+        # and no case here holds them.
+        refusals = [
+            line for line in result.stderr.splitlines() if line.startswith("RuntimeError: ")
+        ]
+        assert len(refusals) == 1, result.stderr
+        assert refusals[0].startswith("RuntimeError: policy controller: "), result.stderr
+        assert named in refusals[0], result.stderr
 
     @pytest.mark.parametrize(
         "mode",
@@ -671,7 +694,7 @@ class TestPolicyDocument:
     )
     def test_the_plain_start_takes_the_document(self, policy_document, mode):
         path = policy_document("round_robin", kind="PolicySpec")
-        self.assert_start_refusal(path, 'the document carries kind "PolicySpec"', *mode)
+        self.assert_start_refusal(path, '"PolicySpec"', *mode)
 
     @pytest.mark.parametrize(
         ("flags", "named"),
@@ -750,18 +773,6 @@ class TestPolicyDocument:
         assert args.options_a_document_replaces() == []
         Router.from_args(args)
 
-    def test_a_line_with_no_document_builds_cache_aware_as_before(self, tmp_path):
-        args = parse_router_args(["--cache-threshold", "2"])
-        args.storage_hook_wasm_path = str(tmp_path / "missing.wasm")
-        with pytest.raises(ValueError, match="cache_threshold"):
-            Router.from_args(args).start()
-        with pytest.raises(ValueError, match="cache_threshold"):
-            _Router(
-                worker_urls=[],
-                cache_threshold=2,
-                storage_hook_wasm_path=args.storage_hook_wasm_path,
-            ).start()
-
 
 class TestKeywordOnlyParametersOfTheCliFlags:
     """The parameters behind the CLI's --engine-metrics, --grouped-dp-sticky,
@@ -778,10 +789,6 @@ class TestKeywordOnlyParametersOfTheCliFlags:
             "grouped_dp_sticky",
             "pd_pairing_mode",
             "policy_controller",
-            "policy_controller_address",
-            "policy_controller_tls_ca_cert",
-            "policy_controller_tls_cert",
-            "policy_controller_tls_key",
             "policy_spec",
             "runtime_worker_threads",
             "webrtc_bind_addr",
@@ -805,33 +812,6 @@ class TestKeywordOnlyParametersOfTheCliFlags:
     def test_an_unknown_policy_controller_value_is_refused(self):
         with pytest.raises(ValueError, match=r"policy_controller.*other.*expected 'on' or 'off'"):
             _Router(worker_urls=["http://w:8000"], policy_controller="other").start()
-
-    @pytest.mark.parametrize(
-        ("options", "refusal"),
-        [
-            ({}, "requires the policy_controller setting"),
-            (
-                {"policy_controller": "on", "worker_urls": ["http://w:8000"]},
-                "supplies the workers",
-            ),
-            (
-                {"policy_controller": "on", "policy_controller_tls_cert": "cert.pem"},
-                "must be given together",
-            ),
-            (
-                {
-                    "policy_controller": "on",
-                    "policy_controller_tls_cert": "cert.pem",
-                    "policy_controller_tls_key": "key.pem",
-                },
-                "requires --policy-controller-tls-ca-cert",
-            ),
-        ],
-    )
-    def test_a_controller_address_is_checked_as_on_the_command_line(self, options, refusal):
-        options = {"worker_urls": [], "policy_controller_address": "controller:30100", **options}
-        with pytest.raises(ValueError, match=refusal):
-            _Router(**options).start()
 
     def test_a_document_path_reaches_the_configuration(self, tmp_path):
         path = tmp_path / "routing.yaml"

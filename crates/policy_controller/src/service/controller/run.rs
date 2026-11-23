@@ -26,9 +26,10 @@ use tracing_subscriber::EnvFilter;
 #[cfg(feature = "discovery")]
 use super::discovery::DiscoveryFlags;
 use super::{
-    Config, ConfigError, Controller, Election, Error, LeasePlace, Listener, Scope, Tls, VERSION,
+    Config, ConfigError, Controller, ElectionConfig, Error, LeasePlace, Listener, Scope, Tls,
+    VERSION,
 };
-use crate::{service::elector::ElectionSettings, stages::catalog::Catalog};
+use crate::{service::elector::ElectionSettings, stages::registry::StageRegistry};
 
 /// The controller's ports sit in one block, apart from the gateway's data
 /// (30000) and metrics (29000) ports.
@@ -411,7 +412,7 @@ impl Cli {
             shutdown_grace: Duration::from_secs(self.shutdown_grace_period_secs),
             load_poll_interval: Duration::from_secs(self.load_monitor_interval),
             decide_shards: usize::from(self.decide_shards),
-            election: Election {
+            election: ElectionConfig {
                 lease: self.lease(),
                 settings: ElectionSettings {
                     duration: Duration::from_millis(self.lease_duration_ms),
@@ -585,7 +586,7 @@ impl Cli {
 /// arrives before anything is served.
 async fn bind(
     config: Config,
-    catalog: Catalog,
+    catalog: StageRegistry,
     as_told: &[String],
     spec: SpecSource,
 ) -> Result<Controller, Error> {
@@ -616,7 +617,7 @@ async fn bind(
 /// the `main` that calls it installs none. When called inside an async
 /// runtime: `run` builds its own and blocks on it, so that `main` is a
 /// plain `fn main`.
-pub fn run(catalog: Catalog) -> ExitCode {
+pub fn run(catalog: StageRegistry) -> ExitCode {
     let cli = Cli::parse();
     init_logging(&cli.log_level, cli.log_json);
     run_with(cli, catalog)
@@ -626,7 +627,7 @@ pub fn run(catalog: Catalog) -> ExitCode {
 /// the spec's source, then the runtime, bind and serve on it. Apart from
 /// the parse, which reads the process's own arguments, and from the log,
 /// which a process sets once.
-fn run_with(cli: Cli, catalog: Catalog) -> ExitCode {
+fn run_with(cli: Cli, catalog: StageRegistry) -> ExitCode {
     let config = match cli.config() {
         Ok(config) => config,
         Err(error) => {
@@ -684,15 +685,15 @@ mod tests {
     use super::{bind, color_for, set, truthy, Cli, SpecSource};
     use crate::{
         document::spec::SpecError,
+        engine::{Candidate, Constraints, Filter, RequestFacts},
         service::{
             controller::{
                 membership::tests::Logged, spec_store::SpecStore, Config, ConfigError, Controller,
-                Election, Error, LeasePlace, Scope, SpecRejected, StoreRefused,
+                ElectionConfig, Error, LeasePlace, Scope, SpecRejected, StoreRefused,
             },
             elector::ElectionSettings,
         },
-        stages::catalog::Catalog,
-        Candidate, Constraints, Filter, RequestFacts,
+        stages::registry::StageRegistry,
     };
 
     /// A spec source for a command line that names none: a start names one,
@@ -1065,7 +1066,7 @@ mod tests {
     #[test]
     fn with_no_lease_flag_one_replica_leads_itself_on_the_designs_settings() {
         let alone = config(&[]).expect("parsed");
-        assert_eq!(alone.election, Election::default());
+        assert_eq!(alone.election, ElectionConfig::default());
         assert_eq!(alone.election.lease, LeasePlace::Process);
         assert_eq!(alone.election.settings, ElectionSettings::default());
         assert_eq!(
@@ -1253,14 +1254,17 @@ mod tests {
     #[tokio::test]
     async fn the_bound_controller_holds_the_stages_the_run_is_handed() {
         let config = parse(&EPHEMERAL).config().expect("the flags are in order");
-        let mut stages = Catalog::builtin();
+        let mut stages = StageRegistry::builtin();
         stages.filter("any", || Box::new(Any)).expect("a free name");
         let dir = tempfile::tempdir().expect("a temp dir");
         let source = SpecSource::Store(dir.path().to_owned());
         let controller = bind(config, stages, &[], source).await.expect("binds");
-        assert!(controller.catalog().filters().any(|name| name == "any"));
+        assert!(controller
+            .stage_registry()
+            .filters()
+            .any(|name| name == "any"));
         // The stock build holds no such stage.
-        assert!(Catalog::builtin().filters().all(|name| name != "any"));
+        assert!(StageRegistry::builtin().filters().all(|name| name != "any"));
     }
 
     /// A spec file's document names the stages the run is handed: a stage
@@ -1273,18 +1277,18 @@ mod tests {
         let document =
             "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [any]\n    pick: random\n";
         std::fs::write(&path, document).expect("the file");
-        let start = |stages: Catalog| {
+        let start = |stages: StageRegistry| {
             let config = parse(&EPHEMERAL).config().expect("the flags are in order");
             bind(config, stages, &[], SpecSource::File(path.clone()))
         };
 
-        let mut stages = Catalog::builtin();
+        let mut stages = StageRegistry::builtin();
         stages.filter("any", || Box::new(Any)).expect("a free name");
         let controller = start(stages).await.expect("a host's stage starts");
-        assert_eq!(controller.store().world().spec().generation(), 1);
+        assert_eq!(controller.store().snapshot().spec().generation(), 1);
         drop(controller);
 
-        match start(Catalog::builtin()).await {
+        match start(StageRegistry::builtin()).await {
             Err(Error::SpecFile {
                 source: SpecRejected::Invalid(SpecError::UnknownFilter { profile, name }),
                 ..
@@ -1299,13 +1303,13 @@ mod tests {
     #[derive(Debug)]
     struct Level(bool);
 
-    impl crate::Lifecycle for Level {
+    impl crate::stages::Lifecycle for Level {
         fn needs_lifecycle(&self) -> bool {
             self.0
         }
     }
 
-    impl crate::Scorer for Level {
+    impl crate::engine::Scorer for Level {
         fn name(&self) -> &'static str {
             "level"
         }
@@ -1316,9 +1320,9 @@ mod tests {
             _: &[Candidate],
             _: &[u32],
             out: &mut [f32],
-        ) -> crate::TieBand {
+        ) -> crate::engine::TieBand {
             out.fill(1.0);
-            crate::TieBand::NORMALIZED
+            crate::engine::TieBand::NORMALIZED
         }
     }
 
@@ -1335,7 +1339,7 @@ mod tests {
         std::fs::write(&path, document).expect("the file");
         let start = |needs: bool| {
             let config = parse(&EPHEMERAL).config().expect("the flags are in order");
-            let mut stages = Catalog::builtin();
+            let mut stages = StageRegistry::builtin();
             stages
                 .scorer("level", move || Box::new(Level(needs)))
                 .expect("a free name");
@@ -1343,7 +1347,7 @@ mod tests {
         };
 
         let controller = start(false).await.expect("no need of the calls starts");
-        assert_eq!(controller.store().world().spec().generation(), 1);
+        assert_eq!(controller.store().snapshot().spec().generation(), 1);
         drop(controller);
 
         match start(true).await {
@@ -1377,7 +1381,7 @@ mod tests {
             let config = parse(&EPHEMERAL).config().expect("the flags are in order");
             bind(
                 config,
-                Catalog::builtin(),
+                StageRegistry::builtin(),
                 &[],
                 SpecSource::File(path.clone()),
             )
@@ -1389,7 +1393,7 @@ mod tests {
             ("{}", true),
         ] {
             let controller = start(affinity).await.expect(affinity);
-            let needs = controller.store().world().spec().needs();
+            let needs = controller.store().snapshot().spec().needs();
             assert_eq!(needs.sent_prefixes, sent, "{affinity}");
         }
     }
@@ -1410,7 +1414,7 @@ mod tests {
             async move {
                 bind(
                     config,
-                    Catalog::builtin(),
+                    StageRegistry::builtin(),
                     &cli.identity_as_told,
                     cli.spec_source().expect("the flags name a store"),
                 )
@@ -1483,7 +1487,7 @@ mod tests {
         let (release, blocked) = mpsc::channel::<()>();
         let blocked = Arc::new(Mutex::new(blocked));
         let (left, leaves) = mpsc::channel::<()>();
-        let mut stages = Catalog::builtin();
+        let mut stages = StageRegistry::builtin();
         stages
             .filter("any", move || {
                 // On the run's runtime alone: a registration builds the
@@ -1659,7 +1663,7 @@ mod tests {
             .finish();
         let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let code = tracing::subscriber::with_default(subscriber, || {
-            super::run_with(cli, Catalog::builtin())
+            super::run_with(cli, StageRegistry::builtin())
         });
         assert_eq!(code, ExitCode::FAILURE);
         let said = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
@@ -1680,7 +1684,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a directory");
         let holder = SpecStore::open(dir.path().to_owned()).expect("the holder");
         let config = parse(&EPHEMERAL).config().expect("the flags are in order");
-        let mut controller = Controller::bind_with(config, Catalog::builtin())
+        let mut controller = Controller::bind_with(config, StageRegistry::builtin())
             .await
             .expect("the controller binds");
         let call = controller.spec_store(dir.path().to_owned());
@@ -1721,11 +1725,16 @@ mod tests {
         }
         let start = |path: PathBuf| {
             let config = parse(&EPHEMERAL).config().expect("the flags are in order");
-            bind(config, Catalog::builtin(), &[], SpecSource::Store(path))
+            bind(
+                config,
+                StageRegistry::builtin(),
+                &[],
+                SpecSource::Store(path),
+            )
         };
 
         let mut controller = start(store.clone()).await.expect("the store starts");
-        assert_eq!(controller.store().world().spec().generation(), 4);
+        assert_eq!(controller.store().snapshot().spec().generation(), 4);
         let file = store.join("00000000000000000004.yaml");
         match controller.spec_file(file.clone()).await {
             Err(Error::SpecFile {
@@ -1775,7 +1784,7 @@ mod tests {
         assert!(matches!(config.election.lease, LeasePlace::File(_)));
 
         let source = SpecSource::Store(store.clone());
-        match bind(config, Catalog::builtin(), &[], source).await {
+        match bind(config, StageRegistry::builtin(), &[], source).await {
             Err(refused @ Error::SpecStore {
                 source: StoreRefused::BesideASharedLease,
                 ..
@@ -1813,20 +1822,20 @@ mod tests {
             let config = parse(&args).config().expect("the flags are in order");
             bind(
                 config,
-                Catalog::builtin(),
+                StageRegistry::builtin(),
                 &[],
                 SpecSource::File(file.clone()),
             )
         };
 
         let alone = start(&[]).await.expect("the file starts");
-        assert_eq!(alone.store().world().spec().generation(), 1);
+        assert_eq!(alone.store().snapshot().spec().generation(), 1);
         assert!(alone.shared.generations.source_writes());
         drop(alone);
 
         let paired = start(&shared).await.expect("the file starts");
         assert_eq!(
-            paired.store().world().spec().generation(),
+            paired.store().snapshot().spec().generation(),
             0,
             "passed, not applied"
         );

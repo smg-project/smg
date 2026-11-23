@@ -837,7 +837,7 @@ fn seed_string_tenants(
 ) -> Arc<Tree> {
     policy.init_workers(workers);
     let model_key = normalize_model_key(workers[0].model_id()).to_string();
-    let tree = Arc::clone(policy.string_trees.get(&model_key).unwrap().value());
+    let tree = policy.trees.string_tree(&model_key).unwrap();
     for url in tenant_urls {
         tree.insert_text(text, url);
     }
@@ -854,7 +854,7 @@ fn seed_token_tenants(
 ) -> Arc<TokenTree> {
     policy.init_workers(workers);
     let model_key = normalize_model_key(workers[0].model_id()).to_string();
-    let tree = Arc::clone(policy.token_trees.get(&model_key).unwrap().value());
+    let tree = policy.trees.token_tree(&model_key).unwrap();
     for url in tenant_urls {
         tree.insert_tokens(tokens, url);
     }
@@ -917,7 +917,7 @@ fn string_tree_miss_uses_expected_wait_and_records_final_worker() {
     assert_only_final_worker_credited(&policy, &workers, 1, 1024);
 
     let model = normalize_model_key(workers[0].model_id());
-    let tree = policy.string_trees.get(model).unwrap();
+    let tree = policy.trees.string_tree(model).unwrap();
     let matched = tree.match_prefix_with_counts(text);
     assert!(matched
         .matched_tenants
@@ -1014,7 +1014,7 @@ fn token_tree_miss_uses_expected_wait_and_records_final_worker() {
     assert_only_final_worker_credited(&policy, &workers, 1, 8);
 
     let model = normalize_model_key(workers[0].model_id());
-    let tree = policy.token_trees.get(model).unwrap();
+    let tree = policy.trees.token_tree(model).unwrap();
     let matched = tree.match_prefix_with_counts(&tokens);
     assert!(matched
         .matched_tenants
@@ -1782,8 +1782,8 @@ fn test_remove_worker_purges_tree_tenants() {
     // Seed both tenants explicitly; worker cleanup is the behavior under
     // test, independent of random tie-breaking in a fully dark fleet.
     let model_key = normalize_model_key(workers[0].model_id()).to_string();
-    let string_tree = Arc::clone(policy.string_trees.get(&model_key).unwrap().value());
-    let token_tree = Arc::clone(policy.token_trees.get(&model_key).unwrap().value());
+    let string_tree = policy.trees.string_tree(&model_key).unwrap();
+    let token_tree = policy.trees.token_tree(&model_key).unwrap();
     string_tree.insert_text("purge me please", workers[0].url());
     string_tree.insert_text("keep me around", workers[1].url());
     let tokens_a: Vec<u32> = (0..32).collect();
@@ -1823,23 +1823,19 @@ fn test_remove_workers_from_model_does_not_mutate_other_models() {
     let tokens: Vec<u32> = (0..32).collect();
 
     for model_id in ["retired-model", "active-model"] {
-        let string_tree = Arc::new(Tree::new());
+        let string_tree = policy.trees.string_tree_or_new(model_id);
         string_tree.insert_text("shared prefix", worker_url);
-        policy
-            .string_trees
-            .insert(model_id.to_string(), string_tree);
 
-        let token_tree = Arc::new(policy.new_token_tree());
+        let token_tree = policy.trees.token_tree_or_new(model_id);
         token_tree.insert_tokens(&tokens, worker_url);
-        policy.token_trees.insert(model_id.to_string(), token_tree);
 
         policy.record_placement(model_id, None, &tokens, &[16], worker_url, Instant::now());
     }
 
     policy.remove_workers_from_model("retired-model", &HashSet::from([worker_url.to_string()]));
 
-    let retired_string = policy.string_trees.get("retired-model").unwrap();
-    let retired_token = policy.token_trees.get("retired-model").unwrap();
+    let retired_string = policy.trees.string_tree("retired-model").unwrap();
+    let retired_token = policy.trees.token_tree("retired-model").unwrap();
     assert!(!retired_string
         .get_tenant_char_count()
         .contains_key(worker_url));
@@ -1851,8 +1847,8 @@ fn test_remove_workers_from_model_does_not_mutate_other_models() {
         .get("retired-model")
         .is_some_and(|placements| placements.is_empty()));
 
-    let active_string = policy.string_trees.get("active-model").unwrap();
-    let active_token = policy.token_trees.get("active-model").unwrap();
+    let active_string = policy.trees.string_tree("active-model").unwrap();
+    let active_token = policy.trees.token_tree("active-model").unwrap();
     assert!(active_string
         .get_tenant_char_count()
         .contains_key(worker_url));
@@ -1991,8 +1987,8 @@ fn a_repaired_path_resolves_until_the_tree_evicts_it() {
 
     // Both workers hold each path now, so a budget under one copy of the
     // tokens evicts both from the token tree and one from the string tree.
-    let string_tree = Arc::clone(policy.string_trees.get("model1").unwrap().value());
-    let token_tree = Arc::clone(policy.token_trees.get("model1").unwrap().value());
+    let string_tree = policy.trees.string_tree("model1").unwrap();
+    let token_tree = policy.trees.token_tree("model1").unwrap();
     assert_eq!(
         (string_tree.hashed_paths(), token_tree.hashed_paths()),
         (1, 1)
@@ -2078,7 +2074,7 @@ fn a_peer_delta_attaches_the_worker_along_the_whole_request() {
         kv_index::hash_node_path(&second),
         "http://remote",
     ));
-    let tree = Arc::clone(policy.string_trees.get(model).unwrap().value());
+    let tree = policy.trees.string_tree(model).unwrap();
     assert_eq!(
         tree.tenant_char_size(&Arc::<str>::from("http://remote")),
         second.chars().count()
@@ -2108,7 +2104,7 @@ fn a_peer_delta_for_a_recent_request_resolves_after_eviction() {
     };
 
     let older = converse("first");
-    let tree = Arc::clone(policy.string_trees.get(model).unwrap().value());
+    let tree = policy.trees.string_tree(model).unwrap();
     let one_conversation = tree.total_char_size();
     let newer = converse("second");
     policy.evict_cache(one_conversation * 3 / 2);
@@ -2143,8 +2139,8 @@ fn every_turn_of_a_conversation_resolves_while_the_tree_keeps_it() {
             kv_index::hash_token_path(&tokens),
         ));
     }
-    let string_tree = Arc::clone(policy.string_trees.get(model).unwrap().value());
-    let token_tree = Arc::clone(policy.token_trees.get(model).unwrap().value());
+    let string_tree = policy.trees.string_tree(model).unwrap();
+    let token_tree = policy.trees.token_tree(model).unwrap();
     assert_eq!(
         (string_tree.hashed_paths(), token_tree.hashed_paths()),
         (5, 5)
@@ -2186,8 +2182,8 @@ fn nothing_is_hashed_without_the_mesh() {
     let tokens: Vec<u32> = (0..32).collect();
     route_text(&policy, &workers, text).unwrap();
     route_tokens(&policy, &workers, &tokens);
-    assert_eq!(policy.string_trees.get(model).unwrap().hashed_paths(), 0);
-    assert_eq!(policy.token_trees.get(model).unwrap().hashed_paths(), 0);
+    assert_eq!(policy.trees.string_tree(model).unwrap().hashed_paths(), 0);
+    assert_eq!(policy.trees.token_tree(model).unwrap().hashed_paths(), 0);
     assert!(!policy.apply_known_remote_insert(
         model,
         TreeKind::String,
@@ -2217,10 +2213,10 @@ fn a_token_prompt_under_one_page_is_not_hashed() {
     let model = normalize_model_key(workers[0].model_id());
     let short: Vec<u32> = (0..15).collect();
     route_tokens(&policy, &workers, &short);
-    assert_eq!(policy.token_trees.get(model).unwrap().hashed_paths(), 0);
+    assert_eq!(policy.trees.token_tree(model).unwrap().hashed_paths(), 0);
     let page: Vec<u32> = (0..16).collect();
     route_tokens(&policy, &workers, &page);
-    assert_eq!(policy.token_trees.get(model).unwrap().hashed_paths(), 1);
+    assert_eq!(policy.trees.token_tree(model).unwrap().hashed_paths(), 1);
 }
 
 #[test]
@@ -2242,7 +2238,7 @@ fn a_routed_tailed_prompt_and_a_repair_page_name_the_node_by_its_aligned_hash() 
     let model = normalize_model_key(workers[0].model_id());
     let tailed: Vec<u32> = (0..17).collect();
     route_tokens(&policy, &workers, &tailed);
-    assert_eq!(policy.token_trees.get(model).unwrap().hashed_paths(), 1);
+    assert_eq!(policy.trees.token_tree(model).unwrap().hashed_paths(), 1);
 
     let aligned: Vec<u32> = (0..16).collect();
     let never_routed: Vec<u32> = (100..116).collect();
@@ -2286,7 +2282,7 @@ fn a_routed_tailed_prompt_and_a_repair_page_name_the_node_by_its_aligned_hash() 
         resolves(&never_routed),
         "a repaired path the gateway never routed answers to its hash"
     );
-    assert_eq!(policy.token_trees.get(model).unwrap().hashed_paths(), 2);
+    assert_eq!(policy.trees.token_tree(model).unwrap().hashed_paths(), 2);
 }
 
 #[test]
@@ -2325,7 +2321,7 @@ fn peers_resolve_every_tail_of_a_shared_prefix() {
     for prompt in &prompts {
         route_tokens(&a, &workers, prompt);
     }
-    assert_eq!(a.token_trees.get(model).unwrap().hashed_paths(), 1);
+    assert_eq!(a.trees.token_tree(model).unwrap().hashed_paths(), 1);
     route_tokens(&b, &workers, &prompts[0]);
     let resolved = prompts
         .iter()
@@ -2365,7 +2361,7 @@ fn peers_resolve_every_tail_of_a_shared_prefix() {
         })
         .count();
     assert_eq!(resolved_after, prompts.len());
-    assert_eq!(b.token_trees.get(model).unwrap().hashed_paths(), 1);
+    assert_eq!(b.trees.token_tree(model).unwrap().hashed_paths(), 1);
 }
 
 #[test]
@@ -4449,15 +4445,15 @@ fn hash_mode_never_touches_trees() {
     let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     policy.init_workers(&workers);
-    assert!(policy.string_trees.is_empty());
-    assert!(policy.token_trees.is_empty());
+    assert_eq!(policy.trees.string_tree_count(), 0);
+    assert_eq!(policy.trees.token_tree_count(), 0);
 
     let tokens: Vec<u32> = (0..32).collect();
     route_tokens(&policy, &workers, &tokens);
     route_text(&policy, &workers, "a text prompt long enough to insert").unwrap();
 
-    assert!(policy.string_trees.is_empty());
-    assert!(policy.token_trees.is_empty());
+    assert_eq!(policy.trees.string_tree_count(), 0);
+    assert_eq!(policy.trees.token_tree_count(), 0);
     assert!(!policy.placement_index.is_empty());
 }
 
@@ -4553,7 +4549,7 @@ fn hash_mode_untokenized_text_stays_dark_fleet_expected_wait() {
         policy.on_request_complete(workers[1].url());
     }
     assert!(policy.placement_index.is_empty());
-    assert!(policy.string_trees.is_empty());
+    assert_eq!(policy.trees.string_tree_count(), 0);
 }
 
 /// w1 holds one request; each pick on w2 is dropped before its guard is
@@ -4952,7 +4948,7 @@ fn a_request_is_keyed_once_for_both_trees_and_the_marker_length_is_what_a_match_
     // What the token tree reads back for the namespaced key is the
     // prompt plus the marker: the match count minus the marker length
     // is the prompt's own match, and the plain key sees none of it.
-    let tree = policy.new_token_tree();
+    let tree = policy.trees.token_tree_or_new("keyed-once");
     tree.insert_tokens(&keyed, "http://w1:8000");
     let hit = tree.match_and_insert(&keyed, "http://w1:8000");
     assert_eq!(hit.matched_token_count - marker_len, prompt.len());
@@ -5027,7 +5023,7 @@ fn imbalance_fallback_inserts_under_the_cache_namespace() {
         .select_worker_fallback(&workers, &info, &[0, 1], model_id)
         .unwrap();
 
-    let tree = policy.token_trees.get(model_id).unwrap().value().clone();
+    let tree = policy.trees.token_tree(model_id).unwrap();
     // The unpartitioned prompt cannot see the namespaced insert...
     assert!(tree.prefix_match_legacy(&prompt).0.is_empty());
     // ...while the namespaced key matches in full.

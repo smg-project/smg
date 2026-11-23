@@ -612,6 +612,7 @@ struct Router {
     least_load_kv_pressure_weight: f64,
     least_load_mean_prefill_tokens: u32,
     load_monitor_interval: u64,
+    load_monitor_interval_ms: Option<u64>,
     log_dir: Option<String>,
     log_json: bool,
     log_level: Option<String>,
@@ -659,12 +660,6 @@ struct Router {
     pd_disaggregation: bool,
     pd_pairing_mode: String,
     policy_controller: String,
-    /// The controller this gateway follows, as `host:port`, and the PEM files
-    /// of the connection to it.
-    policy_controller_address: Option<String>,
-    policy_controller_tls_ca_cert: Option<String>,
-    policy_controller_tls_cert: Option<String>,
-    policy_controller_tls_key: Option<String>,
     policy_spec: Option<String>,
     postgres_config: Option<PyPostgresConfig>,
     power_of_two_load_metric: String,
@@ -1421,7 +1416,7 @@ impl Router {
         let grouped_dp_sticky = self.parse_grouped_dp_sticky()?;
         let policy_controller = self.parse_policy_controller()?;
 
-        let builder = config::RouterConfig::builder()
+        config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
             .cache_boundaries(self.cache_boundaries.clone())
@@ -1459,6 +1454,7 @@ impl Router {
             )
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .load_monitor_interval_ms(self.load_monitor_interval_ms)
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
@@ -1608,20 +1604,8 @@ impl Router {
                 self.server_cert_path.as_ref(),
                 self.server_key_path.as_ref(),
             )
-            .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler);
-
-        // The controller's address and its files have no builder step. The
-        // command line sets the same four fields on the built configuration,
-        // and the shared validator reads them there.
-        let config = config::RouterConfig {
-            policy_controller_address: self.policy_controller_address.clone(),
-            policy_controller_tls_ca_cert: self.policy_controller_tls_ca_cert.clone(),
-            policy_controller_tls_cert: self.policy_controller_tls_cert.clone(),
-            policy_controller_tls_key: self.policy_controller_tls_key.clone(),
-            ..builder.build_with_validation(false)?
-        };
-        config.validate()?;
-        Ok(config)
+            .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
+            .build()
     }
 }
 
@@ -1717,6 +1701,7 @@ impl Router {
         least_load_kv_pressure_weight = 0.15,
         least_load_mean_prefill_tokens = 1024,
         load_monitor_interval = 10,
+        load_monitor_interval_ms = None,
         log_dir = None,
         log_json = false,
         log_level = None,
@@ -1761,10 +1746,6 @@ impl Router {
         pd_disaggregation = false,
         pd_pairing_mode = String::from("lenient"),
         policy_controller = String::from("off"),
-        policy_controller_address = None,
-        policy_controller_tls_ca_cert = None,
-        policy_controller_tls_cert = None,
-        policy_controller_tls_key = None,
         policy_spec = None,
         postgres_config = None,
         power_of_two_load_metric = String::from("expected_wait"),
@@ -1950,6 +1931,7 @@ impl Router {
         least_load_kv_pressure_weight: f64,
         least_load_mean_prefill_tokens: u32,
         load_monitor_interval: u64,
+        load_monitor_interval_ms: Option<u64>,
         log_dir: Option<String>,
         log_json: bool,
         log_level: Option<String>,
@@ -1994,10 +1976,6 @@ impl Router {
         pd_disaggregation: bool,
         pd_pairing_mode: String,
         policy_controller: String,
-        policy_controller_address: Option<String>,
-        policy_controller_tls_ca_cert: Option<String>,
-        policy_controller_tls_cert: Option<String>,
-        policy_controller_tls_key: Option<String>,
         policy_spec: Option<String>,
         postgres_config: Option<PyPostgresConfig>,
         power_of_two_load_metric: String,
@@ -2234,6 +2212,7 @@ impl Router {
             least_load_kv_pressure_weight,
             least_load_mean_prefill_tokens,
             load_monitor_interval,
+            load_monitor_interval_ms,
             log_dir,
             log_json,
             log_level,
@@ -2278,10 +2257,6 @@ impl Router {
             pd_disaggregation,
             pd_pairing_mode,
             policy_controller,
-            policy_controller_address,
-            policy_controller_tls_ca_cert,
-            policy_controller_tls_cert,
-            policy_controller_tls_key,
             policy_spec,
             postgres_config,
             power_of_two_load_metric,

@@ -15,7 +15,7 @@
 //! windows all hold less than the request has words of its own.
 
 use serde::Deserialize;
-use smg_policy_controller::{Constraints, DemandFacts, Demands, ShedReason};
+use smg_policy_controller::engine::{Constraints, DemandFacts, Demands, ShedReason};
 
 use super::demand_bed::{
     self, pool_refusal, wire_of, Answer, Bed, Pooled, Refusal, Replayed, Runtimes, State, Wire,
@@ -113,6 +113,7 @@ impl Replayed for Row {
                     window: worker.window(),
                     ..DemandFacts::default()
                 },
+                rank: None,
             });
         }
         let mut bed = Bed::new(self.shed, &pooled)?;

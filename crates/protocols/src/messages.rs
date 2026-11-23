@@ -2595,6 +2595,7 @@ pub struct McpToolset {
     pub default_config: Option<McpToolDefaultConfig>,
 
     /// Configuration overrides for specific tools
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub configs: Option<HashMap<String, McpToolConfig>>,
 
     /// Cache control for this toolset

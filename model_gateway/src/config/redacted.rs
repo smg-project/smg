@@ -56,6 +56,7 @@ const PLAIN: &[&str] = &[
     "job_queue_capacity",
     "job_queue_concurrency",
     "load_monitor_interval_secs",
+    "load_monitor_interval_ms",
     "worker_stall_secs",
     "worker_wedge_secs",
     "worker_stale_secs",
@@ -135,10 +136,6 @@ const PLAIN: &[&str] = &[
     "enable_wasm",
     "storage_hook_wasm_path",
     "policy_controller",
-    "policy_controller_address",
-    "policy_controller_tls_ca_cert",
-    "policy_controller_tls_cert",
-    "policy_controller_tls_key",
     "policy_spec_path",
 ];
 

@@ -9,10 +9,11 @@
 //! [`Client`] is the reference client. It asks for a decision one request at
 //! a time ([`Client::decide`]). [`Link`] shares the session and one decide
 //! stream across a host's requests and releases the leases of a decision
-//! its caller never takes. [`Handle::asked`](crate::tracking::handle::Handle::asked)
-//! holds a linked decision and sends its reports on the session that
-//! stands when it reports ([`Link::redial`]). A document the controller
-//! pushes reaches the link's holder ([`Link::spec_pushes`]).
+//! its caller never takes.
+//! [`DecisionGuard::asked`](crate::tracking::decision_guard::DecisionGuard::asked)
+//! holds a linked decision and sends its reports on the session that stands
+//! when it reports ([`Link::redial`]). A document the controller pushes reaches
+//! the link's holder ([`Link::spec_pushes`]).
 //!
 //! A watch of the controller's workers opens on either client's channel
 //! ([`Client::watch_workers`], [`Link::watch_workers`]). Once open it has
@@ -42,7 +43,7 @@
 //! A [`Link`] holds [`ANSWER_WAIT`] over its dial, its `Leader` ask and the
 //! opens of its session, decide stream and watch. An ask waits its
 //! caller's budget ([`Link::ask`]) and a report waits for nothing
-//! ([`Link::report`]). The readers of the session and decide stream wait
+//! ([`Link::queue_frame`]). The readers of the session and decide stream wait
 //! with no bound of their own. The link sets the channel's keepalive,
 //! which ends a session whose controller went silent ([`Link::connect`]).
 
@@ -78,7 +79,7 @@ pub(crate) mod wire;
 
 #[cfg(test)]
 pub(crate) use link::tests::{poll, Peer};
-pub use link::{Link, SpecPushes, Unanswered};
+pub use link::{DecisionUnavailable, Link, SpecPushes};
 
 /// Frames the client may queue toward the controller.
 const SESSION_QUEUE: usize = 16;
@@ -177,14 +178,14 @@ pub enum Error {
     /// A hard demand of a host's request is refused under this kind too, as
     /// `constraints.demands`: this protocol version states none, so a
     /// handle sends no request that states one
-    /// ([`Handle::asked`](crate::tracking::handle::Handle::asked)).
+    /// ([`DecisionGuard::asked`](crate::tracking::decision_guard::DecisionGuard::asked)).
     #[error("an ask's {0} is out of its range in this protocol version")]
     OutOfRange(&'static str),
     /// A link's report queue was full: its session took no report for as
     /// long as the queue covers. The session ended, and the reports its
-    /// queue held are lost with it ([`Link::report`]).
+    /// queue held are lost with it ([`Link::queue_frame`]).
     #[error("the link's report queue was full")]
-    ReportsFull,
+    FrameQueueFull,
     /// A watch was asked of a link with no session standing.
     /// [`Link::ended`] gives the cause.
     #[error("the link has ended")]

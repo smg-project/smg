@@ -95,9 +95,9 @@ fn model_id_from_labels(labels: &HashMap<String, String>) -> String {
 }
 
 /// DP info for a ZMQ worker. There is nothing to read: its engines dial in
-/// later and serve no metadata route, so the spec's own `dp_size` (a grouped
-/// worker: one socket set, N engines) is the answer. Reporting it lets the
-/// creation check a ZMQ worker's shape where the DP read is on.
+/// later and serve no metadata route, so the spec's own `dp_size` (N engines
+/// dialing one socket set) is the answer. Reporting it lets the creation
+/// register one worker per rank where the DP read is on.
 fn zmq_dp_info(config: &WorkerSpec, labels: &HashMap<String, String>) -> DpInfo {
     DpInfo {
         dp_size: config.dp_size.unwrap_or(1).max(1),
@@ -161,10 +161,21 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Discov
                 }
             }
             // A ZMQ worker has no metadata route to read: its DP shape is
-            // the spec's own `dp_size` (a grouped worker awaiting N engines
-            // on one socket set). Report it so the creation can check the
-            // shape.
-            Some(ConnectionMode::Zmq) => zmq_dp_info(config, &context.data.discovered_labels),
+            // the spec's own `dp_size` (N engines dialing one socket set),
+            // which the creation expands into rank workers. Engines that
+            // only declare their count at the handshake are not known yet:
+            // the worker registers as one grouped worker.
+            Some(ConnectionMode::Zmq) => {
+                if config.dp_size.is_none() {
+                    warn!(
+                        "No DP size for ZMQ worker {}: its ranks register as one grouped \
+                         worker, and no routing policy chooses among them; give the \
+                         engine count (--zmq-engine-count, or `dp_size` on the worker spec)",
+                        Endpoint::redacted_str(&config.url)
+                    );
+                }
+                zmq_dp_info(config, &context.data.discovered_labels)
+            }
             _ => {
                 // Over HTTP the DP size stands in the server info of the
                 // runtimes whose row of the table says so. No other runtime

@@ -173,11 +173,11 @@ impl fmt::Debug for KeptCredential {
 impl KeptCredential {
     /// The write was taken: the stated credential stands at the address,
     /// bound to `row`, the row the door answered (the `new` row of a
-    /// [`Wrote::Another`](super::Wrote::Another)), beside the rows bound
-    /// there before. Call it whether or not the write moved the row: a
-    /// worker stated again binds its row on a host that had not bound it.
-    /// Call it at the door's answer, with no await between the two: a
-    /// token dropped there puts back a credential the row's object was
+    /// [`MembershipWriteOutcome::Another`](super::MembershipWriteOutcome::Another)),
+    /// beside the rows bound there before. Call it whether or not the write
+    /// moved the row: a worker stated again binds its row on a host that had
+    /// not bound it. Call it at the door's answer, with no await between the
+    /// two: a token dropped there puts back a credential the row's object was
     /// built with.
     ///
     /// Return `true` where an object at the address may hold another

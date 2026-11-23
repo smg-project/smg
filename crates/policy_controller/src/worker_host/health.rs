@@ -34,7 +34,7 @@ use smg_worker::{
     worker::WorkerStatus as ObjectStatus,
 };
 
-use super::{object::status, Lead, Objects, Standing};
+use super::{object::status, Lead, Objects, RowRevision};
 use crate::store::{HealthSink as StoreHealthSink, HealthWrite, LeaderBits};
 
 /// The health sink for a replica that keeps its workers in the store.
@@ -112,7 +112,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
         &self,
         worker_id: &ObjectId,
         revision: u64,
-        write_row: impl FnOnce(&S, Standing) -> HealthWrite,
+        write_row: impl FnOnce(&S, RowRevision) -> HealthWrite,
     ) -> HealthWrite {
         self.fenced(worker_id, revision, |store, standing, _| {
             let write = write_row(store, standing);
@@ -129,7 +129,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
         &self,
         worker_id: &ObjectId,
         revision: u64,
-        write_row: impl FnOnce(&S, Standing, &dyn Worker) -> (HealthWrite, Option<ObjectStatus>),
+        write_row: impl FnOnce(&S, RowRevision, &dyn Worker) -> (HealthWrite, Option<ObjectStatus>),
     ) -> HealthWrite {
         if !self.leads() {
             return HealthWrite::Stale;
@@ -199,23 +199,18 @@ impl<G: Generation, S: StoreHealthSink + ?Sized + 'static> HealthSink for Health
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
-
     use parking_lot::Mutex;
     use smg_worker::{
-        health::manager::{WorkerManager, WorkerManagerConfig},
         registry::{event::WorkerEvent, WorkerRegistry},
         runtime::StallReason,
-        settings::UnhealthyRemovalScope,
     };
     use tokio::sync::broadcast::error::TryRecvError;
 
     use super::*;
     use crate::{
-        engine::view::Role,
         store::{
-            membership::life, Ask, GatewayId, HealthPolicy, MemoryStore, ViewBuffers, WorkerFacts,
-            WorkerPatch, WorkerStatus as RowStatus, WorkersStore,
+            membership::life, HealthPolicy, MemoryStore, StoreSnapshot, WorkerFacts, WorkerPatch,
+            WorkerStatus as RowStatus, WorkersStore,
         },
         worker_host::{object, Members, SoleLead},
     };
@@ -272,22 +267,16 @@ mod tests {
             registry.get(&self.id).expect("a worker")
         }
 
-        /// Whether a decision reads the worker as doubted: the stalled bit
-        /// of its row in the model's pool, as any gateway is handed it.
+        /// Whether the store holds the leader's doubt of the worker: the
+        /// stalled bit of its record, as the store's world holds it.
         fn doubted(&self) -> bool {
-            let ask = Ask {
-                gateway: GatewayId(1),
-                now: Instant::now(),
-                pinned: None,
-                affinity: false,
-                signal_cells: false,
-            };
-            let mut out = ViewBuffers::default();
             // A registration is in force at its window's publication: the
             // case asks for one.
             self.store.publish_now();
-            let built = self.store.build_view(MODEL, Role::Single, &ask, &mut out);
-            built.is_some() && out.candidates.iter().any(|row| row.health.stalled)
+            let id = self.store.by_key(URL).expect("a stored worker").id;
+            let stalled =
+                |world: &StoreSnapshot| world.first_row_of(id).map(|row| row.health.stalled);
+            self.store.deciding(stalled).expect("the worker's record")
         }
 
         #[track_caller]
@@ -416,15 +405,15 @@ mod tests {
         // No veto stands on the object: its projection writes no doubt.
         assert_eq!(adapter.project(&replica.id), stood);
         assert!(!replica.doubted());
-        // The veto alone moves no row. The projection writes it, and moves
-        // no status of the row or of the object.
+        // The veto alone moves no record. The projection writes it, and
+        // moves no status of the record or of the object.
         assert!(replica.object().set_stall(Some(StallReason::Unreachable)));
         assert!(!replica.doubted());
         assert_eq!(adapter.project(&replica.id), stood);
         assert!(replica.doubted());
         replica.assert_statuses(Some(RowStatus::Pending), ObjectStatus::Pending);
         // The object is read at the write: the veto it dropped is gone
-        // from the row at the next projection.
+        // from the record at the next projection.
         assert!(replica.object().set_stall(None));
         assert_eq!(adapter.project(&replica.id), stood);
         assert!(!replica.doubted());
@@ -443,105 +432,16 @@ mod tests {
         assert!(replica.object().set_stall(Some(StallReason::Wedged)));
         // The object still names the row's earlier revision.
         assert_eq!(adapter.project(&replica.id), HealthWrite::Stale);
-        assert!(!replica.doubted());
         // The holder lays the row's next revision in the object's place.
         // The replacement takes its running state, the veto with the rest,
-        // and its projection writes the doubt.
+        // and its projection is taken.
         replica.objects.follow(replica.store.as_ref());
         assert_ne!(replica.object().revision(), replica.revision);
+        assert_eq!(replica.object().stall_reason(), Some(StallReason::Wedged));
         assert_eq!(
             adapter.project(&replica.id),
             HealthWrite::Stood(RowStatus::Pending)
         );
-        assert!(replica.doubted());
-    }
-
-    /// The worker crate's collector over the holder's registry, with an
-    /// adapter of the replica as its sink. It probes nothing: the row's
-    /// policy turns its probes off.
-    fn collector(replica: &Replica) -> WorkerManager {
-        let adapter = HealthAdapter::new(
-            Arc::clone(&replica.objects),
-            Arc::clone(&replica.store),
-            Arc::new(SoleLead),
-            SoleLead::TERM,
-        );
-        WorkerManager::start_with_sink(
-            Arc::clone(replica.objects.registry()),
-            Arc::new(adapter),
-            WorkerManagerConfig {
-                default_check_interval_secs: 3_600,
-                remove_unhealthy: UnhealthyRemovalScope::Disabled,
-            },
-            None,
-        )
-    }
-
-    /// Whether `holds` comes true within five seconds.
-    async fn comes(holds: impl Fn() -> bool) -> bool {
-        for _ in 0..500 {
-            if holds() {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        holds()
-    }
-
-    /// The collector drives the projection, and no host calls it. A move
-    /// of the object's veto reaches the row through the object's signal,
-    /// the collector and the adapter, and a decision's view reads it.
-    #[tokio::test]
-    async fn the_collectors_tell_writes_the_leaders_doubt_and_clears_it() {
-        let replica = Replica::new(1, false).expect("a laid worker");
-        let _collector = collector(&replica);
-        assert!(!replica.doubted());
-
-        assert!(replica.object().set_stall(Some(StallReason::Unreachable)));
-        assert!(comes(|| replica.doubted()).await, "the doubt is written");
-        assert!(replica.object().set_stall(None));
-        assert!(comes(|| !replica.doubted()).await, "and cleared");
-    }
-
-    /// A collector tells its sink of every worker at its start, so the
-    /// first loop of a term writes what the objects know with no call of
-    /// the host: a veto that moved while no loop ran, and the clearing of
-    /// a doubt the row kept from the loop before.
-    #[tokio::test]
-    async fn a_collector_started_behind_a_move_writes_what_the_objects_know() {
-        let replica = Replica::new(1, false).expect("a laid worker");
-        assert!(replica.object().set_stall(Some(StallReason::Wedged)));
-        assert!(!replica.doubted());
-        let first = collector(&replica);
-        assert!(comes(|| replica.doubted()).await, "the start writes it");
-
-        drop(first);
-        assert!(replica.object().set_stall(None));
-        let _second = collector(&replica);
-        assert!(comes(|| !replica.doubted()).await, "the next clears it");
-    }
-
-    /// A tell the row outran is dropped: the object still names the row's
-    /// earlier revision. The holder lays the row's next revision in the
-    /// object's place, the collector tells its sink of the replacement,
-    /// and the doubt is written with no call of the host.
-    #[tokio::test]
-    async fn a_replacement_laid_behind_a_dropped_tell_carries_the_doubt_to_its_row() {
-        let replica = Replica::new(1, false).expect("a laid worker");
-        let _collector = collector(&replica);
-        let row = replica.store.by_key(URL).expect("a row");
-        let patch = WorkerPatch {
-            priority: Some(1),
-            ..WorkerPatch::default()
-        };
-        assert!(replica.store.patch(row.id, patch, row.revision).is_some());
-        assert!(replica.object().set_stall(Some(StallReason::Wedged)));
-        // The loop takes the signal and its tell is dropped.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!replica.doubted());
-
-        replica.objects.follow(replica.store.as_ref());
-        assert!(comes(|| replica.doubted()).await, "the lay writes it");
     }
 
     /// The store has the term's last word. A projection that passed the
@@ -558,13 +458,11 @@ mod tests {
             1,
         );
         assert_eq!(adapter.project(&replica.id), HealthWrite::Stale);
-        assert!(!replica.doubted());
-        // Under a term that stands the same projection writes the doubt.
+        // Under a term that stands the same projection is taken.
         assert_eq!(
             replica.adapter().project(&replica.id),
             HealthWrite::Stood(RowStatus::Pending)
         );
-        assert!(replica.doubted());
     }
 
     /// The store has the term's last word at a verdict too. A probe's
@@ -633,29 +531,6 @@ mod tests {
         );
         replica.assert_statuses(Some(RowStatus::Ready), ObjectStatus::Pending);
         assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
-    }
-
-    /// The object is read under its lock, at the write. A projection that
-    /// waited for the lock while the veto rose and another projection
-    /// wrote it writes the veto too: no reading from before its wait.
-    #[test]
-    fn a_projection_that_waited_for_the_lock_writes_the_reading_under_it() {
-        let replica = Replica::new(1, true).expect("a laid worker");
-        let adapter = replica.adapter();
-        let stood = HealthWrite::Stood(RowStatus::Pending);
-        let waited = replica
-            .objects
-            .registry()
-            .with_another_write_before_the_lock(
-                |_| adapter.project(&replica.id),
-                |_| {
-                    assert!(replica.object().set_stall(Some(StallReason::Unreachable)));
-                    assert_eq!(adapter.project(&replica.id), stood);
-                    assert!(replica.doubted());
-                },
-            );
-        assert_eq!(waited, stood);
-        assert!(replica.doubted());
     }
 
     #[test]

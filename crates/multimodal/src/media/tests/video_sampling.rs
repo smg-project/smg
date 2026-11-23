@@ -1057,7 +1057,7 @@ async fn the_selection_picks_the_same_frames_through_ffmpeg() {
         "rgb24",
         "pipe:1",
     ]);
-    let all = run_video_command_output(all, "ffmpeg")
+    let all = run_video_command_output(all, "ffmpeg", 0, usize::MAX)
         .await
         .expect("full decode");
     assert!(all.status.success());
@@ -1129,7 +1129,7 @@ async fn the_selection_picks_the_same_frames_through_ffmpeg() {
             "rgb24",
             "pipe:1",
         ]);
-        let output = run_video_command_output(command, "ffmpeg")
+        let output = run_video_command_output(command, "ffmpeg", 0, usize::MAX)
             .await
             .expect("selected decode");
         assert!(

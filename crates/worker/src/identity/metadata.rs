@@ -174,8 +174,9 @@ impl WorkerMetadata {
     /// socket set, N engines dialing in (the connector balances across them
     /// and drives the wave protocol for lockstep groups). `None` for a worker
     /// given no count, which awaits as many engines as the first to dial
-    /// declares (one, from an engine that declares none). Rank-expanded DP
-    /// workers never reach ZMQ connect (rejected at registration).
+    /// declares (one, from an engine that declares none). The rank workers of
+    /// a group expanded under dp-aware routing carry the group's `dp_size`
+    /// too, and await the same engines over the connection they share.
     pub fn zmq_engine_count(&self) -> Option<usize> {
         self.spec.dp_size.map(|count| count.max(1))
     }

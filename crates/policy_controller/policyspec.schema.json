@@ -108,7 +108,7 @@
           "default": 256
         },
         "max_report_age_ms": {
-          "description": "With this limit in milliseconds set, `least-load`, `resident-work`,\n`least-cost` and the KV-pressure gates of `prefix-affinity` and\n`warmup-slice` treat older reports as missing. A report exactly at\nthe limit still counts. A host-registered stage reads a report\nunder the limit through its build context's `reports()`, and one\nthat reads the row's report itself sees it at any age. Overload\nverdicts can still reflect older reports, and plugins interpret\nreport age themselves. Omit it to use reports of any age.",
+          "description": "With this limit in milliseconds set, `least-load`, `resident-work`,\n`least-cost` and the KV-pressure gates of `prefix-affinity` and\n`warmup-slice` treat older reports as missing. A report exactly at\nthe limit still counts. A host-registered stage reads a report\nunder the limit through its build context's `load_report_reader()`,\nand one that reads the row's report itself sees it at any age.\nOverload verdicts can still reflect older reports, and plugins\ninterpret report age themselves. Omit it to use reports of any age.",
           "type": [
             "integer",
             "null"
@@ -279,6 +279,15 @@
           ],
           "format": "uint32",
           "minimum": 1
+        },
+        "sent_report_delay_ms": {
+          "description": "The least number of milliseconds between a send and the sample of a\nload report that ends it: a report sampled less than that long after\na send leaves the send counted. Unset, a report sampled at or after\na send ends it. A written zero is refused, as a zero limit is. A\nprofile whose stages do not read its count of sends is refused if it\nsets a delay. The limit ends a send whatever the delay. A new\ndocument's profile of the same name takes over the sends the\nstanding profile holds and shares them: a read under the shorter of\nthe two delays ends such a send for both.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
         }
       },
       "additionalProperties": false,
@@ -339,7 +348,7 @@
       "type": "object",
       "properties": {
         "used": {
-          "description": "What a worker holds: field names and their coefficients, summed. At\nleast one is required. A name written `signal.<name>` reads a signal\nthe document declares. Under a capacity that is a number, a field\nor a signal of the worker is required: the request's size alone\nreads nothing of a worker there. A worker that lacks a named value\nhas no room.",
+          "description": "What a worker holds: field names and their coefficients, summed. At\nleast one is required. A name written `signal.<name>` reads a signal\nthe document declares. `request.max_output_tokens` reads the most\ntokens the request's answer may hold, so a coefficient above zero\nreserves room for the answer: a request that states no limit\nreserves none. Under a capacity that is a number, a field or a\nsignal of the worker is required: the request's own values alone\nread nothing of a worker there. A worker that lacks a named value\nhas no room.",
           "type": "object",
           "additionalProperties": {
             "type": "number",
@@ -362,6 +371,7 @@
                   "load.resident_tokens",
                   "load.running",
                   "load.waiting_uncached_tokens",
+                  "request.max_output_tokens",
                   "request.prompt_tokens",
                   "sent.requests",
                   "sent.tokens"
@@ -1678,14 +1688,14 @@
           }
         },
         "ttl_s": {
-          "description": "How long an idle key stays pinned, in seconds; above zero (default\n14400), `4294967295` for ever.",
+          "description": "How long an idle key stays pinned, in seconds, before the rule's\nnext sweep forgets it; above zero (default 14400), `4294967295` for\never. A host that keeps a record of the pins, as the controller's\nown service does, forgets the key at `ttl_s` itself.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
           "default": 14400
         },
         "sweep_s": {
-          "description": "The sweep cadence of idle keys, in seconds; above zero (default 120),\n`4294967295` for never, allowed under a `ttl_s` for ever alone.",
+          "description": "The sweep cadence of idle keys, in seconds: a key idle for `ttl_s`\nis forgotten at the next sweep, and one used again ahead of it stays\npinned. Above zero (default 120), `4294967295` for never, allowed\nunder a `ttl_s` for ever alone. Under a host that keeps a record of\nthe pins the sweep only reclaims.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
@@ -1713,6 +1723,10 @@
           "description": "Which pin leads once both of a key's pins are routable (default\n`original`).",
           "$ref": "#/$defs/Recovery",
           "default": "original"
+        },
+        "rule_placed": {
+          "description": "Whether a single request this rule placed alone is the profile's\nown (default `told`). Under `untold` no stage hears that request's\nissue or its dispatch, it is none of the profile's sends, and\nneither the engine's record of sent prefixes nor a lent token tree\ntakes its prompt. The session table still hears its dispatch,\nand the stages its completion and its release. A pair's sides are\ntold under either word. A host that tells a lease's words off its\nfile keeps no such word of a pick: it takes the rule, tells such a\nrequest as it tells any other, and records its prompt as any\nother's.",
+          "$ref": "#/$defs/RulePlaced"
         }
       },
       "additionalProperties": false
@@ -1748,6 +1762,21 @@
       "enum": [
         "original",
         "latest"
+      ]
+    },
+    "RulePlaced": {
+      "description": "Whether a single request a sessions rule placed alone is the profile's\nown: a pin of the request's key followed, or the rule's own assignment.\nNo stage of the profile placed such a request.",
+      "oneOf": [
+        {
+          "description": "The profile's own: its stages hear the request's issue and its\ndispatch, it counts among the profile's sends, and its prompt is\nrecorded as behind any pick.",
+          "type": "string",
+          "const": "told"
+        },
+        {
+          "description": "Kept from the profile, as a gateway's sticky map keeps a request it\nplaces from the gateway's policy.",
+          "type": "string",
+          "const": "untold"
+        }
       ]
     },
     "ShadowSpec": {

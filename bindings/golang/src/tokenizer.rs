@@ -1,11 +1,6 @@
 //! Tokenizer FFI functions
 
-use std::{
-    ffi::{CStr, CString},
-    os::raw::{c_char, c_int},
-    ptr,
-    sync::Arc,
-};
+use std::{ffi::CStr, os::raw::c_char, ptr, sync::Arc};
 
 use llm_tokenizer::{
     chat_template::ChatTemplateParams, create_tokenizer, traits::Tokenizer as TokenizerTrait,
@@ -263,62 +258,6 @@ pub unsafe extern "C" fn sgl_tokenizer_apply_chat_template(
         Err((code, msg)) => {
             set_error_message(error_out, msg);
             code
-        }
-    }
-}
-
-/// Decode token IDs to text
-///
-/// # Arguments
-/// * `handle` - Tokenizer handle
-/// * `token_ids` - Array of token IDs
-/// * `token_count` - Number of tokens
-/// * `skip_special_tokens` - Whether to skip special tokens
-/// * `result_out` - Pointer to receive result string (must be freed with sgl_free_string)
-/// * `error_out` - Optional pointer to receive error message
-///
-/// # Returns
-/// * SglErrorCode::Success on success, error code on failure
-///
-/// # Safety
-/// - `handle` must be a valid pointer returned by `sgl_tokenizer_create`
-/// - `token_ids` must be a valid pointer to an array of at least `token_count` u32 values
-/// - `result_out` must be a valid pointer to writable memory
-/// - `error_out` may be null; if non-null, must point to writable memory
-/// - Caller must free the string written to `result_out` using `sgl_free_string`
-#[no_mangle]
-pub unsafe extern "C" fn sgl_tokenizer_decode(
-    handle: *mut TokenizerHandle,
-    token_ids: *const u32,
-    token_count: usize,
-    skip_special_tokens: c_int,
-    result_out: *mut *mut c_char,
-    error_out: *mut *mut c_char,
-) -> SglErrorCode {
-    if handle.is_null() || token_ids.is_null() || result_out.is_null() {
-        set_error_message(error_out, "Invalid arguments: null pointer");
-        return SglErrorCode::InvalidArgument;
-    }
-
-    if token_count == 0 {
-        let empty = CString::default();
-        *result_out = empty.into_raw();
-        clear_error_message(error_out);
-        return SglErrorCode::Success;
-    }
-
-    // Convert C array to Rust slice
-    let token_slice = std::slice::from_raw_parts(token_ids, token_count);
-
-    let tokenizer = &(*handle).tokenizer;
-    match tokenizer.decode(token_slice, skip_special_tokens != 0) {
-        Ok(text) => match write_string_result(text, result_out, error_out) {
-            Ok(()) => SglErrorCode::Success,
-            Err(code) => code,
-        },
-        Err(e) => {
-            set_error_message(error_out, &e.to_string());
-            SglErrorCode::TokenizationError
         }
     }
 }

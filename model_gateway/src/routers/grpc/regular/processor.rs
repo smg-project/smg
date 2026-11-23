@@ -516,6 +516,7 @@ impl ResponseProcessor {
             model_id: &dispatch.model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: None,
+            dispatch_wait: None,
             generation_duration: started.elapsed(),
             input_tokens: Some(u64::from(counts.prompt)),
             cached_tokens: Some(u64::from(counts.cached)),
@@ -773,6 +774,7 @@ impl ResponseProcessor {
             model_id: &dispatch.model,
             endpoint: metrics_endpoint,
             ttft: None,
+            dispatch_wait: None,
             generation_duration: started.elapsed(),
             input_tokens: Some(u64::from(counts.prompt)),
             cached_tokens: Some(u64::from(counts.cached)),
@@ -846,6 +848,7 @@ impl ResponseProcessor {
                 model_id: &dispatch.model,
                 endpoint: metrics_labels::ENDPOINT_MESSAGES,
                 ttft: None,
+                dispatch_wait: None,
                 generation_duration: started.elapsed(),
                 input_tokens: Some(u64::from(counts.prompt)),
                 cached_tokens: Some(u64::from(counts.cached)),
@@ -1264,6 +1267,7 @@ impl ResponseProcessor {
             model_id: &dispatch.model,
             endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
             ttft: None,
+            dispatch_wait: None,
             generation_duration: started.elapsed(),
             input_tokens: Some(u64::from(total_prompt)),
             cached_tokens: Some(u64::from(total_cached)),
@@ -1700,7 +1704,7 @@ fn object_inputs(content: &mut [messages::ContentBlock], function: &'static str)
 #[cfg(test)]
 mod tool_use_input_tests {
     use serde_json::json;
-    use symphony::{adapt, Event, Events, FinishReason, Text};
+    use symphony::{adapt, CallEnd, Event, Events, FinishReason, Text};
 
     use super::{messages, object_inputs, tool_use_input};
 
@@ -1760,6 +1764,7 @@ mod tool_use_input_tests {
             events.push(Event::ToolCallEnd {
                 index: 0,
                 source: Text::new("", 0),
+                ended: CallEnd::Closed,
             });
             events.push(Event::Finish {
                 reason: FinishReason::ToolCalls,

@@ -74,7 +74,7 @@ fn pd_source_with(prefill: Arc<dyn Worker>) -> StreamSource {
     let selection = WorkerSelection::Disaggregated {
         encode_assignments: None,
         prefill,
-        decode: worker(DECODE_URL),
+        decode: worker(DECODE_URL).into(),
         runtime_type: Default::default(),
     };
     StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT)
@@ -166,6 +166,7 @@ async fn stream_pd(
                 decode_sent: Instant::now(),
                 runtime: "test",
             },
+            None,
             vec![None],
             None,
         )

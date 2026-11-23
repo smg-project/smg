@@ -5,8 +5,8 @@
 //! engine addresses, and its provider's key, are told without their
 //! userinfo; the store keeps the originals.
 //!
-//! A page writes itself as JSON ([`Told`]): a host in process serves the
-//! rows an operator reads with no mapping of its own.
+//! A page writes itself as JSON ([`WorkerRowsPage`]): a host in process serves
+//! the rows an operator reads with no mapping of its own.
 
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc, time::Instant};
 
@@ -16,8 +16,8 @@ use crate::{
     address::{split, Address, UNPARSABLE},
     engine::view::{Role, WireModes},
     store::{
-        membership::blank, pairing::LAYOUT_FACTS, Cut, EncodeHandoff, Maker, Reachability,
-        WorkerFacts, WorkerRow, WorkerStatus,
+        membership::blank, pairing::LAYOUT_FACTS, EncodeHandoff, Reachability, Registrant,
+        StoreCheckpoint, WorkerFacts, WorkerRow, WorkerStatus,
     },
 };
 
@@ -29,7 +29,7 @@ pub(crate) const MODELS: usize = 128;
 
 /// What a snapshot caller asks of the worker rows.
 #[derive(Debug)]
-pub struct Asked {
+pub struct WorkerRowsQuery {
     /// The model ids to include. An empty list includes every model.
     pub models: Vec<String>,
     /// The maximum number of rows to return. `usize::MAX` uses only the
@@ -37,7 +37,7 @@ pub struct Asked {
     pub limit: usize,
 }
 
-impl Asked {
+impl WorkerRowsQuery {
     /// Why a snapshot may not name `models`, and `None` where it may. The
     /// list is read at each row, so it keeps a row's own rules: at most 128
     /// ids, each of at most 256 bytes, none empty, none with a blank or a
@@ -82,7 +82,7 @@ pub(crate) fn serves(models: &[String], row: &WorkerRow) -> bool {
 /// The store rows read for a snapshot.
 pub enum Rows {
     /// A shared cut, ordered by registration key, before model filtering.
-    Shared(Arc<Cut>),
+    Shared(Arc<StoreCheckpoint>),
     /// The first serving rows in key order and the total that serve,
     /// as returned by [`crate::store::MemoryStore::rows_serving`].
     Told(Vec<WorkerRow>, usize),
@@ -90,7 +90,7 @@ pub enum Rows {
 
 /// A page of worker rows as an operator reads it.
 #[derive(Debug)]
-pub struct Told {
+pub struct WorkerRowsPage {
     /// The matching rows in registration key order, with addresses redacted.
     pub rows: Vec<WorkerRow>,
     /// Whether the row count or byte bound left a matching row out.
@@ -106,7 +106,7 @@ pub struct Told {
 /// is in milliseconds at the take. A fact the row does not state is `null`,
 /// and `pairing` is `null` for a row that states nothing of a pair or of an
 /// encode handoff.
-impl Serialize for Told {
+impl Serialize for WorkerRowsPage {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
         struct Page<'a> {
@@ -122,7 +122,7 @@ impl Serialize for Told {
     }
 }
 
-/// One row of a page's JSON ([`Told`]).
+/// One row of a page's JSON ([`WorkerRowsPage`]).
 #[derive(Serialize)]
 struct RowJson<'a> {
     id: String,
@@ -148,7 +148,7 @@ struct RowJson<'a> {
     signals: SignalsJson,
     health_policy: HealthPolicyJson,
     admitted_age_ms: u64,
-    maker: Option<MakerJson<'a>>,
+    maker: Option<RegistrantJson<'a>>,
 }
 
 /// From where a row is reachable: every gateway, or the one that holds its
@@ -202,7 +202,7 @@ struct HealthPolicyJson {
 }
 
 #[derive(Serialize)]
-struct MakerJson<'a> {
+struct RegistrantJson<'a> {
     provider: &'a str,
     key: &'a str,
 }
@@ -274,8 +274,8 @@ impl<'a> RowJson<'a> {
             },
             admitted_age_ms: u64::try_from(age).unwrap_or(u64::MAX),
             maker: match &row.maker {
-                Maker::Control => None,
-                Maker::Provider(maker) => Some(MakerJson {
+                Registrant::Control => None,
+                Registrant::Provider(maker) => Some(RegistrantJson {
                     provider: maker.provider(),
                     key: maker.key(),
                 }),
@@ -326,12 +326,12 @@ impl<'a> PairingJson<'a> {
 /// Takes a redacted page at `now`, limited by row count and a conservative
 /// measure of the rows' facts. A row admitted after `now` reads as new at
 /// that instant. The first row must fit the byte bound too.
-pub fn told(asked: &Asked, read: Rows, now: Instant) -> Told {
-    let (rows, truncated) = told_with(asked, read, now, false, |row| {
+pub fn worker_rows_page(asked: &WorkerRowsQuery, read: Rows, now: Instant) -> WorkerRowsPage {
+    let (rows, truncated) = worker_rows_page_with(asked, read, now, false, |row| {
         let bytes = measure(&row);
         (row.into_owned(), bytes)
     });
-    Told {
+    WorkerRowsPage {
         rows,
         truncated,
         taken: now,
@@ -340,8 +340,8 @@ pub fn told(asked: &Asked, read: Rows, now: Instant) -> Told {
 
 /// Pages the redacted rows using the host's measure of the answer. A host
 /// that sends an oversized first row alone can keep that rule here.
-pub(crate) fn told_with<T>(
-    asked: &Asked,
+pub(crate) fn worker_rows_page_with<T>(
+    asked: &WorkerRowsQuery,
     read: Rows,
     now: Instant,
     allow_oversized_first: bool,
@@ -404,10 +404,10 @@ fn redacted(mut row: Cow<'_, WorkerRow>, now: Instant) -> Cow<'_, WorkerRow> {
         row.to_mut().facts.engine = engine;
     }
     let maker = match &row.maker {
-        Maker::Provider(maker) => {
+        Registrant::Provider(maker) => {
             key_without_userinfo(maker.key()).map(|key| told_maker(maker.provider(), key))
         }
-        Maker::Control => None,
+        Registrant::Control => None,
     };
     if let Some(maker) = maker {
         row.to_mut().maker = maker;
@@ -421,10 +421,10 @@ fn redacted(mut row: Cow<'_, WorkerRow>, now: Instant) -> Cow<'_, WorkerRow> {
 /// The maker a row tells in place of one whose key is not told as it
 /// stands: the provider's name with the key a snapshot tells
 /// ([`key_without_userinfo`]). That key is inside a key's rule
-/// ([`Maker::provider`]), never empty and never past the bound, so the
+/// ([`Registrant::provider`]), never empty and never past the bound, so the
 /// last arm is never told.
-fn told_maker(provider: &str, key: String) -> Maker {
-    Maker::provider(provider, key).unwrap_or_default()
+fn told_maker(provider: &str, key: String) -> Registrant {
+    Registrant::provider(provider, key).unwrap_or_default()
 }
 
 /// A provider's key as a snapshot tells it, or `None` where it is told as
@@ -492,7 +492,7 @@ fn measure(row: &WorkerRow) -> usize {
     {
         bytes = bytes.saturating_add(text(field));
     }
-    if let Maker::Provider(maker) = &row.maker {
+    if let Registrant::Provider(maker) = &row.maker {
         bytes = bytes
             .saturating_add(text(maker.provider()))
             .saturating_add(text(maker.key()));
@@ -592,7 +592,7 @@ mod tests {
         use crate::store::{MemoryStore, WorkerFacts, WorkersStore};
 
         let store = MemoryStore::new();
-        let asked = Asked {
+        let asked = WorkerRowsQuery {
             models: Vec::new(),
             limit: usize::MAX,
         };
@@ -610,14 +610,14 @@ mod tests {
         }
         let read = || store.rows_serving(&asked.models, asked.limit);
         let (rows, serving) = read();
-        let page = told(&asked, Rows::Told(rows, serving), now);
+        let page = worker_rows_page(&asked, Rows::Told(rows, serving), now);
         assert_eq!(page.rows.len(), 1);
         assert!(page.truncated);
 
         let (mut rows, _) = read();
         rows.truncate(1);
         rows[0].facts.key = "x".repeat(2 * 1024 * 1024);
-        let too_large = told(&asked, Rows::Told(rows, 1), now);
+        let too_large = worker_rows_page(&asked, Rows::Told(rows, 1), now);
         assert!(too_large.rows.is_empty() && too_large.truncated);
     }
 
@@ -631,7 +631,7 @@ mod tests {
         use crate::{
             engine::view::WorkerId,
             store::{
-                EncodeOffer, GatewayId, Overload, PairingDescriptor, Signals, WorkerFacts,
+                pairing::PairingDescriptor, EncodeOffer, GatewayId, Overload, Signals, WorkerFacts,
                 WorkerStatus,
             },
         };
@@ -689,7 +689,7 @@ mod tests {
             status: WorkerStatus::Ready,
             revision: 3,
             admitted_at: admitted,
-            maker: Maker::provider("finder", "http://u:p@host/x").expect("a maker"),
+            maker: Registrant::provider("finder", "http://u:p@host/x").expect("a maker"),
         };
         let least = WorkerRow {
             id: WorkerId(1),
@@ -703,13 +703,13 @@ mod tests {
             status: WorkerStatus::Pending,
             revision: 1,
             admitted_at: taken + Duration::from_secs(2),
-            maker: Maker::Control,
+            maker: Registrant::Control,
         };
-        let asked = Asked {
+        let asked = WorkerRowsQuery {
             models: Vec::new(),
             limit: usize::MAX,
         };
-        let page = told(&asked, Rows::Told(vec![full, least], 2), taken);
+        let page = worker_rows_page(&asked, Rows::Told(vec![full, least], 2), taken);
         let probes = serde_json::json!({
             "failure_threshold": 3,
             "success_threshold": 2,
