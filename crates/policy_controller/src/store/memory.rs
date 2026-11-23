@@ -4206,8 +4206,8 @@ impl MemoryStore {
         Ok((lease, issue))
     }
 
-    /// [`Self::issue_decided`] for a keyed decision made under a sessions
-    /// rule with an in-flight cap: the lease books one request of its key
+    /// [`Self::issue_decided`] for a keyed single decision, under any
+    /// sessions rule and under none: the lease books one request of its key
     /// on its worker until it leaves the file, whatever the decision did
     /// with the key's pin, and the worker's count of the key's requests
     /// steps with the lease's own ([`InFlightCounts::book`]). The lease of
