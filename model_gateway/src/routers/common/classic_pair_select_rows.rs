@@ -32,9 +32,12 @@
 //!   cargo test -p smg --lib routers::common::classic_pair_select_rows -- --ignored --nocapture
 //! ```
 //!
-//! That filter also runs this module's child recorder
-//! ([`classic_pair_bound_rows`]), which writes a sheet of its own beside
-//! this one: its rows draw nothing.
+//! That filter also runs this module's two child recorders
+//! ([`classic_pair_bound_rows`], [`classic_pair_runtime_rows`]), each of
+//! which writes a sheet of its own beside this one: their rows draw
+//! nothing. A row of the second is placed on the wire that carries one
+//! runtime's request, and names the runtime of a worker that is not on the
+//! sheet's own.
 //!
 //! A sequence row is recorded twenty times from fresh pools and fresh
 //! policies and must come out the same each time; a drawn row records how
@@ -100,7 +103,9 @@ struct Rooms {
 
 /// One worker of a row: the requests the router holds on it, its state, the
 /// transport its registration names (`a`, `b` or none) and, for a decode
-/// that reports a running window, its rooms.
+/// that reports a running window, its rooms. A worker that is not on the
+/// sheet's one runtime names its own: `other`, a second known runtime, or
+/// `unknown`, none.
 #[derive(Clone, Copy, Serialize)]
 struct Member {
     in_flight: u32,
@@ -108,6 +113,8 @@ struct Member {
     transport: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rooms: Option<Rooms>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime: Option<&'static str>,
 }
 
 const fn member(in_flight: u32, state: State, transport: Option<&'static str>) -> Member {
@@ -116,6 +123,15 @@ const fn member(in_flight: u32, state: State, transport: Option<&'static str>) -
         state,
         transport,
         rooms: None,
+        runtime: None,
+    }
+}
+
+impl Member {
+    /// The member on `runtime`: `other` or `unknown`.
+    const fn on(mut self, runtime: &'static str) -> Self {
+        self.runtime = Some(runtime);
+        self
     }
 }
 
@@ -154,6 +170,10 @@ struct Row {
     /// the row runs behind it; a prefill holding that many has no capacity.
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill_bound: Option<u32>,
+    /// The wire the row's pair is placed for, where it is not the plain
+    /// one: `grpc`, which carries one runtime's request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wire: Option<&'static str>,
     prefills: Vec<Member>,
     decodes: Vec<Member>,
     /// How many requests the row places, one after another.
@@ -181,9 +201,24 @@ fn config_of(policy: &str) -> PolicyConfig {
     serde_json::from_str(&text).expect("the policy's configuration")
 }
 
-fn worker(side: &str, place: usize, role: WorkerType, member: Member) -> Arc<dyn Worker> {
-    let mut spec = WorkerSpec::new(format!("http://{side}{place}:8000"));
-    spec.runtime_type = RuntimeType::Vllm;
+fn worker(
+    side: &str,
+    place: usize,
+    role: WorkerType,
+    member: Member,
+    wire: PdWire,
+) -> Arc<dyn Worker> {
+    let (scheme, mode) = match wire {
+        PdWire::Http => ("http", ConnectionMode::Http),
+        PdWire::Grpc => ("grpc", ConnectionMode::Grpc),
+    };
+    let mut spec = WorkerSpec::new(format!("{scheme}://{side}{place}:8000"));
+    spec.runtime_type = match member.runtime {
+        None => RuntimeType::Vllm,
+        Some("other") => RuntimeType::Sglang,
+        Some("unknown") => RuntimeType::Unspecified,
+        Some(runtime) => panic!("a row names no runtime {runtime}"),
+    };
     spec.kv_connector = member.transport.map(|transport| {
         if transport == "a" {
             TX_A.to_string()
@@ -198,7 +233,7 @@ fn worker(side: &str, place: usize, role: WorkerType, member: Member) -> Arc<dyn
     let worker = BasicWorkerBuilder::from_spec(spec)
         .model(ModelCard::new(MODEL))
         .worker_type(role)
-        .connection_mode(ConnectionMode::Http)
+        .connection_mode(mode)
         .labels(labels)
         .health_config(no_health_check())
         .build();
@@ -222,12 +257,17 @@ struct Bed {
 impl Bed {
     fn new(cell: &Cell) -> Self {
         let registry = WorkerRegistry::new();
+        let wire = match cell.wire {
+            None => PdWire::Http,
+            Some("grpc") => PdWire::Grpc,
+            Some(wire) => panic!("{}: a row names no wire {wire}", cell.name),
+        };
         let pool = |side: &str, role: WorkerType, members: &[Member]| -> Vec<Arc<dyn Worker>> {
             members
                 .iter()
                 .enumerate()
                 .map(|(place, &member)| {
-                    let worker = worker(side, place, role, member);
+                    let worker = worker(side, place, role, member, wire);
                     registry
                         .register(Arc::clone(&worker))
                         .expect("the worker registers");
@@ -249,7 +289,7 @@ impl Bed {
         let pairs = PdPairIndex::build(
             Arc::from(prefill_pool.clone()),
             Arc::from(decode_pool.clone()),
-            PdWire::Http,
+            wire,
             PdPairingMode::Lenient,
         );
         for (workers, members) in [
@@ -373,6 +413,7 @@ struct Cell {
     decode_policy: &'static str,
     shed: bool,
     prefill_bound: Option<u32>,
+    wire: Option<&'static str>,
     prefills: Vec<Member>,
     decodes: Vec<Member>,
 }
@@ -408,6 +449,7 @@ impl Cell {
             decode_policy: self.decode_policy,
             shed: self.shed,
             prefill_bound: self.prefill_bound,
+            wire: self.wire,
             prefills: self.prefills,
             decodes: self.decodes,
             requests,
@@ -477,6 +519,7 @@ fn fleet(
         decode_policy: policies.1,
         shed,
         prefill_bound: None,
+        wire: None,
         prefills: vec![member(p0, s0, Some("a")), member(p1, s1, Some("b"))],
         decodes: vec![
             member(d0, t0, Some("a")),
@@ -926,6 +969,7 @@ fn rows() -> Vec<Row> {
         decode_policy: BY_COUNT,
         shed: false,
         prefill_bound: None,
+        wire: None,
         prefills,
         decodes,
     };
@@ -964,3 +1008,8 @@ fn record_the_classic_pair_select_rows() {
 /// The rows behind the prefill admission's bound where a prefill that holds
 /// it has an open partner or none, on a sheet of their own.
 mod classic_pair_bound_rows;
+
+/// The rows of a pair on one known runtime beside workers of another or of
+/// none, on the wire that carries one runtime's request and on a sheet of
+/// their own.
+mod classic_pair_runtime_rows;

@@ -50,10 +50,10 @@ pub use demands::{DemandFacts, Demands, References, UnmetDemand};
 pub use explain::{DecisionNames, DecisionRecord};
 pub use framework::{
     AloneProfile, Binding, DecisionScope, DrawUnit, EncodeItems, EncodePlaced, EncodePool,
-    EncoderFacts, Engine, Filter, InTheWay, NotAlone, OverloadThresholds, PairPools, PairSide,
-    PairTable, PairTableError, Picker, Place, Plan, PoolRows, PoolWord, Profile, ScoreFront,
-    ScoreSpread, Scorer, Scratch, Shortlist, TieBand, WeightedScorer, DRAW_BOUND, DRAW_FROM,
-    RANK_FROM,
+    EncoderFacts, Engine, Filter, FirstPartners, FirstPartnersError, InTheWay, NotAlone,
+    OverloadThresholds, PairPools, PairSide, PairTable, PairTableError, Picker, Place, Plan,
+    PoolRows, PoolWord, Profile, ScoreFront, ScoreSpread, Scorer, Scratch, Shortlist, TieBand,
+    WeightedScorer, DRAW_BOUND, DRAW_FROM, RANK_FROM,
 };
 #[cfg(feature = "in-process")]
 pub use list_cell::{LentList, ListCell, ModelLists};

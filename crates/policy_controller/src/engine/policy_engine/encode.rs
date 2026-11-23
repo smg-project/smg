@@ -250,6 +250,7 @@ impl EncodeLists<'_> {
                 prefills,
                 decodes,
                 table: pair.classes.table(),
+                first: pair.classes.first(),
                 ..PairPools::default()
             };
             let encode = EncodePool {

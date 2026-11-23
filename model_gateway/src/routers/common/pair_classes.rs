@@ -6,11 +6,13 @@
 //! that as a class on each worker's record and a table of the classes that
 //! pair. This module numbers the classes from the index's partner lists, so
 //! the pairing rule is written once, in the index, whoever places the pair.
+//! It says too which partners a prefill is paired with first, by the order
+//! the classic selection gives its candidates on the index's wire.
 
 use std::{ptr, sync::Arc};
 
 use smg_policy_controller::engine::PartnerClasses;
-use smg_worker::identity::basic::Worker;
+use smg_worker::identity::basic::{RuntimeType, Worker};
 use tracing::warn;
 
 use super::pair_index::PdPairIndex;
@@ -44,23 +46,63 @@ fn places(pool: &Workers, list: &Workers) -> Vec<u32> {
     places
 }
 
+/// One partner list as the prefills of one runtime hold it.
+struct Listed<'a> {
+    list: &'a Workers,
+    /// The runtime its prefills are paired on first, where they have one.
+    runtime: Option<RuntimeType>,
+    /// The list's places in the decode pool.
+    places: Vec<u32>,
+    /// Those of the places whose decode is on `runtime`.
+    first: Vec<u32>,
+}
+
 /// The class of every worker of `index`'s two pools, in each pool's order,
-/// and the table of the classes that pair.
+/// and the table of the classes that pair, with the partners each prefill
+/// is paired with first.
+///
+/// On a wire that carries one runtime's request
+/// ([`PdWire::runtime_specific`](super::pair_index::PdWire::runtime_specific))
+/// a prefill of a known runtime is paired first with its partners on that
+/// runtime: a pair on one known runtime goes ahead of a pair with a worker
+/// whose runtime is unknown, as the classic selection orders its candidates
+/// (`placement.rs:2479-2502`, and the pick's decode at `:2615-2618`, on main
+/// `30f636706`). The other wire states no first partner, and neither does a
+/// prefill of no known runtime.
 ///
 /// Called once an index, at the policy engine's first pair decision over it
 /// ([`PdPairIndex::classes`]). Prefills of one descriptor share one partner
 /// list, so a list is turned into places once, however many prefills hold
 /// it.
 pub(super) fn of(index: &PdPairIndex) -> PartnerClasses {
-    let mut lists: Vec<(&Workers, Vec<u32>)> = Vec::new();
+    let apart = index.wire.runtime_specific();
+    let runtime_of = |worker: &Arc<dyn Worker>| worker.metadata().spec.runtime_type;
+    let mut lists: Vec<Listed<'_>> = Vec::new();
     // Each prefill with a partner, by its list's place in `lists`.
     let listed: Vec<usize> = index
-        .partners
+        .prefill
         .iter()
-        .map(|list| {
-            let known = lists.iter().position(|(held, _)| Arc::ptr_eq(held, list));
+        .zip(&index.partners)
+        .map(|(prefill, list)| {
+            let runtime = Some(runtime_of(prefill)).filter(|own| apart && own.is_specified());
+            let known = lists
+                .iter()
+                .position(|held| Arc::ptr_eq(held.list, list) && held.runtime == runtime);
             known.unwrap_or_else(|| {
-                lists.push((list, places(&index.decode_pool, list)));
+                let places = places(&index.decode_pool, list);
+                // A place is a decode of the pool, so no decode's runtime
+                // equals a prefill's that has none.
+                let on_it = |place: &u32| {
+                    let decode = index.decode_pool.get(*place as usize);
+                    decode.map(runtime_of) == runtime
+                };
+                let first = places.iter().copied().filter(on_it).collect();
+                lists.push(Listed {
+                    list,
+                    runtime,
+                    places,
+                    first,
+                });
                 lists.len() - 1
             })
         })
@@ -69,17 +111,24 @@ pub(super) fn of(index: &PdPairIndex) -> PartnerClasses {
     // order: every other prefill of the pool pairs with nobody.
     let mut paired = index.prefill.iter().zip(&listed).peekable();
     let partners = index.prefill_pool.iter().map(|worker| {
-        paired
-            .next_if(|(prefill, _)| same(prefill, worker))
-            .map_or(&[][..], |(_, &list)| lists[list].1.as_slice())
+        let held = paired.next_if(|(prefill, _)| same(prefill, worker));
+        held.map_or((&[][..], &[][..]), |(_, &list)| {
+            (lists[list].places.as_slice(), lists[list].first.as_slice())
+        })
     });
-    let classes = PartnerClasses::number(index.decode_pool.len(), partners);
+    let classes = PartnerClasses::number_first(index.decode_pool.len(), partners);
     // Asked once, where the table is built, in every build: a decision of a
     // release build checks none.
     if let Err(clause) = classes.table().validate() {
         warn!(
             %clause,
             "The pair classes' table is not one the policy engine honours whole"
+        );
+    }
+    if let Err(clause) = classes.first().within(&classes.table()) {
+        warn!(
+            %clause,
+            "The pair classes' first partners do not stand within their table"
         );
     }
     classes
@@ -112,6 +161,26 @@ mod tests {
 
     fn prefill(url: &str, connector: Option<&str>) -> Arc<dyn Worker> {
         worker(url, WorkerType::Prefill, connector)
+    }
+
+    /// A worker on `runtime` that names no transport.
+    fn on(url: &str, worker_type: WorkerType, runtime: RuntimeType) -> Arc<dyn Worker> {
+        let builder = BasicWorkerBuilder::new(url)
+            .model(ModelCard::new("m"))
+            .worker_type(worker_type)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(runtime)
+            .health_config(no_health_check());
+        Arc::new(builder.build())
+    }
+
+    /// The pairs the classes make first, as (prefill place, decode place).
+    fn first(classes: &PartnerClasses) -> Vec<(usize, usize)> {
+        let (prefills, decodes) = (classes.prefills().len(), classes.decodes().len());
+        (0..prefills)
+            .flat_map(|prefill| (0..decodes).map(move |decode| (prefill, decode)))
+            .filter(|&(prefill, decode)| classes.pairs_first(prefill, decode))
+            .collect()
     }
 
     fn decode(url: &str, connector: Option<&str>) -> Arc<dyn Worker> {
@@ -173,6 +242,59 @@ mod tests {
         assert_eq!(classes.decodes(), [1, 1]);
         assert_eq!(classed(classes), indexed(&index));
         assert_eq!(classed(classes).len(), 4);
+        // One known runtime on every worker: every partner would go first,
+        // so none does.
+        assert!(first(classes).is_empty());
+    }
+
+    /// On the wire that carries one runtime's request, a prefill of a known
+    /// runtime is paired first with its partners on that runtime, ahead of
+    /// its partners of no known runtime. A prefill of no known runtime has
+    /// no first partner, and the other wire states none. The classic
+    /// selection orders its candidates so (`placement.rs:2479-2502` on main
+    /// `30f636706`). Under the mode that compares nothing of the handoff
+    /// both prefills hold the decode pool itself as their list, and stand
+    /// apart by their runtime alone.
+    #[test]
+    fn a_known_runtimes_partners_go_first_on_a_runtime_specific_wire() {
+        let index = |wire: PdWire, mode: PdPairingMode| {
+            let prefills = [
+                on("grpc://p:known", WorkerType::Prefill, RuntimeType::Vllm),
+                on(
+                    "grpc://p:unknown",
+                    WorkerType::Prefill,
+                    RuntimeType::Unspecified,
+                ),
+            ];
+            let decodes = [
+                on(
+                    "grpc://d:unknown",
+                    WorkerType::Decode,
+                    RuntimeType::Unspecified,
+                ),
+                on("grpc://d:known", WorkerType::Decode, RuntimeType::Vllm),
+            ];
+            PdPairIndex::build(Arc::from(prefills), Arc::from(decodes), wire, mode)
+        };
+        for (mode, name) in [
+            (PdPairingMode::Lenient, "lenient"),
+            (PdPairingMode::Off, "off"),
+        ] {
+            let specific = index(PdWire::Grpc, mode);
+            let classes = specific.classes();
+            assert_eq!(indexed(&specific), [(0, 0), (0, 1), (1, 0), (1, 1)]);
+            assert_eq!(classed(classes), indexed(&specific), "{name}");
+            assert_eq!(classes.prefills(), [1, 2], "{name}");
+            assert_eq!(classes.decodes(), [1, 2], "{name}");
+            assert_eq!(classes.first().within(&classes.table()), Ok(()));
+            assert_eq!(first(classes), [(0, 1)], "{name}");
+        }
+        // The wire that forwards one body to both sides tells no runtime
+        // apart: the same pairs, and none of them first.
+        let plain = index(PdWire::Http, PdPairingMode::Lenient);
+        assert_eq!(classed(plain.classes()), indexed(&plain));
+        assert_eq!(plain.classes().prefills(), [1, 1]);
+        assert!(first(plain.classes()).is_empty());
     }
 
     /// Two transports and a prefill that reports none: under the lenient
