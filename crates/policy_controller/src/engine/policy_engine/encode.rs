@@ -141,7 +141,8 @@ impl EncodeLists<'_> {
     /// entry issues the pair's
     /// ([`PolicyEngine::decide_encode_at`](super::PolicyEngine::decide_encode_at)).
     /// A request held to wires is not declined here: that entry tests the
-    /// lists' wires ahead of this call.
+    /// lists' wires ahead of this call. The decision itself leaves out an
+    /// encoder dialed on none of them.
     pub fn decide(
         &self,
         engine: &PolicyEngine,
@@ -275,8 +276,11 @@ impl PolicyEngine {
     ///
     /// No lease is issued for an encoder and no stage is told of one. A
     /// request held to wires is declined under the wires' name where a
-    /// worker of a list it reads is dialed on a wire it does not state:
-    /// the pair's two lists, and the encoders for a request with items.
+    /// worker of its pair's two lists is dialed on a wire it does not
+    /// state. Its items are placed on the encoders dialed on a wire it
+    /// states, and a request with items is declined under that name too
+    /// where the list holds encoders and none of them is. A request with
+    /// no item reads no encoder's wire.
     ///
     /// A request that states the later decode is declined under
     /// `decode-later` where it asks images of its decode
@@ -374,11 +378,21 @@ impl PolicyEngine {
 /// ([`EncodeLists::decide`]) reads the reports in `loads`, as a pair's
 /// first decision reads them ([`super::pair::decide`]).
 ///
-/// A request held to wires is its host's to hand lists for. Where a worker
-/// of a list the request reads is dialed on a wire it does not state, the
-/// request is declined under the wires' name, as a pair is, and no key is
-/// placed. A request with items reads the three lists, and one with none
-/// the pair's two: it takes no encoder.
+/// A request held to wires is its host's to hand a pair's lists for. Where
+/// a worker of the pair's two lists is dialed on a wire the request does
+/// not state, the request is declined under the wires' name, as a pair is,
+/// and no key is placed.
+///
+/// The encoders are narrowed here, by the decision. An encoder is named by
+/// its place in its list, and what its host says of it and of each prefill
+/// is laid by that place ([`EncodeLists::facts`],
+/// [`EncodeLists::prefill_classes`]), so the host has no narrowed list to
+/// hand. A request with items takes each item's encoder among the encoders
+/// dialed on a wire it states, and a prefill that only other encoders hand
+/// to is not its pair's. Where the list holds encoders and none is dialed
+/// on a stated wire, the request is declined under the wires' name too. A
+/// request with no item reads the pair's two lists and no encoder's wire:
+/// it takes no encoder.
 ///
 /// A request that states the later decode is declined under
 /// [`DECODE_LATER`], and no key is placed, where its decode is held to the
@@ -399,20 +413,27 @@ pub(super) fn decide(
 ) -> Decision {
     // The engine's own value of each of the pair's lists, asked of the
     // list's cell once. The encoders' is asked where it is read: here
-    // for the wires of a request with items, and else where their rows
-    // are written.
+    // for the wires of a request with items whose pair's lists are on its
+    // wires, and else where their rows are written.
     let sides = lists.asked(own);
     let mut encoders = None;
     let wires = request.constraints.wire_modes;
     if !wires.is_empty() {
         let (prefill, decode) = sides;
-        let mut dialed = prefill.wires().union(decode.wires());
-        if !items.keys.is_empty() {
+        // The pair's two lists are their host's to hand on the request's
+        // wires: every worker of both is dialed on one.
+        let mut on_wires = wires.contains(prefill.wires().union(decode.wires()));
+        if on_wires && !items.keys.is_empty() {
+            // The encoders are held to less: the decision leaves out each
+            // one dialed on no stated wire, so the list answers where one
+            // of its encoders is dialed on one. A list of no encoder is
+            // the encode side's own gap.
             let asked = own.members_of(lists.encoders);
-            dialed = dialed.union(asked.wires());
+            let theirs = asked.wires();
+            on_wires = theirs.is_empty() || theirs.intersects(wires);
             encoders = Some(asked);
         }
-        if !wires.contains(dialed) {
+        if !on_wires {
             placed.clear();
             return single::declined(own, request, WIRES);
         }
