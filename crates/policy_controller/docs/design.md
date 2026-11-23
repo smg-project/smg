@@ -421,7 +421,8 @@ A worker dials nobody for this, so it needs no address of a gateway or of a cont
 The host that opens the stream is the process that holds the workers' data (the table of
 section 1): the gateway in classic and with the engine in the gateway, the controller with the
 engine in a controller (section 10.2). So a worker's data takes one way in every mode. Only the
-process that opens the stream changes.
+process that opens the stream changes. On main a controller's collector hands its load monitor no
+load record yet: that monitor is fed by its polls alone (section 10.2).
 
 ### 4.4 The in-flight counters **[built]** (`smg-worker`)
 
@@ -524,9 +525,10 @@ events they push fill the index and nothing else. Records B and C are the decidi
 account of the prompts it sent, written by its policy at each decision. No worker pushes them and
 no worker's stream carries them. In classic the gateway's policy keeps them. With the engine in
 the gateway the gateway keeps them and lends them to the engine. On main it lends none yet
-(section 9.2). Until it does, a request under the engine reads the index and the hash table, and
-a pair reads no record of sent prefixes. A controller keeps its own, and section 11 says what its
-contract must hold for that.
+(section 9.2). Until it does, a request under the engine reads the hash table, and the index
+beside it where its model has one. A pair reads no record of sent prefixes. A controller is to
+keep trees of its own **[planned]**, and section 11 says what its contract must hold for that. On
+main a controller's engine reads its hash table alone (section 10.1).
 
 One change was made outside the policy crate first **[built]**: classic's trees moved out of
 its policy object into one store type of the kv-index crate (`ModelTrees`), with no behaviour
@@ -1420,7 +1422,11 @@ request ──> route (HTTP or gRPC, any family)
 - **The request's end.** The placement stays with the request's load guard, which every route
   already keeps to the end of the response, streamed or not (decision 4).
 
-  The engine hears the dispatch where the guard is made, or at the send for a guard a route makes ahead of its send, and the end where the guard is dropped. It is told no outcome, so a plugin stage that learns from outcomes learns nothing in process.
+  The engine hears the dispatch where the guard is made, or at the send for a guard a route makes
+  ahead of its send, and the end where the guard is dropped. It is told no outcome. A stage hears
+  the end of a request that was sent as a cancelled completion, with the time since its dispatch
+  and no other measure. It hears a guard dropped before its send as a release, abandoned. So a
+  plugin stage that learns from outcomes reads every request sent in process as cancelled.
 
 - **Membership.** The gateway's value for a model's workers gets one cell for each list, which
   the engine fills.
@@ -1529,11 +1535,10 @@ The contract has two calls that would push the same data to a controller, `PushL
 worker that only it can reach, and it would forward what that worker's stream brought. Neither
 call is served, and this design names no use for them.
 
-What leaves the crate with that switch: the store-backed engine, the store's copies of the worker
-data that a worker object holds, the crate's own load poller, and the adapters that write worker
-state into the store. Some facts of a worker are not carried to its worker object today, and
-some stand there in a narrower form than a registration states: 10.3 names them and where they
-are kept.
+What leaves the crate with that switch: the store's copies of the worker data that a worker
+object holds, the crate's own load poller, and the adapters that write worker state into the
+store. Some facts of a worker are not carried to its worker object today, and some stand there in
+a narrower form than a registration states: 10.3 names them and where they are kept.
 
 **The first step, on main.** A single request's decision reads the model's single workers in the
 order they registered, where the store's copy was sorted by id. It reads a worker's status, its
@@ -1569,7 +1574,8 @@ tells the data once more:
 The record leads and the object follows it. After the switch the object leads: a worker's data
 stands once, as its worker object with its remainder beside it, and the log still tells it. The
 remainder is the copy that stays. The table of records and the second copy of the facts end
-with step 4 below, and the published copy with the store-backed engine (10.2).
+with step 4 below. The published copy ends when its two readers, a pick's booking and a gateway's
+vetoes, read the worker objects: a later step **[planned]**.
 
 **What stands beside an object [built].** `RowRemainder` (`worker_host/remainder.rs`) holds
 what a registration stated and the worker object does not hold as stated. The code that keeps
@@ -1669,10 +1675,11 @@ gateway                                           controller (leader)
   (`PlaceRequest::tenant`); the gateway fills none yet, and no binding may match by tenant yet.
   That block is not the admission window of a pair's prefills, which stays the host's
   (section 8.2).
-- Of the workers, the controller tells a gateway their list alone, on `WatchWorkers`: each
-  worker's address, role, models and status, with the facts a decision reads of it. It sends a
-  gateway no load report and no cache event: that data goes to the controller alone
-  (section 10.2).
+- About the workers, the controller tells a gateway only their list, on `WatchWorkers`: each
+  worker's address, role, models and status, with the facts a decision reads of it. A gateway
+  reads those facts in two places: where a route applies its own rule for a worker, and where it
+  decides by itself because no answer came in time (both below). It is sent no load report and no
+  cache event: that data goes to the controller alone (section 10.2).
 - The gateway's side is the same five functions of section 9, made asynchronous: an answer from a
   controller is a round trip, so each route's call changes by that much.
 - The request crosses in the contract's own form. The prompt crosses as hashes of its blocks, not
@@ -1682,8 +1689,14 @@ gateway                                           controller (leader)
   controller's own design settles which.
 - The gateway tells the controller what became of each request, on `Session`: its dispatch, then
   its completion with the outcome (status, time to first token, tokens in and out, duration), or
-  its release with a reason. A controller's stages learn of the requests they placed from these
-  (section 6). In process the gateway tells its own engine no outcome yet (section 9.2).
+  its release with a reason. For a request the controller placed, a completion or a release ends
+  its lease, or the side of a pair's lease that it names. The leases on file are the controller's
+  count of each worker's requests in flight, which every decision by load reads. A controller's
+  stages also learn of the requests they placed from these reports (section 6). A request that
+  the gateway placed by itself holds no lease on file, so it enters no count of requests in
+  flight: its dispatch names no worker (decision 6). Its completion names the worker that served
+  it and still counts toward that worker's health. In process the gateway tells its own engine no
+  outcome yet (section 9.2).
 - When no answer comes in time (no credit on the stream, a change of leader, the controller
   gone), the gateway decides by itself with the same engine, under the document the controller
   pushed, over the worker list it follows (decision 6). That list stops changing while the
@@ -1802,26 +1815,56 @@ policy shows its cell before and after, with classic's count beside it.
 
 ### 13.3 On a cluster
 
-One cluster run exists, of 2026-11-22: 72 engines, 1,024 clients, one run for each line, through
-the gateway integration that stage 0 takes out. It has to be repeated through the new one.
-"Same worker" is the share of a conversation's next turns that went to the worker of the turn
-before.
+The engine has run beside classic on a cluster twice: 72 engines, 1,024 clients, single requests
+in conversations of several turns. "Same worker" is the share of a conversation's next turns that
+went to the worker of the turn before.
 
-| Policy | Who decided | Requests a second | First token p50 / p95 ms | Same worker |
-|---|---|---|---|---|
-| `cache_aware` | classic | 419.89 | 207.95 / 423.78 | 0.9960 |
-| `cache_aware` | engine | 419.61 | 206.41 / 419.63 | 0.9961 |
-| `power_of_two` | classic | 303.67 | 393.22 / 654.35 | 0.0152 |
-| `power_of_two` | engine | 302.68 | 394.21 / 658.95 | 0.0156 |
-| `least_load` | classic | 302.26 | 361.16 / 569.44 | 0.0159 |
-| `least_load` | engine | 302.77 | 363.26 / 575.41 | 0.0161 |
+**Through the gateway's option, 2026-11-23.** One gateway ran with `--policy-controller` off and
+with it on (section 9.3), over the same fleet. With the option on, the engine ran the document
+that the routing flags mean. For `cache_aware` on the earlier head the flags themselves made it.
+For the other rows it was supplied as a file: the document the earlier head's gateway prints for
+those flags, with its profile renamed. Two builds of the change that brought the engine back were
+run, both before it merged: an earlier head, and the head that merged as `4da61bd83`. A run
+measures 480 seconds behind a warm-up of 120, with no bursts. No request failed. A cell is the
+mean of its side's runs.
 
-On these three policies the engine and classic are not told apart: two runs of one setting
-differ by as much.
+| Policy | Build | Runs a side | Who decided | Requests a second | First token p50 / p95 / p99 ms | Same worker |
+|---|---|---|---|---|---|---|
+| `power_of_two` | earlier head | 3 | classic | 302.15 | 397.02 / 661.99 / 803.00 | 0.0157 |
+| `power_of_two` | earlier head | 3 | engine | 302.19 | 397.66 / 662.58 / 802.89 | 0.0157 |
+| `least_load` | earlier head | 2 | classic | 301.80 | 363.17 / 573.02 / 678.75 | 0.0160 |
+| `least_load` | earlier head | 2 | engine | 302.46 | 364.60 / 577.24 / 688.19 | 0.0163 |
+| `cache_aware` | earlier head | 2 | classic | 420.03 | 207.15 / 420.97 / 522.69 | 0.9963 |
+| `cache_aware` | earlier head | 2 | engine | 419.55 | 207.93 / 424.22 / 528.68 | 0.9964 |
+| `cache_aware` | merged head | 2 | classic | 420.28 | 207.18 / 423.07 / 525.23 | 0.9965 |
+| `cache_aware` | merged head | 2 | engine | 419.43 | 208.10 / 422.53 / 527.16 | 0.9965 |
 
-The same run showed the faults of the engine's own record of sent prefixes (section 4.5), under a
-document whose prefix stage reads that record alone. The two-tree lines ran on a build 32 commits
-later than the others, so their speed is not proven to be the record's alone.
+A difference is told apart here when it is larger than each side's spread: the largest of a
+side's runs less its smallest. The spreads stand in parentheses, classic's first. With two runs a
+side, told apart means seen twice, not proven.
+
+- `power_of_two`: not told apart on any measure of the table.
+- `cache_aware` on the merged head: not told apart on any measure. The engine served 0.85
+  requests a second fewer, inside classic's own spread (1.44 and 0.42).
+- `cache_aware` on the earlier head: the engine served 0.48 requests a second fewer (0.11 %;
+  0.38 and 0.10), and its p99 was 6.0 ms later (1.15 %; 2.67 and 5.26). Its p50 and p95 are not
+  told apart.
+- `least_load`: the first token is later with the engine, by 1.4 ms at p50 (0.39 %; 0.84 and
+  0.24), 4.2 ms at p95 (0.74 %; 1.44 and 0.58) and 9.4 ms at p99 (1.39 %; 5.47 and 1.13). The
+  requests a second are not told apart.
+
+One measured run of the earlier head is left out of the table. Under a supplied `cache_aware`
+document that head applied no cache event: 397.97 requests a second, same worker 0.8942. The
+merged head applies them, as its rows show.
+
+Not run through the option: a pair, an encode request, bursts, any other policy, a controller in
+its own process, or any commit of main later than that merge.
+
+**Through the earlier integration, 2026-11-22.** One run for each line, through the gateway
+integration that stage 0 took out. It showed the faults of the engine's own record of sent
+prefixes (section 4.5), under a document whose prefix stage reads that record alone. The two-tree
+lines ran on a build 32 commits later than the others, so their speed is not proven to be the
+record's alone.
 
 | Load | Who decided | First token p50 / p95 ms | Same worker |
 |---|---|---|---|
