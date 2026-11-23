@@ -51,7 +51,7 @@ use crate::{
         error,
         grpc::{
             backend_client::BackendClient,
-            common::stages::encode::EncodeDispatchPlan,
+            common::stages::{dispatch_metadata::weight_version_of, encode::EncodeDispatchPlan},
             context::{
                 stage_output, ClientSelection, DispatchContext, EncodeOutputs, ExecutionPlan,
                 ExecutionPlanKind, ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
@@ -502,6 +502,11 @@ pub(crate) async fn execute_plan(
     // names the decode that was sent, for the response's stages and for a
     // retry.
     if let Some(moved) = moved {
+        // The response states the weight version of the decode that answers
+        // it: the metadata was prepared for the decode named first.
+        if let Some(dispatch) = ctx.dispatch.as_mut() {
+            dispatch.weight_version = Some(weight_version_of(Some(&moved)));
+        }
         ctx.workers = Some(moved);
     }
     // The engines hold the request bodies now. An earlier attempt keeps its
