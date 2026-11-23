@@ -14,9 +14,8 @@ use openai_protocol::{
 };
 use serde_json::{json, to_value, Value};
 use smg_data_connector::{
-    is_unstored, visible_chain, ConversationItemStorage, ConversationStorage,
-    RequestContext as StorageRequestContext, ResponseId, ResponseStorage, ResponseStorageError,
-    StoredResponse,
+    ConversationItemStorage, ConversationStorage, RequestContext as StorageRequestContext,
+    ResponseId, ResponseStorage, ResponseStorageError, StoredResponse,
 };
 use smg_mcp::{McpOrchestrator, McpServerBinding};
 use tracing::{debug, error, warn};
@@ -577,23 +576,8 @@ pub(crate) async fn previous_response_chain(
     tenant: Option<&str>,
 ) -> Result<Vec<Arc<StoredResponse>>, Response> {
     let prev_id = ResponseId::from(prev_id_str);
-    match storage.get_response_chain(&prev_id, None).await {
-        Ok(chain)
-            if !chain.responses.is_empty()
-                && !chain
-                    .responses
-                    .last()
-                    .is_some_and(|response| is_unstored(response)) =>
-        {
-            let responses = visible_chain(chain.responses, tenant);
-            if responses.is_empty() {
-                return Err(error::not_found(
-                    "previous_response_not_found",
-                    format!("Previous response with id '{prev_id_str}' not found."),
-                ));
-            }
-            Ok(responses)
-        }
+    match storage.get_response_chain_for(&prev_id, tenant).await {
+        Ok(chain) if !chain.responses.is_empty() => Ok(chain.responses),
         Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => Err(error::not_found(
             "previous_response_not_found",
             format!("Previous response with id '{prev_id_str}' not found."),
@@ -860,6 +844,61 @@ mod tests {
             .await
             .expect_err("an unknown id is refused");
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A store read one record at a time (the trait's own chain walk), counted.
+    struct CountedReads {
+        inner: MemoryResponseStorage,
+        reads: AtomicUsize,
+    }
+
+    response_storage_over! {
+        CountedReads.inner;
+        passes store_response, delete_response, list_identifier_responses, delete_identifier_responses;
+        async fn get_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<Option<StoredResponse>, ResponseStorageError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_response(response_id).await
+        }
+    }
+
+    /// A previous response the caller may not read is refused after one read
+    /// of the store; a chain is walked no further than the first such record.
+    #[tokio::test]
+    async fn a_previous_response_the_caller_may_not_read_is_refused_after_one_read() {
+        let counted = Arc::new(CountedReads {
+            inner: MemoryResponseStorage::new(),
+            reads: AtomicUsize::new(0),
+        });
+        let storage: Arc<dyn ResponseStorage> = counted.clone();
+        let mut previous = None;
+        for id in ["a1", "a2", "a3", "b4"] {
+            let mut response = StoredResponse::new(previous.replace(ResponseId::from(id)));
+            response.id = ResponseId::from(id);
+            response.tenant = Some(id[..1].to_string()); // the letter of its id
+            storage.store_response(response).await.unwrap();
+        }
+
+        let mut loads = Vec::new();
+        for (named, tenant) in [("a3", "a"), ("a3", "b"), ("b4", "b")] {
+            let chain = previous_response_chain(&storage, named, Some(tenant)).await;
+            let ids: Vec<&str> = chain.iter().flatten().map(|r| r.id.0.as_str()).collect();
+            loads.push((
+                chain.as_ref().err().map(|refused| refused.status()),
+                ids.join(" "),
+                counted.reads.swap(0, Ordering::SeqCst),
+            ));
+        }
+        assert_eq!(
+            loads,
+            [
+                (None, "a1 a2 a3".to_string(), 3),
+                (Some(StatusCode::NOT_FOUND), String::new(), 1),
+                (None, "b4".to_string(), 2),
+            ]
+        );
     }
 
     /// `background: true` with `store: false`, the public API's probe: the

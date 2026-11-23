@@ -16,8 +16,8 @@ use openai_protocol::{
 use serde::Deserialize;
 use serde_json::Value;
 use smg_data_connector::{
-    is_unstored, visible_chain, ConversationId, ConversationItem, ListParams, ResponseId,
-    ResponseStorageError, SortOrder, StorageFailure, StoredResponse,
+    ConversationId, ConversationItem, ListParams, ResponseId, ResponseStorageError, SortOrder,
+    StorageFailure, StoredResponse,
 };
 use tracing::warn;
 
@@ -127,18 +127,10 @@ async fn visible_previous_chain(
     let prev_id = ResponseId::from(prev_id_str);
     match components
         .response_storage
-        .get_response_chain(&prev_id, None)
+        .get_response_chain_for(&prev_id, tenant)
         .await
-        .map(|chain| visible_chain(chain.responses, tenant))
     {
-        Ok(responses)
-            if !responses.is_empty()
-                && !responses
-                    .last()
-                    .is_some_and(|response| is_unstored(response)) =>
-        {
-            Ok(responses)
-        }
+        Ok(chain) if !chain.responses.is_empty() => Ok(chain.responses),
         Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => {
             super::record_error(
                 model,
