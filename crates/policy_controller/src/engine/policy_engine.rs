@@ -484,8 +484,6 @@ impl PolicyEngine {
     /// its cost does not grow with the list. Under this value every worker
     /// states nothing: none takes images, none meets a demand for a runtime
     /// or for media by reference, and each holds a request of any size.
-    /// Whether a worker registered a data-parallel rank is read off its
-    /// object under either.
     #[must_use]
     pub(crate) fn pool_members(&self, pool: &Arc<[Arc<dyn Worker>]>) -> PoolMembers {
         let epoch = self.epochs.fetch_add(1, Ordering::Relaxed) + 1;
