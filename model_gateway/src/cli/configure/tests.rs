@@ -553,7 +553,7 @@ const ROUTING_FLAGS: &[Row] = &[
         &[],
         "whether a rank is a worker of its own is its registration's, not the document's",
     ),
-    refused("routing-key-override", &[], "routing_key_override.enabled"),
+    lands("routing-key-override", &[], &[]),
     lands("pd-pairing-mode", PAIR, &["strict"]),
     lands("routing-key-headers", MANUAL, &["x-session-id"]),
     kept(
@@ -749,8 +749,15 @@ fn is_one_sentence_headed(sentence: &str, head: &str) -> bool {
 fn the_print_option_says_a_refusal_in_one_sentence() {
     // A setting no document says: no document, and one sentence with the
     // setting by its name at the head. The words behind the head are the
-    // policy crate's, and no case of the gateway holds them.
-    let sticky = printed(&["smg", "--routing-key-override", "--print-policy-spec"]);
+    // policy crate's, and no case of the gateway holds them. The sticky
+    // override has no document beside the prefix hash ring.
+    let sticky = printed(&[
+        "smg",
+        "--policy",
+        "prefix_hash",
+        "--routing-key-override",
+        "--print-policy-spec",
+    ]);
     assert_eq!(sticky.document(), None);
     assert!(
         sticky
