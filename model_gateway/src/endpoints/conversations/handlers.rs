@@ -448,8 +448,14 @@ pub async fn list_conversation_items(
             let last_id = items.last().map(|item| item.id.0.clone());
             // The item objects as the public API lists them: each item's own
             // fields, the same object the single-item GET answers; the page is
-            // this answer's own, so each item moves into its object.
-            let item_values: Vec<Value> = items.into_iter().map(item_to_json).collect();
+            // this answer's own, so each item moves into its object. A row is
+            // listed only for an owner its own rule allows; the paging fields
+            // above are the store's.
+            let item_values: Vec<Value> = items
+                .into_iter()
+                .filter(|item| item.is_visible_to(tenant))
+                .map(item_to_json)
+                .collect();
 
             (
                 StatusCode::OK,
@@ -930,8 +936,10 @@ pub async fn get_conversation_item(
     }
 
     match item_storage.get_item(&item_id).await {
-        Ok(Some(item)) => (StatusCode::OK, Json(item_to_json(item))).into_response(),
-        Ok(None) => not_found("Item not found"),
+        Ok(Some(item)) if item.is_visible_to(tenant) => {
+            (StatusCode::OK, Json(item_to_json(item))).into_response()
+        }
+        Ok(_) => not_found("Item not found in this conversation"),
         Err(e) => store_error("Failed to get item", &e),
     }
 }
@@ -2647,5 +2655,48 @@ mod tests {
             assert_eq!(other.tenant.as_deref(), B, "{case}");
             assert_eq!(other.content[0]["text"], "msg_o", "{case}");
         }
+    }
+
+    /// A conversation serves a row only to an owner the row's own rule
+    /// allows: a link to another tenant's row is not listed, and its read
+    /// answers what the read of an id the conversation does not hold answers.
+    #[tokio::test]
+    async fn a_linked_row_of_another_tenant_is_neither_listed_nor_read() {
+        use crate::middleware::test_support::text_of;
+
+        let (conversations, items, _, item_of_a) = conversation_of_a().await;
+        let created =
+            json_of(create_conversation(&conversations, &items, B, json!({})).await).await;
+        let conv_of_b = created["id"].as_str().unwrap();
+        items
+            .link_items(
+                &ConversationId::from(conv_of_b),
+                &[(
+                    ConversationItemId::from(item_of_a.as_str()),
+                    chrono::Utc::now(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        let listed = json_of(
+            list_conversation_items(&conversations, &items, B, conv_of_b, None, None, None).await,
+        )
+        .await;
+        let mut reads = Vec::new();
+        for id in [item_of_a.as_str(), "msg_unlinked"] {
+            let response =
+                get_conversation_item(&conversations, &items, B, conv_of_b, id, None).await;
+            reads.push((
+                response.status(),
+                response.headers().clone(),
+                text_of(response).await,
+            ));
+        }
+        assert_eq!(
+            (&listed["data"], reads[0].0, &reads[0]),
+            (&json!([]), StatusCode::NOT_FOUND, &reads[1]),
+            "{listed}"
+        );
     }
 }

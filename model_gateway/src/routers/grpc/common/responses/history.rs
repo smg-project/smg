@@ -465,12 +465,18 @@ async fn conversation_items(
     if cut {
         stored.drain(..stored.len() - MAX_CONVERSATION_HISTORY_ITEMS);
     }
+    let mut hidden = false;
     // A row a stored response wrote was answered without the parts the
     // pipeline never carried; a row the client added to the conversation
     // itself (no response id) was answered by nobody and keeps every part,
     // so the conversion refuses it as it would the request's own.
     let items: Vec<ResponseInputOutputItem> = stored
         .into_iter()
+        .filter(|row| {
+            let visible = row.is_visible_to(tenant);
+            hidden |= !visible;
+            visible
+        })
         .filter_map(|row| {
             let answered = row.response_id.is_some();
             let item = conversation_item_as_input(row).filter(replays)?;
@@ -482,7 +488,12 @@ async fn conversation_items(
         })
         .collect();
     if !cut {
-        return Ok(items);
+        // The output of a call the rule hid is no history, as after a cut.
+        return Ok(if hidden {
+            without_outputs_of_missing_calls(items)
+        } else {
+            items
+        });
     }
     // The window is cut at the limit: it begins at its first turn boundary
     // (the tail of the turn the cut split is not replayed), and an output
@@ -1310,6 +1321,22 @@ pub(crate) mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A call the caller may not see is not replayed, and its output goes
+    /// with it, as the output of a call before a cut window does.
+    #[tokio::test]
+    async fn a_call_the_caller_may_not_see_takes_its_output_out_of_the_replay() {
+        let stores = Stores::with_conversation().await;
+        let mut call = call_row("call_other");
+        call.tenant = Some("other".to_string());
+        link_rows(
+            &stores,
+            vec![message_row(1), call, output_row("call_other")],
+        )
+        .await;
+        let items = replayed_items(&stores, "item 2").await;
+        assert_eq!(shape(&items), ["message:user", "message:user"]);
     }
 
     /// A conversation of 120 items replays its newest 100, oldest first,

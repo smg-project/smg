@@ -69,7 +69,7 @@ pub(crate) async fn load_input_history(
     if let Some(conv_id_str) = conversation {
         let conv_id = ConversationId::from(conv_id_str);
         check_conversation_visible(components, &conv_id, tenant, model).await?;
-        let mut items = conversation_window_items(components, &conv_id, model).await?;
+        let mut items = conversation_window_items(components, &conv_id, tenant, model).await?;
         let own_input =
             std::mem::replace(&mut request_body.input, ResponseInput::Items(Vec::new()));
         append_current_input(&mut items, own_input, conv_id_str);
@@ -219,6 +219,7 @@ async fn check_conversation_visible(
 async fn conversation_window_items(
     components: &ResponsesComponents,
     conv_id: &ConversationId,
+    tenant: Option<&str>,
     model: &str,
 ) -> Result<Vec<ResponseInputOutputItem>, Response> {
     let params = ListParams {
@@ -246,12 +247,21 @@ async fn conversation_window_items(
     if cut {
         stored_items.drain(..stored_items.len() - MAX_CONVERSATION_HISTORY_ITEMS);
     }
+    let mut hidden = false;
     let mut items: Vec<ResponseInputOutputItem> = stored_items
         .into_iter()
+        .filter(|row| {
+            let visible = row.is_visible_to(tenant);
+            hidden |= !visible;
+            visible
+        })
         .filter_map(stored_item_as_input)
         .collect();
     if cut {
         items = without_outputs_of_missing_calls(from_turn_boundary(items));
+    } else if hidden {
+        // The output of a call the rule hid is no history, as after a cut.
+        items = without_outputs_of_missing_calls(items);
     }
     Ok(items)
 }
