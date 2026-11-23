@@ -71,7 +71,7 @@ const ENCODE_COLUMN: &str = "encode-column";
 const ENCODE_SCOPE: &str = "encode-scope";
 
 /// What the encode side reads of one encoder beside its candidate row, as
-/// the store holds it.
+/// its host states it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EncoderFacts {
     /// The encoder's encode class; `0` when it states no end. The store

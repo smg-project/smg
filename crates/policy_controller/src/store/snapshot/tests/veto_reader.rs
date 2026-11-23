@@ -118,6 +118,64 @@ fn a_veto_is_read_until_its_end_and_held_until_its_holds_end() {
     assert_eq!(at(t0), []);
 }
 
+/// A gateway that holds no veto in a pool reads none there, wherever its
+/// id falls among the gateways that hold one: under the first, between two
+/// and above the last. It never reads another gateway's run, and a holder
+/// reads its own. The even ids hold a veto. Up to two holders are asked at
+/// the two ends alone, more are walked to from the nearer end by strides,
+/// and 161 are found by search.
+#[test]
+fn a_gateway_with_no_veto_reads_none_wherever_its_id_falls_among_the_holders() {
+    for holders in [1, 2, 3, 9, 24, 161] {
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let ids =
+            ["http://a:8000", "http://b:8000", "http://c:8000"].map(|key| member(&store, key));
+        let until = t0 + 10 * S;
+        // The holders veto three workers by turns: a holder's neighbours
+        // hold another worker's veto than its own.
+        let vetoed = |holder: u64| ids[(holder / 2 % 3) as usize];
+        for holder in (2..=2 * holders).step_by(2) {
+            doubted(&store, GatewayId(holder), vetoed(holder), until, t0);
+        }
+        for gateway in 1..=2 * holders + 1 {
+            let own = if gateway % 2 == 0 {
+                vec![doubt(vetoed(gateway))]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                read(&store, MODEL, GatewayId(gateway), t0),
+                own,
+                "gateway {gateway} among {holders} holders"
+            );
+        }
+    }
+}
+
+/// A hold noted past its veto's end is kept as that end. A veto noted again
+/// with another hold past the same end changes neither end, so the store
+/// publishes no world for it. A hold short of the end is another hold than
+/// the one that stands, and its write is published.
+#[test]
+fn a_hold_noted_again_past_the_same_end_publishes_no_world() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let id = member(&store, "http://a:8000");
+    let until = t0 + 5 * S;
+    let noted = |hold_end: Instant| {
+        let written = store.gateway_veto_noted(ASKER, id, Some(until), Some(hold_end), false, t0);
+        assert_eq!(written, VetoWrite::Written);
+        store.publications()
+    };
+    let first = noted(until + S);
+    assert_eq!(noted(until + 60 * S), first);
+    assert_eq!(noted(until), first);
+    assert_eq!(read(&store, MODEL, ASKER, until - MS), [hold(id)]);
+    assert_eq!(noted(until - S), first + 1);
+    assert_eq!(read(&store, MODEL, ASKER, until - MS), [doubt(id)]);
+}
+
 /// A worker of two pools is read in each pool's ask. A model the store
 /// does not know and a role with no pool read nothing.
 #[test]

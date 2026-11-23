@@ -655,17 +655,6 @@ pub struct StoreSnapshot {
     /// The standing vetoes by pool, each pool's by gateway: empty while no
     /// veto stands in the store.
     vetoes: Arc<[PoolVetoes]>,
-    /// How many rows of each pool hold no report, at the pool's index
-    /// ([`Working::unreported`]): kept by the writes and shown with the rows
-    /// a publication shows. One list for every world until a count moves.
-    #[expect(
-        dead_code,
-        reason = "the decision views were this count's one reader: it leaves in a following change"
-    )]
-    unreported: Arc<[u32]>,
-    /// The epoch of the overload verdicts these rows carry
-    /// ([`Self::overload_epoch`]).
-    overload_epoch: u64,
     /// The generation this publication was made under: its engine and its
     /// number, read with the rows in one load.
     spec: Arc<Applied>,
@@ -786,17 +775,6 @@ impl StoreSnapshot {
     /// `at` in the rows' clock: microseconds since the store's origin.
     pub fn micros(&self, at: Instant) -> u64 {
         micros(self.origin, at)
-    }
-
-    /// The epoch of this world's overload verdicts: the one thing to
-    /// compare between two worlds' verdicts. It moves with a judgment that
-    /// moved a row's bit, whatever started it, and with every membership
-    /// build, whose rows are judged from no bit. Two worlds of one epoch
-    /// carry the same verdict on every row, so a host that mirrors the
-    /// verdicts ([`Self::overloaded`]) reads them again only where the
-    /// epoch moved.
-    pub fn overload_epoch(&self) -> u64 {
-        self.overload_epoch
     }
 
     /// Every row this world publishes under an overload verdict, pool by
@@ -1271,11 +1249,6 @@ struct Working {
     rows: Vec<Candidate>,
     /// Folded since the last publication.
     dirty: bool,
-    /// How many of the rows hold no report ([`unreported`]): taken where a
-    /// membership write builds the rows, then moved by each write that
-    /// gives a row its first report or takes its last ([`rows_at`]). A
-    /// publication reads it and passes over no row.
-    unreported: u32,
     /// Each row's own overload thresholds, from its registration.
     own: Vec<Overload>,
     /// The thresholds the standing generation's binding hands this pool;
@@ -1432,10 +1405,6 @@ pub(super) struct Writer {
     derivations: FxHashMap<Box<str>, Derivation>,
     /// Each pool's rows as the last publication left them.
     published: Vec<Arc<[Candidate]>>,
-    /// How many rows of each pool hold no report, as the last publication
-    /// showed them ([`Working::unreported`]): one list for every world until
-    /// a count moves.
-    unreported: Arc<[u32]>,
     /// Each pool's spare: the rows it published before its last, kept for
     /// its next publication to write over; none before the pool's first
     /// publication after a membership build. Beside the working copies,
@@ -1557,11 +1526,6 @@ pub(super) struct Writer {
     unnamed: Vec<(WorkerId, u16)>,
     /// How many writes to the load table moved an overload verdict.
     flips: u64,
-    /// The epoch of the working rows' overload verdicts. It moves with a
-    /// judgment that moved a row's bit ([`Self::judge`]) and with every
-    /// membership build, whose rows start with no bit. A world carries the
-    /// epoch of its publication ([`StoreSnapshot::overload_epoch`]).
-    overload_epoch: u64,
     /// The standing members outside the standing generation's lists.
     outside: OutsideLists,
     /// Each member's fields under the standing generation's lists, in id
@@ -1593,7 +1557,6 @@ impl Writer {
             derived: Arc::default(),
             derivations: FxHashMap::default(),
             published: Vec::new(),
-            unreported: Arc::from(Vec::new()),
             spares: Vec::new(),
             working: Vec::new(),
             held: Vec::new(),
@@ -1627,7 +1590,6 @@ impl Writer {
             silenced: 0,
             unnamed: Vec::new(),
             flips: 0,
-            overload_epoch: 0,
             outside: OutsideLists::default(),
             listed: Vec::new(),
             listed_spare: Vec::new(),
@@ -1659,8 +1621,6 @@ impl Writer {
             origin: self.origin,
             derived: Arc::clone(&self.derived),
             rows: self.published.clone().into_boxed_slice(),
-            unreported: Arc::clone(&self.unreported),
-            overload_epoch: self.overload_epoch,
             vetoes: Arc::clone(&self.pool_vetoes),
             spec: Arc::clone(&self.spec),
             #[cfg(feature = "controller")]
@@ -1921,7 +1881,6 @@ impl Writer {
             heard,
             sample_bound,
             unnamed,
-            overload_epoch,
             ..
         } = self;
         let Some(engine) = engines.get(engine as usize).filter(|engine| engine.judged) else {
@@ -2018,7 +1977,6 @@ impl Writer {
                 moved = true;
             }
         }
-        *overload_epoch += u64::from(moved);
         moved
     }
 
@@ -2415,9 +2373,6 @@ impl Writer {
         // A build takes in every membership write: none stays owed.
         self.owed = None;
         self.builds += 1;
-        // A build's rows start with no bit: a verdict the last world showed
-        // can go with no judgment to move it.
-        self.overload_epoch += 1;
         let origin = self.origin;
         // The last write's classes: carried, or what the written worker's
         // derive starts from.
@@ -2666,8 +2621,6 @@ impl Writer {
                 self.working.push(Working {
                     rows,
                     dirty: false,
-                    // Taken at this write's end, once its rows stand.
-                    unreported: 0,
                     // No list where no member names a threshold of its own:
                     // a row with none reads its pool's.
                     own: if owned {
@@ -2904,16 +2857,6 @@ impl Writer {
         // Every pool's rows are new, and so are their cells.
         self.read_cells(&on_file);
         self.index_pools(&before, classes);
-        // Every pool's rows are new: each count is taken again, by the one
-        // pass over a pool's rows that a membership write pays for it.
-        self.unreported = self
-            .working
-            .iter_mut()
-            .map(|pool| {
-                pool.unreported = unreported(&pool.rows);
-                pool.unreported
-            })
-            .collect();
         self.publish()
     }
 
@@ -3253,17 +3196,9 @@ impl Writer {
             .retain_mut(|world| Arc::get_mut(world).is_none());
         let unlisted = |rows: &mut Arc<[Candidate]>| Arc::get_mut(rows).is_some();
         self.unlisted.extend(self.held.extract_if(.., unlisted));
-        // One count a pool: every membership write takes the list again.
-        debug_assert_eq!(self.unreported.len(), self.working.len());
         let pools = self.working.iter_mut().zip(&mut self.published);
-        // Whether this publication moves a count. The list is then taken
-        // once more from the pools: the worlds that list the old counts
-        // keep them.
-        let mut moved = false;
-        for (at, ((pool, published), spare)) in pools.zip(&mut self.spares).enumerate() {
+        for ((pool, published), spare) in pools.zip(&mut self.spares) {
             if !pool.dirty {
-                // No write touched this pool: it holds the count listed.
-                debug_assert_eq!(self.unreported.get(at), Some(&pool.unreported));
                 continue;
             }
             let mut next = spare.take();
@@ -3281,14 +3216,6 @@ impl Writer {
             });
             *spare = Some(mem::replace(published, next));
             pool.dirty = false;
-            // The count the writes kept: no row is passed over for it.
-            let count = pool.unreported;
-            debug_assert_eq!(count, unreported(&pool.rows));
-            moved |= self.unreported.get(at) != Some(&count);
-        }
-        if moved {
-            // One allocation: the counts go straight into their shared list.
-            self.unreported = self.working.iter().map(|pool| pool.unreported).collect();
         }
         if mem::take(&mut self.cells_moved) {
             self.publish_cells();
@@ -3618,13 +3545,6 @@ fn predict_of(
     })
 }
 
-/// How many of `rows` hold no report: the pass a membership write takes over
-/// each pool it builds. Every later write moves the pool's count by the row
-/// it folds ([`rows_at`]), so no publication takes the pass.
-fn unreported(rows: &[Candidate]) -> u32 {
-    rows.iter().filter(|row| row.load.is_none()).count() as u32
-}
-
 /// Writes `rows` over `over` when `over` is of `rows`' length and the
 /// writer holds the last reference to it: no world lists it, so nothing
 /// can read it. Whether it did.
@@ -3655,9 +3575,7 @@ fn seek<T>(sorted: &[T], from: usize, id: WorkerId, id_of: impl Fn(&T) -> Worker
 }
 
 /// Hand `fold` each row of member `id` that stands at `rank` in the working
-/// copy; a pool is marked written where `fold` says it wrote, and its count
-/// of rows without a report ([`Working::unreported`]) moves where `fold`
-/// gave a row its first report or took its last. Where the
+/// copy; a pool is marked written where `fold` says it wrote. Where the
 /// member's first place stands when a row was handed, and `None` where no
 /// row of the member stands at the rank: the member has no place yet, or
 /// its rows stand at another rank. A load write folds a rank's record by
@@ -3683,13 +3601,7 @@ fn rows_at(
         if row.dp_rank != rank {
             continue;
         }
-        let held = row.load.is_some();
         pool.dirty |= fold(row);
-        match (held, row.load.is_some()) {
-            (false, true) => pool.unreported = pool.unreported.saturating_sub(1),
-            (true, false) => pool.unreported = pool.unreported.saturating_add(1),
-            _ => {}
-        }
         at = Some(first as u32);
     }
     at
