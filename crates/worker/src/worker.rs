@@ -1831,6 +1831,25 @@ pub struct SchedulerLoadSnapshot {
     #[serde(skip)]
     #[schemars(skip)]
     pub kept: LoadTelemetry,
+    /// How old the kept `num_used_tokens` is at this entry's own sample, in
+    /// milliseconds: the time since the count was last stated, by a record
+    /// of the rank or by a poll's answer. The time is rounded up to a whole
+    /// millisecond: a reader ends the count by this age, and a count must
+    /// never read younger than it is. The load monitor writes it, for a
+    /// count this entry keeps ([`Self::kept`]), in a report that lists the
+    /// rank alone. `None` for a count this entry's own source states, for a
+    /// count nothing has stated, and in a report of several ranks: such a
+    /// report has one sample instant, which every rank's record moves, so
+    /// a reader cannot date one rank's count by it. Never serialized, as
+    /// the mark is not.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub kept_used_tokens_age_ms: Option<u32>,
+    /// How old the kept `max_total_num_tokens` is at this entry's own
+    /// sample, as [`Self::kept_used_tokens_age_ms`] says of the used count.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub kept_total_tokens_age_ms: Option<u32>,
 }
 
 impl SchedulerLoadSnapshot {
@@ -1851,43 +1870,53 @@ impl SchedulerLoadSnapshot {
     }
 
     /// Values the engine reports by name, followed by the two fixed token
-    /// counts, each where this snapshot's own source stated it and its
-    /// name is absent from the list. A stated count is offered at zero
-    /// too: an engine that goes idle states zero tokens held, and a reader
-    /// that keeps the last value it read must hear it.
+    /// counts, each where a record stated it and its name is absent from
+    /// the list. A stated count is offered at zero too: an engine that goes
+    /// idle states zero tokens held, and a reader that keeps the last value
+    /// it read must hear it.
     ///
-    /// Two rules say what is stated, and both are read here alone. A count
-    /// the source did not carry ([`Self::kept`]) is not offered: what a
-    /// snapshot offers by name is its own record's, and such a count is
-    /// stored as zero or as the last record's. An entry with no token
-    /// capacity offers neither count, whatever its source: an engine that
-    /// reports its counts reports its capacity
-    /// ([`WorkerLoadResponse::has_absolute_token_data`]), and one that
-    /// keeps no such size fills both with zero on every record. The
+    /// Three rules say what is offered, and all are read here alone. A
+    /// count this snapshot's own source stated is offered with no age of
+    /// its own. A count the source did not carry ([`Self::kept`]) is
+    /// offered where the entry states how old it is
+    /// ([`Self::kept_used_tokens_age_ms`]), under that age: the count as
+    /// it was last stated, which a reader ends by the age. A
+    /// kept count with no age is not offered: it is stored as zero or as a
+    /// record's whose instant the entry does not know, as in a report of
+    /// several ranks. An entry with no token capacity offers neither count,
+    /// whatever its source: an engine that reports its counts reports its
+    /// capacity ([`WorkerLoadResponse::has_absolute_token_data`]), and one
+    /// that keeps no such size fills both with zero on every record. The
     /// capacity is the entry's, so a record that leaves it out is read by
     /// the one the entry keeps.
     pub fn named_values(&self) -> impl Iterator<Item = NamedValue> + '_ {
         let [used, capacity, tokens] = &*FIXED_COUNT_NAMES;
         let sized = self.max_total_num_tokens > 0;
         let fixed = [
-            (used, self.num_used_tokens, LoadTelemetry::USED_TOKENS),
+            (
+                used,
+                self.num_used_tokens,
+                LoadTelemetry::USED_TOKENS,
+                self.kept_used_tokens_age_ms,
+            ),
             (
                 capacity,
                 self.max_total_num_tokens,
                 LoadTelemetry::TOTAL_TOKENS,
+                self.kept_total_tokens_age_ms,
             ),
         ]
         .into_iter()
-        .filter(move |&(name, _, part)| {
+        .filter(move |&(name, _, part, age)| {
             sized
-                && !self.kept.contains(part)
+                && (!self.kept.contains(part) || age.is_some())
                 && !self.values.iter().any(|value| value.name == *name)
         })
-        .map(move |(name, count, _)| NamedValue {
+        .map(move |(name, count, part, age)| NamedValue {
             name: Arc::clone(name),
             unit: Arc::clone(tokens),
             value: f64::from(count),
-            age_ms: None,
+            age_ms: age.filter(|_| self.kept.contains(part)),
         });
         self.values.iter().cloned().chain(fixed)
     }
@@ -2621,30 +2650,62 @@ mod load_snapshot_tests {
         );
     }
 
+    /// A count the entry keeps from an older record is offered where the
+    /// entry states its age, under that age, and not where it states none.
+    /// A count of the entry's own record is offered with no age, whatever
+    /// age the entry holds for it.
     #[test]
-    fn named_values_offer_no_count_the_entry_kept_from_an_older_record() {
+    fn named_values_offer_a_kept_count_under_its_age_and_none_without_one() {
         let mut snapshot = SchedulerLoadSnapshot {
             num_used_tokens: 211,
             max_total_num_tokens: 1_373,
             ..Default::default()
         };
-        let names = |snapshot: &SchedulerLoadSnapshot| -> Vec<String> {
+        let offered = |snapshot: &SchedulerLoadSnapshot| -> Vec<(String, f64, Option<u32>)> {
             snapshot
                 .named_values()
-                .map(|value| value.name.to_string())
+                .map(|value| (value.name.to_string(), value.value, value.age_ms))
                 .collect()
         };
-        assert_eq!(names(&snapshot), [KV_TOKENS_USED, KV_TOKENS_CAPACITY]);
+        let used = |age| (KV_TOKENS_USED.to_owned(), 211.0, age);
+        let capacity = |age| (KV_TOKENS_CAPACITY.to_owned(), 1_373.0, age);
+        assert_eq!(offered(&snapshot), [used(None), capacity(None)]);
+        // Kept with no age: not offered, as a record no instant is known of.
         snapshot.kept = LoadTelemetry::USED_TOKENS;
-        assert_eq!(names(&snapshot), [KV_TOKENS_CAPACITY]);
+        assert_eq!(offered(&snapshot), [capacity(None)]);
         snapshot.kept = LoadTelemetry::USED_TOKENS | LoadTelemetry::TOTAL_TOKENS;
-        assert!(names(&snapshot).is_empty());
-        // The mark is the process's own: the answer on the wire states both
-        // counts and no mark.
+        assert!(offered(&snapshot).is_empty());
+        // Kept with an age: offered under it, each count by its own.
+        snapshot.kept_used_tokens_age_ms = Some(40);
+        assert_eq!(offered(&snapshot), [used(Some(40))]);
+        snapshot.kept_total_tokens_age_ms = Some(0);
+        assert_eq!(offered(&snapshot), [used(Some(40)), capacity(Some(0))]);
+        // The entry's own record states the used count again: no age.
+        snapshot.kept = LoadTelemetry::TOTAL_TOKENS;
+        assert_eq!(offered(&snapshot), [used(None), capacity(Some(0))]);
+        // A list that states a count's name stands for it, kept or not.
+        snapshot.values = vec![NamedValue {
+            name: KV_TOKENS_CAPACITY.into(),
+            unit: "tokens".into(),
+            value: 9.0,
+            age_ms: None,
+        }];
+        assert_eq!(
+            offered(&snapshot),
+            [(KV_TOKENS_CAPACITY.to_owned(), 9.0, None), used(None)]
+        );
+        // The mark and the ages are the process's own: the answer on the
+        // wire states both counts and neither.
         let json = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(json["num_used_tokens"], 211);
         assert_eq!(json["max_total_num_tokens"], 1_373);
-        assert!(json.get("kept").is_none());
+        for key in [
+            "kept",
+            "kept_used_tokens_age_ms",
+            "kept_total_tokens_age_ms",
+        ] {
+            assert!(json.get(key).is_none(), "{key}");
+        }
     }
 
     #[test]
