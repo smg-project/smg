@@ -38,7 +38,7 @@ use crate::{
         filters::{HasCapacity, HasRoom, Healthy, NotOverloaded, NotTried},
         pickers::{Best, CountFirst},
     },
-    tracking::dispatch_credit::DispatchCredit,
+    tracking::dispatch_credit::{DispatchCredit, SentSettings},
 };
 
 /// Builds one stage: once at its registration, then once for each place a
@@ -82,7 +82,7 @@ pub(crate) enum Found<T: ?Sized, F = Infallible> {
 pub struct StageBuild<'a> {
     written: &'a Map<String, Value>,
     profile: &'a str,
-    sent_ttl_ms: Option<u32>,
+    sent_settings: SentSettings,
     sent: &'a mut Option<Arc<DispatchCredit>>,
     reports: LoadReportReader,
     /// The document's signals, resolved, in name order.
@@ -105,7 +105,7 @@ impl<'a> StageBuild<'a> {
     pub(crate) fn built<S: ?Sized>(
         written: &'a Map<String, Value>,
         profile: &'a str,
-        sent_ttl_ms: Option<u32>,
+        sent_settings: SentSettings,
         sent: &'a mut Option<Arc<DispatchCredit>>,
         reports: LoadReportReader,
         signals: &'a [SignalColumn],
@@ -115,7 +115,7 @@ impl<'a> StageBuild<'a> {
         let mut context = Self {
             written,
             profile,
-            sent_ttl_ms,
+            sent_settings,
             sent,
             reports,
             signals,
@@ -173,9 +173,10 @@ impl StageBuild<'_> {
     }
 
     /// The profile's count of sends. The first call for a profile makes
-    /// its tally under that profile's `sent_ttl_ms`.
+    /// its tally under that profile's `sent_ttl_ms` and its
+    /// `sent_report_delay_ms`.
     pub fn dispatch_credit(&mut self) -> Arc<DispatchCredit> {
-        profile_sent(self.sent, self.profile, self.sent_ttl_ms)
+        profile_sent(self.sent, self.profile, self.sent_settings)
     }
 
     /// The view's reading of a row's load report, for a stage that reads
@@ -204,14 +205,14 @@ impl StageBuild<'_> {
 }
 
 /// The count of sends in a profile's slot, made at the first ask under the
-/// profile's `sent_ttl_ms`. A factory's context and a typed stage both ask
-/// here, so a profile holds one count.
+/// profile's `sent_ttl_ms` and its `sent_report_delay_ms`. A factory's
+/// context and a typed stage both ask here, so a profile holds one count.
 pub(crate) fn profile_sent(
     slot: &mut Option<Arc<DispatchCredit>>,
     profile: &str,
-    sent_ttl_ms: Option<u32>,
+    settings: SentSettings,
 ) -> Arc<DispatchCredit> {
-    Arc::clone(slot.get_or_insert_with(|| Arc::new(DispatchCredit::new(profile, sent_ttl_ms))))
+    Arc::clone(slot.get_or_insert_with(|| Arc::new(DispatchCredit::new(profile, settings))))
 }
 
 /// Why a factory refuses what the document wrote. It displays as the

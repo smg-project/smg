@@ -321,6 +321,42 @@ fn a_send_takes_room_until_a_report_or_the_profiles_limit_ends_it() {
 }
 
 #[test]
+fn a_send_takes_room_past_a_report_sampled_sooner_than_the_profiles_delay() {
+    const SENT_AT: u64 = 91_347;
+    let document: PolicySpec = serde_json::from_str(&format!(
+        r#"{{"apiVersion":"{API_VERSION}","profiles":{{"p":{{"sent_report_delay_ms":5,
+            "filter":[{{"has-room":{{"used":{{"sent.tokens":1}},"capacity":300}}}}],"pick":"random"}}}}}}"#
+    ))
+    .expect("a policy document");
+    let policy = document
+        .validate()
+        .expect("the rule reads the sends the delay holds");
+    let mut a = row(0, 0);
+    let b = row(1, 0);
+    let lease = Lease {
+        issued_micros: SENT_AT,
+        tokens: 317,
+        ..Lease::default()
+    };
+    let target = Target {
+        id: a.id,
+        dp_rank: a.dp_rank,
+        ..Target::default()
+    };
+    policy.on_dispatched(&lease, &target, Side::Single, 0);
+    let facts = RequestFacts {
+        now_micros: SENT_AT + 9_000,
+        ..RequestFacts::default()
+    };
+    // Three milliseconds behind the send: its 317 tokens are over 300.
+    a.load_sampled_at_micros = SENT_AT + 3_000;
+    assert_eq!(kept(&policy, 0, &facts, &[a, b]), [1]);
+    // Five behind it: the report ends the send.
+    a.load_sampled_at_micros = SENT_AT + 5_000;
+    assert_eq!(kept(&policy, 0, &facts, &[a, b]), [0, 1]);
+}
+
+#[test]
 fn a_sends_request_and_its_tokens_each_take_room_by_their_own_coefficient() {
     let policy =
         policy(r#"{"has-room":{"used":{"sent.requests":100,"sent.tokens":1},"capacity":250}}"#);

@@ -69,7 +69,7 @@ use crate::{
             DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
         },
     },
-    tracking::dispatch_credit::DispatchCredit,
+    tracking::dispatch_credit::{DispatchCredit, SentSettings},
 };
 
 pub const API_VERSION: &str = "smg.policy/v1";
@@ -1965,6 +1965,18 @@ pub struct ProfileSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub sent_ttl_ms: Option<u32>,
+    /// The least number of milliseconds between a send and the sample of a
+    /// load report that ends it: a report sampled less than that long after
+    /// a send leaves the send counted. Unset, a report sampled at or after
+    /// a send ends it. A written zero is refused, as a zero limit is. A
+    /// profile whose stages do not read its count of sends is refused if it
+    /// sets a delay. The limit ends a send whatever the delay. A new
+    /// document's profile of the same name takes over the sends the
+    /// standing profile holds and shares them: a read under the shorter of
+    /// the two delays ends such a send for both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub sent_report_delay_ms: Option<u32>,
 }
 
 /// A closed range with one or both bounds.
@@ -3472,7 +3484,7 @@ fn picker_of(
     profile: &str,
     at: &At,
     from: StageInputs<'_>,
-    sent_ttl_ms: Option<u32>,
+    settings: SentSettings,
     sent: &mut Option<Arc<DispatchCredit>>,
 ) -> Result<Resolved<Box<dyn Picker>>, SpecError> {
     let named = pick.name();
@@ -3486,7 +3498,7 @@ fn picker_of(
         let picker = StageBuild::built(
             &params,
             profile,
-            sent_ttl_ms,
+            settings,
             sent,
             from.reports,
             from.signals,
@@ -3619,7 +3631,7 @@ fn filtered<'a>(
     at: &At,
     index: usize,
     from: StageInputs<'_>,
-    sent_ttl_ms: Option<u32>,
+    settings: SentSettings,
     sent: &mut Option<Arc<DispatchCredit>>,
 ) -> Result<Filtered<'a>, SpecError> {
     let name = entry.name();
@@ -3633,7 +3645,7 @@ fn filtered<'a>(
         let filter = StageBuild::built(
             &params,
             profile,
-            sent_ttl_ms,
+            settings,
             sent,
             from.reports,
             from.signals,
@@ -3823,7 +3835,7 @@ fn scored(
     profile: &str,
     at: &At,
     from: StageInputs<'_>,
-    sent_ttl_ms: Option<u32>,
+    settings: SentSettings,
     sent: &mut Option<Arc<DispatchCredit>>,
 ) -> Result<Scored, SpecError> {
     let name = entry.name();
@@ -3882,7 +3894,7 @@ fn scored(
             let scorer = StageBuild::built(
                 &params,
                 profile,
-                sent_ttl_ms,
+                settings,
                 sent,
                 from.reports,
                 from.signals,
@@ -4021,16 +4033,21 @@ fn check_profile(
     let gates = gates_of(p, view);
     let at = At::new(format!("profiles.{name}"));
     at.nonzero("sent_ttl_ms", p.sent_ttl_ms)?;
+    at.nonzero("sent_report_delay_ms", p.sent_report_delay_ms)?;
+    let settings = SentSettings {
+        ttl_ms: p.sent_ttl_ms,
+        report_delay_ms: p.sent_report_delay_ms,
+    };
     // The profile's count of sends, made where a stage's factory first
     // asks for it: a filter's may, ahead of any scorer's.
     let mut sent = None;
     let mut filters = Vec::with_capacity(p.filter.len());
     for (index, entry) in p.filter.iter().enumerate() {
-        let filter = match filtered(entry, name, &at, index, from, p.sent_ttl_ms, &mut sent)? {
+        let filter = match filtered(entry, name, &at, index, from, settings, &mut sent)? {
             Filtered::Built(filter) => filter,
             Filtered::Typed(stage) => {
                 let stage_at = At::new(format!("{}.filter[{index}].{}", at.0, stage.name()));
-                let count = || profile_sent(&mut sent, name, p.sent_ttl_ms);
+                let count = || profile_sent(&mut sent, name, settings);
                 filter_of(stage, view, from.signals, count, &stage_at)?
             }
         };
@@ -4041,7 +4058,7 @@ fn check_profile(
     let mut plain_ring = false;
     for (i, entry) in p.score.iter().enumerate() {
         let entry_at = At::new(format!("{}.score[{i}]", at.0));
-        let stage = match scored(entry, name, &entry_at, from, p.sent_ttl_ms, &mut sent)? {
+        let stage = match scored(entry, name, &entry_at, from, settings, &mut sent)? {
             Scored::Typed(stage) => stage,
             Scored::Built(weighted) => {
                 depth.deepen(HashDepth::of(weighted.scorer.needs()));
@@ -4052,7 +4069,7 @@ fn check_profile(
         let stage_at = entry_at.sub(stage.name());
         check_stage(&stage, &stage_at)?;
         check_prefix_depth(&stage, gates, view, &stage_at)?;
-        let count = || profile_sent(&mut sent, name, p.sent_ttl_ms);
+        let count = || profile_sent(&mut sent, name, settings);
         match scorer_of(&stage, gates, view, from.signals, count, &stage_at)? {
             Resolved::Built(scorer) => {
                 let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
@@ -4073,7 +4090,7 @@ fn check_profile(
             }
         }
     }
-    let picker = match picker_of(&p.pick, name, &at, from, p.sent_ttl_ms, &mut sent)? {
+    let picker = match picker_of(&p.pick, name, &at, from, settings, &mut sent)? {
         Resolved::Built(picker) => Some(picker),
         Resolved::NotInBuild(what) => {
             deferred.note(at.field("pick"), what);
@@ -4082,6 +4099,13 @@ fn check_profile(
     };
     if let Some(ms) = p.sent_ttl_ms.filter(|_| sent.is_none()) {
         return Err(at.bad("sent_ttl_ms", ms, "a limit any stage of this profile reads"));
+    }
+    if let Some(ms) = p.sent_report_delay_ms.filter(|_| sent.is_none()) {
+        return Err(at.bad(
+            "sent_report_delay_ms",
+            ms,
+            "a delay any stage of this profile reads",
+        ));
     }
     // The scores combine by each weight's share of the weights' sum: a sum
     // that is not finite, or whose reciprocal is not, gives shares that
@@ -7505,7 +7529,7 @@ mod tests {
             "p",
             &At::new("profiles.p.score[0]"),
             from,
-            None,
+            SentSettings::default(),
             &mut None,
         )
         .expect("a built-in scorer") else {

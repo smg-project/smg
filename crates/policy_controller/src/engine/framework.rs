@@ -4734,7 +4734,7 @@ impl Engine {
     /// under a new name starts empty. The two engines share those entries
     /// from here on: a decision still running under the standing engine
     /// reads the sends a later one counts, and each count reads them under
-    /// its own time limit.
+    /// its own time limit and report delay.
     ///
     /// [`MemoryStore::apply`](crate::store::MemoryStore::apply) calls it
     /// before it shows the new engine. A host with a store of its own
