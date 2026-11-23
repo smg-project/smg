@@ -1046,34 +1046,64 @@ Whether each preset gives classic's answer is section 13.
 
 ## 8. What a host does
 
-This is the contract between the engine and the program that embeds it. Its start is the same
-for the gateway and for the controller. For each request the two differ. The gateway makes the
-one call of section 8.2 and keeps the placement. A controller states worker ids of its own and
-keeps no placement: it calls the entry that issues nothing and files its own record.
+This is the contract between the engine and the program that embeds it. The gateway and a
+controller keep it differently on main.
+
+- **At start.** The gateway takes steps 1 to 3 of section 8.1's start. It hands no lists yet
+  (step 4). A controller takes none of the steps: its store builds an engine object for each
+  document it applies, with no hand-over (section 10.2).
+- **For each request.** The gateway makes the one call of section 8.2 and keeps the placement. A
+  controller states worker ids of its own and keeps no placement: it calls the entry that issues
+  nothing and files its own record.
 
 ### 8.1 On main today **[built]**
 
-At start:
+At start the host does five things.
 
-| The host does | With |
-|---|---|
-| starts the engine with its own data, once | `PolicyEngine::start(spec, WorkerData { registry, loads, cache_indexes })`. It builds the engine from the document and takes the host's worker registry (the host implements `Members`, and the worker crate's registry is one), its load monitor's channel and its indexes of cache events (the host implements `CacheIndexes` and `CacheIndex`). The same hand-over also lends the token tree, where the host keeps one (`CacheIndexes::token_tree`). A host with no load monitor or no index says `None`. It answers the engine, which lives as long as the process, and the engine's own task |
-| spawns the task the start answered, once | on a runtime of its choice, which needs its timer on: the upkeep once a second, the newest load snapshot kept at hand, the follow of the registry, which tells the policies a worker that joined or was removed (the table below), each new load report told to the policies that keep them, and the cells of the lists the host handed filled ahead of their requests |
-| keeps an empty cell beside each published worker list | a `ListCell` in its value of a membership generation, lent with the list as a `LentList`, with `facts` where the host knows a fact of its workers that their objects do not hold |
-| hands its worker lists by model, once | `engine.set_lists(lists)`, beside the start, which does not take them yet. The host implements `ModelLists` over its registry, and the engine's task fills a list's cell behind the registry's word of the membership change. A later call is ignored |
-| hands its load monitor's channel again where it builds another monitor | `engine.set_loads(channel)`; an engine whose document reads no load report and no named signal, and none of whose policies keeps a report, keeps none |
+1. **It starts the engine with its own data, once.** The call is
+   `PolicyEngine::start(spec, WorkerData { registry, loads, cache_indexes })`. It builds the
+   engine from the document and takes three things of the host:
+   - its worker registry (the host implements `Members`, and the worker crate's registry is one);
+   - its load monitor's channel;
+   - its indexes of cache events (the host implements `CacheIndexes` and `CacheIndex`). The same
+     hand-over also lends the token tree, where the host keeps one (`CacheIndexes::token_tree`).
 
-A caller that builds its engine with `PolicyEngine::new(spec)`, as the crate's own cases and bench
-do over lists made by hand, makes each hand-over itself: `engine.set_registry(registry)`, or with
-no registry `engine.forget(address)` when a worker is removed and `engine.joined(address)` when
-one joins, a removal and a registration at one address in that order;
-`engine.affinity().set_indexes(indexes)`; `engine.set_loads(channel)`; and it spawns
-`engine.run()`. A host makes none of these calls but `engine.set_loads`, where it builds another
-load monitor.
+   A host with no load monitor or no index says `None`. The call answers the engine, which lives
+   as long as the process, and the engine's own task.
+2. **It spawns that task, once,** on a runtime of its choice, which needs its timer on. The task
+   does five things:
+   - it runs the upkeep once a second;
+   - it keeps the newest load snapshot at hand;
+   - it follows the registry and tells the policies a worker that joined or was removed (the
+     table below);
+   - it tells each new load report to the policies that keep them;
+   - it fills the cells of the lists the host handed, ahead of their requests.
+3. **It keeps an empty cell beside each published worker list**: a `ListCell` in its value of a
+   membership generation. The cell is lent with the list as a `LentList`, with `facts` where the
+   host knows a fact of its workers that their objects do not hold.
+4. **It hands its worker lists by model, once**: `engine.set_lists(lists)`, beside the start,
+   which does not take them yet. The host implements `ModelLists` over its registry. The engine's
+   task fills a list's cell behind the registry's word of the membership change. A later call is
+   ignored.
+5. **It hands its load monitor's channel again where it builds another monitor**:
+   `engine.set_loads(channel)`. An engine keeps no channel where its document reads no load
+   report and no named signal, and none of its policies keeps a report.
 
-What the engine's task tells the policies at each event of the registry. It names a worker by the
-id the host states of it (`Members::facts_of`), which is the id the host's lists name it by; a
-worker whose host states none is named by the fingerprint of its address.
+A caller that builds its engine with `PolicyEngine::new(spec)`, as the crate's own cases and
+bench do over lists made by hand, makes each hand-over itself:
+
+- `engine.set_registry(registry)`. With no registry the caller says `engine.forget(address)` when
+  a worker is removed and `engine.joined(address)` when one joins. It says a removal and a
+  registration at one address in that order.
+- `engine.affinity().set_indexes(indexes)`.
+- `engine.set_loads(channel)`.
+- It spawns `engine.run()`.
+
+A host makes none of these calls but `engine.set_loads`, where it builds another load monitor.
+
+The table says what the engine's task tells the policies at each event of the registry. The task
+names a worker by the id the host states of it (`Members::facts_of`), which is the id the host's
+lists name it by. A worker whose host states none is named by the fingerprint of its address.
 
 | The registry's event | The policies are told |
 |---|---|
@@ -1082,22 +1112,28 @@ worker whose host states none is named by the fingerprint of its address.
 | `Replaced` | nothing where the host states the same id of the new object; a leave of the old id and a join of the new one where it states another; nothing of an object the task does not hold |
 | `StatusChanged` | nothing: a decision reads a worker's status on its object |
 
-A worker removed and another registered at its address come as a `Removed` and a `Registered`,
-so a leave and then a join. Where the registration is heard first, the worker is read as its
-id's next life: a leave and a join of the id, and the removal then tells nothing. That holds
-under the registry's own id of a worker too: a removal tells a leave only of the worker the
-task holds. The events
-are a broadcast that drops its oldest for a reader that falls behind: the task then reads the
-registry whole, tells what changed, and last tells the ids that stand, so a stage keeps
-nothing of a worker whose whole life the channel dropped. It does the same behind a channel
-that closed, and at its next upkeep behind every registration, replacement and removal of a
-host known to state ids, from the first ask it answers with one: such a host may have stated an
-id of a worker and taken it back ahead of
-the event. The session table is told nothing: a pin on a worker that is gone stands until the
-session's idle time or two other workers end it.
+Three cases need more words:
 
-For each request the host implements a small trait and calls the engine. A host writes `model`
-and `make`; the other four methods have default bodies:
+- **Two workers at one address.** A worker removed and another registered at its address come as
+  a `Removed` and a `Registered`: a leave and then a join. Where the registration is heard first,
+  the worker is read as its id's next life: a leave and a join of the id, and the removal then
+  tells nothing. That holds under the registry's own id of a worker too: a removal tells a leave
+  only of the worker the task holds.
+- **A reader that falls behind.** The events are a broadcast that drops its oldest for a reader
+  that falls behind. The task then reads the registry whole, tells what changed, and last tells
+  the ids that stand. So a stage keeps nothing of a worker whose whole life the channel dropped.
+  The task does the same behind a channel that closed.
+- **A host that states ids.** The task reads the registry whole in the same way at its next
+  upkeep behind every registration, replacement and removal of a host known to state ids, from
+  the first ask it answers with one. Such a host may have stated an id of a worker and taken it
+  back ahead of the event.
+
+The session table is told nothing: a pin on a worker that is gone stands until the session's idle
+time or two other workers end it.
+
+For each request a host implements a small trait and calls the engine. A controller does so for
+each frame it decides. The gateway makes the one call of section 8.2, and the crate implements the
+trait for that call. A host writes `model` and `make`; every other method has a default body:
 
 ```rust
 // engine/decision_engine.rs
@@ -1105,6 +1141,9 @@ pub trait RequestMaker {
     fn model(&self) -> &str;                          // the request's model
     fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w>; // builds the request
     fn plain(&self) -> Option<Plain>;                 // what a plain request states, if it is plain
+    fn prompt_chars(&self) -> u32;                    // the length of its text in characters, asked for a plain request's lease
+    fn prompt_bytes(&self) -> u32;                    // the same length in bytes
+    fn session_counted_under(&self) -> SessionCountedUnder; // where a worker object counts its session key's requests
     fn workers(&self) -> WorkerLists<'_>;             // the worker list, a pair's two lists, or an encode request's three
     fn loads(&self) -> Option<&Arc<LoadSnapshot>>;    // a request's snapshot of the host's own; without one the engine reads its own
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>>; // the prompt's entry in the host's token tree, where the host lends one
@@ -1124,25 +1163,31 @@ pub enum Decided {
 }
 ```
 
-Then the host itself has to: derive the routing key by the document's rule and hash the prompt
-into blocks, inside `make`; try the targets in order, checking each worker's health again; keep
-the decision's lease and report each event; turn a refusal into a status. For a single request and for a pair
-`place` of section 8.2 now derives the key, hashes the prompt and tries the targets, and its
-`Placement` keeps the lease. The host still says the two events and turns a refusal into a
-status.
+A host that calls the engine through this trait alone has four more things to do itself:
+
+- derive the routing key by the document's rule and hash the prompt into blocks, inside `make`;
+- try the targets in order, checking each worker's health again;
+- keep the decision's lease and report each event;
+- turn a refusal into a status.
 
 That is too much. The gateway's earlier integration needed a module of its own of 19 files and
-13,856 lines (tests included) for it, and a branch in every route.
+13,856 lines (tests included) for it, and a branch in every route. For a single request and for a
+pair, `place` of section 8.2 now derives the key, hashes the prompt and tries the targets, and its
+`Placement` keeps the lease. The host still says the two events and turns a refusal into a status.
 
-A host that keeps a hash ring of a model's workers can lend it with a request: the request's facts
-carry the ring, behind one trait (`LentRing`), and where the request stands on it
-(`RequestFacts::ring`, `RequestFacts::ring_positions`). A trap for the lender. Under `prefix_hash`
-classic asks its ring for the sixteen hex digits of the hash of the bytes a request is placed by,
-also where those bytes are a routing key's (`model_gateway/src/policies/prefix_hash.rs:223`,
-`:292`, `:300`). Under `consistent_hashing` it asks for the routing key's own text
-(`model_gateway/src/policies/consistent_hashing.rs:84`, `:109`). A lender that states a request's
-place from the wrong text sends routing keys to other workers than classic does, and no test in
-the crate sees it.
+**A lent hash ring.** A host that keeps a hash ring of a model's workers can lend it with a
+request. The request's facts carry the ring, behind one trait (`LentRing`), and where the request
+stands on it (`RequestFacts::ring`, `RequestFacts::ring_positions`).
+
+There is a trap for the lender: classic asks its ring for two different texts.
+
+| Policy | What classic asks its ring for |
+|---|---|
+| `prefix_hash` | the sixteen hex digits of the hash of the bytes a request is placed by, also where those bytes are a routing key's (`model_gateway/src/policies/prefix_hash.rs:223`, `:292`, `:300`) |
+| `consistent_hashing` | the routing key's own text (`model_gateway/src/policies/consistent_hashing.rs:84`, `:109`) |
+
+A lender that states a request's place from the wrong text sends routing keys to other workers
+than classic does, and no test in the crate sees it.
 
 The trait keeps the two questions apart: `position` answers for a key's own text, `head_position`
 for a head of the request, each by the lender's own recipe.
