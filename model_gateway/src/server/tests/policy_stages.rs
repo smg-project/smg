@@ -81,8 +81,7 @@ fn configuration() -> RouterConfig {
 async fn refusal(config: RouterConfig, host: Extensions) -> String {
     build_app_context(&ServerConfig::minimal(config), host)
         .await
-        .err()
-        .expect("the start is refused")
+        .expect_err("the start is refused")
 }
 
 fn register_workers(app: &AppContext) {
@@ -137,8 +136,7 @@ async fn the_stock_table_refuses_a_document_that_names_a_hosts_stage() {
     let document = config.policy_spec.clone().expect("the supplied document");
     let refused = config
         .hosted_policy(&document, &StageRegistry::builtin())
-        .err()
-        .expect("the stock table holds no such stage");
+        .expect_err("the stock table holds no such stage");
     let ended = refusal(config, Extensions::new()).await;
     assert_eq!(ended, format!("policy controller: {refused}"));
     assert!(ended.contains(&format!("{STAGE:?}")), "{ended}");
