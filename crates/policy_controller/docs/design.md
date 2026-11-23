@@ -1339,7 +1339,7 @@ then ask again, send the first decision's decode, or answer its client.
 
 A host that keeps a value with each send, as a gateway keeps a worker's load guard, takes a
 kept placement apart into its sides. A side says its dispatch by one call and its end at its
-drop, with no outcome:
+drop. Whoever reads the side's answer reports its outcome through a handle on the side's end:
 
 ```rust
 // tracking/placement_side.rs, behind the feature `in-process`
@@ -1352,14 +1352,31 @@ impl PlacementSide {
     pub fn profile(&self) -> &'static str; // the label of the profile that picked this side
     // a pair's decode side: its decode decided again, answered the decode the request goes to
     pub fn decode_again(&mut self, request: &PlaceRequest<'_>) -> Result<Arc<dyn Worker>, Unplaced>;
-    // dropped: a release where the side never went out, an end of class cancelled where it did
+    pub fn side_end(&self) -> SideEnd; // a handle on this side's end
+    // dropped with no outcome reported: a release where the side never went out, an end of
+    // class cancelled where it did
+}
+impl SideEnd {
+    pub fn reported(&self, outcome: Outcome); // the side ended with this outcome
+    pub fn is_empty(&self) -> bool;           // a report through it reaches nobody
 }
 ```
 
+The value a host keeps with a send is often not where the answer is read: a streamed
+response's guard rides in the response's body, and another task reads the worker's answer. So
+the reader holds a handle, which is cheap to clone and may outlive the side. The side's end is
+said once the side and every handle on it are gone: with the outcome last reported, or with
+none in the words of a dropped side, a release or an end of class cancelled. The side writes
+into a reported outcome its own name, the worker that served and the span from its dispatch to
+the report. A host that asks no handle, and a handle dropped with no report, change nothing.
+Under a document none of whose stages takes an end a handle is empty and costs nothing: no
+allocation and no lock. Under one that does, a side shares its placement with its handles: one
+allocation a side.
+
 A pair's two sides share the pair's one placement behind a lock of that one request. The
-crate keeps the order of a pair's words itself: a prefill side dropped while the decode still
-stands chosen holds its end back until the decode side speaks, and says it then with the
-instant of its own drop.
+crate keeps the order of a pair's words itself: a prefill side that ends while the decode still
+stands chosen holds its end back until the decode side speaks, and says it then as it stood:
+with the outcome reported, or with the instant of its own drop.
 
 A host that keeps sides asks the decode again on the pair's decode side, once the prefill
 side's send was said. It may let the prefill side go before that call or behind it: a

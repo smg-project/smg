@@ -18,7 +18,7 @@ use crate::{
     document::spec::AppliedSpec,
     engine::{framework::SHADOWS, shadow::ShadowCounts},
     stages::Lifecycle,
-    tracking::lease::EventSet,
+    tracking::lease::{EventKind, EventSet},
 };
 
 /// What the engine holds of one policy document: the document, its number,
@@ -106,6 +106,16 @@ impl Deref for Loaded<'_, '_> {
     #[inline(always)]
     fn deref(&self) -> &PolicyEngine {
         self.object
+    }
+}
+
+impl Loaded<'_, '_> {
+    /// Whether a stage of the document takes events of `kind`
+    /// ([`InForce::hears`]): what a host's value for a request asks before
+    /// it keeps anything for a word of that kind.
+    #[inline]
+    pub(crate) fn takes(self, kind: EventKind) -> bool {
+        self.document.hears.contains(kind)
     }
 }
 

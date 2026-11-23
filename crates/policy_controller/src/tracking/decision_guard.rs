@@ -818,6 +818,24 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         matches!(self.owed, Owed::Completion { .. }) && self.decode_chosen()
     }
 
+    /// The span from `side`'s dispatch to `at`, in whole microseconds: what
+    /// an end of class cancelled states of a side given up at `at`
+    /// ([`Self::released`]). Zero for a side whose dispatch was not said,
+    /// and for one whose end was.
+    #[cfg(feature = "in-process")]
+    #[must_use]
+    pub(crate) fn since_sent(&self, side: Side, at: Instant) -> u32 {
+        let owed = match side {
+            Side::Decode if self.decided.pair() => self.decode,
+            _ => self.owed,
+        };
+        if let Owed::Completion { sent, .. } = owed {
+            micros(at.saturating_duration_since(sent))
+        } else {
+            0
+        }
+    }
+
     fn release(&self, owed: Owed, reason: ReleaseReason, now: Instant) -> Owed {
         match owed {
             Owed::Nothing | Owed::Later { .. } => {}

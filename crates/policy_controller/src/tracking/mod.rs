@@ -24,5 +24,5 @@ pub use placement::Encoders;
 #[cfg(feature = "in-process")]
 pub use placement::Placement;
 #[cfg(feature = "in-process")]
-pub use placement_side::PlacementSide;
+pub use placement_side::{PlacementSide, SideEnd};
 pub use prefix_predictor::{DeepestPrefix, PrefixPredictor};
