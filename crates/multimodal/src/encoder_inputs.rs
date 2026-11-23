@@ -247,7 +247,7 @@ impl EncoderInput {
     }
 
     /// Elements in all.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.shape().iter().product()
     }
 
@@ -279,7 +279,7 @@ impl EncoderInput {
     }
 
     /// Bytes per element as stored.
-    pub fn element_size(&self) -> usize {
+    pub(crate) fn element_size(&self) -> usize {
         match self {
             Self::F32(_) => size_of::<f32>(),
             Self::U8 { .. } => size_of::<u8>(),
@@ -349,7 +349,7 @@ impl EncoderInput {
     }
 
     /// The input as normalized `f32`, owned: a move for floats.
-    pub fn into_f32(self) -> ArrayD<f32> {
+    pub(crate) fn into_f32(self) -> ArrayD<f32> {
         match self {
             Self::F32(array) => array,
             other => other.as_f32().into_owned(),
@@ -583,7 +583,7 @@ impl EncoderInput {
 
     /// Stack inputs along the first axis. Bytes stack with bytes of the same
     /// normalization, floats with floats; the two forms do not mix.
-    pub fn concat(parts: &[&Self]) -> AnyhowResult<Self> {
+    pub(crate) fn concat(parts: &[&Self]) -> AnyhowResult<Self> {
         let first = parts.first().context("cannot join zero encoder inputs")?;
         match first {
             Self::Wire { .. } | Self::SharedWire { .. } => {
@@ -1250,7 +1250,7 @@ impl ModelSpecificValue {
 
     /// Stack per-item values along their first dimension. A scalar has no
     /// item dimension: it must be the same in every part and is kept once.
-    pub fn concat_first_dim(parts: &[&Self]) -> AnyhowResult<Self> {
+    pub(crate) fn concat_first_dim(parts: &[&Self]) -> AnyhowResult<Self> {
         let first = parts.first().context("cannot join zero values")?;
         match first {
             Self::Tensor { .. } => {

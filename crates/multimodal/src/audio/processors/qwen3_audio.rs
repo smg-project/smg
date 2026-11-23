@@ -48,7 +48,10 @@ impl Default for Qwen3AudioParams {
 }
 
 impl Qwen3AudioParams {
-    pub fn from_configs(model_config: &Value, preprocessor_config: &PreProcessorConfig) -> Self {
+    pub(crate) fn from_configs(
+        model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+    ) -> Self {
         let mut params = Self::default();
 
         if let Some(value) = preprocessor_config.get_extra::<usize>("sampling_rate") {
@@ -142,7 +145,7 @@ impl Qwen3AudioProcessor {
         Self::with_params(Qwen3AudioParams::default())
     }
 
-    pub fn with_params(params: Qwen3AudioParams) -> Self {
+    pub(crate) fn with_params(params: Qwen3AudioParams) -> Self {
         Self {
             params,
             frontend: OnceLock::new(),

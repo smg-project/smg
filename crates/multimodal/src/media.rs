@@ -5172,7 +5172,7 @@ mod tests;
 
 /// The vision patch factor MiniMax-M3's `max_long_side_pixel` must align to
 /// (patch_size 14 * spatial merge 2).
-pub const MAX_LONG_SIDE_PIXEL_FACTOR: u32 = 28;
+pub(crate) const MAX_LONG_SIDE_PIXEL_FACTOR: u32 = 28;
 
 /// Reject a `max_long_side_pixel` that is zero or not a multiple of the patch
 /// factor, so the value cannot silently round to a different resolution tier.
