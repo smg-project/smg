@@ -298,5 +298,20 @@ mod tests {
             ),
             (1, 2)
         );
+        // Both keep their rows of the ranks below the bound, in order.
+        for kept in [&engine, &rollup] {
+            assert!(kept.iter().map(|row| row.dp_rank).eq([0, 1]));
+        }
+        // The first 64 ranks that leave are remembered: a repeat of the
+        // first or of the 64th leaves uncounted, and each row of a 65th
+        // counts.
+        let mut long: Vec<_> = (64..128)
+            .chain([64, 127, 128, 128])
+            .map(|dp_rank| SchedulerLoadSnapshot {
+                dp_rank,
+                ..Default::default()
+            })
+            .collect();
+        assert_eq!(bound_ranks(&mut long, None, true), 66);
     }
 }
