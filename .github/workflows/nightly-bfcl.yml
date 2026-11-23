@@ -455,14 +455,21 @@ jobs:
           # cache (the script's import canary fails here, not at engine start).
           bash scripts/ci_install_flashinfer_jit_cache.sh
           python -c "import torch, torchcodec, flashinfer, vllm; print('vllm', vllm.__version__)"
-      - name: Install smg wheel + bfcl-eval (+ ninja for vLLM torch.compile, soundfile for bfcl's qwen handler)
+      - name: Install SMG and the official BFCL client
+        env:
+          GPU_VENDOR: ${{ matrix.vendor || 'nvidia' }}
         run: |
           pip uninstall -y smg || true
           pip install wheel/*.whl
-          # bfcl-eval is pinned to the release the green runs used; bump it deliberately.
-          pip install "bfcl-eval==2026.3.23" soundfile ninja
+          if [ "$GPU_VENDOR" = amd ]; then
+            # Preserve the existing ROCm client environment in this repair.
+            pip install "bfcl-eval==2026.3.23" soundfile ninja
+          else
+            pip install ninja
+            bash scripts/bfcl/setup_client_env.sh "$RUNNER_TEMP/bfcl-client-venv"
+          fi
       - name: Register model in bfcl (no-op if bfcl already ships a handler)
-        run: python scripts/bfcl/register_bfcl_model.py --model-id "$MODEL" || true
+        run: '"${BFCL_CLIENT_PYTHON:-python}" scripts/bfcl/register_bfcl_model.py --model-id "$MODEL" || true'
       - name: Stage model weights
         # Skip if pre-staged locally at <cache>/<id> (e.g. blackwell NVMe); else
         # download just this leg's model (not the whole GPU tier, which pulls
@@ -537,7 +544,10 @@ jobs:
           }
           trap cleanup EXIT
           trap 'cleanup; exit 143' INT TERM
-          BFCL="$(command -v bfcl)"
+          if [ "$GPU_VENDOR" != amd ]; then
+            : "${BFCL_EXECUTABLE:?The isolated NVIDIA BFCL client was not prepared}"
+          fi
+          BFCL="${BFCL_EXECUTABLE:-$(command -v bfcl)}"
           ROOT="$RUNNER_TEMP/bfcl_ab"
           # Final comparison: 0 clean, 1 regression (warning only), 2 incomplete.
           # Score regressions are not a merge gate. Per-arm/stop failures are hard;

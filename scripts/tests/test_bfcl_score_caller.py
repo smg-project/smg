@@ -14,7 +14,7 @@ import yaml
 def score_script():
     workflow = Path(__file__).resolve().parents[2] / ".github/workflows/nightly-bfcl.yml"
     jobs = yaml.safe_load(workflow.read_text())["jobs"].values()
-    marker = 'BFCL="$(command -v bfcl)"'
+    marker = "\nBFCL="
     scripts = [
         step["run"]
         for job in jobs
