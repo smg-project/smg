@@ -9539,6 +9539,128 @@ mod tests {
         }
     }
 
+    /// A decode of `router`'s fleet behind the prefill at `prefill_url` that
+    /// answers every request its own 500, with what arrives at its server.
+    async fn refusing_decode(router: &PDRouter, prefill_url: &str) -> (Arc<dyn Worker>, Arrivals) {
+        let (url, arrivals) = refusing_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+        register_fleet(router, Shape::Sequential, prefill_url, &[url.as_str()]);
+        let worker = router.worker_registry.get_by_url(&url);
+        (worker.expect("a registered decode"), arrivals)
+    }
+
+    /// A failed attempt is settled on the decode its request went to. Here
+    /// the decode the selection named stops being ready while the prefill
+    /// runs, and the decode the ask names answers its own 500. That decode
+    /// is the one the request leaves: no other pair is left, so the client
+    /// reads its 500 after one attempt. Settled on the decode the selection
+    /// named, the request would be sent to the decode that failed it once
+    /// more.
+    #[tokio::test]
+    async fn a_moved_decodes_own_500_is_settled_on_the_decode_that_answered() {
+        let prefill_stub =
+            spawn_held_stub(healthy_answer(Shape::Sequential, PdSide::Prefill)).await;
+        let router = quick_retry_router();
+        let _heard = hearing_pairs_on(&router.policy_registry, true);
+        let (first, first_arrivals) = refusing_decode(&router, &prefill_stub.url).await;
+        let (second, second_arrivals) = refusing_decode(&router, &prefill_stub.url).await;
+
+        let first_named = std::cell::Cell::new(false);
+        let meanwhile = async {
+            prefill_stub.reached.notified().await;
+            first_named.set(first.load() == 1);
+            let named = if first_named.get() { &first } else { &second };
+            named.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+            // Every prefill request is let go from here on, a retry's too.
+            loop {
+                prefill_stub.answers.notify_one();
+                prefill_stub.reached.notified().await;
+            }
+        };
+        let response = tokio::select! {
+            response = chat_through(&router, false) => response,
+            () = meanwhile => panic!("the case's steps never end"),
+        };
+
+        let arrived = |arrivals: &Arrivals| arrivals.lock().unwrap().len();
+        let (named, moved_to) = if first_named.get() {
+            (arrived(&first_arrivals), arrived(&second_arrivals))
+        } else {
+            (arrived(&second_arrivals), arrived(&first_arrivals))
+        };
+        assert_eq!(
+            (
+                response.status(),
+                prefill_stub.hits.load(Ordering::SeqCst),
+                named,
+                moved_to
+            ),
+            (StatusCode::INTERNAL_SERVER_ERROR, 1, 0, 1),
+            "the answer, the prefill's requests, the requests at the decode the selection named \
+             and at the decode the request moved to"
+        );
+    }
+
+    /// A retry's decode is asked again under the retry's own rule: a worker
+    /// that answered the request its own 500 takes no further attempt of
+    /// it, behind the prefill as at the selection. Here the first attempt's
+    /// decode answers its own 500, and the decode the retry names stops
+    /// being ready while the retry's prefill runs. The ask finds nobody it
+    /// may name, so the retry's decode stands and is sent the request.
+    #[tokio::test]
+    async fn a_retrys_decode_is_asked_again_under_the_retrys_rule() {
+        let prefill_stub =
+            spawn_held_stub(healthy_answer(Shape::Sequential, PdSide::Prefill)).await;
+        let router = quick_retry_router();
+        let _heard = hearing_pairs_on(&router.policy_registry, true);
+        let (first, first_arrivals) = refusing_decode(&router, &prefill_stub.url).await;
+        let (second, second_arrivals) = refusing_decode(&router, &prefill_stub.url).await;
+
+        let first_retried = std::cell::Cell::new(false);
+        let meanwhile = async {
+            // The first attempt goes to the decode its own ask names, either
+            // of the two.
+            prefill_stub.reached.notified().await;
+            prefill_stub.answers.notify_one();
+            // The retry names the other decode, the one counted now, which
+            // stops being ready while the retry's prefill runs.
+            prefill_stub.reached.notified().await;
+            first_retried.set(first.load() == 1);
+            let (answered, retried) = if first_retried.get() {
+                (&second, &first)
+            } else {
+                (&first, &second)
+            };
+            assert_eq!((answered.load(), retried.load()), (0, 1));
+            retried.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+            loop {
+                prefill_stub.answers.notify_one();
+                prefill_stub.reached.notified().await;
+            }
+        };
+        let response = tokio::select! {
+            response = chat_through(&router, false) => response,
+            () = meanwhile => panic!("the case's steps never end"),
+        };
+
+        let arrived = |arrivals: &Arrivals| arrivals.lock().unwrap().len();
+        let (answered, retried) = if first_retried.get() {
+            (arrived(&second_arrivals), arrived(&first_arrivals))
+        } else {
+            (arrived(&first_arrivals), arrived(&second_arrivals))
+        };
+        assert_eq!(
+            (
+                response.status(),
+                prefill_stub.hits.load(Ordering::SeqCst),
+                answered,
+                retried
+            ),
+            (StatusCode::INTERNAL_SERVER_ERROR, 2, 1, 1),
+            "the answer, the prefill's requests, the requests at the decode that answered the \
+             first attempt and at the decode the retry named"
+        );
+    }
+
     /// A decode policy with a favourite: the worker at that address whenever
     /// it is among the candidates, as a policy that holds a session or a
     /// cached prefix picks one worker for one request at every attempt.
