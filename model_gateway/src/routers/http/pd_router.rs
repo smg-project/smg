@@ -10217,4 +10217,6 @@ mod tests {
         drop(setup);
         assert_eq!((prefill.load(), decode.load()), (0, 0));
     }
+
+    mod policy_engine;
 }
