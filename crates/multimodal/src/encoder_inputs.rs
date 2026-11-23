@@ -507,13 +507,9 @@ impl EncoderInput {
         self.view().write_as(dtype)
     }
 
-    /// [`EncoderInputView::write_into`] for the whole input.
-    pub fn write_into(&self, dtype: EncoderDtype, out: &mut [u8]) -> Result<(), String> {
-        self.view().write_into(dtype, out)
-    }
-
     /// Rows `[start, start + len)` along the first axis, as an owned input.
-    pub fn slice_axis0(&self, start: usize, len: usize) -> AnyhowResult<Self> {
+    #[cfg(test)]
+    pub(crate) fn slice_axis0(&self, start: usize, len: usize) -> AnyhowResult<Self> {
         Ok(self.view().slice_axis0(start, len)?.to_owned())
     }
 
@@ -1195,15 +1191,6 @@ pub enum ModelSpecificValue {
 }
 
 impl ModelSpecificValue {
-    /// Create a 1D uint tensor from a vector.
-    pub fn uint_1d(data: Vec<u32>) -> Self {
-        let len = data.len();
-        Self::UintTensor {
-            data,
-            shape: vec![len],
-        }
-    }
-
     /// Create a 1D int tensor from a vector.
     pub fn int_1d(data: Vec<i64>) -> Self {
         let len = data.len();
@@ -1739,7 +1726,10 @@ mod tests {
         )
         .with_extra(
             "image_grid_thw",
-            ModelSpecificValue::uint_1d(vec![1, 16, 16]),
+            ModelSpecificValue::UintTensor {
+                data: vec![1, 16, 16],
+                shape: vec![3],
+            },
         )
         .with_extra("aspect_ratio_id", ModelSpecificValue::Int(0));
 
@@ -1749,11 +1739,6 @@ mod tests {
 
     #[test]
     fn model_specific_value_tensor_constructors_set_shapes() {
-        assert!(matches!(
-            ModelSpecificValue::uint_1d(vec![1, 2, 3]),
-            ModelSpecificValue::UintTensor { data, shape }
-                if data == vec![1, 2, 3] && shape == vec![3]
-        ));
         assert!(matches!(
             ModelSpecificValue::int_1d(vec![1, 2, 3]),
             ModelSpecificValue::IntTensor { data, shape }
@@ -2230,6 +2215,7 @@ mod tests {
             } else {
                 // a narrower wire cannot be widened into the reference's float32: nothing is written
                 assert!(wire
+                    .view()
                     .write_into(EncoderDtype::Float32, &mut vec![0u8; 72 * 4])
                     .is_err());
                 assert!(wire.write_as(EncoderDtype::Float32).is_empty());
