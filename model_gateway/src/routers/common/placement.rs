@@ -792,6 +792,7 @@ impl ByEngine {
             &pairs,
             wire,
             None,
+            None,
             inputs,
             self.stated,
             |request| side.decode_again(request),
@@ -2212,10 +2213,15 @@ impl PairAdmission for PairGates<'_> {
 ///
 /// What `inputs` and `stated` state of the request is handed as the engine
 /// reads it ([`place_request`]), the route's own rule among it, which the
-/// engine asks of the workers it picked. Three things are the pair's own:
+/// engine asks of the workers it picked. Four things are the pair's own:
 ///
 /// - A retry pinned to its retained plan's wire is held to the places of
 ///   each pool on that wire. The lists stay the pools' own.
+/// - A pair asked again behind a call that answered no worker, where the
+///   route's rule takes a pair that can be sent to, is held to the places
+///   of the workers `held_to` takes too, that rule ([`pair_by_engine`]). A
+///   first ask states none, and neither does a decode asked again: its
+///   route's rule claims the decode it is asked of.
 /// - The retry number is stated as half the engines the request tried,
 ///   rounded up: a pair's failed attempt names both its engines.
 /// - The request states that its decode may be asked again behind its
@@ -2232,22 +2238,26 @@ fn with_pair_request<R>(
     model_id: &str,
     pairs: &PdPairIndex,
     wire: Option<WireConstraint>,
+    held_to: Option<CandidateFilter<'_>>,
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
     stated: Stated,
     ask: impl FnOnce(&PlaceRequest<'_>) -> R,
 ) -> R {
     let [prefill, decode] = pairs.lent();
-    let on_wire = |pool: &[Arc<dyn Worker>]| -> Option<Vec<u32>> {
-        wire.is_some().then(|| {
+    let held = |pool: &[Arc<dyn Worker>]| -> Option<Vec<u32>> {
+        (wire.is_some() || held_to.is_some()).then(|| {
             (0u32..)
                 .zip(pool)
-                .filter(|(_, worker)| WireConstraint::admits(wire, worker.as_ref()))
+                .filter(|(_, worker)| {
+                    WireConstraint::admits(wire, worker.as_ref())
+                        && held_to.is_none_or(|takes| takes(worker.as_ref()))
+                })
                 .map(|(place, _)| place)
                 .collect()
         })
     };
-    let (prefill_places, decode_places) = (on_wire(prefill.workers), on_wire(decode.workers));
+    let (prefill_places, decode_places) = (held(prefill.workers), held(decode.workers));
     let gates = PairGates {
         prefills: prefill.workers,
         decodes: decode.workers,
@@ -2282,8 +2292,10 @@ fn with_pair_request<R>(
 
 /// [`select_pair`] where the gateway started the policy engine, out of
 /// line: the engine places the pair with one call, over the request
-/// [`with_pair_request`] states. Its document picks both sides: no classic
-/// policy runs, and the load default of the classic pass pairs nobody here.
+/// [`with_pair_request`] states, and with one more, held to the route's
+/// rule, where the first answers no worker and the rule takes a pair that
+/// can be sent to. Its document picks both sides: no classic policy runs,
+/// and the load default of the classic pass pairs nobody here.
 ///
 /// Prefills all at the request's admission limit answer
 /// [`PlacementFailure::PrefillAtCapacity`], on which the route waits for a
@@ -2320,26 +2332,63 @@ fn pair_by_engine(
     let stated = stated();
     let fail =
         |role: WorkerRole, verdict: PlacementFailure| Box::new(PairFailure { role, verdict });
-    let placed = with_pair_request(
-        engine,
-        registry,
-        policies,
-        model_id,
-        pairs,
-        wire,
-        prefill_capacity,
-        inputs,
-        stated,
-        |request| {
-            engine.place(request).map(|placement| {
-                let labels = (
-                    placement.profile,
-                    placement.decode_profile.unwrap_or(placement.profile),
-                );
-                (labels, PlacedPair::by_engine(placement, stated))
-            })
-        },
-    );
+    let admitted = |worker: &Arc<dyn Worker>| {
+        WireConstraint::admits(wire, worker.as_ref())
+            && inputs
+                .candidate_filter
+                .is_none_or(|accepts| accepts(worker.as_ref()))
+    };
+    let place = |held_to: Option<CandidateFilter<'_>>| {
+        with_pair_request(
+            engine,
+            registry,
+            policies,
+            model_id,
+            pairs,
+            wire,
+            held_to,
+            prefill_capacity,
+            inputs,
+            stated,
+            |request| {
+                engine.place(request).map(|placement| {
+                    let labels = (
+                        placement.profile,
+                        placement.decode_profile.unwrap_or(placement.profile),
+                    );
+                    (labels, PlacedPair::by_engine(placement, stated))
+                })
+            },
+        )
+    };
+    // The engine asks a pair's rule of its picks alone, a few a decision,
+    // which miss the workers a rule takes of a long pool: the pair is then
+    // decided once more among the workers the rule takes now, where it
+    // takes a prefill and a decode that prefill pairs with, each open but
+    // for the overload veto, which the engine lifts itself. Prefills of one
+    // descriptor share one partner list: the rule is asked of a list once.
+    let takes_a_pair = || {
+        let takes = |worker: &Arc<dyn Worker>| {
+            worker.routing_state().eligible_ignoring_overload() && admitted(worker)
+        };
+        let mut refused: Vec<&Arc<[Arc<dyn Worker>]>> = Vec::new();
+        for (prefill, partners) in pairs.prefill.iter().zip(&pairs.partners) {
+            if refused.iter().any(|&list| Arc::ptr_eq(list, partners)) || !takes(prefill) {
+                continue;
+            }
+            if partners.iter().any(takes) {
+                return true;
+            }
+            refused.push(partners);
+        }
+        false
+    };
+    let placed = match place(None) {
+        Err(Unplaced::NoWorkers) if inputs.candidate_filter.is_some() && takes_a_pair() => {
+            place(inputs.candidate_filter)
+        }
+        placed => placed,
+    };
     let (labels, pair) = match placed {
         Ok(placed) => placed,
         Err(Unplaced::PrefillsFull) => {
@@ -2350,12 +2399,6 @@ fn pair_by_engine(
         }
         Err(unplaced) => {
             report_unplaced(model_id, &unplaced, "The policy engine placed no pair");
-            let admitted = |worker: &Arc<dyn Worker>| {
-                WireConstraint::admits(wire, worker.as_ref())
-                    && inputs
-                        .candidate_filter
-                        .is_none_or(|accepts| accepts(worker.as_ref()))
-            };
             let open =
                 |pool: &[Arc<dyn Worker>]| pool.iter().any(|w| admitted(w) && w.is_available());
             let (role, pool) = if open(&pairs.prefill) {
@@ -2876,7 +2919,13 @@ pub(crate) mod tests {
             hash_ring::HashRing, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
             LeastLoadPolicy, PowerOfTwoPolicy, RoundRobinPolicy,
         },
-        routers::{common::pair_index::PdWire, grpc::backend_client::BasicWorkerBuilder},
+        routers::{
+            common::{
+                pair_index::PdWire,
+                prefill_admission::{PrefillAdmission, PrefillAdmissionAttempt},
+            },
+            grpc::backend_client::BasicWorkerBuilder,
+        },
     };
 
     pub(crate) const MODEL: &str = "m";
@@ -7803,6 +7852,75 @@ pub(crate) mod tests {
             unpinned.iter().all(|(_, decode)| decode != "grpc://d:2"),
             "{unpinned:?}"
         );
+    }
+
+    /// A route's rule that takes one worker of each pool finds that pair.
+    /// The engine's call names twelve pairs at most, four a decision: where
+    /// none of them holds the rule's two workers, the pair is decided once
+    /// more among the workers the rule takes. That ask answers as a first
+    /// one does: with the rule's prefill at its admission limit the request
+    /// waits for a slot. A rule whose decode is not ready takes no second
+    /// ask: the first answer stands.
+    #[test]
+    fn the_engines_pair_finds_the_one_decode_its_routes_rule_takes() {
+        let grpc = ConnectionMode::Grpc;
+        let side = |name: &str| -> Vec<String> {
+            (0..13).map(|at| format!("grpc://{name}:{at}")).collect()
+        };
+        let (prefills, decodes) = (side("p"), side("d"));
+        let mut workers: Vec<_> = prefills
+            .iter()
+            .map(|url| (url.as_str(), WorkerType::Prefill, grpc, RuntimeType::Sglang))
+            .collect();
+        workers.extend(
+            decodes
+                .iter()
+                .map(|url| (url.as_str(), WorkerType::Decode, grpc, RuntimeType::Sglang)),
+        );
+        let registry = registry_of(&workers);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let document = PolicySpec::pair_presets("passthrough", "passthrough");
+        let spec = AppliedSpec::validate(&document.expect("the pair presets"));
+        engine_on(&policies, spec.expect("a valid document"));
+        let pairs = pairs_of(&registry, &policies);
+        let (prefill, decode) = (&pairs.prefill[12], &pairs.decode_pool[12]);
+        let takes = |worker: &dyn Worker| [prefill.url(), decode.url()].contains(&worker.url());
+        let inputs = PlacementInputs {
+            candidate_filter: Some(&takes),
+            ..Default::default()
+        };
+        let pick = |limit: Option<&PrefillSelectionContext<'_>>| {
+            select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                limit,
+                inputs,
+                Stated::nothing,
+            )
+        };
+        let placed = pick(None).ok().map(|pair| pair.decode.url().to_owned());
+        assert_eq!(placed.as_deref(), Some(decode.url()));
+
+        let admission = PrefillAdmission::new(1, 0, Duration::ZERO);
+        let runtime = tokio::runtime::Builder::new_current_thread().build();
+        let runtime = runtime.expect("a runtime");
+        // Which side refused the request, and whether it waits for a slot.
+        let refused = || {
+            let mut failure = None;
+            let asked = admission.admit(None, |limit: &PrefillSelectionContext<'_>| {
+                failure = pick(Some(limit)).err();
+                PrefillAdmissionAttempt::<()>::Unavailable
+            });
+            assert!(runtime.block_on(asked).is_err());
+            failure.map(|failure| (failure.role, failure.is_at_capacity()))
+        };
+        prefill.increment_load();
+        assert_eq!(refused(), Some((WorkerRole::Prefill, true)));
+        decode.set_status(WorkerStatus::NotReady);
+        assert_eq!(refused(), Some((WorkerRole::Decode, false)));
     }
 
     /// A guard sent on another answer than the one it was made ahead of
