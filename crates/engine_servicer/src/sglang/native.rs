@@ -209,13 +209,6 @@ impl ManagedNativeRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_abort_grace(self, grace: Duration) -> Self {
-        self.abort_grace_ms
-            .store(grace.as_millis() as u64, Ordering::Release);
-        self
-    }
-
-    #[cfg(test)]
     pub(crate) fn set_abort_grace(&self, grace: Duration) {
         self.abort_grace_ms
             .store(grace.as_millis() as u64, Ordering::Release);
@@ -488,8 +481,6 @@ async fn run_native(
     };
     let rid = native.request_id().to_owned();
     let rank = native.engine_index().unwrap_or(0);
-    // D must retain its receive buffers until native output proves the PD handoff finished.
-    let mut waiting_for_decode = external.is_none();
     let mut aborting = false;
     let mut abort_until = Instant::now();
     let mut layout_sent = false;
@@ -522,9 +513,9 @@ async fn run_native(
             }
             aborting = true;
             abort_until = Instant::now() + abort_grace;
-            if !waiting_for_decode {
-                send_abort(&client);
-            }
+            // SGLang's decode transfer/prealloc queues handle AbortReq with drain-ack accounting,
+            // so withholding AbortReq on D deadlocks D behind an already-aborted P.
+            send_abort(&client);
         }
         let sleep_duration = if aborting {
             Some(abort_until.saturating_duration_since(Instant::now()))
@@ -546,14 +537,7 @@ async fn run_native(
                         Status::unavailable("native cancellation unconfirmed; worker quarantined"),
                     );
                     drop(output);
-                    while let Some(item) = native.next().await {
-                        if waiting_for_decode && item.is_ok() {
-                            waiting_for_decode = false;
-                            if !native.native_terminal_received() {
-                                send_abort(&client);
-                            }
-                        }
-                    }
+                    while native.next().await.is_some() {}
                     return (native.native_terminal_received(), true);
                 }
             }
@@ -586,12 +570,6 @@ async fn run_native(
             }
             item = native.next(), if !native_finished => {
                 let safe = native.native_terminal_received();
-                if waiting_for_decode && matches!(&item, Some(Ok(_))) {
-                    waiting_for_decode = false;
-                    if aborting && !safe {
-                        send_abort(&client);
-                    }
-                }
                 match item {
                     Some(Ok(response)) if !aborting => {
                         let event = native.to_sglang_response(&rid, response);
@@ -613,9 +591,7 @@ async fn run_native(
                         if !aborting {
                             aborting = true;
                             abort_until = Instant::now() + abort_grace;
-                            if !waiting_for_decode {
-                                send_abort(&client);
-                            }
+                            send_abort(&client);
                         }
                     }
                     None if safe && needs_layout && !layout_sent && !aborting => {

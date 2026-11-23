@@ -2,11 +2,13 @@
 
 import asyncio
 import gc
+import json
 import struct
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from http import HTTPStatus
 from types import SimpleNamespace
 
 import pytest
@@ -88,25 +90,49 @@ async def test_run_uninterruptible_retains_owner_across_repeated_cancel():
         assert finished == [True]
 
 
+class _FakeEncoder:
+    transfer_backend = "mooncake"
+    _embedding_dims = {}
+    _element_size = 2
+
+    def __init__(self, calls=None, fail_release=None, hang_abandon=False):
+        self.calls = calls if calls is not None else []
+        self.fail_release = fail_release or [False]
+        self.hang_abandon = hang_abandon
+
+    async def abandon_request(self, rid):
+        self.calls.append(("abandon", rid))
+        if self.hang_abandon:
+            await asyncio.sleep(10)
+
+    async def release_request(self, rid):
+        self.calls.append(("release", rid))
+        if self.fail_release[0]:
+            raise RuntimeError("release failed")
+
+    def clear_abandoned_request(self, rid):
+        self.calls.append(("clear", rid))
+
+
+def _ipc_sockets(tmp_path):
+    zmq = pytest.importorskip("zmq")
+    zmq_asyncio = pytest.importorskip("zmq.asyncio")
+    cmd_ep = f"ipc://{tmp_path}/cmd.sock"
+    evt_ep = f"ipc://{tmp_path}/evt.sock"
+    ctx = zmq_asyncio.Context()
+    push, pull = ctx.socket(zmq.PUSH), ctx.socket(zmq.PULL)
+    push.setsockopt(zmq.LINGER, 0)
+    pull.setsockopt(zmq.LINGER, 0)
+    push.bind(cmd_ep)
+    pull.bind(evt_ep)
+    return ctx, push, pull, cmd_ep, evt_ep
+
+
 @pytest.mark.asyncio
 async def test_native_encoder_early_facade_and_release_barrier(monkeypatch):
     """Early facade waits for execute, enforces host fence, and release waits for active sends."""
     release_send, send_started = asyncio.Event(), asyncio.Event()
     calls, fail_release = [], [True]
-
-    class FakeEncoder:
-        transfer_backend = "mooncake"
-
-        async def abandon_request(self, rid):
-            calls.append(("abandon", rid))
-
-        async def release_request(self, rid):
-            calls.append(("release", rid))
-            if fail_release[0]:
-                raise RuntimeError("release failed")
-
-        def clear_abandoned_request(self, rid):
-            calls.append(("clear", rid))
 
     async def fake_send(encoder, req, *, release_without_count):
         send_started.set()
@@ -128,7 +154,9 @@ async def test_native_encoder_early_facade_and_release_barrier(monkeypatch):
     ]:
         monkeypatch.setitem(sys.modules, name, mod)
 
-    backend = SimpleNamespace(encoder=FakeEncoder(), scheduler=SimpleNamespace())
+    backend = SimpleNamespace(
+        encoder=_FakeEncoder(calls, fail_release), scheduler=SimpleNamespace()
+    )
     owner = epd_encoder.NativeEncoder({"max_receivers": 4}, backend)
 
     # Early facade waits for entry registration.
@@ -183,31 +211,8 @@ async def test_native_encoder_early_facade_and_release_barrier(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_serve_native_ipc_roundtrip_and_clean_shutdown(tmp_path):
-    zmq = pytest.importorskip("zmq")
-    zmq_asyncio = pytest.importorskip("zmq.asyncio")
-
-    cmd_ep = f"ipc://{tmp_path}/cmd.sock"
-    evt_ep = f"ipc://{tmp_path}/evt.sock"
-    ctx = zmq_asyncio.Context()
-    push, pull = ctx.socket(zmq.PUSH), ctx.socket(zmq.PULL)
-    push.setsockopt(zmq.LINGER, 0)
-    pull.setsockopt(zmq.LINGER, 0)
-    push.bind(cmd_ep)
-    pull.bind(evt_ep)
-
-    class FakeEncoder:
-        transfer_backend = "mooncake"
-
-        async def abandon_request(self, rid):
-            pass
-
-        async def release_request(self, rid):
-            pass
-
-        def clear_abandoned_request(self, rid):
-            pass
-
-    backend = SimpleNamespace(encoder=FakeEncoder(), scheduler=SimpleNamespace())
+    ctx, push, pull, cmd_ep, evt_ep = _ipc_sockets(tmp_path)
+    backend = SimpleNamespace(encoder=_FakeEncoder(), scheduler=SimpleNamespace())
     cfg = {
         "native_commands": cmd_ep,
         "native_events": evt_ep,
@@ -216,17 +221,20 @@ async def test_serve_native_ipc_roundtrip_and_clean_shutdown(tmp_path):
         "max_receivers": 2,
     }
     task = asyncio.create_task(epd_encoder.serve_native(cfg, backend))
-    ready = await asyncio.wait_for(pull.recv_json(), timeout=2)
-    assert ready == {"ready": True}
-    await push.send_json({"sequence": 1, "operation": "cancel", "rid": "missing"})
-    reply = await asyncio.wait_for(pull.recv_json(), timeout=2)
-    assert reply == {"sequence": 1, "result": None}
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    push.close()
-    pull.close()
-    ctx.term()
+    try:
+        assert await asyncio.wait_for(pull.recv_json(), timeout=2) == {"ready": True}
+        await push.send_json({"sequence": 1, "operation": "cancel", "rid": "missing"})
+        assert await asyncio.wait_for(pull.recv_json(), timeout=2) == {
+            "sequence": 1,
+            "result": None,
+        }
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        push.close()
+        pull.close()
+        ctx.term()
 
 
 def test_launcher_complete_and_window_validation():
@@ -359,18 +367,6 @@ async def test_native_encoder_forget_and_unknown_cancel_wake_waiters():
     assert "r-forget" in owner.abandoned
 
     # Re-executing a previously forgotten rid must clear the abandoned tombstone.
-    class FakeEncoder:
-        transfer_backend = "mooncake"
-
-        async def abandon_request(self, rid):
-            pass
-
-        async def release_request(self, rid):
-            pass
-
-        def clear_abandoned_request(self, rid):
-            pass
-
     monkeypatch = pytest.MonkeyPatch()
     try:
         server_mod = SimpleNamespace(
@@ -391,7 +387,7 @@ async def test_native_encoder_forget_and_unknown_cancel_wake_waiters():
             ),
         ]:
             monkeypatch.setitem(sys.modules, name, mod)
-        owner.backend.encoder = FakeEncoder()
+        owner.backend.encoder = _FakeEncoder()
         receipt = await owner.execute(
             {
                 "rid": "r-forget",
@@ -475,44 +471,37 @@ async def test_http_facade_body_limit_independent_of_max_control_bytes(monkeypat
     resp = await captured["handler"](OversizedRequest())
     assert resp.status == 413
 
+    assert epd_encoder._HTTP_STATUS
+    for code in epd_encoder._HTTP_STATUS.values():
+        assert isinstance(code, HTTPStatus)
+        assert int(code) != 499
+        assert HTTPStatus(int(code)) == code
+
+    owner.forget("cancelled-rid")
+
+    class CancelledRequest:
+        match_info = {"route": "metadata"}
+
+        async def read(self):
+            return json.dumps({"req_id": "cancelled-rid", "part_idx": 0}).encode()
+
+    cancelled_resp = await captured["handler"](CancelledRequest())
+    assert cancelled_resp.status == 404
+
 
 @pytest.mark.asyncio
 async def test_serve_native_bounded_shutdown_on_hung_task(tmp_path, monkeypatch):
-    zmq = pytest.importorskip("zmq")
-    zmq_asyncio = pytest.importorskip("zmq.asyncio")
-
-    cmd_ep = f"ipc://{tmp_path}/cmd.sock"
-    evt_ep = f"ipc://{tmp_path}/evt.sock"
-    ctx = zmq_asyncio.Context()
-    push, pull = ctx.socket(zmq.PUSH), ctx.socket(zmq.PULL)
-    push.setsockopt(zmq.LINGER, 0)
-    pull.setsockopt(zmq.LINGER, 0)
-    push.bind(cmd_ep)
-    pull.bind(evt_ep)
+    ctx, push, pull, cmd_ep, evt_ep = _ipc_sockets(tmp_path)
 
     async def hung_execute(request, owner_cancel=None):
         await asyncio.sleep(10)
-
-    class FakeEncoder:
-        transfer_backend = "mooncake"
-        _embedding_dims = {}
-        _element_size = 2
-
-        async def abandon_request(self, rid):
-            await asyncio.sleep(10)
-
-        async def release_request(self, rid):
-            pass
-
-        def clear_abandoned_request(self, rid):
-            pass
 
     monkeypatch.setattr(
         epd_encoder.NativeEncoder,
         "execute",
         lambda self, cmd, art: hung_execute(cmd),
     )
-    backend = SimpleNamespace(encoder=FakeEncoder(), scheduler=SimpleNamespace())
+    backend = SimpleNamespace(encoder=_FakeEncoder(hang_abandon=True), scheduler=SimpleNamespace())
     cfg = {
         "native_commands": cmd_ep,
         "native_events": evt_ep,

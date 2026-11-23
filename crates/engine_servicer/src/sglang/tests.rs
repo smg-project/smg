@@ -1564,10 +1564,10 @@ fn prepared_native_labels_follow_the_engine_capability() {
     }
 }
 
-/// A silent D closes its observer after cancellation grace, quarantines health and text
-/// admission, and only sends native Abort after first output proves handoff progressed.
+/// Cancelling a silent D immediately forwards native Abort, quarantines health and text
+/// admission once abort grace expires without a terminal receipt, and recovers when it arrives.
 #[tokio::test]
-async fn prepared_decode_cancel_grace_quarantines_and_defers_abort_until_first_output() {
+async fn prepared_decode_cancel_sends_abort_and_quarantines_silent_scheduler() {
     let Harness {
         server,
         mut engine_in,
@@ -1599,6 +1599,7 @@ async fn prepared_decode_cancel_grace_quarantines_and_defers_abort_until_first_o
         server.state.shared.registry.abort(&[rid.into()]).unwrap(),
         1
     );
+    assert_eq!(recv_abort(&mut engine_in).bounded().await, vec![rid]);
     let verdict = tokio::time::timeout(Duration::from_secs(2), output.next())
         .await
         .unwrap()
@@ -1621,9 +1622,7 @@ async fn prepared_decode_cancel_grace_quarantines_and_defers_abort_until_first_o
     assert_eq!(blocked.code(), Code::Unavailable);
     assert!(blocked.message().contains("unhealthy"));
     assert_scheduler_idle(&mut engine_in).await;
-    // First native output proves handoff progressed; only now may D send Abort.
-    send(&mut engine_out, &batch(rid, vec![7], 1, None, None)).await;
-    assert_eq!(recv_abort(&mut engine_in).bounded().await, vec![rid]);
+    // Once the late native terminal confirms RDMA/buffer release, temporary quarantine clears.
     send(
         &mut engine_out,
         &batch(rid, vec![8], 2, Some("abort"), None),
@@ -1658,8 +1657,6 @@ async fn prepared_decode_cancel_grace_quarantines_and_defers_abort_until_first_o
 /// and buffered (`stream=false`) generations continue past the handoff deadline until completion.
 #[tokio::test]
 async fn prepared_decode_continues_streaming_past_handoff_deadline_after_first_output() {
-    use smg_grpc_client::sglang_managed::Limits;
-    let config = managed_test_config("decode");
     let Harness {
         server,
         mut engine_in,
@@ -1667,15 +1664,7 @@ async fn prepared_decode_continues_streaming_past_handoff_deadline_after_first_o
         _dir,
         ..
     } = managed_harness("decode").await;
-    let client_engine = server.state.shared.engine().unwrap().clone();
-    let runtime = Arc::new(
-        ManagedNativeRuntime::new(
-            Arc::new(move || Some(client_engine.clone())),
-            &config,
-            Limits::default(),
-        )
-        .unwrap(),
-    );
+    let runtime = Arc::clone(server.state.prepared.get().unwrap());
     // 1. Streaming decode continues past the preparation deadline.
     let rid = "long-prepared-decode";
     let binding = prepared_binding("p-long", rid);
@@ -1778,8 +1767,6 @@ async fn prepared_decode_continues_streaming_past_handoff_deadline_after_first_o
 /// (or cancels), rather than dropping the error and closing the stream with a silent EOF.
 #[tokio::test]
 async fn prepared_decode_retains_terminal_error_until_slow_reader_drains_full_queue() {
-    use smg_grpc_client::sglang_managed::Limits;
-    let config = managed_test_config("decode");
     let Harness {
         server,
         mut engine_in,
@@ -1787,15 +1774,7 @@ async fn prepared_decode_retains_terminal_error_until_slow_reader_drains_full_qu
         _dir,
         ..
     } = managed_harness("decode").await;
-    let client_engine = server.state.shared.engine().unwrap().clone();
-    let runtime = Arc::new(
-        ManagedNativeRuntime::new(
-            Arc::new(move || Some(client_engine.clone())),
-            &config,
-            Limits::default(),
-        )
-        .unwrap(),
-    );
+    let runtime = Arc::clone(server.state.prepared.get().unwrap());
     let rid = "slow-reader-error-decode";
     let binding = prepared_binding("p-err", rid);
     let (registration, cancellation) = server.state.shared.registry.register(rid).unwrap();
@@ -1859,23 +1838,13 @@ async fn prepared_decode_retains_terminal_error_until_slow_reader_drains_full_qu
 /// sending native `Add` to the scheduler, while still leaving post-submit D decoding unbounded.
 #[tokio::test]
 async fn prepared_decode_rejects_expired_admission_before_submit() {
-    use smg_grpc_client::sglang_managed::Limits;
-    let config = managed_test_config("decode");
     let Harness {
         server,
         mut engine_in,
         _dir,
         ..
     } = managed_harness("decode").await;
-    let client_engine = server.state.shared.engine().unwrap().clone();
-    let runtime = Arc::new(
-        ManagedNativeRuntime::new(
-            Arc::new(move || Some(client_engine.clone())),
-            &config,
-            Limits::default(),
-        )
-        .unwrap(),
-    );
+    let runtime = Arc::clone(server.state.prepared.get().unwrap());
     let rid = "expired-prepared-decode";
     let (registration, cancellation) = server.state.shared.registry.register(rid).unwrap();
     let mut output = runtime
@@ -1907,8 +1876,6 @@ async fn prepared_decode_rejects_expired_admission_before_submit() {
 /// error must still be delivered to the caller after the 8 buffered chunks drain.
 #[tokio::test]
 async fn prepared_full_queue_delivers_quarantine_error_after_buffered_chunks() {
-    use smg_grpc_client::sglang_managed::Limits;
-    let config = managed_test_config("decode");
     let Harness {
         server,
         mut engine_in,
@@ -1916,16 +1883,8 @@ async fn prepared_full_queue_delivers_quarantine_error_after_buffered_chunks() {
         _dir,
         ..
     } = managed_harness("decode").await;
-    let client_engine = server.state.shared.engine().unwrap().clone();
-    let runtime = Arc::new(
-        ManagedNativeRuntime::new(
-            Arc::new(move || Some(client_engine.clone())),
-            &config,
-            Limits::default(),
-        )
-        .unwrap()
-        .with_abort_grace(Duration::from_millis(100)),
-    );
+    let runtime = Arc::clone(server.state.prepared.get().unwrap());
+    runtime.set_abort_grace(Duration::from_millis(100));
     let rid = "full-queue-quarantine-err";
     let (registration, cancellation) = server.state.shared.registry.register(rid).unwrap();
     let mut output = runtime

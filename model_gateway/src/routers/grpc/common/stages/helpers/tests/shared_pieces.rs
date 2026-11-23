@@ -158,14 +158,26 @@ async fn epd_finishing_stamps_native_pd_bootstrap() {
         });
         if prepared_media {
             ctx.input.request_type = RequestType::Chat(Arc::new(
-            serde_json::from_value(serde_json::json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}}
-                ]}]
-            }))
-            .expect("image request"),
-        ));
+                serde_json::from_value(serde_json::json!({
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://example.test/image.png",
+                                "max_long_side_pixel": 504
+                            }
+                        }
+                    ]}]
+                }))
+                .expect("image request"),
+            ));
+            ctx.state.multimodal_refs = Some(MediaPlan::new([MediaContentPart::ImageUrl {
+                url: "https://example.test/image.png".to_string().into(),
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: Some(504),
+            }]));
             ctx.state.encode_outputs = Some(EncodeOutputs::PreparedInput(Box::new(
                 prepare(&ctx).expect("prepare").expect("media plan"),
             )));
@@ -175,6 +187,9 @@ async fn epd_finishing_stamps_native_pd_bootstrap() {
         let ProtoGenerateRequest::Sglang(request) = request else {
             panic!("expected a SGLang native request")
         };
+        assert!(request.mm_inputs.is_none());
+        assert!(ctx.state.multimodal_refs.is_none());
+        assert_eq!(ctx.state.media_refs_forwarded, prepared_media);
         let bootstrap = request
             .disaggregated_params
             .expect("native PD requires a room");

@@ -21,17 +21,18 @@ use std::{
 
 use bytes::Bytes;
 use engine_servicer::{
-    sglang::encoder::EncoderServer, BoxFuture, EncodeDispatchErrorSink, EncodeDispatchOutcome,
-    EncodeDispatchRequest, EncodeFuture, EncodeMediaRefs, EncodeRelease, EncodeTransport,
-    EncoderDispatchErrorReq, MediaError, MediaFeatures, MediaProcessor, MediaRequest,
-    ProcessedMedia, ServicerConfig, ServicerError, SglangEncodeDispatcher, SglangMediaProcessor,
-    SglangModelInfo, SglangServicerConfig, SglangServicerServer, TokenSpeedModelInfo,
-    TokenSpeedServicerConfig, TokenSpeedServicerServer, TrtllmModelInfo, TrtllmServicerConfig,
-    TrtllmServicerServer, VllmModelInfo, VllmServicerConfig, VllmServicerServer, ALL_MODALITIES,
-    DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC, DEFAULT_ENGINE_SILENCE_TIMEOUT,
-    DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT, PIXEL_MODALITIES,
+    sglang::encoder::{EncoderMediaItem, EncoderServer},
+    BoxFuture, EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
+    EncodeMediaRefs, EncodeRelease, EncodeTransport, EncoderDispatchErrorReq, MediaError,
+    MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia, ServicerConfig, ServicerError,
+    SglangEncodeDispatcher, SglangMediaProcessor, SglangModelInfo, SglangServicerConfig,
+    SglangServicerServer, TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer,
+    TrtllmModelInfo, TrtllmServicerConfig, TrtllmServicerServer, VllmModelInfo, VllmServicerConfig,
+    VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC,
+    DEFAULT_ENGINE_SILENCE_TIMEOUT, DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT,
+    PIXEL_MODALITIES,
 };
-use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, MediaErrorCode, Modality};
+use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, ImageDetail, MediaErrorCode, Modality};
 use prost::Message;
 use pyo3::{
     exceptions::{PyRuntimeError, PyTimeoutError, PyValueError},
@@ -530,10 +531,7 @@ impl MediaProcessor for SmgMediaProcessor {
                             )))
                         }
                     };
-                    Ok(WorkerMediaItem {
-                        modality,
-                        url: item.url,
-                    })
+                    Ok(WorkerMediaItem::new(modality, item.url))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let output = pipeline
@@ -605,7 +603,7 @@ impl SglangMediaProcessor for SmgSglangMediaProcessor {
                 // The shared pipeline matches anchors per modality, preserving URL order.
                 let items = mm.image_urls.into_iter().map(|url| (Modality::Image, url))
                     .chain(mm.video_urls.into_iter().map(|url| (Modality::Video, url)))
-                    .map(|(modality, url)| WorkerMediaItem { modality, url })
+                    .map(|(modality, url)| WorkerMediaItem::new(modality, url))
                     .collect::<Vec<_>>();
                 let tokenized = request.tokenized.as_mut()
                     .ok_or_else(|| tonic::Status::invalid_argument("media references require tokenized input"))?;
@@ -2064,42 +2062,73 @@ impl PyManagedEncoderServer {
                     .map_err(|error| PyValueError::new_err(format!("{error:#}")))?,
             );
             drop(runtime);
-            let process: EncoderProcessor = Arc::new(move |urls| {
-                let pipeline = pipeline.clone();
-                Box::pin(async move {
-                    let tokens = vec![token; urls.len()];
-                    let items = urls
-                        .into_iter()
-                        .map(|url| WorkerMediaItem {
-                            modality: Modality::Image,
-                            url,
+            let process: EncoderProcessor =
+                Arc::new(move |encoder_items: Vec<EncoderMediaItem>| {
+                    let pipeline = pipeline.clone();
+                    Box::pin(async move {
+                        let tokens = vec![token; encoder_items.len()];
+                        let items = encoder_items
+                            .into_iter()
+                            .map(|item| {
+                                let detail = item.detail.as_deref().and_then(|value| {
+                                    if value.eq_ignore_ascii_case("low") {
+                                        Some(ImageDetail::Low)
+                                    } else if value.eq_ignore_ascii_case("high") {
+                                        Some(ImageDetail::High)
+                                    } else if value.eq_ignore_ascii_case("auto") {
+                                        Some(ImageDetail::Auto)
+                                    } else {
+                                        None
+                                    }
+                                });
+                                WorkerMediaItem {
+                                    modality: Modality::Image,
+                                    url: item.url,
+                                    detail,
+                                    max_long_side_pixel: item.max_long_side_pixel,
+                                }
+                            })
+                            .collect();
+                        let (_, inputs, extras) = pipeline
+                            .process_sglang_encoder(tokens, items)
+                            .await
+                            .map_err(|error| match error {
+                                WorkerMediaError::Invalid(message) => {
+                                    tonic::Status::invalid_argument(message)
+                                }
+                                WorkerMediaError::Internal(message) => {
+                                    tonic::Status::internal(message)
+                                }
+                                WorkerMediaError::Media { fault, message, .. } => match fault {
+                                    smg_grpc_client::WorkerMediaFault::Client => {
+                                        tonic::Status::invalid_argument(message)
+                                    }
+                                    smg_grpc_client::WorkerMediaFault::Transient => {
+                                        tonic::Status::unavailable(message)
+                                    }
+                                },
+                            })?;
+                        let embedding_tokens = std::iter::once(&inputs)
+                            .chain(extras.iter())
+                            .flat_map(|batch| batch.mm_placeholders.iter())
+                            .map(|item| u64::from(item.length))
+                            .sum();
+                        let artifact = smg_grpc_client::sglang_proto::GenerateRequest {
+                            mm_inputs: Some(Box::new(inputs)),
+                            extra_mm_inputs: extras,
+                            ..Default::default()
+                        };
+                        if artifact.encoded_len() > max_artifact_bytes {
+                            return Err(tonic::Status::resource_exhausted(
+                                "managed CPU artifact exceeds byte budget",
+                            ));
+                        }
+                        Ok(EncoderArtifact {
+                            bytes: artifact.encode_to_vec().into(),
+                            embedding_tokens,
                         })
-                        .collect();
-                    let (_, inputs, extras) = pipeline
-                        .process_sglang_encoder(tokens, items)
-                        .await
-                        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-                    let embedding_tokens = std::iter::once(&inputs)
-                        .chain(extras.iter())
-                        .flat_map(|batch| batch.mm_placeholders.iter())
-                        .map(|item| u64::from(item.length))
-                        .sum();
-                    let artifact = smg_grpc_client::sglang_proto::GenerateRequest {
-                        mm_inputs: Some(Box::new(inputs)),
-                        extra_mm_inputs: extras,
-                        ..Default::default()
-                    };
-                    if artifact.encoded_len() > max_artifact_bytes {
-                        return Err(tonic::Status::resource_exhausted(
-                            "managed CPU artifact exceeds byte budget",
-                        ));
-                    }
-                    Ok(EncoderArtifact {
-                        bytes: artifact.encode_to_vec().into(),
-                        embedding_tokens,
                     })
-                })
-            });
+                });
             EncoderServer::start(&config_json, process)
                 .map(|server| Self { server })
                 .map_err(to_py_err)

@@ -8,6 +8,7 @@ import json
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from http import HTTPStatus
 from urllib.parse import urlsplit
 
 import grpc
@@ -21,13 +22,17 @@ _ROUTES = {
     "scheduler_receive_url": "register",
     "send": "send",
 }
+# Every status must belong to `http.HTTPStatus` (SGLang `request_receiver.py` calls `HTTPStatus(int(code))`
+# and non-standard codes like 499 crash the Prefill scheduler) and stay in `engine_abort_status`'s 4xx/504 set.
 _HTTP_STATUS = {
-    grpc.StatusCode.CANCELLED: 499,
-    grpc.StatusCode.OUT_OF_RANGE: 413,
-    grpc.StatusCode.RESOURCE_EXHAUSTED: 429,
-    grpc.StatusCode.DEADLINE_EXCEEDED: 504,
-    grpc.StatusCode.NOT_FOUND: 404,
-    grpc.StatusCode.INTERNAL: 500,
+    grpc.StatusCode.INVALID_ARGUMENT: HTTPStatus.BAD_REQUEST,
+    grpc.StatusCode.CANCELLED: HTTPStatus.NOT_FOUND,
+    grpc.StatusCode.OUT_OF_RANGE: HTTPStatus.BAD_REQUEST,
+    grpc.StatusCode.ALREADY_EXISTS: HTTPStatus.BAD_REQUEST,
+    grpc.StatusCode.RESOURCE_EXHAUSTED: HTTPStatus.TOO_MANY_REQUESTS,
+    grpc.StatusCode.DEADLINE_EXCEEDED: HTTPStatus.GATEWAY_TIMEOUT,
+    grpc.StatusCode.NOT_FOUND: HTTPStatus.NOT_FOUND,
+    grpc.StatusCode.INTERNAL: HTTPStatus.INTERNAL_SERVER_ERROR,
 }
 
 
@@ -287,6 +292,13 @@ class NativeEncoder:
             return False
         return True
 
+    def _require_not_abandoned(self, rid):
+        require(
+            not self._is_abandoned(rid),
+            "native operation aborted before execution",
+            grpc.StatusCode.CANCELLED,
+        )
+
     async def _receiver_control(self, entry, operation):
         """Race a receiver control future against entry cancellation and clean up on exit."""
         work = asyncio.create_task(operation)
@@ -308,11 +320,7 @@ class NativeEncoder:
         entry = self.entries.get(rid)
         if entry is None:
             require(not self.closed, "encoder shutting down", grpc.StatusCode.CANCELLED)
-            require(
-                not self._is_abandoned(rid),
-                "native operation aborted before execution",
-                grpc.StatusCode.CANCELLED,
-            )
+            self._require_not_abandoned(rid)
             event = asyncio.Event()
             self.waiters.setdefault(rid, []).append(event)
             try:
@@ -328,11 +336,7 @@ class NativeEncoder:
                         del self.waiters[rid]
             entry = self.entries.get(rid)
             if entry is None:
-                require(
-                    not self._is_abandoned(rid),
-                    "native operation aborted before execution",
-                    grpc.StatusCode.CANCELLED,
-                )
+                self._require_not_abandoned(rid)
         require(entry is not None, "native operation is not registered")
         require(not entry.abort_requested, "native part closed", grpc.StatusCode.CANCELLED)
         require(
@@ -594,7 +598,8 @@ async def _start_http_facade(owner, config):
                 return web.json_response({"status": "ok"} if result is None else result)
             except Rejected as err:
                 return web.json_response(
-                    {"message": str(err)}, status=_HTTP_STATUS.get(err.code, 400)
+                    {"message": str(err)},
+                    status=int(_HTTP_STATUS.get(err.code, HTTPStatus.BAD_REQUEST)),
                 )
             except (json.JSONDecodeError, ValueError) as err:
                 return web.json_response({"message": _err(err)}, status=400)

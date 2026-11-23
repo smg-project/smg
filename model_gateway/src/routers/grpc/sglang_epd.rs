@@ -4,10 +4,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use openai_protocol::chat::ChatCompletionRequest;
+use llm_multimodal::{media::MAX_LONG_SIDE_PIXEL_FACTOR, ImageDetail, MediaContentPart};
 use prost::Message;
 use sha2::{Digest, Sha256};
 use smg_grpc_client::{
+    sglang_encoder_proto::{EncodeRequest, ImageOption},
     sglang_managed::{proto, Limits, LAYOUT, VERSION},
     sglang_proto,
 };
@@ -23,7 +24,7 @@ use crate::{
             backend_client::{get_backend_client, BackendClient},
             client::GrpcClient,
             context::{RequestContext, RequestType, WorkerSelection},
-            multimodal::media_plan_messages,
+            multimodal::{media_plan_chat, media_plan_messages, MediaPlan},
         },
     },
 };
@@ -120,48 +121,119 @@ pub(crate) fn pipeline_ready(workers: &[Arc<dyn Worker>], mode: PdPairingMode) -
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparedImage {
+    url: String,
+    detail: Option<ImageDetail>,
+    max_long_side_pixel: Option<u32>,
+}
+
 pub(crate) struct PreparedInput {
-    images: Vec<String>,
+    images: Vec<PreparedImage>,
     digest: Vec<u8>,
     deadline: Instant,
 }
 
 /// Only media enters prepared-input; text keeps ordinary Generate semantics.
 pub(crate) fn prepare(ctx: &RequestContext) -> Result<Option<PreparedInput>, Status> {
-    let RequestType::Chat(body) = &ctx.input.request_type else {
-        if let RequestType::Messages(body) = &ctx.input.request_type {
-            if !media_plan_messages(&body.messages).is_empty() {
-                return Err(Status::invalid_argument(
-                    "SGLang prepared-input media requires /v1/chat/completions",
-                ));
-            }
-        }
-        return Ok(None);
+    let (plan, unsupported_flags) = match &ctx.input.request_type {
+        RequestType::Chat(body) => (
+            media_plan_chat(&body.messages),
+            body.n.unwrap_or(1) != 1 || body.session_params.is_some() || body.return_hidden_states,
+        ),
+        RequestType::Messages(body) => (media_plan_messages(&body.messages), false),
+        _ => return Ok(None),
     };
-    let images = image_references(body)?;
-    if images.is_empty() {
+    if plan.is_empty() {
         return Ok(None);
     }
-    if body.n.unwrap_or(1) != 1
-        || body.session_params.is_some()
-        || body.declares_tools()
-        || body.return_hidden_states
-        || images.len() > Limits::default().images
-    {
+    let images = prepared_images_from_plan(plan)?;
+    if unsupported_flags || images.len() > Limits::default().images {
         return Err(Status::invalid_argument(
-            "prepared-input v1 requires at most 32 images, n=1, no session/tools/hidden states",
+            "prepared-input v1 requires at most 32 images, n=1, and no session/hidden states",
+        ));
+    }
+    const MAX_IMAGE_REF_BYTES: usize = 63 * 1024 * 1024;
+    let total_bytes: usize = images.iter().map(|img| img.url.len()).sum();
+    if total_bytes > MAX_IMAGE_REF_BYTES {
+        return Err(Status::invalid_argument(
+            "managed image references exceed the 64 MiB encoder control budget",
         ));
     }
     let mut hasher = Sha256::new();
-    for url in &images {
-        hasher.update((url.len() as u64).to_le_bytes());
-        hasher.update(url.as_bytes());
+    for image in &images {
+        hasher.update((image.url.len() as u64).to_le_bytes());
+        hasher.update(image.url.as_bytes());
+        hasher.update([match image.detail {
+            None | Some(ImageDetail::Auto) => 0,
+            Some(ImageDetail::Low) => 1,
+            Some(ImageDetail::High) => 2,
+        }]);
+        hasher.update(image.max_long_side_pixel.unwrap_or(0).to_le_bytes());
     }
     Ok(Some(PreparedInput {
         images,
         digest: hasher.finalize().to_vec(),
         deadline: Instant::now() + PREPARED_TIMEOUT,
     }))
+}
+
+fn validate_long_side_cap(cap: Option<u32>) -> Result<(), Status> {
+    if let Some(value) = cap {
+        if value == 0 || !value.is_multiple_of(MAX_LONG_SIDE_PIXEL_FACTOR) {
+            return Err(Status::invalid_argument(format!(
+                "managed image max_long_side_pixel ({value}) must be a positive multiple of {MAX_LONG_SIDE_PIXEL_FACTOR}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Extract occurrence order without decoding, fetching, or examining image bytes.
+fn prepared_images_from_plan(plan: MediaPlan) -> Result<Vec<PreparedImage>, Status> {
+    plan.into_parts()
+        .into_iter()
+        .map(|part| match part {
+            MediaContentPart::ImageUrl {
+                url,
+                detail,
+                max_long_side_pixel,
+                ..
+            } => {
+                if url.is_empty() {
+                    return Err(Status::invalid_argument("managed image URL is missing"));
+                }
+                validate_long_side_cap(max_long_side_pixel)?;
+                Ok(PreparedImage {
+                    url: url.as_ref().clone(),
+                    detail,
+                    max_long_side_pixel,
+                })
+            }
+            MediaContentPart::ImageBase64 {
+                media_type,
+                data,
+                detail,
+                max_long_side_pixel,
+                ..
+            } => {
+                if data.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "managed image base64 payload is missing",
+                    ));
+                }
+                validate_long_side_cap(max_long_side_pixel)?;
+                Ok(PreparedImage {
+                    url: format!("data:{media_type};base64,{data}"),
+                    detail,
+                    max_long_side_pixel,
+                })
+            }
+            _ => Err(Status::invalid_argument(
+                "managed EPD supports text and images only",
+            )),
+        })
+        .collect()
 }
 
 impl PreparedInput {
@@ -229,13 +301,35 @@ impl PreparedInput {
             processor_contract: p.processor_contract,
             layout_contract: LAYOUT.into(),
         };
-        let request = smg_grpc_client::sglang_encoder_proto::EncodeRequest {
+        let has_options = self.images.iter().any(|img| {
+            img.max_long_side_pixel.is_some()
+                || matches!(img.detail, Some(ImageDetail::Low | ImageDetail::High))
+        });
+        let item_options = if has_options {
+            self.images
+                .iter()
+                .map(|img| ImageOption {
+                    detail: match img.detail {
+                        Some(ImageDetail::Low) => "low",
+                        Some(ImageDetail::High) => "high",
+                        Some(ImageDetail::Auto) => "auto",
+                        None => "",
+                    }
+                    .into(),
+                    max_long_side_pixel: img.max_long_side_pixel.unwrap_or(0),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let request = EncodeRequest {
             req_id: encoder_req_id.clone(),
-            mm_items: self.images.clone(),
+            mm_items: self.images.iter().map(|img| img.url.clone()).collect(),
             num_parts: 1,
             part_idx: 0,
             prefill_host: p.bootstrap_host.clone(),
             embedding_port: vec![],
+            item_options,
         };
         tracing::debug!(
             logical_request_id = %generation.request_id,
@@ -266,7 +360,7 @@ impl PreparedInput {
 /// One prompt is assigned to one native encoder, using its cached worker connection.
 pub(crate) struct NativeEncode {
     worker: Arc<dyn Worker>,
-    request: smg_grpc_client::sglang_encoder_proto::EncodeRequest,
+    request: EncodeRequest,
     timeout: Duration,
 }
 
@@ -285,63 +379,6 @@ impl NativeEncode {
             .await
             .map_err(|e| e.to_string())
     }
-}
-
-/// Extract occurrence order without decoding, fetching, deduplicating, or examining image bytes.
-fn image_references(body: &ChatCompletionRequest) -> Result<Vec<String>, Status> {
-    use openai_protocol::{
-        chat::{ChatMessage, MessageContent},
-        common::ContentPart,
-    };
-
-    let mut images = Vec::new();
-    for message in &body.messages {
-        let content = match message {
-            ChatMessage::System { content, .. }
-            | ChatMessage::Root { content, .. }
-            | ChatMessage::User { content, .. }
-            | ChatMessage::Tool { content, .. }
-            | ChatMessage::Developer { content, .. } => Some(content),
-            ChatMessage::Assistant { .. } | ChatMessage::Function { .. } => None,
-        };
-        let Some(MessageContent::Parts(parts)) = content else {
-            continue;
-        };
-        for part in parts {
-            match part {
-                ContentPart::Text { .. } | ContentPart::Refusal { .. } => {}
-                ContentPart::ImageUrl { image_url } => {
-                    if image_url.max_long_side_pixel.is_some()
-                        || image_url
-                            .detail
-                            .as_deref()
-                            .is_some_and(|detail| !detail.eq_ignore_ascii_case("auto"))
-                    {
-                        return Err(Status::invalid_argument(
-                            "managed image resize/detail overrides are unsupported",
-                        ));
-                    }
-                    if image_url.url.is_empty() {
-                        return Err(Status::invalid_argument("managed image URL is missing"));
-                    }
-                    images.push(image_url.url.as_ref().clone());
-                }
-                _ => {
-                    return Err(Status::invalid_argument(
-                        "managed EPD supports text and images only",
-                    ))
-                }
-            }
-        }
-    }
-    const MAX_IMAGE_REF_BYTES: usize = 63 * 1024 * 1024;
-    let total_bytes: usize = images.iter().map(String::len).sum();
-    if total_bytes > MAX_IMAGE_REF_BYTES {
-        return Err(Status::invalid_argument(
-            "managed image references exceed the 64 MiB encoder control budget",
-        ));
-    }
-    Ok(images)
 }
 
 /// Split one frozen control into P and D requests before either RPC starts.
@@ -424,7 +461,10 @@ mod tests {
     use super::*;
     use crate::routers::{
         common::snapshot::WorkerRegistry,
-        grpc::{backend_client::BasicWorkerBuilder, context::EncodeWorkerAssignment},
+        grpc::{
+            backend_client::BasicWorkerBuilder,
+            context::{EncodeWorkerAssignment, SharedComponents},
+        },
     };
 
     fn worker_with_contract(
@@ -478,7 +518,11 @@ mod tests {
 
     fn prepared() -> PreparedInput {
         PreparedInput {
-            images: vec!["data:image/png;base64,AAAA".into()],
+            images: vec![PreparedImage {
+                url: "data:image/png;base64,AAAA".into(),
+                detail: None,
+                max_long_side_pixel: None,
+            }],
             digest: vec![1; 32],
             deadline: Instant::now() + PREPARED_TIMEOUT,
         }
@@ -566,5 +610,149 @@ mod tests {
         let expired = refresh_decode_timeout(&mut decode, tokio::time::Instant::now())
             .expect_err("expired deadline must be rejected");
         assert_eq!(expired.code(), tonic::Code::DeadlineExceeded);
+    }
+
+    fn test_components() -> Arc<SharedComponents> {
+        use llm_tokenizer::TokenizerRegistry;
+
+        use crate::{
+            config::ParserChoice,
+            routers::{
+                common::snapshot::WorkerRegistry,
+                grpc::{regular::symphony::template::Templates, utils::ParserResolver},
+            },
+        };
+        let tokenizers = Arc::new(TokenizerRegistry::new());
+        Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(Arc::clone(&tokenizers))),
+            tokenizer_registry: tokenizers,
+            worker_registry: Arc::new(WorkerRegistry::new()),
+            tool_parser_factory: Default::default(),
+            reasoning_parser_factory: Default::default(),
+            parser_resolver: ParserResolver::disabled(),
+            multimodal: None,
+            tokenizer_autoload: true,
+            tokenizer_load_failures: Arc::default(),
+            parser: ParserChoice::Legacy,
+        })
+    }
+
+    fn prepare_chat_json(value: serde_json::Value) -> Result<Option<PreparedInput>, Status> {
+        let req = Arc::new(serde_json::from_value(value).unwrap());
+        let ctx = RequestContext::for_chat(req, None, "glm53_flash".into(), test_components());
+        prepare(&ctx)
+    }
+
+    fn prepare_messages_json(value: serde_json::Value) -> Result<Option<PreparedInput>, Status> {
+        let req = Arc::new(serde_json::from_value(value).unwrap());
+        let ctx = RequestContext::for_messages_carrying_its_tools(
+            req,
+            None,
+            "glm53_flash".into(),
+            test_components(),
+        );
+        prepare(&ctx)
+    }
+
+    #[test]
+    fn prepare_supports_detail_resize_tools_and_messages() {
+        let plain = prepare_chat_json(serde_json::json!({
+            "model": "glm53_flash",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}}
+            ]}]
+        }))
+        .unwrap()
+        .unwrap();
+        let detailed = prepare_chat_json(serde_json::json!({
+            "model": "glm53_flash",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.test/a.png", "detail": "high", "max_long_side_pixel": 504}},
+                {"type": "image_url", "image_url": {"url": "https://example.test/b.png", "detail": "low"}}
+            ]}],
+            "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+        }))
+        .unwrap()
+        .unwrap();
+        assert_ne!(plain.hashes(), detailed.hashes());
+
+        let workers = selection(ready_workers(|role| {
+            worker_with_contract(role, RuntimeType::Sglang, |_| {})
+        }));
+        let base_req = || sglang_proto::GenerateRequest {
+            request_id: "client".into(),
+            disaggregated_params: Some(sglang_proto::DisaggregatedParams {
+                bootstrap_host: "prefill.service".into(),
+                bootstrap_port: 8998,
+                bootstrap_room: 17,
+            }),
+            ..Default::default()
+        };
+        assert!(plain
+            .build(&mut base_req(), &workers)
+            .unwrap()
+            .request
+            .item_options
+            .is_empty());
+        let encoded = detailed.build(&mut base_req(), &workers).unwrap().request;
+        assert_eq!(
+            encoded.mm_items,
+            vec!["https://example.test/a.png", "https://example.test/b.png"]
+        );
+        assert_eq!(
+            encoded.item_options,
+            vec![
+                ImageOption {
+                    detail: "high".into(),
+                    max_long_side_pixel: 504
+                },
+                ImageOption {
+                    detail: "low".into(),
+                    max_long_side_pixel: 0
+                },
+            ]
+        );
+
+        let msgs = prepare_messages_json(serde_json::json!({
+            "model": "glm53_flash",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AQ=="}},
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "image", "source": {"type": "url", "url": "https://example.test/tool.png"}}
+                ]}
+            ]}],
+            "tools": [{"name": "lookup", "input_schema": {"type": "object"}}]
+        }))
+        .unwrap()
+        .unwrap();
+        let msg_req = msgs.build(&mut base_req(), &workers).unwrap().request;
+        assert_eq!(
+            msg_req.mm_items,
+            vec![
+                "data:image/png;base64,AQ==",
+                "https://example.test/tool.png"
+            ]
+        );
+
+        // Text-only stays un-prepared even when n > 1.
+        assert!(prepare_chat_json(serde_json::json!({
+            "model": "glm53_flash",
+            "n": 2,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap()
+        .is_none());
+
+        for bad in [
+            serde_json::json!({"model": "glm53_flash", "n": 2, "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.test/a.png"}}]}]}),
+            serde_json::json!({"model": "glm53_flash", "return_hidden_states": true, "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.test/a.png"}}]}]}),
+            serde_json::json!({"model": "glm53_flash", "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.test/a.png", "max_long_side_pixel": 0}}]}]}),
+            serde_json::json!({"model": "glm53_flash", "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.test/a.png", "max_long_side_pixel": 500}}]}]}),
+            serde_json::json!({"model": "glm53_flash", "messages": [{"role": "user", "content": [{"type": "audio_url", "audio_url": {"url": "https://example.test/a.wav"}}]}]}),
+        ] {
+            let err = prepare_chat_json(bad).err().unwrap();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
     }
 }

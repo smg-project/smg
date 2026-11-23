@@ -14,6 +14,13 @@ from .epd_plugin import EVENTS_ENV, ROLE_ENV
 PROCESSOR_CONTRACT = "smg-image-grid-v1"
 MAX_CONTEXT_BYTES = 16 * 1024**3
 MAX_IMAGE_TOKENS_PER_REQUEST = 32768
+_DTYPE_BYTES = {"float16": 2, "bfloat16": 2, "float32": 4}
+_DTYPE_ALIASES = {"half": "float16", "float": "float32"}
+
+
+def _normalize_dtype(value):
+    dtype = str(value).removeprefix("torch.")
+    return _DTYPE_ALIASES.get(dtype, dtype)
 
 
 def available_cpus():
@@ -49,8 +56,8 @@ def complete(args, role):
     if dtype == "auto":
         from sglang.srt.configs.model_config import ModelConfig
 
-        dtype = str(ModelConfig.from_server_args(args).dtype).removeprefix("torch.")
-    dtype = {"half": "float16", "float": "float32"}.get(dtype, dtype)
+        dtype = ModelConfig.from_server_args(args).dtype
+    dtype = _normalize_dtype(dtype)
     config = dict(
         role=role,
         model_revision=revision,
@@ -94,22 +101,18 @@ def _cfg_get(obj, key):
 
 def encoder_artifact_bytes(hf_config, dtype):
     """Compute per-request preprocessed pixel-artifact budget from vision geometry and dtype."""
-    element_bytes = {"float16": 2, "bfloat16": 2, "float32": 4}.get(dtype)
+    element_bytes = _DTYPE_BYTES.get(dtype)
     if element_bytes is None:
         raise ValueError("unsupported managed visual dtype")
     vision = getattr(hf_config, "vision_config", None)
     raw_patch = _cfg_get(vision, "patch_size")
     if raw_patch is None:
         patch = 16
-    elif isinstance(raw_patch, dict):
-        vals = list(raw_patch.values())
+    elif isinstance(raw_patch, (dict, list, tuple)):
+        vals = list(raw_patch.values() if isinstance(raw_patch, dict) else raw_patch)
         if not vals or any(type(v) is not int or v <= 0 for v in vals):
             raise ValueError("unsupported managed vision geometry")
         patch = max(vals)
-    elif isinstance(raw_patch, (list, tuple)):
-        if not raw_patch or any(type(v) is not int or v <= 0 for v in raw_patch):
-            raise ValueError("unsupported managed vision geometry")
-        patch = max(raw_patch)
     else:
         patch = raw_patch
     temporal = _cfg_get(vision, "temporal_patch_size")
@@ -142,7 +145,7 @@ def encoder_artifact_bytes(hf_config, dtype):
 
 def encoder_staging_bytes(hidden_size, dtype):
     """Compute per-request staging byte budget from embedding dimension and dtype."""
-    element_bytes = {"float16": 2, "bfloat16": 2, "float32": 4}.get(dtype)
+    element_bytes = _DTYPE_BYTES.get(dtype)
     if type(hidden_size) is not int or hidden_size <= 0 or element_bytes is None:
         raise ValueError("unsupported managed embedding dimensions or dtype")
     return MAX_IMAGE_TOKENS_PER_REQUEST * hidden_size * element_bytes
@@ -272,10 +275,7 @@ async def serve(config, args):
         if not hasattr(backend.encoder.preprocessor, "max_artifact_bytes"):
             raise RuntimeError("native rank zero did not install the managed Rust bridge")
         visual = getattr(backend.encoder.model, "visual", None)
-        vision_dtype = str(getattr(visual, "dtype", config["embedding_dtype"])).removeprefix(
-            "torch."
-        )
-        vision_dtype = {"half": "float16", "float": "float32"}.get(vision_dtype, vision_dtype)
+        vision_dtype = _normalize_dtype(getattr(visual, "dtype", config["embedding_dtype"]))
         hf_config = backend.encoder.model_config.hf_config
         config["max_staging_bytes_per_request"] = encoder_staging_bytes(
             backend.encoder.model_config.hidden_size, config["embedding_dtype"]

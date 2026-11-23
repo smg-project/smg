@@ -970,14 +970,7 @@ async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_
             .await
             .expect("drain body");
         let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
-        if prepared {
-            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
-            assert_eq!(body["error"]["code"], "sglang_epd_capability", "{body}");
-            assert!(body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("/v1/chat/completions"));
-        } else if refused {
+        if refused {
             assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
             assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
             assert_eq!(
@@ -985,9 +978,10 @@ async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_
                 "{body}"
             );
         } else {
-            // Past the matrix the request goes on into media resolution, to
-            // the config lookup the test's model directory cannot satisfy:
-            // the deployment's fault, answered in the server's class.
+            // Past ingress and the matrix (including managed EPD when prepared), the request goes
+            // into media resolution, to the config lookup the test's model directory cannot
+            // satisfy: the deployment's fault, answered in the server's class.
+            let _ = prepared;
             assert_eq!(status, http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
             assert_eq!(
                 body["error"]["code"], "multimodal_processing_failed",

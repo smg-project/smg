@@ -14,9 +14,9 @@ use anyhow::Context;
 use llm_multimodal::{
     configure_parallelism, data_url::data_url_payload_bytes, jpeg_turbo::TurboJpegPolicy,
     registry::modality_limit_override, vision::PreProcessorConfig, EncoderDtype, FrameSampling,
-    MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaContentPart, MediaErrorCode,
-    MediaFault, Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism,
-    POOL_THREADS_ENV,
+    ImageDetail, MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaContentPart,
+    MediaErrorCode, MediaFault, Modality, ModelMetadata, ModelRegistry, MultiModalError,
+    Parallelism, POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
@@ -334,6 +334,20 @@ fn check_item_counts(
 pub struct WorkerMediaItem {
     pub modality: Modality,
     pub url: String,
+    pub detail: Option<ImageDetail>,
+    pub max_long_side_pixel: Option<u32>,
+}
+
+impl WorkerMediaItem {
+    /// Construct a plain item without per-item image overrides.
+    pub fn new(modality: Modality, url: String) -> Self {
+        Self {
+            modality,
+            url,
+            detail: None,
+            max_long_side_pixel: None,
+        }
+    }
 }
 
 /// Expanded prompt, primary SGLang inputs and additional modality batches.
@@ -954,8 +968,8 @@ impl WorkerMediaPipeline {
         Ok(match item.modality {
             Modality::Image => MediaContentPart::ImageUrl {
                 url: Arc::new(item.url),
-                detail: None,
-                max_long_side_pixel: None,
+                detail: item.detail,
+                max_long_side_pixel: item.max_long_side_pixel,
                 uuid: None,
             },
             Modality::Video => MediaContentPart::VideoUrl {
@@ -1128,13 +1142,7 @@ mod tests {
     }
 
     fn image_items(count: usize) -> Vec<WorkerMediaItem> {
-        vec![
-            WorkerMediaItem {
-                modality: Modality::Image,
-                url: "data:image/png;base64,AAAA".to_string(),
-            };
-            count
-        ]
+        vec![WorkerMediaItem::new(Modality::Image, "data:image/png;base64,AAAA".to_string()); count]
     }
 
     /// The settings every pipeline test starts from: a model at `model_dir`
@@ -1236,13 +1244,11 @@ mod tests {
         );
         assert!(check_item_counts(&image_items(1), &limits).is_ok());
         // A modality without a limit here is the spec's to validate.
-        let videos = vec![
-            WorkerMediaItem {
-                modality: Modality::Video,
-                url: "data:video/mp4;base64,AAAA".to_string(),
-            };
-            3
-        ];
+        let videos =
+            vec![
+                WorkerMediaItem::new(Modality::Video, "data:video/mp4;base64,AAAA".to_string());
+                3
+            ];
         assert!(check_item_counts(&videos, &limits).is_ok());
     }
 
@@ -1326,10 +1332,7 @@ mod tests {
             ..pipeline_settings(&path)
         };
         let tokenizer = || Arc::new(MockTokenizer::new().with_tokens(&[("<image>", 32000)]));
-        let items = [WorkerMediaItem {
-            modality: Modality::Image,
-            url: PIXEL.to_string(),
-        }];
+        let items = [WorkerMediaItem::new(Modality::Image, PIXEL.to_string())];
 
         let pipeline = WorkerMediaPipeline::new(settings(Some(575)), tokenizer())
             .await
@@ -1464,13 +1467,13 @@ mod tests {
         image::DynamicImage::ImageRgb8(image::RgbImage::new(56, 56))
             .write_to(&mut png, image::ImageFormat::Png)
             .unwrap();
-        WorkerMediaItem {
-            modality: Modality::Image,
-            url: format!(
+        WorkerMediaItem::new(
+            Modality::Image,
+            format!(
                 "data:image/png;base64,{}",
                 STANDARD.encode(png.into_inner())
             ),
-        }
+        )
     }
 
     /// The one-second test clip as a video item.
@@ -1480,10 +1483,10 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../crates/multimodal/tests/fixtures/videos/testsrc_128x96_8fps_1s.mp4"
         ));
-        WorkerMediaItem {
-            modality: Modality::Video,
-            url: format!("data:video/mp4;base64,{}", STANDARD.encode(video)),
-        }
+        WorkerMediaItem::new(
+            Modality::Video,
+            format!("data:video/mp4;base64,{}", STANDARD.encode(video)),
+        )
     }
 
     #[tokio::test]
@@ -1506,13 +1509,13 @@ mod tests {
         image::DynamicImage::ImageRgb8(image)
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
-        let items = [WorkerMediaItem {
-            modality: Modality::Image,
-            url: format!(
+        let items = [WorkerMediaItem::new(
+            Modality::Image,
+            format!(
                 "data:image/png;base64,{}",
                 STANDARD.encode(bytes.into_inner())
             ),
-        }];
+        )];
         let (float_tokens, float, _) = pipeline
             .process_sglang(vec![1, 32000, 2], items.to_vec())
             .await
@@ -1657,6 +1660,48 @@ mod tests {
                 .collect()
         );
         assert!(!tokens.is_empty() && tokens.iter().all(|&token| token == 32000));
+    }
+
+    #[tokio::test]
+    async fn managed_encoder_honors_image_detail_and_max_long_side_pixel() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let (_dir, pipeline) = glm_video_test_pipeline().await;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(280, 280))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let url = format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(png.into_inner())
+        );
+        let high = WorkerMediaItem {
+            detail: Some(ImageDetail::High),
+            max_long_side_pixel: Some(224),
+            ..WorkerMediaItem::new(Modality::Image, url.clone())
+        };
+        let capped = WorkerMediaItem {
+            detail: Some(ImageDetail::Low),
+            max_long_side_pixel: Some(112),
+            ..WorkerMediaItem::new(Modality::Image, url.clone())
+        };
+        let (tokens_high, _, _) = pipeline
+            .process_sglang_encoder(vec![32000], vec![high])
+            .await
+            .unwrap();
+        let (tokens_capped, _, _) = pipeline
+            .process_sglang_encoder(vec![32000], vec![capped])
+            .await
+            .unwrap();
+        assert!(tokens_capped.len() < tokens_high.len());
+
+        let invalid = WorkerMediaItem {
+            max_long_side_pixel: Some(100),
+            ..WorkerMediaItem::new(Modality::Image, url)
+        };
+        assert!(pipeline
+            .process_sglang_encoder(vec![32000], vec![invalid])
+            .await
+            .is_err());
     }
 
     /// Grouped references retain per-modality anchors in interleaved prompts.
@@ -1952,13 +1997,13 @@ mod tests {
             image::DynamicImage::new_rgb8(width, height)
                 .write_to(&mut bytes, image::ImageFormat::Png)
                 .unwrap();
-            let item = WorkerMediaItem {
-                modality: Modality::Image,
-                url: format!(
+            let item = WorkerMediaItem::new(
+                Modality::Image,
+                format!(
                     "data:image/png;base64,{}",
                     STANDARD.encode(bytes.into_inner())
                 ),
-            };
+            );
             let output = pipeline
                 .process(vec![1, 32000, 2], vec![item.clone()], false)
                 .await
@@ -2039,10 +2084,7 @@ mod tests {
             "data:image/png;base64,AAAAAAAA",
             "DATA:image/png;base64,AAAAAAAA",
         ] {
-            let items = [WorkerMediaItem {
-                modality: Modality::Image,
-                url: url.to_string(),
-            }];
+            let items = [WorkerMediaItem::new(Modality::Image, url.to_string())];
             let error = pipeline
                 .process(vec![1, 2, 3], items.to_vec(), false)
                 .await
@@ -2229,13 +2271,13 @@ mod tests {
             image::DynamicImage::new_rgb8(width, height)
                 .write_to(&mut bytes, image::ImageFormat::Png)
                 .unwrap();
-            let item = WorkerMediaItem {
-                modality: Modality::Image,
-                url: format!(
+            let item = WorkerMediaItem::new(
+                Modality::Image,
+                format!(
                     "data:image/png;base64,{}",
                     STANDARD.encode(bytes.into_inner())
                 ),
-            };
+            );
             let (ids, mm, _) = pipeline
                 .process_sglang(vec![1, 32000, 2], vec![item])
                 .await

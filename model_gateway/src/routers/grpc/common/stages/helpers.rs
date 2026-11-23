@@ -1103,11 +1103,19 @@ pub(crate) fn finish_generate_request(
                 "media references require a supported gRPC worker",
             ));
         }
-        let refs =
-            assemble_media_refs(&plan).map_err(|e| error::bad_request(e.code(), e.to_string()))?;
-        proto_request
-            .set_media_refs(refs)
-            .map_err(|e| error::bad_request("multimodal_not_supported", e))?;
+        // `PreparedInput` dispatches images (plus per-item `detail` /
+        // `max_long_side_pixel` options) to E during execution and clears
+        // `mm_inputs` on P/D; avoid rejecting its hints in `vllm::MediaRefs`.
+        if !matches!(
+            ctx.state.encode_outputs,
+            Some(EncodeOutputs::PreparedInput(_))
+        ) {
+            let refs = assemble_media_refs(&plan)
+                .map_err(|e| error::bad_request(e.code(), e.to_string()))?;
+            proto_request
+                .set_media_refs(refs)
+                .map_err(|e| error::bad_request("multimodal_not_supported", e))?;
+        }
         ctx.state.media_refs_forwarded = true;
     }
     Ok(())
