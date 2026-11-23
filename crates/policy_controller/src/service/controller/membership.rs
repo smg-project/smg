@@ -39,8 +39,7 @@
 //! answer tells what the call made of each rank, then each row that left,
 //! at the place of the call's last write. A registration of one rank for
 //! an engine that stands as ranks is refused: a plain row beside its ranks
-//! would be the engine twice. A build without the worker host lays no
-//! ranks and refuses a width above one.
+//! would be the engine twice.
 //!
 //! A row has one maker ([`Registrant`]), the control call or provider that
 //! registered it. A registration keeps the maker while the URL stands.
@@ -62,12 +61,9 @@
 //! that holds by the draw, not by construction: two runs' counts meet with
 //! odds near a run's writes over 2^38.
 
-#[cfg(feature = "worker-host")]
-use std::cell::RefCell;
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 
 use parking_lot::Mutex;
-#[cfg(feature = "worker-host")]
 use smg_worker::identity::{basic::Worker, builder::rank_url};
 use tonic::{Code, Status};
 use tracing::info;
@@ -83,14 +79,10 @@ use crate::{
         replication::Log,
     },
     store::{
-        membership::{self, life, WorkerFactsChange},
-        HealthSink, JournalKinds, MemoryStore, Position, Registrant, WorkerRow, WorkerStatus,
-        WorkersStore,
+        membership::{self, life, FactPastBound, WorkerFactsChange},
+        HealthSink, JournalKinds, MemoryStore, Position, Registrant, WorkerFacts, WorkerRow,
+        WorkerStatus, WorkersStore,
     },
-};
-#[cfg(feature = "worker-host")]
-use crate::{
-    store::{membership::FactPastBound, WorkerFacts},
     worker_host::{
         drain, lay, lay_one, lay_ready, refresh, stated, stating, take, MembershipWriteOutcome,
         MembershipWriteRefused, MembershipWriter, Over, Precondition, Ready, Remover, RowRevision,
@@ -120,7 +112,6 @@ fn invalid(refused: Refused) -> Status {
 
 const ABSENT: &str = "no worker is registered under the URL";
 const MOVED: &str = "the row moved under the call";
-#[cfg(feature = "worker-host")]
 const DRAINING: &str = "the worker under the URL is draining";
 
 /// A `REPLACE` of a URL no row stands under.
@@ -268,7 +259,6 @@ impl MembershipCalls {
                 }));
             }
         };
-        #[cfg(feature = "worker-host")]
         if spec.dp_size > 1 {
             return self.upsert_ranks(by, maker, admitted, request, spec, mode);
         }
@@ -291,7 +281,6 @@ impl MembershipCalls {
         // may be the engine's or a rank's own. A caller that did not make
         // the ranks is told so first, as the wide call tells it: an add
         // asks no maker.
-        #[cfg(feature = "worker-host")]
         {
             let engine = standing
                 .as_ref()
@@ -494,12 +483,10 @@ fn stands(row: &WorkerRow) -> Status {
 }
 
 /// A registration of one row for an engine that stands as ranks.
-#[cfg(feature = "worker-host")]
 const AS_RANKS: &str =
     "the worker stands as ranks: a registration states its width, or its ranks are removed first";
 
 /// The host door's refusal as a call's answer and an audit line's words.
-#[cfg(feature = "worker-host")]
 fn refused(refusal: &MembershipWriteRefused) -> Status {
     match refusal {
         MembershipWriteRefused::NotRegistrant(why) => Status::permission_denied(why.as_str()),
@@ -523,7 +510,6 @@ fn refused(refusal: &MembershipWriteRefused) -> Status {
 }
 
 /// What a write made of its row, as its audit line names it, and the row.
-#[cfg(feature = "worker-host")]
 fn made(wrote: MembershipWriteOutcome) -> (&'static str, WorkerId) {
     match wrote {
         MembershipWriteOutcome::Registered(id) => ("registered", id),
@@ -539,7 +525,6 @@ fn made(wrote: MembershipWriteOutcome) -> (&'static str, WorkerId) {
 /// and its lives, each row as its write left it, for the call's answer,
 /// and each write's audit line as it lands. A call refused behind its
 /// first write leaves the lines of the writes that stand.
-#[cfg(feature = "worker-host")]
 struct CallTurn<'a> {
     door: &'a MembershipCalls,
     by: &'a Principal,
@@ -547,7 +532,6 @@ struct CallTurn<'a> {
     laid: RefCell<Vec<WorkerRow>>,
 }
 
-#[cfg(feature = "worker-host")]
 impl Turn for CallTurn<'_> {
     fn store(&self) -> &MemoryStore {
         &self.door.store
@@ -581,7 +565,6 @@ impl Turn for CallTurn<'_> {
     }
 }
 
-#[cfg(feature = "worker-host")]
 impl MembershipCalls {
     /// The write of a registration that states more than one rank, in the
     /// door's turn, from `maker`. Each rank's row is stated by the call's
@@ -714,7 +697,6 @@ impl MembershipCalls {
 
 /// A controller replica's own membership writer: the same calls for the
 /// program's own writers, sharing the turn of its control calls.
-#[cfg(feature = "worker-host")]
 #[cfg_attr(not(test), expect(dead_code, reason = "the host owns the door"))]
 pub(crate) struct ReplicaMembershipWriter {
     door: Arc<MembershipCalls>,
@@ -722,7 +704,6 @@ pub(crate) struct ReplicaMembershipWriter {
     leading: Box<dyn Fn() -> Result<u64, Status> + Send + Sync>,
 }
 
-#[cfg(feature = "worker-host")]
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "the host supplies the principal and fence")
@@ -816,7 +797,6 @@ impl ReplicaMembershipWriter {
     }
 }
 
-#[cfg(feature = "worker-host")]
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "the host reads the term for each registration")
@@ -826,7 +806,6 @@ struct ReplicaTurn<'a> {
     term: u64,
 }
 
-#[cfg(feature = "worker-host")]
 impl Turn for ReplicaTurn<'_> {
     fn store(&self) -> &MemoryStore {
         &self.host.door.store
@@ -864,7 +843,6 @@ impl Turn for ReplicaTurn<'_> {
     }
 }
 
-#[cfg(feature = "worker-host")]
 impl MembershipWriter for ReplicaMembershipWriter {
     fn found(
         &self,
@@ -988,17 +966,14 @@ fn audit_refusal(call: &'static str, by: &Principal, code: Code, why: &str, aske
 
 #[cfg(test)]
 pub(crate) mod tests {
-    #[cfg(feature = "worker-host")]
-    use std::sync::atomic::AtomicUsize;
     use std::{
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Barrier,
         },
         thread,
     };
 
-    #[cfg(feature = "worker-host")]
     use smg_worker::{
         identity::{basic::Worker, builder::BasicWorkerBuilder},
         model_card::ModelCard,
@@ -1006,13 +981,9 @@ pub(crate) mod tests {
     };
     use tonic::{Code, Status};
 
-    #[cfg(feature = "worker-host")]
-    use super::ReplicaMembershipWriter;
-    use super::{MembershipCalls, Position};
-    #[cfg(feature = "worker-host")]
-    use crate::service::replication;
+    use super::{MembershipCalls, Position, ReplicaMembershipWriter};
     use crate::{
-        engine::view::WorkerId,
+        engine::view::{Role, WireModes, WorkerId},
         service::{
             controller::{
                 election::LeasePlace,
@@ -1020,13 +991,12 @@ pub(crate) mod tests {
                 replication::{journaled, journaled_from},
             },
             proto::{self, register_worker_request::Mode, worker_event::Event},
+            replication,
         },
-        store::{self, identity, MemoryStore, Registrant, WorkerStatus, WorkersStore},
-    };
-    #[cfg(feature = "worker-host")]
-    use crate::{
-        engine::view::{Role, WireModes},
-        store::{GatewayId, Reachability, WorkerFacts, WorkerRow},
+        store::{
+            self, identity, GatewayId, MemoryStore, Reachability, Registrant, WorkerFacts,
+            WorkerRow, WorkerStatus, WorkersStore,
+        },
         worker_host::{
             check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
             check_one_row, check_provider, check_rank_rows, check_refresh, FindOne,
@@ -1577,7 +1547,6 @@ pub(crate) mod tests {
     }
 
     /// A spec that states `width` ranks.
-    #[cfg(feature = "worker-host")]
     fn wide(url: &str, width: u32) -> proto::WorkerSpec {
         proto::WorkerSpec {
             dp_size: width,
@@ -1586,7 +1555,6 @@ pub(crate) mod tests {
     }
 
     /// What an answer of several ranks made of each row.
-    #[cfg(feature = "worker-host")]
     fn made_of(event: &proto::WorkerEvent) -> Vec<proto::rank_row::Made> {
         match event.event.clone().expect("an event") {
             Event::Ranks(ranks) => ranks
@@ -1602,7 +1570,6 @@ pub(crate) mod tests {
     /// the rank's URL and answers each as its write left it, at the one
     /// place of the call's last write. Stated again it writes nothing and
     /// answers each rank unmoved.
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_registration_of_several_ranks_writes_a_row_a_rank_and_answers_each() {
         use proto::rank_row::Made;
@@ -1645,7 +1612,6 @@ pub(crate) mod tests {
     /// stand or the engine stands in another form. A replacement wants every
     /// stated rank and makes each its next life. An upsert lays each rank,
     /// and the engine's rows it does not state leave with it.
-    #[cfg(feature = "worker-host")]
     #[test]
     fn the_modes_of_a_registration_of_several_ranks_hold_for_the_engine() {
         use proto::rank_row::Made;
@@ -1727,7 +1693,6 @@ pub(crate) mod tests {
     /// A registration of one rank for an engine that stands as ranks is
     /// refused by name in every mode and writes nothing: a plain row beside
     /// its ranks would be the engine twice. The way off is a rank at a time.
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_registration_of_one_rank_over_an_engine_that_stands_as_ranks_is_refused() {
         let (store, door) = door();
@@ -1768,7 +1733,6 @@ pub(crate) mod tests {
     /// A one-rank replacement or upsert over ranks another maker laid is
     /// told who made them, ahead of the engine's form, as the wide call
     /// tells it. An add asks no maker.
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_registration_of_one_rank_over_another_makers_ranks_is_told_the_maker_first() {
         let (store, door) = door();
@@ -1804,7 +1768,6 @@ pub(crate) mod tests {
 
     /// The door's log as its store's journal, which leaves its term as a
     /// membership write lands: a lead lost inside one call.
-    #[cfg(feature = "worker-host")]
     struct LosesTheLead {
         log: Arc<replication::Log>,
         /// The membership writes the lead still holds for. The write that
@@ -1812,7 +1775,6 @@ pub(crate) mod tests {
         holds: AtomicUsize,
     }
 
-    #[cfg(feature = "worker-host")]
     impl store::Journal for LosesTheLead {
         fn member(
             &self,
@@ -1876,7 +1838,6 @@ pub(crate) mod tests {
     /// A wide call that loses its lead between two ranks is refused. The
     /// rank written before the refusal stands, and its write leaves its
     /// audit line ahead of the refusal's.
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_term_lost_between_two_ranks_leaves_the_first_rank_and_its_audit_line() {
         let lines = Logged::default();
@@ -1922,7 +1883,6 @@ pub(crate) mod tests {
 
     /// A door whose journal loses the lead when told, with `width` ranks of
     /// [`URL`] registered under a lead that holds.
-    #[cfg(feature = "worker-host")]
     fn losing(width: u32) -> (Arc<MemoryStore>, MembershipCalls, Arc<LosesTheLead>) {
         let (_, feed) = journaled_from(&LeasePlace::Process, 0);
         let journal = Arc::new(LosesTheLead {
@@ -1941,7 +1901,6 @@ pub(crate) mod tests {
     /// A lead lost behind a rank's write in place refuses the next rank's.
     /// The term is asked ahead of every write, whatever it makes of its
     /// row.
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_term_lost_behind_a_write_in_place_stops_the_next_ranks_write() {
         let (store, door, journal) = losing(2);
@@ -1966,7 +1925,6 @@ pub(crate) mod tests {
 
     /// A lead lost behind the last rank that stays refuses the removal of
     /// the rank a narrower registration no longer states.
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_term_lost_ahead_of_a_removal_leaves_the_rank_that_would_leave() {
         let (store, door, journal) = losing(3);
@@ -1989,7 +1947,6 @@ pub(crate) mod tests {
     /// A door whose lead was lost behind the first of an add's three ranks
     /// and came back under a later term: the next leader's door, over the
     /// row the first attempt left.
-    #[cfg(feature = "worker-host")]
     fn led_again_behind_a_lost_add() -> (Arc<MemoryStore>, MembershipCalls) {
         let (_, feed) = journaled_from(&LeasePlace::Process, 0);
         let journal = Arc::new(LosesTheLead {
@@ -2016,7 +1973,6 @@ pub(crate) mod tests {
     /// others are registered, and each rank has its one row. Called once
     /// more, the engine stands whole: the add is refused by the first
     /// rank's row.
-    #[cfg(feature = "worker-host")]
     #[test]
     fn an_add_called_again_behind_a_lost_lead_lays_the_ranks_it_left() {
         use proto::rank_row::Made;
@@ -2052,7 +2008,6 @@ pub(crate) mod tests {
     /// The same add with another label than the standing rank's is refused
     /// by that rank's row and writes nothing: an add lays the rest by what
     /// stands alone.
-    #[cfg(feature = "worker-host")]
     #[test]
     fn an_add_called_again_with_another_label_is_refused_and_writes_nothing() {
         let (store, door) = led_again_behind_a_lost_add();
@@ -2070,7 +2025,6 @@ pub(crate) mod tests {
     /// A registration states at most 64 ranks. At the bound, with every rank
     /// replaced by rows near their size bound, the answer stays inside a
     /// 4 MiB frame: a replacement tells two rows.
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_registration_states_at_most_64_ranks_and_its_widest_answer_fits_a_frame() {
         use prost::Message as _;
@@ -2111,7 +2065,6 @@ pub(crate) mod tests {
     /// the answer. A rank whose checks are off is answered as its write left
     /// it, and its connect signal is the watcher's next event. The answer's
     /// place is the call's last write.
-    #[cfg(feature = "worker-host")]
     #[test]
     fn each_entry_of_an_answer_of_several_ranks_is_the_event_a_watcher_is_told() {
         use proto::rank_row::Made;
@@ -2453,7 +2406,6 @@ pub(crate) mod tests {
         assert!(status.message().starts_with("labels:"), "{status:?}");
     }
 
-    #[cfg(feature = "worker-host")]
     fn found_facts() -> WorkerFacts {
         WorkerFacts {
             key: URL.to_owned(),
@@ -2467,7 +2419,6 @@ pub(crate) mod tests {
 
     /// A standby builds its rows from the log. A fact the log's row does not
     /// carry would leave it another row than its leader holds.
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written() {
         use super::super::worker_wire;
@@ -2527,7 +2478,6 @@ pub(crate) mod tests {
     /// The store reads a row as host-local by its reach alone: a row of the
     /// host-local wire that names no gateway would stand in every gateway's
     /// pool. A store held in process serves one gateway.
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_host_local_wire_names_its_gateway_at_the_controllers_door() {
         let stated = |wire: WireModes, from: Reachability| {
@@ -2569,7 +2519,6 @@ pub(crate) mod tests {
         assert_eq!(wrote, Ok(MembershipWriteOutcome::Registered(row.id)));
     }
 
-    #[cfg(feature = "worker-host")]
     fn standing(row: &WorkerRow) -> RowRevision {
         RowRevision {
             row: row.id,
@@ -2577,7 +2526,6 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(feature = "worker-host")]
     impl Rows for ReplicaMembershipWriter {
         fn rows(
             &self,
@@ -2589,7 +2537,6 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(feature = "worker-host")]
     fn hosted_door() -> (Arc<MemoryStore>, Box<dyn Rows>) {
         let (store, door) = door();
         (
@@ -2602,61 +2549,51 @@ pub(crate) mod tests {
         )
     }
 
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_registration_is_laid_over_what_it_expects() {
         check_expectations(hosted_door);
     }
 
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_found_row_states_its_event_signal() {
         check_event_signal(hosted_door);
     }
 
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_hosted_door_checks_and_writes_the_whole_registration() {
         check_rank_rows(hosted_door).expect("rank registrations at the hosted door");
     }
 
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_hosted_door_keeps_the_write_of_one_row() {
         check_one_row(hosted_door);
     }
 
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_removal_takes_only_the_row_its_asker_saw() {
         check_guard(hosted_door).expect("both registrations stand in turn");
     }
 
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_refresh_writes_its_workers_labels_and_no_other_fact() {
         check_refresh(hosted_door).expect("the makers and their rows");
     }
 
-    #[cfg(feature = "worker-host")]
     #[test]
     fn the_hosts_own_source_removes_its_rows_under_any_key() {
         check_provider(hosted_door).expect("the makers and their rows");
     }
 
-    #[cfg(feature = "worker-host")]
     #[test]
     fn health_removes_inside_its_scope_alone() {
         check_health_scope(hosted_door).expect("the makers and their rows");
     }
 
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_removal_leaves_the_rows_maker_as_it_was() {
         check_maker(hosted_door).expect("the maker and its row");
     }
 
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_provider_acting_as_maker_takes_only_its_own_guarded_row() {
         let (store, door) = door();
@@ -2734,7 +2671,6 @@ pub(crate) mod tests {
         assert_eq!(store.by_key(URL), Some(again));
     }
 
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_providers_write_on_a_replica_that_does_not_lead_is_refused_and_writes_nothing() {
         use std::sync::atomic::AtomicUsize;
@@ -2774,7 +2710,6 @@ pub(crate) mod tests {
         assert_eq!(hosted.door.place(), at);
     }
 
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_providers_registration_numbers_its_life_under_the_term_the_log_leads() {
         use super::{ReplicaTurn, Turn};
@@ -2859,7 +2794,6 @@ pub(crate) mod tests {
         );
     }
 
-    #[cfg(feature = "worker-host")]
     #[test]
     fn the_two_doors_answer_one_row_alike() {
         let (replica, door) = door();
@@ -3456,7 +3390,6 @@ pub(crate) mod tests {
     /// A registration that states several ranks leaves a line a row: what
     /// the call made of each rank, `nothing` where it moved none, and each
     /// row that left.
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_registration_of_several_ranks_leaves_an_audit_line_a_row() {
         let lines = Logged::default();
@@ -3506,7 +3439,6 @@ pub(crate) mod tests {
         assert!(!logged.contains(URL), "{logged}");
     }
 
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_removal_health_asked_leaves_an_audit_line_that_names_health() {
         use tracing::{
@@ -3563,7 +3495,6 @@ pub(crate) mod tests {
     /// A refresh leaves one audit line a call, under its own name. One that
     /// states another fact than the labels is refused in a refresh's
     /// words, never in a removal's, and no line holds the URL.
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_refresh_leaves_its_audit_line_in_its_own_words() {
         const HTTP: &str = "http://10.0.0.5:8000";
@@ -3613,7 +3544,6 @@ pub(crate) mod tests {
     /// carries no pairing descriptor and its room test refuses a row that
     /// states one. So a worker that reports a transport and a version is
     /// registered and refreshed here, and its row states no descriptor.
-    #[cfg(feature = "worker-host")]
     #[test]
     fn a_worker_that_reports_pairing_facts_is_laid_with_no_descriptor() {
         const HTTP: &str = "http://10.0.0.6:8000";
@@ -3644,7 +3574,6 @@ pub(crate) mod tests {
         assert_eq!(version.map(String::as_str), Some("2"));
     }
 
-    #[cfg(feature = "worker-host")]
     #[test]
     fn every_write_of_a_provider_leaves_its_audit_line() {
         let lines = Logged::default();

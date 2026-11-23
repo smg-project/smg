@@ -258,9 +258,7 @@ fn past(field: &'static str, number: u32, most: u32) -> Status {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    // The rule a guard's lease is told by builds with the engine over
-    // worker lists.
-    #[cfg(feature = "in-process")]
+    // The rule a guard's lease is told by.
     mod lease_on_file;
 
     use std::{

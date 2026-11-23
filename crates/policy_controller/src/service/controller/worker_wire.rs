@@ -265,7 +265,6 @@ pub(crate) fn status_changed(id: WorkerId, from: WorkerStatus, to: WorkerStatus)
 /// One entry of the answer of a registration that states several ranks: the
 /// event a watcher is told of that row, without a place of its own. `None`
 /// for a case no registration makes of a row.
-#[cfg(feature = "worker-host")]
 pub(crate) fn rank_row(event: Event) -> Option<proto::RankRow> {
     use proto::rank_row::Made;
     let made = match event {
@@ -388,7 +387,6 @@ fn maker_weight(maker: &Registrant) -> usize {
 /// and a zero admission window, block size or port as none. The facts are
 /// written as the log writes them and read back as a standby reads them, so
 /// a fact the wire gains is taken here with no second list.
-#[cfg(feature = "worker-host")]
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "the host's door asks it of each registration")
@@ -925,12 +923,10 @@ pub(crate) fn registration(
 
 /// The most ranks one registration states: a replacement answers two rows a
 /// rank, and the answer stays inside half of a 4 MiB frame.
-#[cfg(feature = "worker-host")]
 pub(crate) const RANKS: u32 = 64;
 
 /// The ranks a registration states: one where it states none, and at most
 /// [`RANKS`].
-#[cfg(feature = "worker-host")]
 pub(crate) fn width(spec: &proto::WorkerSpec) -> Result<u16, Refused> {
     if spec.dp_size > RANKS {
         return Err(refused(
@@ -944,7 +940,6 @@ pub(crate) fn width(spec: &proto::WorkerSpec) -> Result<u16, Refused> {
 /// The facts of one rank of a registration that states `width` ranks, with
 /// the row that stands under the rank's URL. The URL's own rules hold for
 /// the engine's address ([`key`]) and for the rank's.
-#[cfg(feature = "worker-host")]
 pub(crate) fn rank_registration(
     spec: &proto::WorkerSpec,
     (url, rank, width): (&str, u16, u16),
