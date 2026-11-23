@@ -484,9 +484,11 @@ request goes to.
   route's rule. So a call that decides again stores the prompt once, for the worker it sends
   to, and a call shed under the rule's name stores nothing. A maker that does not answer is
   stored for the pick's first target.
-- Where a worker's state changes, or its route's rule answers it two ways, between the tree's
-  walk and the call's own read of it, the tree names another worker than the one the prompt went
-  to: the two reads are not one. The hash table is written for a pick's first target, as before.
+- **[built]** The one call takes a target by the answer the tree's walk was given on it: a
+  worker's state is read, and its route's rule asked, once a decision. So the tree names the
+  worker the prompt went to. A worker that stops being ready behind that read is still sent to,
+  as under classic, which also stores its selection ahead of the send. The hash table is written
+  for a pick's first target, as before.
 - **[planned]** A request given as text is decided the same way in the host's string tree.
 - **[planned]** The hash table leaves the single decision. Until then a model with an index of
   cache events reads the index and the hash table together, as today.
@@ -1193,8 +1195,9 @@ of the one picked worker, and of a single request's whole list only behind a dec
 route belongs to the list itself. And a plain request touches neither the load snapshot nor the
 other fields of the request.
 
-A request decided inside a lent token tree has the rule asked once more: inside the tree's walk,
-of the pick's targets best first, so the tree stores the prompt for a worker the rule takes.
+A request decided inside a lent token tree has the rule asked inside the tree's walk, of the
+pick's targets best first, so the tree stores the prompt for a worker the rule takes. The call
+takes that answer and asks the rule of that worker no second time.
 
 **3. Keep the placement with the request.**
 
