@@ -23,7 +23,7 @@ pub mod transcription {
 
     /// Qwen3-ASR: transcript forced via a `language {name}<asr_text>`
     /// assistant continuation; `<asr_text>` framing stripped from the output.
-    pub struct Qwen3Asr;
+    pub(crate) struct Qwen3Asr;
 
     impl TranscriptionFamily for Qwen3Asr {
         fn name(&self) -> &'static str {
@@ -52,13 +52,13 @@ pub mod transcription {
 
     /// The tag Qwen3-ASR emits (and the continuation prompt pre-seeds)
     /// between the language header and the transcript body.
-    pub const ASR_TEXT_TAG: &str = "<asr_text>";
+    pub(crate) const ASR_TEXT_TAG: &str = "<asr_text>";
 
     /// Byte cap on caller prompts, applied before sanitization.
     pub const MAX_PROMPT_BYTES: usize = 4096;
 
     /// `(code, name)` pairs of the languages the checkpoint transcribes.
-    pub const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[
+    pub(crate) const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[
         ("ar", "Arabic"),
         ("yue", "Cantonese"),
         ("zh", "Chinese"),
@@ -92,7 +92,7 @@ pub mod transcription {
     ];
 
     /// Whether a model id, path, or label value names this family.
-    pub fn is_qwen3_asr_identifier(value: &str) -> bool {
+    pub(crate) fn is_qwen3_asr_identifier(value: &str) -> bool {
         let value = value.to_ascii_lowercase();
         value.contains("qwen3-asr") || value.contains("qwen3_asr")
     }
@@ -100,7 +100,7 @@ pub mod transcription {
     /// Sanitize a caller prompt: cap its size, then strip ChatML-like
     /// control tokens and the [`ASR_TEXT_TAG`] to a fixpoint, so a prompt
     /// cannot smuggle framing the output parser would misread.
-    pub fn sanitize_prompt(mut text: String) -> Result<String, PromptTooLong> {
+    pub(crate) fn sanitize_prompt(mut text: String) -> Result<String, PromptTooLong> {
         if text.len() > MAX_PROMPT_BYTES {
             return Err(PromptTooLong {
                 max_bytes: MAX_PROMPT_BYTES,
@@ -138,7 +138,7 @@ pub mod transcription {
 
     /// Resolve a language code or English name to the checkpoint's canonical
     /// language name; `None` in and blank map to `None` out.
-    pub fn normalize_language(
+    pub(crate) fn normalize_language(
         language: Option<&str>,
     ) -> Result<Option<String>, UnsupportedLanguage> {
         let Some(language) = language.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -155,7 +155,7 @@ pub mod transcription {
 
     /// Strip the model's framing from raw chat content: drop `<|im_end|>`,
     /// keep everything after the [`ASR_TEXT_TAG`] when present.
-    pub fn parse_transcript(raw: &str) -> String {
+    pub(crate) fn parse_transcript(raw: &str) -> String {
         let cleaned = raw.replace("<|im_end|>", "");
         let cleaned = cleaned.trim();
         cleaned

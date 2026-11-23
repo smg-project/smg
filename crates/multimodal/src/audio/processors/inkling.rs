@@ -57,7 +57,7 @@ impl Default for InklingAudioEncoderParams {
 }
 
 impl InklingAudioEncoderParams {
-    pub fn from_model_config(config: &serde_json::Value) -> Self {
+    pub(crate) fn from_model_config(config: &serde_json::Value) -> Self {
         let mut params = Self::default();
         let Some(audio_config) = config.get("audio_config") else {
             return params;
@@ -128,7 +128,7 @@ impl InklingAudioProcessor {
         }
     }
 
-    pub fn from_model_config(config: &serde_json::Value) -> Self {
+    pub(crate) fn from_model_config(config: &serde_json::Value) -> Self {
         Self::with_params(InklingAudioEncoderParams::from_model_config(config))
     }
 
