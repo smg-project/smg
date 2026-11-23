@@ -45,13 +45,9 @@
 //!   the session's thread, and one a request would time the wake.
 //! - `policy_decide_stream/count/<mode>/<members>`, one cell a run, named by
 //!   `DECIDE_STREAM_COUNT=<mode>:<members>:<decisions>`: the whole process's
-//!   allocator calls a decision, `in_process` (the store's deciding door, a
-//!   view as the row's decider reads it and the engine's decide on this
-//!   thread), `commit` (the same with the pick's lease issued at the store's
-//!   leases door and ended there, as a host that embeds the engine commits a
-//!   decision), `stream` (the decision asked over one stream, one at a time so
-//!   every decision wakes the same threads whatever its fleet, the client's
-//!   own calls included) or
+//!   allocator calls a decision, `stream` (the decision asked over one
+//!   stream, one at a time so every decision wakes the same threads
+//!   whatever its fleet, the client's own calls included) or
 //!   `pair` (the `stream` cell under a pair plan, over that many prefills and
 //!   as many decodes: each request enters at the pair's prefill, and its one
 //!   answer names both workers under two leases of one id). A run's
@@ -186,7 +182,6 @@ mod filled;
 use std::{
     alloc::{GlobalAlloc, Layout},
     env, fs,
-    hint::black_box,
     io::{self, Write},
     mem,
     net::{Ipv4Addr, SocketAddr},
@@ -200,7 +195,7 @@ use std::{
 
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec, ShadowSpec},
-    engine::{Constraints, LoadRow, PoolFacts, RequestFacts, Role, Scratch},
+    engine::{LoadRow, Role},
     service::{
         controller::{Config, Controller, ElectionConfig, Listener, Scope, State},
         proto::{
@@ -211,10 +206,9 @@ use smg_policy_controller::{
         },
     },
     store::{
-        GatewayId, Hand, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore,
-        PickRecord, ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore,
+        GatewayId, Hand, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore,
     },
-    tracking::{Lease, LeaseId, ReleaseReason, Said},
+    tracking::{LeaseId, ReleaseReason, Said},
 };
 use tokio::{
     runtime,
@@ -591,8 +585,6 @@ static GIVEN: OnceLock<Vec<usize>> = OnceLock::new();
 const RING: u64 = 1_024;
 /// The budget every request brings.
 const BUDGET_MICROS: u32 = 5_000_000;
-/// The dispatch deadline an in-process commit files its lease with.
-const DISPATCH: Duration = Duration::from_secs(5);
 /// A stream's window of credit, as the `Welcome` states it.
 const WINDOW: u64 = 128;
 /// An offered request handed over this long after it was due is counted
@@ -2106,101 +2098,6 @@ fn ties(counts: [u64; 4]) -> String {
     format!("{apart}/{one_then_two}/{two_then_one}/{alike}")
 }
 
-/// The engine's own decision, in process: the store's deciding door, the
-/// view as the row's decider reads it and the engine's decide on this
-/// thread, over buffers kept across decisions. With `commit` the pick's
-/// lease is issued at the store's leases door and ended there, as a host
-/// that embeds the engine commits a decision and reports its end: one lease
-/// on file at a time. Returns the allocator's calls over `decisions` of
-/// them.
-fn in_process(store: &MemoryStore, decisions: u64, commit: bool) -> u64 {
-    let name = model(0);
-    let mut view = ViewBuffers::default();
-    let mut scratch = Scratch::new();
-    let gateway = GatewayId(1);
-    let term = store.term();
-    let mut decide = |seed: u64| {
-        let ask = ViewQuery {
-            gateway,
-            now: Instant::now(),
-            pinned: None,
-            affinity: false,
-            signal_cells: false,
-        };
-        let decision = store.deciding(|world| {
-            // The door a decider reads a plain request's pool by: the
-            // publication's own rows, the asking gateway's vetoes and the
-            // leases' counts beside them.
-            let read = world.view(&name, Role::Single, &ask, false, &mut view);
-            let facts = RequestFacts {
-                model: &name,
-                seed,
-                budget_micros: BUDGET_MICROS,
-                now_micros: world.micros(ask.now),
-                lent_in_flight: read.as_ref().and_then(|read| read.in_flight.as_ref()),
-                ..RequestFacts::default()
-            };
-            let pool = read.map_or_else(
-                || PoolFacts {
-                    generation: world.spec().generation(),
-                    ..PoolFacts::default()
-                },
-                |read| read.built.pool_facts(),
-            );
-            let (candidates, stalled) = read
-                .map(|read| (read.candidates, read.stalled))
-                .unwrap_or_default();
-            world.spec().engine().decide(
-                &facts,
-                &pool,
-                candidates,
-                &Constraints {
-                    stalled,
-                    ..Constraints::default()
-                },
-                &mut scratch,
-            )
-        });
-        let target = decision
-            .pick()
-            .and_then(|pick| pick.targets.first())
-            .expect("a pick over the fleet, in process")
-            .id;
-        if commit {
-            // An id of the host's own minting: the high bit.
-            let lease = LeaseId(1 << 63 | seed);
-            let filed = store.issue(LeaseRecord {
-                lease: Lease {
-                    id: lease,
-                    ..Lease::default()
-                },
-                gateway,
-                request: seed,
-                target,
-                picked: PickRecord::default(),
-                decode: None,
-                term,
-                issued_at: ask.now,
-                dispatch_deadline: ask.now + DISPATCH,
-                state: LeaseState::ISSUED,
-            });
-            assert_eq!(filed, Ok(()), "the store files the lease");
-            let ended = store.released(gateway, lease, None, ReleaseReason::ClientGone);
-            assert!(ended, "the lease is on the store's file");
-        }
-        black_box(&decision);
-    };
-    for seed in 0..2_000 {
-        decide(seed);
-    }
-    counting();
-    for seed in 0..decisions {
-        decide(2_000 + seed);
-    }
-    COUNTING.store(false, Ordering::Relaxed);
-    CALLS.load(Ordering::Relaxed)
-}
-
 /// One count row, `<mode>:<members>:<decisions>`.
 fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
     let mut parts = cell.split(':');
@@ -2227,22 +2124,11 @@ fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
         pair: mode == "pair",
     };
     let (calls, busy) = match mode {
-        "in_process" | "commit" => {
-            let served = serve(shape);
-            let calls = in_process(&served.store, decisions, mode == "commit");
-            served.stop();
-            (calls, 0)
-        }
         "stream" | "pair" => {
             let row = wire(shape);
             (row.calls, row.busy)
         }
-        _ => {
-            return writeln!(
-                out,
-                "a count row's mode is in_process, commit, stream or pair"
-            )
-        }
+        _ => return writeln!(out, "a count row's mode is stream or pair"),
     };
     writeln!(
         out,
