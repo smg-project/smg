@@ -1338,7 +1338,7 @@ request ──> route (HTTP or gRPC, any family)
 - **Each request.** Four of the five functions ask the engine. They fill `PlaceRequest` from the inputs
   they already take. A route names the answer's type and makes its load guard from the answer, in the places it made one before.
 
-  The fifth, the encode stage's own selection, takes its pair from `select_pair` and refuses a request that carries an item for the encode workers by name **[planned]**: the engine places no encoder yet.
+  The fifth, the encode stage's own selection, takes its pair from `select_pair` and refuses a request that carries an item for the encode workers by name **[planned]**: the gateway does not yet hand the engine an encode request's three lists.
 
   Where the document asks a pair's decode again, the two pair routes make one more call between the prefill's answer and the decode's dispatch (section 8.2).
 
@@ -1742,7 +1742,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The lease and its events; the guard | **[built]** | |
 | The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request, for a pair and for an encode request, with the route's rule and the decision made again, three decisions a call at most or a single request's fourth where the third found the workers the route's rule takes, and a single request's later decisions held to those workers; the later decisions of a pair and of an encode request held to them are not |
 | The crate's bench of the kept engine | **[planned]** | |
-| The gateway as a host | **[partly]** | section 9, behind `--policy-controller on`, which is off by default: single requests and pairs on the HTTP and gRPC routes, a pair's decode asked again, a host's table of stages at the start; an encode request that carries an item is refused by name until the engine places an encoder; every classic test of the gateway with the engine on (the bar's fourth point) is not met yet |
+| The gateway as a host | **[partly]** | section 9, behind `--policy-controller on`, which is off by default: single requests and pairs on the HTTP and gRPC routes, a pair's decode asked again, a host's table of stages at the start; an encode request that carries an item is refused by name until the gateway hands the engine its three lists; every classic test of the gateway with the engine on (the bar's fourth point) is not met yet |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |
 | The controller on the one engine and the worker crate's structures | **[partly]** | a single request is decided by `PolicyEngine` over the registry's list; a pair's phases are answered `Busy`; a decision reads no load report, no overload verdict and no cache event, and a sessions rule's cap counts nothing (section 10.2) |
 | The controller finding its own workers | **[partly]** | discovery registers nothing yet |
