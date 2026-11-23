@@ -3,7 +3,10 @@
 
 use std::{
     cell::{Cell, RefCell},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        mpsc, Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -14,9 +17,9 @@ use super::{
     HealthSink, HealthWrite, Journal, JournalKinds, KvEvent, KvEventSink, LeaseRecord,
     LeaseRefused, LeaseState, LeasesStore, LoadSample, LoadSink, LoadSource, LookOutcome,
     MembershipChange, MembershipTail, MemoryStore, PickRecord, Pin, PollMode, Position,
-    Reachability, ReservationKind, ReservationStore, ResyncReason, SequenceHash, SessionsStore,
-    Sides, Signals, SnapshotChunk, StoreSnapshot, StoredBlock, VetoWrite, ViewBuffers, ViewQuery,
-    WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+    ReservationKind, ReservationStore, ResyncReason, SequenceHash, SessionsStore, Sides, Signals,
+    SnapshotChunk, StoreSnapshot, StoredBlock, VetoWrite, WorkerFacts, WorkerPatch, WorkerRow,
+    WorkerStatus, WorkersStore,
 };
 use crate::{
     document::spec,
@@ -29,9 +32,12 @@ use crate::{
         view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
     },
     service::replication::Log,
-    tracking::lease::{
-        Dispatch, Lease, LeaseId, Membership, Outcome, ReleaseReason, Said, Side, TransportClass,
-        DISPATCH_TTL,
+    tracking::{
+        lease::{
+            Dispatch, Lease, LeaseId, Membership, Outcome, ReleaseReason, Said, Side,
+            TransportClass, DISPATCH_TTL,
+        },
+        HostCount,
     },
 };
 
@@ -3154,46 +3160,52 @@ fn gateways_dropped_together_leave_whole_and_say_their_leases_in_the_order_asked
 /// No lease's counter: what an issue that ended nothing hands back.
 const NONE: [u64; 0] = [];
 
-/// Each member's requests in flight as a view of the cases' model reads
-/// them for `gateway`, in the view's order: by worker id.
-fn in_flight_for(store: &MemoryStore, gateway: GatewayId) -> Vec<(WorkerId, u32)> {
-    let ask = ViewQuery {
-        gateway,
-        now: Instant::now(),
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
-    };
-    let mut out = ViewBuffers::default();
-    store.deciding(|world| {
-        if let Some(built) = world.build("m", Role::Single, &ask, &mut out) {
-            world.count_in_flight(&built, &ask, &mut out.candidates);
-        }
-    });
-    let rows = out.candidates.iter();
-    let written: Vec<(WorkerId, u32)> = rows.map(|row| (row.id, row.in_flight)).collect();
-    // The store's view reads the same counts: beside the rows it lends,
-    // each at its row's position, and in the rows it writes.
-    let mut viewed = ViewBuffers::default();
-    let read: Vec<(WorkerId, u32)> = store.deciding(|world| {
-        let view = world.view("m", Role::Single, &ask, false, &mut viewed);
-        view.map_or_else(Vec::new, |view| {
-            let rows = view.candidates.iter();
-            let lent = view.in_flight;
-            rows.map(|row| {
-                let own = row.in_flight;
-                (row.id, lent.map_or(own, |lent| lent.at(row.position)))
-            })
-            .collect()
-        })
-    });
-    assert_eq!(read, written, "the view's counts are the door's");
-    written
+/// One worker's requests in flight as its host counts them: a number the
+/// store steps ([`HostCount`]).
+struct Tally(Arc<AtomicU32>);
+
+impl HostCount for Tally {
+    fn booked(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn freed(&self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
-/// [`in_flight_for`] the gateway the cases issue their leases to.
+/// The count a host keeps of the row `id` from here on: handed to the
+/// store, which steps it with each lease that books the row and each that
+/// books it no longer ([`WorkersStore::host_count`]). A count handed for a
+/// row takes a step for each lease that books the row by then. `None` for
+/// a row that left: the store takes no count for it.
+fn handed_count(store: &MemoryStore, id: WorkerId) -> Option<Arc<AtomicU32>> {
+    let count = Arc::new(AtomicU32::new(0));
+    let handed = store.host_count(id, Box::new(Tally(Arc::clone(&count))));
+    handed.then_some(count)
+}
+
+/// The count a host keeps of the row `id`, which stands in the store.
+fn standing(store: &MemoryStore, id: WorkerId) -> Arc<AtomicU32> {
+    handed_count(store, id).expect("the row stands in the store")
+}
+
+/// What the leases on file book on the row `id`, as a host that asks now
+/// counts it ([`handed_count`]).
+fn booked_on(store: &MemoryStore, id: WorkerId) -> Option<u32> {
+    Some(handed_count(store, id)?.load(Ordering::Relaxed))
+}
+
+/// Each member's requests in flight, by worker id: what the leases on
+/// file book on each row that serves the cases' model ([`booked_on`]).
 pub(super) fn in_flight(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
-    in_flight_for(store, GatewayId(1))
+    let (_, mut rows) = store.all_rows();
+    rows.retain(|row| row.facts.models.iter().any(|model| model == "m"));
+    rows.sort_by_key(|row| row.id);
+    let counted = rows
+        .iter()
+        .filter_map(|row| Some((row.id, booked_on(store, row.id)?)));
+    counted.collect()
 }
 
 /// A pair's decode side on `target`: issued, with no alternate behind it.
@@ -3217,7 +3229,7 @@ pub(super) fn booking(gateway: GatewayId, id: u64, target: WorkerId, now: Instan
 }
 
 #[test]
-fn a_views_row_reads_the_leases_on_file_that_book_its_worker() {
+fn a_rows_count_reads_the_leases_on_file_that_book_its_worker() {
     let store = MemoryStore::new();
     let (a, b) = (ready(&store, "http://a:1"), ready(&store, "http://b:1"));
     let (first, second) = (a.min(b), a.max(b));
@@ -3409,22 +3421,6 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     );
     assert!(store.vetoed(gateway, id, now));
     assert!(store.completed_ok_since(gateway, id, now));
-    let ask = ViewQuery {
-        gateway,
-        now,
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
-    };
-    let mut out = ViewBuffers::default();
-    store
-        .build_view("m", Role::Single, &ask, &mut out)
-        .expect("the pool");
-    let health = out.candidates[0].health;
-    assert!(
-        health.stalled && health.breaker_open,
-        "the decision reads the veto"
-    );
     assert_eq!(LoadSink::load(&store, id, 0), Some(local_load));
     assert_eq!(store.kv().held_blocks("m"), 1);
     assert_eq!(WorkersStore::get(&store, id), Some(expected));
@@ -3437,25 +3433,8 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     );
 }
 
-/// The count in a one-member world held across a snapshot. Its slot still
-/// reads the live count after the worker leaves the current world.
-fn held_count(world: &StoreSnapshot, gateway: GatewayId, now: Instant) -> u32 {
-    let ask = ViewQuery {
-        gateway,
-        now,
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
-    };
-    let mut out = ViewBuffers::default();
-    let view = world
-        .view("m", Role::Single, &ask, false, &mut out)
-        .expect("the old pool");
-    view.in_flight.expect("the old slot is lent").at(0)
-}
-
 #[test]
-fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_ends_on_its_own_count() {
+fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_moves_no_other_count() {
     let store = MemoryStore::new();
     let left = publisher(&store, "http://a:1", 0);
     store.publish_now();
@@ -3480,7 +3459,6 @@ fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_ends_on_its_own_count(
     LoadSink::record(&source, joined, 0, row(0), now, LoadSource::Stream);
     assert!(store.watch_from(source.checkpoint(JournalKinds::All)));
     assert_eq!(leases.get(gateway, lease.lease.id), Some(lease));
-    assert_eq!(held_count(&before, gateway, now), 1);
     assert_ne!(store.snapshot().booked_of(joined), Some(slot));
     assert_eq!(in_flight(&store), [(joined, 0)]);
     assert!(WorkersStore::by_key(&store, "http://a:1").is_none());
@@ -3497,7 +3475,6 @@ fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_ends_on_its_own_count(
         Some(left)
     );
     assert!(leases.released(gateway, lease.lease.id, None, ReleaseReason::ClientGone));
-    assert_eq!(held_count(&before, gateway, now), 0);
     assert_eq!(in_flight(&store), [(joined, 0)]);
     LoadSink::record(&store, joined, 0, row(0), now, LoadSource::Stream);
     assert!(LoadSink::load(&store, joined, 0).is_some());
@@ -3508,7 +3485,6 @@ fn a_watch_snapshot_gives_a_new_incarnation_its_own_count() {
     let store = MemoryStore::new();
     let key = "http://a:1";
     let old = ready(&store, key);
-    let before = store.snapshot();
     let (gateway, now) = (GatewayId(1), Instant::now());
     let lease = booking(gateway, 1, old, now);
     let leases: &dyn LeasesStore = &store;
@@ -3522,9 +3498,7 @@ fn a_watch_snapshot_gives_a_new_incarnation_its_own_count() {
     assert_eq!(store.by_key(key).map(|row| row.id), Some(new));
     assert!(WorkersStore::get(&store, old).is_none());
     assert_eq!(in_flight(&store), [(new, 0)]);
-    assert_eq!(held_count(&before, gateway, now), 1);
     assert!(leases.released(gateway, lease.lease.id, None, ReleaseReason::ClientGone));
-    assert_eq!(held_count(&before, gateway, now), 0);
     assert_eq!(in_flight(&store), [(new, 0)]);
 }
 
@@ -3607,21 +3581,12 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
     );
     assert_eq!(store.publish_due(), None);
     assert_eq!(store.filed_members(), 0);
-    let ask = ViewQuery {
-        gateway: GatewayId(1),
-        now: Instant::now(),
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
-    };
-    let mut out = ViewBuffers::default();
-    store
-        .build_view("m", Role::Single, &ask, &mut out)
-        .expect("the pool");
-    assert_eq!(out.candidates.len(), 1);
-    assert_eq!(out.candidates[0].id, id);
-    assert_eq!(out.candidates[0].labels, 1, "the cut's labels");
-    assert!(out.candidates[0].health.draining, "the cut's status");
+    let (_, rows) = store.all_rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, id);
+    let zone = rows[0].facts.labels.get("zone").map(String::as_str);
+    assert_eq!(zone, Some("b"), "the cut's labels");
+    assert_eq!(rows[0].status, WorkerStatus::Draining, "the cut's status");
     let snapshot = Membership::Snapshot(&[id]);
     assert_eq!(
         *heard.lock().expect("the stage heard"),
@@ -3764,60 +3729,6 @@ fn a_take_beside_a_restore_files_its_first_lease_behind_it() {
     assert_eq!(in_flight(store), [(a, 1)]);
 }
 
-/// A pool that holds another gateway's host-local row is walked as its
-/// build walks it: each row the asking gateway reaches reads its own
-/// worker's count, and a build alone writes none.
-#[test]
-fn a_count_is_written_on_its_own_workers_row_past_another_gateways_local_row() {
-    let store = MemoryStore::new();
-    let (gateway, now) = (GatewayId(1), Instant::now());
-    store.set_term(1);
-    let member = |key: &str, reachable_from| {
-        let id = store
-            .upsert(WorkerFacts {
-                reachable_from,
-                ..facts(key, 1)
-            })
-            .id();
-        store.publish_now();
-        let revision = WorkersStore::get(&store, id).expect("the row").revision;
-        store
-            .set_status(id, WorkerStatus::Ready, revision)
-            .expect("ready");
-        id
-    };
-    let open = member("http://a:1", Reachability::Any);
-    let theirs = member("unix:///b", Reachability::Gateway(GatewayId(2)));
-    let ours = member("unix:///c", Reachability::Gateway(gateway));
-    let last = member("http://d:1", Reachability::Any);
-    // No two workers hold the same count.
-    let mut id = 0;
-    for (count, target) in [(1, open), (2, theirs), (3, ours), (4, last)] {
-        for _ in 0..count {
-            id += 1;
-            LeasesStore::issue(&store, booking(gateway, id, target, now)).expect("filed");
-        }
-    }
-    let by_id = |mut rows: Vec<(WorkerId, u32)>| {
-        rows.sort_unstable();
-        rows
-    };
-    let seen = |asker: u64| in_flight_for(&store, GatewayId(asker));
-    assert_eq!(seen(1), by_id(vec![(open, 1), (ours, 3), (last, 4)]));
-    assert_eq!(seen(2), by_id(vec![(open, 1), (theirs, 2), (last, 4)]));
-    assert_eq!(seen(3), by_id(vec![(open, 1), (last, 4)]));
-    let mut built = ViewBuffers::default();
-    let ask = ViewQuery {
-        gateway,
-        now,
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
-    };
-    store.build_view("m", Role::Single, &ask, &mut built);
-    assert!(built.candidates.iter().all(|row| row.in_flight == 0));
-}
-
 /// The counts are one table in pieces that never move: every slot names a
 /// cell of its own in whichever piece holds it, a run of slots is read in
 /// its order across the pieces, and the slot that names no cell reads zero
@@ -3900,8 +3811,9 @@ fn a_member_keeps_its_slot_and_a_leavers_slot_is_given_to_no_one() {
 
 /// Two leases filed through `file`, one on a member that is built and one
 /// on a member whose first build is owed to the window. Each books its
-/// worker's count and asks for no build: the row the window's build lists
-/// reads its lease, and each lease ends on the count it booked.
+/// worker's count and asks for no build: its host's count reads the lease
+/// inside the window and behind the window's build, and each lease ends
+/// on the count it booked.
 fn filed_ahead_of_a_first_build(file: fn(&dyn LeasesStore, GatewayId, &[LeaseRecord; 2])) {
     let store = MemoryStore::new();
     let built = ready(&store, "http://a:1");
@@ -3927,12 +3839,13 @@ fn filed_ahead_of_a_first_build(file: fn(&dyn LeasesStore, GatewayId, &[LeaseRec
         (builds, true),
         "a lease asked for the build"
     );
-    store.publish_now();
     let of = |count| {
         let mut rows = [(built, count), (owed, count)];
         rows.sort_unstable();
         rows
     };
+    assert_eq!(in_flight(&store), of(1), "inside the window");
+    store.publish_now();
     assert_eq!(in_flight(&store), of(1));
     for id in [1, 2] {
         assert!(leases.released(gateway, LeaseId(id), None, ReleaseReason::ClientGone));
@@ -3992,8 +3905,8 @@ fn a_lease_issued_leaves_an_owed_build_to_its_window() {
 
 /// A first dispatch that moves a lease onto a worker inside its
 /// registration window books that worker's count and asks for no build:
-/// the row the window's build lists reads the lease, and the lease ends on
-/// the count it booked.
+/// its host's count reads the lease inside the window and behind the
+/// window's build, and the lease ends on the count it booked.
 #[test]
 fn a_lease_dispatched_onto_a_worker_inside_its_window_books_its_count() {
     let store = MemoryStore::new();
@@ -4029,12 +3942,13 @@ fn a_lease_dispatched_onto_a_worker_inside_its_window_books_its_count() {
         (builds, true),
         "the dispatch asked for the build"
     );
-    store.publish_now();
     let of = |count| {
         let mut rows = [(built, 0), (owed, count)];
         rows.sort_unstable();
         rows
     };
+    assert_eq!(in_flight(&store), of(1), "inside the window");
+    store.publish_now();
     assert_eq!(in_flight(&store), of(1));
     assert!(leases.released(gateway, LeaseId(1), None, ReleaseReason::ClientGone));
     assert_eq!(in_flight(&store), of(0));
@@ -4141,10 +4055,10 @@ fn a_member_given_its_first_model_books_a_lease_inside_that_window() {
 }
 
 /// A lease on a member that offers no model books its count all the same:
-/// the world behind the member's first build names its slot, and the row
-/// reads the count at the build that first lists the member in a pool.
+/// its host's count reads the lease while the member stands in no pool,
+/// and through the write that gives it its first model.
 #[test]
-fn a_lease_on_a_member_in_no_pool_is_counted_once_a_build_lists_it() {
+fn a_lease_on_a_member_in_no_pool_books_its_count() {
     let store = MemoryStore::new();
     let built = ready(&store, "http://a:1");
     let bare = WorkerFacts {
@@ -4158,7 +4072,8 @@ fn a_lease_on_a_member_in_no_pool_is_counted_once_a_build_lists_it() {
     let (gateway, now) = (GatewayId(1), Instant::now());
     leases.set_term(1);
     assert_eq!(leases.issue(booking(gateway, 1, owed, now)), Ok(()));
-    assert_eq!(in_flight(&store), [(built, 0)], "it stands in no pool");
+    assert_eq!(in_flight(&store), [(built, 0)], "it serves no model");
+    assert_eq!(booked_on(&store, owed), Some(1), "booked, in no pool");
     assert_eq!(store.upsert(facts("http://b:1", 1)).id(), owed);
     let revision = WorkersStore::get(&store, owed).expect("the row").revision;
     store
@@ -5792,27 +5707,11 @@ fn a_places_apply_applies_what_was_handed_at_its_own_file() {
     assert_eq!(in_flight(&store), [(a, 0)]);
 }
 
-/// The rows' counts read once, as a decision reads them.
-fn in_flight_once(store: &MemoryStore, out: &mut ViewBuffers) -> u32 {
-    let ask = ViewQuery {
-        gateway: GatewayId(1),
-        now: Instant::now(),
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
-    };
-    store.deciding(|world| {
-        if let Some(built) = world.build("m", Role::Single, &ask, &mut *out) {
-            world.count_in_flight(&built, &ask, &mut out.candidates);
-        }
-    });
-    out.candidates.iter().map(|row| row.in_flight).sum()
-}
-
 /// A place's apply reads behind what a watch kept, whatever the watching
 /// thread does meanwhile. A hand leaves a release under the second
 /// file's watch and returns; this place then applies what waits at the
-/// other files and reads the rows' count once, as a decision does. In
+/// other files and reads the worker's count once, as a decision over
+/// worker lists does: the count its host keeps, with no lock taken. In
 /// every other round the second file's thread takes up a job as that
 /// read is made: it says it works under its turn, with its apply behind
 /// the mark, so the read finds the release applied, by this place or by
@@ -5903,7 +5802,7 @@ fn a_places_apply_reads_behind_a_watchs_frames_beside_a_job_that_begins() {
                 std::thread::yield_now();
             }
         };
-        let mut rows = ViewBuffers::default();
+        let counted = standing(store, a);
         for round in 1..=ROUNDS {
             wait_for(WATCHES);
             drop(told());
@@ -5918,9 +5817,9 @@ fn a_places_apply_reads_behind_a_watchs_frames_beside_a_job_that_begins() {
                 }
             }
             place.apply_waiting();
-            let counted = in_flight_once(store, &mut rows);
             assert_eq!(
-                counted, 0,
+                counted.load(Ordering::Relaxed),
+                0,
                 "round {round}: the read is behind the release's apply"
             );
             if !begins {

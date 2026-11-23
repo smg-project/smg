@@ -1,6 +1,6 @@
 //! The count a store's host keeps for a worker ([`HostCount`]): the store
-//! keeps it equal to the worker's cell at every door of the leases, a
-//! lease filed ahead of it is on it, and it goes with its row.
+//! steps it at every door of the leases, a lease filed ahead of it is on
+//! it, and it goes with its row.
 
 use std::{
     sync::{
@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{booked, booking, done, facts, followed, issue_pair, on, pair, ready};
+use super::{booking, done, facts, followed, issue_pair, on, pair, ready};
 use crate::{
     engine::{
         decision::{Target, Targets},
@@ -85,33 +85,23 @@ fn remove(store: &MemoryStore, id: WorkerId) {
     WorkersStore::remove(store, id, revision).expect("removed");
 }
 
-/// Three ready workers with a count handed for each, and the read of both
-/// counts: each worker's count is its cell's, under the step's name.
-fn fleet() -> (
-    MemoryStore,
-    [WorkerId; 3],
-    impl Fn(&MemoryStore, &str) -> Vec<u32>,
-) {
+/// Three ready workers with a count handed for each, and the read of the
+/// three counts.
+fn fleet() -> (MemoryStore, [WorkerId; 3], impl Fn() -> [i64; 3]) {
     let store = MemoryStore::new();
     let workers = ["http://a:1", "http://b:1", "http://c:1"].map(|key| ready(&store, key));
     let counts = workers.map(|id| handed(&store, id));
-    let both = move |store: &MemoryStore, step: &str| {
-        let cells = booked(store, &workers);
-        let hosts: Vec<i64> = counts.iter().map(|kept| kept.held()).collect();
-        let cells_wide: Vec<i64> = cells.iter().map(|&cell| i64::from(cell)).collect();
-        assert_eq!(hosts, cells_wide, "{step}: each host's count is its cell's");
-        cells
-    };
-    (store, workers, both)
+    let held = move || [0, 1, 2].map(|at: usize| counts[at].held());
+    (store, workers, held)
 }
 
-/// Every door of the leases steps a host's count with its cell: a filing,
-/// a dispatch that names another target, a completion, a pair's two
-/// sides, a release, the dispatch deadline, a new leader's restore and a
-/// gone gateway.
+/// Every door of the leases steps a host's count: a filing, a dispatch
+/// that names another target, a completion, a pair's two sides, a
+/// release, the dispatch deadline, a new leader's restore and a gone
+/// gateway.
 #[test]
-fn every_door_of_the_leases_steps_a_hosts_count_with_its_cell() {
-    let (store, [a, b, c], both) = fleet();
+fn every_door_of_the_leases_steps_a_hosts_count() {
+    let (store, [a, b, c], held) = fleet();
     let leases: &dyn LeasesStore = &store;
     let (gateway, now) = (GatewayId(1), Instant::now());
     leases.set_term(1);
@@ -127,36 +117,33 @@ fn every_door_of_the_leases_steps_a_hosts_count_with_its_cell() {
     let mut single = booking(gateway, 1, a, now);
     single.picked = PickRecord::of(&targets);
     assert_eq!(leases.issue(single), Ok(()));
-    assert_eq!(both(&store, "a filing"), [1, 0, 0]);
+    assert_eq!(held(), [1, 0, 0], "a filing");
     assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Single, 1), now));
-    assert_eq!(both(&store, "a dispatch on another target"), [0, 1, 0]);
+    assert_eq!(held(), [0, 1, 0], "a dispatch on another target");
     assert!(leases.completed(gateway, LeaseId(1), &done(Side::Single)));
-    assert_eq!(both(&store, "a completion"), [0, 0, 0]);
+    assert_eq!(held(), [0, 0, 0], "a completion");
 
     // A pair: each side on its own worker, the decode sent to an alternate.
     issue_pair(leases, pair(2, a, &[b, c], now)).expect("the key is free");
-    assert_eq!(both(&store, "a pair's filing"), [1, 1, 0]);
+    assert_eq!(held(), [1, 1, 0], "a pair's filing");
     assert!(leases.dispatched(gateway, LeaseId(2), on(Side::Decode, 1), now));
-    assert_eq!(
-        both(&store, "a decode's dispatch on an alternate"),
-        [1, 0, 1]
-    );
+    assert_eq!(held(), [1, 0, 1], "a decode's dispatch on an alternate");
     let gone = ReleaseReason::ClientGone;
     assert!(leases.released(gateway, LeaseId(2), None, gone));
-    assert_eq!(both(&store, "a release of every side"), [0, 0, 0]);
+    assert_eq!(held(), [0, 0, 0], "a release of every side");
 
     // A lease no dispatch names by its deadline.
     assert_eq!(leases.issue(booking(gateway, 3, c, now)), Ok(()));
-    assert_eq!(both(&store, "a second filing"), [0, 0, 1]);
+    assert_eq!(held(), [0, 0, 1], "a second filing");
     assert_eq!(leases.expire(now + Duration::from_secs(9)).len(), 1);
-    assert_eq!(both(&store, "the dispatch deadline"), [0, 0, 0]);
+    assert_eq!(held(), [0, 0, 0], "the dispatch deadline");
 
     // A new leader's file: what a gateway's pages list, then the gateway gone.
     let pages = [booking(gateway, 4, b, now), booking(gateway, 5, b, now)];
     assert_eq!(leases.restore(gateway, &pages), 2);
-    assert_eq!(both(&store, "a restore"), [0, 2, 0]);
+    assert_eq!(held(), [0, 2, 0], "a restore");
     assert_eq!(leases.drop_gateways(&[gateway]), [2]);
-    assert_eq!(both(&store, "a gone gateway"), [0, 0, 0]);
+    assert_eq!(held(), [0, 0, 0], "a gone gateway");
 }
 
 /// A lease filed ahead of its worker's count is on the first count handed,
@@ -172,12 +159,11 @@ fn a_lease_filed_ahead_of_its_workers_count_is_on_the_first_count_handed() {
         assert_eq!(leases.issue(booking(gateway, id, worker, now)), Ok(()));
     }
     assert!(leases.completed(gateway, LeaseId(1), &done(Side::Single)));
-    assert_eq!(booked(&store, &[worker]), [1]);
 
     let kept = handed(&store, worker);
     assert_eq!(kept.held(), 1, "the lease that stands");
     assert!(leases.completed(gateway, LeaseId(2), &done(Side::Single)));
-    assert_eq!((kept.held(), booked(&store, &[worker])), (0, vec![0]));
+    assert_eq!(kept.held(), 0);
 }
 
 /// A count handed in the place of one that steps the same number leaves
@@ -408,7 +394,6 @@ fn a_count_handed_among_filings_holds_the_leases_that_stand() {
         among_filings(&store, worker, || hand(&store, worker, &kept));
         let stand = u32::try_from(u64::from(WRITERS) * LEASES / 2).expect("a small count");
         assert_eq!(kept.held(), i64::from(stand), "the leases that stand");
-        assert_eq!(booked(&store, &[worker]), [stand], "as the worker's cell");
     }
 }
 
