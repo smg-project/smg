@@ -1587,6 +1587,19 @@ pub(crate) mod tests {
         Checked::new(frame).expect("a frame the record holds")
     }
 
+    /// `request` as a decider takes it for `gateway`, received and taken
+    /// at the two instants with budget left, with the decider's `place` at
+    /// the leases' files.
+    pub(crate) fn taken_at<'a>(
+        request: &'a Checked,
+        gateway: GatewayId,
+        (received, now): (Instant, Instant),
+        place: Option<&'a crate::store::AtWork>,
+    ) -> DecisionCall<'a, Checked> {
+        let taken = DecisionCall::at(request, gateway, received, now);
+        taken.expect("budget is left").placed(place)
+    }
+
     impl Bed {
         /// Hands `frame` over as `gateway`'s, received `received` after the
         /// take; why it took no place, if it took none.
@@ -3502,7 +3515,7 @@ pub(crate) mod tests {
     /// decider's look applies the frame: its next look says whether the
     /// frame still waited ([`LookOutcome::Fed`]) or was applied meanwhile
     /// ([`LookOutcome::Quiet`]).
-    fn a_frame_under_the_second_files_watch(
+    pub(crate) fn a_frame_under_the_second_files_watch(
         store: &Arc<MemoryStore>,
         member: WorkerId,
     ) -> crate::store::AtWork {
