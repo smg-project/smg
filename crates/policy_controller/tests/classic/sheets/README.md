@@ -369,17 +369,22 @@ behavior did, and the drawn rows are a new sample.
 
 ## Reading
 
-The crate's replay reads this directory, every run of its suite with the `ingest` and `in-process` features:
+The crate's replay reads this directory, every run of its suite with the `ingest`, `in-process` and `worker-host`
+features:
 
 ```bash
-cargo test -p smg-policy-controller --features ingest,in-process --test classic_rows
+cargo test -p smg-policy-controller --features ingest,in-process,worker-host --test classic_rows
 ```
 
-A few rows of each sheet are also copied into the crate's test source, and the replay holds each copy to its sheet.
+A few rows of each sheet a module replays are also copied into the crate's test source, and the replay holds each
+copy to its sheet.
 
 `retry_wire.json`, `media_refs.json`, `context_window.json`, `rank_pin.json`, `sticky_rank.json` and
 `encode_pair.json` replay over worker objects, which the `in-process` feature brings. The encode sheet's fleets are
 decided by the engine's entry for an encode request over three lists of worker objects.
+
+`overload.json` replays through the worker crate's load monitor, built as a host of the engine over worker lists
+builds it, which the `worker-host` feature brings.
 
 ## Limits left
 
@@ -399,11 +404,22 @@ fails once the reason no longer holds.
   reason: where the only ready prefill's partners are all over their thresholds beside a free decode of another
   transport, the gateway answers unavailable and the pair's decision names the overload veto. The other 35 rows
   replay.
-- `overload.json`: owed whole, 25 rows. A row records the overload verdict of the gateway's load monitor. A host of
-  the engine over worker lists writes that verdict on the worker object and the engine reads it there: the engine
-  judges no load. The crate's store judged these rows by rules of its own, 19 as recorded and six apart, until its
-  decision views left. No module replays the sheet now: the replay names it as owed and holds it to its 25 rows,
-  until the change that asks the load monitor of a controller's host for these verdicts.
+- `overload.json`: none where the worker is one object for all its ranks, as the recording gateway held it. All 25
+  rows replay there, verdict for verdict, through the worker crate's load monitor. The replay builds the holder of
+  worker objects with the calls a controller builds its own with, and writes the row's worker into the store the
+  holder follows. It hands the monitor each step: a poll through the monitor's poll of the worker's group, a pushed
+  record through the record's own entry, and an eviction as the worker's row leaving the ready set. It reads the
+  verdict off the worker object, where the engine reads it: the engine judges no load.
+  Eleven of the 14 rows of several ranks answer apart where each rank is a worker object of its own, as a
+  registration of several ranks lays them. The replay runs those 14 rows a second time in that layout and names
+  the eleven, each with the verdict on each rank's object. One rule holds all eleven: there the monitor judges a
+  rank's object by its own rank's figures, not by the queue summed and the usage averaged over the engine's ranks.
+  Two ranks that queue 4 requests each under a threshold of 8 are vetoed as one worker and not as two
+  (`the-queue-vetoes-at-its-count-and-above-summed-over-two-ranks`). Under a usage threshold of 0.5 a rank at 0.5
+  is vetoed alone where the mean over both ranks is 0.375 and the one worker is not vetoed
+  (`the-usage-vetoes-at-its-mean-and-above-over-two-ranks`). A rank's object states the address, the engine's
+  address, the rank and the width that the worker crate's builder gives a rank worker, which a gateway that
+  registers each data-parallel rank as a worker builds its workers with.
 - `manual.json`: one row is owed, `manual-one-key-pins-apart-under-the-prefill-and-the-decode-role`. The gateway
   keeps a key's pins apart under each role of a prefill and decode pair. The crate refuses a sessions rule under a
   pair plan today, so it cannot build the row; the other 13 rows replay.
@@ -418,8 +434,9 @@ fails once the reason no longer holds.
 - `sticky_override.json`: none. All 18 rows replay.
 - `minimum_tokens.json`: owed whole, 18 rows. A row records the rank the load monitor's rank cache gives a request
   on a worker that stands for several ranks: an answer of the host's own code, asked after the pick. The crate's
-  store listed a row a rank and decided these rows by rules of its own, eight as recorded and ten apart, until its
-  decision views left. No module replays the sheet now: the replay names it as owed and holds it to its 18 rows,
+  store listed a row a rank and decided these rows by rules of its own, eight as recorded and ten apart, until the
+  replay stopped reading that store.
+  No module replays the sheet now: the replay names it as owed and holds it to its 18 rows,
   until the change that asks the load monitor of a controller's host. Three of the ten rows were held apart by
   rules of the engine's scorer and picker, which stand whatever feeds a rank's loads. A rank is scored by the
   context tokens of its requests, not by the tokens its cache uses
