@@ -160,7 +160,10 @@ pub enum CallSyntax {
     /// the one the family's model writes before its first call, when the table names one
     /// (`<|python_tag|>`, the token Llama 3.1's template reserves for a call): read at the output's
     /// start only and dropped as the template's wrapping, so that an output with it and one without
-    /// read the same.
+    /// read the same. A table with a row into its arguments state and no call marker (Command)
+    /// reads the same between its markers, where text in place of the calls is malformed. The
+    /// engine picks that reading for the table as a whole, as it picks the framed list for
+    /// [`Self::JsonList`]: every call of such a table reads so, one the turn starts in included.
     JsonAlone(Option<&'static str>),
     /// An XML tree of arguments: `<invoke name="…">`, then one element per argument, `<key>` to
     /// `</key>`, nested for an object and with `<item>` elements for a list, typed by the request's

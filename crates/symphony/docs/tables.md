@@ -878,13 +878,66 @@ What the table says beyond the others:
 - **A call is `tool_name` and `parameters`.** The outline reads those keys beside `name` and
   `arguments`; the `tool_call_id` the template counts from zero is another member, and the
   call's id is the engine's.
+- **Between the action markers, one object alone is one call.** The template renders a list,
+  one call a list of one; the gateway's older `cohere` parser also read a bare object there,
+  and the table does (`CallSyntax::JsonAlone` between markers: an object, several, or the
+  list), with text in place of the calls malformed as it is between Llama Nemotron's markers.
+  `<|START_TEXT|>` and `<|END_TEXT|>` are dropped from the answer, as the answer's markers are
+  and as that parser dropped them.
+
+Where the table reads otherwise than the older `cohere` parser read a response taken whole (its
+streaming reader is not compared). That parser looked for the action markers in all the text, a
+thought and a string of a JSON answer included; it parsed each block as one JSON value and
+dropped the block when the value did not parse; and it joined the text outside the blocks, then
+removed the answer's and the text markers from it, then trimmed its two ends. The table reads
+the output as it comes, a marker where its state has a row for it and a block object by object:
+
+- **A call's arguments are the model's bytes**, where that parser wrote them again without the
+  model's spacing. What a JSON parser refuses in them passes: a line feed or a tab written raw
+  inside a string comes out as its escape and a number beyond a float's range as written, where
+  that parser dropped the block.
+- **The first key written counts.** Of `name` and `tool_name` the first names the call, where
+  that parser took `tool_name`; of `arguments`, `parameters` and `args` the first holds the
+  arguments, where that parser took `parameters`, then `arguments`, and never `args`; a key
+  written twice counts the first time, where that parser took the last. A name that is no
+  string names no call in either.
+- **A call stands once its name and the start of its arguments have come, or its object has
+  closed.** A block the end cuts behind that point is the call with what arrived, and what the
+  cut leaves behind a closed arguments value is malformed text; an object that closed with no
+  `<|END_ACTION|>` behind it is the call. That parser read no call from either and showed the
+  block as content, its opener included. Cut before that point the block is no call, and what
+  arrived is malformed text.
+- **What stands behind a call does not take it back.** Two objects side by side, with
+  whitespace, a `;` or nothing between them, are two calls; a list or text behind an object is
+  malformed text behind the call; a comma before the object's close is passed over. That parser
+  read no call from any of these blocks and showed nothing.
+- **A block that holds no call is malformed text**, which a chat response shows as the model
+  wrote it, where that parser showed nothing; an empty list is nothing in both. A list whose
+  first value is no object is such a block whole, where that parser passed over the value and
+  read the calls behind it. Inside a list that opened with an object, an object with no name is
+  malformed text without the list's brackets, and the objects of a list inside the list are
+  calls, where that parser read the list's own objects alone.
+- **`<|END_ACTION|>` inside a string argument ends the block there**, where that parser read on
+  to the next one. A reader that follows the strings of the JSON keeps the marker as the
+  string's text, as that parser did: the forced variants, and the JSON-answer option
+  (`Engine::reads_json_answer`) inside a call.
+- **Whitespace.** Whitespace alone between one part's close and the next part's opener is the
+  template's wrapping and is dropped, where that parser kept it inside the text it joined.
+  Whitespace alone inside an action block is content, where that parser dropped the block. The
+  answer keeps the whitespace at its two ends, which that parser trimmed.
+- **A marker counts where its state has a row for it.** The text markers are dropped from the
+  answer alone, and an action block is read in the answer alone: inside a thought both are the
+  thought's text, also where the thought is shown as content (`Format::without_reasoning`), and
+  under the JSON-answer option both are text inside a string of the answer. That parser removed
+  the text markers from all the text it read, and read an action block wherever it stood.
 
 What it leaves open: the structural tag derived from the table spells a call `name` and
 `arguments`, which the table reads and the template does not write. A checkpoint whose template
 writes the answer between `<|START_TEXT|>` and `<|END_TEXT|>` has no recorded output and no row
-here. Command R v01's two recorded cases hold content alone: a call it writes in another spelling
-than the action markers (its `tool_use` template, which a request with tools selects, is not among
-the recorded sets) reads as content here, as it does with the legacy parser.
+here; the table drops the two markers from the answer. Command R v01's two recorded cases hold
+content alone: a call it writes in another spelling than the action markers (its `tool_use`
+template, which a request with tools selects, is not among the recorded sets) reads as content
+here, as it does with the legacy parser.
 
 ## MiniCPM5 (`minicpm5`)
 
