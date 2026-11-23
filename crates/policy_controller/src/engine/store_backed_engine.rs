@@ -3276,7 +3276,7 @@ impl Orders for WithEncode<'_, '_, '_> {
 
 // The fixtures left here are read by the cases of a pair and of a handle
 // alone, and those stand under `in-process`. A build without that feature
-// reads the sent prefixes' fixtures and none of these.
+// reads none of these.
 #[cfg(test)]
 #[cfg_attr(
     not(feature = "in-process"),
@@ -3286,8 +3286,6 @@ impl Orders for WithEncode<'_, '_, '_> {
     )
 )]
 pub(crate) mod tests {
-    pub(crate) mod sent_prefixes;
-
     use std::{error::Error, sync::Arc, time::Instant};
 
     use super::{Request, StoreBackedEngine};

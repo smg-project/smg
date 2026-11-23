@@ -1265,3 +1265,70 @@ fn a_tried_worker_names_every_rank_of_its_engine_once() {
     pool.tried_engines(&named, &mut whole);
     assert_eq!(whole, named);
 }
+
+/// A report's age stops at the far end: a decision one millisecond past
+/// the largest age a `u32` holds reads `u32::MAX` milliseconds, never an
+/// age that wrapped to a young report.
+#[test]
+fn a_record_caps_its_report_age_at_u32_max() {
+    let spec = applied("least_load");
+    let clock = DecisionClock::new();
+    let workers = fleet(1);
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let (loads, sampled_at) = reports(&[100], Duration::ZERO);
+    let now = sampled_at + Duration::from_millis(u64::from(u32::MAX) + 1);
+    let live = Live::at(spec.engine(), &clock, now, Some(&loads), None);
+
+    let mut rows = Vec::new();
+    let (written, _) = pool.write(&workers, &live, &mut rows);
+    assert_eq!(written[0].load.expect("a report").report_age_ms, u32::MAX);
+}
+
+/// Two ranks of one engine report at two instants, and one decision ages
+/// each from its own sample. A rank that has not reported reads no load
+/// beside a rank that has.
+#[test]
+fn two_ranks_are_each_aged_from_their_own_sample() {
+    let spec = applied("least_load");
+    let clock = DecisionClock::new();
+    let base = url(0);
+    let workers = [0, 1].map(|rank| -> Arc<dyn Worker> {
+        Arc::new(
+            <BasicWorkerBuilder>::new(base.clone())
+                .dp_config(rank, 2)
+                .health_config(no_health_check())
+                .build(),
+        )
+    });
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let ages_at = |now, reports| {
+        let loads = LoadSnapshot::from_loads_for_test(reports);
+        let live = Live::at(spec.engine(), &clock, now, Some(&loads), None);
+        let mut rows = Vec::new();
+        let (written, _) = pool.write(&workers, &live, &mut rows);
+        [0, 1].map(|rank| {
+            let row = written.iter().find(|row| row.dp_rank == rank);
+            let row = row.expect("the rank's record");
+            row.load.map(|load| load.report_age_ms)
+        })
+    };
+
+    let first_at = Instant::now();
+    let mut first = one_rank_load(0, 0.1, 1_000.0);
+    first.sampled_at = Some(first_at);
+    let mut reports = vec![(workers[0].url().to_owned(), first)];
+    assert_eq!(
+        ages_at(first_at + Duration::from_millis(2), reports.clone()),
+        [Some(2), None]
+    );
+
+    let second_at = first_at + Duration::from_millis(20);
+    let mut second = one_rank_load(0, 0.1, 1_000.0);
+    second.loads[0].dp_rank = 1;
+    second.sampled_at = Some(second_at);
+    reports.push((workers[1].url().to_owned(), second));
+    assert_eq!(
+        ages_at(second_at + Duration::from_millis(5), reports),
+        [Some(25), Some(5)]
+    );
+}

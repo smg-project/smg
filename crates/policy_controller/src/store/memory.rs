@@ -1411,36 +1411,10 @@ impl MemoryStore {
         self.loads.lock().ranks.len()
     }
 
-    /// How many ranks stand unnamed by their engine's last answer.
-    #[cfg(test)]
-    pub(super) fn unnamed_ranks(&self) -> usize {
-        self.loads.lock().writer.unnamed_ranks()
-    }
-
-    /// Whether a load write is judged: an engine has a threshold, or a rank
-    /// stands unnamed.
-    #[cfg(test)]
-    pub(super) fn judges_writes(&self) -> bool {
-        self.loads.lock().writer.judges_writes()
-    }
-
-    /// How many rows that left their pool the writer still keeps.
-    #[cfg(test)]
-    pub(super) fn held_rows(&self) -> usize {
-        self.loads.lock().writer.held_rows()
-    }
-
     /// How many members the table of the ones no world lists holds.
     #[cfg(test)]
     pub(super) fn filed_members(&self) -> usize {
         self.joined.lock().len()
-    }
-
-    /// How many whole derivations made what the writer keeps of `model`'s
-    /// pair classes; `None` where it keeps nothing of them.
-    #[cfg(test)]
-    pub(super) fn whole_derivations(&self, model: &str) -> Option<usize> {
-        self.loads.lock().writer.whole_derivations(model)
     }
 
     /// How many membership writes walked the pools to stand each in its
@@ -1458,20 +1432,6 @@ impl MemoryStore {
         self.workers.try_lock().is_some()
             && self.files.iter().all(turn::File::free)
             && self.loads.try_lock().is_some()
-    }
-
-    /// Whether the membership lock is free at this instant, tried: a stage
-    /// told a membership write finds it held.
-    #[cfg(all(test, feature = "controller"))]
-    pub(crate) fn workers_lock_free(&self) -> bool {
-        self.workers.try_lock().is_some()
-    }
-
-    /// Whether the load lock is free at this instant, tried: a stage told a
-    /// membership write finds it free.
-    #[cfg(all(test, feature = "controller"))]
-    pub(crate) fn load_lock_free(&self) -> bool {
-        self.loads.try_lock().is_some()
     }
 
     /// The KV tables, for the index's cases.

@@ -538,3 +538,62 @@ fn the_session_table_is_the_engines_own_under_every_document() {
         );
     }
 }
+
+/// The owner of a key leaves and a new worker takes its place in the
+/// list, two thousand times. A key whose owner left goes to another worker
+/// while the old list still stands. Behind the last change the keys reach
+/// all four workers, and each goes where an engine that saw none of the
+/// changes sends it.
+#[test]
+fn keyed_decisions_reach_all_four_live_workers_after_two_thousand_replacements() {
+    let first = |engine: &PolicyEngine, members: &PublishedList, key: u64| {
+        let mut asks = keyed(key, members);
+        asks.request.facts.seed = 1;
+        let named = targets(&decided(engine, &asks).decision);
+        let &(place, id) = named.first().expect("a first target");
+        (place as usize, id)
+    };
+
+    let engine = preset("consistent_hashing");
+    let mut live = pool(4);
+    let mut members = PublishedList::new(Arc::clone(&live));
+    for key in 1..=2_000 {
+        let (slot, departed) = first(&engine, &members, key);
+        assert_eq!(
+            departed,
+            records::worker_id(live[slot].as_ref()),
+            "key {key}"
+        );
+        engine.forget(live[slot].url());
+
+        // This list still contains the worker that owned the key.
+        assert_ne!(
+            first(&engine, &members, key).1,
+            departed,
+            "key {key} still picks its departed owner"
+        );
+
+        let next = ready_worker(&format!("http://replacement-{key}:8000"), MODEL);
+        engine.joined(next.url());
+        Arc::make_mut(&mut live)[slot] = next;
+        members = PublishedList::new(Arc::clone(&live));
+
+        let (place, id) = first(&engine, &members, 77);
+        assert_eq!(
+            id,
+            records::worker_id(live[place].as_ref()),
+            "key 77 after replacement {key}"
+        );
+    }
+
+    let fresh = preset("consistent_hashing");
+    let final_members = PublishedList::new(Arc::clone(&live));
+    let mut reached = [false; 4];
+    for key in 1..=500 {
+        let (place, id) = first(&engine, &members, key);
+        assert_eq!(id, records::worker_id(live[place].as_ref()), "key {key}");
+        assert_eq!((place, id), first(&fresh, &final_members, key), "key {key}");
+        reached[place] = true;
+    }
+    assert_eq!(reached, [true; 4], "each live worker owns a key");
+}

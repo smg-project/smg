@@ -642,11 +642,6 @@ impl Predicted {
             self.sweeping.store(false, Ordering::Relaxed);
         }
     }
-
-    #[cfg(test)]
-    pub(super) fn bound(&self) -> usize {
-        self.record.read().bound()
-    }
 }
 
 /// Where a pool stands in its model's index, as the membership write that
@@ -1429,11 +1424,6 @@ impl PoolIndex {
         if self.tables.covered(row) {
             predicted.sent(named, target, &self.tables.allowed[row]);
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn predicted(&self) -> Option<Arc<Predicted>> {
-        self.tables.predicted.clone()
     }
 }
 
