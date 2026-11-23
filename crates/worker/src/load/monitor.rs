@@ -387,6 +387,9 @@ pub trait LoadConsumer: Send + Sync {
 struct PushedFile {
     report: WorkerLoadResponse,
     pusher: Arc<dyn Worker>,
+    /// When the report's one rank last had each of its two fixed token
+    /// counts stated.
+    counts_stated: CountsStated,
     /// A record came while the pusher was not `Ready`: its rank is on file
     /// and its engine series is held. The file stays in the flush's queue
     /// until a flush finds the pusher `Ready`: that one writes every
@@ -403,6 +406,7 @@ impl PushedFile {
         Self {
             report: WorkerLoadResponse::default(),
             pusher: Arc::clone(pusher),
+            counts_stated: CountsStated::default(),
             series_held: false,
             queued: false,
         }
@@ -420,6 +424,69 @@ impl PushedFile {
             &self.report.loads[at],
         );
     }
+}
+
+/// When each of the two fixed token counts of a file's rank was last
+/// stated: the sample instant of the record of the stream that stated it,
+/// or of the poll's answer laid on the file. A record that leaves a count
+/// out keeps it, and says by these how old it is
+/// ([`SchedulerLoadSnapshot::kept_used_tokens_age_ms`]).
+///
+/// Held for a report that lists one rank. A reader dates a kept count by
+/// the report's one sample instant less the count's age, and in a report
+/// of several ranks that instant is another rank's record's as often as
+/// this one's: there nothing is noted and no age is stated. A row that is
+/// new on the file clears the two: nothing has stated its counts, and a
+/// second rank comes to a report no other way.
+#[derive(Clone, Copy, Default)]
+struct CountsStated {
+    used: Option<Instant>,
+    total: Option<Instant>,
+}
+
+impl CountsStated {
+    /// Both counts stated at `at`: a poll's answer states every figure of
+    /// its entry.
+    fn both(at: Instant) -> Self {
+        Self {
+            used: Some(at),
+            total: Some(at),
+        }
+    }
+
+    /// Dates the two counts of `entry`, the row a record sampled at `at`
+    /// has just written. `alone` says the report lists no other rank, and
+    /// `first` that the row is new on the file.
+    fn date(&mut self, entry: &mut SchedulerLoadSnapshot, at: Instant, alone: bool, first: bool) {
+        if first {
+            *self = Self::default();
+        }
+        if !alone {
+            return;
+        }
+        let kept = entry.kept;
+        let used = kept.contains(LoadTelemetry::USED_TOKENS);
+        let total = kept.contains(LoadTelemetry::TOTAL_TOKENS);
+        entry.kept_used_tokens_age_ms = age_at(&mut self.used, used, at);
+        entry.kept_total_tokens_age_ms = age_at(&mut self.total, total, at);
+    }
+}
+
+/// How old a count is at `at`, the sample of the record that wrote its
+/// entry, in milliseconds. A count the record states (`kept` is false) is
+/// stated at `at` from here on and has no age. A count the entry keeps is
+/// as old as the time since its statement, rounded up to a whole
+/// millisecond: a reader ends the count by this age, and a count must
+/// never read younger than it is. The time is taken whole at each record
+/// and never summed, so no rounding adds up over the records between two
+/// statements. `None` where no statement is on file.
+fn age_at(stated: &mut Option<Instant>, kept: bool, at: Instant) -> Option<u32> {
+    if !kept {
+        *stated = Some(at);
+        return None;
+    }
+    let since = at.saturating_duration_since((*stated)?);
+    Some(u32::try_from(since.as_nanos().div_ceil(1_000_000)).unwrap_or(u32::MAX))
 }
 
 /// The rank of each entry `report` holds at or past `width`, its worker's
@@ -550,8 +617,9 @@ type EngineAnswer = Vec<(Arc<dyn Worker>, Option<WorkerLoadResponse>)>;
 /// record replaces; what it keeps moves out of it. `carried` is the
 /// record's own word on what it carries. The mark of what the record did
 /// not state (`SchedulerLoadSnapshot::kept`) is the fresh snapshot's own,
-/// written at its making: what the entry offers by name is its own
-/// record's, and nothing here sets the mark.
+/// written at its making, and nothing here sets the mark. How old a kept
+/// token count is, which the entry offers by name with it, is written
+/// behind this call ([`CountsStated::date`]).
 fn keep_telemetry(
     fresh: &mut SchedulerLoadSnapshot,
     previous: SchedulerLoadSnapshot,
@@ -819,21 +887,26 @@ impl<G: Generation> WorkerMonitor<G> {
         if dropped != 0 {
             Metrics::record_engine_load_values_dropped(url, dropped);
         }
-        let at = match report
+        let (at, first) = match report
             .loads
             .binary_search_by_key(&dp_rank, |load| load.dp_rank)
         {
             Ok(at) => {
                 let previous = std::mem::replace(&mut report.loads[at], fresh);
                 keep_telemetry(&mut report.loads[at], previous, record.telemetry());
-                at
+                (at, false)
             }
             Err(at) => {
                 report.loads.insert(at, fresh);
                 report.dp_rank_count = i32::try_from(report.loads.len()).unwrap_or(i32::MAX);
-                at
+                (at, true)
             }
         };
+        // A token count the entry keeps is offered by name as old as its
+        // last statement, where the report lists this rank alone.
+        let alone = report.loads.len() == 1;
+        file.counts_stated
+            .date(&mut report.loads[at], sampled_at, alone, first);
         report.sampled_at = Some(sampled_at);
         // The sink takes the receipt and judges the report where it is,
         // under this hold of the reports: its receipt and the row stand
@@ -933,7 +1006,7 @@ impl<G: Generation> WorkerMonitor<G> {
             let on_file = reports.get(url).map(|file| &file.report);
             classic.merge(url, load, on_file, polled_at, &mut ranks);
         }
-        Self::lay_polled(&mut reports, url, load, &ranks)
+        Self::lay_polled(&mut reports, url, load, &ranks, polled_at)
     }
 
     /// The file's half of a poll's answer with rows for one member (`load`,
@@ -945,12 +1018,15 @@ impl<G: Generation> WorkerMonitor<G> {
     /// no report to lay: the poll's report stands on its own. Returns the
     /// rows of the newer ranks and, when there are any, the report on file's
     /// sample instant, for a publish that carries them over the poll's under
-    /// their own sample boundary.
+    /// their own sample boundary. `polled_at` is the instant the poll's
+    /// report is dated at: a row that takes the answer's entry has its two
+    /// fixed token counts stated then ([`CountsStated`]).
     fn lay_polled(
         reports: &mut FxHashMap<String, PushedFile>,
         url: &str,
         load: &WorkerLoadResponse,
         ranks: &PolledRanks,
+        polled_at: Instant,
     ) -> (Vec<SchedulerLoadSnapshot>, Option<Instant>) {
         // A rollup from a gateway registered as a worker is keyed by
         // downstream worker, not by rank: its entries all say rank 0 and
@@ -959,11 +1035,13 @@ impl<G: Generation> WorkerMonitor<G> {
         if !load.ranks_are_dp_ranks() {
             return (Vec::new(), None);
         }
-        let Some(report) = reports.get_mut(url).map(|file| &mut file.report) else {
+        let Some(file) = reports.get_mut(url) else {
             return (Vec::new(), None);
         };
+        let report = &mut file.report;
         let on_file = report.loads.len();
         let mut newer = Vec::new();
+        let mut laid = false;
         report.loads.retain_mut(|row| {
             if ranks.newer.contains(&row.dp_rank) {
                 newer.push(row.clone());
@@ -971,12 +1049,17 @@ impl<G: Generation> WorkerMonitor<G> {
             }
             if let Some(entry) = load.loads.iter().find(|entry| entry.dp_rank == row.dp_rank) {
                 row.clone_from(entry);
+                laid = true;
                 return true;
             }
             !ranks.leaving.contains(&row.dp_rank)
         });
         if report.loads.len() < on_file {
             report.dp_rank_count = i32::try_from(report.loads.len()).unwrap_or(i32::MAX);
+        }
+        // The one row left is the answer's: its counts are the poll's.
+        if laid && report.loads.len() == 1 {
+            file.counts_stated = CountsStated::both(polled_at);
         }
         let sampled_at = if newer.is_empty() {
             None
@@ -1150,7 +1233,7 @@ impl<G: Generation> WorkerMonitor<G> {
             for (worker, response) in engine.iter() {
                 kept.push(match response {
                     Some(load) if !load.loads.is_empty() => {
-                        Self::lay_polled(&mut reports, worker.url(), load, &ranks)
+                        Self::lay_polled(&mut reports, worker.url(), load, &ranks, read_at)
                     }
                     Some(_) => {
                         Self::drop_leaving(&mut reports, worker.url(), &ranks.leaving);

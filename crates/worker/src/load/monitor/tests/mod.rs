@@ -1256,48 +1256,264 @@ async fn a_pushed_record_counts_the_named_values_its_snapshot_drops() {
     );
 }
 
-/// What a rank's entry offers by name is its own record's. A count the entry
-/// keeps from a heartbeat is not offered under a later record that did not
-/// carry it, and the entry still holds it.
+/// A record that leaves a token count out keeps the count of the last
+/// record that stated it, and the rank's entry offers it by name as old as
+/// that record is at the fresh one's sample. A heartbeat, a record that is
+/// the core alone, a second one, a record that states the used count alone,
+/// one more core record and the next heartbeat: each count is offered at
+/// its own record's age, the gaps summed, and with no age where its own
+/// record states it. The entry's two figures, which `GET /loads` and the
+/// gauges read, are the kept ones throughout.
 #[tokio::test]
-async fn a_core_record_offers_no_fixed_count_the_entry_kept() {
+async fn a_kept_token_count_is_offered_by_name_as_old_as_the_record_that_stated_it() {
     let (registry, monitor) = build_monitor();
     let worker = ready_worker("grpc://w1:9000", "llama-3");
     registry.register(Arc::clone(&worker)).unwrap();
-    let names = |rank: &SchedulerLoadSnapshot| -> Vec<String> {
-        rank.named_values()
-            .map(|value| value.name.to_string())
-            .collect()
+    let start = Instant::now();
+    let push = |record: &PushedRecord, ms: u64| {
+        monitor.apply_pushed_load(&worker, 0, record, start + Duration::from_millis(ms));
+        let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+        let offered: Vec<_> = rank0
+            .named_values()
+            .map(|value| (value.name.to_string(), value.value, value.age_ms))
+            .collect();
+        (offered, (rank0.num_used_tokens, rank0.max_total_num_tokens))
+    };
+    let used = |count: f64, age| ("kv_tokens_used".to_owned(), count, age);
+    let capacity = |age| ("kv_tokens_capacity".to_owned(), 8_192.0, age);
+    let heartbeat = |count| pushed(7).used_tokens(count).total_tokens(8_192);
+
+    let stated = (vec![used(2_048.0, None), capacity(None)], (2_048, 8_192));
+    assert_eq!(push(&heartbeat(2_048), 0), stated);
+    let kept = (
+        vec![used(2_048.0, Some(40)), capacity(Some(40))],
+        (2_048, 8_192),
+    );
+    assert_eq!(push(&pushed(8), 40), kept);
+    let again = (
+        vec![used(2_048.0, Some(100)), capacity(Some(100))],
+        (2_048, 8_192),
+    );
+    assert_eq!(push(&pushed(8), 100), again);
+    // The used count alone: the capacity is as old as its own record.
+    let mixed = (vec![used(300.0, None), capacity(Some(150))], (300, 8_192));
+    assert_eq!(push(&pushed(9).used_tokens(300), 150), mixed);
+    // Behind it each count is as old as its own record.
+    let each = (
+        vec![used(300.0, Some(30)), capacity(Some(180))],
+        (300, 8_192),
+    );
+    assert_eq!(push(&pushed(9), 180), each);
+    let stated = (vec![used(500.0, None), capacity(None)], (500, 8_192));
+    assert_eq!(push(&heartbeat(500), 200), stated);
+}
+
+/// A kept count whose age the report does not know is not offered. A rank
+/// whose records have stated no used count keeps a zero no record said:
+/// here the first record states the capacity alone, and no record behind it
+/// offers the used count. And a report of several ranks has one sample
+/// instant, which every rank's record moves: there a rank's record that is
+/// the core alone offers neither count, while the entry keeps both figures.
+#[tokio::test]
+async fn a_kept_token_count_of_no_known_age_is_not_offered_by_name() {
+    let start = Instant::now();
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    let offered = |monitor: &WorkerMonitor| {
+        let rank0 = published_rank0(monitor, "grpc://w1:9000");
+        let offered: Vec<_> = rank0
+            .named_values()
+            .map(|value| (value.name.to_string(), value.value, value.age_ms))
+            .collect();
+        (offered, (rank0.num_used_tokens, rank0.max_total_num_tokens))
+    };
+    let capacity = |age| ("kv_tokens_capacity".to_owned(), 8_192.0, age);
+
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &pushed(7).total_tokens(8_192), at(0));
+    assert_eq!(offered(&monitor), (vec![capacity(None)], (0, 8_192)));
+    for (ms, age) in [(40, 40), (100, 100)] {
+        monitor.apply_pushed_load(&worker, 0, &pushed(8), at(ms));
+        let kept = (vec![capacity(Some(age))], (0, 8_192));
+        assert_eq!(offered(&monitor), kept, "{ms} ms");
+    }
+
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let heartbeat = pushed(7).used_tokens(2_048).total_tokens(8_192);
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, at(0));
+    monitor.apply_pushed_load(&worker, 1, &heartbeat, at(10));
+    monitor.apply_pushed_load(&worker, 0, &pushed(8), at(40));
+    assert_eq!(offered(&monitor), (Vec::new(), (2_048, 8_192)));
+}
+
+/// A kept count's age is the whole time since its statement, taken at each
+/// record and rounded up to a millisecond. Gaps that are no whole number of
+/// milliseconds do not shorten it, however many records stand between: four
+/// hundred records 1.5 ms apart leave the count 600 ms old. And a record
+/// 0.3 ms behind the statement reads the count one millisecond old: a count
+/// never reads younger than it is.
+#[tokio::test]
+async fn a_kept_token_counts_age_is_not_shortened_by_gaps_of_no_whole_millisecond() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let start = Instant::now();
+    let ages = |record: &PushedRecord, micros: u64| {
+        monitor.apply_pushed_load(&worker, 0, record, start + Duration::from_micros(micros));
+        let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+        (
+            rank0.kept_used_tokens_age_ms,
+            rank0.kept_total_tokens_age_ms,
+        )
     };
     let heartbeat = pushed(7).used_tokens(2_048).total_tokens(8_192);
-    monitor.apply_pushed_load(&worker, 0, &heartbeat, Instant::now());
-    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
-    assert_eq!(names(&rank0), ["kv_tokens_used", "kv_tokens_capacity"]);
 
-    monitor.apply_pushed_load(&worker, 0, &pushed(8), Instant::now());
-    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
-    assert!(names(&rank0).is_empty());
-    assert_eq!(
-        (rank0.num_used_tokens, rank0.max_total_num_tokens),
-        (2_048, 8_192)
-    );
+    assert_eq!(ages(&heartbeat, 0), (None, None));
+    let mut last = (None, None);
+    for nth in 1..=400 {
+        last = ages(&pushed(8), nth * 1_500);
+    }
+    assert_eq!(last, (Some(600), Some(600)));
 
-    // A record that carries one of the two offers that one.
-    let capacity = pushed(9).total_tokens(4_096);
-    monitor.apply_pushed_load(&worker, 0, &capacity, Instant::now());
-    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
-    assert_eq!(names(&rank0), ["kv_tokens_capacity"]);
-    assert_eq!(
-        (rank0.num_used_tokens, rank0.max_total_num_tokens),
-        (2_048, 4_096)
-    );
+    assert_eq!(ages(&heartbeat, 700_000), (None, None));
+    assert_eq!(ages(&pushed(8), 700_300), (Some(1), Some(1)));
+    assert_eq!(ages(&pushed(8), 700_600), (Some(1), Some(1)));
+    assert_eq!(ages(&pushed(8), 701_200), (Some(2), Some(2)));
+}
+
+/// A count a poll's answer stated is as old as that poll behind the records
+/// that follow it. The stream goes quiet, a poll's answer is laid on the
+/// file, and a record that is the core alone comes: it keeps the poll's
+/// counts and offers them at the time since the poll, not at the time since
+/// the stream's last record. A record's sample stands a one-way margin
+/// ahead of its receipt, and a poll's at the instant its report is dated.
+#[tokio::test]
+async fn a_token_count_a_polls_answer_stated_is_as_old_as_that_poll() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let start = Instant::now();
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    let offered = |monitor: &WorkerMonitor| {
+        let rank0 = published_rank0(monitor, "grpc://w1:9000");
+        let offered: Vec<_> = rank0
+            .named_values()
+            .map(|value| (value.name.to_string(), value.value, value.age_ms))
+            .collect();
+        (offered, (rank0.num_used_tokens, rank0.max_total_num_tokens))
+    };
+    let polled = |age| {
+        let used = ("kv_tokens_used".to_owned(), 4_096.0, age);
+        let capacity = ("kv_tokens_capacity".to_owned(), 8_192.0, age);
+        (vec![used, capacity], (4_096, 8_192))
+    };
+
+    let heartbeat = pushed(7).used_tokens(2_048).total_tokens(8_192);
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, at(0));
+    let answer = WorkerLoadResponse {
+        dp_rank_count: 1,
+        loads: vec![SchedulerLoadSnapshot {
+            dp_rank: 0,
+            num_running_reqs: 3,
+            num_used_tokens: 4_096,
+            max_total_num_tokens: 8_192,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    monitor.apply_polled_load("grpc://w1:9000", &answer, at(1_000));
+    let margin = u32::try_from(PUSHED_ONE_WAY_MARGIN.as_millis()).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &pushed(8), at(1_100));
+    assert_eq!(offered(&monitor), polled(Some(100 - margin)));
+    monitor.apply_pushed_load(&worker, 0, &pushed(8), at(1_300));
+    assert_eq!(offered(&monitor), polled(Some(300 - margin)));
+}
+
+/// The instants of the two counts' statements are a one-rank report's. A
+/// second rank's record clears them, and nothing notes one while the
+/// report lists two: not a record that states both counts, and not a
+/// poll's answer laid on one rank's row. So once the second rank has left
+/// the file, a record of the first that is the core alone offers no count,
+/// and the next statement brings each back. And a row that is new on the
+/// file has had nothing stated: a rank that comes behind one that left
+/// offers no count of the other's.
+#[tokio::test]
+async fn a_token_counts_statement_is_forgotten_where_the_report_lists_another_rank() {
+    let start = Instant::now();
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    let on_file = |monitor: &WorkerMonitor| {
+        let reports = monitor.pushed_reports.lock();
+        let row = reports["http://w:1"].report.loads[0].clone();
+        let ages = (row.kept_used_tokens_age_ms, row.kept_total_tokens_age_ms);
+        let offered: Vec<_> = row
+            .named_values()
+            .map(|value| (value.name.to_string(), value.age_ms))
+            .collect();
+        (row.dp_rank, ages, offered)
+    };
+    let heartbeat = pushed(7).used_tokens(2_048).total_tokens(8_192);
+
+    // Rank 0's stream is the newer at each poll. Rank 1 takes the first
+    // answer's entry, and leaves at the second, which does not name it.
+    let ranks = PolledRanks {
+        newer: vec![0],
+        leaving: vec![1],
+    };
+    let (registry, monitor, _sink) = build_recording(PollMode::Fallback, ranks, true, false);
+    let worker = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&worker)).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, at(0));
+    monitor.apply_pushed_load(&worker, 1, &heartbeat, at(10));
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, at(50));
+    let mut both = answer_of(0, 3);
+    both.loads.push(SchedulerLoadSnapshot {
+        dp_rank: 1,
+        num_used_tokens: 4_096,
+        max_total_num_tokens: 8_192,
+        ..Default::default()
+    });
+    both.dp_rank_count = 2;
+    let mut engine = vec![(Arc::clone(&worker), Some(both))];
+    monitor.reconcile_engine(&mut engine, at(60));
+    let laid = monitor.pushed_reports.lock()["http://w:1"].report.loads[1].clone();
+    assert_eq!((laid.dp_rank, laid.num_used_tokens), (1, 4_096));
+    let mut engine = vec![(Arc::clone(&worker), Some(answer_of(0, 3)))];
+    monitor.reconcile_engine(&mut engine, at(70));
+    monitor.apply_pushed_load(&worker, 0, &pushed(8), at(100));
+    assert_eq!(on_file(&monitor), (0, (None, None), Vec::new()));
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, at(150));
+    monitor.apply_pushed_load(&worker, 0, &pushed(8), at(190));
+    let kept = vec![
+        ("kv_tokens_used".to_owned(), Some(40)),
+        ("kv_tokens_capacity".to_owned(), Some(40)),
+    ];
+    assert_eq!(on_file(&monitor), (0, (Some(40), Some(40)), kept));
+
+    // Rank 0 leaves, and rank 1 comes with a record of the capacity alone.
+    let ranks = PolledRanks {
+        newer: Vec::new(),
+        leaving: vec![0],
+    };
+    let (registry, monitor, _sink) = build_recording(PollMode::Poll, ranks, true, false);
+    let worker = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&worker)).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, at(0));
+    let mut empty = vec![(Arc::clone(&worker), Some(WorkerLoadResponse::default()))];
+    monitor.reconcile_engine(&mut empty, at(10));
+    monitor.apply_pushed_load(&worker, 1, &pushed(3).total_tokens(8_192), at(100));
+    let stated = vec![("kv_tokens_capacity".to_owned(), None)];
+    assert_eq!(on_file(&monitor), (1, (None, None), stated));
 }
 
 /// A count its record states is offered, zero included: an engine that
-/// goes idle states zero tokens held. A record that leaves the count out
-/// offers none, and neither does a rank's first record that states none.
+/// goes idle states zero tokens held. A rank's first record that states no
+/// count offers none. A record that leaves a stated count out offers the
+/// last record's, the zero too.
 #[tokio::test]
-async fn a_record_offers_the_count_it_states_at_zero_and_none_it_leaves_out() {
+async fn a_stated_zero_is_offered_and_a_first_record_that_states_no_count_offers_none() {
     let (registry, monitor) = build_monitor();
     let worker = ready_worker("grpc://w1:9000", "llama-3");
     registry.register(Arc::clone(&worker)).unwrap();
@@ -1326,9 +1542,10 @@ async fn a_record_offers_the_count_it_states_at_zero_and_none_it_leaves_out() {
     monitor.apply_pushed_load(&worker, 0, &idle, Instant::now());
     assert_eq!(offered(&monitor), counts(0.0));
 
-    // Left out: none is offered, and the entry keeps the last counts.
+    // Left out: the entry keeps the last counts and offers them, the zero
+    // too.
     monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
-    assert!(offered(&monitor).is_empty());
+    assert_eq!(offered(&monitor), counts(0.0));
     let rank0 = published_rank0(&monitor, "grpc://w1:9000");
     assert_eq!(
         (rank0.num_used_tokens, rank0.max_total_num_tokens),
@@ -1380,10 +1597,17 @@ async fn a_pushed_heartbeat_with_no_capacity_offers_neither_fixed_count() {
     );
 
     // A record that carries a held count and leaves its capacity out: the
-    // entry keeps the capacity of the record before, so the rank has one,
-    // and the count the record carried is offered.
+    // entry keeps the capacity of the record before, so the rank has one.
+    // The count the record carried is offered, and the kept capacity
+    // beside it.
     monitor.apply_pushed_load(&worker, 0, &pushed(10).used_tokens(211), Instant::now());
-    assert_eq!(offered(&monitor), [("kv_tokens_used".to_owned(), 211.0)]);
+    assert_eq!(
+        offered(&monitor),
+        [
+            ("kv_tokens_used".to_owned(), 211.0),
+            ("kv_tokens_capacity".to_owned(), 8_192.0)
+        ]
+    );
     assert_eq!(figures(&monitor), (211, 8_192));
 }
 

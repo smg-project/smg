@@ -36,6 +36,15 @@
 //! stated it, and reads as no value behind a record that left it out. A
 //! polled worker's every answer states its values whole, and is read so.
 //!
+//! The two fixed token counts are the report's to keep. Behind a record
+//! that leaves one out, a report of one rank offers the count as it was
+//! last stated, as old as that statement
+//! ([`SchedulerLoadSnapshot::named_values`]): it is read until its signal's
+//! maximum age, as any value is. A signal that declares none reads it
+//! until a record states the count again.
+//!
+//! [`SchedulerLoadSnapshot::named_values`]: smg_worker::worker::SchedulerLoadSnapshot::named_values
+//!
 //! **A limit: a worker object that stands for several ranks.** Its report
 //! states one sample instant for all its ranks. Where it pushes, the report
 //! lists each rank at that rank's latest record under the newest record's
