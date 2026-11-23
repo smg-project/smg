@@ -4959,7 +4959,17 @@ mod tests {
                 max_payload_size: 64,
                 ..single_attempt_router()
             };
-            register_pd_pair(&router, prefill_url, decode_url);
+            // A breaker that opens on the first failure shows which worker
+            // the 502 is charged to.
+            let pair = [
+                fragile_worker(prefill_url, WorkerType::Prefill),
+                fragile_worker(decode_url, WorkerType::Decode),
+            ];
+            for worker in &pair {
+                router
+                    .worker_registry
+                    .register_or_replace(Arc::clone(worker));
+            }
             let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
             let chat: ChatCompletionRequest = serde_json::from_value(json!({
@@ -4972,14 +4982,20 @@ mod tests {
             let response = router
                 .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
                 .await;
-            read.push((response.status(), error_code(&response).map(str::to_owned)));
+            read.push((
+                response.status(),
+                error_code(&response).map(str::to_owned),
+                pair.map(|worker| !worker.circuit_breaker_can_execute()),
+            ));
         }
 
-        let refused = (
-            StatusCode::BAD_GATEWAY,
-            Some("upstream_response_too_large".to_owned()),
+        let code = Some("upstream_response_too_large".to_owned());
+        let refused = |charged: [bool; 2]| (StatusCode::BAD_GATEWAY, code.clone(), charged);
+        // Charged, prefill then decode: the side above the limit, alone.
+        assert_eq!(
+            read,
+            [[false, true], [true, false], [true, false]].map(refused)
         );
-        assert_eq!(read, vec![refused; 3]);
     }
 
     #[tokio::test]
