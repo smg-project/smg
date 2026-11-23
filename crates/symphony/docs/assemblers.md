@@ -673,7 +673,13 @@ What the syntax says, and what the assembler does with it:
   of every value): the text between a value's double quotes, as written and with no escape
   decoded, is typed by the kind the request's tool declares for the parameter, through the value
   module's `json`, or by its text where none is declared; a bare value, a single-quoted Python
-  string included, reads as under the other dialects.
+  string included, reads as under the other dialects. One escape is the model's own: a `"` right
+  after a backslash, with more of the value after it, is a quote the model escaped, and the
+  value is typed from its text with the quote alone (`"5\" screen"` is `5" screen`, at the cost
+  of a value meant to hold that backslash), save a list or an object the literal reader takes
+  as written, which keeps its text. The stream's end right after such a backslash, or after its
+  quote, holds both back, since the next character decides between the escape and the value's
+  last character; a value with such a quote under a kind that is no string is held whole.
 - **A parameter without a value is reported and skipped.** `key=` followed by the comma or the
   call's `)` is a member Python refuses and the templates never write: its bytes, the separator
   before it, the key, the `=` and the whitespace around them, come back as
