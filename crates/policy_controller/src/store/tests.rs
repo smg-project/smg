@@ -14,11 +14,11 @@ use super::{
     identity, identity_of,
     leases::{InFlightCounts, WorkerSlot},
     AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeSide, GatewayId, Hand,
-    HealthSink, HealthWrite, Journal, JournalKinds, KvEvent, KvEventSink, LeaseRecord,
-    LeaseRefused, LeaseState, LeasesStore, LoadSample, LoadSink, LoadSource, LookOutcome,
-    MembershipChange, MembershipTail, MemoryStore, PickRecord, PollMode, Position, ReservationKind,
-    ReservationStore, ResyncReason, SequenceHash, Sides, Signals, SnapshotChunk, StoreSnapshot,
-    StoredBlock, VetoWrite, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+    HealthSink, HealthWrite, Journal, KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState,
+    LeasesStore, LoadSink, LoadSource, LookOutcome, MembershipChange, MembershipTail, MemoryStore,
+    PickRecord, PollMode, Position, ReservationKind, ReservationStore, ResyncReason, SequenceHash,
+    Sides, Signals, SnapshotChunk, StoreSnapshot, StoredBlock, VetoWrite, WorkerFacts, WorkerPatch,
+    WorkerRow, WorkerStatus, WorkersStore,
 };
 use crate::{
     document::spec,
@@ -1782,7 +1782,7 @@ fn a_followed_key_registered_again_past_the_absences_time_takes_no_pin() {
     std::thread::sleep(Duration::from_millis(1_100));
     let again = leader.upsert(facts("http://a:8000", 2));
     followed(&leader, &followers[0], again);
-    assert!(followers[1].watch_from(leader.checkpoint(JournalKinds::Watched)));
+    assert!(followers[1].watch_from(leader.checkpoint()));
     for follower in &followers {
         assert_eq!(pin_of(follower, 11), None);
     }
@@ -1814,7 +1814,7 @@ fn a_snapshot_moves_the_pins_of_the_rows_it_drops() {
     for restore in [false, true] {
         let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
         let lay = || {
-            let cut = leader.checkpoint(JournalKinds::All);
+            let cut = leader.checkpoint();
             if restore {
                 follower.restore_from(cut)
             } else {
@@ -1875,10 +1875,10 @@ fn a_snapshot_returns_a_key_that_had_left_to_its_pins() {
         let change = leader.remove(id, revision).expect("removed");
         followed(&leader, &follower, change);
     }
-    assert!(follower.watch_from(leader.checkpoint(JournalKinds::Watched)));
+    assert!(follower.watch_from(leader.checkpoint()));
     assert_eq!((of(11), of(12)), (Some(a), Some(b)), "both stay on file");
     let again = leader.upsert(facts("http://a:8000", 2)).id();
-    assert!(follower.watch_from(leader.checkpoint(JournalKinds::Watched)));
+    assert!(follower.watch_from(leader.checkpoint()));
     assert_eq!((of(11), of(12)), (Some(again), Some(b)));
     let back = leader.upsert(facts("http://b:8000", 2));
     followed(&leader, &follower, back);
@@ -1894,11 +1894,11 @@ fn a_snapshot_files_no_more_keys_than_the_list_holds() {
     let ids: Vec<WorkerId> = (0..GONE_KEYS + 2)
         .map(|at| leader.upsert(facts(&format!("http://w{at}:8000"), 1)).id())
         .collect();
-    assert!(follower.watch_from(leader.checkpoint(JournalKinds::Watched)));
+    assert!(follower.watch_from(leader.checkpoint()));
     for (key, &id) in (1..).zip(&ids) {
         pinned(&follower, key, id);
     }
-    assert!(follower.watch_from(MemoryStore::new().checkpoint(JournalKinds::Watched)));
+    assert!(follower.watch_from(MemoryStore::new().checkpoint()));
     assert_eq!(pins_held(&follower), GONE_KEYS);
 }
 
@@ -3039,7 +3039,7 @@ fn a_restore_empties_the_lease_file_and_a_hello_books_what_it_lists_once() {
     let theirs = (ready(&leader, "http://a:1"), ready(&leader, "http://b:1"));
     assert_eq!(theirs, (a, b));
     drop(told());
-    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(store.restore_from(leader.checkpoint()));
     let leases: &dyn LeasesStore = &store;
     assert_eq!(leases.live(gateway), 0, "a lease stood behind the restore");
     assert!(leases.get(gateway, LeaseId(1)).is_none());
@@ -3058,7 +3058,7 @@ fn a_restore_empties_the_lease_file_and_a_hello_books_what_it_lists_once() {
     ended.sort_unstable();
     assert_eq!(ended, [1, 2, 3]);
     // The file is empty: a second restore tells no end.
-    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(store.restore_from(leader.checkpoint()));
     assert!(told().is_empty(), "a lease was told twice");
     // The lead taken again: the gateway lists the two leases it still
     // holds, one a worker.
@@ -3096,7 +3096,7 @@ fn a_restore_tells_each_end_under_the_decider_whose_file_holds_its_lease() {
     // its cut on a thread that names none.
     let leader = MemoryStore::new();
     assert_eq!(ready(&leader, "http://a:1"), a);
-    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(store.restore_from(leader.checkpoint()));
     let mut ended: Vec<(u64, Option<DecisionSlot>)> = told()
         .into_iter()
         .map(|(record, _)| record.lease.id.0)
@@ -3131,13 +3131,12 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     );
     store.probed(id, 2, 0, 0);
 
-    let mut cut = store.checkpoint(JournalKinds::All);
+    let mut cut = store.checkpoint();
     cut.epoch += 1;
     cut.at.term = 7;
     cut.rows[0].admitted_at += Duration::from_secs(1);
     cut.rows[0].revision += 1;
     cut.rows[0].facts.priority = 8;
-    cut.loads[0].2.row.running = 9;
     let mut expected = cut.rows[0].clone();
     expected.admitted_at = WorkersStore::get(&store, id).expect("the row").admitted_at;
     let revision = expected.revision;
@@ -3185,7 +3184,7 @@ fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_moves_no_other_count()
     let source = MemoryStore::new();
     let joined = ready(&source, "http://b:1");
     LoadSink::record(&source, joined, 0, row(0), now, LoadSource::Stream);
-    assert!(store.watch_from(source.checkpoint(JournalKinds::All)));
+    assert!(store.watch_from(source.checkpoint()));
     assert_eq!(leases.get(gateway, lease.lease.id), Some(lease));
     assert_ne!(store.snapshot().booked_of(joined), Some(slot));
     assert_eq!(in_flight(&store), [(joined, 0)]);
@@ -3218,7 +3217,7 @@ fn a_watch_snapshot_gives_a_new_incarnation_its_own_count() {
     let source = MemoryStore::new();
     assert_eq!(ready(&source, key), old);
     let new = source.upsert(facts(key, 2)).id();
-    assert!(store.watch_from(source.checkpoint(JournalKinds::Watched)));
+    assert!(store.watch_from(source.checkpoint()));
     assert_eq!(store.by_key(key).map(|row| row.id), Some(new));
     assert!(WorkersStore::get(&store, old).is_none());
     assert_eq!(in_flight(&store), [(new, 0)]);
@@ -3282,7 +3281,7 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
         AppliedSpec::validate_digested(&document, digest, &catalog, &[]).expect("a generation");
     store.apply(spec).expect("the generation is applied");
 
-    let mut cut = store.checkpoint(JournalKinds::Watched);
+    let mut cut = store.checkpoint();
     let earlier = cut.epoch;
     // The same revision can name other facts in another history.
     cut.rows[0]
@@ -3320,17 +3319,17 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
 
 #[test]
 fn a_watch_snapshot_the_journal_refuses_changes_nothing() {
-    let store = MemoryStore::journaled(Arc::new(Log::new(8, 8)));
+    let store = MemoryStore::journaled(Arc::new(Log::new(8)));
     let id = ready(&store, "http://a:1");
     store.set_term(3);
-    let before = store.checkpoint(JournalKinds::Watched);
+    let before = store.checkpoint();
     let world = store.snapshot();
     let source = MemoryStore::new();
     ready(&source, "http://b:1");
-    let mut cut = source.checkpoint(JournalKinds::Watched);
+    let mut cut = source.checkpoint();
     cut.at = Position { seq: 1, term: 2 };
     assert!(!store.watch_from(cut));
-    let after = store.checkpoint(JournalKinds::Watched);
+    let after = store.checkpoint();
     assert_eq!(
         (after.at, after.epoch, after.rows),
         (before.at, before.epoch, before.rows)
@@ -3359,19 +3358,13 @@ impl Journal for WaitsAtRestart {
     ) {
     }
 
-    fn load(&self, _: Option<Position>, _: WorkerId, _: u16, _: &LoadSample) {}
-
     fn term_rose(&self, _: u64) {}
 
     fn generation(&self, _: Option<Position>, _: u64) {}
 
     fn term_followed(&self, _: Position) {}
 
-    fn carries_loads(&self) -> bool {
-        false
-    }
-
-    fn head(&self, _: JournalKinds) -> Position {
+    fn head(&self) -> Position {
         Position::default()
     }
 
@@ -3411,7 +3404,7 @@ fn a_take_beside_a_restore_files_its_first_lease_behind_it() {
     // its cut.
     let leader = MemoryStore::new();
     assert_eq!(ready(&leader, "http://a:1"), a);
-    let cut = leader.checkpoint(JournalKinds::All);
+    let cut = leader.checkpoint();
     let store = &store;
     let (inside, restored, filed) = std::thread::scope(move |scope| {
         let restore = scope.spawn(move || store.restore_from(cut));
@@ -3885,7 +3878,7 @@ fn a_lease_books_on_a_standby_behind_a_followed_refresh() {
         .expect("ready");
     leader.publish_now();
     let standby = MemoryStore::new();
-    assert!(standby.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(standby.restore_from(leader.checkpoint()));
     assert_eq!(standby.filed_members(), 0, "the restore built its world");
     // The leader gives the member its first model and the standby follows.
     let unjournaled = Position::default();
@@ -4369,7 +4362,7 @@ fn a_restore_that_raises_the_term_starts_the_blocks_under_it() {
     let (gateway, now) = (GatewayId(1), Instant::now());
     let held = standby.issue_decided(lease(gateway, 0, 3, now), None, |_| ());
     held.expect("minted under the term the standby stood at");
-    let mut cut = MemoryStore::new().checkpoint(JournalKinds::All);
+    let mut cut = MemoryStore::new().checkpoint();
     cut.at.term = 7;
     assert!(standby.restore_from(cut));
     assert_eq!(term.term(), 7);
@@ -5949,7 +5942,7 @@ fn a_restore_leaves_a_working_deciders_leases_to_its_next_take() {
     let (store, a, ids) = handed_bed(2, now);
     let leader = MemoryStore::new();
     assert_eq!(ready(&leader, "http://a:1"), a);
-    let cut = leader.checkpoint(JournalKinds::All);
+    let cut = leader.checkpoint();
     let (began, working) = mpsc::sync_channel(1);
     let (look, asked) = mpsc::sync_channel::<()>(1);
     let (looked, seen) = mpsc::sync_channel(1);

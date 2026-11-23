@@ -35,7 +35,7 @@ use crate::{
         applied::Applied,
         health::{HealthSink, HealthWrite, VetoWrite},
         index::{indexed_under, KvEvent, KvTables, LaneCounts, LaneWriter},
-        journal::{Journal, JournalKinds, Position},
+        journal::{Journal, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{
             DecodeMark, DecodeSide, HostCount, InFlightCounts, LeaseRecord, LeaseRefused,
@@ -149,9 +149,6 @@ pub struct MemoryStore {
     /// for a store nobody follows. The membership writes tell through
     /// their table's own handle.
     journal: Option<Arc<dyn Journal>>,
-    /// The same journal where it carries load rows: where the load writes
-    /// are told.
-    load_journal: Option<Arc<dyn Journal>>,
     /// The host's wake, once its loop handed one ([`LoadSink::wake_with`]):
     /// called where a membership write leaves a build owed and none was,
     /// the one instant the host's loop cannot have read. A lock of its own,
@@ -168,16 +165,13 @@ pub struct MemoryStore {
 /// built from it: the operator's, the watch's and the replication's.
 #[derive(Clone, Debug)]
 pub struct StoreCheckpoint {
-    /// The last journaled write of the kinds asked that the tables hold,
-    /// with its term; the default for a store with no journal.
+    /// The last journaled write that the tables hold, with its term; the
+    /// default for a store with no journal.
     pub at: Position,
     /// The membership epoch.
     pub epoch: u64,
     /// Every row, by registration key.
     pub rows: Vec<WorkerRow>,
-    /// Every load row on file, by worker and rank; none in a cut of the
-    /// watched kinds.
-    pub loads: Vec<(WorkerId, u16, LoadSample)>,
 }
 
 impl Default for MemoryStore {
@@ -257,20 +251,18 @@ impl MemoryStore {
             counts,
             origin,
             journal: None,
-            load_journal: None,
             wake: Mutex::new(None),
             signal_writes: Writes::default(),
         }
     }
 
     /// A store that tells `journal` its replicated writes (membership and
-    /// status, the term, and the load rows where the journal carries
-    /// them), each inside the write's own critical section: a store a
-    /// standby or a watcher of its rows can follow.
+    /// status, and the term), each inside the write's own critical
+    /// section: a store a standby or a watcher of its rows can follow. A
+    /// load write tells it nothing.
     pub fn journaled(journal: Arc<dyn Journal>) -> Self {
         let mut store = Self::default();
         store.workers.get_mut().journal = Some(Arc::clone(&journal));
-        store.load_journal = journal.carries_loads().then(|| Arc::clone(&journal));
         store.journal = Some(journal);
         store
     }
@@ -284,48 +276,27 @@ impl MemoryStore {
         self.journal.as_ref().and_then(|journal| journal.followed())
     }
 
-    /// The tables of `kinds` as one journaled write of those kinds left
-    /// them, with that write's position: the rows, and with
-    /// [`JournalKinds::All`] the load rows. What a watcher of the rows starts
-    /// from, and what a standby is restored from. Taken under the locks of the
-    /// kinds asked, in the store's order (the membership lock; the load lock
-    /// for the load rows alone): every journaled write holds its table's lock
-    /// from its apply to its telling, so none stands half told here. A writer
-    /// of those tables waits for the copy; a decision reads the published world
-    /// and does not, and a cut of the rows leaves the load writers be. Where
-    /// the journal carries no load row a cut of every kind has no tail: that
-    /// journal is lost to a reader of every kind.
-    pub fn checkpoint(&self, kinds: JournalKinds) -> StoreCheckpoint {
-        // Copied under the locks, sorted after them: a writer waits for the
+    /// The rows as one journaled write left them, with that write's
+    /// position. What a watcher of the rows starts from, and what a standby
+    /// is restored from. Taken under the membership lock: every journaled
+    /// write holds its table's lock from its apply to its telling, so none
+    /// stands half told here. A writer of the rows waits for the copy; a
+    /// decision reads the published world and does not, and a cut leaves
+    /// the load writers be.
+    pub fn checkpoint(&self) -> StoreCheckpoint {
+        // Copied under the lock, sorted after it: a writer waits for the
         // copy alone.
-        let (at, epoch, mut rows, mut samples) = {
+        let (at, epoch, mut rows) = {
             let workers = self.workers.lock();
-            let loads = (kinds == JournalKinds::All).then(|| self.loads.lock());
             let at = self
                 .journal
                 .as_ref()
-                .map_or_else(Position::default, |journal| journal.head(kinds));
+                .map_or_else(Position::default, |journal| journal.head());
             let rows: Vec<WorkerRow> = workers.rows.values().map(|row| row.row.clone()).collect();
-            let samples: Vec<(WorkerId, u16, LoadSample)> = loads
-                .iter()
-                .flat_map(|loads| loads.ranks.iter())
-                .flat_map(|(id, ranks)| {
-                    ranks
-                        .samples
-                        .iter()
-                        .map(|(rank, sample)| (*id, *rank, *sample))
-                })
-                .collect();
-            (at, workers.epoch, rows, samples)
+            (at, workers.epoch, rows)
         };
         rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
-        samples.sort_by_key(|(id, rank, _)| (*id, *rank));
-        StoreCheckpoint {
-            at,
-            epoch,
-            rows,
-            loads: samples,
-        }
+        StoreCheckpoint { at, epoch, rows }
     }
 
     /// The first `limit` rows in key order of the ones that serve one of
@@ -450,8 +421,8 @@ impl MemoryStore {
     /// and local loads. Its KV lane stays while its cache events still
     /// belong to the same model and rank.
     ///
-    /// Loads in the cut are ignored. Returns `false` with the store as it
-    /// was if the journal refuses the snapshot's place.
+    /// Returns `false` with the store as it was if the journal refuses the
+    /// snapshot's place.
     ///
     /// A follower's store has no journal. On a journaled store the journal
     /// takes the cut's place: it follows the cut's term and leads no
@@ -467,7 +438,7 @@ impl MemoryStore {
     }
 
     /// Lays the rows and publishes their world. A watch carries local
-    /// state for the ids it sees again. A standby takes the cut's loads
+    /// state for the ids it sees again. A standby holds no load row
     /// and gives every row a fresh slot. The session pins take the steps
     /// of the writes the cut stands for ([`Workers::lay_gone`]). The ids
     /// whose pins leave are returned, for the caller to forget behind its
@@ -543,12 +514,6 @@ impl MemoryStore {
                     !dispatches.is_empty()
                 });
                 loads.ranks.retain(|id, _| stays(id));
-            } else {
-                for (id, rank, sample) in cut.loads {
-                    if let Some(ranks) = loads.ranks.get_mut(&id) {
-                        ranks.samples.insert(rank, sample);
-                    }
-                }
             }
         }
         // The index is this replica's own: a row that left gives up its
@@ -823,21 +788,6 @@ impl MemoryStore {
         seam::released();
         self.forget_gone(&ended);
         true
-    }
-
-    /// One of the leader's load rows, applied as the replication stream
-    /// tells it: [`LoadSink::record`] on a standby, journaled at `at`, the
-    /// event's place, which the applier holds ([`Journal::load`]).
-    pub fn follow_load(
-        &self,
-        at: Position,
-        id: WorkerId,
-        rank: u16,
-        row: LoadRow,
-        received_at: Instant,
-        source: LoadSource,
-    ) {
-        self.record_at(Some(at), id, rank, row, received_at, source);
     }
 
     /// The start of a leader's term, applied as the replication stream
@@ -2568,12 +2518,9 @@ impl Loads {
 }
 
 impl MemoryStore {
-    /// [`LoadSink::record`], told to the journal with `at`: the place of
-    /// the leader's event the row applies, none for a row of the store's
-    /// own.
+    /// [`LoadSink::record`]'s write.
     fn record_at(
         &self,
-        at: Option<Position>,
         id: WorkerId,
         rank: u16,
         row: LoadRow,
@@ -2601,9 +2548,6 @@ impl MemoryStore {
             ranks.pushed_at.insert(rank, received_at);
         }
         ranks.samples.insert(rank, sample);
-        if let Some(journal) = &self.load_journal {
-            journal.load(at, id, rank, &sample);
-        }
         if let Some(place) = writer.fold_load(id, rank, Some(&sample)) {
             writer.recorded(place, id, rank, received_at);
             let world = writer.folded_at(received_at);
@@ -2690,9 +2634,6 @@ impl MemoryStore {
                         source,
                     };
                     ranks.samples.insert(rank, sample);
-                    if let Some(journal) = &self.load_journal {
-                        journal.load(None, id, rank, &sample);
-                    }
                     let place = writer.fold_load(id, rank, Some(&sample));
                     let engine = place.and_then(|place| {
                         let engine = writer.engine_at(place)?;
@@ -2814,7 +2755,7 @@ impl LoadSink for MemoryStore {
         received_at: Instant,
         source: LoadSource,
     ) {
-        self.record_at(None, id, rank, row, received_at, source);
+        self.record_at(id, rank, row, received_at, source);
     }
 
     fn report(

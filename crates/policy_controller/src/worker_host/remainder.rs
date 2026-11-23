@@ -260,8 +260,8 @@ mod tests {
         store::{
             encoding::{EncodeHandoff, EncodeOffer},
             pairing::PairingDescriptor,
-            GatewayId, HealthPolicy, JournalKinds, MemoryStore, Overload, Reachability, Registrant,
-            Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore as _,
+            GatewayId, HealthPolicy, MemoryStore, Overload, Reachability, Registrant, Signals,
+            WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore as _,
         },
         worker_host::{
             Members, MembershipWriter as _, Objects, Precondition, StoreMembershipWriter,
@@ -591,7 +591,7 @@ mod tests {
         let other = MemoryStore::new();
         let second = Registrant::provider("found", "two").expect("a maker");
         assert_eq!(other.upsert_by(at(URL), second.clone()).id(), id);
-        assert!(store.restore_from(other.checkpoint(JournalKinds::Watched)));
+        assert!(store.restore_from(other.checkpoint()));
         assert_eq!(read_back(&store, &objects, "another history"), 1);
 
         let after = objects.remainder(&object).expect("the remainder");

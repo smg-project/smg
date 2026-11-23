@@ -1180,7 +1180,7 @@ mod tests {
             proto::{self, busy::Reason, policy_controller_server::PolicyController},
         },
         stages::registry::StageRegistry,
-        store::{JournalKinds, LeasesStore, Position, WorkersStore},
+        store::{LeasesStore, Position, WorkersStore},
         tracking::lease::{LeaseId, ReleaseReason},
     };
 
@@ -3130,7 +3130,7 @@ mod tests {
             refused(service.deregister_worker(removal).await.err(), "a removal");
             let snapshot = from("operator-a", proto::SnapshotRequest::default());
             refused(service.get_snapshot(snapshot).await.err(), "a snapshot");
-            assert_eq!(service.shared.feed.log.head(JournalKinds::Watched), place);
+            assert_eq!(service.shared.feed.log.head(), place);
         }
     }
 

@@ -20,17 +20,17 @@ use crate::{
     engine::view::{Health, LoadRow, Role, WireModes, WorkerId},
     store::{
         identity, pairing::PairingDescriptor, BatchFacts, BatchOutcome, ContentHash, GatewayId,
-        HealthSink, Journal, JournalKinds, KvEvent, KvEventSink, LeasesStore, LoadSample, LoadSink,
-        LoadSource, MembershipChange, MembershipTail, MemoryStore, OutsideLists, Position,
-        SequenceHash, Signals, StoreCheckpoint, StoredBlock, WorkerFacts, WorkerPatch, WorkerRow,
-        WorkerStatus, WorkersStore,
+        HealthSink, Journal, KvEvent, KvEventSink, LeasesStore, LoadSink, LoadSource,
+        MembershipChange, MembershipTail, MemoryStore, OutsideLists, Position, SequenceHash,
+        Signals, StoreCheckpoint, StoredBlock, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
+        WorkersStore,
     },
     tracking::lease::TransportClass,
 };
 
-/// A store whose log carries every kind, `events` of each retained.
+/// A store with its log, `events` retained.
 fn journaled(events: usize) -> (MemoryStore, Arc<Log>) {
-    let log = Arc::new(Log::new(events, events));
+    let log = Arc::new(Log::new(events));
     let journal: Arc<dyn Journal> = Arc::clone(&log) as _;
     (MemoryStore::journaled(journal), log)
 }
@@ -77,7 +77,7 @@ fn all(log: &Log) -> Vec<Entry> {
         let after = entries
             .last()
             .map_or_else(Position::default, |entry| entry.at);
-        log.read(JournalKinds::All, after, 64, &mut out)
+        log.read(after, 64, &mut out)
             .expect("the log retains the test's writes");
         if out.is_empty() {
             return entries;
@@ -109,15 +109,7 @@ fn member(entry: &Entry) -> (MembershipChange, &WorkerRow, u64) {
 fn left(entry: &Entry) -> Option<&WorkerRow> {
     match &entry.event {
         Event::Member { left, .. } => left.as_deref(),
-        Event::Load { .. } | Event::Term | Event::Generation { .. } => None,
-    }
-}
-
-/// A load event's worker, rank and sample.
-fn load(entry: &Entry) -> (WorkerId, u16, LoadSample) {
-    match &entry.event {
-        Event::Load { id, rank, sample } => (*id, *rank, *sample),
-        other => panic!("a load event, not {other:?}"),
+        Event::Term | Event::Generation { .. } => None,
     }
 }
 
@@ -129,6 +121,8 @@ fn every_journaled_entry_tells_one_event_in_the_stores_order() {
     let a = store.upsert(facts(KEY, 1)).id();
     store.set_status(a, WorkerStatus::Ready, revision(&store, a));
     let now = Instant::now();
+    // The load writes that follow take no place: a load row is told to no
+    // journal.
     store.record(a, 0, running(3), now, LoadSource::Stream);
     // A poll that began before that record: rank 0 pushed since, rank 1 did
     // not, so the report writes rank 1 alone.
@@ -175,19 +169,17 @@ fn every_journaled_entry_tells_one_event_in_the_stores_order() {
             at(3, 2),
             at(4, 2),
             at(5, 2),
-            at(6, 2),
-            at(7, 2),
+            at(6, 5),
+            at(7, 5),
             at(8, 5),
             at(9, 5),
-            at(10, 5),
-            at(11, 5),
-            at(12, 5)
+            at(10, 5)
         ]
     );
-    assert_eq!(log.head(JournalKinds::All), at(12, 5));
+    assert_eq!(log.head(), at(10, 5));
     // Each term starts with its own position: the store took it.
     assert_eq!(entries[0].event, Event::Term);
-    assert_eq!(entries[7].event, Event::Term);
+    assert_eq!(entries[5].event, Event::Term);
 
     let (change, row, epoch) = member(&entries[1]);
     assert_eq!(change, MembershipChange::Registered { id: a });
@@ -210,42 +202,31 @@ fn every_journaled_entry_tells_one_event_in_the_stores_order() {
         (WorkerStatus::Ready, 1, 2)
     );
 
-    let (id, rank, sample) = load(&entries[3]);
-    assert_eq!(
-        (id, rank, sample.row.running, sample.source),
-        (a, 0, 3, LoadSource::Stream)
-    );
-    let (id, rank, sample) = load(&entries[4]);
-    assert_eq!(
-        (id, rank, sample.row.running, sample.source),
-        (a, 1, 5, LoadSource::Poll)
-    );
-
-    let (change, row, epoch) = member(&entries[5]);
+    let (change, row, epoch) = member(&entries[3]);
     assert_eq!(change, MembershipChange::Relabelled { id: a });
     assert_eq!((row.facts.priority, epoch), (7, 3));
 
-    let (change, row, epoch) = member(&entries[6]);
+    let (change, row, epoch) = member(&entries[4]);
     assert_eq!(change, MembershipChange::Resized { id: a });
     assert_eq!((row.facts.dp_size, epoch), (2, 4));
 
-    let (change, row, epoch) = member(&entries[8]);
+    let (change, row, epoch) = member(&entries[6]);
     assert_eq!(change, MembershipChange::Replaced { old: a, new: b });
     assert_eq!(
         (row.id, row.facts.incarnation, row.revision, epoch),
         (b, 2, 1, 5)
     );
     assert_eq!(
-        left(&entries[8]),
+        left(&entries[6]),
         Some(&replaced),
         "a replacement tells the incarnation it took out"
     );
     assert!(
-        entries[..8].iter().all(|entry| left(entry).is_none()),
+        entries[..6].iter().all(|entry| left(entry).is_none()),
         "no other write took a row out"
     );
 
-    let (change, row, _) = member(&entries[9]);
+    let (change, row, _) = member(&entries[7]);
     assert_eq!(
         change,
         MembershipChange::StatusChanged {
@@ -256,7 +237,7 @@ fn every_journaled_entry_tells_one_event_in_the_stores_order() {
     );
     assert_eq!(row.status, WorkerStatus::NotReady);
 
-    let (change, row, _) = member(&entries[10]);
+    let (change, row, _) = member(&entries[8]);
     assert_eq!(
         change,
         MembershipChange::StatusChanged {
@@ -267,7 +248,7 @@ fn every_journaled_entry_tells_one_event_in_the_stores_order() {
     );
     assert_eq!(row.status, WorkerStatus::Ready);
 
-    match &entries[11].event {
+    match &entries[9].event {
         Event::Member {
             epoch,
             change,
@@ -309,7 +290,7 @@ fn a_write_the_store_refused_and_an_entry_off_the_journal_tell_nothing() {
     store.evict(a);
     store.publish(now + Duration::from_secs(1));
     assert_eq!(
-        log.head(JournalKinds::All),
+        log.head(),
         Position { seq: 1, term: 0 },
         "the registration alone"
     );
@@ -327,7 +308,7 @@ fn a_watched_write_is_told_once_the_store_let_its_locks_go() {
     let written: Arc<OnceLock<Weak<MemoryStore>>> = Arc::default();
     let log = {
         let (told, written) = (Arc::clone(&told), Arc::clone(&written));
-        Log::new(64, 64).on_watched(move || {
+        Log::new(64).on_watched(move || {
             let store = written.get().and_then(Weak::upgrade);
             told.lock()
                 .push(store.expect("the store that wrote").unlocked());
@@ -390,20 +371,18 @@ fn the_stores_term_reaches_its_journal_and_never_falls() {
     store.set_term(2);
     assert_eq!((store.term(), log.term()), (3, 3));
     assert_eq!(
-        log.head(JournalKinds::All),
+        log.head(),
         Position { seq: 1, term: 3 },
         "the take is the term's first position"
     );
     store.upsert(facts("http://a:8000", 1));
-    assert_eq!(log.head(JournalKinds::All), Position { seq: 2, term: 3 });
+    assert_eq!(log.head(), Position { seq: 2, term: 3 });
 }
 
-/// A journal that keeps the terms it is told and counts the load rows.
+/// A journal that keeps the terms it is told.
 #[derive(Default)]
 struct Told {
     terms: Mutex<Vec<u64>>,
-    loads: AtomicU64,
-    carries_loads: bool,
 }
 
 impl Journal for Told {
@@ -417,10 +396,6 @@ impl Journal for Told {
     ) {
     }
 
-    fn load(&self, _: Option<Position>, _: WorkerId, _: u16, _: &LoadSample) {
-        self.loads.fetch_add(1, Ordering::SeqCst);
-    }
-
     fn term_rose(&self, term: u64) {
         self.terms.lock().push(term);
     }
@@ -429,11 +404,7 @@ impl Journal for Told {
 
     fn term_followed(&self, _: Position) {}
 
-    fn carries_loads(&self) -> bool {
-        self.carries_loads
-    }
-
-    fn head(&self, _: JournalKinds) -> Position {
+    fn head(&self) -> Position {
         Position::default()
     }
 
@@ -458,41 +429,26 @@ fn the_store_tells_a_term_once_when_it_rises() {
 }
 
 #[test]
-fn a_store_tells_no_load_row_to_a_journal_that_carries_none() {
-    for carries_loads in [false, true] {
-        let told = Arc::new(Told {
-            carries_loads,
-            ..Told::default()
-        });
-        let store = MemoryStore::journaled(Arc::clone(&told) as _);
-        let a = store.upsert(facts("http://a:8000", 1)).id();
-        let now = Instant::now();
-        store.record(a, 0, running(1), now, LoadSource::Stream);
-        store.report(&[(a, 1, Some(running(2)))], now, LoadSource::Poll);
-        assert_eq!(
-            told.loads.load(Ordering::SeqCst),
-            if carries_loads { 2 } else { 0 }
-        );
-    }
-    // A log of the watched kinds alone: a load write takes no position
-    // and the store holds the row all the same.
-    let log = Arc::new(Log::new(8, 0));
+fn a_load_write_takes_no_position_and_the_store_holds_its_row() {
+    let log = Arc::new(Log::new(8));
     let store = MemoryStore::journaled(Arc::clone(&log) as _);
     let a = store.upsert(facts("http://a:8000", 1)).id();
-    store.record(a, 0, running(1), Instant::now(), LoadSource::Stream);
+    let now = Instant::now();
+    store.record(a, 0, running(1), now, LoadSource::Stream);
+    store.report(&[(a, 1, Some(running(2)))], now, LoadSource::Poll);
     assert_eq!(
-        log.head(JournalKinds::All),
+        log.head(),
         Position { seq: 1, term: 0 },
         "the registration alone"
     );
-    assert_eq!(store.checkpoint(JournalKinds::All).loads.len(), 1);
+    assert!(store.load(a, 0).is_some() && store.load(a, 1).is_some());
 }
 
 #[test]
 fn a_store_with_no_journal_cuts_at_the_start_and_a_journaled_one_at_its_head() {
     let plain = MemoryStore::new();
     plain.upsert(facts("http://a:8000", 1));
-    let cut = plain.checkpoint(JournalKinds::All);
+    let cut = plain.checkpoint();
     assert_eq!((cut.at, cut.rows.len()), (Position::default(), 1));
 
     let (store, log) = journaled(8);
@@ -500,52 +456,32 @@ fn a_store_with_no_journal_cuts_at_the_start_and_a_journaled_one_at_its_head() {
     let a = store.upsert(facts("http://b:8000", 1)).id();
     store.upsert(facts("http://a:8000", 1));
     store.record(a, 1, running(2), Instant::now(), LoadSource::Stream);
-    let cut = store.checkpoint(JournalKinds::All);
-    assert_eq!(cut.at, log.head(JournalKinds::All));
-    assert_eq!(cut.at, Position { seq: 4, term: 4 });
+    // The cut stands at the last journaled write: the load row after it
+    // took no place.
+    let cut = store.checkpoint();
+    assert_eq!(cut.at, log.head());
+    assert_eq!(cut.at, Position { seq: 3, term: 4 });
     assert_eq!(cut.epoch, store.epoch());
     let keys: Vec<&str> = cut.rows.iter().map(|row| row.facts.key.as_str()).collect();
     assert_eq!(keys, ["http://a:8000", "http://b:8000"], "rows by key");
-    let loads: Vec<(WorkerId, u16, u32)> = cut
-        .loads
-        .iter()
-        .map(|(id, rank, sample)| (*id, *rank, sample.row.running))
-        .collect();
-    assert_eq!(loads, [(a, 1, 2)]);
-
-    // A cut of the rows: the same rows at the last write of the membership
-    // kinds, not at the load row after it.
-    let rows = store.checkpoint(JournalKinds::Watched);
-    assert_eq!(rows.at, log.head(JournalKinds::Watched));
-    assert_eq!(rows.at, Position { seq: 3, term: 4 });
-    assert_eq!((rows.epoch, &rows.rows), (cut.epoch, &cut.rows));
-    assert!(rows.loads.is_empty());
 }
 
 /// What a standby holds after a cut and the events it applied since: the
-/// rows and the load rows, under the store's own rules (a load of no member
-/// is dropped; a row that leaves takes its load rows).
+/// rows.
 #[derive(Debug, PartialEq)]
 struct Twin {
     rows: BTreeMap<WorkerId, WorkerRow>,
-    loads: BTreeMap<(WorkerId, u16), LoadSample>,
 }
 
 impl Twin {
     fn of(cut: &StoreCheckpoint) -> Self {
         Self {
             rows: cut.rows.iter().map(|row| (row.id, row.clone())).collect(),
-            loads: cut
-                .loads
-                .iter()
-                .map(|(id, rank, sample)| ((*id, *rank), *sample))
-                .collect(),
         }
     }
 
     fn leave(&mut self, id: WorkerId) {
         self.rows.remove(&id);
-        self.loads.retain(|(of, _), _| *of != id);
     }
 
     fn apply(&mut self, event: &Event) {
@@ -562,11 +498,6 @@ impl Twin {
                     self.rows.insert(other.id(), row.clone());
                 }
             },
-            Event::Load { id, rank, sample } => {
-                if self.rows.contains_key(id) {
-                    self.loads.insert((*id, *rank), *sample);
-                }
-            }
             Event::Term | Event::Generation { .. } => {}
         }
     }
@@ -648,16 +579,6 @@ fn loads(store: &MemoryStore, lives: &[AtomicU64], seed: u64, writes: u32) {
     }
 }
 
-/// One load row for the worker each key holds. With no churn beside it,
-/// the row of every worker a key holds is journaled.
-fn load_each(store: &MemoryStore, lives: &[AtomicU64]) {
-    let now = Instant::now();
-    for (index, life) in lives.iter().enumerate() {
-        let id = identity(&key(index), life.load(Ordering::SeqCst));
-        store.record(id, 0, running(0), now, LoadSource::Stream);
-    }
-}
-
 #[test]
 fn a_cut_and_the_tail_after_it_are_the_next_cut_under_writers() {
     const LEGS: u32 = 4;
@@ -666,14 +587,11 @@ fn a_cut_and_the_tail_after_it_are_the_next_cut_under_writers() {
     const CUTS: usize = 500;
     let (store, log) = journaled(1 << 17);
     let lives: Vec<AtomicU64> = (0..KEYS).map(|_| AtomicU64::new(0)).collect();
-    // A standby's cuts (every kind) and a watcher's (the rows), in turn.
-    let mut cuts = vec![store.checkpoint(JournalKinds::All)];
-    let mut row_cuts = vec![store.checkpoint(JournalKinds::Watched)];
+    let mut cuts = vec![store.checkpoint()];
     // The writers' work in legs. While a leg runs, a cut is taken each time
-    // the log has moved past the last one, a bounded number of them. After
-    // the leg each key's worker gets one load row and one more cut is
-    // taken: cuts stand between writes of both kinds whatever the
-    // scheduler does.
+    // the log has moved past the last one, a bounded number of them, and one
+    // more behind the leg. The load writers write beside the churn: a load
+    // row takes no place, and a cut waits for none of them.
     for _ in 0..LEGS {
         thread::scope(|scope| {
             let writers = [
@@ -683,37 +601,27 @@ fn a_cut_and_the_tail_after_it_are_the_next_cut_under_writers() {
             ];
             let mut taken = 0;
             while taken < CUTS && writers.iter().any(|writer| !writer.is_finished()) {
-                if cuts
-                    .last()
-                    .is_some_and(|cut| cut.at == log.head(JournalKinds::All))
-                {
+                if cuts.last().is_some_and(|cut| cut.at == log.head()) {
                     thread::yield_now();
                     continue;
                 }
-                cuts.push(store.checkpoint(JournalKinds::All));
-                row_cuts.push(store.checkpoint(JournalKinds::Watched));
+                cuts.push(store.checkpoint());
                 taken += 1;
             }
         });
-        load_each(&store, &lives);
-        cuts.push(store.checkpoint(JournalKinds::All));
-        row_cuts.push(store.checkpoint(JournalKinds::Watched));
+        cuts.push(store.checkpoint());
     }
 
     let entries = all(&log);
     let place = |cut: &StoreCheckpoint| usize::try_from(cut.at.seq).expect("a count of events");
     let mut out = Vec::new();
-    let (mut members, mut load_rows, mut moved) = (0u32, 0u32, 0u32);
+    let (mut members, mut moved) = (0u32, 0u32);
     for pair in cuts.windows(2) {
         let (from, to) = (&pair[0], &pair[1]);
         let mut twin = Twin::of(from);
         let after = &entries[place(from)..place(to)];
         for entry in after {
-            match entry.event {
-                Event::Member { .. } => members += 1,
-                Event::Load { .. } => load_rows += 1,
-                Event::Term | Event::Generation { .. } => {}
-            }
+            members += u32::from(matches!(entry.event, Event::Member { .. }));
             twin.apply(&entry.event);
         }
         moved += u32::from(!after.is_empty());
@@ -725,82 +633,20 @@ fn a_cut_and_the_tail_after_it_are_the_next_cut_under_writers() {
             after.len(),
             to.at
         );
-        // The cut's load rows stand by worker and rank.
-        assert!(
-            to.loads
-                .windows(2)
-                .all(|pair| (pair[0].0, pair[0].1) < (pair[1].0, pair[1].1)),
-            "{:?}",
-            to.at
-        );
         // The cut's place is a place of the log: the tail is read from it.
-        assert_eq!(
-            log.read(JournalKinds::All, to.at, 1, &mut out),
-            Ok(()),
-            "{:?}",
-            to.at
-        );
+        assert_eq!(log.read(to.at, 1, &mut out), Ok(()), "{:?}", to.at);
         assert_eq!(
             out.first().map(|entry| entry.at.seq),
-            (to.at != log.head(JournalKinds::All)).then_some(to.at.seq + 1)
-        );
-    }
-
-    // A watcher's cuts: the rows at the last write of the watched kinds,
-    // and the membership events after it are the next cut's rows.
-    let mut rows_moved = 0u32;
-    for pair in row_cuts.windows(2) {
-        let (from, to) = (&pair[0], &pair[1]);
-        let mut twin = Twin::of(from);
-        let after = &entries[place(from)..place(to)];
-        for entry in after {
-            if matches!(entry.event, Event::Member { .. }) {
-                twin.apply(&entry.event);
-            }
-        }
-        rows_moved += u32::from(!after.is_empty());
-        assert_eq!(
-            twin,
-            Twin::of(to),
-            "the rows at {:?} and the membership events after them are not the rows at {:?}",
-            from.at,
-            to.at
-        );
-        assert!(to.loads.is_empty(), "a cut of the rows carries no load row");
-        // It stands at a write of the watched kinds, and the log reads
-        // those kinds on from it.
-        let last = place(to)
-            .checked_sub(1)
-            .and_then(|index| entries.get(index));
-        assert!(
-            !last.is_some_and(|entry| matches!(entry.event, Event::Load { .. })),
-            "{:?}",
-            to.at
-        );
-        assert_eq!(
-            log.read(JournalKinds::Watched, to.at, 1, &mut out),
-            Ok(()),
-            "{:?}",
-            to.at
+            (to.at != log.head()).then_some(to.at.seq + 1)
         );
     }
 
     // The case is held to what it claims, by its legs and not by the
-    // scheduler: every leg wrote both kinds, and a cut stands after each.
-    assert_eq!(
-        u64::from(members + load_rows),
-        log.head(JournalKinds::All).seq
-    );
+    // scheduler: every leg wrote membership events, no load row took a
+    // place, and a cut stands behind each leg.
+    assert_eq!(u64::from(members), log.head().seq);
     assert!(members >= LEGS * ROUNDS / 2, "{members} membership events");
-    assert!(
-        load_rows >= LEGS,
-        "{load_rows} load rows written to a member"
-    );
     assert!(moved >= LEGS, "{moved} cuts with a tail, of {}", cuts.len());
-    assert!(
-        rows_moved >= LEGS,
-        "{rows_moved} cuts of the rows with a tail"
-    );
 }
 
 #[test]
@@ -814,18 +660,18 @@ fn a_reader_of_a_restarted_store_starts_at_its_cut_and_reads_on() {
     log.restart(Position { seq: 2, term: 2 })
         .expect("a place the log takes");
     store.upsert(facts("http://a:8000", 1));
-    let first = store.checkpoint(JournalKinds::All);
+    let first = store.checkpoint();
     assert_eq!(first.at, Position { seq: 3, term: 0 });
-    assert_eq!(log.read(JournalKinds::All, first.at, 64, &mut out), Ok(()));
+    assert_eq!(log.read(first.at, 64, &mut out), Ok(()));
     assert!(out.is_empty());
     let b = store.upsert(facts("http://b:8000", 1)).id();
     store.record(b, 0, running(2), Instant::now(), LoadSource::Stream);
-    assert_eq!(log.read(JournalKinds::All, first.at, 64, &mut out), Ok(()));
+    assert_eq!(log.read(first.at, 64, &mut out), Ok(()));
     let mut twin = Twin::of(&first);
     for entry in &out {
         twin.apply(&entry.event);
     }
-    let next = store.checkpoint(JournalKinds::All);
+    let next = store.checkpoint();
     assert_eq!(out.last().map(|entry| entry.at), Some(next.at));
     assert_eq!(twin, Twin::of(&next));
     // A restart below those numbers: the first reader's place is gone for
@@ -833,68 +679,11 @@ fn a_reader_of_a_restarted_store_starts_at_its_cut_and_reads_on() {
     log.restart(Position { seq: 2, term: 3 })
         .expect("a place the log takes");
     store.upsert(facts("http://c:8000", 1));
-    assert_eq!(
-        log.read(JournalKinds::All, first.at, 64, &mut out),
-        Err(LogPositionLost)
-    );
-    let again = store.checkpoint(JournalKinds::All);
-    assert_eq!(again.at, Position { seq: 6, term: 0 });
-    assert_eq!(log.read(JournalKinds::All, again.at, 64, &mut out), Ok(()));
+    assert_eq!(log.read(first.at, 64, &mut out), Err(LogPositionLost));
+    let again = store.checkpoint();
+    assert_eq!(again.at, Position { seq: 5, term: 0 });
+    assert_eq!(log.read(again.at, 64, &mut out), Ok(()));
     assert!(out.is_empty());
-}
-
-#[test]
-fn a_workers_load_rows_stand_between_its_registration_and_its_leaving() {
-    const ROUNDS: u32 = 4_000;
-    const WRITES: u32 = 40_000;
-    let (store, log) = journaled(1 << 17);
-    let lives: Vec<AtomicU64> = (0..KEYS).map(|_| AtomicU64::new(0)).collect();
-    thread::scope(|scope| {
-        scope.spawn(|| churn(&store, &lives, ROUNDS));
-        scope.spawn(|| loads(&store, &lives, 17, WRITES));
-        scope.spawn(|| loads(&store, &lives, 19, WRITES));
-    });
-    // One row more for each key's worker, the churn ended: the journal
-    // holds load rows whatever the scheduler did.
-    load_each(&store, &lives);
-    // Each worker by the journal: live from its registration, gone from its
-    // removal or its replacement.
-    let mut live = BTreeMap::new();
-    let mut load_rows = 0u32;
-    for entry in all(&log) {
-        match entry.event {
-            Event::Member { change, .. } => match change {
-                MembershipChange::Registered { id } => {
-                    live.insert(id, true);
-                }
-                MembershipChange::Replaced { old, new } => {
-                    live.insert(old, false);
-                    live.insert(new, true);
-                }
-                MembershipChange::Removed { id } => {
-                    live.insert(id, false);
-                }
-                _ => {}
-            },
-            Event::Load { id, .. } => {
-                load_rows += 1;
-                match live.get(&id) {
-                    Some(true) => {}
-                    Some(false) => {
-                        panic!("the load at {:?} stands after its worker left", entry.at)
-                    }
-                    None => panic!(
-                        "the load at {:?} stands before its worker's registration",
-                        entry.at
-                    ),
-                }
-            }
-            Event::Term | Event::Generation { .. } => {}
-        }
-    }
-    assert!(load_rows > 0, "no load row was written to a member");
-    let gone = live.values().filter(|live| !**live).count();
-    assert!(gone > 0, "no worker left under the load writers");
 }
 
 /// One of a leader's entries applied to a standby's store under the guard
@@ -914,15 +703,6 @@ fn applies(standby: &MemoryStore, entry: &Entry) {
         } => {
             let (change, row) = told(*change, row.as_deref());
             standby.follow(entry.at, *epoch, change, row);
-        }
-        Event::Load { id, rank, sample } => {
-            let LoadSample {
-                row,
-                received_at,
-                source,
-                ..
-            } = *sample;
-            standby.follow_load(entry.at, *id, *rank, row, received_at, source);
         }
         Event::Term => standby.follow_term(entry.at),
         Event::Generation { generation } => {
@@ -952,20 +732,16 @@ fn rounds(leader: &MemoryStore, lives: &[AtomicU64], count: u64) {
     }
 }
 
-/// A standby's tables are the leader's: the place, the epoch, every row
-/// under its key and every load row.
+/// A standby's tables are the leader's: the place, the epoch and every row
+/// under its key.
 fn twins(standby: &MemoryStore, leader: &MemoryStore) {
-    let (ours, theirs) = (
-        standby.checkpoint(JournalKinds::All),
-        leader.checkpoint(JournalKinds::All),
-    );
+    let (ours, theirs) = (standby.checkpoint(), leader.checkpoint());
     assert_eq!((ours.at, ours.epoch), (theirs.at, theirs.epoch));
     assert_eq!(ours.rows, theirs.rows);
     for row in &ours.rows {
         let found = standby.by_key(&row.facts.key).map(|found| found.id);
         assert_eq!(found, Some(row.id), "{}", row.facts.key);
     }
-    assert_eq!(ours.loads, theirs.loads);
     let at = later();
     assert_eq!(pool(standby, at), pool(leader, at));
 }
@@ -977,18 +753,19 @@ fn later() -> Instant {
     Instant::now() + Duration::from_secs(READS.fetch_add(1, Ordering::SeqCst) + 1)
 }
 
-/// What the store's world holds of each worker on file at `at`, once every
-/// folded load row is published: the id, width, health bits and load row of
-/// its published row, by id. A worker no pool lists has none.
-fn pool(store: &MemoryStore, at: Instant) -> Vec<(WorkerId, u16, Health, Option<LoadRow>)> {
+/// What the store's world holds of each worker on file at `at`: the id,
+/// width and health bits of its published row, by id. A worker no pool
+/// lists has none. A standby follows no load row, so the load rows are set
+/// aside.
+fn pool(store: &MemoryStore, at: Instant) -> Vec<(WorkerId, u16, Health)> {
     store.publish(at);
     let world = store.snapshot();
-    let on_file = store.checkpoint(JournalKinds::All).rows;
+    let on_file = store.checkpoint().rows;
     let mut ids: Vec<WorkerId> = on_file.iter().map(|row| row.id).collect();
     ids.sort_unstable();
     ids.into_iter()
         .filter_map(|id| world.first_row_of(id))
-        .map(|row| (row.id, row.dp_size, row.health, row.load))
+        .map(|row| (row.id, row.dp_size, row.health))
         .collect()
 }
 
@@ -1026,13 +803,11 @@ fn a_standby_that_follows_holds_the_leaders_tables_and_its_log() {
         MembershipChange::Resized { .. }
     ));
     reads(&leader);
-    // The worker leaves: its row, its key and its load row leave the
-    // standby.
+    // The worker leaves: its row and its key leave the standby.
     let left = leader.by_key("http://wide:8000").expect("the row");
     assert!(leader.remove(left.id, left.revision).is_some());
     reads(&leader);
     assert!(standby.by_key("http://wide:8000").is_none());
-    assert!(standby.load(wide, 0).is_none());
     // It comes back under its key, which the removal freed.
     assert!(matches!(
         leader.upsert(facts("http://wide:8000", 1)),
@@ -1040,7 +815,7 @@ fn a_standby_that_follows_holds_the_leaders_tables_and_its_log() {
     ));
     reads(&leader);
     let entries = all(&led);
-    assert!(entries.len() > 300, "{} entries", entries.len());
+    assert!(entries.len() > 200, "{} entries", entries.len());
     assert_eq!(all(&followed), entries);
     assert!(!pool(&standby, later()).is_empty());
     assert_eq!(standby.term(), 3, "the leader's term, told under its guard");
@@ -1095,7 +870,7 @@ fn a_standbys_index_holds_a_lane_for_each_row_that_asks_for_events() {
     let (other, _) = journaled(256);
     let own = other.upsert(asks("http://own:8000", 1)).id();
     assert_eq!(lanes(&other, &[own, again]), [true, false]);
-    assert!(other.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(other.restore_from(leader.checkpoint()));
     assert_eq!(lanes(&other, &[own, again, a]), [false, true, false]);
     // A row that stays through a restore keeps what this replica heard for
     // it: its lane's blocks are the replica's own, in no cut.
@@ -1113,7 +888,7 @@ fn a_standbys_index_holds_a_lane_for_each_row_that_asks_for_events() {
     };
     assert_eq!(heard.admit(again, 0, first, &block), BatchOutcome::Applied);
     assert_eq!(other.indexed_blocks(again, 0), 1);
-    assert!(other.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(other.restore_from(leader.checkpoint()));
     assert_eq!(other.indexed_blocks(again, 0), 1, "the lane was made again");
 }
 
@@ -1126,11 +901,11 @@ fn a_restore_and_the_tail_after_it_are_the_leaders_tables() {
     // The standby held a row of its own, written under no term.
     let (standby, followed) = journaled(4_096);
     standby.upsert(facts("http://stale:8000", 1));
-    let cut = leader.checkpoint(JournalKinds::All);
+    let cut = leader.checkpoint();
     let at = cut.at;
     assert!(standby.restore_from(cut));
     assert_eq!(standby.term(), 3);
-    assert_eq!(followed.head(JournalKinds::All), at);
+    assert_eq!(followed.head(), at);
     assert!(standby.by_key("http://stale:8000").is_none());
     twins(&standby, &leader);
     rounds(&leader, &lives, 20);
@@ -1154,7 +929,7 @@ fn a_restore_and_a_followed_write_are_told_once_the_store_let_its_locks_go() {
     let written: Arc<OnceLock<Weak<MemoryStore>>> = Arc::default();
     let followed = {
         let (told, written) = (Arc::clone(&told), Arc::clone(&written));
-        Arc::new(Log::new(64, 64).on_watched(move || {
+        Arc::new(Log::new(64).on_watched(move || {
             let store = written.get().and_then(Weak::upgrade);
             told.lock()
                 .push(store.expect("the store that wrote").unlocked());
@@ -1163,7 +938,7 @@ fn a_restore_and_a_followed_write_are_told_once_the_store_let_its_locks_go() {
     let journal: Arc<dyn Journal> = Arc::<Log>::clone(&followed);
     let standby = Arc::new(MemoryStore::journaled(journal));
     assert!(written.set(Arc::downgrade(&standby)).is_ok());
-    let cut = leader.checkpoint(JournalKinds::All);
+    let cut = leader.checkpoint();
     let at = cut.at;
     assert!(standby.restore_from(cut));
     assert_eq!(*told.lock(), [true], "a restore");
@@ -1195,13 +970,10 @@ fn a_reader_of_a_restored_replica_recovers_at_a_cut_in_every_shape_it_serves_in(
         for key in ["http://x:8000", "http://y:8000", "http://z:8000"] {
             replica.upsert(facts(key, 1));
         }
-        let stale = replica.checkpoint(JournalKinds::All).at;
+        let stale = replica.checkpoint().at;
         assert_eq!(stale, Position { seq: 3, term: 0 }, "{shape}");
         // The restore stands at the leader's second position.
-        assert!(
-            replica.restore_from(leader.checkpoint(JournalKinds::All)),
-            "{shape}"
-        );
+        assert!(replica.restore_from(leader.checkpoint()), "{shape}");
         match shape {
             "before its first follow" => {}
             "leading alone" => {
@@ -1213,16 +985,12 @@ fn a_reader_of_a_restored_replica_recovers_at_a_cut_in_every_shape_it_serves_in(
         }
         let mut out = Vec::new();
         assert_eq!(
-            log.read(JournalKinds::All, stale, 64, &mut out),
+            log.read(stale, 64, &mut out),
             Err(LogPositionLost),
             "{shape}"
         );
-        let cut = replica.checkpoint(JournalKinds::All);
-        assert_eq!(
-            log.read(JournalKinds::All, cut.at, 64, &mut out),
-            Ok(()),
-            "{shape}"
-        );
+        let cut = replica.checkpoint();
+        assert_eq!(log.read(cut.at, 64, &mut out), Ok(()), "{shape}");
         assert!(out.is_empty(), "{shape}");
         // One more write in the replica's shape: the leader's, followed, or
         // its own.
@@ -1234,25 +1002,17 @@ fn a_reader_of_a_restored_replica_recovers_at_a_cut_in_every_shape_it_serves_in(
             replica.upsert(facts("http://b:8000", 1));
         }
         assert_eq!(
-            log.read(JournalKinds::All, stale, 64, &mut out),
+            log.read(stale, 64, &mut out),
             Err(LogPositionLost),
             "{shape}"
         );
-        assert_eq!(
-            log.read(JournalKinds::All, cut.at, 64, &mut out),
-            Ok(()),
-            "{shape}"
-        );
+        assert_eq!(log.read(cut.at, 64, &mut out), Ok(()), "{shape}");
         assert_eq!(out.len(), 1, "{shape}");
         let mut twin = Twin::of(&cut);
         for entry in &out {
             twin.apply(&entry.event);
         }
-        assert_eq!(
-            twin,
-            Twin::of(&replica.checkpoint(JournalKinds::All)),
-            "{shape}"
-        );
+        assert_eq!(twin, Twin::of(&replica.checkpoint()), "{shape}");
     }
 }
 
@@ -1263,7 +1023,7 @@ fn a_restore_the_journal_refuses_changes_nothing() {
     store.set_term(3);
     store.upsert(facts("http://own:8000", 1));
     let held = |store: &MemoryStore| {
-        let cut = store.checkpoint(JournalKinds::All);
+        let cut = store.checkpoint();
         (cut.at, cut.epoch, Twin::of(&cut), store.term())
     };
     let before = (held(&store), all(&log));
@@ -1274,24 +1034,21 @@ fn a_restore_the_journal_refuses_changes_nothing() {
         other.set_term(term);
         other.upsert(facts("http://theirs:8000", 1));
         other.upsert(facts("http://more:8000", 1));
-        assert!(
-            !store.restore_from(other.checkpoint(JournalKinds::All)),
-            "term {term}"
-        );
+        assert!(!store.restore_from(other.checkpoint()), "term {term}");
         assert_eq!((held(&store), all(&log)), before, "term {term}");
     }
     // A store under no term takes no cut under no term: no leader wrote it.
     let (fresh, fresh_log) = journaled(64);
     let (other, _) = journaled(64);
     other.upsert(facts("http://theirs:8000", 1));
-    assert!(!fresh.restore_from(other.checkpoint(JournalKinds::All)));
+    assert!(!fresh.restore_from(other.checkpoint()));
     assert!(fresh.by_key("http://theirs:8000").is_none());
     assert!(all(&fresh_log).is_empty());
     // A term above its own is a leader's.
     let (leader, _) = journaled(64);
     leader.set_term(4);
     leader.upsert(facts("http://theirs:8000", 1));
-    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(store.restore_from(leader.checkpoint()));
     assert_eq!(store.term(), 4);
     assert_eq!(log.followed(), Some(4));
 }
@@ -1305,7 +1062,7 @@ fn a_restore_never_lowers_the_stores_term() {
     let (leader, _) = journaled(64);
     leader.set_term(3);
     leader.upsert(facts("http://theirs:8000", 1));
-    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(store.restore_from(leader.checkpoint()));
     assert!(store.by_key("http://theirs:8000").is_some());
     assert_eq!(store.term(), 5);
 }
@@ -1336,7 +1093,7 @@ fn a_restore_leaves_nothing_of_the_tables_it_replaces() {
         standing.any(|veto| veto.id == kept && veto.held)
     };
     assert!(held(&store));
-    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(store.restore_from(leader.checkpoint()));
     assert!(WorkersStore::get(&store, gone).is_none());
     assert!(store.load(gone, 0).is_none());
     assert!(!store.vetoed(ASKER, kept, now), "the veto in the table");
@@ -1378,12 +1135,12 @@ fn a_restore_reads_each_row_it_brings_under_the_lists_and_carries_no_field() {
     assert_eq!((again, revised), (id, at));
     let (standby, _log) = journaled(64);
     standby.apply(listing()).expect("applied");
-    assert!(standby.restore_from(inside.checkpoint(JournalKinds::All)));
+    assert!(standby.restore_from(inside.checkpoint()));
     assert_eq!(standby.outside_lists(), OutsideLists::default());
     // The next cut brings a row at the id and the revision the standby's
     // world read one at, in the other zone. No field of the row that left
     // is carried: the row is read under the lists again.
-    assert!(standby.restore_from(outside.checkpoint(JournalKinds::All)));
+    assert!(standby.restore_from(outside.checkpoint()));
     let counted = OutsideLists {
         engines: 0,
         zones: 1,
@@ -1399,9 +1156,9 @@ fn a_cut_beside_restores_is_one_restore_whole() {
     leader.set_term(1);
     let lives: Vec<AtomicU64> = (0..KEYS).map(|_| AtomicU64::new(0)).collect();
     rounds(&leader, &lives, 10);
-    let first = leader.checkpoint(JournalKinds::All);
+    let first = leader.checkpoint();
     rounds(&leader, &lives, 10);
-    let second = leader.checkpoint(JournalKinds::All);
+    let second = leader.checkpoint();
     let whole = |cut: &StoreCheckpoint| (cut.at, cut.epoch, Twin::of(cut));
     let cuts = [whole(&first), whole(&second)];
     assert_ne!(cuts[0], cuts[1]);
@@ -1416,7 +1173,7 @@ fn a_cut_beside_restores_is_one_restore_whole() {
         });
         // The place, the epoch and the tables of a cut are one restore's.
         loop {
-            let seen = whole(&standby.checkpoint(JournalKinds::All));
+            let seen = whole(&standby.checkpoint());
             assert!(
                 cuts.contains(&seen),
                 "a cut between two restores, at {:?}",
@@ -1430,48 +1187,31 @@ fn a_cut_beside_restores_is_one_restore_whole() {
 }
 
 #[test]
-fn a_row_of_the_standbys_own_inside_an_adoption_takes_no_place_of_its_leaders() {
+fn a_load_row_of_the_standbys_own_inside_an_adoption_takes_no_place() {
     let (leader, led) = journaled(64);
     leader.set_term(1);
     let a = leader.upsert(facts("http://a:8000", 1)).id();
     let before = all(&led).len();
-    // The leader's next events, one of each kind: a load row, a member and
-    // the start of its next term.
-    leader.record(a, 0, running(3), Instant::now(), LoadSource::Stream);
+    // The leader's next events, one of each kind: a member and the start of
+    // its next term.
     leader.upsert(facts("http://b:8000", 1));
     leader.set_term(2);
     let entries = all(&led);
-    assert_eq!(entries.len(), before + 3);
-    for event in &entries[before..] {
+    assert_eq!(entries.len(), before + 2);
+    for (index, event) in entries.iter().enumerate().skip(before) {
         let (standby, followed) = journaled(64);
-        for entry in entries.iter().take_while(|entry| entry.at != event.at) {
+        for entry in &entries[..index] {
             follows(&standby, &followed, entry);
         }
         // A poll's answer that was out when the standby stopped leading
-        // lands while the applier holds the event's place.
+        // lands while the applier holds the event's place. It tells the
+        // journal nothing: the hold stands, and the leader's event lands.
         let adopting = followed.adopt(event.at).expect("the next position");
         standby.record(a, 0, running(9), Instant::now(), LoadSource::Poll);
         applies(&standby, event);
-        // The row stands under no term, where the store's own writes
-        // stand, and the leader's event did not land.
-        assert!(!adopting.landed(), "{event:?}");
-        let last = all(&followed).pop().expect("the row");
-        assert!(matches!(last.event, Event::Load { .. }), "{event:?}");
-        assert_eq!(last.at.term, 0, "{event:?}");
+        assert!(adopting.landed(), "{event:?}");
         drop(adopting);
-        // No event of the leader's continues the standby there: it starts
-        // again from a snapshot, and holds what its leader holds.
-        let next = Position {
-            seq: event.at.seq + 1,
-            term: event.at.term,
-        };
-        assert_eq!(
-            followed.adopt(next).err(),
-            Some(LogPositionLost),
-            "{event:?}"
-        );
-        assert!(standby.restore_from(leader.checkpoint(JournalKinds::All)));
-        twins(&standby, &leader);
+        assert_eq!(all(&followed), entries[..=index], "{event:?}");
     }
 }
 
@@ -1628,7 +1368,7 @@ fn a_change_that_does_not_fit_the_tables_is_not_applied_and_takes_no_place() {
         ),
     ];
     let stands = |standby: &MemoryStore| {
-        let cut = standby.checkpoint(JournalKinds::All);
+        let cut = standby.checkpoint();
         (cut.at, cut.epoch, Twin::of(&cut), all(&followed))
     };
     let before = stands(&standby);
@@ -1905,7 +1645,7 @@ fn a_standbys_pair_classes_follow_each_membership_write_and_a_restore() {
     other.upsert(pair_facts("grpc://dz:9000", Role::Decode, Some("tx-a")));
     other.publish_now();
     assert_ne!(pair_rows(&other), fewer);
-    assert!(other.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(other.restore_from(leader.checkpoint()));
     assert_eq!(pair_rows(&other), fewer);
     let (ours, theirs) = (other.snapshot(), leader.snapshot());
     assert_eq!(ours.pairs("m"), theirs.pairs("m"));
@@ -1936,12 +1676,12 @@ fn a_generation_takes_a_place_under_a_term_and_a_take_tells_the_standing_one() {
     let (unbound, log) = journaled(16);
     unbound.set_term(1);
     assert_eq!(generations(&log), []);
-    assert_eq!(log.head(JournalKinds::All), at(1, 1));
+    assert_eq!(log.head(), at(1, 1));
 
     let (store, log) = journaled(16);
     // Applied before any take: the log is told, and keeps no place for it.
     store.apply(generation(3)).expect("above the unbound one");
-    assert_eq!(log.head(JournalKinds::All), Position::default());
+    assert_eq!(log.head(), Position::default());
     // The take tells the term's start, then the generation that stands.
     store.set_term(1);
     let start = Entry {
@@ -1955,12 +1695,12 @@ fn a_generation_takes_a_place_under_a_term_and_a_take_tells_the_standing_one() {
     store.upsert(facts("grpc://a:9000", 1));
     store.apply(generation(4)).expect("above the standing one");
     assert_eq!(generations(&log), [(at(2, 1), 3), (at(4, 1), 4)]);
-    assert_eq!(log.head(JournalKinds::Watched), at(4, 1));
+    assert_eq!(log.head(), at(4, 1));
     // A generation the store refuses tells nothing.
     store
         .apply(generation(4))
         .expect_err("not above the standing one");
-    assert_eq!(log.head(JournalKinds::All), at(4, 1));
+    assert_eq!(log.head(), at(4, 1));
     // The next take tells the standing one again, under its own term.
     store.set_term(2);
     assert_eq!(generations(&log).last(), Some(&(at(6, 2), 4)));
@@ -1994,7 +1734,7 @@ fn a_standby_follows_a_generation_at_its_leaders_place() {
     // A generation the store refuses tells nothing: its guard does not
     // land, and the standby starts again from a snapshot.
     let next = Position {
-        seq: log.head(JournalKinds::All).seq + 1,
+        seq: log.head().seq + 1,
         term: 1,
     };
     let adopting = log.adopt(next).expect("the next position");

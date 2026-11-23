@@ -1419,8 +1419,8 @@ mod tests {
     use super::*;
     use crate::{
         store::{
-            GatewayId, HealthSink, JournalKinds, MemoryStore, Overload, Registrant, WorkerFacts,
-            WorkerPatch, WorkerStatus,
+            GatewayId, HealthSink, MemoryStore, Overload, Registrant, WorkerFacts, WorkerPatch,
+            WorkerStatus,
         },
         worker_host::{
             facts as stated, object, HealthAdapter, KeptCredential, Members, MembershipWriter,
@@ -3480,9 +3480,7 @@ mod tests {
                 .set_status(row.id, WorkerStatus::Ready, row.revision)
                 .is_some());
         }
-        assert!(replica
-            .store
-            .restore_from(other.checkpoint(JournalKinds::Watched)));
+        assert!(replica.store.restore_from(other.checkpoint()));
         replica.follow();
 
         assert!(Arc::ptr_eq(&a, &replica.at(A)));
@@ -3499,9 +3497,7 @@ mod tests {
         assert!(other
             .set_status(row.id, WorkerStatus::NotReady, row.revision)
             .is_some());
-        assert!(replica
-            .store
-            .restore_from(other.checkpoint(JournalKinds::Watched)));
+        assert!(replica.store.restore_from(other.checkpoint()));
         replica.follow();
         assert!(Arc::ptr_eq(&a, &replica.at(A)));
         assert!(!a.is_available());
@@ -3770,9 +3766,7 @@ mod tests {
                 before_tail(&self.store);
             }
             if let Some((other, row)) = self.turn.lock().take() {
-                assert!(self
-                    .store
-                    .restore_from(other.checkpoint(JournalKinds::Watched)));
+                assert!(self.store.restore_from(other.checkpoint()));
                 let revision = self.store.get(row).expect("the row").revision;
                 assert!(self.store.patch(row, labels("gold"), revision).is_some());
             }
@@ -3937,7 +3931,7 @@ mod tests {
         });
         other.upsert(facts(C, 1));
         other.upsert(facts(D, 1));
-        let cut = other.checkpoint(JournalKinds::Watched);
+        let cut = other.checkpoint();
         let (epoch, theirs) = (cut.epoch, other.by_key(A).expect("a row"));
         assert_eq!(epoch, replica.store.epoch());
         assert_eq!((theirs.id, theirs.revision), (row, replica.row(A).revision));

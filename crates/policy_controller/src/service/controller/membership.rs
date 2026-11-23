@@ -92,8 +92,8 @@ use crate::{
     },
     store::{
         membership::{self, life, FactPastBound, WorkerFactsChange},
-        HealthSink, JournalKinds, MembershipChange, MemoryStore, Position, Registrant, WorkerFacts,
-        WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+        HealthSink, MembershipChange, MemoryStore, Position, Registrant, WorkerFacts, WorkerPatch,
+        WorkerRow, WorkerStatus, WorkersStore,
     },
     worker_host::{
         drain, lay, lay_one, lay_ready, refresh, stated, stating, take, Members,
@@ -221,7 +221,7 @@ impl MembershipCalls {
     /// The log's place: read after a call's write, that write's own or one
     /// past it.
     fn place(&self) -> Position {
-        self.log.head(JournalKinds::Watched)
+        self.log.head()
     }
 
     /// The number of the life a registration makes now, under `admitted`,
@@ -2104,10 +2104,6 @@ pub(crate) mod tests {
             }
         }
 
-        fn load(&self, at: Option<Position>, id: WorkerId, rank: u16, sample: &store::LoadSample) {
-            self.log.load(at, id, rank, sample);
-        }
-
         fn generation(&self, at: Option<Position>, generation: u64) {
             self.log.generation(at, generation);
         }
@@ -2120,12 +2116,8 @@ pub(crate) mod tests {
             self.log.term_followed(at);
         }
 
-        fn carries_loads(&self) -> bool {
-            self.log.carries_loads()
-        }
-
-        fn head(&self, kinds: store::JournalKinds) -> Position {
-            self.log.head(kinds)
+        fn head(&self) -> Position {
+            self.log.head()
         }
 
         fn followed(&self) -> Option<u64> {
@@ -2381,7 +2373,7 @@ pub(crate) mod tests {
         let watched = |after: Position| {
             let mut entries = Vec::new();
             door.log
-                .read(store::JournalKinds::Watched, after, 64, &mut entries)
+                .read(after, 64, &mut entries)
                 .expect("the log holds the call's writes");
             entries
                 .iter()

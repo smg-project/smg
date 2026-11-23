@@ -75,7 +75,7 @@ use crate::{
         proto,
         replication::{Entry, Event, Log, ReadStamp},
     },
-    store::{GatewayId, JournalKinds, MemoryStore, Position, StoreCheckpoint, WorkerRow},
+    store::{GatewayId, MemoryStore, Position, StoreCheckpoint, WorkerRow},
 };
 
 /// The rows of one snapshot page.
@@ -190,10 +190,7 @@ impl Feed {
         let Some(mut kept) = self.rows.try_lock() else {
             return;
         };
-        if kept
-            .as_ref()
-            .is_some_and(|cut| cut.at != self.log.head(JournalKinds::Watched))
-        {
+        if kept.as_ref().is_some_and(|cut| cut.at != self.log.head()) {
             *kept = None;
         }
     }
@@ -209,11 +206,11 @@ impl Feed {
     /// alone: a restore can leave one sequence over other rows.
     pub(crate) fn rows_at_head(&self, store: &MemoryStore) -> Arc<StoreCheckpoint> {
         let mut kept = self.rows.lock();
-        let head = self.log.head(JournalKinds::Watched);
+        let head = self.log.head();
         if let Some(cut) = kept.as_ref().filter(|cut| cut.at == head) {
             return Arc::clone(cut);
         }
-        let cut = Arc::new(store.checkpoint(JournalKinds::Watched));
+        let cut = Arc::new(store.checkpoint());
         #[cfg(test)]
         self.cuts.fetch_add(1, Ordering::Relaxed);
         *kept = Some(Arc::clone(&cut));
@@ -225,7 +222,7 @@ impl Feed {
     /// and where none is kept.
     pub(crate) fn kept_at_head(&self) -> Option<Arc<StoreCheckpoint>> {
         let kept = self.rows.lock();
-        let head = self.log.head(JournalKinds::Watched);
+        let head = self.log.head();
         kept.as_ref().filter(|cut| cut.at == head).cloned()
     }
 
@@ -434,7 +431,7 @@ impl Watching {
 
     /// The word to a watcher that cannot continue from its place.
     fn start_again(&mut self) -> Poll<Option<Told>> {
-        let floor = self.source.feed.log.floor(JournalKinds::Watched);
+        let floor = self.source.feed.log.floor();
         self.last(Ok(worker_wire::start_again(floor)))
     }
 }
@@ -607,7 +604,7 @@ impl Asked {
                         .flatten()
                         .any(|row| self.serves(row))
             }
-            Event::Load { .. } | Event::Term | Event::Generation { .. } => false,
+            Event::Term | Event::Generation { .. } => false,
         }
     }
 
@@ -706,7 +703,7 @@ impl Watching {
                 At::Ended => return Poll::Ready(None),
                 At::Start(Start::After(place)) => {
                     let place = *place;
-                    if !self.source.feed.log.holds(JournalKinds::Watched, place) {
+                    if !self.source.feed.log.holds(place) {
                         return self.start_again();
                     }
                     self.at = At::Tail(place, ReadStamp::default());
@@ -849,8 +846,8 @@ pub(crate) mod tests {
             proto::{self, worker_event::Event},
         },
         store::{
-            Journal, JournalKinds, LeasesStore, LoadSink, LoadSource, MembershipChange,
-            MemoryStore, Position, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+            Journal, LeasesStore, LoadSink, LoadSource, MembershipChange, MemoryStore, Position,
+            WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
         },
     };
 
@@ -949,7 +946,7 @@ pub(crate) mod tests {
         }
 
         fn head(&self) -> Position {
-            self.feed.log.head(JournalKinds::Watched)
+            self.feed.log.head()
         }
     }
 
@@ -1308,7 +1305,7 @@ pub(crate) mod tests {
             run.register(1, 1, "model-a");
             run.register(2, 1, "model-a");
             assert_eq!(held.term, run.head().term, "one term, two runs");
-            let floor = run.feed.log.floor(JournalKinds::Watched);
+            let floor = run.feed.log.floor();
             let mut stream = run.watch(Start::After(held), &[]);
             let word = next(&mut stream).await;
             assert_eq!(
@@ -1325,13 +1322,7 @@ pub(crate) mod tests {
     #[test]
     fn a_runs_log_starts_at_a_place_drawn_below_the_bound_and_apart_from_another_runs() {
         let starts: Vec<u64> = (0..64)
-            .map(|_| {
-                journaled(&LeasePlace::Process, 1)
-                    .1
-                    .log
-                    .head(JournalKinds::Watched)
-                    .seq
-            })
+            .map(|_| journaled(&LeasePlace::Process, 1).1.log.head().seq)
             .collect();
         assert!(
             starts.iter().all(|&first| first < FIRST_PLACES),
@@ -1391,7 +1382,7 @@ pub(crate) mod tests {
         assert_eq!((row.id, event.seq), (second.0, held.seq + 1));
         drop(stream);
 
-        let floor = leader.feed.log.floor(JournalKinds::Watched);
+        let floor = leader.feed.log.floor();
         let lost = [
             // Another term at the position.
             Position {
@@ -1577,20 +1568,16 @@ pub(crate) mod tests {
         turns().await;
         let (woken, waker) = Woken::waker();
         parks(&mut stream, &waker);
-        let before = (leader.head(), leader.feed.log.head(JournalKinds::All));
+        let before = (leader.head(), leader.feed.log.head());
         let now = Instant::now();
         for _ in 0..10_000 {
             leader
                 .store
                 .record(id, 0, LoadRow::default(), now, LoadSource::Stream);
         }
-        // The journal's kinds were fixed where the store was built, the
-        // watched kinds alone: a load row is no position of this log, wakes
-        // no task and hands the watcher nothing.
-        assert_eq!(
-            (leader.head(), leader.feed.log.head(JournalKinds::All)),
-            before
-        );
+        // A load write tells the journal nothing: it is no position of this
+        // log, wakes no task and hands the watcher nothing.
+        assert_eq!((leader.head(), leader.feed.log.head()), before);
         turns().await;
         assert_eq!(woken.wakes(), 0, "a load row woke the stream");
         parks(&mut stream, &waker);
@@ -2205,7 +2192,7 @@ pub(crate) mod tests {
     #[test]
     fn the_draw_is_made_wherever_the_lease_lives() {
         for place in [LeasePlace::Process, LeasePlace::File("lease".into())] {
-            let first = journaled(&place, 1).1.log.head(JournalKinds::Watched);
+            let first = journaled(&place, 1).1.log.head();
             assert!(
                 first.seq != 0 && first.term == 0,
                 "a drawn start: {first:?}"

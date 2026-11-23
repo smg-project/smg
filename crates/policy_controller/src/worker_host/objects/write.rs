@@ -195,10 +195,7 @@ mod tests {
     use super::*;
     use crate::{
         engine::view::Role,
-        store::{
-            identity, HealthSink, Journal, JournalKinds, LoadSample, Position, WorkerStatus,
-            WorkersStore,
-        },
+        store::{identity, HealthSink, Journal, Position, WorkerStatus, WorkersStore},
         worker_host::Members,
     };
 
@@ -224,19 +221,13 @@ mod tests {
             self.0.lock().push((change, row.cloned(), left.cloned()));
         }
 
-        fn load(&self, _: Option<Position>, _: WorkerId, _: u16, _: &LoadSample) {}
-
         fn generation(&self, _: Option<Position>, _: u64) {}
 
         fn term_rose(&self, _: u64) {}
 
         fn term_followed(&self, _: Position) {}
 
-        fn carries_loads(&self) -> bool {
-            false
-        }
-
-        fn head(&self, _: JournalKinds) -> Position {
+        fn head(&self) -> Position {
             Position::default()
         }
 
