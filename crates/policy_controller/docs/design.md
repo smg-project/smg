@@ -1103,7 +1103,11 @@ The fourth job serves a policy that keeps a number of each worker's load report
 reports that are new in it, for the workers it follows in the host's registry, and only then keeps
 the snapshot at hand. A report is new where its sample instant is not the one the task told last
 of its worker. The channel keeps one snapshot, so of two reports of one worker the task took no
-snapshot between, the earlier is told to no policy.
+snapshot between, the earlier is told to no policy. A told report states its named values too, one
+cell a signal the document declares and in the document's order, under a document a stage of which
+keeps a signal's column: a stage reads its column's cell (`SignalColumn::told`) for the time of the
+call and copies out what it keeps. A report of several ranks states none, and neither plugin view
+carries the values yet.
 
 The host keeps one empty cell beside each worker list it publishes. That is one field in the
 host's `Generation` type. The engine fills the cell at the list's first decision.

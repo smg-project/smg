@@ -19,6 +19,10 @@
 //! under a profile whose stages read a signal and under no other. The
 //! engine over worker lists makes them itself, from the load reports its
 //! decision holds.
+//!
+//! A stage that keeps a number of each load report is told a report's
+//! named values with the report ([`ReportSignals`]), and reads one by the
+//! column it holds ([`SignalColumn::told`]): the same index, and no age.
 
 use crate::{
     document::spec::{AcrossRanks, COST_PARAMETER_LIMIT, MAX_SIGNALS},
@@ -200,6 +204,55 @@ impl SignalCells {
     }
 }
 
+/// The named values one load report states, as a stage is told them with
+/// the report ([`Signal::Load`](crate::tracking::Signal)): one cell a
+/// signal the document declares, in the order of the document's names,
+/// each value with its own sample instant. A name the report does not
+/// state holds the empty cell ([`SignalCell::NONE`]).
+///
+/// A stage reads a value by the column it took at its build
+/// ([`SignalColumn::told`]). The cells are lent for the call that hands
+/// them: a stage copies out what it keeps, and a cell is `Copy`.
+///
+/// Two of them are equal where they hold as many cells and each cell
+/// holds the same sample instant and the same value by its bits: the
+/// empty cell equals itself, which no compare of two numbers would say.
+#[derive(Clone, Copy, Debug)]
+pub struct ReportSignals<'a>(&'a [SignalCell]);
+
+impl<'a> ReportSignals<'a> {
+    /// No named value: every column reads none. A report states it under
+    /// a document none of whose stages keeps a signal's column, and so
+    /// does a report of several ranks. A host that states no named value
+    /// tells every report with it.
+    pub const NONE: Self = Self(&[]);
+
+    /// The values in `cells`: one cell a signal the document declares, in
+    /// the order of the document's names
+    /// ([`AppliedSpec::signal_columns`](crate::document::AppliedSpec::signal_columns)),
+    /// as one row of [`SignalCells`] stands. For a host that builds the
+    /// load signal itself, and for a case that tells a stage a report
+    /// with values ([`Signal::with_signals`](crate::tracking::Signal::with_signals)).
+    /// Such a host holds its values to the cells' bound itself
+    /// ([`SignalCell`]).
+    #[must_use]
+    pub const fn new(cells: &'a [SignalCell]) -> Self {
+        Self(cells)
+    }
+}
+
+impl PartialEq for ReportSignals<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        let same = |(ours, theirs): (&SignalCell, &SignalCell)| {
+            ours.value.to_bits() == theirs.value.to_bits()
+                && ours.sampled_at_micros == theirs.sampled_at_micros
+        };
+        self.0.len() == other.0.len() && self.0.iter().zip(other.0).all(same)
+    }
+}
+
+impl Eq for ReportSignals<'_> {}
+
 /// One declared signal, resolved: its column's number, its unit, its
 /// maximum age and how a report of several ranks makes one row's value.
 #[derive(Clone, Debug)]
@@ -246,6 +299,16 @@ impl SignalColumn {
         self.across_ranks
     }
 
+    /// The signal's maximum age in microseconds, as the document declares
+    /// it (`max_age_ms`): `None` where it declares none, and a value does
+    /// not end by its age. A decision's read holds a value to it
+    /// ([`Self::read`]). A stage that keeps a value it was told
+    /// ([`Self::told`]) holds the value to it at its own decisions.
+    #[must_use]
+    pub fn max_age_micros(&self) -> Option<u64> {
+        (self.max_age_micros != u64::MAX).then_some(self.max_age_micros)
+    }
+
     /// The row's value at this decision: `None` where the facts hand no
     /// cells, where the row has no value, and where the value is older
     /// than the signal's maximum age. A value at exactly that age is read.
@@ -254,7 +317,21 @@ impl SignalColumn {
     #[inline]
     pub fn read(&self, facts: &RequestFacts<'_>, row: &Candidate) -> Option<f64> {
         let cell = facts.signal_cells?.cell(row.position, self.column)?;
-        fresh(cell, self.oldest(facts))
+        fresh(cell, self.oldest(facts)).map(|cell| cell.value)
+    }
+
+    /// The value a told report states under this column, with its own
+    /// sample instant ([`Signal::Load`](crate::tracking::Signal)): `None`
+    /// where the report states none under the signal's name, and where it
+    /// states no named value at all ([`ReportSignals::NONE`]). No age is
+    /// tested, since a telling has no request's clock: a stage that keeps
+    /// the value ages it at its decisions, by the cell's sample instant
+    /// and the signal's maximum age ([`Self::max_age_micros`]).
+    #[inline]
+    #[must_use]
+    pub fn told(&self, signals: ReportSignals<'_>) -> Option<SignalCell> {
+        // The first instant of all: no value was sampled before it.
+        self.held(signals.0, 0).copied()
     }
 
     /// The oldest sample instant a decision still reads of the signal: one
@@ -270,18 +347,28 @@ impl SignalColumn {
     /// value, or one sampled before that instant.
     #[inline]
     pub(crate) fn among(&self, cells: &[SignalCell], oldest: u64) -> Option<f64> {
+        self.held(cells, oldest).map(|cell| cell.value)
+    }
+
+    /// The column's cell among one row's cells, where it holds a value
+    /// sampled at or after `oldest`: the one index of a row's cells, for
+    /// a pass's read and for a told report's. Cells that end before the
+    /// column, as the empty ones do, answer `None`.
+    #[inline]
+    fn held<'c>(&self, cells: &'c [SignalCell], oldest: u64) -> Option<&'c SignalCell> {
         fresh(cells.get(usize::from(self.column))?, oldest)
     }
 }
 
-/// The cell's value, where it holds one sampled at or after `oldest`.
+/// The cell, where it holds a value sampled at or after `oldest`: the one
+/// test for the empty cell, behind every read.
 #[inline]
-fn fresh(cell: &SignalCell, oldest: u64) -> Option<f64> {
+fn fresh(cell: &SignalCell, oldest: u64) -> Option<&SignalCell> {
     debug_assert!(
         cell.is_none() || cell.value.is_finite(),
         "a signal's value is finite: no source states another"
     );
-    (!cell.is_none() && cell.sampled_at_micros >= oldest).then_some(cell.value)
+    (!cell.is_none() && cell.sampled_at_micros >= oldest).then_some(cell)
 }
 
 /// The column of the signal `name` among a document's resolved columns,
@@ -464,6 +551,67 @@ mod tests {
         cells.blank(2, 2);
         assert!(cells.fits(2) && valued(&cells) == 0);
         assert_eq!(cells.cells_mut().capacity(), room);
+    }
+
+    /// A told report's value is read by its column, with its own sample
+    /// instant and at any age: the third signal ends a millisecond old at
+    /// a decision, whose read of the same cells passes the value over. A
+    /// cell with no value reads none. So does a column past the report's
+    /// cells, as every column is under a report that states no value.
+    #[test]
+    fn a_told_value_is_read_by_its_column_with_its_instant_at_any_age() {
+        let cell = |value, sampled_at_micros| SignalCell {
+            value,
+            sampled_at_micros,
+        };
+        let cells = [cell(7.0, 9), SignalCell::NONE, cell(-0.5, 0)];
+        let column = |at: u16| SignalColumn::new("held", "tokens", at, (at == 2).then_some(1));
+        let told = |at: u16, signals| {
+            let cell = column(at).told(signals)?;
+            Some((cell.value, cell.sampled_at_micros))
+        };
+        let stated = ReportSignals::new(&cells);
+        assert_eq!(told(0, stated), Some((7.0, 9)));
+        assert_eq!(told(1, stated), None, "the empty cell");
+        assert_eq!(told(2, stated), Some((-0.5, 0)), "at any age");
+        assert_eq!(column(2).among(&cells, 1), None, "a decision ages it");
+        assert_eq!(column(2).among(&cells, 0), Some(-0.5));
+        let ages = [column(0), column(2)].map(|column| column.max_age_micros());
+        assert_eq!(ages, [None, Some(1_000)], "as the document declares");
+        assert_eq!(told(3, stated), None, "past the report's cells");
+        assert_eq!(told(u16::MAX, stated), None);
+        for at in 0..3 {
+            assert_eq!(told(at, ReportSignals::NONE), None, "column {at}");
+        }
+    }
+
+    /// Two reports' values are equal cell by cell: each value by its bits,
+    /// so the empty cell equals itself and the two zeros differ, and each
+    /// sample instant. A report of fewer cells is another report.
+    #[test]
+    fn two_reports_values_are_equal_by_each_cells_bits_and_instant() {
+        let cell = |value, sampled_at_micros| SignalCell {
+            value,
+            sampled_at_micros,
+        };
+        let held = [cell(7.0, 9), SignalCell::NONE];
+        let same = [cell(7.0, 9), SignalCell::NONE];
+        assert_eq!(ReportSignals::new(&held), ReportSignals::new(&same));
+        assert_eq!(ReportSignals::new(&[]), ReportSignals::NONE);
+        for other in [
+            [cell(7.0, 8), SignalCell::NONE],
+            [cell(7.5, 9), SignalCell::NONE],
+            [cell(7.0, 9), cell(0.0, 0)],
+            [SignalCell::NONE, SignalCell::NONE],
+        ] {
+            let other = ReportSignals::new(&other);
+            assert_ne!(ReportSignals::new(&held), other);
+        }
+        assert_ne!(ReportSignals::new(&held), ReportSignals::new(&held[..1]));
+        assert_ne!(ReportSignals::new(&held[..1]), ReportSignals::NONE);
+        let zeros = [cell(0.0, 0), cell(-0.0, 0)];
+        let (plus, minus) = (&zeros[..1], &zeros[1..]);
+        assert_ne!(ReportSignals::new(plus), ReportSignals::new(minus));
     }
 
     #[test]

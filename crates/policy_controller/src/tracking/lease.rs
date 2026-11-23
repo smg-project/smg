@@ -16,6 +16,7 @@ use crate::{
         sticky_sessions::SessionVerdict,
         view::{Health, LoadRow, Session, WorkerId},
     },
+    load::ReportSignals,
     tracking::in_flight::WorkerSlot,
 };
 
@@ -224,12 +225,20 @@ pub enum Membership<'a> {
 
 /// A signal about one worker. The named values a document declares under
 /// `signals` are the other thing of that name: numbers read beside the
-/// rows ([`SignalCells`](crate::load::SignalCells)).
+/// rows ([`SignalCells`](crate::load::SignalCells)). A load row states its
+/// report's named values too, and borrows them: the word lives as long as
+/// they are lent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Signal {
+pub enum Signal<'a> {
     /// A load row for one rank of a worker, as the host shows it to its
     /// decisions. The in-process engine tells one row a worker object: the
     /// sum of the ranks its report holds, under the rank the object states.
+    ///
+    /// A host makes the word by [`Signal::load`] and puts its report's
+    /// named values on it by [`Signal::with_signals`]. The variant may
+    /// gain a field: code outside this crate matches it with `..` and
+    /// writes it by those two calls.
+    #[non_exhaustive]
     Load {
         worker: WorkerId,
         dp_rank: u16,
@@ -252,6 +261,20 @@ pub enum Signal {
         /// the record states and a one-way margin, and a report that holds
         /// both at the earlier.
         sampled_at_micros: u64,
+        /// The named values the report states, for a stage that keeps a
+        /// signal's column
+        /// ([`SignalColumn::told`](crate::load::SignalColumn::told)): one
+        /// cell a signal the document declares, each value under its own
+        /// sample instant on the clock of `sampled_at_micros`. They are
+        /// lent for the call that tells the word
+        /// ([`Lifecycle::on_signal`](crate::stages::Lifecycle::on_signal)).
+        /// In-process only: no wire carries them, and a plugin is told
+        /// the row alone. None ([`ReportSignals::NONE`]) from a host that
+        /// states none, as the policy store does. The in-process engine
+        /// states them under a document a stage of which keeps a signal's
+        /// column, as its lists' cells state them, and none of a report
+        /// of several ranks.
+        signals: ReportSignals<'a>,
     },
     Health {
         worker: WorkerId,
@@ -263,6 +286,53 @@ pub enum Signal {
         worker: WorkerId,
         until_micros: u64,
     },
+}
+
+impl<'a> Signal<'a> {
+    /// A load row of `worker`'s rank `dp_rank`, sampled at
+    /// `sampled_at_micros`, as a host that keeps no counts tells it: with
+    /// no slot ([`WorkerSlot::NONE`]) and no named value
+    /// ([`ReportSignals::NONE`]).
+    #[must_use]
+    pub const fn load(
+        worker: WorkerId,
+        dp_rank: u16,
+        row: LoadRow,
+        sampled_at_micros: u64,
+    ) -> Self {
+        Self::Load {
+            worker,
+            dp_rank,
+            row,
+            slot: WorkerSlot::NONE,
+            sampled_at_micros,
+            signals: ReportSignals::NONE,
+        }
+    }
+
+    /// The word with `signals` as the named values its report states. A
+    /// word that is no load row is answered as it is.
+    #[must_use]
+    pub const fn with_signals(self, signals: ReportSignals<'a>) -> Self {
+        match self {
+            Self::Load {
+                worker,
+                dp_rank,
+                row,
+                slot,
+                sampled_at_micros,
+                ..
+            } => Self::Load {
+                worker,
+                dp_rank,
+                row,
+                slot,
+                sampled_at_micros,
+                signals,
+            },
+            other => other,
+        }
+    }
 }
 
 /// One kind of lifecycle event: one of the six calls of [`Lifecycle`], as
@@ -396,6 +466,48 @@ mod tests {
             assert_eq!((place, EventSet::of([kind]).0), (at, 1 << at), "{kind:?}");
         }
         kinds
+    }
+
+    /// A load word made by its call names no slot and no named value. It
+    /// takes a report's values whole and keeps every other field, its slot
+    /// too. Two words of one row are two where their values are. A word of
+    /// another kind takes no value.
+    #[test]
+    fn a_load_word_is_made_with_no_slot_and_takes_its_reports_values() {
+        use crate::{load::SignalCell, tracking::in_flight::InFlightCounts};
+        let row = LoadRow {
+            waiting_uncached_tokens: 7,
+            ..LoadRow::default()
+        };
+        let load = |slot, signals| Signal::Load {
+            worker: WorkerId(3),
+            dp_rank: 1,
+            row,
+            slot,
+            sampled_at_micros: 9,
+            signals,
+        };
+        let made = Signal::load(WorkerId(3), 1, row, 9);
+        assert_eq!(made, load(WorkerSlot::NONE, ReportSignals::NONE));
+        let cells = [
+            SignalCell {
+                value: 7.0,
+                sampled_at_micros: 5,
+            },
+            SignalCell::NONE,
+        ];
+        let stated = ReportSignals::new(&cells);
+        assert_eq!(made.with_signals(stated), load(WorkerSlot::NONE, stated));
+        assert_ne!(made.with_signals(stated), made, "one row, two words");
+        let slot = InFlightCounts::default().claim();
+        assert_ne!(slot, WorkerSlot::NONE, "a table's first slot");
+        let counted = load(slot, ReportSignals::NONE);
+        assert_eq!(counted.with_signals(stated), load(slot, stated));
+        let health = Signal::Health {
+            worker: WorkerId(3),
+            health: Health::default(),
+        };
+        assert_eq!(health.with_signals(stated), health);
     }
 
     #[test]

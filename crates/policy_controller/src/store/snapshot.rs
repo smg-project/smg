@@ -119,7 +119,7 @@ use crate::{
         warm_up::WarmUpRule,
         EncodePool, EncoderFacts,
     },
-    load::signals::{SignalCell, SignalCells},
+    load::signals::{ReportSignals, SignalCell, SignalCells},
     stages::lifecycle::Lifecycle,
     store::{
         applied::Applied,
@@ -1104,9 +1104,9 @@ impl StoreSnapshot {
 
     /// Tells each stage of `engine` that keeps a number of the reports
     /// each rank's report as this world shows it to a decision, with the
-    /// rank's slot and the report's sample instant ([`Signal::Load`]). A
-    /// stage that keeps none is sent nothing. A member of several pools is
-    /// told once a pool, the same word.
+    /// rank's slot, the report's sample instant and no named value
+    /// ([`Signal::Load`]). A stage that keeps none is sent nothing. A
+    /// member of several pools is told once a pool, the same word.
     pub fn tell_loads(&self, engine: &Engine) {
         engine.tell_loads(|tell| {
             for (rows, shape) in self.rows.iter().zip(self.derived.pools.iter()) {
@@ -1118,6 +1118,7 @@ impl StoreSnapshot {
                             row: load,
                             slot,
                             sampled_at_micros: row.load_sampled_at_micros,
+                            signals: ReportSignals::NONE,
                         });
                     }
                 }

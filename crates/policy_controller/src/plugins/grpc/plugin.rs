@@ -1215,7 +1215,7 @@ impl BoundPlugin for PluginBinding {
         inner.observe(|| view::membership(change));
     }
 
-    fn observe_signal(&self, signal: &Signal) {
+    fn observe_signal(&self, signal: &Signal<'_>) {
         let inner = &self.plugin.inner;
         inner.observe(|| view::signal(signal, inner.now()));
     }

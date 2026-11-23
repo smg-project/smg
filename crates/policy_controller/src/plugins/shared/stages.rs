@@ -97,7 +97,7 @@ pub trait BoundPlugin: DecisionScope + 'static {
     fn observe_completed(&self, lease: &Lease, outcome: &Outcome);
     fn observe_released(&self, lease: &Lease, reason: ReleaseReason);
     fn observe_membership(&self, change: &Membership<'_>);
-    fn observe_signal(&self, signal: &Signal);
+    fn observe_signal(&self, signal: &Signal<'_>);
 }
 
 /// What one adapter needs from the host: its plugin's declared needs and
@@ -382,7 +382,7 @@ macro_rules! forward_lifecycle {
                 }
             }
 
-            fn on_signal(&self, signal: &Signal) {
+            fn on_signal(&self, signal: &Signal<'_>) {
                 if self.observes.contains(EventKind::Signal) {
                     self.bound.observe_signal(signal);
                 }
@@ -502,7 +502,7 @@ mod tests {
 
         fn observe_membership(&self, _: &Membership<'_>) {}
 
-        fn observe_signal(&self, _: &Signal) {}
+        fn observe_signal(&self, _: &Signal<'_>) {}
     }
 
     /// A bound plugin that answers no stage and counts the events it is
@@ -604,7 +604,7 @@ mod tests {
             self.note(EventKind::Membership);
         }
 
-        fn observe_signal(&self, _: &Signal) {
+        fn observe_signal(&self, _: &Signal<'_>) {
             self.note(EventKind::Signal);
         }
     }
@@ -643,7 +643,7 @@ mod tests {
             self.count();
         }
 
-        fn on_signal(&self, _: &Signal) {
+        fn on_signal(&self, _: &Signal<'_>) {
             self.count();
         }
 
