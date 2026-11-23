@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::response::Response;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use openai_protocol::{
-    common::{to_value_exact, Tool, Usage},
+    common::{Tool, Usage},
     responses::{
         CustomTool, IncompleteDetails, IncompleteReason, InputTokensDetails, NamespaceTool,
         OutputTokensDetails, ResponseStatus, ResponseTool, ResponseUsage, ResponsesRequest,
@@ -779,6 +779,23 @@ fn not_stored(error: &PersistError) -> NotStored {
     NotStored::new(error.retryable, error)
 }
 
+/// `value` as a JSON number the way the `f32` prints (`0.7`), not widened
+/// to 64 bits (`0.699999988079071`); the text is written on the stack.
+pub(crate) fn exact_f32(value: f32) -> Value {
+    let mut text = [0u8; 32];
+    let mut rest = &mut text[..];
+    let exact = match serde_json::to_writer(&mut rest, &value) {
+        Ok(()) => {
+            let left = rest.len();
+            serde_json::from_slice(&text[..text.len() - left]).ok()
+        }
+        Err(_) => None,
+    };
+    // An f32 prints in at most 16 bytes, so this never falls back in
+    // practice; if it did, the widened number is kept.
+    exact.unwrap_or_else(|| Value::from(value))
+}
+
 /// Writes `temperature` and `top_p` into the JSON tree of a response as
 /// the response holds them: the plain conversion widens the two 32-bit
 /// numbers to 64 bits.
@@ -787,9 +804,8 @@ pub(crate) fn exact_sampling_numbers(raw: &mut Value, response: &ResponsesRespon
         ("temperature", response.temperature),
         ("top_p", response.top_p),
     ] {
-        let Some(value) = value else { continue };
-        if let (Some(slot), Ok(exact)) = (raw.get_mut(key), to_value_exact(&value)) {
-            *slot = exact;
+        if let (Some(slot), Some(value)) = (raw.get_mut(key), value) {
+            *slot = exact_f32(value);
         }
     }
 }
@@ -1063,38 +1079,69 @@ mod tests {
     }
 
     /// A stored response gives its `temperature` and `top_p` to a `GET` of
-    /// its id as the answer itself gave them, not widened to 64 bits.
+    /// its id as the answer itself gave them, not widened to 64 bits: the
+    /// record of a stored response, the queued record of a background one
+    /// and the record an unstored background run ends in.
     #[tokio::test]
     async fn a_get_of_a_stored_response_reads_the_sampling_numbers_unwidened() {
         use crate::endpoints::responses::get_response;
 
         let storage: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
-        let request: ResponsesRequest = serde_json::from_value(json!({
+        let read = |id: &'static str| {
+            let storage = storage.clone();
+            async move {
+                let answer = get_response(&storage, None, id, None).await;
+                let body = axum::body::to_bytes(answer.into_body(), 1 << 20).await;
+                let read: Value = serde_json::from_slice(&body.unwrap()).unwrap();
+                (read["temperature"].clone(), read["top_p"].clone())
+            }
+        };
+        let exact = (json!(0.7), json!(0.9));
+        let mut request = json!({
             "model": "m",
             "input": "hi",
             "temperature": 0.7,
             "top_p": 0.9
-        }))
-        .unwrap();
+        });
+        let stored: ResponsesRequest = serde_json::from_value(request.clone()).unwrap();
         persist_response_if_needed(
             Arc::new(MemoryConversationStorage::new()),
             Arc::new(MemoryConversationItemStorage::new()),
             storage.clone(),
-            &completed_response("resp_g", &request),
-            &request,
+            &completed_response("resp_g", &stored),
+            &stored,
             None,
             None,
         )
         .await
         .expect("the record is written");
+        assert_eq!(read("resp_g").await, exact);
 
-        let answer = get_response(&storage, None, "resp_g", None).await;
-        let body = axum::body::to_bytes(answer.into_body(), 1 << 20).await;
-        let read: Value = serde_json::from_slice(&body.unwrap()).unwrap();
-        assert_eq!(
-            (&read["temperature"], &read["top_p"]),
-            (&json!(0.7), &json!(0.9))
-        );
+        request["background"] = json!(true);
+        request["store"] = json!(false);
+        let unstored: ResponsesRequest = serde_json::from_value(request).unwrap();
+        background::store_record(
+            &storage,
+            &background::queued_response("resp_q", &unstored),
+            &unstored,
+            None,
+            None,
+        )
+        .await
+        .expect("the queued record is written");
+        assert_eq!(read("resp_q").await, exact);
+        persist_response_if_needed(
+            Arc::new(MemoryConversationStorage::new()),
+            Arc::new(MemoryConversationItemStorage::new()),
+            storage.clone(),
+            &completed_response("resp_q", &unstored),
+            &unstored,
+            None,
+            None,
+        )
+        .await
+        .expect("the unstored end is written");
+        assert_eq!(read("resp_q").await, exact);
     }
 
     /// A background response deleted while its work ran (its record is gone
