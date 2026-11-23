@@ -362,10 +362,10 @@ fn test_special_tokens() {
 
 /// The file's BPE section says `byte_fallback`, so on the sentencepiece path
 /// the load builds no model and its listing answers in the model's place:
-/// `max_token_id` reads the listing's last id (the three added tokens are
-/// below it), not the empty model's.
+/// `max_token_id` still counts the whole vocabulary (the three added tokens
+/// are below its last id), not just the empty model's added tokens.
 #[test]
-fn max_token_id_reads_the_listing_of_an_unbuilt_model() {
+fn max_token_id_counts_the_vocabulary_of_an_unbuilt_model() {
     use llm_tokenizer::traits::Tokenizer as TokenizerTrait;
 
     let (_dir, tokenizer_path) = tokenizer_file();
