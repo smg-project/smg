@@ -9,10 +9,14 @@ use std::{
     time::Duration,
 };
 
-use axum::http::StatusCode;
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{header::CONTENT_TYPE, StatusCode},
+};
 use openai_protocol::completion::CompletionRequest;
 use serde_json::json;
-use smg::{middleware::TenantRequestMeta, tenant::TenantKey};
+use smg::{config::RouterConfig, middleware::TenantRequestMeta, tenant::TenantKey};
 use smg_policy_controller::{
     document::PolicySpec,
     engine::{Candidate, RequestFacts, Scorer, Target, TieBand},
@@ -24,8 +28,11 @@ use smg_test_harness::{
     grpc_harness::{
         build_grpc_router, grpc_router_config, grpc_workers, serve_canned_worker, Canned,
     },
+    mock_worker::MockWorkerConfig,
+    AppTestContext, TestRouterConfig, TestWorkerConfig,
 };
 use smg_worker::identity::basic::{RuntimeType, WorkerType};
+use tower::ServiceExt;
 
 const MODEL: &str = "harness-policy-stages-model";
 /// The test's own stage, as its table and its document name it.
@@ -178,4 +185,87 @@ async fn a_configuration_that_leaves_the_policy_controller_off_starts_no_engine(
     } else {
         assert!(heard.is_empty(), "{heard:?}");
     }
+}
+
+/// Serves one request on a gateway of `config` whose `workers` went through
+/// the gateway's registration steps, and answers what the gateway's registry
+/// counted: the classic policy objects it made, and the requests that
+/// reached a classic policy's place under the policy engine.
+#[expect(clippy::expect_used, reason = "test helper: failures should panic")]
+async fn made_by_a_gateway(config: RouterConfig, workers: Vec<MockWorkerConfig>) -> usize {
+    let gateway = AppTestContext::new_with_config(config, workers).await;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/generate")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"text": "one request", "stream": false}).to_string(),
+        ))
+        .expect("a request");
+    let answer = gateway.create_app().oneshot(request).await;
+    let status = answer.expect("an answer").status();
+    assert_eq!(status, StatusCode::OK, "the request is served");
+    let made = gateway.app_context.policy_registry.classic_made_or_asked();
+    gateway.shutdown().await;
+    made
+}
+
+/// What the registries of two gateways counted, each started by the harness
+/// with the policy controller as `policy_controller` says. The first
+/// registered a regular worker and served a request. The second registered a
+/// prefill and a decode worker under the two port names and served a pair's
+/// request.
+async fn counted_by_two_gateways(
+    policy_controller: bool,
+    [prefill, decode]: [u16; 2],
+) -> [usize; 2] {
+    let mut single = TestRouterConfig::round_robin(0);
+    single.policy_controller = policy_controller;
+    // A gateway's start and its one request make a large future: each is boxed.
+    let single = Box::pin(made_by_a_gateway(
+        single,
+        vec![TestWorkerConfig::healthy(0)],
+    ))
+    .await;
+
+    let url = |port: u16| format!("http://127.0.0.1:{port}");
+    let mut pair = RouterConfig::builder()
+        .prefill_decode_mode(vec![(url(prefill), None)], vec![url(decode)])
+        .round_robin_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .build_unchecked();
+    pair.health_check.disable_health_check = true;
+    pair.policy_controller = policy_controller;
+    let workers = vec![
+        TestWorkerConfig::prefill(prefill),
+        TestWorkerConfig::decode(decode),
+    ];
+    [single, Box::pin(made_by_a_gateway(pair, workers)).await]
+}
+
+/// Where the policy controller runs, a gateway makes no classic policy
+/// object and hands no request to one: not at its start, not when a regular,
+/// a prefill or a decode worker registers, and not to serve a request or a
+/// pair's request.
+#[tokio::test]
+async fn a_gateway_that_runs_the_policy_controller_makes_and_asks_no_classic_policy() {
+    assert_eq!(
+        counted_by_two_gateways(true, [19_960, 19_961]).await,
+        [0, 0]
+    );
+}
+
+/// The same steps with the policy controller off make the configured
+/// policies: the default policy, and for a pair each side's own beside it.
+#[tokio::test]
+async fn a_gateway_that_leaves_the_policy_controller_off_makes_its_classic_policies() {
+    let made = if common::policy_controller_forced() {
+        [0, 0]
+    } else {
+        [1, 3]
+    };
+    assert_eq!(counted_by_two_gateways(false, [19_962, 19_963]).await, made);
 }

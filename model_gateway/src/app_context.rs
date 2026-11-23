@@ -925,15 +925,11 @@ impl AppContextBuilder {
         self
     }
 
-    /// Create policy registry
+    /// Create policy registry: the one that makes no classic policy where
+    /// the configuration runs the policy controller
+    /// ([`PolicyRegistry::of_config`]).
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(
-            PolicyRegistry::with_override(
-                config.policy.clone(),
-                config.routing_key_override.clone(),
-            )
-            .with_pd_pairing_mode(config.pd_pairing_mode),
-        ));
+        self.policy_registry = Some(Arc::new(PolicyRegistry::of_config(config)));
         self
     }
 

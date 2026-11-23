@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
         Arc, OnceLock, Weak,
     },
 };
@@ -12,7 +12,7 @@ use http::{header::HeaderName, HeaderMap};
 use openai_protocol::UNKNOWN_MODEL_ID;
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxBuildHasher;
-use smg_policy_controller::engine::PolicyEngine;
+use smg_policy_controller::{document::Needs, engine::PolicyEngine};
 use smg_worker::{
     identity::{
         basic::{RequestCompletionSink, Worker, WorkerType},
@@ -37,7 +37,9 @@ use super::{
     PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
 use crate::{
-    config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
+    config::types::{
+        ManualAssignmentMode, PdPairingMode, PolicyConfig, RouterConfig, RoutingKeyOverrideConfig,
+    },
     mesh::adapters::TreeSyncAdapter,
     observability::{cache_trace, metrics::Metrics},
     policies::kv_index::event_monitor::KvEventMonitor,
@@ -75,6 +77,58 @@ impl RequestCompletionSink for PolicyCompletionSink {
         registry
             .policy_for_worker(worker)
             .on_request_complete(worker.url());
+    }
+}
+
+/// What stands where a classic policy would in a registry whose gateway
+/// runs the policy engine ([`PolicyRegistry::for_policy_engine`]): in the
+/// default slot and the encode slot, so every getter hands it out. It is no
+/// classic policy, and the policy factory never makes it.
+///
+/// It places nothing. A request that reaches its placing call is answered
+/// that no worker is available, and is never sent: a path that wrongly asks
+/// a classic policy under the engine shows as a failure, and not as a
+/// classic placement. Each such request counts on the registry's count
+/// ([`PolicyRegistry::classic_made_or_asked`]).
+///
+/// It answers the two text questions from the registry's stored bits
+/// ([`TextNeeds`]), so a reader that asks the object a getter handed it
+/// gets the registry's answer. It reads no load report and no cache event,
+/// and it keeps no state of its own.
+#[derive(Debug)]
+struct NoClassicPolicy {
+    /// The registry's text bits.
+    text_needs: Arc<AtomicU8>,
+    /// The registry's count.
+    asked: Arc<AtomicUsize>,
+}
+
+impl NoClassicPolicy {
+    fn text_needs(&self) -> TextNeeds {
+        TextNeeds(self.text_needs.load(Ordering::Acquire))
+    }
+}
+
+impl LoadBalancingPolicy for NoClassicPolicy {
+    fn select_worker(&self, _: &[Arc<dyn Worker>], _: &SelectWorkerInfo) -> Option<usize> {
+        self.asked.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    fn name(&self) -> &'static str {
+        "policy_controller"
+    }
+
+    fn needs_request_text(&self) -> bool {
+        self.text_needs().answer(false, false)
+    }
+
+    fn needs_request_text_with_tokens(&self) -> bool {
+        self.text_needs().answer(true, false)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -202,8 +256,26 @@ pub struct PolicyRegistry {
 
     /// Shared sticky selector for the routing-key override. `Some` when the
     /// override is enabled; consulted (instead of the configured policy) for keyed
-    /// requests via [`PolicyRegistry::select_worker_for_model`].
+    /// requests via [`PolicyRegistry::select_worker_for_model`]. `None` in a
+    /// registry made for the policy engine, whatever the settings say.
     routing_key_sticky: Option<Arc<ManualPolicy>>,
+
+    /// Whether the settings enable the routing-key override: what the
+    /// registry answers a route that derives a request's key. Under the
+    /// classic policies it is `routing_key_sticky.is_some()`.
+    routing_key_override: bool,
+
+    /// Whether the classic policies place this gateway's requests. `false`
+    /// in a registry made for the policy engine
+    /// ([`Self::for_policy_engine`]): it makes no classic policy object,
+    /// and what feeds one does nothing. Read at the start and at a
+    /// worker's registration, never by a decision.
+    classic: bool,
+
+    /// How many classic policy objects this registry made or was handed,
+    /// and how many requests reached its stand-in's placing call
+    /// ([`Self::classic_made_or_asked`]).
+    made_or_asked: Arc<AtomicUsize>,
 
     /// Ordered routing-key header names, parsed once from
     /// `routing_key_override.headers`; the first header present with a valid
@@ -263,6 +335,87 @@ impl PolicyRegistry {
                 assignment_mode: routing_key_override.assignment_mode,
             }))
         });
+        // The default policy, and the override's pin table where it is on.
+        let made = 1 + usize::from(routing_key_sticky.is_some());
+        Self::assembled(
+            default_policy,
+            default_policy_config,
+            routing_key_sticky,
+            &routing_key_override,
+            true,
+            made,
+        )
+    }
+
+    /// The registry of a gateway whose requests the policy engine places
+    /// (`policy_controller: on`). It makes NO classic policy object, here or
+    /// later: its default slot and its encode slot hold a stand-in that
+    /// places nothing, it keeps no pin table for the routing-key override,
+    /// a worker's registration and a router's build add no policy to it,
+    /// and what would feed a policy (the load feed, the cache-event
+    /// monitor, the mesh bridge, a request's end) does nothing. The set-up
+    /// and the removal of a policy's trees and tables find no policy in
+    /// it. A request that reached the stand-in would be refused, and
+    /// counted ([`Self::classic_made_or_asked`]). The stand-in answers the
+    /// two text questions from the registry's stored answers.
+    /// What a route asks of the registry beside a policy stands as the
+    /// settings say: the routing key's headers, whether the override is on,
+    /// the pairing mode, the hash rings.
+    pub fn for_policy_engine(
+        default_policy_config: PolicyConfig,
+        routing_key_override: RoutingKeyOverrideConfig,
+    ) -> Self {
+        let text_needs = Arc::new(AtomicU8::new(TextNeeds::default().0));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let stand_in: Arc<dyn LoadBalancingPolicy> = Arc::new(NoClassicPolicy {
+            text_needs: Arc::clone(&text_needs),
+            asked: Arc::clone(&asked),
+        });
+        Self {
+            // The stand-in reads the registry's text bits and counts on
+            // the registry's count.
+            text_needs,
+            made_or_asked: asked,
+            // The encode slot is filled: empty, its getter would build a
+            // policy at each call.
+            encode_policy: Arc::new(OnceLock::from(Arc::clone(&stand_in))),
+            ..Self::assembled(
+                stand_in,
+                default_policy_config,
+                None,
+                &routing_key_override,
+                false,
+                0,
+            )
+        }
+    }
+
+    /// The registry of a gateway of `config`: the classic one
+    /// ([`Self::with_override`]), or the one that makes no classic policy
+    /// where the configuration runs the policy controller
+    /// ([`Self::for_policy_engine`]), under the configuration's pairing
+    /// mode. The one place that reads the option for the registry.
+    pub fn of_config(config: &RouterConfig) -> Self {
+        let (policy, routing_key_override) =
+            (config.policy.clone(), config.routing_key_override.clone());
+        let registry = if config.policy_controller {
+            Self::for_policy_engine(policy, routing_key_override)
+        } else {
+            Self::with_override(policy, routing_key_override)
+        };
+        registry.with_pd_pairing_mode(config.pd_pairing_mode)
+    }
+
+    /// The registry's fields from what a constructor made: `made` classic
+    /// policy objects, the default policy and the pin table among them.
+    fn assembled(
+        default_policy: Arc<dyn LoadBalancingPolicy>,
+        default_policy_config: PolicyConfig,
+        routing_key_sticky: Option<Arc<ManualPolicy>>,
+        routing_key_override: &RoutingKeyOverrideConfig,
+        classic: bool,
+        made: usize,
+    ) -> Self {
         // ConfigValidator rejects invalid names at startup; skipping here
         // covers direct construction.
         let routing_key_headers = routing_key_override
@@ -292,6 +445,9 @@ impl PolicyRegistry {
             dp_rank_policy: Arc::new(OnceLock::new()),
             engine: Arc::new(OnceLock::new()),
             routing_key_sticky,
+            routing_key_override: routing_key_override.enabled,
+            classic,
+            made_or_asked: Arc::new(AtomicUsize::new(made)),
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
             rings: Arc::new(KeptRings::default()),
@@ -364,7 +520,9 @@ impl PolicyRegistry {
     /// or the key exceeds the routing-key byte cap; a rid that is nothing but
     /// suffix keys as itself.
     pub fn derive_rid_key<'a>(&self, rid: Option<&'a str>) -> Option<&'a str> {
-        self.routing_key_sticky.as_ref()?;
+        if !self.routing_key_override {
+            return None;
+        }
         let rid = rid?;
         let stripped = strip_lineage_suffixes(rid);
         let key = if stripped.is_empty() { rid } else { stripped };
@@ -402,7 +560,7 @@ impl PolicyRegistry {
     /// counts under it, so selection and accounting agree by construction.
     pub fn sticky_header_key<'a>(&self, headers: Option<&'a HeaderMap>) -> Option<&'a str> {
         let raw = self.resolve_routing_key(headers)?;
-        Some(if self.routing_key_sticky.is_some() {
+        Some(if self.routing_key_override {
             Self::strip_header_key(raw)
         } else {
             raw
@@ -422,7 +580,7 @@ impl PolicyRegistry {
     /// body's `rid`, requiring automatic body-path selection to keep the body
     /// readable.
     pub(crate) fn routing_key_override_enabled(&self) -> bool {
-        self.routing_key_sticky.is_some()
+        self.routing_key_override
     }
 
     /// Resolve the effective sticky key: a valid configured routing-key header
@@ -601,6 +759,9 @@ impl PolicyRegistry {
     /// Set KV event monitor (thread-safe, can be called after initialization).
     /// Propagates to all existing cache-aware policies (including default, prefill, decode).
     pub fn set_kv_event_monitor(&self, monitor: Option<Arc<KvEventMonitor>>) {
+        if !self.classic {
+            return;
+        }
         {
             let mut guard = self.kv_event_monitor.write();
             guard.clone_from(&monitor);
@@ -654,6 +815,9 @@ impl PolicyRegistry {
     /// called after initialization); a policy created later takes it from
     /// the registry (see [`Self::publish_with_shared_state`]).
     pub(crate) fn set_load_receiver(&self, rx: Option<LoadReceiver>) {
+        if !self.classic {
+            return;
+        }
         {
             let mut guard = self.load_rx.write();
             guard.clone_from(&rx);
@@ -697,6 +861,9 @@ impl PolicyRegistry {
     /// future cache-aware policy created here inherits both. Pass `None`
     /// to detach.
     pub fn set_mesh_tree_sync(&self, adapter: Option<Arc<TreeSyncAdapter>>) {
+        if !self.classic {
+            return;
+        }
         {
             let mut guard = self.mesh_tree_sync.write();
             guard.clone_from(&adapter);
@@ -737,6 +904,60 @@ impl PolicyRegistry {
         })
     }
 
+    /// The request-completion observer a worker of this gateway is given
+    /// at its registration: the registry's own ([`Self::completion_sink`])
+    /// under the classic policies, and none where the policy engine places
+    /// the requests. The engine hears a request's end from its placement,
+    /// and a guard's drop then reaches no policy.
+    pub fn worker_completion_sink(self: &Arc<Self>) -> Option<Arc<dyn RequestCompletionSink>> {
+        self.classic.then(|| self.completion_sink())
+    }
+
+    /// What this registry counts for the rule that a gateway which runs
+    /// the policy engine uses no classic policy: the classic policy
+    /// objects it made or was handed, and the requests that reached its
+    /// stand-in's placing call.
+    ///
+    /// A made or handed object is the default policy, the routing-key
+    /// override's pin table, a model's own policy built from a worker's
+    /// label, a side's policy of a pair or an encode deployment, a policy
+    /// handed whole, or the rank policy. A policy counts once, with what
+    /// its own constructor builds inside it. The gateway makes a classic
+    /// policy nowhere else: the policy factory is called from this file
+    /// alone, and the router factory builds the rank policy only for a
+    /// registry that keeps classic policies. One object is not counted,
+    /// the consistent-hashing policy [`Self::get_encode_policy`] builds at
+    /// each call where no encode policy was set: a registry made for the
+    /// policy engine never builds it.
+    ///
+    /// A registry made for the policy engine makes none of these. It
+    /// reads zero until a request reaches its stand-in's placing call,
+    /// which refuses the request and counts it. The stand-in a getter
+    /// hands out is no classic object and does not count by itself: a
+    /// reader may ask it its name and its text answers.
+    pub fn classic_made_or_asked(&self) -> usize {
+        self.made_or_asked.load(Ordering::Relaxed)
+    }
+
+    /// Whether the classic policies place this gateway's requests:
+    /// `false` for a registry made for the policy engine. The router
+    /// factory reads it before it builds a policy to hand over.
+    pub(crate) fn keeps_classic_policies(&self) -> bool {
+        self.classic
+    }
+
+    /// One more classic policy object was made or handed.
+    fn count_classic_policy(&self) {
+        self.made_or_asked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// What the document in force needs of the host, where the policy
+    /// engine stands: the load poll and a worker's cache-event stream are
+    /// asked of it in a registry made for the engine.
+    fn document_needs(&self) -> Option<Needs> {
+        self.engine().map(|engine| engine.spec().needs())
+    }
+
     /// The policy that places requests on `worker`: the prefill, decode or
     /// encode policy by worker type, else the model's policy. Completion
     /// reports and in-flight reconciliation both go there, and the worker's
@@ -755,6 +976,9 @@ impl PolicyRegistry {
     /// [`LoadBalancingPolicy::reconcile_in_flight`]). The worker monitor
     /// calls this once per load poll for every polled worker.
     pub fn reconcile_in_flight(&self, worker: &dyn Worker) {
+        if !self.classic {
+            return;
+        }
         self.policy_for_worker(worker)
             .reconcile_in_flight(worker.url(), worker.load());
     }
@@ -769,6 +993,11 @@ impl PolicyRegistry {
         model_id: &str,
         policy_hint: Option<&str>,
     ) -> Arc<dyn LoadBalancingPolicy> {
+        if !self.classic {
+            // No model has a policy of its own under the engine: the
+            // stand-in is answered and nothing is kept.
+            return Arc::clone(&self.default_policy);
+        }
         // Check if model already has a policy (lock-free read via DashMap)
         if let Some(existing_policy) = self.model_policies.get(model_id) {
             debug!(
@@ -910,8 +1139,10 @@ impl PolicyRegistry {
     /// [`Self::on_worker_added`].
     fn create_policy_from_type(&self, policy_type: &str) -> Arc<dyn LoadBalancingPolicy> {
         if Self::hint_matches_config(policy_type, self.default_policy_config.name()) {
+            self.count_classic_policy();
             Self::create_policy_from_config(&self.default_policy_config)
         } else if let Some(policy) = PolicyFactory::create_by_name(policy_type) {
+            self.count_classic_policy();
             policy
         } else {
             warn!("Unknown policy type '{}', using default", policy_type);
@@ -943,7 +1174,7 @@ impl PolicyRegistry {
             Side::Decode => &self.decode_policy,
             Side::Encode => &self.encode_policy,
         };
-        if kept.get().is_some() {
+        if !self.classic || kept.get().is_some() {
             return;
         }
         let policy = Self::create_policy_from_config(config);
@@ -975,6 +1206,10 @@ impl PolicyRegistry {
     /// registry, and those setters only reach policies that already exist,
     /// so the policy takes that state here, under the shared-state read guards.
     pub fn set_prefill_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        if !self.classic {
+            return;
+        }
+        self.count_classic_policy();
         self.publish_with_shared_state(&policy, || {
             // OnceLock::set returns Err if already set, which we ignore since
             // the policy should only be set once at startup
@@ -983,6 +1218,10 @@ impl PolicyRegistry {
     }
 
     pub fn set_dp_rank_policy(&self, policy: Arc<dyn DPRankLoadPolicy>) {
+        if !self.classic {
+            return;
+        }
+        self.count_classic_policy();
         // OnceLock::set returns Err if already set, which we ignore since
         // the policy should only be set once at startup
         debug!("set dp rank policy");
@@ -1000,6 +1239,10 @@ impl PolicyRegistry {
     /// registry, and those setters only reach policies that already exist,
     /// so the policy takes that state here, under the shared-state read guards.
     pub fn set_decode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        if !self.classic {
+            return;
+        }
+        self.count_classic_policy();
         self.publish_with_shared_state(&policy, || {
             // OnceLock::set returns Err if already set, which we ignore since
             // the policy should only be set once at startup
@@ -1014,6 +1257,10 @@ impl PolicyRegistry {
     /// registry, and those setters only reach policies that already exist,
     /// so the policy takes that state here, under the shared-state read guards.
     pub fn set_encode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        if !self.classic {
+            return;
+        }
+        self.count_classic_policy();
         self.publish_with_shared_state(&policy, || {
             // OnceLock::set returns Err if already set, which we ignore since
             // the policy should only be set once at startup
@@ -1078,7 +1325,7 @@ impl PolicyRegistry {
             return false;
         }
         let keyed_override =
-            self.routing_key_sticky.is_some() && self.resolve_routing_key(headers).is_some();
+            self.routing_key_override && self.resolve_routing_key(headers).is_some();
         TextNeeds(self.text_needs.load(Ordering::Acquire)).answer(with_tokens, keyed_override)
     }
 
@@ -1100,6 +1347,13 @@ impl PolicyRegistry {
     /// [`LoadBalancingPolicy::needs_backend_loads`]): with load monitoring
     /// off, the worker monitor still polls a group while this holds.
     pub fn needs_backend_loads(&self) -> bool {
+        if !self.classic {
+            // The document's word, as the engine keeps the load channel by
+            // it: a load report or a named signal read.
+            return self
+                .document_needs()
+                .is_some_and(|needs| needs.loads || needs.signal_cells);
+        }
         let mut needs = false;
         self.each_policy(|policy| needs |= policy.needs_backend_loads());
         needs
@@ -1116,6 +1370,9 @@ impl PolicyRegistry {
     /// index: what the policy that places requests on it reads
     /// ([`Self::policy_for_worker`]).
     pub(crate) fn worker_needs_kv_events(&self, worker: &dyn Worker) -> bool {
+        if !self.classic {
+            return self.document_needs().is_some_and(|needs| needs.events);
+        }
         self.policy_for_worker(worker).needs_kv_events()
     }
 
@@ -1278,6 +1535,7 @@ impl LoadConsumer for PolicyRegistry {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+    use smg_policy_controller::document::{AppliedSpec, PolicySpec};
     use smg_worker::{
         identity::basic::{Worker, WorkerLoadGuard, WorkerType},
         load::state::LoadSnapshot,
@@ -1294,6 +1552,138 @@ mod tests {
         },
         routers::common::snapshot::test_support::worker_of,
     };
+
+    /// Every step that makes a classic policy or hands the registry one: a
+    /// model's own policy by a worker's label, a model that takes the
+    /// default, each side's policy, a policy handed whole and the rank
+    /// policy.
+    fn every_making_step(registry: &PolicyRegistry) {
+        registry.on_worker_added("labelled", Some("power_of_two"));
+        registry.on_worker_added("plain", None);
+        for side in [Side::Prefill, Side::Decode, Side::Encode] {
+            registry.set_side_policy(side, &PolicyConfig::RoundRobin);
+        }
+        registry.set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::Random));
+        registry.set_dp_rank_policy(Arc::new(crate::policies::MinimumTokensPolicy::new(None)));
+    }
+
+    /// Where the policy engine places the requests the registry makes no
+    /// classic policy object and keeps none it is handed. The same steps
+    /// count eight under the classic policies: the default and the
+    /// override's pin table at the start, then the labelled model's policy,
+    /// the three sides', the one handed whole and the rank policy.
+    #[test]
+    fn a_registry_made_for_the_policy_engine_makes_no_classic_policy_object() {
+        let classic = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
+        assert_eq!(classic.classic_made_or_asked(), 2);
+        every_making_step(&classic);
+        assert_eq!(classic.classic_made_or_asked(), 8);
+
+        let engine =
+            PolicyRegistry::for_policy_engine(PolicyConfig::RoundRobin, enabled_override());
+        every_making_step(&engine);
+        assert_eq!(engine.classic_made_or_asked(), 0);
+        assert!(engine.get_policy("labelled").is_none());
+        assert!(engine.get_dp_rank_policy().is_none());
+        // The settings' word on the routing-key override stands, with no
+        // pin table behind it.
+        assert!(engine.routing_key_override_enabled());
+        assert_eq!(engine.derive_rid_key(Some("session-A")), Some("session-A"));
+        assert_eq!(classic.derive_rid_key(Some("session-A")), Some("session-A"));
+        // A worker's guard tells a policy of the request's end under the
+        // classic policies alone.
+        assert!(Arc::new(classic).worker_completion_sink().is_some());
+        assert!(Arc::new(engine).worker_completion_sink().is_none());
+    }
+
+    /// A request that reaches the stand-in is placed nowhere, whichever
+    /// accessor handed the stand-in out: its route answers that no worker
+    /// is available and sends nothing, and the registry counts it. A
+    /// classic policy places the same workers.
+    #[test]
+    fn the_stand_in_of_a_registry_made_for_the_policy_engine_places_no_request() {
+        let workers = vec![
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
+        ];
+        let info = SelectWorkerInfo::default();
+        let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let placed = classic.get_default_policy().select_worker(&workers, &info);
+        assert!(placed.is_some());
+
+        let engine =
+            PolicyRegistry::for_policy_engine(PolicyConfig::RoundRobin, enabled_override());
+        for policy in [
+            engine.get_default_policy(),
+            engine.get_policy_or_default("any-model"),
+            engine.get_prefill_policy(),
+            engine.get_decode_policy(),
+            engine.get_encode_policy(),
+            engine.on_worker_added("any-model", Some("round_robin")),
+        ] {
+            let before = engine.classic_made_or_asked();
+            assert_eq!(policy.select_worker(&workers, &info), None);
+            assert_eq!(engine.select_worker(&policy, &workers, &info), None);
+            assert_eq!(engine.classic_made_or_asked(), before + 2);
+        }
+    }
+
+    /// The stand-in answers the two text questions from the registry's
+    /// stored bits, so the pair's text question, which asks the two side
+    /// getters' objects, reads what the registry stored.
+    #[test]
+    fn the_stand_in_answers_the_text_questions_from_the_registrys_stored_bits() {
+        let engine = PolicyRegistry::for_policy_engine(
+            PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096),
+            RoutingKeyOverrideConfig::default(),
+        );
+        let stand_in = engine.get_prefill_policy();
+        let answers = |policy: &Arc<dyn LoadBalancingPolicy>| {
+            (
+                policy.needs_request_text(),
+                policy.needs_request_text_with_tokens(),
+            )
+        };
+        assert_eq!(answers(&stand_in), (false, false));
+        assert!(!engine.pair_needs_request_text());
+
+        engine.text_needs.store(TextNeeds::TEXT, Ordering::Release);
+        assert_eq!(answers(&stand_in), (true, false));
+        assert!(engine.pair_needs_request_text());
+        assert!(engine.any_policy_needs_request_text(None));
+
+        let both = TextNeeds::TEXT | TextNeeds::TEXT_WITH_TOKENS;
+        engine.text_needs.store(both, Ordering::Release);
+        assert_eq!(answers(&engine.get_encode_policy()), (true, true));
+        assert_eq!(engine.classic_made_or_asked(), 0);
+    }
+
+    /// Under the policy engine the load poll and a worker's cache-event
+    /// stream follow what the document in force reads, whatever policy the
+    /// classic settings name, and nothing is asked before an engine stands.
+    #[test]
+    fn under_the_policy_engine_loads_and_cache_events_follow_the_document() {
+        let asked = |settings: PolicyConfig, preset: &str| {
+            let registry =
+                PolicyRegistry::for_policy_engine(settings, RoutingKeyOverrideConfig::default());
+            let worker = worker_of("http://w1:8000", WorkerType::Regular);
+            let ask = |registry: &PolicyRegistry| {
+                (
+                    LoadConsumer::needs_loads(registry),
+                    registry.worker_needs_kv_events(worker.as_ref()),
+                )
+            };
+            assert_eq!(ask(&registry), (false, false));
+            let document = PolicySpec::preset(preset).expect("a stock preset");
+            let spec = AppliedSpec::validate(&document).expect("a valid document");
+            registry.set_engine(Box::leak(Box::new(PolicyEngine::new(spec))));
+            assert_eq!(registry.classic_made_or_asked(), 0);
+            ask(&registry)
+        };
+        let cache_aware = PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096);
+        assert_eq!(asked(cache_aware, "round_robin"), (false, false));
+        assert_eq!(asked(PolicyConfig::RoundRobin, "cache_aware"), (true, true));
+    }
 
     /// The static needs the host answers before any request exists: a
     /// cache-aware default policy reads the request text, the load poll and
