@@ -635,6 +635,7 @@ impl Placed {
     /// placement, a test. An engine's side of the request is let go here,
     /// which the engine hears as a release. A route never calls this: it
     /// makes its guard by [`Self::guard`].
+    #[cfg(any(test, feature = "test-util"))]
     #[inline]
     pub(crate) fn into_worker(self) -> Arc<dyn Worker> {
         self.worker

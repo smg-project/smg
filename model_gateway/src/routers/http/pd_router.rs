@@ -1685,6 +1685,10 @@ impl PDRouter {
     }
 
     // Internal method that performs the actual dual dispatch (without retry logic)
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one attempt carries both sides, their guards and who records the prefill"
+    )]
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,

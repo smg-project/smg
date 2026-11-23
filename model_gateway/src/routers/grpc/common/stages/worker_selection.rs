@@ -66,6 +66,7 @@ use crate::{
 };
 
 /// Result type for PD worker pair selection: (prefill, decode, runtime_type)
+#[cfg(any(test, feature = "test-util"))]
 type PdWorkerPair = (Arc<dyn Worker>, Arc<dyn Worker>, RuntimeType);
 
 /// A PD pair as the placement answers it: each worker as a [`Placed`],
