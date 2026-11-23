@@ -500,9 +500,9 @@ let mut stop = StopSequenceDecoder::new(
 );
 for &token in encoding.token_ids() {
     match stop.process_token(token)? {
-        SequenceDecoderOutput::Text(t) => println!("{}", t),
+        SequenceDecoderOutput::Text(t) => print!("{t}"),
         SequenceDecoderOutput::StoppedWithText(t) => {
-            println!("{}", t);
+            print!("{t}");
             break;
         }
         SequenceDecoderOutput::Stopped => break,
@@ -511,8 +511,8 @@ for &token in encoding.token_ids() {
 }
 // End of input: release the text still held as a possible start of a stop
 match stop.finish()? {
-    SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) => println!("{}", t),
-    SequenceDecoderOutput::Held | SequenceDecoderOutput::Stopped => {}
+    SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) => println!("{t}"),
+    SequenceDecoderOutput::Held | SequenceDecoderOutput::Stopped => println!(),
 }
 ```
 
