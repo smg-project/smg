@@ -92,11 +92,10 @@ impl Engine {
     /// whose every row read is over its thresholds (the whole decision
     /// says whether the veto left the pool nobody), a binding with a shadow,
     /// a profile that opens a scope or draws, a profile whose filters
-    /// cannot be asked of one row alone ([`Filter::row_wise`]), a ring's
-    /// walk under a scorer that states what its pick holds of the request
-    /// ([`Self::decide_stated`]), a request that carries an affinity
-    /// column, a request its host holds to places of the pool
-    /// ([`Constraints::places`]), and every plan but the single one.
+    /// cannot be asked of one row alone ([`Filter::row_wise`]), a request
+    /// that carries an affinity column, a request its host holds to places
+    /// of the pool ([`Constraints::places`]), and every plan but the single
+    /// one.
     ///
     /// A row is read here by its place, a pin's and a walk's alike,
     /// whatever places the request may take. The whole decision opens its
@@ -161,11 +160,6 @@ impl Engine {
             if !facts.session_key.is_none() {
                 return self.follow_pin(index, rule, facts, rows, cx);
             }
-        }
-        // A scorer that states what its pick holds reads the rows for it:
-        // its ring's walk is the whole decision's.
-        if self.stating[at].is_some() {
-            return None;
         }
         // No rule governs the key. A picker that leaves the placement to
         // its rule's assignment places over every row, and so does a
