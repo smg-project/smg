@@ -16,7 +16,7 @@ use std::{sync::Arc, time::Instant};
 use smg_worker::load::state::LoadSnapshot;
 
 use super::{
-    pair::{issued, not_decided, stamp, Buffers, PairLists, BUFFERS},
+    pair::{issued, not_decided, stamp, tried_engines, Buffers, PairLists, BUFFERS},
     single::{self, PLACES},
     Loaded, PolicyEngine, PoolMembers,
 };
@@ -26,7 +26,7 @@ use crate::engine::{
     framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools},
     list_cell::LentList,
     records::Live,
-    view::{Constraints, Phase},
+    view::{Constraints, Phase, RequestFacts},
 };
 
 #[cfg(test)]
@@ -221,6 +221,22 @@ impl EncodeLists<'_> {
             ..*cx
         };
         let encoders = encoders.unwrap_or_else(|| engine.members_of(self.encoders));
+        // A retry leaves every worker of the engines it tried, each of the
+        // three lists by its own engines, as a pair's retry does over its
+        // two. The pair's pass and the encoders' profile read one list.
+        let tried = if facts.tried.is_empty() {
+            None
+        } else {
+            tried_engines(engine, facts.tried, &[prefill, decode, encoders])
+        };
+        let widened;
+        let facts = match &tried {
+            Some(tried) => {
+                widened = RequestFacts { tried, ..*facts };
+                &widened
+            }
+            None => facts,
+        };
         let mut decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;
             let (workers, records) = (prefill.workers(), prefill.records(spec, clock));
@@ -256,12 +272,17 @@ impl EncodeLists<'_> {
                 placed,
             )
         };
-        BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
+        let decision = BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
             Ok(mut buffers) => decide(&mut buffers),
             // A stage asked for a decision from inside its own, on this
             // thread: that decision takes buffers of its own.
             Err(_) => decide(&mut Buffers::default()),
-        })
+        });
+        // The thread's list goes back for its next retry.
+        if let Some(tried) = tried {
+            single::TRIED.set(tried);
+        }
+        decision
     }
 }
 

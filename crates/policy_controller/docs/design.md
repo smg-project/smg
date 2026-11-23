@@ -816,7 +816,7 @@ every worker of a tried worker's engine as tried before the key's pin is read an
 run. So `not-tried` passes the whole engine over while another worker is left, and hands it
 again where none is. A tried worker the list no longer holds names itself alone: the list does
 not say which engine it was a rank of. A pair's retry is widened the same way, each of its two
-lists by its own engines.
+lists by its own engines, and an encode request's over its three.
 
 A decision that panics is caught, counted and answered as refused. It never takes the host down.
 

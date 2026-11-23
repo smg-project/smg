@@ -401,7 +401,7 @@ impl<'a> PairLists<'a> {
         let tried = if facts.tried.is_empty() {
             None
         } else {
-            tried_engines(engine, facts.tried, [prefill, decode])
+            tried_engines(engine, facts.tried, &[prefill, decode])
         };
         let widened;
         let facts = match &tried {
@@ -511,11 +511,12 @@ impl<'a> PairLists<'a> {
     }
 }
 
-/// The workers of the engines a pair's retry tried: `tried` as its host
-/// named them, and behind them every other worker of an engine of either
-/// list that holds a tried worker, each list read by its own engines
-/// (`PoolRecords::tried_engines`). `None` where neither list holds
-/// several workers of one engine: the request's own list stands.
+/// The workers of the engines a retry tried: `tried` as its host named
+/// them, and behind them every other worker of an engine of one of
+/// `lists` that holds a tried worker, each list read by its own engines
+/// (`PoolRecords::tried_engines`). A pair hands its two lists and an
+/// encode request its three. `None` where no list holds several workers
+/// of one engine: the request's own list stands.
 ///
 /// The workers stand in the calling thread's own list ([`single::TRIED`]),
 /// which the caller puts back behind its decision: a retry allocates
@@ -523,19 +524,22 @@ impl<'a> PairLists<'a> {
 /// runs none of it.
 #[cold]
 #[inline(never)]
-fn tried_engines(
+pub(super) fn tried_engines(
     engine: Loaded<'_, '_>,
     tried: &[WorkerId],
-    [prefill, decode]: [&PoolMembers; 2],
+    lists: &[&PoolMembers],
 ) -> Option<Vec<WorkerId>> {
     let (spec, clock) = (&engine.document.spec, &engine.clock);
-    let (prefills, decodes) = (prefill.records(spec, clock), decode.records(spec, clock));
-    if !prefills.has_ranks() && !decodes.has_ranks() {
-        return None;
-    }
+    let mut ranked = lists
+        .iter()
+        .map(|list| list.records(spec, clock))
+        .filter(|records| records.has_ranks());
+    let first = ranked.next()?;
     let mut whole = single::TRIED.take();
-    prefills.tried_engines(tried, &mut whole);
-    decodes.more_tried_engines(tried, &mut whole);
+    first.tried_engines(tried, &mut whole);
+    for records in ranked {
+        records.more_tried_engines(tried, &mut whole);
+    }
     Some(whole)
 }
 
