@@ -21,7 +21,8 @@ pub struct CircuitBreakerConfig {
     pub success_threshold: u32,
     /// Duration to wait before attempting half-open
     pub timeout_duration: Duration,
-    /// Time window for failure counting
+    /// A closed circuit's failure later than this after the last one starts
+    /// a new streak; zero is no window
     pub window_duration: Duration,
 }
 
@@ -40,6 +41,13 @@ impl Default for CircuitBreakerConfig {
 const STATE_CLOSED: u8 = 0;
 const STATE_OPEN: u8 = 1;
 const STATE_HALF_OPEN: u8 = 2;
+
+/// The failure streak word holds the streak's count in its low 32 bits (the
+/// count stops at their maximum) and, above them, the low 32 bits of a time
+/// in milliseconds: they tell a gap of up to 49 days, and a longer one reads
+/// as its remainder.
+const STREAK_COUNT_BITS: u32 = 32;
+const STREAK_COUNT_MAX: u64 = (1 << STREAK_COUNT_BITS) - 1;
 
 /// Circuit breaker state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,14 +111,18 @@ fn now_ms() -> u64 {
 ///
 /// This implementation avoids RwLock contention by using atomic operations
 /// for state checks (the most common operation). Only state transitions
-/// use compare-and-swap which is still lock-free. The one mutex serializes
-/// the state gauge writes a transition makes, so the gauge cannot end up
-/// behind the state; the check and record paths never take it.
+/// and the record of a failure use compare-and-swap, which is still
+/// lock-free. The one mutex serializes the state gauge writes a transition
+/// makes, so the gauge cannot end up behind the state; the check and record
+/// paths never take it.
 #[derive(Debug)]
 pub struct CircuitBreaker {
     /// Circuit state stored as atomic u8 (0=Closed, 1=Open, 2=HalfOpen)
     state: AtomicU8,
-    consecutive_failures: AtomicU32,
+    /// The failure streak in one word, so that a failure commits both parts
+    /// at once: its count in the low `STREAK_COUNT_BITS` bits and above them
+    /// the time of its last failure (from now_ms()). Zero is no streak.
+    failure_streak: AtomicU64,
     consecutive_successes: AtomicU32,
     total_failures: AtomicU64,
     total_successes: AtomicU64,
@@ -140,7 +152,7 @@ impl CircuitBreaker {
     pub fn with_config_and_label(config: CircuitBreakerConfig, metric_label: String) -> Self {
         Self {
             state: AtomicU8::new(STATE_CLOSED),
-            consecutive_failures: AtomicU32::new(0),
+            failure_streak: AtomicU64::new(0),
             consecutive_successes: AtomicU32::new(0),
             total_failures: AtomicU64::new(0),
             total_successes: AtomicU64::new(0),
@@ -230,7 +242,7 @@ impl CircuitBreaker {
     /// Record a successful request
     pub fn record_success(&self) {
         self.total_successes.fetch_add(1, Ordering::Relaxed);
-        self.consecutive_failures.store(0, Ordering::Release);
+        self.failure_streak.store(0, Ordering::Release);
         let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
 
         let current_state = CircuitState::from_int(self.state.load(Ordering::Acquire));
@@ -255,15 +267,44 @@ impl CircuitBreaker {
     pub fn record_failure(&self) {
         self.total_failures.fetch_add(1, Ordering::Relaxed);
         self.consecutive_successes.store(0, Ordering::Release);
-        let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        // A closed circuit's failure later than the window after the last one
+        // starts a new streak. One swap commits the count with the time, and
+        // every round reads the clock and the state after the word it builds
+        // on, so a failure never counts into a streak that ran out or that
+        // another failure restarted.
+        let mut streak = self.failure_streak.load(Ordering::Acquire);
+        let (now, failures) = loop {
+            let now = now_ms();
+            let gap =
+                now.wrapping_sub(streak >> STREAK_COUNT_BITS) & (u64::MAX >> STREAK_COUNT_BITS);
+            let count = if self.peek_state() == CircuitState::Closed
+                && !self.config.window_duration.is_zero()
+                && Duration::from_millis(gap) > self.config.window_duration
+            {
+                1
+            } else {
+                ((streak & STREAK_COUNT_MAX) + 1).min(STREAK_COUNT_MAX)
+            };
+            match self.failure_streak.compare_exchange_weak(
+                streak,
+                (now << STREAK_COUNT_BITS) | count,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break (now, count),
+                // Lost to another record on this breaker in the round, or a spurious miss.
+                Err(seen) => streak = seen,
+            }
+        };
 
-        self.last_failure_time_ms.store(now_ms(), Ordering::Release);
+        // The later time stays: a recorder that was delayed does not rewind it.
+        self.last_failure_time_ms.fetch_max(now, Ordering::AcqRel);
 
         let current_state = CircuitState::from_int(self.state.load(Ordering::Acquire));
 
         match current_state {
             CircuitState::Closed => {
-                if failures >= self.config.failure_threshold {
+                if failures >= u64::from(self.config.failure_threshold) {
                     self.transition_to(CircuitState::Open);
                 }
             }
@@ -295,7 +336,7 @@ impl CircuitBreaker {
         self.last_state_change_ms.store(now_ms(), Ordering::Release);
         match to {
             CircuitState::Closed | CircuitState::HalfOpen => {
-                self.consecutive_failures.store(0, Ordering::Release);
+                self.failure_streak.store(0, Ordering::Release);
                 self.consecutive_successes.store(0, Ordering::Release);
             }
             CircuitState::Open => {
@@ -319,7 +360,7 @@ impl CircuitBreaker {
 
     /// Get the number of consecutive failures
     pub fn consecutive_failures(&self) -> u32 {
-        self.consecutive_failures.load(Ordering::Acquire)
+        (self.failure_streak.load(Ordering::Acquire) & STREAK_COUNT_MAX) as u32
     }
 
     /// Get the number of consecutive successes
@@ -360,7 +401,7 @@ impl CircuitBreaker {
     /// published here as well.
     pub fn reset(&self) {
         self.transition_to(CircuitState::Closed);
-        self.consecutive_failures.store(0, Ordering::Release);
+        self.failure_streak.store(0, Ordering::Release);
         self.consecutive_successes.store(0, Ordering::Release);
         self.publish_gauge_metrics();
     }
@@ -384,7 +425,7 @@ impl CircuitBreaker {
         if CircuitState::from_int(self.state.load(Ordering::Acquire)) != CircuitState::Closed {
             return;
         }
-        self.consecutive_failures.store(0, Ordering::Release);
+        self.failure_streak.store(0, Ordering::Release);
         self.publish_gauge_metrics();
     }
 
@@ -469,7 +510,7 @@ impl Clone for CircuitBreaker {
     fn clone(&self) -> Self {
         Self {
             state: AtomicU8::new(self.state.load(Ordering::Acquire)),
-            consecutive_failures: AtomicU32::new(self.consecutive_failures.load(Ordering::Acquire)),
+            failure_streak: AtomicU64::new(self.failure_streak.load(Ordering::Acquire)),
             consecutive_successes: AtomicU32::new(
                 self.consecutive_successes.load(Ordering::Acquire),
             ),
@@ -799,6 +840,42 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::HalfOpen);
         assert!(!cb.try_half_open());
         assert_eq!(cb.state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn a_failure_later_than_the_window_starts_a_new_streak() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 2,
+            window_duration: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config.clone(), String::new());
+        cb.record_failure();
+        thread::sleep(Duration::from_millis(150));
+        cb.record_failure();
+        assert_eq!(
+            cb.state(),
+            CircuitState::Closed,
+            "a failure outside the window opened the circuit"
+        );
+        assert_eq!(cb.consecutive_failures(), 1);
+
+        // An open circuit keeps its streak past the window.
+        cb.transition_to(CircuitState::Open);
+        thread::sleep(Duration::from_millis(150));
+        cb.record_failure();
+        assert_eq!(cb.consecutive_failures(), 2);
+
+        // A window of zero is no window.
+        let config = CircuitBreakerConfig {
+            window_duration: Duration::ZERO,
+            ..config
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
+        cb.record_failure();
+        thread::sleep(Duration::from_millis(5));
+        cb.record_failure();
+        assert_eq!(cb.consecutive_failures(), 2);
     }
 
     /// The worker's health returned while its circuit was still closed: the

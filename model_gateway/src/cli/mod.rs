@@ -1383,7 +1383,8 @@ struct ServingArgs {
     #[arg(long, default_value_t = 60, help_heading = "Circuit Breaker")]
     cb_timeout_duration_secs: u64,
 
-    /// Sliding window duration for tracking failures
+    /// While the circuit is closed, a failed request more than this many
+    /// seconds after the last one starts the count anew
     #[arg(long, default_value_t = 120, help_heading = "Circuit Breaker")]
     cb_window_duration_secs: u64,
 
