@@ -7257,6 +7257,49 @@ pub(crate) mod tests {
         assert_eq!(said()[2..], ["released Abandoned", "released Abandoned"]);
     }
 
+    /// A pair's decision the engine refuses is written at `warn` as a
+    /// single request's is, with the model and the engine's reason, and the
+    /// pair placement answers no pair. The stage that fails here ranks the
+    /// decode side.
+    #[test]
+    fn a_pairs_decision_the_engine_refuses_is_written_at_warn() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = test_subscriber(EventLines(tracing::Level::WARN, Arc::clone(&lines)));
+        let registry = one_pair();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let mut stages = StageRegistry::builtin();
+        stages
+            .scorer("faults", || Box::new(Faults))
+            .expect("a free name");
+        let document = PolicySpec::pair_presets("round_robin", "round_robin");
+        let mut document = document.expect("the pair presets");
+        document.generation = 1;
+        let decode = document.profiles.get_mut("decode");
+        let decode = decode.expect("the decode side's profile");
+        decode.score = vec!["faults".into()];
+        decode.pick = "best".into();
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        engine_on(&policies, spec.expect("the stages hold the scorer"));
+
+        assert!(
+            pair_from(&registry, &policies).is_err(),
+            "a refused decision places no pair"
+        );
+        let lines = lines.lock().unwrap();
+        let refused: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("message=The policy engine refused a decision"))
+            .collect();
+        assert_eq!(refused.len(), 1, "{lines:?}");
+        for expected in ["model_id=\"m\"", "refused=Faulted"] {
+            assert!(
+                refused[0].contains(expected),
+                "{expected} missing from {:?}",
+                refused[0]
+            );
+        }
+    }
+
     /// Under a document that picks a pair's decode behind its prefill the
     /// placement books the prefill alone, and names the decode all the
     /// same. A route that asks nothing more sends that decode, and the
