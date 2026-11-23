@@ -1594,10 +1594,10 @@ On main: 18 sheets, 482 lines.
 |---|---|---|
 | replayed and passing | 17 | 477 |
 | recorded, replayed by nothing (`constraint_decider`) | 1 | 5 |
-| replayed through the engine that stays (`PolicyEngine`) | **0** | **0** |
+| replayed through the engine that stays (`PolicyEngine`) | **4** | **37** |
 | replayed lines held to an answer of the crate's own, not classic's | | 28 |
 
-A replay through `PolicyEngine` over worker objects is in work and not on main yet. Measured
+A replay of all fourteen decision sheets through `PolicyEngine` over worker objects is in work and not on main yet: on main the four hard-demand sheets (`retry_wire`, `media_refs`, `context_window`, `rank_pin`; 37 lines) replay through it. Measured
 with it locally on 2026-11-22, on main (`096c0f5ea`): of the 408 lines that record a decision
 (point 1 below), the engine answers 286 as classic recorded and 28 differently, and 94 cannot
 be asked yet. Of the 94, 25 are declined because the request states a hard demand, 16 need a
@@ -1607,8 +1607,8 @@ the ring) lose lines, so the replay can fail.
 
 Five things follow, and they are the first work of section 16.
 
-1. **No recorded line goes through the engine that stays** in main's own tests. The replays
-   call the decision function over hand-built candidates, or the old engine. Fourteen sheets
+1. **Only the four hard-demand sheets (37 lines) go through the engine that stays** in main's own tests. The other replays
+   call the decision function over hand-built candidates, or over candidates of the old engine's store. Fourteen sheets
    (408 lines) record a decision, and each has to replay through `PolicyEngine` over worker
    objects. The other four (74 lines: `overload` 25, `pair_index` 23, `minimum_tokens` 18,
    `sticky_rank` 8) record an answer of the host, which the kept engine is never asked for. It
@@ -1719,7 +1719,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; a pair's shadows run in no engine, and `explain.sample` is kept by the served controller alone (decision 7) |
 | The ten presets and the conversion from routing settings | **[built]** | |
 | The stage interfaces and a builder's own stages | **[built]** | |
-| The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, a pair's demand, mixed protocols; no recorded line replays through it |
+| The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, a pair's demand, mixed protocols; of the recorded lines only the four hard-demand sheets (37) replay through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |
 | `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. Every other request the engine names the holders of reads the engine's own record, with its three faults: a request whose caller names no entry is one. The string tree is planned |
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | placed on the ring the host lends (decision 3): through `place` the plain ring alone, at the place the engine reads with the request's keys; `prefix_hash` at the places a host that writes the request's facts itself states; that both are classic's is proven at stage 3; a host that lends none is placed on the crate's ring, which may be another worker than classic's |

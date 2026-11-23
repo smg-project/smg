@@ -14,9 +14,9 @@ use crate::{
     document::spec::{AppliedSpec, Pairing, PolicySpec},
     engine::{
         Constraints, Decision, PairAdmission, PairLists, Phase, PolicyEngine, Request,
-        RequestFacts, Role, StoreBackedEngine, WireModes, WorkerId,
+        RequestFacts, Role, WireModes, WorkerId,
     },
-    store::{pairing::PairingDescriptor, GatewayId, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{pairing::PairingDescriptor, WorkerFacts, WorkerStatus, WorkersStore},
     worker_host::OpenAdmission,
 };
 
@@ -187,13 +187,12 @@ fn a_lent_worker_whose_object_was_replaced_pairs_with_nobody() {
     );
 }
 
-/// One fleet under the stock pair document, decided by both engines: the
-/// one over the store's rows, and the one over the lists the holder lends,
-/// with the holder's pair classes and a controller's open admission. One
-/// prefill and one decode share a transport, so the fleet holds one pair,
-/// and both engines pick it.
+/// One fleet under the stock pair document, decided over the lists the
+/// holder lends, with the holder's pair classes and a controller's open
+/// admission. One prefill and one decode share a transport, so the fleet
+/// holds one pair, and the decision picks it.
 #[test]
-fn both_engines_pick_the_one_pair_of_one_fleet() {
+fn the_lent_lists_and_the_holders_classes_pick_the_one_pair_of_one_fleet() {
     let mut replica = Replica::new();
     replica.objects = replica.objects.with_status_followed();
     let sides = [
@@ -218,7 +217,7 @@ fn both_engines_pick_the_one_pair_of_one_fleet() {
     let the_pair = Some((rows[1], rows[3]));
     let document = PolicySpec::pair_presets("least_load", "least_load").expect("the stock presets");
     let applied = || AppliedSpec::validate(&document).expect("the stock document");
-    let asked = || Request {
+    let mut request = Request {
         id: b"pair",
         facts: RequestFacts {
             model: MODEL,
@@ -252,14 +251,7 @@ fn both_engines_pick_the_one_pair_of_one_fleet() {
         decode_held: &[],
     };
     assert!(OpenAdmission.has_capacity(0) && OpenAdmission.has_room(1));
-    let (mut request, now) = (asked(), Instant::now());
+    let now = Instant::now();
     let over_lists = lists.decide(&engine, None, now, &mut request, None);
     assert_eq!(picked(&over_lists), the_pair, "over the lists lent");
-
-    let store = Arc::new(replica.store);
-    store.apply(applied()).expect("a first generation");
-    let door = StoreBackedEngine::new(store);
-    let over_rows = door.decide(GatewayId(11), &asked(), Instant::now());
-    let over_rows = over_rows.expect("no refusal").decision;
-    assert_eq!(picked(&over_rows), the_pair, "over the store's rows");
 }

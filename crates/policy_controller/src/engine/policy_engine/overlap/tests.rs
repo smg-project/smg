@@ -1693,3 +1693,743 @@ fn a_decision_that_names_no_row_writes_nothing_of_the_one_before() {
     }
     assert!(bed.holders(&asked, NOW).is_empty());
 }
+
+/// Under a source that reads the record alone the record's holders are
+/// named first, and where they fill the profile's sample the index is not
+/// asked. The decision is named the worker the prefix was sent to, though
+/// the index holds the whole request for another, and it still goes to
+/// that other worker where the filters refuse the named one.
+#[test]
+fn a_cap_the_records_holders_fill_is_not_read_past() {
+    use crate::document::spec::{AffinitySource, BestParams, PickStage, ScoreSpec};
+
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    document.generation = 1;
+    let profile = document
+        .profiles
+        .get_mut("cache_aware")
+        .expect("the profile");
+    profile.pick = PickStage::Best(BestParams { sample: 1 }).into();
+    for stage in &mut profile.score {
+        if let ScoreSpec::Params(ScoreStage::PrefixAffinity(prefix)) = stage {
+            prefix.source = Some(AffinitySource::Predictor);
+        }
+    }
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 4);
+    store(&index, 0, &hashes_of(&asked));
+    let bed = Bed::new(affinity, spec, 2);
+    let mut facts = request(&asked, 0, NOW);
+    let first = bed.decide(&facts, Some(1)).expect("rows");
+    assert_eq!(first.holders, [(0, 4, 0)]);
+
+    let mut rows = records(&bed.ids);
+    rows[1].health.healthy = false;
+    let pool = PoolFacts {
+        pool_size: 2,
+        generation: 1,
+        ..PoolFacts::default()
+    };
+    let decision = decide(
+        &bed.affinity,
+        &bed.pool,
+        &bed.spec,
+        &bed.workers,
+        &bed.ids,
+        &mut facts,
+        |_| None,
+        |_| true,
+        |facts| {
+            assert_eq!(
+                facts.named.expect("rows").holders,
+                &[AffinityHolder {
+                    row: 1,
+                    overlap_blocks: 0,
+                    predicted_blocks: 4,
+                }]
+            );
+            bed.spec.engine().decide(
+                facts,
+                &pool,
+                &rows,
+                &Constraints::default(),
+                &mut Scratch::new(),
+            )
+        },
+    );
+    let pick = decision.pick().expect("a healthy worker");
+    assert_eq!(pick.targets.first().expect("a target").id, bed.ids[0]);
+
+    // The index was not asked again: a lookup empties its answer first,
+    // even under a cap of zero, and the first decision's answer stands.
+    with_buffers(|buffers| {
+        assert_eq!(buffers.kept.len(), 1, "the first index answer survives");
+    });
+}
+
+/// A naming is made once a decision, ahead of its filters. The holder the
+/// record names and the holder the index names stand in it by row, each
+/// with its depth, and they stand whole where the filters refuse every
+/// worker.
+#[test]
+fn a_naming_the_record_fills_stands_whole_where_every_holder_is_refused() {
+    use crate::document::spec::{BestParams, PickStage};
+
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    document.generation = 1;
+    let profile = document
+        .profiles
+        .get_mut("cache_aware")
+        .expect("the profile");
+    profile.pick = PickStage::Best(BestParams { sample: 2 }).into();
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    assert_eq!(spec.engine().affinity_rows_cap(MODEL, Phase::Single), 2);
+
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 4);
+    store(&index, 1, &hashes_of(&asked));
+    let bed = Bed::new(affinity, spec, 2);
+    bed.decide(&request(&asked, 0, NOW), Some(0)).expect("rows");
+
+    let pool = PoolFacts {
+        pool_size: 2,
+        generation: 1,
+        ..PoolFacts::default()
+    };
+    let named_when = |healthy| {
+        let mut rows = records(&bed.ids);
+        for row in &mut rows {
+            row.health.healthy = healthy;
+        }
+        let mut holders = Vec::new();
+        let decision = decide(
+            &bed.affinity,
+            &bed.pool,
+            &bed.spec,
+            &bed.workers,
+            &bed.ids,
+            &mut request(&asked, 0, NOW),
+            |_| None,
+            |_| true,
+            |facts| {
+                for holder in facts.named.expect("rows").holders {
+                    holders.push((holder.row, holder.overlap_blocks, holder.predicted_blocks));
+                }
+                bed.spec.engine().decide(
+                    facts,
+                    &pool,
+                    &rows,
+                    &Constraints::default(),
+                    &mut Scratch::new(),
+                )
+            },
+        );
+        assert_eq!(
+            decision.pick().is_some(),
+            healthy,
+            "only healthy workers pass"
+        );
+        holders
+    };
+
+    let first = named_when(true);
+    assert_eq!(first, [(0, 0, 4), (1, 4, 0)]);
+    assert_eq!(named_when(false), first);
+}
+
+/// A list whose every worker the index speaks for reads no record and
+/// writes none: a naming folds no key and a pick leaves no entry. Once a
+/// read of the table finds a worker with no block in the index, the record
+/// is read and written again.
+#[test]
+fn a_pool_whose_workers_are_all_heard_reads_no_record() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let bed = Bed::new(affinity, preset("cache_aware"), 2);
+    let asked = prompt(1_000, 4);
+    let other = hashes_of(&prompt(9_000, 1))[0];
+
+    // Keep the first worker's block map for the clear.
+    let number = index.intern_worker(&address(0)).expect("a worker number");
+    let mut map = ChainBlockMap::new();
+    let block = StoredBlock {
+        seq_hash: other.into(),
+        content_hash: ContentHash(other),
+    };
+    index
+        .apply_stored(number, &[block], None, &mut map)
+        .expect("a stored block");
+    store(&index, 1, &[other]);
+
+    let check = |now, reads| {
+        let facts = request(&asked, 7, now);
+        let named = bed.decide(&facts, Some(0)).expect("rows");
+        assert!(
+            named.holders.is_empty(),
+            "no worker holds the prefix before this pick"
+        );
+
+        let standing = bed.pool.table.load();
+        let table = standing.as_deref().expect("the list's table");
+        let record = table.record.as_ref().expect("the model's record");
+        let placements = record.predictor.read().len();
+
+        let mut buffers = Buffers::new();
+        let read = table.name(&facts, &mut buffers);
+        assert_eq!(read.is_some(), reads, "record read at {now}");
+        let blocks = if reads { 4 } else { 0 };
+        assert_eq!(buffers.keys.len(), blocks, "folded keys at {now}");
+        assert_eq!(placements, blocks, "placements after the pick at {now}");
+    };
+
+    check(NOW, false);
+    index.apply_cleared(number, &mut map);
+    check(NOW + SECOND - 1, false);
+    check(NOW + SECOND, true);
+}
+
+/// A worker the index numbers and holds no block for is the record's to
+/// speak for: an empty write of its events leaves it named by the prefix
+/// it was sent. Once the index holds a block for it the index speaks, and
+/// a request it holds no block of there names nobody.
+#[test]
+fn an_empty_index_write_keeps_the_predicted_worker_named() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let bed = Bed::new(affinity, preset("cache_aware"), 2);
+    // The index holds a block throughout, the second worker's, as an
+    // index its host lends does.
+    let other = prompt(9_000, 1);
+    store(&index, 1, &hashes_of(&other));
+    let asked = prompt(1_000, 4);
+    bed.decide(&request(&asked, 7, NOW), Some(0))
+        .expect("rows named");
+
+    store(&index, 0, &[]);
+    assert_eq!(bed.holders(&asked, NOW + SECOND), [(0, 0, 4)]);
+
+    store(&index, 0, &hashes_of(&other));
+    assert!(
+        bed.holders(&asked, NOW + 2 * SECOND).is_empty(),
+        "the worker's only indexed block belongs to another prompt"
+    );
+}
+
+/// A worker the record names until the index holds blocks for it is named
+/// by the index alone from the next read of the table: its entry in the
+/// record names no second row.
+#[test]
+fn a_stale_prediction_cannot_name_a_worker_the_index_already_names() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let bed = Bed::new(affinity, preset("cache_aware"), 2);
+    let asked = prompt(1_000, 4);
+
+    bed.decide(&request(&asked, 7, NOW), Some(1))
+        .expect("rows named");
+    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+
+    store(&index, 1, &hashes_of(&asked));
+    assert_eq!(
+        bed.holders(&asked, NOW + SECOND),
+        [(1, 4, 0)],
+        "only the index names row 1 after the refresh"
+    );
+}
+
+/// A list of more workers than one word of a mask holds is read whole.
+/// Under no sample each of seventy workers is named by the record, and by
+/// the index alone once its events arrived and the table is read again.
+#[test]
+fn a_pool_past_one_word_of_workers_is_read_whole() {
+    const WORKERS: usize = 70;
+
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    let profile = document
+        .profiles
+        .get_mut("cache_aware")
+        .expect("the profile");
+    profile.pick = "best".into();
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    for at in 0..WORKERS {
+        index.intern_worker(&address(at)).expect("a worker number");
+    }
+    let bed = Bed::new(affinity, spec, WORKERS);
+    let asked = prompt(1_000, 4);
+    let facts = request(&asked, 7, NOW);
+    for at in 0..WORKERS {
+        bed.decide(&facts, Some(at as u32)).expect("rows");
+    }
+
+    let predicted: Vec<_> = (0..WORKERS).map(|at| (at as u32, 0, 4)).collect();
+    assert_eq!(bed.holders(&asked, NOW), predicted);
+
+    let hashes = hashes_of(&asked);
+    for at in 0..WORKERS {
+        store(&index, at, &hashes);
+    }
+    assert_eq!(
+        bed.holders(&asked, NOW),
+        predicted,
+        "the standing table still names the predictions"
+    );
+    let indexed: Vec<_> = (0..WORKERS).map(|at| (at as u32, 4, 0)).collect();
+    assert_eq!(bed.holders(&asked, NOW + SECOND), indexed);
+}
+
+/// The index's holders and the record's share the one cap. At a sample of
+/// two the index's holder is named beside one of three recorded holders,
+/// each of the three over the seeds, in row order. At a sample of one the
+/// index's holder is named alone.
+#[test]
+fn the_two_lists_of_holders_keep_one_cap() {
+    use crate::document::spec::{BestParams, PickStage};
+
+    let [two, one] = [2, 1].map(|sample| {
+        let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+        let profile = document
+            .profiles
+            .get_mut("cache_aware")
+            .expect("the profile");
+        profile.pick = PickStage::Best(BestParams { sample }).into();
+        AppliedSpec::validate(&document).expect("the document validates")
+    });
+
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 4);
+    store(&index, 3, &hashes_of(&asked));
+    index.intern_worker(&address(4)).expect("a worker number");
+    let mut bed = Bed::new(affinity, two, 5);
+    let facts = request(&asked, 7, NOW);
+    for row in 0..3 {
+        bed.decide(&facts, Some(row)).expect("rows");
+    }
+
+    let mut seen = [false; 3];
+    for seed in 0..32 {
+        let holders = bed
+            .decide(&request(&asked, seed, NOW), None)
+            .expect("rows")
+            .holders;
+        assert_eq!(holders.len(), 2, "seed {seed}");
+        assert_eq!(holders[1], (3, 4, 0), "seed {seed}");
+        let (row, overlap, predicted) = holders[0];
+        assert!(row < holders[1].0, "seed {seed} named {holders:?}");
+        assert_eq!((overlap, predicted), (0, 4), "seed {seed}");
+        seen[row as usize] = true;
+    }
+    assert_eq!(seen, [true; 3], "each prediction takes the open slot");
+
+    bed.spec = one;
+    let named = bed
+        .decide(&request(&asked, 0, NOW + SECOND), None)
+        .expect("rows");
+    assert_eq!(named.holders, [(3, 4, 0)]);
+}
+
+/// A list is named the deepest holder among its own workers: a worker of
+/// another list that was sent more of the request hides no shorter prefix
+/// a worker of this list was sent.
+#[test]
+fn a_worker_outside_the_list_hides_no_shorter_prefix_inside_it() {
+    let (affinity, _, _) = hosted(false);
+    let both = Bed::new(affinity, preset("cache_aware"), 2);
+    let four = prompt(1_000, 4);
+    let three = prompt(1_000, 3);
+    both.decide(&request(&four, 7, NOW), Some(0));
+    both.decide(&request(&three, 7, NOW), Some(1));
+    assert_eq!(both.holders(&four, NOW), [(0, 0, 4)], "the deeper holder");
+
+    // The second worker alone, as another list of the model: the model's
+    // one record holds what both workers were sent.
+    let alone = Bed {
+        workers: both.workers[1..].to_vec(),
+        ids: both.ids[1..].to_vec(),
+        pool: PoolAffinity::default(),
+        ..both
+    };
+    assert_eq!(
+        alone.holders(&four, NOW),
+        [(0, 0, 3)],
+        "its own three blocks"
+    );
+}
+
+/// A profile whose prefix stage reads the record alone is named the
+/// record's holders ahead of the index's: at a sample of one the worker
+/// the prefix was sent to, and at two the index's holder beside it.
+#[test]
+fn a_source_that_reads_the_record_alone_names_its_holders_first() {
+    use crate::document::spec::{AffinitySource, BestParams, PickStage, ScoreSpec};
+
+    let spec = |sample| {
+        let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+        let profile = document
+            .profiles
+            .get_mut("cache_aware")
+            .expect("the preset's profile");
+        for stage in &mut profile.score {
+            if let ScoreSpec::Params(ScoreStage::PrefixAffinity(params)) = stage {
+                params.source = Some(AffinitySource::Predictor);
+            }
+        }
+        profile.pick = PickStage::Best(BestParams { sample }).into();
+        AppliedSpec::validate(&document).expect("the document validates")
+    };
+
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 4);
+    store(&index, 0, &hashes_of(&asked));
+    let facts = request(&asked, 0, NOW);
+
+    let one = Bed::new(affinity, spec(1), 2);
+    one.decide(&facts, Some(1));
+    let named = one.decide(&facts, None).expect("rows at cap one");
+    assert_eq!(
+        named.holders,
+        [(1, 0, 4)],
+        "the recorded worker takes the slot"
+    );
+
+    let two = Bed {
+        pool: PoolAffinity::default(),
+        spec: spec(2),
+        ..one
+    };
+    let named = two.decide(&facts, None).expect("rows at cap two");
+    assert_eq!(named.holders, [(0, 4, 0), (1, 0, 4)]);
+}
+
+/// A removal takes a record's lock as a writer only where the record holds
+/// the worker: it ends while a decision of another model holds that
+/// model's record as a reader, and the worker's placement is gone.
+#[test]
+fn a_removal_waits_for_no_decider_of_another_model() {
+    const READER_MODEL: &str = "model-b";
+
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 1);
+    let asked = prompt(1_000, 4);
+    let facts = request(&asked, 7, NOW);
+    bed.decide(&facts, Some(0));
+    assert_eq!(bed.holders(&asked, NOW), [(0, 0, 4)]);
+
+    let reader_id = WorkerId(2);
+    let reader_workers = [ready_worker(&address(1), READER_MODEL)];
+    let reader_pool = PoolAffinity::default();
+    decide(
+        &bed.affinity,
+        &reader_pool,
+        &bed.spec,
+        &reader_workers,
+        &[reader_id],
+        &mut RequestFacts {
+            model: READER_MODEL,
+            ..facts
+        },
+        |_| None,
+        |_| true,
+        |_| picked(0, reader_id),
+    );
+
+    let record = {
+        let records = bed.affinity.records.lock();
+        Arc::clone(records.get(READER_MODEL).expect("the reader's record"))
+    };
+    let reading = record.predictor.read();
+    assert!(!reading.holds(bed.ids[0]), "a worker of the other model");
+    // The removal runs on a thread of its own: one that waited for the
+    // reader is seen waiting, five seconds at most, and hangs no case.
+    let (affinity, gone) = (&bed.affinity, bed.ids[0]);
+    let ended = thread::scope(|scope| {
+        let removal = scope.spawn(move || affinity.forget(gone));
+        for _ in 0..5_000 {
+            if removal.is_finished() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let ended = removal.is_finished();
+        assert!(reading.holds(reader_id), "the reader holds its record");
+        drop(reading);
+        ended
+    });
+    assert!(ended, "the removal waited for a reader of another model");
+    assert!(bed.holders(&asked, NOW).is_empty(), "the placement is gone");
+}
+
+/// One prefix stage that reads cache events keeps the index's holders
+/// first, whatever another reads. Beside a stage that reads the record
+/// alone, the worker the index names keeps a sample of one after the
+/// prefix was sent to another worker.
+#[test]
+fn a_stage_that_reads_cache_events_keeps_the_index_holders_first() {
+    use crate::document::spec::{AffinitySource, BestParams, PickStage, PrefixAffinityParams};
+
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    let profile = document
+        .profiles
+        .get_mut("cache_aware")
+        .expect("the preset profile");
+    profile.pick = PickStage::Best(BestParams { sample: 1 }).into();
+    profile.score.push(
+        ScoreStage::PrefixAffinity(PrefixAffinityParams {
+            weight: 0.01,
+            source: Some(AffinitySource::Predictor),
+            ..PrefixAffinityParams::default()
+        })
+        .into(),
+    );
+    let spec = AppliedSpec::validate(&document).expect("valid mixed profile");
+    assert_eq!(spec.engine().affinity_rows_cap(MODEL, Phase::Single), 1);
+
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the host index");
+    let asked = prompt(1_000, 4);
+    store(&index, 1, &hashes_of(&asked));
+    let bed = Bed::new(affinity, spec, 2);
+    let facts = request(&asked, 0, NOW);
+
+    let cold = bed.decide(&facts, Some(0)).expect("named rows");
+    assert_eq!(cold.holders, [(1, 4, 0)]);
+    let (column, _) = bed.column(&facts, Phase::Single);
+    assert_eq!(
+        held(&column),
+        [(0, 4), (4, 0)],
+        "row 0 has the recorded prefix"
+    );
+    let warm = bed.decide(&facts, None).expect("named rows");
+    assert_eq!(warm.holders, [(1, 4, 0)], "row 1 keeps the only slot");
+}
+
+/// A pick of a worker the record holds no part of the request for is
+/// written, though the record holds the whole request for another worker
+/// at this tick: both then hold it.
+#[test]
+fn a_fresh_prefix_still_writes_for_a_new_target() {
+    use crate::document::spec::{BestParams, PickStage};
+
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    let profile = document
+        .profiles
+        .get_mut("cache_aware")
+        .expect("the preset profile");
+    profile.pick = PickStage::Best(BestParams { sample: 1 }).into();
+    let spec = AppliedSpec::validate(&document).expect("valid profile");
+
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, spec, 2);
+    let asked = prompt(1_000, 4);
+    let facts = request(&asked, 7, NOW);
+    let cold = bed.decide(&facts, Some(0)).expect("named rows");
+    assert!(cold.holders.is_empty());
+    let warm = bed.decide(&facts, Some(1)).expect("named rows");
+    assert_eq!(warm.holders, [(0, 0, 4)]);
+    assert_eq!(
+        bed.holders(&asked, NOW).len(),
+        1,
+        "only one holder is named"
+    );
+
+    let standing = bed.pool.table.load();
+    let table = standing.as_deref().expect("the list table");
+    let record = table.record.as_deref().expect("the prefix record");
+    let mut keys = Vec::new();
+    let mut holders = Vec::new();
+    let (blocks, _) = table.read_record(record, &facts, &mut keys, &mut holders);
+    assert_eq!(blocks, 4);
+    // The record names a block's holders in no order.
+    holders.sort_unstable();
+    assert_eq!(holders, bed.ids, "both workers hold the fourth block");
+}
+
+/// A pick of a worker that holds the whole request at this tick is a
+/// repeat and writes nothing, though the sample left that worker unnamed.
+/// A write would have moved the prompt's last use: the next block to leave
+/// a full record is the prompt's own last one.
+#[test]
+fn a_fresh_target_outside_the_holder_cap_writes_nothing() {
+    use crate::document::spec::{BestParams, PickStage};
+
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    let profile = document
+        .profiles
+        .get_mut("cache_aware")
+        .expect("the preset profile");
+    profile.pick = PickStage::Best(BestParams { sample: 1 }).into();
+    // Four blocks per worker and one other block fill the record.
+    document.index.entry(MODEL.into()).or_default().max_size = 9 * u64::from(BLOCK);
+    let spec = AppliedSpec::validate(&document).expect("valid bounded profile");
+
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, spec, 2);
+    let asked = prompt(1_000, 4);
+    let facts = request(&asked, 7, NOW);
+    for row in [0, 1] {
+        bed.decide(&facts, Some(row)).expect("named rows");
+    }
+    let (before, _) = bed.column(&facts, Phase::Single);
+    assert_eq!(held(&before), [(0, 4); 2]);
+
+    let newer = prompt(9_000, 1);
+    bed.decide(&request(&newer, 7, NOW), Some(0))
+        .expect("named rows");
+    let named = bed.holders(&asked, NOW);
+    assert_eq!(named.len(), 1);
+    let target = if named[0].0 == 0 { 1 } else { 0 };
+    let repeat = bed.decide(&facts, Some(target)).expect("named rows");
+    assert_eq!(
+        repeat.holders,
+        [(1 - target, 0, 4)],
+        "the picked holder is omitted"
+    );
+
+    let incoming = prompt(50_000, 1);
+    bed.decide(&request(&incoming, 7, NOW), Some(0))
+        .expect("named rows");
+    let (after, _) = bed.column(&facts, Phase::Single);
+    assert_eq!(
+        held(&after),
+        [(0, 3); 2],
+        "a repeat write would keep the fourth block"
+    );
+    assert_eq!(bed.holders(&newer, NOW), [(0, 0, 1)]);
+}
+
+/// A bound that came down forgets nothing by itself. The write that ends
+/// behind it sweeps one step: of a hundred placements at most 36 stay.
+#[test]
+fn the_last_slice_sweeps_placements_owed_by_a_lower_bound() {
+    let (affinity, _, _) = hosted(false);
+    let mut bed = Bed::new(affinity, preset("cache_aware"), 1);
+    let first = prompt(1_000, 100);
+    bed.decide(&request(&first, 7, NOW), Some(0))
+        .expect("rows for the first pick");
+    let record = {
+        let records = bed.affinity.records.lock();
+        Arc::clone(records.get(MODEL).expect("the model's record"))
+    };
+
+    let mut smaller = PolicySpec::preset("cache_aware").expect("the preset");
+    smaller.generation = 2;
+    smaller.index.entry(MODEL.into()).or_default().max_size = u64::from(BLOCK);
+    bed.spec = AppliedSpec::validate(&smaller).expect("the smaller document");
+
+    let cold = prompt(50_000, 4);
+    let now = NOW + SECOND;
+    assert!(bed.holders(&cold, now).is_empty(), "the new prompt is cold");
+    assert_eq!(record.predictor.read().bound(), 1);
+    assert_eq!(
+        record.predictor.read().len(),
+        100,
+        "the sweep waits for the write"
+    );
+
+    bed.decide(&request(&cold, 7, now), Some(0))
+        .expect("rows for the cold pick");
+    let left = record.predictor.read().len();
+    assert!(left <= 36, "the cold write leaves {left} placements");
+}
+
+/// The record's bound is the index's size in blocks of the size the
+/// indexes report for the model. A size twice the document's halves the
+/// bound at the next read of the table, and with none reported the
+/// document's size serves again.
+#[test]
+fn a_block_size_of_record_moves_the_records_bound() {
+    struct ReportedSize(Mutex<Option<u32>>);
+
+    impl CacheIndexes for ReportedSize {
+        fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+            None
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
+            *self.0.lock()
+        }
+    }
+
+    let reported = Arc::new(ReportedSize(Mutex::new(None)));
+    let bed = Bed::new(Affinity::default(), preset("cache_aware"), 1);
+    bed.affinity
+        .set_indexes(Arc::clone(&reported) as Arc<dyn CacheIndexes>);
+
+    let empty = PromptHashes::default();
+    bed.holders(&empty, NOW);
+    let record = {
+        let records = bed.affinity.records.lock();
+        Arc::clone(records.get(MODEL).expect("the model's record"))
+    };
+    let bound = || record.predictor.read().bound();
+    let original = bound();
+    assert!(
+        original > 1,
+        "the starting bound allows at least two placements"
+    );
+
+    *reported.0.lock() = Some(2 * bed.spec.block_size());
+    bed.holders(&empty, NOW + SECOND);
+    assert_eq!(bound(), original / 2, "the reported size halves the bound");
+
+    *reported.0.lock() = None;
+    bed.holders(&empty, NOW + 2 * SECOND);
+    assert_eq!(bound(), original, "the document size restores the bound");
+}
+
+/// A bound that comes down while a decision holds the record keeps its
+/// sweep. The holder's own sweep finds nothing owed under the bound the
+/// record still reads, and the work waits for the next writer all the
+/// same.
+#[test]
+fn a_lower_bound_keeps_its_sweep_past_a_decider_that_holds_the_record() {
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 1);
+    let first = prompt(1_000, 100);
+    bed.decide(&request(&first, 7, NOW), Some(0))
+        .expect("rows for the first pick");
+    let record = {
+        let records = bed.affinity.records.lock();
+        Arc::clone(records.get(MODEL).expect("the model's record"))
+    };
+    assert!(!record.sweeping.load(Ordering::Relaxed), "nothing is owed");
+    let was = record.bound.load(Ordering::Relaxed);
+
+    // A decision holds the record while another thread lowers the bound,
+    // and sweeps once that thread waits for it.
+    let mut held = record.predictor.write();
+    assert_eq!(held.len(), 100, "the record holds the prompt whole");
+    thread::scope(|scope| {
+        scope.spawn(|| record.bound_to(1));
+        // Five seconds at most for the bound's word to move: a lowering
+        // that never moves it fails the case below and hangs nothing.
+        for _ in 0..5_000 {
+            if record.bound.load(Ordering::Relaxed) != was {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Time for a step the lowering must not take ahead of the guard:
+        // a lowering that takes it later than this passes here unseen.
+        thread::sleep(Duration::from_millis(20));
+        record.sweep(&mut held);
+        drop(held);
+    });
+    assert_eq!(record.bound.load(Ordering::Relaxed), 1, "the bound's word");
+    assert_eq!(record.predictor.read().bound(), 1, "the lower bound");
+    assert!(
+        record.sweeping.load(Ordering::Relaxed),
+        "the lower bound's sweep is still owed"
+    );
+    bed.affinity.sweep();
+    let left = record.predictor.read().len();
+    assert!(left <= 36, "one step of the sweep leaves {left} placements");
+}

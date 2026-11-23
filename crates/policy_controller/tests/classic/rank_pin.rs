@@ -7,7 +7,8 @@
 //! The rows replay on the hard demands' bed ([`Bed`]). A worker states
 //! whether it registered a rank as the row's recorder read it off the
 //! worker's own object (`rank_registered`): a group of one registered a
-//! rank too. Each request states that no rank can be pinned for it, as a
+//! rank too. Its object here registers the rank and the group size its row
+//! records. Each request states that no rank can be pinned for it, as a
 //! hard demand ([`Demands::no_rank`]), and carries nothing else: a row
 //! holds one answer a request.
 //!
@@ -29,6 +30,9 @@ struct Worker {
     state: State,
     /// Whether the worker registered a rank, as the gateway reads it.
     rank_registered: bool,
+    /// The rank it registered and its group's size, where it named a rank.
+    dp_rank: Option<usize>,
+    dp_size: Option<usize>,
 }
 
 /// The gateway's words for a shed under `emptied_by`. A pool whose every
@@ -69,6 +73,7 @@ impl Replayed for Row {
                 ranked: worker.rank_registered,
                 ..DemandFacts::default()
             },
+            rank: worker.dp_rank.zip(worker.dp_size),
         };
         let pooled: Vec<Pooled> = self.workers.iter().map(pooled).collect();
         let mut bed = Bed::new(self.shed, &pooled)?;
