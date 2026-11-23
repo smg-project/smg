@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arc_swap::{ArcSwap, Guard};
+use arc_swap::ArcSwap;
 use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::FxHashMap;
 
@@ -1104,13 +1104,6 @@ impl MemoryStore {
         PromptHashes::of_prompt(tokens, text, seeds, |kind| {
             self.deciding(|world| block_size_and_depth(world.spec(), self.block_size(model), kind))
         })
-    }
-
-    /// The load of [`MemoryStore::deciding`], held by a decision that asks
-    /// a question of the world before it decides under it: the same world
-    /// for both, whole until the hold is dropped.
-    pub(crate) fn loaded(&self) -> Guard<Arc<StoreSnapshot>> {
-        self.world.load()
     }
 
     /// `at` in the rows' clock: microseconds since the store's origin.
@@ -3422,28 +3415,6 @@ impl ReservationStore for MemoryStore {
 
 // --------------------------------------------------------------- sessions
 
-impl MemoryStore {
-    /// What a keyed decision reads of `session` under one hold of the
-    /// key's shard ([`SessionTables::read`]): its pin of record, and in
-    /// `carried`, cleared first, the workers that carry its requests in
-    /// flight with their counts. A door asks for a keyed request whose
-    /// rule has an in-flight cap, and for no other.
-    pub(crate) fn keyed(
-        &self,
-        session: Session,
-        carried: &mut Vec<(WorkerId, u32)>,
-    ) -> Option<Pin> {
-        carried.clear();
-        self.sessions.read(session, carried)
-    }
-
-    /// How many keys have a request in flight: no door tells it.
-    #[cfg(test)]
-    pub(crate) fn keys_in_flight(&self) -> usize {
-        self.sessions.keys_in_flight()
-    }
-}
-
 impl SessionsStore for MemoryStore {
     fn pin(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<u64>) {
         if key == 0 {
@@ -3689,7 +3660,7 @@ struct Held {
     /// Whether the lease's sides book their keys' requests in flight
     /// ([`SessionTables`]): said once, where the lease is filed, so an end
     /// frees what the filing booked. A decision's lease counts where its
-    /// decision read the key's count ([`MemoryStore::issue_keyed`]). A
+    /// decision read the key's count. A
     /// record filed whole carries no such word and counts wherever it has
     /// a key: more than a cap reads, never less.
     keyed: bool,
@@ -3708,7 +3679,7 @@ struct FiledDecode {
     issues: u8,
     /// The index of the pick's target the prefill's dispatch took: 0, the
     /// pick's first, until that dispatch names another target the side's
-    /// pick holds ([`Self::taken_decode`]).
+    /// pick holds.
     taken: u8,
 }
 
@@ -3741,15 +3712,6 @@ impl FiledDecode {
             issues: 0,
             taken: 0,
         }
-    }
-
-    /// The decode, with its rank, of the target the prefill's dispatch
-    /// took ([`Self::taken`]): the one a decode decided again behind that
-    /// prefill starts from. Every target of a pair's pick names the one
-    /// prefill, so the index its dispatch names says which decode its
-    /// host took.
-    fn taken_decode(&self) -> Option<(WorkerId, u16)> {
-        self.side.target_at(self.taken)
     }
 }
 
@@ -4587,7 +4549,7 @@ impl MemoryStore {
     /// store's own term: the store mints its id ([`Leases::mint`]), files
     /// the record under it and books `booked`, the slot of the record's
     /// target's count as the decision's own world names it
-    /// ([`StoreSnapshot::booked`]). `Ok` is the lease as filed, with its id.
+    /// ([`StoreSnapshot::booked_of`]). `Ok` is the lease as filed, with its id.
     ///
     /// # Errors
     ///
@@ -4613,45 +4575,6 @@ impl MemoryStore {
         issued: impl Fn(&crate::tracking::Lease),
     ) -> Result<crate::tracking::Lease, LeaseRefused> {
         self.issue_minted(record, booked, None, false, issued)
-    }
-
-    /// [`Self::issue_decided`] for a decision that read its key's count
-    /// ([`Self::keyed`]): the lease books one request of its key on its
-    /// worker until it leaves the file, whatever the decision did with the
-    /// key's pin. A door asks for a keyed request whose rule has an
-    /// in-flight cap, and for no other: the lease of any other decision
-    /// books no key.
-    ///
-    /// # Errors
-    ///
-    /// Those of [`Self::issue_decided`].
-    pub(crate) fn issue_keyed(
-        &self,
-        record: LeaseRecord,
-        booked: Option<WorkerSlot>,
-        issued: impl Fn(&crate::tracking::Lease),
-    ) -> Result<crate::tracking::Lease, LeaseRefused> {
-        self.issue_minted(record, booked, None, true, issued)
-    }
-
-    /// Issues the two leases of one pair's decision under the one id the
-    /// store mints: [`Self::issue_decided`] for `record`, the prefill
-    /// part, with `side`, the decode side, laid beside it under the same
-    /// hold of the turn. `booked` holds the slots of the counts the sides
-    /// book, the prefill's first. `issued` hears the prefill and then the
-    /// decode if it was issued. `Ok` is the prefill side's lease.
-    ///
-    /// # Errors
-    ///
-    /// Those of [`Self::issue_decided`].
-    pub(crate) fn issue_decided_pair(
-        &self,
-        record: LeaseRecord,
-        side: DecodeSide,
-        [booked, decode]: [Option<WorkerSlot>; 2],
-        issued: impl Fn(&crate::tracking::Lease),
-    ) -> Result<crate::tracking::Lease, LeaseRefused> {
-        self.issue_minted(record, booked, Some((side, decode)), false, issued)
     }
 
     /// [`LeasesStore::issue_decode`] with the slot from the decision's world.
@@ -4750,23 +4673,6 @@ impl MemoryStore {
         self.turn_of(self.file_of(lease))
             .taken_back(&(gateway, lease), Some(issue))
             .is_some()
-    }
-
-    /// The pair of the lease a decode call names, where the lease still
-    /// takes a decode side: its prefill is dispatched and held and its
-    /// decode side is chosen. The prefill's worker comes first, then the
-    /// worker and the rank of the decode the lease's first decision chose
-    /// for the target the prefill's dispatch took: the pick's first
-    /// target, or the one that dispatch named. The call reads this before
-    /// it decides, and its issue tests the same again under its own turn.
-    pub(crate) fn held_pair(
-        &self,
-        gateway: GatewayId,
-        lease: LeaseId,
-    ) -> Result<(WorkerId, Option<(WorkerId, u16)>), DecodeRefused> {
-        self.turn_of(self.file_of(lease))
-            .chosen_decode(&(gateway, lease))
-            .map(|(held, decode)| (held.record.target, decode.taken_decode()))
     }
 
     /// The one issue behind the doors: a single's lease with no `pair`,

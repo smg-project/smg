@@ -120,13 +120,6 @@ impl InFlight {
         }
         self.first.1 == 0
     }
-
-    /// The workers that carry a request of the key, each with its count,
-    /// in no order.
-    fn workers(&self) -> impl Iterator<Item = (WorkerId, u32)> + '_ {
-        let first = (self.first.1 != 0).then_some(self.first);
-        first.into_iter().chain(self.rest.iter().copied())
-    }
 }
 
 /// One shard of a store's sessions' tables.
@@ -140,9 +133,7 @@ pub(super) struct Shard {
 
 /// A store's sessions' tables, in the shards of the engine's own table
 /// ([`shard_of`]): each key's pin of record and, beside it, the key's
-/// requests in flight. One lock a shard holds both, so a keyed decision
-/// reads its key's pin and its count under one hold
-/// ([`SessionTables::read`]).
+/// requests in flight. One lock a shard holds both.
 ///
 /// A lease's file writes under its own turn: the turn first, then the
 /// key's shard. A registration that takes its key's pins along renames
@@ -206,24 +197,5 @@ impl SessionTables {
         held.book(to);
         let emptied = held.free(from);
         debug_assert!(!emptied, "the request stands on the worker it moved to");
-    }
-
-    /// What a keyed decision reads of `session` under one hold of its
-    /// shard: the key's pin of record, and onto `carried` the workers that
-    /// carry its requests in flight, each with its count.
-    pub(super) fn read(&self, session: Session, carried: &mut Vec<(WorkerId, u32)>) -> Option<Pin> {
-        let key = session.get();
-        let shard = self.shard(key).lock();
-        if let Some(held) = shard.in_flight.get(&key) {
-            carried.extend(held.workers());
-        }
-        shard.pins.get(&key).copied()
-    }
-
-    /// How many keys have a request in flight: no door tells it.
-    #[cfg(test)]
-    pub(super) fn keys_in_flight(&self) -> usize {
-        let shards = self.shards.iter();
-        shards.map(|shard| shard.lock().in_flight.len()).sum()
     }
 }

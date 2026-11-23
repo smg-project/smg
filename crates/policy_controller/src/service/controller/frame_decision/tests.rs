@@ -22,7 +22,6 @@ use crate::{
         decision_engine::{Request, RequestMaker, WorkerLists},
         decision_slot::DecisionSlot,
         framework::{DecisionScope, Filter, Picker, TieBand},
-        store_backed_engine::Part,
         view::{
             AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Phase, PoolFacts,
             RequestFacts, Role, WireModes, WorkerId,
@@ -31,9 +30,12 @@ use crate::{
     policies::random::Random,
     service::{
         controller::{
-            decision_slots::tests::{
-                a_frame_under_the_second_files_watch, fleet, frame_for, holder, preset, ready,
-                taken_at, BUDGET, GATEWAY, MODEL,
+            decision_slots::{
+                tests::{
+                    a_frame_under_the_second_files_watch, fleet, frame_for, holder, preset, ready,
+                    taken_at, BUDGET, GATEWAY, MODEL,
+                },
+                Part,
             },
             frame_request::FrameRequest,
             wire::{Checked, Lists},

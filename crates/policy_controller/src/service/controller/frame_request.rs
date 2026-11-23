@@ -9,9 +9,9 @@
 //! **No seed and no block hash is made here.** A frame's routing key, its
 //! seed and the block hashes of its prompt were made once, by the gateway
 //! that asks, and the frame carries them. They are read by the one reader
-//! of a frame ([`Checked::facts`], [`Checked::constraints`]), as they are
-//! read for the engine over stored records. That reader fingerprints a
-//! tenant or a session key the frame carries in the clear, at each read.
+//! of a frame ([`Checked::facts`], [`Checked::constraints`]). That reader
+//! fingerprints a tenant or a session key the frame carries in the clear,
+//! at each read.
 //!
 //! **What a controller adds.** The block hashes are cut at the depth the
 //! deciding document reads of them. The budget is what is left of the
@@ -30,8 +30,7 @@
 //!   decision over no candidates, and the maker keeps it. Its answer is
 //!   the caller's to give before it asks the engine
 //!   (`GatewayPlaces::taken`), and the engine refuses a frame whose caller
-//!   gave none: it declines a single request, and it sheds a pair as the
-//!   engine over stored records sheds it.
+//!   gave none: it declines a single request, and it sheds a pair.
 //! - A plain request ([`RequestMaker::plain`]). Every decision of a
 //!   controller is a whole one, with the alternates its pass finds. A
 //!   gateway's dispatch names a target of the answer by its index, and a

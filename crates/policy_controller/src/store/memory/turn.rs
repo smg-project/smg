@@ -41,10 +41,8 @@
 //! job. The price is a lag on a lull: a frame handed while the file's
 //! decider waits is applied one period later at most, and another file's
 //! decision reads what its apply writes that much later: its worker's
-//! count, high for a lease that ended and low on a target a dispatch
-//! moved a lease to, and what a stage keeps of a lease's events. A
-//! session's pin of record is read by its own model's decisions alone,
-//! which the file's decider makes behind its apply. A look says whether
+//! count, high for a lease that ended and low on a target a dispatch moved
+//! a lease to, and what a stage keeps of a lease's events. A look says whether
 //! it applied a frame ([`LookOutcome`]), and its host sets the time to its next
 //! look by that: short while the file's frames flow, longer over a quiet
 //! file. A watch ends where a look finds no lease on file: the decider
@@ -76,15 +74,6 @@
 //! the ring full. So a frame of a lease on file waits one period at
 //! most, but behind a thread that left its work by an unwind or rested
 //! on its watch: what it left is the next take's.
-//!
-//! A door in process has no deciding thread
-//! ([`crate::engine::StoreBackedEngine`]): each caller is at work at its seat's
-//! file for its one decision and rests as it leaves ([`AtWork::rest`]). No
-//! caller looks at a file again, so a door's file shows no watch: what is said
-//! of a lease is applied at once where no caller decides at its file, and by
-//! the caller at work otherwise, as it leaves. A report said through the door
-//! does not wait at a full ring: the door keeps it beside the ring, and the
-//! caller at work hands it on as it leaves.
 //!
 //! The hand-over, where a file shows no watch. A frame handed while the
 //! file's decider leaves its work waits on no lull: the leaver's last
@@ -504,7 +493,7 @@ pub enum LookOutcome {
 /// keeps and takes the turn once more: what was handed behind its last
 /// take is applied before the thread waits, and the hands apply in place
 /// from there. A thread that rests behind each job never looks, and
-/// keeps no watch: a caller of a door in process.
+/// keeps no watch.
 pub struct AtWork {
     store: Arc<MemoryStore>,
     file: usize,
@@ -1045,10 +1034,7 @@ impl MemoryStore {
     }
 
     /// Hands the file a lease's id names what a frame said of `lease`: a
-    /// session's own hand. A host in process says the same through its
-    /// door
-    /// ([`StoreBackedEngine::report`](crate::engine::store_backed_engine::StoreBackedEngine::report)),
-    /// which a full ring does not hold. The frame is written into the file's
+    /// session's own hand. The frame is written into the file's
     /// ring. Where the file's decider keeps its watch the hand leaves it there:
     /// the decider applies it at its next take, one period of its host away at
     /// most. The word is read with no fence behind the ring's write, so a hand
@@ -1111,21 +1097,9 @@ impl MemoryStore {
         }
     }
 
-    /// One look of [`Self::hand`] at the file at `at`, the one `lease`
-    /// names ([`Self::file_of`]), for a caller that must not be held:
-    /// `false` where the file's ring is full and a thread at work there
-    /// has not applied yet. Nothing was written then: the caller keeps
-    /// what was said, and hands it again in the order said.
-    ///
-    /// Always inlined: the served hand is this look in a loop, and the
-    /// door's two callers would otherwise move it out of line under it.
-    #[inline(always)]
-    pub(crate) fn try_hand(&self, at: usize, hand: &Hand, lease: LeaseId, said: Said) -> bool {
-        self.try_hand_word(at, hand, lease, Word::Said(said))
-    }
-
-    /// [`Self::try_hand`] for either word of the ring, inlined with it: a
-    /// frame's word is the one the served hand and the door write.
+    /// Writes a word of `lease` into the file's ring and marks the hand.
+    /// `false` where the ring is full and stays so: a thread at work at the
+    /// file keeps what its ring holds.
     #[inline(always)]
     fn try_hand_word(&self, at: usize, hand: &Hand, lease: LeaseId, word: Word) -> bool {
         let file = &self.files[at];

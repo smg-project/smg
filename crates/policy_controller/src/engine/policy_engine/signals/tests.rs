@@ -468,8 +468,7 @@ fn each_workers_stated_value_is_read_at_its_place_in_the_list() {
 /// caller's own positions, and the engine reads the snapshot its decision
 /// holds. Here the caller's cells hold a value at every place. The stage
 /// reads the one value the snapshot states, and under no snapshot it reads
-/// no value at all. The store-backed engine holds the same rule in
-/// `the_door_reads_none_of_the_cells_a_caller_hands_on_the_request`.
+/// no value at all.
 #[test]
 fn cells_a_caller_put_on_the_request_are_not_read() {
     let built = built(&reads("", "best"));

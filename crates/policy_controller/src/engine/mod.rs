@@ -32,7 +32,6 @@ pub(crate) mod prompt_hashes;
 pub(crate) mod records;
 pub(crate) mod shadow;
 pub(crate) mod sticky_sessions;
-pub(crate) mod store_backed_engine;
 pub(crate) mod view;
 pub(crate) mod warm_up;
 
@@ -85,7 +84,6 @@ pub use sticky_sessions::{
     DecodeVerdict, SessionExpiry, SessionPins, SessionRule, SessionTable, SessionVerdict,
     ABSENT_WORKER_PIN_TTL_MICROS,
 };
-pub use store_backed_engine::StoreBackedEngine;
 pub use view::{
     fingerprint, key_of_session, permille, AffinityFacts, AffinityHolder, AffinityRows, Candidate,
     Constraints, Engines, FixedFacts, HashKind, Header, Health, Identity, KeyedRow, LoadRow,

@@ -4893,6 +4893,13 @@ impl Engine {
         self.seat_flags & KEEPS_SLOT_STATE != 0
     }
 
+    #[cfg_attr(
+        not(any(feature = "in-process", test)),
+        expect(
+            dead_code,
+            reason = "the one reader is the engine over worker lists, built under `in-process`"
+        )
+    )]
     pub(crate) fn seat_flags(&self) -> u8 {
         self.seat_flags
     }
@@ -4972,16 +4979,6 @@ impl Engine {
             .copied()
             .unwrap_or_default()
             .or(self.shadow_needs(binding, Phase::Decode))
-    }
-
-    /// The needs of the encode profile of `model`'s pair binding
-    /// ([`Self::pair_binding`]), nothing where the pair has none.
-    pub(crate) fn pair_encode_needs(&self, model: &str) -> Needs {
-        self.pair_binding(model)
-            .and_then(|b| profile_index(b, Phase::Encode))
-            .and_then(|i| self.profile_needs.get(usize::from(i)))
-            .copied()
-            .unwrap_or_default()
     }
 
     /// The pair binding of `model`: the binding its prefill lookup resolves
@@ -5329,6 +5326,13 @@ impl Engine {
     /// function reads nothing of the request's key. The profile's own part
     /// is said once at the build ([`Profile::asked_by_row`]). `None` too
     /// where no binding matches.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "No host asks a holder's test before it names the holder yet."
+        )
+    )]
     pub(crate) fn keeps_for<'a>(
         &'a self,
         model: &str,

@@ -698,10 +698,24 @@ pub(crate) const WIRES: &str = "wires";
 
 /// The stage a decision is shed under when its gateway hints a subset of 0
 /// of a pool that has rows: a decision over no candidates, as it asked.
+#[cfg_attr(
+    not(feature = "in-process"),
+    expect(
+        dead_code,
+        reason = "the deciders that shed under it are built under `in-process`"
+    )
+)]
 pub(crate) const SUBSET_HINT: &str = "subset-hint";
 
 /// A shed the deciders say in the engine's place, in the shape of the
 /// engine's own.
+#[cfg_attr(
+    not(feature = "in-process"),
+    expect(
+        dead_code,
+        reason = "the deciders that say it are built under `in-process`"
+    )
+)]
 pub(crate) fn shed(
     reason: ShedReason,
     emptied_by: &'static str,

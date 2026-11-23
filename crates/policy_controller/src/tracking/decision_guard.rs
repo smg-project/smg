@@ -938,7 +938,6 @@ impl<D: Deref<Target: DecisionEngine>> fmt::Debug for DecisionGuard<D> {
 #[cfg(feature = "in-process")]
 mod tests {
     use std::{
-        error::Error,
         sync::{Arc, Barrier},
         thread,
         time::{Duration, Instant},
@@ -955,16 +954,15 @@ mod tests {
         engine::{
             decision::{Decision, Target, Targets},
             decision_engine::{Request, RequestMaker, WorkerLists},
-            framework::{EncodeItems, EncodePlaced, Picker, TieBand},
+            framework::{Picker, TieBand},
             list_cell::tests::PublishedList,
             policy_engine::PolicyEngine,
-            store_backed_engine::tests::{pair_counts, pair_request, push_fleet, GATEWAY},
-            view::{Candidate, Constraints, Identity, RequestFacts, WorkerId},
+            view::{Candidate, Constraints, RequestFacts, WorkerId},
         },
         policies::random::Random,
         stages::{lifecycle::Lifecycle, registry::StageRegistry},
-        store::{GatewayId, LeaseState, LeasesStore, MemoryStore},
-        tracking::lease::{EventSet, Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+        store::GatewayId,
+        tracking::lease::{EventSet, Lease, Outcome, ReleaseReason, Side, TransportClass},
     };
 
     /// The model of the list's workers.
@@ -1468,53 +1466,6 @@ mod tests {
     }
 
     mod pairs;
-
-    fn states(store: &MemoryStore, lease: LeaseId) -> Option<[LeaseState; 2]> {
-        let filed = store.sides(GATEWAY, lease)?;
-        Some([filed.record.state, filed.decode?.state])
-    }
-
-    #[test]
-    fn a_handle_of_an_encode_pair_holds_the_pairs_two_sides() -> Result<(), Box<dyn Error>> {
-        let (door, encoder) = push_fleet()?;
-        let store = door.store();
-        let now = Instant::now();
-        let items = EncodeItems {
-            keys: &[Identity::hashed(11)],
-            ..EncodeItems::default()
-        };
-        let mut placed = EncodePlaced::new();
-        let mut handle = DecisionGuard::decide_encode_pair(
-            &door,
-            GATEWAY,
-            &pair_request(b"pair"),
-            items,
-            &mut placed,
-            now,
-        )
-        .expect("a decision");
-        let lease = handle.lease().expect("the prefill's lease");
-        let id = lease.lease.id;
-        assert_eq!(lease.lease.side, Side::Prefill);
-        let target = handle.take(0).expect("the first pair");
-        let decode = target.pair.expect("the decode's target");
-        assert_eq!(placed.encoders().len(), 1);
-        assert_eq!(
-            placed.encoders().first().map(|target| target.id),
-            Some(encoder)
-        );
-        assert_eq!(states(store, id), Some([LeaseState::ISSUED; 2]));
-        handle.dispatched_decode(now);
-        assert_eq!(
-            states(store, id),
-            Some([LeaseState::ISSUED, LeaseState::Dispatched { at: now }])
-        );
-        drop(handle);
-        assert!(store.sides(GATEWAY, id).is_none());
-        assert_eq!(pair_counts(store, [target.id, decode.decode_id]), [0, 0]);
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
-        Ok(())
-    }
 
     /// A single's handle holds no decode side: a decode's take, dispatch
     /// and release say nothing. Its lease ends under any side its host

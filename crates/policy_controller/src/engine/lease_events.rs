@@ -116,8 +116,7 @@ pub(crate) fn decode_as_issued(prefill: &Lease, first: &Target, session: Session
     })
 }
 
-/// Tells the stages what was `said` of a pair's lease, a side at a time, as
-/// the engine over a store tells it off its file.
+/// Tells the stages what was `said` of a pair's lease, a side at a time.
 ///
 /// - A dispatch is told on the side it names: the send counts, the session
 ///   table, then the stages. The lease told is the side's as issued, under

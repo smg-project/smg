@@ -20,6 +20,7 @@
 use std::sync::atomic::Ordering;
 
 use super::{
+    decision_slots::{DecisionCall, Part},
     frame_request::FrameRequest,
     gateway_places::{Asking, GatewayPlaces, Taken},
     wire::{Checked, Lists},
@@ -29,8 +30,6 @@ use crate::{
         decision::{shed, Decision, ShedReason},
         decision_engine::{DecisionRefused, WorkerLists},
         shadow::Shadowed,
-        sticky_sessions::SessionVerdict,
-        store_backed_engine::{DecisionCall, Part},
         view::{fingerprint, Phase, Role, Session},
     },
     stages::lifecycle::Lifecycle,
@@ -161,13 +160,6 @@ pub(crate) fn decide(
 /// the store's hold of the file's turn. `None` for a shed, which files
 /// none.
 ///
-/// A pick a sessions rule governed, by its own verdict, carries that
-/// rule's TTL on its record: the rule of the binding that decided, under
-/// which the live profile and a shadow are decided alike. A pick no rule
-/// governed carries none. Where the engine's table says nothing of the
-/// key at the lease's dispatch, as behind an apply, the pin of record
-/// that dispatch writes ends by it.
-///
 /// The binding's shadow is counted behind a filing that stands, and behind
 /// a shed all the same. A filing the store refuses counts none.
 ///
@@ -195,14 +187,6 @@ pub(crate) fn issue(
         return Ok(None);
     };
     let stages = front.spec().engine();
-    // The TTL of the sessions rule that governed the pick: the binding
-    // that decided states it, in the document the pick was made under.
-    let governed = pick.session_verdict != SessionVerdict::None;
-    let binding = governed.then(|| stages.binding(taken.request.model(), Phase::Single));
-    let rule = binding
-        .flatten()
-        .and_then(|binding| binding.sessions.as_ref());
-    let ttl_micros = rule.and_then(|rule| rule.ttl_micros);
     let lease = Lease {
         id: LeaseId::default(),
         kind: LeaseKind::Credit,
@@ -226,7 +210,7 @@ pub(crate) fn issue(
         term,
         issued_at: taken.now,
         dispatch_deadline: taken.due(),
-        state: LeaseState::issued(ttl_micros),
+        state: LeaseState::ISSUED,
     };
     let told = |lease: &Lease| stages.on_decision_issued(lease, decision);
     // The slot of the pick's count, as the decision's world names it. A

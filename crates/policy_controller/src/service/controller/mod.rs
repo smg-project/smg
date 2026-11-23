@@ -51,6 +51,7 @@ mod gateways;
 mod generations;
 #[cfg(test)]
 mod kv_feed;
+mod lease_words;
 mod lifecycle;
 mod membership;
 pub mod metrics;
@@ -1362,7 +1363,7 @@ mod tests {
 
     use super::{
         config::tests::valid,
-        decision_slots::tests as bed,
+        decision_slots::{tests as bed, TERM_MARK},
         election::{self, ElectionObservation},
         following,
         membership::tests::Logged,
@@ -1373,7 +1374,6 @@ mod tests {
         Error, NoFollow, Scope,
     };
     use crate::{
-        engine::store_backed_engine::TERM_MARK,
         load::ingest::{
             loads::{LoadProbe, ReadError},
             probe::unbuildable,

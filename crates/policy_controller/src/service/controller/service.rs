@@ -1149,12 +1149,11 @@ mod tests {
 
     use super::{unanswered, Call, RpcStatus, Service, Shared};
     use crate::{
-        engine::store_backed_engine::TERM_MARK,
         service::{
             controller,
             controller::{
                 config::Scope,
-                decision_slots::{tests as bed, Job},
+                decision_slots::{tests as bed, Job, TERM_MARK},
                 election::{self, ElectionObservation, LeasePlace},
                 gateways::tests::PATIENT,
                 generations::{tests::LEAST_LOAD, Format, Unanswered},

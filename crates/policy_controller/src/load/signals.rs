@@ -17,8 +17,8 @@
 //! through the request's facts
 //! ([`RequestFacts::signal_cells`](crate::engine::RequestFacts::signal_cells)),
 //! under a profile whose stages read a signal and under no other. The
-//! store-backed engine fills them from its store. The engine over worker
-//! lists makes them itself, from the load reports its decision holds.
+//! engine over worker lists makes them itself, from the load reports its
+//! decision holds.
 
 use crate::{
     document::spec::{AcrossRanks, COST_PARAMETER_LIMIT, MAX_SIGNALS},

@@ -33,9 +33,7 @@ mod tests {
     //! What the gateway's own routing answers here: it states no budget for
     //! a selection and has no stage that reads one, so it passes no request
     //! by for want of time (`model_gateway/src/policies/mod.rs:486`, the
-    //! facts a selection carries). The engine over stored records shows a
-    //! stage the widest value for a request in process that states none
-    //! (`engine/store_backed_engine.rs`, where it takes a request up).
+    //! facts a selection carries).
 
     use std::{sync::Arc, time::Instant};
 

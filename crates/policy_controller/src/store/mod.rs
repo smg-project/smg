@@ -100,6 +100,7 @@ pub use leases::{
     DecodeMark, DecodeSide, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, PickRecord, Sides,
 };
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake};
+#[cfg(feature = "controller")]
 pub(crate) use memory::DecodeIssue;
 pub use memory::{AtWork, Hand, LookOutcome, MemoryStore, StoreCheckpoint, StoreStats};
 pub use reservations::{ReservationKind, ReservationStore};
