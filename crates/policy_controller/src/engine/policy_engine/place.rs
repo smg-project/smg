@@ -314,6 +314,12 @@ pub struct PlaceRequest<'a> {
     /// holds for every request of a route belongs to the list its caller
     /// hands.
     ///
+    /// Where a pair's decode is decided again on its decode side
+    /// ([`PlacementSide::decode_again`](crate::tracking::PlacementSide::decode_again)),
+    /// the rule is asked under the lock the pair's two sides share. It
+    /// must leave both sides alone: the send or the drop of one, from
+    /// inside the rule, waits on that lock and never returns.
+    ///
     /// For an encode request the rule is its pair's: it is asked of the
     /// pair's two workers and of no encoder.
     pub admits: Option<WorkerRule<'a>>,

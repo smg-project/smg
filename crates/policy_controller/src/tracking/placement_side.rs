@@ -15,8 +15,13 @@
 //!
 //! **A pair's two sides** share the pair's one placement behind a lock.
 //! The lock is one request's own: its two sides alone take it, each for
-//! the time of one word, and no other request ever waits on it. A single
-//! request's side owns its placement and takes no lock.
+//! the time of one call or of its drop, and no other request ever waits
+//! on it. The decode side holds it through its second decision
+//! ([`PlacementSide::decode_again`]), so a route's rule for that decision
+//! ([`PlaceRequest::admits`]) is asked under it. Such a rule must leave
+//! the pair's sides alone: the send or the drop of one, from inside the
+//! rule, would wait on the lock the rule is asked under and never
+//! return. A single request's side owns its placement and takes no lock.
 //!
 //! **The order of a pair's words** is kept here, in whatever order its
 //! host lets the two sides go. A decode that still stands chosen leaves
@@ -104,21 +109,22 @@ impl Placement<'static> {
     /// The placement as the sides its host sends, each an owned value to
     /// keep with that side's send: the side of [`Placement::worker`], which
     /// is a single request's one side or a pair's prefill, and a pair's
-    /// decode side. A placement is a pair's where its lease is a pair's,
-    /// and one that holds no lease where it names a decode worker.
+    /// decode side. A placement is a pair's where its lease is a pair's: a
+    /// pair always holds one.
     ///
     /// Its host reads the placement's workers before this call and leaves
-    /// them in place: a side names none. A debug build stops on a pair's
-    /// placement whose decode worker was taken out.
+    /// them as placed: a side names none. A debug build stops on a pair's
+    /// placement whose decode worker was taken out, and on any other that
+    /// a decode worker was written into.
     #[must_use]
     pub fn sides(self) -> (PlacementSide, Option<PlacementSide>) {
         let profile = self.profile;
-        let names_decode = self.decode.is_some();
         let lease = self.held.as_ref();
-        let pair = lease.map_or(names_decode, |held| held.target().pair.is_some());
+        let pair = lease.is_some_and(|held| held.target().pair.is_some());
         debug_assert_eq!(
-            pair, names_decode,
-            "a pair's placement names its decode worker: its host leaves it in place"
+            pair,
+            self.decode.is_some(),
+            "a placement names a decode worker where it is a pair's, and nowhere else"
         );
         if !pair {
             let whole = PlacementSide {
@@ -180,7 +186,9 @@ impl PlacementSide {
     /// decode there, and says this side's [`Self::sent`] at that send.
     ///
     /// `request` states the request again, as [`Placement::decode_again`]
-    /// reads it.
+    /// reads it. Its rule ([`PlaceRequest::admits`]) is asked under the
+    /// pair's lock and must leave the pair's sides alone (the module's
+    /// words on the lock).
     ///
     /// **The order.** The call is made once the prefill side's send was
     /// said. Its host may let the prefill side go before the call or
@@ -206,11 +214,19 @@ impl PlacementSide {
         };
         let mut pair = pair.lock();
         pair.placement.decode_again(request)?;
+        // The call wrote the decode it took. It is read ahead of the held
+        // end: had the call written none, it took no decode, and that end
+        // still waits.
+        let decode = pair.placement.decode.clone();
+        debug_assert!(
+            decode.is_some(),
+            "a decode decided again is written into its placement"
+        );
+        let decode = decode.ok_or(Unplaced::NoWorkers)?;
         // The decode no longer stands chosen: a prefill's end that waited
         // for this side's word is said behind the decode the call took.
         pair.end_held_prefill();
-        // The call wrote the decode it took.
-        pair.placement.decode.clone().ok_or(Unplaced::NoWorkers)
+        Ok(decode)
     }
 }
 
@@ -409,6 +425,18 @@ mod tests {
             .kept()
     }
 
+    /// A ready worker of `worker_type` at an address of `name`.
+    fn worker(name: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
+        let worker = <BasicWorkerBuilder>::from_spec(WorkerSpec {
+            worker_type,
+            ..WorkerSpec::new(format!("grpc://{name}:9000"))
+        })
+        .health_config(no_health_check())
+        .build();
+        worker.set_status(WorkerStatus::Ready);
+        Arc::new(worker)
+    }
+
     /// A host: its engine for the life of the process, under a document
     /// whose `profile` picks through [`Hears`], the words that stage heard,
     /// and one prefill and one decode worker, each one's list published
@@ -433,16 +461,6 @@ mod tests {
             let spec = AppliedSpec::validate_in(&document, &stages, &[]);
             let engine = PolicyEngine::new(spec.expect("the stages hold the picker"));
             let engine: &'static PolicyEngine = Box::leak(Box::new(engine));
-            let worker = |name: &str, worker_type| -> Arc<dyn Worker> {
-                let worker = <BasicWorkerBuilder>::from_spec(WorkerSpec {
-                    worker_type,
-                    ..WorkerSpec::new(format!("grpc://{name}:9000"))
-                })
-                .health_config(no_health_check())
-                .build();
-                worker.set_status(WorkerStatus::Ready);
-                Arc::new(worker)
-            };
             let workers = [
                 worker("prefill", WorkerType::Prefill),
                 worker("decode", WorkerType::Decode),
@@ -768,6 +786,32 @@ mod tests {
         assert_eq!(host.words(), [("ended", D)]);
     }
 
+    /// The side answers the decode its second decision took, and not the
+    /// one that stood chosen: by that call the host's decode list holds
+    /// another worker alone.
+    #[test]
+    fn a_decode_side_answers_the_decode_its_second_decision_took() {
+        let host = Host::of_later_pairs();
+        let classes = PartnerClasses::number(1, [&[0_u32][..]]);
+        let request = later(host.lists(&classes));
+        let (mut prefill, mut decode) = sides_of(&host, &request);
+        prefill.sent();
+        assert_eq!(host.words(), [("issued", P), ("sent", P)]);
+
+        let other = worker("decode-b", WorkerType::Decode);
+        let moved = PublishedList::new(Arc::from([Arc::clone(&other)]));
+        let WorkerLists::Pair(lists) = host.lists(&classes) else {
+            panic!("a pair's lists");
+        };
+        let lists = PairLists {
+            decode: moved.lent(),
+            ..lists
+        };
+        let taken = decode.decode_again(&later(WorkerLists::Pair(lists)));
+        assert_eq!(taken.expect("a decode").url(), other.url());
+        assert_eq!(host.words(), [("issued", D)]);
+    }
+
     /// A side that is not a pair's decode side is refused its second ask
     /// by one name, with no decision made and nothing said: a pair's
     /// prefill side, and a single request's one side.
@@ -860,13 +904,42 @@ mod tests {
     /// the placement names no decode.
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "its host leaves it in place")]
+    #[should_panic(expected = "names a decode worker where it is a pair's, and nowhere else")]
     fn a_pairs_placement_with_its_decode_taken_out_stops_a_debug_build() {
         let host = Host::of_pairs();
         let classes = PartnerClasses::number(1, [&[0_u32][..]]);
         let lists = host.lists(&classes);
         let mut placement = placed(host.engine, &host.workers, lists, false);
         drop(placement.decode.take());
+        drop(placement.sides());
+    }
+
+    /// A single request's placement that its host wrote a decode worker
+    /// into stops a debug build under the same words: its lease is no
+    /// pair's.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "names a decode worker where it is a pair's, and nowhere else")]
+    fn a_single_requests_placement_with_a_decode_written_in_stops_a_debug_build() {
+        let host = Host::of_singles();
+        let lists = WorkerLists::Single(host.lists[0].lent());
+        let mut placement = placed(host.engine, &host.workers, lists, false);
+        placement.decode = Some(Arc::clone(&host.workers[1]));
+        drop(placement.sides());
+    }
+
+    /// A placement that holds no lease is no pair's, whatever its host
+    /// wrote into it: one with a decode worker stops a debug build under
+    /// the same words. The engine makes no such placement: a pair always
+    /// holds a lease.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "names a decode worker where it is a pair's, and nowhere else")]
+    fn a_placement_that_holds_no_lease_with_a_decode_written_in_stops_a_debug_build() {
+        let host = Host::of_pairs();
+        let [worker, decode] = &host.workers;
+        let mut placement = Placement::alone(Arc::clone(worker), "prefill");
+        placement.decode = Some(Arc::clone(decode));
         drop(placement.sides());
     }
 
