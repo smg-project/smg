@@ -15,8 +15,9 @@
 //! memset of the tags alone. The encoder builds one table at load from the
 //! vocabulary, read by a thread for a piece it has not met; each thread keeps
 //! the pieces it met in a table of its own (see `native`), which starts at
-//! [`MIN_SLOTS`] and grows as the thread meets pieces (by four up to
-//! `GROW_BY_FOUR_UP_TO` slots, by two above), up to the slots for the
+//! [`MIN_SLOTS`] and grows as the thread meets pieces (to
+//! `FIRST_GROWTH_SLOTS` at first, then by four up to `GROW_BY_FOUR_UP_TO`
+//! slots, by two above), up to the slots for the
 //! thread's share, so a thread that encodes little holds little. A thread's
 //! table grows in place: its slots are reserved up to
 //! [`THREAD_BACKING_SLOTS`] when it is made (reserved, not written: a page
@@ -53,12 +54,17 @@ pub(super) const MIN_SLOTS: usize = 64;
 /// were 97 % of a cold call's page faults under threads).
 pub(super) const THREAD_BACKING_SLOTS: usize = 16_384;
 
+/// Slots a thread's table grows to in its first step, inside its
+/// reservation: about 25 KiB written sooner, so that no step places the
+/// entries again at 192 stored pieces. A table without the reservation
+/// grows by four from the start.
+const FIRST_GROWTH_SLOTS: usize = 1_024;
 /// Slots up to which a table grows by four at a time (the entries placed
 /// again over that growth are a fourth of what doublings place); above them
 /// it doubles. Above 4,096 slots the sizes are the ones doubling gives;
-/// up to it, a table that has just grown holds up to about 5.3 slots per
-/// entry (four times the slots it had at its fill bound), at most 2,048
-/// slots, about 66 KiB, more than doubling would, per thread.
+/// up to it, a table that has just grown by four holds up to about 5.3
+/// slots per entry (four times the slots it had at its fill bound), at
+/// most 2,048 slots, about 66 KiB, more than doubling would, per thread.
 const GROW_BY_FOUR_UP_TO: usize = 4_096;
 /// The tag of an empty slot; a stored slot's tag has its high bit set.
 const EMPTY_TAG: u8 = 0;
@@ -299,7 +305,6 @@ impl ShortPieceTable {
     }
 
     /// Slots the table can grow to before it moves.
-    #[cfg(test)]
     fn backing(&self) -> usize {
         self.entries.capacity()
     }
@@ -480,7 +485,7 @@ impl ShortPieceTable {
 
     /// Stores `ids` as the piece's encoding and answers true. A table at its
     /// fill bound with fewer slots than `bound` entries take grows first
-    /// (by four while small, by two above `GROW_BY_FOUR_UP_TO` slots, up to
+    /// (in the steps of `grow`: more than doubling while small, up to
     /// the slots for `bound`; every stored entry placed again, the spill
     /// stays), so a table starts small and grows with use; at the bound it
     /// refuses, as it does ids that are not 1..=15 in number, and
@@ -569,15 +574,18 @@ impl ShortPieceTable {
         self.len += 1;
     }
 
-    /// Grows the slots (by four up to `GROW_BY_FOUR_UP_TO`, by two above, to
-    /// `most` at the most) in place: the table extends into its reservation
+    /// Grows the slots (in the first step to `FIRST_GROWTH_SLOTS` where the
+    /// table reserved them, else by four up to `GROW_BY_FOUR_UP_TO`, by two
+    /// above; to `most` at the most) in place, into the table's reservation
     /// (past the reservation it moves, as a `Vec` does) and every stored
     /// entry is placed again where it stands ([`Self::place_again`]). A tag
     /// does not depend on the slot count, so the tags move with their
     /// entries.
     fn grow(&mut self, most: usize) {
         let old = self.entries.len();
-        let slots = if old < GROW_BY_FOUR_UP_TO {
+        let slots = if old == MIN_SLOTS && self.backing() >= FIRST_GROWTH_SLOTS {
+            FIRST_GROWTH_SLOTS
+        } else if old < GROW_BY_FOUR_UP_TO {
             old * 4
         } else {
             old * 2
@@ -863,14 +871,14 @@ mod tests {
         assert_eq!(table.len(), 1);
     }
 
-    /// A thread's table: the fewest slots at first, grown at the fill bound
+    /// A table: the fewest slots at first, grown at the fill bound
     /// while `bound` entries take more slots (by four while small, by two
     /// above `GROW_BY_FOUR_UP_TO`), every piece kept across the growths (the
     /// spilled ones too), and at the slots for `bound` the fill bound refuses
     /// and a probe still ends.
     #[test]
     fn a_table_starts_small_grows_by_four_then_doubles_and_refuses_at_its_bound() {
-        let mut table = ShortPieceTable::new();
+        let mut table = ShortPieceTable::for_entries(0);
         let bound = 1000;
         let fifteen: Vec<u32> = (100..115).collect();
         assert!(table.insert(key(&[0x80; 15]), &fifteen, bound));
@@ -976,7 +984,7 @@ mod tests {
 
     #[test]
     fn a_vacancy_taken_at_the_fill_bound_inserts_by_probing_and_the_table_grows() {
-        let mut table = ShortPieceTable::new();
+        let mut table = ShortPieceTable::for_entries(0);
         let bound = 1000;
         let mut stored: usize = 0;
         while table.len() < table.fill_bound() {
@@ -1121,7 +1129,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(sizes, [64, 256, 1024, 4096, 8192, 16_384, 32_768]);
+        assert_eq!(sizes, [64, 1024, 4096, 8192, 16_384, 32_768]);
         assert!(table.backing() >= 32_768);
         assert_eq!(table.len(), stored);
         table.clear(100);
@@ -1133,34 +1141,45 @@ mod tests {
         assert_eq!(table.slots(), ShortPieceTable::slots_for(100));
     }
 
-    /// A run that wrapped around the old slots' end is placed again whole:
-    /// for homes that stay behind that end, for homes at the grown table's
-    /// end, where the run wraps again, and for a run that mixes the two,
-    /// the one a walk from the first slot loses entries of.
+    /// A run that wrapped around the old slots' end is placed again whole,
+    /// in a step by four and in a thread table's first step: for homes that
+    /// stay behind that end, for homes at the grown table's end, where the
+    /// run wraps again, and for a run that mixes the two, the one a walk
+    /// from the first slot loses entries of.
     #[test]
     fn a_run_wrapped_around_the_old_end_reads_back_after_growth() {
-        let grown = ShortPieceTable::for_entries(100);
-        assert_eq!(grown.slots(), 256);
-        let slot_of = |i: u32| grown.first_slot(key(&i.to_le_bytes())).0;
-        for homes in [&[62, 63][..], &[254, 255], &[62, 63, 254, 255]] {
-            let wrapped: Vec<u32> = (0..4000)
+        for (slots, homes) in [
+            (256, &[62, 63][..]),
+            (256, &[254, 255]),
+            (256, &[62, 63, 254, 255]),
+            (FIRST_GROWTH_SLOTS, &[62, 63]),
+            (FIRST_GROWTH_SLOTS, &[1022, 1023]),
+            (FIRST_GROWTH_SLOTS, &[62, 63, 1022, 1023]),
+        ] {
+            let grown = ShortPieceTable::with_slots(slots, slots);
+            let slot_of = |i: u32| grown.first_slot(key(&i.to_le_bytes())).0;
+            let wrapped: Vec<u32> = (0..40_000)
                 .filter(|&i| homes.contains(&slot_of(i)))
                 .take(6)
                 .collect();
             assert_eq!(wrapped.len(), 6);
-            let mut table = ShortPieceTable::new();
+            let mut table = if slots == FIRST_GROWTH_SLOTS {
+                ShortPieceTable::new()
+            } else {
+                ShortPieceTable::for_entries(0)
+            };
             for &i in &wrapped {
                 assert!(table.insert(key(&i.to_le_bytes()), &[i], 1000));
             }
             assert_ne!(table.tags[3], EMPTY_TAG, "the run wrapped to the start");
             let mut stored = wrapped.clone();
-            let mut rest = (0..4000).filter(|&i| slot_of(i) % MIN_SLOTS < 62);
+            let mut rest = (0..40_000).filter(|&i| slot_of(i) % MIN_SLOTS < 62);
             while table.slots() == MIN_SLOTS {
                 let i = rest.next().expect("pieces enough to grow the table");
                 assert!(table.insert(key(&i.to_le_bytes()), &[i], 1000));
                 stored.push(i);
             }
-            assert_eq!(table.slots(), 256);
+            assert_eq!(table.slots(), slots);
             for &i in &stored {
                 assert_eq!(ids_of(&table, &i.to_le_bytes()), Some(vec![i]), "{i}");
             }

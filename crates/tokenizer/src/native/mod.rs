@@ -254,7 +254,8 @@ const FULL_SHARE_PACKED: usize = ShortPieceTable::slots_for(PIECE_CACHE_CAPACITY
 /// stay under, three quarters of them in packed slots, the table's
 /// included, and a quarter in the maps and the wide tables. A thread's packed
 /// table starts
-/// at 64 slots (2 KiB) and grows as the thread meets pieces (by four up to
+/// at 64 slots (2 KiB) and grows as the thread meets pieces (to 1,024 slots
+/// in its first step, then by four up to
 /// 4,096 slots, by two above), up to the slots for its cap, and is cut back to
 /// the slots of a smaller cap when it is cleared (made anew only past its
 /// reservation), so a thread that encodes little holds little and the packed
