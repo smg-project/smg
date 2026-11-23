@@ -1502,7 +1502,10 @@ pub struct ResilienceUpdate {
     pub cb_timeout_secs: Option<u64>,
     /// Time window in seconds for failure counting.
     pub cb_window_secs: Option<u64>,
-    /// Disable circuit breaker entirely for this worker.
+    /// `true` gives this worker the failure threshold `u32::MAX`, as the
+    /// router's `--disable-circuit-breaker` gives every worker, and wins over
+    /// `cb_failure_threshold`. `false` under the router's flag gives a
+    /// working breaker only together with `cb_failure_threshold`.
     pub disable_circuit_breaker: Option<bool>,
 
     // ── Retryable status codes ──
