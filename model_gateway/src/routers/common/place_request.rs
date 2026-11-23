@@ -3,8 +3,9 @@
 //! The placement functions take one [`PlacementInputs`] from their route:
 //! what a classic policy reads of a request. Where the engine decides, they
 //! ask it with a [`PlaceRequest`] instead. This file fills that request from
-//! the same inputs, each under the name the engine reads it by. A route
-//! hands nothing more than it hands classic placement.
+//! the same inputs, each under the name the engine reads it by, and from
+//! what the route states for the engine alone ([`Stated`]), which a classic
+//! placement is handed nothing of.
 
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use smg_policy_controller::engine::{
 };
 use smg_worker::identity::basic::Worker;
 
-use super::placement::{was_tried, PlacementInputs};
+use super::placement::{was_tried, PlacementInputs, Stated};
 use crate::policies::CacheNamespace;
 
 /// The workers at the engines a request's failed attempts were sent to,
@@ -43,9 +44,9 @@ pub(crate) fn tried_ids(workers: &[Arc<dyn Worker>], tried: &[String], ids: &mut
     );
 }
 
-/// The request `inputs` state for `model_id` over `lists`, as the engine
-/// reads it. `tried` are the workers at the engines the request's failed
-/// attempts were sent to ([`tried_ids`]).
+/// The request `inputs` and `stated` state for `model_id` over `lists`, as
+/// the engine reads it. `tried` are the workers at the engines the
+/// request's failed attempts were sent to ([`tried_ids`]).
 ///
 /// - The prompt's text and token ids, and the two seeds of its cache
 ///   partition. The engine hashes the prompt under them, where a classic
@@ -66,15 +67,19 @@ pub(crate) fn tried_ids(workers: &[Arc<dyn Worker>], tried: &[String], ids: &mut
 ///   an engine of its own, and less where an engine was tried twice. A
 ///   pair's failed attempt can name two engines, so a pair's caller states
 ///   the number over this request's.
+/// - The most tokens the answer may hold, as the route states the body's
+///   limit for the engine alone ([`Stated::max_output_tokens`]). Zero
+///   states none: a body with no limit, a route that parsed no body.
 ///
-/// The inputs hold no tenant, priority, output bound, media count, demand
-/// or budget, so the request states none.
+/// Neither the inputs nor what a route states hold a tenant, a priority, a
+/// media count, a demand or a budget, so the request states none.
 #[must_use]
 pub(crate) fn place_request<'a>(
     model_id: &'a str,
     lists: WorkerLists<'a>,
     inputs: PlacementInputs<'a>,
     tried: &'a [WorkerId],
+    stated: Stated,
 ) -> PlaceRequest<'a> {
     let headers: &'a dyn HeaderRead = match inputs.headers {
         Some(headers) => headers,
@@ -96,6 +101,7 @@ pub(crate) fn place_request<'a>(
         admits: inputs
             .candidate_filter
             .map(|rule| -> WorkerRule<'a> { rule }),
+        max_output_tokens: stated.max_output_tokens,
         ..PlaceRequest::of(model_id, lists)
     }
 }
@@ -130,8 +136,9 @@ mod tests {
     }
 
     /// Each input a placement function takes reaches the engine under the
-    /// field that names it, over the list its caller hands, and the request
-    /// states nothing else.
+    /// field that names it, over the list its caller hands, with the output
+    /// limit its route states for the engine alone, and the request states
+    /// nothing else.
     #[test]
     fn a_request_states_what_its_placement_inputs_hold() {
         let tokens = [7_u32, 8, 9];
@@ -164,7 +171,10 @@ mod tests {
             candidate_filter: Some(&filter),
             tried: &engines,
         };
-        let request = place_request(MODEL, WorkerLists::Single(lent), inputs, &ids);
+        let stated = Stated {
+            max_output_tokens: 256,
+        };
+        let request = place_request(MODEL, WorkerLists::Single(lent), inputs, &ids, stated);
 
         assert_eq!(request.model, MODEL);
         assert!(
@@ -195,9 +205,13 @@ mod tests {
         let admits = request.admits.expect("a rule");
         assert!(!admits(fleet[0].as_ref()) && admits(fleet[1].as_ref()));
 
-        // What the inputs do not hold is not stated.
+        // The body's output limit, as the route stated it for the engine.
+        assert_eq!(request.max_output_tokens, 256);
+
+        // What neither the inputs nor the route's statement hold is not
+        // stated.
         assert!(request.tenant.is_none() && request.priority == 0 && !request.streaming);
-        assert_eq!((request.max_output_tokens, request.budget_micros), (0, 0));
+        assert_eq!(request.budget_micros, 0);
         assert!(request.demands.is_none() && request.encode.is_none() && !request.decode_again);
 
         // A prompt of text alone is hashed under its partition's seeds too.
@@ -205,9 +219,10 @@ mod tests {
             tokens: None,
             ..inputs
         };
-        let request = place_request(MODEL, WorkerLists::None, worded, &ids);
+        let request = place_request(MODEL, WorkerLists::None, worded, &ids, Stated::nothing());
         assert!(request.prompt.tokens.is_none());
         assert_eq!(request.prompt.seeds, seeds);
+        assert_eq!(request.max_output_tokens, 0, "a route that states no limit");
     }
 
     /// A first attempt that hands nothing states its model alone, as the
@@ -215,7 +230,13 @@ mod tests {
     /// for an id the request does not state.
     #[test]
     fn a_request_with_no_input_states_its_model_alone() {
-        let request = place_request(MODEL, WorkerLists::None, PlacementInputs::default(), &[]);
+        let request = place_request(
+            MODEL,
+            WorkerLists::None,
+            PlacementInputs::default(),
+            &[],
+            Stated::nothing(),
+        );
         assert_eq!(request.model, MODEL);
         assert!(matches!(request.lists, WorkerLists::None));
         assert!(request.prompt.tokens.is_none() && request.prompt.text.is_none());
@@ -228,7 +249,7 @@ mod tests {
             rid_key: Some("session-7"),
             ..PlacementInputs::default()
         };
-        let request = place_request(MODEL, WorkerLists::None, keyed, &[]);
+        let request = place_request(MODEL, WorkerLists::None, keyed, &[], Stated::nothing());
         assert!(request.request_id.is_none());
     }
 
@@ -242,7 +263,7 @@ mod tests {
                 tried,
                 ..PlacementInputs::default()
             };
-            place_request(MODEL, WorkerLists::None, inputs, &[]).attempt
+            place_request(MODEL, WorkerLists::None, inputs, &[], Stated::nothing()).attempt
         };
         assert_eq!(attempt(&engines[..3]), 3);
         assert_eq!(attempt(&engines[..255]), 255);

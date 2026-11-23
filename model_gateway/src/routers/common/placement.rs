@@ -134,6 +134,40 @@ pub(crate) type CandidateFilter<'a> = &'a (dyn Fn(&dyn Worker) -> bool + Sync);
 /// engine's arm alone makes it, once, and a classic pair reads nothing.
 pub(crate) type PairsAgain<'a> = &'a dyn Fn() -> Arc<PdPairIndex>;
 
+/// What a route states of its request for the policy engine alone: the
+/// facts no classic policy reads, which [`PlacementInputs`] does not hold.
+/// A route hands a placement function a call that states them. The function
+/// hands the call on unmade to the engine's arm, which stands out of line
+/// and makes it, as it reads a pair index again ([`PairsAgain`]): a classic
+/// placement reads none of it, and the call's own reads of the body are
+/// not made for one. A route's call takes what it reads by value (`move`),
+/// so that nothing of the request is kept in memory for it on the way to
+/// a classic placement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Stated {
+    /// The most tokens the request's answer may hold, as its body states
+    /// the limit: one answer's, whatever the request's count of samples or
+    /// prompts. Zero states none.
+    pub max_output_tokens: u32,
+}
+
+impl Stated {
+    /// Nothing stated: for a caller that parsed no body, and for a case.
+    #[inline]
+    pub(crate) fn nothing() -> Self {
+        Self::default()
+    }
+
+    /// The body's output limit as its reader answers it
+    /// (`GenerationRequest::max_output_tokens`), and nothing else.
+    #[inline]
+    pub(crate) fn of_limit(limit: Option<u32>) -> Self {
+        Self {
+            max_output_tokens: limit.unwrap_or(0),
+        }
+    }
+}
+
 /// Everything a single-worker placement reads from the request.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PlacementInputs<'a> {
@@ -384,9 +418,10 @@ impl From<Pair> for PlacedPair {
 impl PlacedPair {
     /// The pair the policy engine placed: each worker with its own side of
     /// the placement, both counted under the routing value the engine
-    /// names. `None` for a placement that names no decode, which the engine
-    /// answers no pair's lists with.
-    fn by_engine(placement: Placement<'_>) -> Option<Self> {
+    /// names. The decode's answer keeps what the request stated for the
+    /// engine alone: it is the one asked again. `None` for a placement
+    /// that names no decode, which the engine answers no pair's lists with.
+    fn by_engine(placement: Placement<'_>, stated: Stated) -> Option<Self> {
         let routing_key = placement.routing_key;
         let placement = placement.kept();
         let prefill = Arc::clone(&placement.worker);
@@ -394,8 +429,9 @@ impl PlacedPair {
         let runtime = prefill.metadata().spec.runtime_type;
         let (prefill_side, decode_side) = placement.sides();
         Some(Self {
-            prefill: Placed::by_side(prefill, prefill_side, routing_key),
-            decode: Placed::by_side(decode, decode_side?, routing_key),
+            // A prefill's answer is asked nothing again.
+            prefill: Placed::by_side(prefill, prefill_side, routing_key, Stated::nothing()),
+            decode: Placed::by_side(decode, decode_side?, routing_key, stated),
             runtime,
         })
     }
@@ -488,6 +524,11 @@ struct ByEngine {
     /// keeps as a fingerprint alone, a document that reads no value. The
     /// guard then counts under its route's key.
     routing_key: Option<Box<str>>,
+    /// What the request stated for the engine alone at the decision that
+    /// made this answer, kept by the answer of a pair's decode. Asked again
+    /// behind its prefill, that decode states it again from here: its
+    /// route may hold the body no more by then.
+    stated: Stated,
 }
 
 impl From<Arc<dyn Worker>> for Placed {
@@ -543,19 +584,28 @@ impl Placed {
             engine: Some(Box::new(ByEngine {
                 side: Mutex::new(side),
                 routing_key,
+                // A single worker's answer is asked nothing again.
+                stated: Stated::nothing(),
             })),
         }
     }
 
     /// The answer for one worker of a pair the policy engine placed: the
     /// worker with its own side of the pair's placement, counted under the
-    /// routing value the engine names for the pair.
-    fn by_side(worker: Arc<dyn Worker>, side: PlacementSide, routing_key: Option<&str>) -> Self {
+    /// routing value the engine names for the pair. `stated` is what the
+    /// request stated for the engine alone at that decision.
+    fn by_side(
+        worker: Arc<dyn Worker>,
+        side: PlacementSide,
+        routing_key: Option<&str>,
+        stated: Stated,
+    ) -> Self {
         Self {
             worker,
             engine: Some(Box::new(ByEngine {
                 side: Mutex::new(Some(Box::new(side))),
                 routing_key: routing_key.map(Box::from),
+                stated,
             })),
         }
     }
@@ -706,7 +756,9 @@ impl ByEngine {
     /// [`decode_again`] for a decode the policy engine placed, out of line.
     /// The engine decides the decode again on this answer's side of the
     /// pair, which is held for the time of that decision: the route's rule
-    /// is asked under it, and touches neither of the pair's answers. A side
+    /// is asked under it, and touches neither of the pair's answers. What
+    /// the request stated for the engine alone at the first decision is
+    /// stated again as this answer kept it ([`Stated`]). A side
     /// that a guard took already was sent: it is asked nothing, and the
     /// pair index is not read.
     #[inline(never)]
@@ -741,6 +793,7 @@ impl ByEngine {
             wire,
             None,
             inputs,
+            self.stated,
             |request| side.decode_again(request),
         );
         let worker = match asked {
@@ -761,7 +814,11 @@ impl ByEngine {
         drop(held);
         debug!(decode = %worker.redacted_url(), "A pair's decode moved behind its prefill");
         let guard = ahead.onto(Arc::clone(&worker));
-        let moved = Placed::by_side(worker, *side, self.routing_key.as_deref());
+        // The decode the request moved to is asked nothing again: the
+        // engine decides a pair's decode again once, so its answer keeps
+        // nothing of what the request stated.
+        let routing_key = self.routing_key.as_deref();
+        let moved = Placed::by_side(worker, *side, routing_key, Stated::nothing());
         (Some(moved), guard)
     }
 }
@@ -894,10 +951,11 @@ fn placed_by_engine(
     lent: LentList<'_>,
     ring: Option<&dyn LentRing>,
     inputs: PlacementInputs<'_>,
+    stated: Stated,
 ) -> Option<Placed> {
     let mut tried = TriedIds::new();
     tried_ids(lent.workers, inputs.tried, &mut tried);
-    let mut request = place_request(model_id, WorkerLists::Single(lent), inputs, &tried);
+    let mut request = place_request(model_id, WorkerLists::Single(lent), inputs, &tried, stated);
     request.ring = ring;
     match engine.place(&request) {
         Ok(placement) => {
@@ -923,8 +981,13 @@ fn placed_by_engine(
 
 /// [`select_single`] where the gateway started the policy engine, out of
 /// line: the engine places the request over the pool's list of the model's
-/// snapshot as it stands now.
+/// snapshot as it stands now. `stated` is the route's call, handed on
+/// unmade.
 #[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the placement's own arguments, the engine it asks and what the request states for it"
+)]
 fn single_by_engine(
     engine: &'static PolicyEngine,
     registry: &WorkerRegistry,
@@ -933,9 +996,12 @@ fn single_by_engine(
     pool: RoutingPool,
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
+    stated: impl FnOnce() -> Stated,
 ) -> Option<Placed> {
     let snapshot = registry.get_routing_snapshot(model_id);
-    single_of_by_engine(engine, policies, model_id, &snapshot, pool, wire, inputs)
+    single_of_by_engine(
+        engine, policies, model_id, &snapshot, pool, wire, inputs, stated,
+    )
 }
 
 /// [`select_single_of`] where the gateway started the policy engine, out of
@@ -945,7 +1011,12 @@ fn single_by_engine(
 /// is placed over the same list, held to the wire by the request's rule
 /// ([`WireConstraint::admits`], beside the request's own): the engine keeps
 /// a list's turn and its records with the list, so they are the pool's.
+/// The route's call that states the request ([`Stated`]) is made here.
 #[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the placement's own arguments, the engine it asks and what the request states for it"
+)]
 fn single_of_by_engine(
     engine: &'static PolicyEngine,
     policies: &PolicyRegistry,
@@ -954,12 +1025,14 @@ fn single_of_by_engine(
     pool: RoutingPool,
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
+    stated: impl FnOnce() -> Stated,
 ) -> Option<Placed> {
+    let stated = stated();
     let ring = ModelRing::of(engine, policies, model_id, snapshot);
     let ring = ring.lent();
     let lent = snapshot.lent(pool);
     if wire.is_none() {
-        return placed_by_engine(engine, policies, model_id, lent, ring, inputs);
+        return placed_by_engine(engine, policies, model_id, lent, ring, inputs, stated);
     }
     let own = inputs.candidate_filter;
     let on_wire = move |worker: &dyn Worker| {
@@ -969,7 +1042,7 @@ fn single_of_by_engine(
         candidate_filter: Some(&on_wire),
         ..inputs
     };
-    placed_by_engine(engine, policies, model_id, lent, ring, inputs)
+    placed_by_engine(engine, policies, model_id, lent, ring, inputs, stated)
 }
 
 /// [`select_from`] where the gateway started the policy engine, out of
@@ -981,8 +1054,13 @@ fn single_of_by_engine(
 /// the list, so they are the pool's. A worker that joined the pool behind
 /// the caller's read is in no slice and takes no such request, and a
 /// slice's worker object that the pool's list does not hold, as one
-/// replaced between the two reads, takes none either.
+/// replaced between the two reads, takes none either. The route's call
+/// that states the request ([`Stated`]) is made here.
 #[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the placement's own arguments, the engine it asks and what the request states for it"
+)]
 fn from_by_engine(
     engine: &'static PolicyEngine,
     registry: &WorkerRegistry,
@@ -991,7 +1069,9 @@ fn from_by_engine(
     pool: RoutingPool,
     candidates: &[Arc<dyn Worker>],
     inputs: PlacementInputs<'_>,
+    stated: impl FnOnce() -> Stated,
 ) -> Option<Placed> {
+    let stated = stated();
     let snapshot = registry.get_routing_snapshot(model_id);
     let ring = ModelRing::of(engine, policies, model_id, &snapshot);
     let ring = ring.lent();
@@ -1006,7 +1086,7 @@ fn from_by_engine(
         candidate_filter: Some(&in_slice),
         ..inputs
     };
-    placed_by_engine(engine, policies, model_id, lent, ring, inputs)
+    placed_by_engine(engine, policies, model_id, lent, ring, inputs, stated)
 }
 
 /// Pick one worker for `model_id` from `pool`, or `None` when nothing is
@@ -1019,6 +1099,12 @@ fn from_by_engine(
 /// as its own function as it did before the engine and answers the
 /// worker's handle alone. Where it started one the engine places the
 /// request, out of line.
+///
+/// `stated` states what the engine alone reads of the request
+/// ([`Stated`]). The front hands the call on unmade to the engine's arm,
+/// which stands out of line and makes it: a classic placement is handed
+/// nothing of it, and a caller that states nothing compiles to the code
+/// it had with no such argument.
 #[inline(always)]
 pub(crate) fn select_single(
     registry: &WorkerRegistry,
@@ -1027,9 +1113,12 @@ pub(crate) fn select_single(
     pool: RoutingPool,
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
+    stated: impl FnOnce() -> Stated,
 ) -> Option<Placed> {
     if let Some(engine) = policies.engine() {
-        return single_by_engine(engine, registry, policies, model_id, pool, wire, inputs);
+        return single_by_engine(
+            engine, registry, policies, model_id, pool, wire, inputs, stated,
+        );
     }
     classic_single(registry, policies, model_id, pool, wire, inputs).map(Placed::from)
 }
@@ -1056,6 +1145,10 @@ fn classic_single(
 /// selection takes no count of the list. It keeps its name on the way to
 /// the policy.
 #[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the placement's own arguments, and what the request states for the engine"
+)]
 pub(crate) fn select_single_of(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -1064,9 +1157,12 @@ pub(crate) fn select_single_of(
     pool: RoutingPool,
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
+    stated: impl FnOnce() -> Stated,
 ) -> Option<Placed> {
     if let Some(engine) = policies.engine() {
-        return single_of_by_engine(engine, policies, model_id, snapshot, pool, wire, inputs);
+        return single_of_by_engine(
+            engine, policies, model_id, snapshot, pool, wire, inputs, stated,
+        );
     }
     classic_single_of(registry, policies, model_id, snapshot, pool, wire, inputs).map(Placed::from)
 }
@@ -1116,10 +1212,11 @@ pub(crate) fn select_from(
     pool: RoutingPool,
     candidates: &[Arc<dyn Worker>],
     inputs: PlacementInputs<'_>,
+    stated: impl FnOnce() -> Stated,
 ) -> Option<Placed> {
     if let Some(engine) = policies.engine() {
         return from_by_engine(
-            engine, registry, policies, model_id, pool, candidates, inputs,
+            engine, registry, policies, model_id, pool, candidates, inputs, stated,
         );
     }
     select_among(registry, policies, model_id, candidates, None, inputs).map(Placed::from)
@@ -1882,7 +1979,16 @@ pub(super) fn was_tried(worker: &dyn Worker, tried: &[String]) -> bool {
 /// before the engine and answers the two workers' handles alone. Where it
 /// started one the engine places the pair, out of line
 /// ([`pair_by_engine`]).
+///
+/// `stated` states what the engine alone reads of the request
+/// ([`Stated`]): the call is handed on unmade to the engine's arm, which
+/// makes it. The answer of the pair's decode keeps what it stated, and the
+/// decode asked again states it again ([`decode_again`]).
 #[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pair placement's own arguments, and what the request states for the engine"
+)]
 pub(crate) fn select_pair(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -1891,6 +1997,7 @@ pub(crate) fn select_pair(
     wire: Option<WireConstraint>,
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
+    stated: impl FnOnce() -> Stated,
 ) -> Result<PlacedPair, Box<PairFailure>> {
     if let Some(engine) = policies.engine() {
         return pair_by_engine(
@@ -1902,6 +2009,7 @@ pub(crate) fn select_pair(
             wire,
             prefill_capacity,
             inputs,
+            stated,
         );
     }
     classic_pair(
@@ -2102,9 +2210,9 @@ impl PairAdmission for PairGates<'_> {
 /// first ([`pair_by_engine`]), and the decode asked again behind its
 /// prefill ([`decode_again`]), which reads no prefill's capacity.
 ///
-/// What `inputs` state of the request is handed as the engine reads it
-/// ([`place_request`]), the route's own rule among it, which the engine
-/// asks of the workers it picked. Three things are the pair's own:
+/// What `inputs` and `stated` state of the request is handed as the engine
+/// reads it ([`place_request`]), the route's own rule among it, which the
+/// engine asks of the workers it picked. Three things are the pair's own:
 ///
 /// - A retry pinned to its retained plan's wire is held to the places of
 ///   each pool on that wire. The lists stay the pools' own.
@@ -2126,6 +2234,7 @@ fn with_pair_request<R>(
     wire: Option<WireConstraint>,
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
+    stated: Stated,
     ask: impl FnOnce(&PlaceRequest<'_>) -> R,
 ) -> R {
     let [prefill, decode] = pairs.lent();
@@ -2164,7 +2273,7 @@ fn with_pair_request<R>(
     tried_ids(decode.workers, inputs.tried, &mut decodes_tried);
     tried.append(&mut decodes_tried);
     let ring = ModelRing::read(engine, policies, registry, model_id);
-    let mut request = place_request(model_id, WorkerLists::Pair(lists), inputs, &tried);
+    let mut request = place_request(model_id, WorkerLists::Pair(lists), inputs, &tried, stated);
     request.ring = ring.lent();
     request.attempt = u8::try_from(inputs.tried.len().div_ceil(2)).unwrap_or(u8::MAX);
     request.decode_again = true;
@@ -2186,6 +2295,9 @@ fn with_pair_request<R>(
 /// label and the label of the profile that picked the side, and under the
 /// name the settings give the side's policy where the engine names none
 /// ([`PolicyRegistry::side_policy_name`]): no policy object is asked.
+///
+/// The route's call that states the request ([`Stated`]) is made here,
+/// for a pair that can be placed.
 #[inline(never)]
 #[expect(
     clippy::too_many_arguments,
@@ -2200,10 +2312,12 @@ fn pair_by_engine(
     wire: Option<WireConstraint>,
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
+    stated: impl FnOnce() -> Stated,
 ) -> Result<PlacedPair, Box<PairFailure>> {
     if let Some(failure) = unpairable(policies, model_id, pairs) {
         return Err(failure);
     }
+    let stated = stated();
     let fail =
         |role: WorkerRole, verdict: PlacementFailure| Box::new(PairFailure { role, verdict });
     let placed = with_pair_request(
@@ -2215,13 +2329,14 @@ fn pair_by_engine(
         wire,
         prefill_capacity,
         inputs,
+        stated,
         |request| {
             engine.place(request).map(|placement| {
                 let labels = (
                     placement.profile,
                     placement.decode_profile.unwrap_or(placement.profile),
                 );
-                (labels, PlacedPair::by_engine(placement))
+                (labels, PlacedPair::by_engine(placement, stated))
             })
         },
     );
@@ -2295,7 +2410,9 @@ fn pair_by_engine(
 /// its load guard, made ahead of its send ([`Placed::ahead`]). `pairs`,
 /// `wire` and `inputs` state the request again, over the pair index as it
 /// stands now ([`PairsAgain`]): the route's own rule in `inputs` is asked of
-/// the decode the engine picks. The function answers the guard to keep, and
+/// the decode the engine picks. What the request stated for the engine
+/// alone ([`Stated`]) is stated again as the decode's answer kept it, so a
+/// route states it once. The function answers the guard to keep, and
 /// the decode the request goes to now where that is another worker than
 /// `decode`'s:
 ///
@@ -2814,6 +2931,7 @@ pub(crate) mod tests {
             None,
             None,
             PlacementInputs::default(),
+            Stated::nothing,
         )
     }
 
@@ -2843,6 +2961,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 PlacementInputs::default(),
+                Stated::nothing,
             )
             .expect("a pair is open");
             *hits.entry(pair.prefill.url().to_string()).or_insert(0) += 1;
@@ -3059,6 +3178,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 PlacementInputs::default(),
+                Stated::nothing,
             )
             .map(|_| ())
         };
@@ -3116,6 +3236,7 @@ pub(crate) mod tests {
                 RoutingPool::HttpRegular,
                 None,
                 inputs,
+                Stated::nothing,
             )
             .expect("a worker")
         };
@@ -3217,6 +3338,7 @@ pub(crate) mod tests {
                     headers: Some(&headers),
                     ..Default::default()
                 },
+                Stated::nothing,
             )
             .expect("the targeted pair is open");
             assert_eq!(pair.decode.url(), expected, "target {index}");
@@ -3242,6 +3364,7 @@ pub(crate) mod tests {
                 tried,
                 ..Default::default()
             },
+            Stated::nothing,
         )
         .expect("a pair is open");
         (
@@ -3374,6 +3497,7 @@ pub(crate) mod tests {
                     tried: &tried,
                     ..Default::default()
                 },
+                Stated::nothing,
             )
             .expect("a pair is open");
             pair.decode.url().to_string()
@@ -3432,6 +3556,7 @@ pub(crate) mod tests {
                     tried,
                     ..Default::default()
                 },
+                Stated::nothing,
             )
             .expect("the targeted pair is open");
             (pair.prefill.into_worker(), pair.decode.into_worker())
@@ -3490,6 +3615,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 PlacementInputs::default(),
+                Stated::nothing,
             )
             .expect("a pair is open");
             registry.get_routing_snapshot(MODEL).hash_ring_is_filled()
@@ -3553,6 +3679,7 @@ pub(crate) mod tests {
                         tokens: Some(&tokens),
                         ..Default::default()
                     },
+                    Stated::nothing,
                 )
                 .expect("a pair is open");
                 assert_eq!(
@@ -3747,6 +3874,7 @@ pub(crate) mod tests {
                     None,
                     None,
                     PlacementInputs::default(),
+                    Stated::nothing,
                 )
                 .expect("a pair is open");
                 assert_eq!(
@@ -3975,6 +4103,7 @@ pub(crate) mod tests {
                     None,
                     None,
                     PlacementInputs::default(),
+                    Stated::nothing,
                 )
                 .map(|pair| pair.prefill.url().to_string())
                 .unwrap_or_default()
@@ -4316,6 +4445,7 @@ pub(crate) mod tests {
             None,
             None,
             PlacementInputs::default(),
+            Stated::nothing,
         )
         .is_ok());
 
@@ -4333,6 +4463,7 @@ pub(crate) mod tests {
             }),
             None,
             PlacementInputs::default(),
+            Stated::nothing,
         )
         .err()
         .expect("the retained transport has no decode worker");
@@ -4361,6 +4492,7 @@ pub(crate) mod tests {
             RoutingPool::HttpRegular,
             &only_second,
             PlacementInputs::default(),
+            Stated::nothing,
         )
         .expect("the narrowed slice still has a worker");
         assert_eq!(selected.url(), "http://h:2");
@@ -4398,6 +4530,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 inputs,
+                Stated::nothing,
             )
         };
 
@@ -4450,6 +4583,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 inputs,
+                Stated::nothing,
             )
         };
 
@@ -4506,6 +4640,7 @@ pub(crate) mod tests {
                 candidate_filter: Some(&only_p1),
                 ..Default::default()
             },
+            Stated::nothing,
         )
         .err()
         .expect("no worker on the wire: the pair fails");
@@ -4540,6 +4675,7 @@ pub(crate) mod tests {
                 candidate_filter: Some(&only_h1),
                 ..Default::default()
             },
+            Stated::nothing,
         )
         .expect("steered to the admitted worker");
         assert_eq!(selected.url(), "http://h:1");
@@ -4723,6 +4859,7 @@ pub(crate) mod tests {
                 RoutingPool::HttpRegular,
                 &candidates,
                 PlacementInputs::default(),
+                Stated::nothing,
             );
             if selected.is_none() {
                 refused.push(policies.get_policy_or_default(MODEL).name());
@@ -4794,6 +4931,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 PlacementInputs::default(),
+                Stated::nothing,
             );
             if placed.is_err() {
                 refused.push(vetoed);
@@ -4843,6 +4981,7 @@ pub(crate) mod tests {
                     None,
                     None,
                     PlacementInputs::default(),
+                    Stated::nothing,
                 ) {
                     Err(failure)
                         if matches!(failure.verdict, PlacementFailure::AllOverloaded(_)) => {}
@@ -4887,6 +5026,7 @@ pub(crate) mod tests {
             RoutingPool::HttpRegular,
             None,
             PlacementInputs::default(),
+            Stated::nothing,
         )
         .expect("the HTTP worker is selectable from its own pool");
         assert_eq!(selected.url(), "http://h:1");
@@ -4900,6 +5040,7 @@ pub(crate) mod tests {
             RoutingPool::GrpcPipelineRegular,
             None,
             PlacementInputs::default(),
+            Stated::nothing,
         )
         .is_none());
         assert!(matches!(
@@ -4942,6 +5083,7 @@ pub(crate) mod tests {
             RoutingPool::HttpRegular,
             None,
             inputs,
+            Stated::nothing,
         )
         .expect("a worker is selectable")
     }
@@ -5124,6 +5266,7 @@ pub(crate) mod tests {
                 tried: &both,
                 ..inputs
             },
+            Stated::nothing,
         )
         .is_some());
     }
@@ -5182,6 +5325,7 @@ pub(crate) mod tests {
                 RoutingPool::HttpRegular,
                 &candidates,
                 PlacementInputs::default(),
+                Stated::nothing,
             )
             .expect("a worker is picked");
             *picks.entry(worker.url().to_string()).or_insert(0) += 1;
@@ -5247,6 +5391,7 @@ pub(crate) mod tests {
                     headers: Some(&headers),
                     ..Default::default()
                 },
+                Stated::nothing,
             )
         };
         let by_index: Vec<Arc<dyn Worker>> = (0..3)
@@ -5397,7 +5542,15 @@ pub(crate) mod tests {
         inputs: PlacementInputs<'_>,
     ) -> Option<usize> {
         let pool = RoutingPool::HttpRegular;
-        let worker = select_single(registry, policies, MODEL, pool, None, inputs)?;
+        let worker = select_single(
+            registry,
+            policies,
+            MODEL,
+            pool,
+            None,
+            inputs,
+            Stated::nothing,
+        )?;
         among
             .iter()
             .position(|member| Arc::ptr_eq(member, worker.worker()))
@@ -5812,6 +5965,7 @@ pub(crate) mod tests {
                 tokens: Some(tokens),
                 ..Default::default()
             },
+            Stated::nothing,
         )
         .expect("a pair")
     }
@@ -6586,6 +6740,7 @@ pub(crate) mod tests {
                 RoutingPool::HttpPrefill,
                 None,
                 inputs,
+                Stated::nothing,
             )
             .expect("a prefill worker")
         };
@@ -6600,7 +6755,9 @@ pub(crate) mod tests {
     pub(crate) type Heard = Arc<Mutex<Vec<String>>>;
 
     /// A scorer that ranks every worker alike and takes every word of a
-    /// lease, so the engine leases each pick under it.
+    /// lease, so the engine leases each pick under it. Where the request it
+    /// ranks for states an output limit, it says `limit <tokens>` ahead of
+    /// that decision's words: a request that states none adds no word.
     #[derive(Debug)]
     struct Hears(Heard);
 
@@ -6639,11 +6796,14 @@ pub(crate) mod tests {
 
         fn score(
             &self,
-            _: &RequestFacts<'_>,
+            facts: &RequestFacts<'_>,
             _: &[Candidate],
             _: &[u32],
             out: &mut [f32],
         ) -> TieBand {
+            if facts.max_output_tokens != 0 {
+                self.note(format!("limit {}", facts.max_output_tokens));
+            }
             out.fill(0.0);
             TieBand::NORMALIZED
         }
@@ -6733,6 +6893,126 @@ pub(crate) mod tests {
         );
     }
 
+    /// What a route states for the engine alone reaches the engine's request
+    /// through each single-worker front: the output limit the request states
+    /// is the limit its decision reads, and the call that states it is made
+    /// once a placement. A classic placement never makes the call.
+    #[test]
+    fn the_engine_reads_the_output_limit_a_single_request_states() {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let pool = RoutingPool::HttpRegular;
+        let inputs = PlacementInputs::default();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_engine_on(&policies);
+        let stated = std::cell::Cell::new(0);
+        let limit = |tokens: u32| {
+            let stated = &stated;
+            move || {
+                stated.set(stated.get() + 1);
+                Stated {
+                    max_output_tokens: tokens,
+                }
+            }
+        };
+
+        let snapshot = registry.get_routing_snapshot(MODEL);
+        let slice = registry.get_routing_pool(MODEL, pool);
+        drop(select_single(&registry, &policies, MODEL, pool, None, inputs, limit(64)).unwrap());
+        drop(
+            select_single_of(
+                &registry,
+                &policies,
+                MODEL,
+                &snapshot,
+                pool,
+                None,
+                inputs,
+                limit(65),
+            )
+            .unwrap(),
+        );
+        drop(select_from(&registry, &policies, MODEL, pool, &slice, inputs, limit(66)).unwrap());
+        // A request that states none adds no word.
+        drop(
+            select_single(
+                &registry,
+                &policies,
+                MODEL,
+                pool,
+                None,
+                inputs,
+                Stated::nothing,
+            )
+            .unwrap(),
+        );
+        let released = "released Abandoned";
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            [
+                "limit 64", "issued", released, "limit 65", "issued", released, "limit 66",
+                "issued", released, "issued", released,
+            ]
+        );
+        assert_eq!(stated.get(), 3, "one call a placement the engine decided");
+
+        let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let unread = || -> Stated { panic!("a classic placement is handed nothing of it") };
+        assert!(select_single(&registry, &classic, MODEL, pool, None, inputs, unread).is_some());
+        let pairs = one_pair();
+        let index = pairs_of(&pairs, &classic);
+        let unread = || -> Stated { panic!("a classic pair is handed nothing of it") };
+        assert!(select_pair(&pairs, &classic, MODEL, &index, None, None, inputs, unread).is_ok());
+    }
+
+    /// Under a document whose `has-room` names the request's output limit,
+    /// the limit a route states reserves room for the answer: a worker the
+    /// answer would fill is passed over for one that holds it. A request
+    /// that states no limit reserves none and takes its turn on both.
+    #[test]
+    fn a_stated_output_limit_reserves_room_under_a_rule_that_names_it() {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let pool = RoutingPool::HttpRegular;
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        // A worker holds 100 a request in flight and the answer's limit, and
+        // has room up to 150.
+        let document: PolicySpec = serde_json::from_str(
+            r#"{"apiVersion":"smg.policy/v1","generation":1,"profiles":{"p":{
+                "filter":[{"has-room":{"used":{"candidate.in_flight":100,"request.max_output_tokens":1},"capacity":150}}],
+                "pick":"round-robin"}}}"#,
+        )
+        .expect("a policy document");
+        engine_on(
+            &policies,
+            AppliedSpec::validate(&document).expect("a valid document"),
+        );
+        let place = |tokens: u32| {
+            let stated = move || Stated {
+                max_output_tokens: tokens,
+            };
+            let inputs = PlacementInputs::default();
+            select_single(&registry, &policies, MODEL, pool, None, inputs, stated)
+                .expect("a worker is selectable")
+        };
+
+        // One worker holds a request.
+        let busy = place(0);
+        let _held = busy.guard(None);
+        assert_eq!(busy.load(), 1);
+
+        // An answer of up to 100 tokens fits the idle worker alone.
+        for _ in 0..4 {
+            assert_ne!(place(100).url(), busy.url(), "the busy worker has no room");
+        }
+        // With no limit stated both have room, and the turn visits both.
+        let taken: std::collections::HashSet<String> =
+            (0..4).map(|_| place(0).url().to_owned()).collect();
+        assert_eq!(
+            taken.len(),
+            2,
+            "a request that states no limit reserves none"
+        );
+    }
+
     /// A scorer that panics where the engine asks it: the engine refuses
     /// that decision as its own fault.
     #[derive(Debug)]
@@ -6788,6 +7068,7 @@ pub(crate) mod tests {
             RoutingPool::HttpRegular,
             None,
             PlacementInputs::default(),
+            Stated::nothing,
         );
         assert!(placed.is_none(), "a refused decision places no worker");
         let lines = lines.lock().unwrap();
@@ -6890,10 +7171,26 @@ pub(crate) mod tests {
         let mut on_wire = BTreeMap::new();
         let inputs = PlacementInputs::default();
         for _ in 0..16 {
-            let placed = select_from(&registry, &policies, MODEL, pool, &two, inputs);
+            let placed = select_from(
+                &registry,
+                &policies,
+                MODEL,
+                pool,
+                &two,
+                inputs,
+                Stated::nothing,
+            );
             let placed = placed.expect("a ready candidate");
             *from_slice.entry(placed.url().to_owned()).or_insert(0) += 1;
-            let placed = select_single(&registry, &policies, MODEL, pool, Some(pinned), inputs);
+            let placed = select_single(
+                &registry,
+                &policies,
+                MODEL,
+                pool,
+                Some(pinned),
+                inputs,
+                Stated::nothing,
+            );
             let placed = placed.expect("a ready worker on the wire");
             *on_wire.entry(placed.url().to_owned()).or_insert(0) += 1;
         }
@@ -6910,10 +7207,26 @@ pub(crate) mod tests {
             ..Default::default()
         };
         for _ in 0..8 {
-            let placed = select_single(&registry, &policies, MODEL, pool, Some(pinned), ruled);
+            let placed = select_single(
+                &registry,
+                &policies,
+                MODEL,
+                pool,
+                Some(pinned),
+                ruled,
+                Stated::nothing,
+            );
             let placed = placed.expect("the wire's other worker");
             assert_eq!(placed.url(), "http://v:1");
-            let placed = select_from(&registry, &policies, MODEL, pool, &two, ruled);
+            let placed = select_from(
+                &registry,
+                &policies,
+                MODEL,
+                pool,
+                &two,
+                ruled,
+                Stated::nothing,
+            );
             let placed = placed.expect("the slice's other worker");
             assert_eq!(placed.url(), "http://s:1");
         }
@@ -6921,7 +7234,15 @@ pub(crate) mod tests {
         let whole: Vec<Arc<dyn Worker>> = registry.get_routing_pool(MODEL, pool).to_vec();
         let mut turns = BTreeMap::new();
         for _ in 0..9 {
-            let placed = select_from(&registry, &policies, MODEL, pool, &whole, inputs);
+            let placed = select_from(
+                &registry,
+                &policies,
+                MODEL,
+                pool,
+                &whole,
+                inputs,
+                Stated::nothing,
+            );
             let placed = placed.expect("a ready candidate");
             *turns.entry(placed.url().to_owned()).or_insert(0) += 1;
         }
@@ -6930,7 +7251,16 @@ pub(crate) mod tests {
         for worker in &registry.get_all() {
             worker.set_status(WorkerStatus::NotReady);
         }
-        assert!(select_single(&registry, &policies, MODEL, pool, None, inputs).is_none());
+        assert!(select_single(
+            &registry,
+            &policies,
+            MODEL,
+            pool,
+            None,
+            inputs,
+            Stated::nothing
+        )
+        .is_none());
     }
 
     /// A part of one worker in a pool of sixteen is found at every request:
@@ -6947,7 +7277,15 @@ pub(crate) mod tests {
         let one = [registry.get_by_url("http://h:11").expect("registered")];
         for _ in 0..16 {
             let inputs = PlacementInputs::default();
-            let placed = select_from(&registry, &policies, MODEL, pool, &one, inputs);
+            let placed = select_from(
+                &registry,
+                &policies,
+                MODEL,
+                pool,
+                &one,
+                inputs,
+                Stated::nothing,
+            );
             let placed = placed.expect("the part's one worker");
             assert_eq!(placed.url(), "http://h:11");
         }
@@ -7057,16 +7395,32 @@ pub(crate) mod tests {
             let inputs = with_headers(&headers);
             let pool = RoutingPool::HttpRegular;
             let of = |policies: &PolicyRegistry| {
-                select_from(&registry, policies, MODEL, pool, &slice, inputs)
-                    .expect("a ready candidate")
+                select_from(
+                    &registry,
+                    policies,
+                    MODEL,
+                    pool,
+                    &slice,
+                    inputs,
+                    Stated::nothing,
+                )
+                .expect("a ready candidate")
             };
             let owner = of(&classic);
             assert_eq!(of(&engine).url(), owner.url(), "{headers:?}, a slice");
             *from_slice.entry(owner.url().to_owned()).or_insert(0) += 1;
 
             let on = |policies: &PolicyRegistry| {
-                select_single(&registry, policies, MODEL, pool, Some(pinned), inputs)
-                    .expect("a ready worker on the wire")
+                select_single(
+                    &registry,
+                    policies,
+                    MODEL,
+                    pool,
+                    Some(pinned),
+                    inputs,
+                    Stated::nothing,
+                )
+                .expect("a ready worker on the wire")
             };
             let owner = on(&classic);
             assert_eq!(on(&engine).url(), owner.url(), "{headers:?}, a wire");
@@ -7412,7 +7766,16 @@ pub(crate) mod tests {
                     candidate_filter: rule,
                     ..Default::default()
                 };
-                let pair = select_pair(&registry, &policies, MODEL, &pairs, wire, None, inputs);
+                let pair = select_pair(
+                    &registry,
+                    &policies,
+                    MODEL,
+                    &pairs,
+                    wire,
+                    None,
+                    inputs,
+                    Stated::nothing,
+                );
                 let pair = pair.expect("a pair the request may use");
                 seen.insert((pair.prefill.url().to_owned(), pair.decode.url().to_owned()));
             }
@@ -7649,6 +8012,58 @@ pub(crate) mod tests {
         assert!(moved.is_none());
         assert!(guard.counts(pair.decode.worker()));
         assert_eq!(heard.lock().expect("the stage heard").len(), before);
+        drop(guard);
+    }
+
+    /// A pair's request states its output limit once, at its first
+    /// decision, and the decode's answer keeps it. Under a document that
+    /// picks the decode with its prefill that decision reads the limit.
+    /// Under one that picks it behind the prefill the first decision reads
+    /// it where it ranks the decodes, and the decode asked again reads the
+    /// same limit. The ask is handed no statement: its route may hold the
+    /// body no more by then.
+    #[test]
+    fn a_pairs_second_ask_reads_the_output_limit_its_first_decision_stated() {
+        let stated = || Stated {
+            max_output_tokens: 64,
+        };
+        let inputs = PlacementInputs::default();
+
+        // The decode picked with its prefill: the one decision reads it.
+        let registry = one_pair();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_pairs_on(&policies, false);
+        let pairs = pairs_of(&registry, &policies);
+        let pair = select_pair(
+            &registry, &policies, MODEL, &pairs, None, None, inputs, stated,
+        );
+        drop(pair.expect("the engine places the pair"));
+        assert_eq!(
+            heard.lock().expect("the stage heard")[..2],
+            ["limit 64", "issued"]
+        );
+
+        // The decode picked behind its prefill: each of the two decisions
+        // reads it.
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_pairs_on(&policies, true);
+        let said = || heard.lock().expect("the stage heard").clone();
+        let pairs = pairs_of(&registry, &policies);
+        let pair = select_pair(
+            &registry, &policies, MODEL, &pairs, None, None, inputs, stated,
+        );
+        let pair = pair.expect("the engine places the pair");
+        drop(pair.prefill.guard(None));
+        let ahead = pair.decode.ahead(None);
+        assert_eq!(said(), ["limit 64", "issued", "dispatched Prefill"]);
+
+        let (_moved, guard) = asked_again(&registry, &policies, None, &pair, ahead);
+        assert_eq!(said()[3..5], ["limit 64", "issued"]);
         drop(guard);
     }
 

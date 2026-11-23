@@ -2707,6 +2707,10 @@ impl PDRouter {
             None,
             prefill_capacity,
             inputs,
+            // The pair route states nothing for the policy engine alone:
+            // its selection runs inside the admission's wait, where a
+            // reading of the body would ride for a classic pair too.
+            placement::Stated::nothing,
         )?;
 
         Ok((pair.prefill, pair.decode))
@@ -3459,6 +3463,7 @@ impl RouterTrait for PDRouter {
                     candidate_filter: None,
                     tried: &[],
                 },
+                placement::Stated::nothing,
             ) else {
                 return error::service_unavailable(
                     "no_prefill_servers",

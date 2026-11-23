@@ -216,6 +216,14 @@ pub trait GenerationRequest: Send + Sync {
         None
     }
 
+    /// The most tokens the answer may hold, as the request states the
+    /// limit. `None` where the body states none, and for a protocol that
+    /// generates no text. A request states one limit, whatever its count of
+    /// samples or prompts: the limit of one answer.
+    fn max_output_tokens(&self) -> Option<u32> {
+        None
+    }
+
     /// The fields that partition the backend's prefix cache for this request.
     /// Protocols without such fields are unpartitioned.
     fn cache_partition(&self) -> CachePartition<'_> {
@@ -3788,6 +3796,53 @@ mod tests {
         assert_eq!(routing_text_of_input(&json!([[1, 2], [3]])), "");
         assert_eq!(routing_text_of_input(&json!({"text": "x"})), "");
         assert_eq!(routing_text_of_input(&json!(7)), "");
+    }
+
+    /// Each body states its output limit under its own field's name, and
+    /// one reader answers them all. A chat body's current field stands
+    /// ahead of its deprecated one. A body that names no limit states none,
+    /// and so does a protocol that generates no text.
+    #[test]
+    fn a_body_states_its_output_limit_through_one_reader() {
+        use crate::{
+            chat::ChatCompletionRequest, completion::CompletionRequest,
+            embedding::EmbeddingRequest, generate::GenerateRequest, messages::CreateMessageRequest,
+            responses::ResponsesRequest,
+        };
+
+        fn limit<T: GenerationRequest + de::DeserializeOwned>(body: Value) -> Option<u32> {
+            let request: T = serde_json::from_value(body).expect("a body of its protocol");
+            request.max_output_tokens()
+        }
+        let chat = |fields: Value| {
+            let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+            let extra = fields.as_object().expect("an object").clone();
+            body.as_object_mut().expect("an object").extend(extra);
+            limit::<ChatCompletionRequest>(body)
+        };
+        assert_eq!(chat(json!({"max_completion_tokens": 64})), Some(64));
+        assert_eq!(chat(json!({"max_tokens": 32})), Some(32));
+        assert_eq!(
+            chat(json!({"max_completion_tokens": 64, "max_tokens": 32})),
+            Some(64),
+            "the current field ahead of the deprecated one"
+        );
+        assert_eq!(chat(json!({})), None);
+
+        let completion = json!({"model": "m", "prompt": "hi", "max_tokens": 16});
+        assert_eq!(limit::<CompletionRequest>(completion), Some(16));
+        let messages = json!({"model": "m", "max_tokens": 8, "messages": []});
+        assert_eq!(limit::<CreateMessageRequest>(messages), Some(8));
+        let responses = json!({"model": "m", "input": "hi", "max_output_tokens": 128});
+        assert_eq!(limit::<ResponsesRequest>(responses), Some(128));
+        let generate =
+            json!({"model": "m", "text": "hi", "sampling_params": {"max_new_tokens": 4}});
+        assert_eq!(limit::<GenerateRequest>(generate), Some(4));
+        let unbounded = json!({"model": "m", "text": "hi"});
+        assert_eq!(limit::<GenerateRequest>(unbounded), None);
+
+        let embedding = json!({"model": "m", "input": "hi"});
+        assert_eq!(limit::<EmbeddingRequest>(embedding), None);
     }
 
     /// The type names the validation messages print, one per JSON shape.

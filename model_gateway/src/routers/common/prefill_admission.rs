@@ -613,7 +613,7 @@ mod tests {
                 placement::{
                     select_pair,
                     tests::{hearing_pairs_on, one_pair, pairs_of, MODEL},
-                    PairFailure, PlacedPair, PlacementInputs,
+                    PairFailure, PlacedPair, PlacementInputs, Stated,
                 },
                 snapshot::WorkerRegistry,
             },
@@ -1166,7 +1166,16 @@ mod tests {
            + 'a {
         move |capacity| {
             let inputs = PlacementInputs::default();
-            select_pair(registry, policies, MODEL, pairs, None, capacity, inputs)
+            select_pair(
+                registry,
+                policies,
+                MODEL,
+                pairs,
+                None,
+                capacity,
+                inputs,
+                Stated::nothing,
+            )
         }
     }
 

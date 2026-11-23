@@ -307,6 +307,12 @@ impl GenerationRequest for GenerateRequest {
         self.rid.as_deref()
     }
 
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.sampling_params
+            .as_ref()
+            .and_then(|params| params.max_new_tokens)
+    }
+
     fn is_stream(&self) -> bool {
         self.stream
     }
