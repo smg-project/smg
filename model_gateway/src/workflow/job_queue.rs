@@ -1992,6 +1992,70 @@ mod tests {
         );
     }
 
+    /// An upsert takes a peer's rank workers that stand at its addresses
+    /// though they state no rank: an import with no spec is built from the
+    /// address alone. The registration reads the same two ranks and claims
+    /// both under their addresses. After it the registry holds the engine
+    /// once, each worker states its rank, and this node owns both.
+    #[tokio::test]
+    async fn an_upsert_takes_a_peers_rank_workers_that_state_no_rank() {
+        use http::StatusCode;
+        use serde_json::json;
+        use smg_worker::{
+            registry::{RemoteWorkerState, WorkerOrigin},
+            workflow::find_workers_by_url,
+        };
+
+        use crate::app_context::testing::live_app_context;
+
+        let two_ranks = (StatusCode::OK, json!({"dp_size": 2}));
+        let (base, _) = engine_whose_server_info_turns(two_ranks.clone(), two_ranks).await;
+        let context = live_app_context();
+        let registry = &context.worker_registry;
+        for rank in 0..2 {
+            let url = format!("{base}@{rank}");
+            registry.on_remote_worker_state(&RemoteWorkerState {
+                worker_id: format!("peer-rank-{rank}"),
+                model_id: "m".to_string(),
+                url: url.clone(),
+                health: true,
+                version: 1,
+                spec: Vec::new(),
+            });
+            let id = registry.get_id_by_url(&url).expect("the import");
+            assert_eq!(registry.origin_of(&id), Some(WorkerOrigin::Mesh));
+            let imported = registry.get(&id).expect("the import");
+            assert_eq!(imported.dp_rank(), None, "built from the address alone");
+        }
+        let marks = DashSet::new();
+        let upsert = add_worker(&base, WorkerRegistrationMode::Upsert);
+
+        let result = execute_job(&upsert, &context, &marks, None).await;
+
+        assert!(result.is_ok(), "{result:?}");
+        let mut standing: Vec<(String, Option<usize>, Option<WorkerOrigin>)> =
+            find_workers_by_url(registry, &base)
+                .iter()
+                .map(|worker| {
+                    let id = registry.get_id_by_url(worker.url()).expect("its id");
+                    (
+                        worker.url().to_string(),
+                        worker.dp_rank(),
+                        registry.origin_of(&id),
+                    )
+                })
+                .collect();
+        standing.sort_by(|a, b| a.0.cmp(&b.0));
+        let local = Some(WorkerOrigin::Local);
+        assert_eq!(
+            standing,
+            [
+                (format!("{base}@0"), Some(0), local),
+                (format!("{base}@1"), Some(1), local)
+            ]
+        );
+    }
+
     /// An engine stub whose server info answers `first` until the switch it
     /// returns is set, and `then` from then on: a read that fails, or one
     /// that comes back. Returns its base address and the switch.
@@ -1999,11 +2063,13 @@ mod tests {
         first: (http::StatusCode, serde_json::Value),
         then: (http::StatusCode, serde_json::Value),
     ) -> (String, Arc<AtomicBool>) {
-        use std::{net::Ipv4Addr, sync::atomic::Ordering};
+        use std::sync::atomic::Ordering;
 
-        use axum::{routing::get, Json, Router};
+        use axum::{routing::get, Json};
+        use http::StatusCode;
         use serde_json::json;
-        use tokio::net::TcpListener;
+
+        use crate::workflow::steps::local::test_support::{json_router, serve_router};
 
         let turned = Arc::new(AtomicBool::new(false));
         let server_info = {
@@ -2017,32 +2083,21 @@ mod tests {
                 async move { (status, Json(body)) }
             }
         };
-        let router = Router::new()
-            .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
-            .route(
+        let router = json_router(vec![
+            ("/health", StatusCode::OK, json!({"status": "ok"})),
+            (
                 "/v1/models",
-                get(|| async { Json(json!({"data": [{"id": "m", "owned_by": "sglang"}]})) }),
-            )
-            .route(
+                StatusCode::OK,
+                json!({"data": [{"id": "m", "owned_by": "sglang"}]}),
+            ),
+            (
                 "/model_info",
-                get(|| async { Json(json!({"model_path": "m", "is_generation": true})) }),
-            )
-            .route("/server_info", get(server_info));
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("a loopback port of the system's choice");
-        let base = format!(
-            "http://{}",
-            listener.local_addr().expect("the bound address")
-        );
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "a test fixture: the stub lives as long as the test's runtime"
-        )]
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
-        });
-        (base, turned)
+                StatusCode::OK,
+                json!({"model_path": "m", "is_generation": true}),
+            ),
+        ])
+        .route("/server_info", get(server_info));
+        (serve_router(router).await, turned)
     }
 
     /// A registration of the engine at `base` in `registration_mode`, as the

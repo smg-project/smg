@@ -20,6 +20,14 @@ pub(crate) fn labels_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
 pub(crate) async fn serve_json_routes(
     routes: Vec<(&'static str, http::StatusCode, serde_json::Value)>,
 ) -> String {
+    serve_router(json_router(routes)).await
+}
+
+/// The router of [`serve_json_routes`], for a test that adds a route of its
+/// own to it: one whose answer changes while the test runs.
+pub(crate) fn json_router(
+    routes: Vec<(&'static str, http::StatusCode, serde_json::Value)>,
+) -> axum::Router {
     let mut router = axum::Router::new();
     for (path, status, body) in routes {
         router = router.route(
@@ -30,6 +38,12 @@ pub(crate) async fn serve_json_routes(
             }),
         );
     }
+    router
+}
+
+/// Serves `router` on a loopback port of the system's choice and returns the
+/// base URL; the stub serves for as long as the runtime that spawned it runs.
+pub(crate) async fn serve_router(router: axum::Router) -> String {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("a loopback port of the system's choice");
