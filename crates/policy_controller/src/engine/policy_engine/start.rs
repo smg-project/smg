@@ -42,9 +42,11 @@ pub struct WorkerData {
     /// request gives no snapshot reads no load report until the program
     /// hands a channel ([`PolicyEngine::set_loads`]).
     pub loads: Option<LoadReceiver>,
-    /// The program's indexes of cache events, by model. `None` from a
-    /// program that keeps none: every worker reads as publishing no cache
-    /// events.
+    /// The program's indexes of cache events, by model, and with them its
+    /// token tree, where it keeps one ([`CacheIndexes::token_tree`]). `None`
+    /// from a program that keeps neither: every worker reads as publishing
+    /// no cache events, and no request is decided inside a tree of the
+    /// program's.
     pub cache_indexes: Option<Arc<dyn CacheIndexes>>,
 }
 

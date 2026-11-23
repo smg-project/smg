@@ -3,10 +3,10 @@
 //! The engine chooses the worker each request goes to, inside the program
 //! that serves the request. This example is such a program, as small as one
 //! can be. It keeps its workers in the worker crate's registry, starts the
-//! engine once from routing settings, and serves each request by the one
-//! call the engine has for a request ([`PolicyEngine::place`]): it keeps
-//! the placement to the request's end and says when the request went out
-//! and how it ended.
+//! engine once from routing settings, over that registry, and serves each
+//! request by the one call the engine has for a request
+//! ([`PolicyEngine::place`]): it keeps the placement to the request's end
+//! and says when the request went out and how it ended.
 //!
 //! `program.rs` is the program. This file runs it over three workers that
 //! serve nothing: a send is a line on the output, and one worker answers
@@ -131,6 +131,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for address in addresses {
         assert!(program.join(worker(address)), "a free address joins");
     }
+    // The engine's task takes its turn on the runtime: at its first step
+    // it reads the registry and tells the document's stages each worker.
+    tokio::task::yield_now().await;
     let asked = Asked {
         model: MODEL,
         headers: None,
@@ -144,6 +147,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for address in addresses {
         assert!(program.leave(address), "a worker that joined leaves");
     }
+    // The task hears each leave from the registry.
+    tokio::task::yield_now().await;
     let answer = program.serve(&asked);
     println!(
         "with no worker left the client reads {} after {} sends: {:?}",

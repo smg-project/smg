@@ -31,7 +31,7 @@ use smg_worker::{
     load::state::one_rank_load,
     worker::{WorkerLoadResponse, WorkerStatus},
 };
-use tokio::time::sleep;
+use tokio::{task::JoinHandle, time::sleep};
 
 use crate::{
     program::{settings, Answer, Asked, Program, ATTEMPTS},
@@ -351,10 +351,12 @@ impl Scorer for Hears {
 /// next send fail. A send is answered a 200, and a 502 once where the word
 /// is set, and says `went out` among the stage's words as it goes.
 ///
-/// The stage heard each of the two workers join, under the id every
-/// decision names that worker by: the fingerprint of the address the worker
-/// states.
-fn hearing() -> (Program, Heard, Arc<AtomicBool>) {
+/// The engine's task is spawned, and its handle is the last of the four.
+/// The program told the engine of no worker: at its first step the task
+/// read the program's registry, and the stage heard each of the two
+/// workers join, under the id every decision names that worker by: the
+/// fingerprint of the address the worker states.
+async fn hearing() -> (Program, Heard, Arc<AtomicBool>, JoinHandle<()>) {
     let heard = Heard::default();
     let kept = Arc::clone(&heard);
     let mut stages = StageRegistry::builtin();
@@ -378,10 +380,20 @@ fn hearing() -> (Program, Heard, Arc<AtomicBool>) {
             200
         }
     };
-    let (program, _loads, _task) = started(spec, &workers(2), sends);
-    let fleet = [0, 1].map(|at| WorkerId::from_address(&url(at)));
-    assert_eq!(taken(&heard), fleet.map(joined), "each worker's join");
-    (program, heard, fails)
+    let (program, _loads, task) = started(spec, &workers(2), sends);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the case holds the task's handle and ends the task"
+    )]
+    let task = tokio::spawn(task);
+    // The task's first step reads the registry whole.
+    sleep(Duration::from_millis(1)).await;
+    let mut fleet = [0, 1].map(|at| joined(WorkerId::from_address(&url(at))));
+    fleet.sort_unstable();
+    let mut told = taken(&heard);
+    told.sort_unstable();
+    assert_eq!(told, fleet, "each worker's join");
+    (program, heard, fails, task)
 }
 
 /// The words `heard` holds, taken out of it.
@@ -398,9 +410,9 @@ fn taken(heard: &Heard) -> Vec<String> {
 /// before its send is a release, one dropped behind it an end of class
 /// cancelled, and a placement kept ends on another thread than the one
 /// that placed it.
-#[test]
-fn the_engine_hears_each_requests_end() {
-    let (program, heard, fails) = hearing();
+#[tokio::test(start_paused = true)]
+async fn the_engine_hears_each_requests_end() {
+    let (program, heard, fails, task) = hearing().await;
     assert_eq!(program.serve(&PLAIN).status, 200);
     let served = ["issued", "dispatched", "went out", "completed 200 Ok"];
     assert_eq!(taken(&heard), served);
@@ -442,25 +454,49 @@ fn the_engine_hears_each_requests_end() {
         let completed = format!("completed {status} {class}");
         assert_eq!(taken(&heard), ["issued", "dispatched", completed.as_str()]);
     }
+    task.abort();
 }
 
 /// A worker that leaves is forgotten under the address it states. The
 /// registry finds a worker by an address written without its scheme, and
-/// the engine knows the worker by the whole address, so the program tells
-/// the engine the address of the worker the registry gave back. A leave
-/// that finds no worker tells the engine nothing.
+/// the stages know the worker by the whole address. The program tells the
+/// engine nothing: the engine's task hears the removal from the registry
+/// with the worker's own object, and tells the stages the worker under the
+/// address that object states. A leave that finds no worker tells nothing.
 ///
 /// The classic router's registry resolves such an address the same way
 /// (`crates/worker/src/registry.rs:2032-2035`).
-#[test]
-fn a_worker_that_leaves_is_forgotten_under_the_address_it_states() {
-    let (program, heard, _fails) = hearing();
+#[tokio::test(start_paused = true)]
+async fn a_worker_that_leaves_is_forgotten_under_the_address_it_states() {
+    let (program, heard, _fails, task) = hearing().await;
     let bare = url(1);
     let bare = bare.strip_prefix("http://").expect("an http address");
     assert!(program.leave(bare), "the registry finds the worker");
+    sleep(Duration::from_millis(1)).await;
     assert_eq!(taken(&heard), [left(WorkerId::from_address(&url(1)))]);
     assert!(!program.leave(&url(1)), "it left already");
+    sleep(Duration::from_millis(1)).await;
     assert!(taken(&heard).is_empty(), "nothing left, nothing told");
+    task.abort();
+}
+
+/// A worker that joins later is told to the stages by the engine's task.
+/// The program tells the engine no join: it handed its registry at its
+/// start, and the join itself tells nothing until the task takes its
+/// turn. Once the task has ended nothing is told any more.
+#[tokio::test(start_paused = true)]
+async fn a_worker_that_joins_later_is_told_by_the_engines_task() {
+    let (program, heard, _fails, task) = hearing().await;
+    assert!(program.join(worker(2)), "a free address joins");
+    assert!(taken(&heard).is_empty(), "the join itself tells nothing");
+    sleep(Duration::from_millis(1)).await;
+    assert_eq!(taken(&heard), [joined(WorkerId::from_address(&url(2)))]);
+
+    task.abort();
+    assert!(task.await.is_err_and(|ended| ended.is_cancelled()));
+    assert!(program.leave(&url(0)), "a worker that joined leaves");
+    sleep(Duration::from_millis(1)).await;
+    assert!(taken(&heard).is_empty(), "no task, nothing told");
 }
 
 /// One report a worker: the worker at `short` has no queue, every other a
