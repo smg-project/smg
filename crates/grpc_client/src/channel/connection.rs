@@ -84,10 +84,13 @@ const _: () = assert!((STREAM_WINDOW as usize) * 255 * 4 <= (CONNECTION_WINDOW a
 /// the same; h2 left to itself advertises nothing and decodes up to 16 MiB.
 pub(super) const MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
 
-/// How much of the peer's response headers the connection keeps indexed,
-/// advertised in its SETTINGS. It is held for as long as the connection
-/// lives, and a peer that dates its responses fills h2's 4,096 with dates;
-/// 1,024 keeps a response's two constant headers and 14 dates.
+/// The header table the connection advertises in its SETTINGS: how much of
+/// the peer's response headers its encoder may keep indexed, held for as
+/// long as the connection lives. A peer that dates its responses fills the
+/// protocol's 4,096 with dates; 1,024 holds a response's two constant
+/// headers and 14 dates. The cost is on the wire: h2's encoder indexes no
+/// entry over three quarters of the table (768 bytes), so a long
+/// `grpc-message` is sent in full on every identical error.
 pub(super) const HEADER_TABLE_SIZE: u32 = 1024;
 
 /// How many streams the connection opens before the peer's SETTINGS have
