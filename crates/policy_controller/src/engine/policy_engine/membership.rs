@@ -347,8 +347,9 @@ impl PolicyEngine {
     /// A worker removed and another registered at its address come as a
     /// `Removed` and a `Registered`: a leave, then a join. The records of
     /// sent prefixes forget the worker's id at a leave, at a join no leave
-    /// came ahead of, and behind a whole read where it stands no more. The
-    /// session table is told nothing, as at the two calls.
+    /// came ahead of, at a replacement that takes a model from the worker,
+    /// and behind a whole read where it stands no more. The session table
+    /// is told nothing, as at the two calls.
     ///
     /// An id names one worker. A worker registered under an id that
     /// another worker is held under is read as the id's next life: a leave
@@ -566,8 +567,20 @@ impl PolicyEngine {
                 // removal was heard ahead: it tells nothing.
                 let held = follow.told.get(&worker_id);
                 if held.is_some_and(|held| held.holds(&old)) {
+                    let was = held.map(|held| held.id);
                     let id = follow.id_of(&new);
                     self.stands(follow, worker_id, &new, id, true);
+                    // A worker that stands under its id and serves one of
+                    // its models no more keeps no place in that model's
+                    // record: the records forget it. A changed id was told
+                    // as a leave and a join, which forget it already. The
+                    // objects are asked under a catch, and a panic of their
+                    // code is read as a model lost.
+                    let left = |model: &String| !new.supports_model(model);
+                    let lost = || worker_model_ids(&old).iter().any(left);
+                    if was == Some(id) && self.held(lost).unwrap_or(true) {
+                        self.affinity.forget(id);
+                    }
                 }
                 // The lists of both objects' models were published again,
                 // told or not.
