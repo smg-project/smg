@@ -247,6 +247,10 @@ mod tests {
             admission: &Open,
             prefill_places: None,
             decode_places: None,
+            prefill_stalled: &[],
+            prefill_held: &[],
+            decode_stalled: &[],
+            decode_held: &[],
         };
         for (stated, shown) in [(0, u32::MAX), (STATED, STATED)] {
             let asks = Hands(stating(Phase::Prefill, stated), WorkerLists::Pair(lists));

@@ -671,6 +671,10 @@ A pair's host states each list's places beside its two lists (`PairLists::prefil
 `PairLists::decode_places`), and each side is decided among its own. `EncodeLists::decide` refuses
 lists whose pair states places, under the same name: the encode pass decides its pair over the
 workers it admits for the items and reads no place.
+A pair's host states its standing vetoes the same way, the places each list's vetoes mask and those
+a hold stands on (`PairLists::prefill_stalled`, `prefill_held`, `decode_stalled`, `decode_held`).
+Each side reads its own, under an encode request too, and a pair's or an encode request's own mask
+is refused under the name `places`.
 
 ### 5.5 The decision **[built]**
 

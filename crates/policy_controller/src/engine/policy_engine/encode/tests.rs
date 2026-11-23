@@ -22,7 +22,7 @@ use super::*;
 use crate::{
     document::spec::PolicySpec,
     engine::{
-        decision::{ShedReason, Targets, SUBSET_HINT},
+        decision::{LiftedVeto, ShedReason, Targets, SUBSET_HINT},
         decision_engine::{DecisionEngine, HeldDecision, HeldDecode},
         framework::{DecisionScope, Filter, Picker, TieBand},
         pair_classes::PartnerClasses,
@@ -61,6 +61,9 @@ impl PairAdmission for Gates {
 /// `images` says the request states an image. `excluded` are the workers
 /// the host says it just failed to reach. `places` are the places of the
 /// prefill list and of the decode list the host holds the request to.
+/// `vetoes` are the places of each of the two its standing vetoes mask, and
+/// those of them a hold stands on. `own` is a mask the request states
+/// itself: its stalled places, and those a hold stands on.
 struct Host {
     engine: PolicyEngine,
     members: [PoolMembers; 3],
@@ -70,6 +73,8 @@ struct Host {
     images: bool,
     excluded: Vec<WorkerId>,
     places: [Option<Vec<u32>>; 2],
+    vetoes: [[Vec<u32>; 2]; 2],
+    own: [Vec<u32>; 2],
 }
 
 /// Where the worker at `place` of a host's list `list` answers.
@@ -161,6 +166,8 @@ impl Host {
             images: false,
             excluded: Vec::new(),
             places: [None, None],
+            vetoes: Default::default(),
+            own: Default::default(),
         }
     }
 
@@ -190,6 +197,10 @@ impl Host {
             admission: &self.gates,
             prefill_places: self.places[0].as_deref(),
             decode_places: self.places[1].as_deref(),
+            prefill_stalled: &self.vetoes[0][0],
+            prefill_held: &self.vetoes[0][1],
+            decode_stalled: &self.vetoes[1][0],
+            decode_held: &self.vetoes[1][1],
         };
         EncodeLists {
             pair,
@@ -245,6 +256,8 @@ impl Host {
         let constraints = Constraints {
             subset_hint: hint,
             excluded: &self.excluded,
+            stalled: &self.own[0],
+            held: &self.own[1],
             ..Constraints::default()
         };
         let mut request = Request {
@@ -381,6 +394,124 @@ fn an_encode_request_whose_pair_is_held_to_places_is_declined_by_name() {
             other => panic!("not declined: {other:?}"),
         }
         assert!(encoders.is_empty());
+    }
+}
+
+/// An encode request's pair reads each side's standing vetoes beside that
+/// side's list. The worker at one place of each list reports the shorter
+/// queue, so with no veto the pair and the encoder are of that place. A
+/// veto on the prefill there, with a hold or without, moves the prefill
+/// alone: the decode and the encoder at that place still take the request.
+/// A veto on the decode there moves the decode alone. Where the engine
+/// admits a part of the prefills for the items, the mask is numbered with
+/// the workers admitted: the third prefill is the second of the two an
+/// encoder can hand to, and masking it leaves the first. A side masked
+/// whole is paired by the pair's default, which lifts the liveness veto
+/// and never takes a place a hold stands on: under a hold on every place
+/// of a side no pair is made, and what was placed is emptied.
+#[test]
+fn an_encode_requests_pair_reads_each_sides_vetoes() {
+    let mut host = Host::of(2, 2, 2);
+    let said = (&[of(1), of(1)][..], &[1, 1][..]);
+    let keys = [Identity::plain("item")];
+    let mut placed = EncodePlaced::new();
+    for held in [false, true] {
+        for masked in [0_usize, 1] {
+            let other = 1 - masked;
+            let on = |place: usize| {
+                let mask = vec![place as u32];
+                [mask.clone(), if held { mask } else { Vec::new() }]
+            };
+            host.loads = Some(reports(masked));
+            host.vetoes = Default::default();
+            let (decision, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+            let pair = (prefill, decode_of(&decision));
+            assert_eq!(
+                (pair, encoders),
+                ((Some(masked), Some(masked)), vec![masked])
+            );
+            // The prefill at the place is vetoed, and no decode.
+            host.vetoes = [on(masked), Default::default()];
+            let (decision, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+            let pair = (prefill, decode_of(&decision));
+            assert_eq!(pair, (Some(other), Some(masked)), "held {held}");
+            assert_eq!(encoders, vec![masked], "held {held}");
+            // The decode at the place is vetoed, and no prefill.
+            host.vetoes = [Default::default(), on(masked)];
+            let (decision, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+            let pair = (prefill, decode_of(&decision));
+            assert_eq!(pair, (Some(masked), Some(other)), "held {held}");
+            assert_eq!(encoders, vec![masked], "held {held}");
+        }
+    }
+    // A side masked whole: the pair's default pairs past the mask, and the
+    // key is placed. Under a hold on every place of the side no pair is
+    // made, and what was placed is emptied.
+    let whole = |held: bool| [vec![0, 1], if held { vec![0, 1] } else { Vec::new() }];
+    for side in 0..2 {
+        host.vetoes = Default::default();
+        host.vetoes[side] = whole(false);
+        let (decision, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+        assert_eq!(decision.trace().lifted, LiftedVeto::Liveness, "side {side}");
+        assert!(prefill.is_some() && encoders.len() == 1, "side {side}");
+        host.vetoes[side] = whole(true);
+        let (decision, _, encoders) = host.decide(said, &keys, None, &mut placed);
+        assert!(
+            decision.pick().is_none() && encoders.is_empty(),
+            "side {side}"
+        );
+    }
+    host.vetoes = [whole(true), Default::default()];
+    let (decision, _, _) = host.decide(said, &keys, None, &mut placed);
+    assert_eq!(gap(&decision), Some("healthy"));
+
+    // The second prefill's class holds no encoder: the engine admits the
+    // first and the third, and numbers the mask with them.
+    let mut host = Host::of(3, 1, 1);
+    let said = (&[of(1)][..], &[1, 2, 1][..]);
+    for (masked, left) in [(2, 0), (0, 2)] {
+        host.vetoes = [[vec![masked], Vec::new()], Default::default()];
+        for _ in 0..8 {
+            let (_, prefill, _) = host.decide(said, &keys, None, &mut placed);
+            assert_eq!(prefill, Some(left), "masked {masked}");
+        }
+    }
+    // A mask on the prefill left out masks neither of the two admitted.
+    host.vetoes = [[vec![1], Vec::new()], Default::default()];
+    let (_, prefill, _) = host.decide(said, &keys, None, &mut placed);
+    assert!(matches!(prefill, Some(0 | 2)), "{prefill:?}");
+}
+
+/// An encode request that states a mask of its own is declined under the
+/// stage `places`, as its pair's own decision declines it, and no key is
+/// placed: the mask names places of one list, and each side's vetoes are
+/// stated beside its list. So the request is answered alike at its first
+/// decision and at its decode asked again, which is the pair's. What a
+/// pair is not narrowed by is answered first: a hint of 0 sheds the same
+/// request under its own stage. The same place stated beside the prefill
+/// list is passed over, and the request is decided.
+#[test]
+fn an_encode_request_that_states_a_mask_of_its_own_is_declined_under_the_places_name() {
+    let mut host = Host::of(2, 2, 2);
+    let said = (&[of(1), of(1)][..], &[1, 1][..]);
+    let keys = [Identity::plain("item")];
+    let mut placed = EncodePlaced::new();
+    // A key is placed first, so a decline that left it would show.
+    let (_, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert!(prefill.is_some() && encoders.len() == 1);
+    for own in [[vec![1], vec![]], [vec![1], vec![1]], [vec![], vec![1]]] {
+        host.own = own;
+        let (decision, _, encoders) = host.decide(said, &keys, None, &mut placed);
+        assert_eq!(declined_under(&decision), Some("places"), "{:?}", host.own);
+        assert!(encoders.is_empty(), "{:?}", host.own);
+        let (decision, _, _) = host.decide(said, &keys, Some(0), &mut placed);
+        assert_eq!(gap(&decision), Some("subset-hint"), "{:?}", host.own);
+    }
+    host.own = Default::default();
+    host.vetoes = [[vec![1], Vec::new()], Default::default()];
+    for _ in 0..8 {
+        let (_, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+        assert_eq!((prefill, encoders.len()), (Some(0), 1));
     }
 }
 
