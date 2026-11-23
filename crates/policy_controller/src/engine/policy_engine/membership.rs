@@ -43,6 +43,12 @@
 //! subscribes again at the task's next upkeep and reads the registry whole
 //! behind it, so a worker that stood through the gap is not told again.
 //!
+//! A host that states ids of its own can state one of a worker and take
+//! it back ahead of the follow's ask, and the word then names another id.
+//! From the first ask such a host answers with an id, the follow reads the
+//! registry whole at the task's next upkeep behind every registration,
+//! replacement and removal: the read ends with the ids that stand.
+//!
 //! A panic of the host's own code at a word is held and counted
 //! ([`PolicyEngine::upkeep_faults`]). The word is lost, so the follow reads
 //! the registry whole again at the task's next upkeep.
@@ -116,12 +122,14 @@ pub trait Members: Send + Sync {
     /// and each replacement is then told under its own id. A host that
     /// keeps the id by the worker's address answers of the worker that
     /// stands there. An id that stood only between two replacements heard
-    /// together is then told to no stage. So a replacement that changes
-    /// the id told, or of a worker whose id this states, owes a whole read
-    /// at the task's next upkeep, and its snapshot drops what requests
-    /// left under such an id ([`PolicyEngine::set_registry`]). A host that
-    /// states an id between two words and none at either leaves what
-    /// requests left under it until the next whole read.
+    /// together is then told to no stage. So does an id stated of a worker
+    /// and taken back ahead of the word of its registration or its
+    /// removal. The follow knows a host as one that states ids from the
+    /// first ask this answers with one. From then on every registration,
+    /// replacement and removal owes a whole read at the task's next
+    /// upkeep, and its snapshot drops what requests left under such an id
+    /// ([`PolicyEngine::set_registry`]). Ahead of that first answer, what
+    /// requests left under an id taken back waits for the next whole read.
     fn facts_of(&self, _worker: &Arc<dyn Worker>) -> FixedFacts {
         FixedFacts::default()
     }
@@ -209,19 +217,23 @@ pub(super) struct Follow {
     under: FxHashMap<WorkerId, u32>,
     /// Whether the follow owes a whole read of the registry at the task's
     /// next upkeep: at its start, behind a channel that closed, behind a
-    /// word lost to a panic of the host's own code, and behind a
-    /// replacement that changed the id told or whose host states the
-    /// worker's id.
+    /// word lost to a panic of the host's own code, and behind a word of
+    /// membership of a host that states ids.
     unread: bool,
+    /// Whether the host stated an id of a worker at any ask so far. Such a
+    /// host can state an id and take it back between the registry's write
+    /// and the follow's ask.
+    stating: bool,
 }
 
 impl Follow {
     /// The id the stages are told `worker` under: the one its host states,
-    /// or the fingerprint of its address. And whether its host states one.
-    fn id_of(&self, worker: &Arc<dyn Worker>) -> (WorkerId, bool) {
+    /// or the fingerprint of its address. A host that states one is known
+    /// from here on as one that states ids.
+    fn id_of(&mut self, worker: &Arc<dyn Worker>) -> WorkerId {
         let facts = self.registry.facts_of(worker);
-        let stated = facts.id.is_some();
-        (facts.id_or(worker_id(worker.as_ref())), stated)
+        self.stating |= facts.id.is_some();
+        facts.id_or(worker_id(worker.as_ref()))
     }
 }
 
@@ -273,10 +285,9 @@ impl PolicyEngine {
     /// so a stage keeps nothing of a worker whose whole life the channel
     /// dropped. A worker that keeps no state and was replaced inside the
     /// dropped events is told there as its next life. It reads whole
-    /// behind a replacement that changed the id told, or of a worker
-    /// whose id the host states, too, at
-    /// its next upkeep: a host that keeps ids by address may have stated
-    /// another id between two replacements heard together, and the read
+    /// at its next upkeep behind every registration, replacement and
+    /// removal of a host that states ids too: such a host may have stated
+    /// an id of a worker and taken it back ahead of the word, and the read
     /// drops what requests left under it. It does the same behind a
     /// channel that closed, on another
     /// subscription, once a second for as long as the host hands a closed
@@ -309,6 +320,7 @@ impl PolicyEngine {
                     told: FxHashMap::default(),
                     under: FxHashMap::default(),
                     unread: true,
+                    stating: false,
                 })
             }
         };
@@ -344,9 +356,15 @@ impl PolicyEngine {
     /// Tells the document's stages one word of the registry's channel, by
     /// the rule of this file. Whether the channel still stands.
     fn tells(&self, follow: &mut Follow, word: Result<WorkerEvent, RecvError>) -> bool {
+        let membership = matches!(
+            word,
+            Ok(WorkerEvent::Registered { .. }
+                | WorkerEvent::Replaced { .. }
+                | WorkerEvent::Removed { .. })
+        );
         match word {
             Ok(WorkerEvent::Registered { worker_id, worker }) => {
-                let (id, _) = follow.id_of(&worker);
+                let id = follow.id_of(&worker);
                 self.stands(follow, worker_id, &worker, id, false);
             }
             Ok(WorkerEvent::Replaced {
@@ -359,11 +377,7 @@ impl PolicyEngine {
                 // removal was heard ahead: it tells nothing.
                 let held = follow.told.get(&worker_id);
                 if held.is_some_and(|held| held.holds(&old)) {
-                    let (id, stated) = follow.id_of(&new);
-                    // The id may stand while another stood between two
-                    // replacements heard together: the read ends with
-                    // the ids that stand.
-                    follow.unread |= stated;
+                    let id = follow.id_of(&new);
                     self.stands(follow, worker_id, &new, id, true);
                 }
             }
@@ -378,6 +392,10 @@ impl PolicyEngine {
             }
             Err(RecvError::Closed) => return false,
         }
+        // A host that states ids may have stated one of the word's worker
+        // and taken it back ahead of the ask: the read owed here ends with
+        // the ids that stand.
+        follow.unread |= membership && follow.stating;
         true
     }
 
@@ -394,10 +412,7 @@ impl PolicyEngine {
     ///
     /// A join no leave comes ahead of starts with no sent prefixes all the
     /// same: the records forget the id first, so the worker inherits
-    /// nothing of a life the channel dropped whole. A replacement that
-    /// changes the id told owes a whole read, whatever the host states of
-    /// the new object: it may have taken a statement back ahead of the
-    /// word.
+    /// nothing of a life the channel dropped whole.
     fn stands(
         &self,
         follow: &mut Follow,
@@ -410,7 +425,6 @@ impl PolicyEngine {
             if was.id == id && (replaced || was.is(worker)) {
                 return;
             }
-            follow.unread |= replaced;
             self.unnamed(follow, was.id);
         }
         let held = follow.under.entry(id).or_insert(0);
@@ -467,7 +481,7 @@ impl PolicyEngine {
     fn read_whole(&self, follow: &mut Follow) {
         let standing = follow.registry.standing().into_iter();
         let stands: FxHashMap<ObjectId, (WorkerId, Arc<dyn Worker>)> = standing
-            .map(|(object, worker)| (object, (follow.id_of(&worker).0, worker)))
+            .map(|(object, worker)| (object, (follow.id_of(&worker), worker)))
             .collect();
         let held = follow.told.keys();
         let gone: Vec<ObjectId> = held
