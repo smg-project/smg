@@ -976,14 +976,14 @@ pub(super) mod tests {
             mpsc, Arc, Barrier, Weak,
         },
         thread,
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     use smg_worker::{
         identity::{basic::Worker, builder::BasicWorkerBuilder},
         model_card::ModelCard,
         settings::UnhealthyRemovalScope,
-        worker::{HealthCheckConfig, RuntimeType, WorkerType},
+        worker::{HealthCheckConfig, WorkerType},
     };
 
     use super::{
@@ -991,13 +991,9 @@ pub(super) mod tests {
         MembershipWriter, Precondition, Remover, RowRevision, Stated, StoreMembershipWriter, Turn,
     };
     use crate::{
-        document::spec::{AppliedSpec, Pairing, PolicySpec},
+        document::spec::{AppliedSpec, PolicySpec},
         engine::{
-            demands::{DemandFacts, Demands},
-            store_backed_engine::{
-                tests::{pair_request, request, GATEWAY, MODEL},
-                StoreBackedEngine,
-            },
+            demands::DemandFacts,
             view::{Role, WireModes, WorkerId},
         },
         store::{
@@ -1007,7 +1003,6 @@ pub(super) mod tests {
             MembershipChange, MembershipTail, MemoryStore, Registrant, Signals, WorkerFacts,
             WorkerRow, WorkerStatus, WorkersStore,
         },
-        worker_host::facts,
     };
 
     const URL: &str = "http://worker:8000";
@@ -2284,111 +2279,6 @@ pub(super) mod tests {
         }
     }
 
-    /// A worker of a runtime that names its transfer backend by a label, at
-    /// `url` in `role`, of `version`.
-    fn partner(url: &str, role: WorkerType, version: &str) -> Arc<dyn Worker> {
-        Arc::new(
-            <BasicWorkerBuilder>::new(url)
-                .model(ModelCard::new(MODEL))
-                .worker_type(role)
-                .runtime_type(RuntimeType::Sglang)
-                .label("disaggregation_transfer_backend", "nixl")
-                .label("version", version)
-                .build(),
-        )
-    }
-
-    /// The store's door holds a pairing descriptor in its rows, so it states
-    /// the one a built worker derived, at a registration and at a refresh.
-    /// A holder still takes the object for the row's, since the table keeps
-    /// the row's own descriptor, and the same registration again writes
-    /// nothing. A refresh that moves the version label moves the
-    /// descriptor, and under the strict rule the next decision reads it:
-    /// the pair's request finds no pair, by name, and is placed again once
-    /// the prefill follows.
-    #[test]
-    fn the_stores_door_states_the_pairing_its_worker_derived() {
-        const DECODE: &str = "http://decode:8000";
-        let (store, door) = door();
-        let mut strict =
-            PolicySpec::pair_presets("least_load", "least_load").expect("the pair presets");
-        strict.generation = 1;
-        strict.plans.pd_pair.pairing = Pairing::Strict;
-        for side in ["prefill", "decode"] {
-            let profile = strict.profiles.get_mut(side).expect("the side's profile");
-            profile
-                .filter
-                .retain(|stage| !matches!(stage.name(), "has-capacity" | "has-room"));
-        }
-        store
-            .apply(AppliedSpec::validate(&strict).expect("the document validates"))
-            .expect("the first generation");
-        let prefill = partner(URL, WorkerType::Prefill, "1");
-        let decode = partner(DECODE, WorkerType::Decode, "1");
-        // Each row is laid, and a check's word makes it ready.
-        let ready = |built: &Arc<dyn Worker>| {
-            let wrote = door.found_built(&Registrant::Control, Precondition::Absent, built, None);
-            assert!(wrote.is_ok(), "{wrote:?}");
-            let laid = store.by_key(built.url()).expect("the registered row");
-            let _ = store.set_status(laid.id, WorkerStatus::Ready, laid.revision);
-            store.by_key(built.url()).expect("the ready row")
-        };
-        let first = ready(&prefill);
-        let row = ready(&decode);
-        let said = row.facts.pairing.as_deref().expect("a descriptor");
-        assert_eq!(said.transport.as_deref(), Some("nixl"));
-        assert_eq!(said.version.as_deref(), Some("1"));
-        assert_eq!(facts(decode.as_ref(), Some(&row.facts)), row.facts);
-        let again = door.found_built(&Registrant::Control, Precondition::Any, &decode, None);
-        assert_eq!(again, Ok(MembershipWriteOutcome::Unmoved(row.id)));
-        let pairs = || {
-            store.publish_now();
-            store.with_snapshot(|world| {
-                let classes = world.pairs(MODEL).expect("both pools hold a worker");
-                let refused = classes.refusal(WireModes::HTTP);
-                (
-                    classes.pairs(),
-                    refused.map(|refusal| refusal.mismatches.clone()),
-                )
-            })
-        };
-        // A pair's request, decided over the rows as they stand: the
-        // prefill and its decode, or nobody.
-        let policy = StoreBackedEngine::new(Arc::clone(&store));
-        let placed = |id: &'static [u8]| {
-            store.publish_now();
-            let mut asked = pair_request(id);
-            asked.constraints.wire_modes = WireModes::HTTP;
-            let decided = policy.decide(GATEWAY, &asked, Instant::now());
-            let decided = decided.expect("a decision");
-            let target = decided.decision.pick()?.targets.first()?;
-            Some((target.id, target.pair.map(|pair| pair.decode_id)))
-        };
-        assert_eq!(pairs(), (1, None));
-        assert_eq!(placed(b"first"), Some((first.id, Some(row.id))));
-
-        // The decode comes back on another version: no pair, by name.
-        let rebuilt = partner(DECODE, WorkerType::Decode, "2");
-        let wrote = door.refreshed(standing(&row), &rebuilt, &decode);
-        assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(row.id)));
-        let moved = store.by_key(DECODE).expect("the refreshed row");
-        let version = moved
-            .facts
-            .pairing
-            .as_deref()
-            .and_then(|said| said.version.as_deref());
-        assert_eq!(version, Some("2"));
-        assert_eq!(pairs(), (0, Some(vec!["version".to_owned()])));
-        assert_eq!(placed(b"second"), None);
-
-        // The prefill follows, and the same request is placed again.
-        let followed = partner(URL, WorkerType::Prefill, "2");
-        let wrote = door.refreshed(standing(&first), &followed, &prefill);
-        assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(first.id)));
-        assert_eq!(pairs(), (1, None));
-        assert_eq!(placed(b"third"), Some((first.id, Some(row.id))));
-    }
-
     #[test]
     fn a_found_worker_is_registered_under_its_maker() {
         let (store, door) = door();
@@ -2487,16 +2377,13 @@ pub(super) mod tests {
 
     /// A refresh that changes the runtime a worker states starts another
     /// life. The row that stated the old number is gone when the write is
-    /// answered: with no publication awaited, a retry that demands the old
-    /// runtime is decided over nobody, and one that demands the new runtime
-    /// is placed on the new life. The new life is handed the old one's
-    /// status: the worker's checks are on, and none runs between the two.
+    /// answered. The new life is handed the old one's status: the worker's
+    /// checks are on, and none runs between the two.
     #[test]
-    fn a_changed_demand_fact_is_another_life_and_the_old_one_takes_no_retry() {
+    fn a_changed_demand_fact_is_another_life() {
         let (store, door) = door();
         let maker = Registrant::provider("pool", "first").expect("a maker");
         let stating = |runtime| WorkerFacts {
-            models: vec![MODEL.to_owned()],
             demand_facts: DemandFacts {
                 runtime,
                 ..DemandFacts::default()
@@ -2511,25 +2398,6 @@ pub(super) mod tests {
             .set_status(pending.id, WorkerStatus::Ready, pending.revision)
             .expect("ready");
         let old = store.by_key(URL).expect("the ready row");
-        let mut document = PolicySpec::preset("random").expect("a preset of this build");
-        document.generation = 1;
-        let applied = AppliedSpec::validate(&document).expect("the document validates");
-        store.apply(applied).expect("above the unbound start");
-        store.publish_now();
-        let policy = StoreBackedEngine::new(Arc::clone(&store));
-        let decide = |id: &[u8], runtime: u32| {
-            let mut retry = request(id, 7);
-            retry.constraints.wire_modes = WireModes::HTTP;
-            retry.constraints.demands = Demands {
-                runtime,
-                ..Demands::default()
-            };
-            let decided = policy.decide(GATEWAY, &retry, Instant::now());
-            decided.expect("a decision")
-        };
-        let placed = decide(b"before", 7);
-        let target = placed.decision.pick().expect("the worker states runtime 7");
-        assert_eq!(target.targets.first().map(|target| target.id), Some(old.id));
 
         let wrote = door.found_one(&maker, URL, &|_| stating(9));
         let row = store.by_key(URL).expect("the replaced row");
@@ -2549,81 +2417,6 @@ pub(super) mod tests {
             }
         );
         assert_eq!(row.status, WorkerStatus::Ready, "handed on by the store");
-
-        let refused = decide(b"after", 7);
-        assert!(
-            refused.decision.pick().is_none() && refused.lease.is_none(),
-            "the worker states runtime 9: {refused:?}"
-        );
-        let moved = decide(b"moved", 9);
-        let target = moved.decision.pick().expect("the worker states runtime 9");
-        assert_eq!(target.targets.first().map(|target| target.id), Some(row.id));
-    }
-
-    /// A refresh that turns a worker's vision off starts another life, as
-    /// one that changes a demand fact does: the door reads the bit as a
-    /// hard demand. The row that took images is gone when the write is
-    /// answered: with no publication awaited, a request that needs vision
-    /// is decided over nobody, and one that needs none is placed on the
-    /// new life, which is handed the old one's status.
-    #[test]
-    fn a_changed_vision_is_another_life_and_the_new_one_takes_no_image() {
-        let (store, door) = door();
-        let maker = Registrant::provider("pool", "first").expect("a maker");
-        let seeing = |vision| WorkerFacts {
-            models: vec![MODEL.to_owned()],
-            vision,
-            ..stated()
-        };
-        door.found(&maker, Precondition::Any, URL, &|_| seeing(true))
-            .expect("registered");
-        // Its checks are on: a check's word makes the first life ready.
-        let pending = store.by_key(URL).expect("the registered row");
-        store
-            .set_status(pending.id, WorkerStatus::Ready, pending.revision)
-            .expect("ready");
-        let old = store.by_key(URL).expect("the ready row");
-        let mut document = PolicySpec::preset("random").expect("a preset of this build");
-        document.generation = 1;
-        let applied = AppliedSpec::validate(&document).expect("the document validates");
-        store.apply(applied).expect("above the unbound start");
-        store.publish_now();
-        let policy = StoreBackedEngine::new(Arc::clone(&store));
-        let decide = |id: &[u8], vision: bool| {
-            let mut asked = request(id, 7);
-            asked.constraints.wire_modes = WireModes::HTTP;
-            asked.constraints.demands = Demands {
-                vision,
-                ..Demands::default()
-            };
-            let decided = policy.decide(GATEWAY, &asked, Instant::now());
-            decided.expect("a decision")
-        };
-        let placed = decide(b"before", true);
-        let target = placed.decision.pick().expect("the worker takes images");
-        assert_eq!(target.targets.first().map(|target| target.id), Some(old.id));
-
-        let wrote = door.found(&maker, Precondition::Any, URL, &|_| seeing(false));
-        let row = store.by_key(URL).expect("the replaced row");
-        assert_eq!(
-            wrote,
-            Ok(MembershipWriteOutcome::Another {
-                old: old.id,
-                new: row.id
-            })
-        );
-        assert_eq!(store.get(old.id), None);
-        assert!(!row.facts.vision);
-        assert_eq!(row.status, WorkerStatus::Ready, "handed on by the store");
-
-        let refused = decide(b"after", true);
-        assert!(
-            refused.decision.pick().is_none() && refused.lease.is_none(),
-            "the worker takes no image: {refused:?}"
-        );
-        let plain = decide(b"plain", false);
-        let target = plain.decision.pick().expect("the request needs no vision");
-        assert_eq!(target.targets.first().map(|target| target.id), Some(row.id));
     }
 
     #[test]
@@ -3128,5 +2921,273 @@ pub(super) mod tests {
         assert_eq!(mismatch, Err(refused));
         assert_eq!(store.by_key(URL), Some(row));
         assert_eq!(store.by_key("http://another"), None);
+    }
+
+    /// The cases in which a decision reads what the door wrote. The engine
+    /// over worker lists decides over the lists a holder lends, once the
+    /// holder has followed the door's writes.
+    #[cfg(feature = "in-process")]
+    mod decided {
+        use std::{sync::Arc, time::Instant};
+
+        use smg_worker::{
+            identity::{basic::Worker, builder::BasicWorkerBuilder},
+            model_card::ModelCard,
+            registry::WorkerRegistry,
+            worker::{RuntimeType, WorkerType},
+        };
+
+        use super::{door, standing, stated, URL};
+        use crate::{
+            document::spec::{AppliedSpec, Pairing, PolicySpec},
+            engine::{
+                Constraints, DecideOutcome, Decided, Decision, Demands, PairLists, Phase,
+                PolicyEngine, Request, RequestFacts, RequestMaker, Role, ShedReason, WorkerId,
+                WorkerLists,
+            },
+            store::{MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
+            worker_host::{
+                facts, Members, MembershipWriteOutcome, MembershipWriter, Objects, OpenAdmission,
+                Precondition,
+            },
+        };
+
+        const MODEL: &str = "model-a";
+
+        /// A request stated ahead, with the lists its host hands for it.
+        struct Asks<'a>(Request<'a>, WorkerLists<'a>);
+
+        impl RequestMaker for Asks<'_> {
+            fn model(&self) -> &str {
+                self.0.facts.model
+            }
+
+            fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
+                self.0
+            }
+
+            fn workers(&self) -> WorkerLists<'_> {
+                self.1
+            }
+        }
+
+        /// A request for [`MODEL`] at `phase`.
+        fn request(phase: Phase) -> Request<'static> {
+            Request {
+                id: b"request",
+                facts: RequestFacts {
+                    model: MODEL,
+                    seed: 7,
+                    phase,
+                    ..RequestFacts::default()
+                },
+                constraints: Constraints::default(),
+            }
+        }
+
+        /// A holder with a registry of its own, whose objects take their
+        /// rows' status. It reads `store` where a case has it follow.
+        fn holder() -> Objects<Members> {
+            Objects::new(Arc::new(WorkerRegistry::new())).with_status_followed()
+        }
+
+        /// What `engine` decides for `asked` over `lists`: a whole decision.
+        /// `Asks` states no request plain ([`RequestMaker::plain`]), so
+        /// every request is decided whole and none is answered a place.
+        fn decided(
+            engine: &PolicyEngine,
+            asked: Request<'_>,
+            lists: WorkerLists<'_>,
+        ) -> DecideOutcome {
+            let asks = Asks(asked, lists);
+            match engine.decide_at(&asks, Instant::now).expect("an answer") {
+                Decided::Whole(decided, _) => decided,
+                Decided::Alone(_) => panic!("a place for a request that is not plain"),
+            }
+        }
+
+        /// A worker of a runtime that names its transfer backend by a label,
+        /// at `url` in `role`, of `version`.
+        fn partner(url: &str, role: WorkerType, version: &str) -> Arc<dyn Worker> {
+            Arc::new(
+                <BasicWorkerBuilder>::new(url)
+                    .model(ModelCard::new(MODEL))
+                    .worker_type(role)
+                    .runtime_type(RuntimeType::Sglang)
+                    .label("disaggregation_transfer_backend", "nixl")
+                    .label("version", version)
+                    .build(),
+            )
+        }
+
+        /// The store's door holds a pairing descriptor in its rows, so it
+        /// states the one a built worker derived, at a registration and at
+        /// a refresh. A holder still takes the object for the row's, since
+        /// the table keeps the row's own descriptor, and the same
+        /// registration again writes nothing. A refresh that moves the
+        /// version label moves the descriptor, and under the strict rule
+        /// the next decision over the holder's lists reads it: the classes
+        /// pair no prefill with the decode, the pair's request is shed, and
+        /// it is placed once the prefill follows.
+        #[test]
+        fn the_stores_door_states_the_pairing_its_worker_derived() {
+            const DECODE: &str = "http://decode:8000";
+            let (store, door) = door();
+            let mut strict =
+                PolicySpec::pair_presets("least_load", "least_load").expect("the pair presets");
+            strict.generation = 1;
+            strict.plans.pd_pair.pairing = Pairing::Strict;
+            let applied = AppliedSpec::validate(&strict).expect("the document validates");
+            let engine = PolicyEngine::new(applied);
+            let prefill = partner(URL, WorkerType::Prefill, "1");
+            let decode = partner(DECODE, WorkerType::Decode, "1");
+            // Each row is laid, and a check's word makes it ready.
+            let ready = |built: &Arc<dyn Worker>| {
+                let wrote =
+                    door.found_built(&Registrant::Control, Precondition::Absent, built, None);
+                assert!(wrote.is_ok(), "{wrote:?}");
+                let laid = store.by_key(built.url()).expect("the registered row");
+                let _ = store.set_status(laid.id, WorkerStatus::Ready, laid.revision);
+                store.by_key(built.url()).expect("the ready row")
+            };
+            let first = ready(&prefill);
+            let row = ready(&decode);
+            let said = row.facts.pairing.as_deref().expect("a descriptor");
+            assert_eq!(said.transport.as_deref(), Some("nixl"));
+            assert_eq!(said.version.as_deref(), Some("1"));
+            assert_eq!(facts(decode.as_ref(), Some(&row.facts)), row.facts);
+            let again = door.found_built(&Registrant::Control, Precondition::Any, &decode, None);
+            assert_eq!(again, Ok(MembershipWriteOutcome::Unmoved(row.id)));
+            let holder = holder();
+            // A pair's request, decided over the two lists the holder lends
+            // once it has followed the store, under the classes it hands
+            // beside them: whether the prefill and the decode pair, and the
+            // pair the decision picked or what it was shed under.
+            let placed = || {
+                holder.follow::<MemoryStore>(&store);
+                let registry = holder.registry();
+                let generation = registry.model_generation(MODEL).expect("a generation");
+                let lent = |role: Role| engine.members_of(holder.lent(&generation, role));
+                let classes = holder.pair_classes(&generation, Pairing::Strict);
+                let lists = PairLists {
+                    prefill: lent(Role::Prefill),
+                    decode: lent(Role::Decode),
+                    classes,
+                    admission: &OpenAdmission,
+                    prefill_places: None,
+                    decode_places: None,
+                    prefill_stalled: &[],
+                    prefill_held: &[],
+                    decode_stalled: &[],
+                    decode_held: &[],
+                };
+                let asked = request(Phase::Prefill);
+                let picked = match decided(&engine, asked, WorkerLists::Pair(lists)).decision {
+                    Decision::Pick(pick) => {
+                        let target = pick.targets.first().expect("a target");
+                        Ok((target.id, target.pair.map(|pair| pair.decode_id)))
+                    }
+                    Decision::Shed(shed) => Err((shed.reason, shed.emptied_by)),
+                    Decision::Queue(_) => panic!("a pair's request is not queued"),
+                };
+                (classes.pairs(0, 0), picked)
+            };
+            let the_pair: Result<(WorkerId, Option<WorkerId>), (ShedReason, &str)> =
+                Ok((first.id, Some(row.id)));
+            assert_eq!(placed(), (true, the_pair));
+
+            // The decode comes back on another version: the classes pair
+            // no prefill with it.
+            let rebuilt = partner(DECODE, WorkerType::Decode, "2");
+            let wrote = door.refreshed(standing(&row), &rebuilt, &decode);
+            assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(row.id)));
+            let moved = store.by_key(DECODE).expect("the refreshed row");
+            let version = moved
+                .facts
+                .pairing
+                .as_deref()
+                .and_then(|said| said.version.as_deref());
+            assert_eq!(version, Some("2"));
+            assert_eq!(
+                placed(),
+                (false, Err((ShedReason::NoEndpoints, "partnered")))
+            );
+
+            // The prefill follows, and the same request is placed again.
+            let followed = partner(URL, WorkerType::Prefill, "2");
+            let wrote = door.refreshed(standing(&first), &followed, &prefill);
+            assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(first.id)));
+            assert_eq!(placed(), (true, the_pair));
+        }
+
+        /// A refresh that turns a worker's vision off starts another life,
+        /// as one that changes a demand fact does: the door reads the bit
+        /// as a hard demand. The row that took images is gone when the
+        /// write is answered. Once the holder has followed the write, a
+        /// request that needs vision is decided over nobody, and one that
+        /// needs none is placed on the new life, which is handed the old
+        /// one's status.
+        #[test]
+        fn a_changed_vision_is_another_life_and_the_new_one_takes_no_image() {
+            let (store, door) = door();
+            let maker = Registrant::provider("pool", "first").expect("a maker");
+            let seeing = |vision| WorkerFacts {
+                models: vec![MODEL.to_owned()],
+                vision,
+                ..stated()
+            };
+            door.found(&maker, Precondition::Any, URL, &|_| seeing(true))
+                .expect("registered");
+            // Its checks are on: a check's word makes the first life ready.
+            let pending = store.by_key(URL).expect("the registered row");
+            store
+                .set_status(pending.id, WorkerStatus::Ready, pending.revision)
+                .expect("ready");
+            let old = store.by_key(URL).expect("the ready row");
+            let mut document = PolicySpec::preset("random").expect("a preset of this build");
+            document.generation = 1;
+            let applied = AppliedSpec::validate(&document).expect("the document validates");
+            let engine = PolicyEngine::new(applied);
+            let holder = holder();
+            // A request that states whether it needs vision, decided over
+            // the list the holder lends once it has followed the store.
+            let decide = |vision: bool| {
+                holder.follow::<MemoryStore>(&store);
+                let registry = holder.registry();
+                let generation = registry.model_generation(MODEL).expect("a generation");
+                let list = engine.members_of(holder.lent(&generation, Role::Single));
+                let mut asked = request(Phase::Single);
+                asked.constraints.demands = Demands {
+                    vision,
+                    ..Demands::default()
+                };
+                decided(&engine, asked, WorkerLists::Single(list))
+            };
+            let placed = decide(true);
+            let target = placed.decision.pick().expect("the worker takes images");
+            assert_eq!(target.targets.first().map(|target| target.id), Some(old.id));
+
+            let wrote = door.found(&maker, Precondition::Any, URL, &|_| seeing(false));
+            let row = store.by_key(URL).expect("the replaced row");
+            assert_eq!(
+                wrote,
+                Ok(MembershipWriteOutcome::Another {
+                    old: old.id,
+                    new: row.id
+                })
+            );
+            assert_eq!(store.get(old.id), None);
+            assert!(!row.facts.vision);
+            assert_eq!(row.status, WorkerStatus::Ready, "handed on by the store");
+
+            let refused = decide(true);
+            assert!(
+                refused.decision.pick().is_none() && refused.lease.is_none(),
+                "the worker takes no image: {refused:?}"
+            );
+            let plain = decide(false);
+            let target = plain.decision.pick().expect("the request needs no vision");
+            assert_eq!(target.targets.first().map(|target| target.id), Some(row.id));
+        }
     }
 }
