@@ -210,6 +210,7 @@ impl Bed {
         self.file(id, true);
     }
 
+    /// Files the single's lease `id` with `untold` as its record's word.
     fn file(&self, id: u64, untold: bool) {
         let lease = single(id);
         let record = LeaseRecord {

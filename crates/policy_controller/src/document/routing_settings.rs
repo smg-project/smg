@@ -1651,9 +1651,8 @@ fn key_sources(
 ///   gateway's policy hears of no request its sticky map placed
 ///   (`model_gateway/src/policies/registry.rs:736-739`). Both read such a
 ///   request in the count of requests the gateway holds on the worker. A
-///   host that tells a dispatch off a lease on file keeps no word of who
-///   placed it, and its stages hear such a request's dispatch as any
-///   other's.
+///   controller keeps the rule's word on the lease it files, and tells no
+///   stage that dispatch either.
 /// - `passthrough` sends every request to the first worker that takes one.
 /// - `bucket` draws for a single request, and the rule plans single
 ///   requests alone. Its stage places a prefill decision by the sizes it
@@ -1670,10 +1669,8 @@ fn key_sources(
 ///   stages place, as under the policy alone, and behind none the rule
 ///   places alone: the rule keeps those from the profile
 ///   ([`override_rule`]), and the record's writes read that word
-///   (`lease_events::stages_hear`). A host that tells a dispatch off a
-///   lease on file keeps no word of who placed it, and its stages hear
-///   such a request's dispatch as any other's. Its decision is this
-///   engine's, so its record follows the word all the same.
+///   (`lease_events::stages_hear`). A controller's decision is this
+///   engine's, so its record follows the word too.
 fn override_places(policy: &PolicySettings, config: &RoutingSettings) -> bool {
     let placed = matches!(
         policy,

@@ -201,7 +201,8 @@ pub struct LeaseRecord {
     /// and no stage and no count of sends does. An end and a release are
     /// told as any lease's. `false` on every other record, a pair's among
     /// them: each side of a pair keeps a verdict of its own, and a pick's
-    /// one word does not say which side the rule placed.
+    /// one word does not say which side the rule placed. The door that
+    /// files a pair clears the word, as it writes the pair's mark.
     ///
     /// [`RulePlaced::Untold`]: crate::document::spec::RulePlaced::Untold
     pub untold: bool,

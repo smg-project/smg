@@ -4067,14 +4067,17 @@ impl Leases {
 /// Marks `record` as a door files it, in place, and gives the slot it
 /// books: with `pair` the record takes the mark of a pair's lease, and a
 /// prefill side that ended books none; a
-/// record alone is a single's and carries no mark. In place: the record
-/// is not copied on its way to the file.
+/// record alone is a single's and carries no mark. A pair's record states
+/// no word of a request kept from its profile, whatever its caller wrote
+/// ([`LeaseRecord::untold`]): both sides of a pair are told. In place: the
+/// record is not copied on its way to the file.
 fn marked(
     record: &mut LeaseRecord,
     booked: Option<WorkerSlot>,
     pair: &Paired,
 ) -> Option<WorkerSlot> {
     record.decode = pair.as_ref().map(|_| DecodeMark);
+    record.untold &= pair.is_none();
     booked.filter(|_| pair.is_none() || record.state.is_live())
 }
 
