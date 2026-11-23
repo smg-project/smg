@@ -17,8 +17,9 @@
 //!   wake is in the cell. For a run pinned to two cores; no gate reads it;
 //! - `policy_store_journal/member_write/<plain|journaled>/<n>`: one refresh
 //!   of a member's facts, the pool derived again;
-//! - `policy_store_journal/read/<events>`: one reader's copy of a batch out
-//!   of the log, the longest the log's lock is held;
+//! - `policy_store_journal/read/<events>`: one reader's copy of a batch of
+//!   status events out of the log, each with its row, the longest the log's
+//!   lock is held;
 //! - `policy_store_journal/read/watched_at_head`: a watch's read at the
 //!   log's head: nothing to copy, the lock and the look at the log alone.
 //!   The log of the three read cells holds a full ring;
