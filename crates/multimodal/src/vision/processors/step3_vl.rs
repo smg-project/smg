@@ -265,11 +265,6 @@ impl Step3VLProcessor {
         Self::with_crops(enable_patch)
     }
 
-    /// Whether images take crops beside their global view.
-    pub fn crops_enabled(&self) -> bool {
-        self.enable_patch
-    }
-
     /// The plan of a `width` x `height` image: the pad, the view and the crop
     /// grid the reference's rule derives from the size alone.
     pub fn plan(&self, width: u32, height: u32) -> CropPlan {
@@ -709,12 +704,12 @@ mod tests {
     fn the_model_config_switches_the_crops_off() {
         let processor =
             Step3VLProcessor::from_model_config(&json!({"vision_config": {"enable_patch": false}}));
-        assert!(!processor.crops_enabled());
+        assert!(!processor.enable_patch);
         let plan = processor.plan(1920, 1080);
         assert_eq!(plan.crops, None);
         assert_eq!(plan.num_tokens(), 171);
         assert_eq!(plan.num_features(), IMAGE_FEATURE_TOKENS);
-        assert!(Step3VLProcessor::from_model_config(&json!({"vision_config": {}})).crops_enabled());
+        assert!(Step3VLProcessor::from_model_config(&json!({"vision_config": {}})).enable_patch);
     }
 
     /// The tensors of a 1000x300 image: one view, two crops of which the

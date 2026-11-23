@@ -99,17 +99,6 @@ impl Llama4VisionProcessor {
         }
     }
 
-    /// Create a processor with custom max_patches setting.
-    pub fn with_max_patches(max_patches: usize) -> Self {
-        Self {
-            tile_size: TILE_SIZE,
-            max_patches,
-            resize_to_max_canvas: false,
-            mean: LLAMA4_MEAN,
-            std: LLAMA4_STD,
-        }
-    }
-
     /// Create a processor from preprocessor config.
     pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
         Self {
@@ -597,7 +586,10 @@ mod tests {
 
     #[test]
     fn test_find_supported_resolutions() {
-        let processor = Llama4VisionProcessor::with_max_patches(4);
+        let processor = Llama4VisionProcessor {
+            max_patches: 4,
+            ..Llama4VisionProcessor::new()
+        };
         let resolutions = processor.find_supported_resolutions();
 
         // Should include 1x1, 1x2, 2x1, 1x3, 3x1, 2x2, 1x4, 4x1
