@@ -638,8 +638,9 @@ pub struct Constraints<'a> {
 What is not built in the engine that stays: a request that states a subset hint, a pair's demand,
 or protocols that not every worker of its list serves is refused. The refusal names the input,
 except a pair's demand, which is shed under the stage `wires`.
-A pair's encode items are refused at the engine's entry. `EncodeLists::decide` decides them over
-a host's three lists and no entry calls it. The other inputs are honoured by the old engine only.
+A pair's encode items are decided over a host's three lists, with the pair's lease issued
+(`PolicyEngine::decide_encode_at`). The trait's method for them takes no lists and refuses.
+The other inputs are honoured by the old engine only.
 A request that states places of its list (`Constraints::places`) is refused too, and the refusal
 names `places`, where the request is a pair: one list of places cannot hold a pair's two lists
 (5.8). A single request that states places is decided among them.
@@ -782,8 +783,7 @@ the kept one. `GatewayId` is still defined in the store.
 - It honours what it refuses today: an encode request's pair held to some workers of its two
   lists (`PairLists::decide` keeps a pair to the positions its host states, and a single
   request states the positions of its list in `Constraints::places` and is decided, which is
-  built); a pair's demands (a single request's are kept, which is built); a pair's encode
-  items.
+  built); a pair's demands (a single request's are kept, which is built).
 - Five request fields that only the old engine's host fills leave with it (`pinned_at`,
   `lent_in_flight`, `lent_session_in_flight`, `session_counted`, `model_fingerprint`),
   and `Constraints::pins`. One of them needs a successor: a sessions rule with
@@ -904,7 +904,7 @@ pub trait RequestMaker {
     fn model(&self) -> &str;                          // the request's model
     fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w>; // builds the request
     fn plain(&self) -> Option<Plain>;                 // what a plain request states, if it is plain
-    fn workers(&self) -> WorkerLists<'_>;             // the worker list, or a pair's two lists
+    fn workers(&self) -> WorkerLists<'_>;             // the worker list, a pair's two lists, or an encode request's three
     fn loads(&self) -> Option<&Arc<LoadSnapshot>>;    // a request's snapshot of the host's own; without one the engine reads its own
 }
 
@@ -912,6 +912,7 @@ pub enum WorkerLists<'a> {
     None,
     Single(&'a PoolMembers), // one list for a single request
     Pair(PairLists<'a>),     // a pair's prefill list and decode list
+    Encode(EncodeLists<'a>), // an encode request's three lists: its pair's two and its encoders
 }
 
 pub enum Decided {
@@ -1500,14 +1501,14 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; a pair's shadows and `explain.sample` run in the old engine only (decision 7) |
 | The ten presets and the conversion from routing settings | **[built]** | |
 | The stage interfaces and a builder's own stages | **[built]** | |
-| The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, a pair's demand, mixed protocols, encode items; no recorded line replays through it |
+| The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, a pair's demand, mixed protocols; no recorded line replays through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |
 | `cache_aware` on that engine | **[partly]** | its own record has three faults; the two trees are planned |
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | the crate's ring places a routing key on another worker than classic's ring (decision 3) |
 | `manual` and sticky sessions on that engine | **[partly]** | their sheets replay through the decision function, not through the engine |
 | `bucket` on that engine | **[partly]** | the same |
 | Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) is replayed by nothing |
-| Encode-prefill-decode on that engine | **[partly]** | `EncodeLists::decide` decides it over a host's three lists; the engine's entry refuses it and nothing is issued for it |
+| Encode-prefill-decode on that engine | **[partly]** | `PolicyEngine::decide_encode_at` decides it over a host's three lists and issues the pair's lease; it declines a request held to a wire that one worker of the three lists is not dialed on, and one that asks images of its decode and states the later decode; `place` does not take it |
 | The lease and its events; the guard | **[built]** | |
 | The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, and `place` for a single request and for a pair with one decision; `place` for an encode request, the decision made again and the start call are not |
 | The crate's bench of the kept engine | **[planned]** | |

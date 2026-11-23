@@ -456,17 +456,13 @@ pub(super) fn decide(
 }
 
 /// One decision of a pair by `own`, the engine of a gateway's own process,
-/// over the `lists` its host handed, as the host takes it. With no `held`
-/// decision it is the pair's first, and a pick is issued under the engine's
-/// next id ([`issue`]). With the view of the guard that holds the first it
-/// is the decode asked again behind the prefill that view names, and a pick
-/// issues the decode side under the held lease, dated at this call
-/// ([`issue_decode`]). A lease's dispatch is due as a single's.
-///
-/// The decision is the pair's alone ([`decide`]), the wires' test in it. It
-/// reads the reports in `loads`: the snapshot the request gives for this
-/// call, or the newest the engine's own task keeps at hand. A decision that
-/// picks no pair issues nothing.
+/// over the `lists` its host handed, as the host takes it: the pair's
+/// decision alone ([`decide`]), the wires' test in it, with the lease a
+/// pick issued ([`issued`]). With no `held` decision it is the pair's first.
+/// With the view of the guard that holds the first it is the decode asked
+/// again behind the prefill that view names. The decision reads the
+/// reports in `loads`: the snapshot the request gives for this call, or
+/// the newest the engine's own task keeps at hand.
 pub(super) fn decided(
     own: &PolicyEngine,
     lists: &PairLists<'_>,
@@ -475,9 +471,30 @@ pub(super) fn decided(
     loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
 ) -> DecideOutcome {
-    let (spec, later) = (&own.spec, request.constraints.decode_later);
     let target = held.map(|held| held.target);
     let decision = decide(own, lists, request, target, loads, now);
+    issued(own, request, decision, held, now)
+}
+
+/// A pair's `decision` as its host takes it, with the lease its pick is
+/// issued: the one issue of a pair, for its own decision and for an encode
+/// request's ([`super::encode::decided`]). With no `held` decision the pick
+/// is a pair's first, issued under the engine's next id ([`issue`]). With
+/// the view of the guard that holds the first, the pick issues the decode
+/// side under the held lease, dated at this call ([`issue_decode`]). A
+/// lease's dispatch is due as a single's. A decision that picks no pair
+/// issues nothing.
+// In line at its two callers: as a call it costs a pair's decision 33
+// instructions, counted with Callgrind.
+#[inline(always)]
+pub(super) fn issued(
+    own: &PolicyEngine,
+    request: &Request<'_>,
+    decision: Decision,
+    held: Option<&HeldDecision<'_>>,
+    now: Instant,
+) -> DecideOutcome {
+    let (spec, later) = (&own.spec, request.constraints.decode_later);
     let (engine, facts) = (spec.engine(), &request.facts);
     let issued = match held {
         // A shed writes no word that every pick shares.
