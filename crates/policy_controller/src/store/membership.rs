@@ -2,9 +2,11 @@
 //! controller's door uses them behind the wire. A host can use them over
 //! a store it holds in its own process.
 
-use std::{collections::hash_map::RandomState, fmt, hash::BuildHasher};
+use std::{collections::hash_map::RandomState, fmt, hash::BuildHasher, sync::Arc, time::Instant};
 
-use super::workers::{Registrant, WorkerFacts, WorkerRow, WorkerStatus};
+use super::workers::{
+    identity, MembershipChange, Registrant, WorkerFacts, WorkerRow, WorkerStatus,
+};
 
 /// A write of a row by a caller that did not register it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +116,100 @@ impl WorkerFacts {
         } else {
             WorkerFactsChange::InPlace
         }
+    }
+}
+
+/// Whether `new` registers the worker `old` was: its role, its models and
+/// its wires. A registration that differs in one is another worker.
+pub(super) fn same_worker(old: &WorkerFacts, new: &WorkerFacts) -> bool {
+    old.role == new.role && old.same_models(new) && old.wire_modes == new.wire_modes
+}
+
+impl WorkerFacts {
+    /// What a registration of these facts by `maker` makes of `standing`,
+    /// the row that stands under their key, at `now`: the change, and the
+    /// row the change leaves. One rule for every writer of a row, whatever
+    /// the writer reads the standing row from.
+    ///
+    /// The facts carry the incarnation their door gave them. Under the
+    /// standing row's own they change the row in place: it keeps its id,
+    /// its status, its maker and its admission instant, and its revision
+    /// steps. The change is a resize where the width moved. Under another
+    /// incarnation they are the key's next life: a new id, at revision 1,
+    /// admitted at `now`. The key's registration stands through its new
+    /// incarnation, and so does its maker. The status carries over where
+    /// the registration matches ([`same_worker`]), as the registry
+    /// inherits a replaced worker's runtime state. A drain is of the
+    /// registration it named and ends with it: a draining incarnation
+    /// hands no status on. Whether a worker takes images and what it
+    /// states for a request's hard demands are not asked, though a change
+    /// of either starts another life: it is the same reachable worker. A
+    /// key no row stands under is registered: pending, at revision 1, by
+    /// `maker`.
+    ///
+    /// A blank value of a descriptor or of an encode offer is no report:
+    /// the row holds what the two rules read. A descriptor that stands so
+    /// is kept where it is, shared or not: a row written again copies none.
+    pub(crate) fn laid_over(
+        mut self,
+        standing: Option<&WorkerRow>,
+        maker: Registrant,
+        now: Instant,
+    ) -> (MembershipChange, WorkerRow) {
+        if let Some(descriptor) = self
+            .pairing
+            .as_mut()
+            .filter(|descriptor| !descriptor.is_normalized())
+        {
+            Arc::make_mut(descriptor).normalize();
+        }
+        self.encode = self.encode.normalized();
+        let Some(standing) = standing else {
+            let id = identity(&self.key, self.incarnation);
+            let row = WorkerRow {
+                id,
+                facts: self,
+                status: WorkerStatus::Pending,
+                revision: 1,
+                admitted_at: now,
+                maker,
+            };
+            return (MembershipChange::Registered { id }, row);
+        };
+        if standing.facts.incarnation == self.incarnation {
+            let id = standing.id;
+            let change = if standing.facts.dp_size == self.dp_size {
+                MembershipChange::Relabelled { id }
+            } else {
+                MembershipChange::Resized { id }
+            };
+            let row = WorkerRow {
+                id,
+                facts: self,
+                status: standing.status,
+                revision: standing.revision + 1,
+                admitted_at: standing.admitted_at,
+                maker: standing.maker.clone(),
+            };
+            return (change, row);
+        }
+        let new = identity(&self.key, self.incarnation);
+        let carries =
+            standing.status != WorkerStatus::Draining && same_worker(&standing.facts, &self);
+        let row = WorkerRow {
+            id: new,
+            status: if carries {
+                standing.status
+            } else {
+                WorkerStatus::Pending
+            },
+            facts: self,
+            revision: 1,
+            admitted_at: now,
+            maker: standing.maker.clone(),
+        };
+        let old = standing.id;
+        (MembershipChange::Replaced { old, new }, row)
     }
 }
 
@@ -273,7 +369,10 @@ pub fn base() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use super::{base, NotRegistrant, WorkerFactsChange, HALF};
     use crate::{
@@ -281,7 +380,10 @@ mod tests {
             demands::DemandFacts,
             view::{Role, WireModes, WorkerId},
         },
-        store::{ProviderKeyError, Registrant, WorkerFacts, WorkerRow, WorkerStatus},
+        store::{
+            identity, pairing::PairingDescriptor, EncodeOffer, MembershipChange, ProviderKeyError,
+            Registrant, WorkerFacts, WorkerRow, WorkerStatus,
+        },
     };
 
     #[test]
@@ -662,5 +764,188 @@ mod tests {
                 why: "a row is at most 16384 bytes on the wire",
             })
         );
+    }
+
+    /// A row that stands under the key [`stated`] names, in `status`,
+    /// admitted at `admitted_at` and made by a provider.
+    fn standing(status: WorkerStatus, admitted_at: Instant) -> Result<WorkerRow, ProviderKeyError> {
+        Ok(WorkerRow {
+            id: WorkerId(9),
+            facts: WorkerFacts {
+                incarnation: 1,
+                role: Role::Single,
+                wire_modes: WireModes::HTTP,
+                models: vec!["one".to_owned(), "two".to_owned()],
+                dp_size: 1,
+                ..stated()
+            },
+            status,
+            revision: 4,
+            admitted_at,
+            maker: Registrant::provider("pool", "first")?,
+        })
+    }
+
+    /// The rule's first arm: a key no row stands under.
+    #[test]
+    fn facts_laid_over_no_row_register_a_pending_row_by_their_maker() -> Result<(), ProviderKeyError>
+    {
+        let (maker, now) = (Registrant::provider("pool", "first")?, Instant::now());
+        let facts = WorkerFacts {
+            incarnation: 7,
+            ..stated()
+        };
+        let id = identity("url", 7);
+        let (change, row) = facts.clone().laid_over(None, maker.clone(), now);
+        assert_eq!(change, MembershipChange::Registered { id });
+        let registered = WorkerRow {
+            id,
+            facts,
+            status: WorkerStatus::Pending,
+            revision: 1,
+            admitted_at: now,
+            maker,
+        };
+        assert_eq!(row, registered);
+        Ok(())
+    }
+
+    /// The rule's second arm: the standing row's own incarnation. The row
+    /// keeps what is no fact of a registration: its id, its status, when it
+    /// was admitted and who made it.
+    #[test]
+    fn facts_laid_over_their_own_incarnation_change_the_row_in_place(
+    ) -> Result<(), ProviderKeyError> {
+        let earlier = Instant::now();
+        let now = earlier + Duration::from_secs(5);
+        for status in [WorkerStatus::Ready, WorkerStatus::Draining] {
+            let standing = standing(status, earlier)?;
+            let id = standing.id;
+            let mut facts = standing.facts.clone();
+            facts.labels.insert("zone".to_owned(), "b".to_owned());
+            let (change, row) = facts
+                .clone()
+                .laid_over(Some(&standing), Registrant::Control, now);
+            assert_eq!(change, MembershipChange::Relabelled { id });
+            let relabelled = WorkerRow {
+                facts: facts.clone(),
+                revision: 5,
+                ..standing.clone()
+            };
+            assert_eq!(row, relabelled, "over a row that is {status:?}");
+            // A width that moved is told as a resize.
+            facts.dp_size = 2;
+            let (change, row) = facts
+                .clone()
+                .laid_over(Some(&standing), Registrant::Control, now);
+            assert_eq!(change, MembershipChange::Resized { id });
+            let resized = WorkerRow {
+                facts,
+                revision: 5,
+                ..standing
+            };
+            assert_eq!(row, resized, "over a row that is {status:?}");
+        }
+        Ok(())
+    }
+
+    /// The rule's third arm: another incarnation under the key. The same
+    /// worker's status is handed on, a drain never, and the key's maker
+    /// stands through its new life, whoever states it.
+    #[test]
+    fn facts_laid_over_another_incarnation_are_the_keys_next_life() -> Result<(), ProviderKeyError>
+    {
+        type State = fn(&mut WorkerFacts);
+        // What each next life states, and whether it is the worker the row
+        // was: its role, its models however they are ordered, its wires.
+        let lives: [(State, bool); 6] = [
+            (|_| {}, true),
+            (|facts| facts.models.reverse(), true),
+            (|facts| facts.vision = true, true),
+            (|facts| facts.role = Role::Decode, false),
+            (|facts| facts.wire_modes = WireModes::GRPC, false),
+            (|facts| facts.models.push("three".to_owned()), false),
+        ];
+        let earlier = Instant::now();
+        let now = earlier + Duration::from_secs(5);
+        let new = identity("url", 2);
+        for stood in [
+            WorkerStatus::Ready,
+            WorkerStatus::NotReady,
+            WorkerStatus::Draining,
+        ] {
+            let standing = standing(stood, earlier)?;
+            for (life, (state, same)) in lives.into_iter().enumerate() {
+                let mut facts = WorkerFacts {
+                    incarnation: 2,
+                    ..standing.facts.clone()
+                };
+                state(&mut facts);
+                let (change, row) =
+                    facts
+                        .clone()
+                        .laid_over(Some(&standing), Registrant::Control, now);
+                let old = standing.id;
+                assert_eq!(change, MembershipChange::Replaced { old, new });
+                let carried = same && stood != WorkerStatus::Draining;
+                let next = WorkerRow {
+                    id: new,
+                    facts,
+                    status: if carried {
+                        stood
+                    } else {
+                        WorkerStatus::Pending
+                    },
+                    revision: 1,
+                    admitted_at: now,
+                    maker: standing.maker.clone(),
+                };
+                assert_eq!(row, next, "life {life} over a row that is {stood:?}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Ahead of every arm: a blank value of a descriptor or of an encode
+    /// offer is no report, and a descriptor that holds none is shared with
+    /// the row, never copied.
+    #[test]
+    fn facts_laid_over_any_row_hold_no_blank_of_a_descriptor_or_of_an_encode_offer(
+    ) -> Result<(), ProviderKeyError> {
+        let now = Instant::now();
+        let standing = standing(WorkerStatus::Ready, now)?;
+        let blank = PairingDescriptor {
+            protocol: Some(" nixl ".to_owned()),
+            transport: Some(" ".to_owned()),
+            ..PairingDescriptor::default()
+        };
+        let read = Arc::new(PairingDescriptor {
+            protocol: Some("nixl".to_owned()),
+            ..PairingDescriptor::default()
+        });
+        // A new key, the standing row's own incarnation, and another.
+        for (standing, incarnation) in [(None, 1), (Some(&standing), 1), (Some(&standing), 2)] {
+            let facts = WorkerFacts {
+                incarnation,
+                pairing: Some(Arc::new(blank.clone())),
+                encode: EncodeOffer {
+                    connector: Some("  ".to_owned()),
+                    ..EncodeOffer::default()
+                },
+                ..stated()
+            };
+            let (_, row) = facts.laid_over(standing, Registrant::Control, now);
+            assert_eq!(row.facts.pairing.as_ref(), Some(&read));
+            assert_eq!(row.facts.encode.connector, None);
+            let facts = WorkerFacts {
+                incarnation,
+                pairing: Some(Arc::clone(&read)),
+                ..stated()
+            };
+            let (_, row) = facts.laid_over(standing, Registrant::Control, now);
+            let held = row.facts.pairing.expect("the descriptor stated");
+            assert!(Arc::ptr_eq(&held, &read), "shared, not copied");
+        }
+        Ok(())
     }
 }

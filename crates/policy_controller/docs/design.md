@@ -1561,6 +1561,14 @@ A fact leaves the remainder when the worker object gets a field that holds it as
 4. The table of records, the second copy of the facts, the two conversions between a record
    and an object, and the task that follows the table are deleted.
 
+**One rule for a registration's write [built].** What a registration makes of the record under
+its address is one function beside the other membership rules (`WorkerFacts::laid_over`,
+`store/membership.rs`): from the record that stands and the facts stated, the change and the
+record it leaves. The store's own write decides by it over the table's record. It then writes
+the decided change by the one body a standby's applier writes a leader's change by
+(`MemoryStore::follow`). Step 1 gives the rule its second caller: the code that keeps the worker
+objects, over the record read back from an object.
+
 A lease keeps naming its worker by the record's id, never by a place in a list: a gateway
 reports on a lease later and across membership changes.
 

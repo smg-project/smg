@@ -42,6 +42,7 @@ use crate::{
             LeaseState, LeasesStore, Sides, WorkerSlot,
         },
         loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
+        membership::same_worker,
         reservations::{ReservationKind, ReservationStore},
         sessions::{Pin, SessionTables, SessionsStore},
         signals::{SignalSink, SignalWriteOutcome, Writes},
@@ -51,8 +52,8 @@ use crate::{
             ViewQuery, Writer, PUBLISH_WINDOW,
         },
         workers::{
-            identity, MembershipChange, MembershipTail, Registrant, WorkerFacts, WorkerPatch,
-            WorkerRow, WorkerStatus, WorkersStore,
+            MembershipChange, MembershipTail, Registrant, WorkerFacts, WorkerPatch, WorkerRow,
+            WorkerStatus, WorkersStore,
         },
         GatewayId,
     },
@@ -637,10 +638,30 @@ impl MemoryStore {
         change: MembershipChange,
         row: Option<WorkerRow>,
     ) {
-        let mut workers = self.writing_at(Some(at));
-        if epoch != workers.epoch + 1 {
-            return;
+        let workers = self.writing_at(Some(at));
+        if epoch == workers.epoch + 1 {
+            self.decided(workers, Instant::now(), change, row);
         }
+    }
+
+    /// A decided membership change, written under the write's hold of the
+    /// membership lock: the tables, the epoch, the change log and the
+    /// journal's telling, the member's count slot and load entry, the build
+    /// the write owes or pays, the word to the stages and the session pins
+    /// of record. One body for every writer that hands a change with the
+    /// row it leaves: [`Self::follow`] hands a leader's, and the store's
+    /// own registration decides its own over the table's row
+    /// ([`WorkersStore::upsert_by`]). `now` is the write's one read of the
+    /// clock, behind the lock. Whether the change fit the tables, as
+    /// [`Self::follow`] says it: one that does not writes nothing and tells
+    /// the journal nothing.
+    fn decided(
+        &self,
+        mut workers: Writing<'_>,
+        now: Instant,
+        change: MembershipChange,
+        row: Option<WorkerRow>,
+    ) -> bool {
         // A row told again with the offer it had moves no pair class, here
         // as in the leader's own write: the classes are carried.
         let mut carried = false;
@@ -651,7 +672,6 @@ impl MemoryStore {
         // they follow their worker between, and the ids they leave with.
         let mut follows = None;
         let mut ended = Vec::new();
-        let now = Instant::now();
         let (change, left) = match (change, row) {
             (MembershipChange::Registered { id }, Some(row))
                 if row.id == id
@@ -672,7 +692,7 @@ impl MemoryStore {
             ) if row.id == id => {
                 let held = workers.rows.get_mut(&id);
                 let Some(held) = held.filter(|held| held.row.facts.key == row.facts.key) else {
-                    return;
+                    return false;
                 };
                 let resized = held.row.facts.dp_size != row.facts.dp_size;
                 carried = same_offer(&held.row.facts, &row.facts);
@@ -718,7 +738,7 @@ impl MemoryStore {
             }
             (MembershipChange::Removed { id }, None) => {
                 let Some(held) = workers.rows.remove(&id) else {
-                    return;
+                    return false;
                 };
                 workers.by_key.remove(&held.row.facts.key);
                 self.forget_worker(id);
@@ -727,14 +747,14 @@ impl MemoryStore {
             (MembershipChange::StatusChanged { id, from, to }, None) => {
                 let held = workers.rows.get_mut(&id);
                 let Some(held) = held.filter(|held| held.row.status == from) else {
-                    return;
+                    return false;
                 };
                 // The revision counts a row's stated facts: a status
                 // change leaves it, here as in the leader's own write.
                 held.row.status = to;
                 (change, None)
             }
-            _ => return,
+            _ => return false,
         };
         workers.record_over(change, left.as_ref());
         // The build each write leaves, as the leader's own: a join, a
@@ -743,15 +763,21 @@ impl MemoryStore {
         // them. What is owed, the replica's loop pays at the window's end.
         match change {
             MembershipChange::Registered { id } => {
-                // A row's load entry is made after its telling, as a
-                // registration's is.
-                self.loads.lock().ranks.insert(id, Ranks::default());
-                self.index_member(&workers, id);
-                let classes = Classes::Written {
-                    left: None,
-                    joined: Some(id),
+                // A row's load entry is made after its telling, with the
+                // build its join owes, under one hold of the load lock: a
+                // poll's answer for the member finds neither or both, and
+                // with both it pays the build ahead of its own write.
+                let first = {
+                    let mut loads = self.loads.lock();
+                    loads.ranks.insert(id, Ranks::default());
+                    let classes = Classes::Written {
+                        left: None,
+                        joined: Some(id),
+                    };
+                    loads.writer.owe(classes, now)
                 };
-                self.owe(classes, now);
+                self.wake_host(first);
+                self.index_member(&workers, id);
                 self.tell_membership(change);
             }
             MembershipChange::Replaced { old, new } => {
@@ -799,7 +825,10 @@ impl MemoryStore {
             self.pins_follow(old, new);
         }
         drop(workers);
+        #[cfg(test)]
+        seam::released();
         self.forget_gone(&ended);
+        true
     }
 
     /// One of the leader's load rows, applied as the replication stream
@@ -1658,12 +1687,6 @@ struct Gone {
     facts: WorkerFacts,
 }
 
-/// Whether `new` registers the worker `old` was: its role, its models and
-/// its wires. A registration that differs in one is another worker.
-fn same_worker(old: &WorkerFacts, new: &WorkerFacts) -> bool {
-    old.role == new.role && old.same_models(new) && old.wire_modes == new.wire_modes
-}
-
 #[derive(Default)]
 struct Workers {
     rows: FxHashMap<WorkerId, Row>,
@@ -2014,197 +2037,17 @@ impl MemoryStore {
 }
 
 impl WorkersStore for MemoryStore {
-    fn upsert_by(&self, mut facts: WorkerFacts, maker: Registrant) -> MembershipChange {
-        // A blank value of a descriptor or of an encode offer is no report:
-        // the row of record holds what the two rules read. A descriptor that
-        // stands so is kept where it is, shared or not: a row written again
-        // copies none.
-        if let Some(descriptor) = facts
-            .pairing
-            .as_mut()
-            .filter(|descriptor| !descriptor.is_normalized())
-        {
-            Arc::make_mut(descriptor).normalize();
-        }
-        facts.encode = facts.encode.normalized();
-        let mut workers = self.writing();
+    fn upsert_by(&self, facts: WorkerFacts, maker: Registrant) -> MembershipChange {
+        let workers = self.writing();
+        // The rule every writer of a row decides by, over the table's own
+        // row, and the body every decided change is written by.
+        let standing = workers.by_key.get(&facts.key);
+        let standing = standing.and_then(|id| workers.rows.get(id));
+        let standing = standing.map(|held| &held.row);
         let now = Instant::now();
-        if let Some(old_id) = workers.by_key.get(&facts.key).copied() {
-            let same_incarnation = workers
-                .rows
-                .get(&old_id)
-                .is_some_and(|row| row.row.facts.incarnation == facts.incarnation);
-            if same_incarnation {
-                let Some(row) = workers.rows.get_mut(&old_id) else {
-                    return MembershipChange::Removed { id: old_id };
-                };
-                let resized = row.row.facts.dp_size != facts.dp_size;
-                let kept = same_cache(&row.row.facts, &facts);
-                // A registration refreshed with the offer it had moves no
-                // pair class and takes its worker off no model: the role and
-                // the models are the offer's. Another names the models it
-                // took the worker off, for the stages to hear ahead of the
-                // write's own word. The facts it replaces end here either
-                // way, ahead of the write's world.
-                let (classes, left) = if same_offer(&row.row.facts, &facts) {
-                    row.row.facts = facts;
-                    (Classes::Carry, Vec::new())
-                } else {
-                    let old = mem::replace(&mut row.row.facts, facts);
-                    let classes = Classes::Written {
-                        left: Some(old_id),
-                        joined: Some(old_id),
-                    };
-                    (classes, left_models(old, &row.row.facts))
-                };
-                // Under another offer or rank its placements name pools it
-                // may stand in no longer, or another rank's cache.
-                if !kept {
-                    self.kv.forget_sent(old_id);
-                }
-                row.row.revision += 1;
-                let change = workers.record(if resized {
-                    MembershipChange::Resized { id: old_id }
-                } else {
-                    MembershipChange::Relabelled { id: old_id }
-                });
-                self.index_member(&workers, old_id);
-                self.tell_leaving(&workers, classes, change, &left, now);
-                return change;
-            }
-            // A new incarnation under the key: the old id leaves with its
-            // counters; its status carries over when the registration
-            // matches (role, models and wires), as the registry inherits a
-            // replaced worker's runtime state today. A drain is of the
-            // registration it named and ends with it: a draining
-            // incarnation hands no status on. Whether a worker takes images
-            // and what it states for a request's hard demands are not asked,
-            // though a change of either starts another life: it is the same
-            // reachable worker.
-            let old = workers.rows.remove(&old_id);
-            if let Some(old) = &old {
-                self.counts.left(old.slot);
-            }
-            let new_id = identity(&facts.key, facts.incarnation);
-            // The same worker under a new life: its role, its models and
-            // its wires stand. Its status and its session pins follow it.
-            let same = old
-                .as_ref()
-                .is_some_and(|old| same_worker(&old.row.facts, &facts));
-            let status = old
-                .as_ref()
-                .filter(|old| same && old.row.status != WorkerStatus::Draining)
-                .map_or(WorkerStatus::Pending, |old| old.row.status);
-            workers.by_key.insert(facts.key.clone(), new_id);
-            workers.rows.insert(
-                new_id,
-                Row::new(
-                    WorkerRow {
-                        id: new_id,
-                        facts,
-                        status,
-                        revision: 1,
-                        admitted_at: now,
-                        // The key's registration stands through its new
-                        // incarnation, and so does its maker.
-                        maker: old.as_ref().map_or(maker, |old| old.row.maker.clone()),
-                    },
-                    self.join(new_id),
-                ),
-            );
-            // The old incarnation's tables leave with its row, as on a
-            // removal, under the same lock and before the replacement is
-            // told: a veto, a completed dispatch or a load row keyed by the
-            // old id would outlive it for good, and no load of the old
-            // incarnation stands after the replacement in the journal.
-            self.forget_worker(old_id);
-            let change = workers.record_over(
-                MembershipChange::Replaced {
-                    old: old_id,
-                    new: new_id,
-                },
-                old.as_ref().map(|old| &old.row),
-            );
-            // The new incarnation starts with an empty load entry, made
-            // after the telling: nothing the old one reported is the new
-            // one's, and no load of it stands before the replacement.
-            self.loads.lock().ranks.insert(new_id, Ranks::default());
-            self.index_member(&workers, new_id);
-            let classes = Classes::Written {
-                left: Some(old_id),
-                joined: Some(new_id),
-            };
-            // The models the new incarnation no longer stands in a pool of:
-            // the stages hear them for the new id, behind the build the
-            // replacement pays and behind its own word, which retires the
-            // old id and carries its places first.
-            let left = Self::replaced_models(old.map(|old| old.row), workers.rows.get(&new_id));
-            self.pay_leave(&workers, classes, now);
-            self.tell_membership(change);
-            self.tell_left(new_id, &left);
-            // The engine heard the old id leave. Its session pins follow
-            // the key to the new life of the same worker, behind the
-            // replacement's own word, and leave with another worker's.
-            if same {
-                self.pins_follow(old_id, new_id);
-            }
-            drop(workers);
-            #[cfg(test)]
-            seam::released();
-            if !same {
-                self.forget_gone(&[old_id]);
-            }
-            return change;
-        }
-        // A key that left and is registered again: the worker it was,
-        // inside the absence's time, takes its session pins back under
-        // the id this registration makes.
-        let (returned, ended) = workers.take_gone(&facts, now, self.pins_absence());
-        let id = identity(&facts.key, facts.incarnation);
-        workers.by_key.insert(facts.key.clone(), id);
-        workers.rows.insert(
-            id,
-            Row::new(
-                WorkerRow {
-                    id,
-                    facts,
-                    status: WorkerStatus::Pending,
-                    revision: 1,
-                    admitted_at: now,
-                    maker,
-                },
-                self.join(id),
-            ),
-        );
-        // Recorded before the row's load entry exists: no load of a worker
-        // stands before its registration in the journal.
-        let change = workers.record(MembershipChange::Registered { id });
-        // The row's load entry, created with it: what a member's load
-        // writes go into.
-        let first = {
-            let mut loads = self.loads.lock();
-            loads.ranks.insert(id, Ranks::default());
-            let classes = Classes::Written {
-                left: None,
-                joined: Some(id),
-            };
-            loads.writer.owe(classes, now)
-        };
-        self.wake_host(first);
-        self.index_member(&workers, id);
-        self.tell_membership(change);
-        // Behind the join's own word, under the workers lock: no decision
-        // reads the new row before its pins stand under its id, and the
-        // pins of record are renamed in the order of the registrations.
-        if let Some(old) = returned {
-            self.pins_follow(old, id);
-        }
-        drop(workers);
-        #[cfg(test)]
-        seam::released();
-        // Another worker under the key takes none: its pins leave with
-        // those of the keys that stayed away, in one walk a side.
-        self.forget_gone(&ended);
+        let (change, row) = facts.laid_over(standing, maker, now);
+        let fits = self.decided(workers, now, change, Some(row));
+        debug_assert!(fits, "a change decided under the membership lock fits");
         change
     }
 
@@ -5499,8 +5342,8 @@ mod tests {
     }
 }
 
-/// A seam for the cases: a hook the registering thread runs once, where a
-/// registration has let the workers lock go. No case reaches there from
+/// A seam for the cases: a hook the writing thread runs once, where a
+/// membership write has let the workers lock go. No case reaches there from
 /// outside. In no build but the cases'.
 #[cfg(test)]
 pub(crate) mod seam {
@@ -5513,7 +5356,7 @@ pub(crate) mod seam {
     }
 
     /// `hook` runs once, behind the workers lock of this thread's next
-    /// registration of a new life or of a new key.
+    /// registration or followed change.
     pub(crate) fn on_release(hook: impl FnOnce() + 'static) {
         RELEASED.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
     }
