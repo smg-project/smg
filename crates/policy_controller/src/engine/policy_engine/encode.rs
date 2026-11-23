@@ -26,7 +26,7 @@ use crate::engine::{
     framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools},
     list_cell::LentList,
     records::Live,
-    view::Phase,
+    view::{Constraints, Phase},
 };
 
 #[cfg(test)]
@@ -56,6 +56,16 @@ pub struct EncodeLists<'a> {
     pub pair: PairLists<'a>,
     /// The encoders.
     pub encoders: LentList<'a>,
+    /// The places of the encoder list a standing veto of the host masks,
+    /// ascending, each once; empty for none ([`Constraints::stalled`]). The
+    /// encode side reads them as a single request's list reads its own. A
+    /// place past the list's end names no encoder and is passed by without
+    /// a word: a host's standing veto may name a place of an older list.
+    pub encoders_stalled: &'a [u32],
+    /// The places of [`Self::encoders_stalled`] a hold of the host stands
+    /// on, which no rule lifts ([`Constraints::held`]). A place past the
+    /// list's end is passed by here too.
+    pub encoders_held: &'a [u32],
     /// What the encode side reads of each encoder beside its record, by its
     /// place in the encoder list
     /// ([`EncodeClasses::encoder_facts`](crate::store::EncodeClasses::encoder_facts)).
@@ -107,9 +117,25 @@ impl EncodeLists<'_> {
     /// mask and hold beside that side's list
     /// ([`PairLists::prefill_stalled`], [`PairLists::decode_stalled`]),
     /// numbered with the workers the engine admits for the items. A side
-    /// whose host states none reads no mask, and neither do the encoders.
-    /// A side whose profile shows its rows to a plugin is declined beside
-    /// a mask, under the stage `written-rows`.
+    /// whose host states none reads no mask. A side whose profile shows
+    /// its rows to a plugin is declined beside a mask, under the stage
+    /// `written-rows`.
+    ///
+    /// The encoders read their own list's vetoes the same way
+    /// ([`Self::encoders_stalled`], [`Self::encoders_held`]). A stage of
+    /// the encode profile reads the two numbered with the rows it is
+    /// handed: by the list where the engine asks which encoders are open,
+    /// and with the encoders offered where a key is placed. The mask is
+    /// the health filter's to read, as a single request's is: under a
+    /// profile that lists it, a masked encoder is turned away as one that
+    /// is not ready is. It takes no key, a prefill whose class's encoders
+    /// are all masked is not admitted, and with every encoder masked the
+    /// request is shed as with none ready. No rule of the encode side
+    /// lifts a veto, so a hold answers as a mask does. A profile that
+    /// lists no health filter reads no mask. No mask is written into an
+    /// encoder's record: an encode profile that shows its rows to a plugin
+    /// is declined for a request with items, under the stage
+    /// `encode-scope`, with a veto as without.
     ///
     /// No lease is issued here and no stage is told of one: the engine's
     /// entry issues the pair's
@@ -181,6 +207,13 @@ impl EncodeLists<'_> {
         }
         let (facts, cx) = (&request.facts, &request.constraints);
         let [prefill_cx, decode_cx] = pair.masked(cx);
+        // The encoders read their own list's vetoes: the request states
+        // no mask of its own here.
+        let encode_cx = Constraints {
+            stalled: self.encoders_stalled,
+            held: self.encoders_held,
+            ..*cx
+        };
         let encoders = encoders.unwrap_or_else(|| engine.members_of(self.encoders));
         let mut decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;
@@ -212,7 +245,7 @@ impl EncodeLists<'_> {
                 items,
                 &prefill_cx,
                 &decode_cx,
-                cx,
+                &encode_cx,
                 scratch,
                 placed,
             )

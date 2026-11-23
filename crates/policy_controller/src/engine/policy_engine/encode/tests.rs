@@ -63,8 +63,9 @@ impl PairAdmission for Gates {
 /// the host says it just failed to reach. `places` are the places of the
 /// prefill list and of the decode list the host holds the request to.
 /// `vetoes` are the places of each of the two its standing vetoes mask, and
-/// those of them a hold stands on. `own` is a mask the request states
-/// itself: its stalled places, and those a hold stands on.
+/// those of them a hold stands on. `encoder_vetoes` are the same two of the
+/// encoder list. `own` is a mask the request states itself: its stalled
+/// places, and those a hold stands on.
 struct Host {
     engine: PolicyEngine,
     lists: [PublishedList; 3],
@@ -75,6 +76,7 @@ struct Host {
     excluded: Vec<WorkerId>,
     places: [Option<Vec<u32>>; 2],
     vetoes: [[Vec<u32>; 2]; 2],
+    encoder_vetoes: [Vec<u32>; 2],
     own: [Vec<u32>; 2],
 }
 
@@ -168,6 +170,7 @@ impl Host {
             excluded: Vec::new(),
             places: [None, None],
             vetoes: Default::default(),
+            encoder_vetoes: Default::default(),
             own: Default::default(),
         }
     }
@@ -206,6 +209,8 @@ impl Host {
         EncodeLists {
             pair,
             encoders: encoders.lent(),
+            encoders_stalled: &self.encoder_vetoes[0],
+            encoders_held: &self.encoder_vetoes[1],
             facts: said.0,
             prefill_classes: said.1,
         }
@@ -528,6 +533,291 @@ fn an_encode_requests_pair_reads_each_sides_vetoes() {
     host.vetoes = [[vec![1], Vec::new()], Default::default()];
     let (_, prefill, _) = host.decide(said, &keys, None, &mut placed);
     assert!(matches!(prefill, Some(0 | 2)), "{prefill:?}");
+}
+
+/// The encoders read their own list's standing vetoes, stated beside it.
+/// The worker at one place of each list reports the shorter queue, so with
+/// no veto the pair and the encoder are of that place. A veto on the
+/// encoder there, with a hold or without, moves the key alone: the pair
+/// stays. A place past the list's end masks nothing. The encode side lifts
+/// no veto: with every encoder masked the request is shed under the encode
+/// side's stage, as with no encoder ready, and what was placed is emptied.
+#[test]
+fn an_encode_requests_encoders_read_their_own_lists_vetoes() {
+    let mut host = Host::of(2, 2, 2);
+    let said = (&[of(1), of(1)][..], &[1, 1][..]);
+    let keys = [Identity::plain("item")];
+    let mut placed = EncodePlaced::new();
+    for held in [false, true] {
+        for masked in [0_usize, 1] {
+            let other = 1 - masked;
+            let at = Some(masked);
+            host.loads = Some(reports(masked));
+            for free in [[vec![], vec![]], [vec![7], vec![7]]] {
+                host.encoder_vetoes = free;
+                let (decision, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+                assert_eq!(
+                    ((prefill, decode_of(&decision)), encoders),
+                    ((at, at), vec![masked])
+                );
+            }
+            // The encoder at the place is vetoed, and no worker of the pair.
+            let mask = vec![masked as u32];
+            host.encoder_vetoes = [mask.clone(), if held { mask } else { Vec::new() }];
+            let (decision, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+            assert_eq!((prefill, decode_of(&decision)), (at, at), "held {held}");
+            assert_eq!(encoders, vec![other], "held {held}");
+        }
+    }
+    for holds in [vec![], vec![1], vec![0, 1]] {
+        host.encoder_vetoes = [vec![0, 1], holds];
+        let (decision, _, encoders) = host.decide(said, &keys, None, &mut placed);
+        assert_eq!(
+            gap(&decision),
+            Some("encoders"),
+            "{:?}",
+            host.encoder_vetoes
+        );
+        assert!(encoders.is_empty(), "{:?}", host.encoder_vetoes);
+    }
+}
+
+/// A mask names places of the encoder list, whatever part of the list a
+/// key is offered. The second encoder is of another class than the prefill
+/// names, so a key is offered the first and the third: masking the third
+/// leaves the first, and masking the first leaves the third. A mask on the
+/// encoder left out moves no key: the third encoder reports the shorter
+/// queue and keeps the key, though it is the second of the two offered.
+/// With both of the class masked the prefill is admitted no more than with
+/// neither of them ready, and the two sheds name one stage.
+#[test]
+fn an_encoders_mask_names_places_of_the_list_under_a_class_that_holds_a_part_of_it() {
+    let mut host = Host::of(1, 1, 3);
+    let said = (&[of(1), of(2), of(1)][..], &[1][..]);
+    let keys = [Identity::plain("item")];
+    let mut placed = EncodePlaced::new();
+    for (masked, left) in [(2, 0), (0, 2)] {
+        host.encoder_vetoes = [vec![masked], Vec::new()];
+        for _ in 0..8 {
+            let (_, _, encoders) = host.decide(said, &keys, None, &mut placed);
+            assert_eq!(encoders, vec![left], "masked {masked}");
+        }
+    }
+    // The encoder of the other class masked, with none and beside it: the
+    // key stays on the third encoder, which reports the shorter queue.
+    let queued = |place, queued| (url(2, place), one_rank_load(queued, 0.1, 1_000.0));
+    host.loads = Some(LoadSnapshot::from_loads_for_test(vec![
+        queued(0, 5),
+        queued(2, 0),
+    ]));
+    for masked in [Vec::new(), vec![1]] {
+        host.encoder_vetoes = [masked, Vec::new()];
+        let (_, _, encoders) = host.decide(said, &keys, None, &mut placed);
+        assert_eq!(encoders, vec![2], "{:?}", host.encoder_vetoes);
+    }
+    host.loads = None;
+    // The prefill's class masked whole, beside an encoder of another
+    // class that no veto holds back.
+    host.encoder_vetoes = [vec![0, 2], Vec::new()];
+    let (vetoed, _, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert!(vetoed.pick().is_none() && encoders.is_empty());
+    host.encoder_vetoes = Default::default();
+    for place in [0, 2] {
+        host.worker(2, place).set_status(WorkerStatus::NotReady);
+    }
+    let (unready, _, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert!(unready.pick().is_none() && encoders.is_empty());
+    assert!(gap(&vetoed).is_some());
+    assert_eq!(gap(&vetoed), gap(&unready));
+}
+
+/// The pair is picked where an encoder is open, under the encoders' vetoes
+/// as under their readiness: a prefill whose class is masked whole steps
+/// aside for the prefill of a class that holds an open encoder, with a
+/// hold or without.
+#[test]
+fn a_prefill_whose_encoders_are_all_vetoed_steps_aside() {
+    let mut host = Host::of(2, 2, 3);
+    // Encoders 0 and 1 hand to prefill 0, encoder 2 to prefill 1.
+    let said = (&[of(1), of(1), of(2)][..], &[1, 2][..]);
+    let keys = [Identity::plain("item")];
+    let mut placed = EncodePlaced::new();
+    for held in [false, true] {
+        for (masked, prefill_left) in [(vec![0, 1], 1), (vec![2], 0)] {
+            let holds = if held { masked.clone() } else { Vec::new() };
+            host.encoder_vetoes = [masked.clone(), holds];
+            for _ in 0..8 {
+                let (_, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+                assert_eq!(prefill, Some(prefill_left), "{masked:?} held {held}");
+                let class = said.1[prefill_left];
+                assert_eq!(encoders.len(), 1);
+                assert!(
+                    encoders.iter().all(|&at| said.0[at].class == class),
+                    "{masked:?} held {held}: {encoders:?}"
+                );
+                assert!(
+                    encoders.iter().all(|&at| !masked.contains(&(at as u32))),
+                    "{masked:?} held {held}: {encoders:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The masks and the holds a stage of the encode profile was handed in its
+/// constraints, each pair once, in the order it first met them.
+type Handed = Arc<Mutex<Vec<(Vec<u32>, Vec<u32>)>>>;
+
+/// A filter of a host's own build that keeps every row and notes the mask
+/// and the hold its constraints state, and whether a row it was handed
+/// carries a veto's bit of its own.
+#[derive(Debug)]
+struct ReadsVetoes(Handed, Arc<Mutex<bool>>);
+
+impl Filter for ReadsVetoes {
+    fn name(&self) -> &'static str {
+        "reads-vetoes"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, row: &Candidate, cx: &Constraints<'_>) -> bool {
+        *self.1.lock() |= row.health.stalled || row.health.breaker_open;
+        let handed = (cx.stalled.to_vec(), cx.held.to_vec());
+        let mut seen = self.0.lock();
+        if !seen.contains(&handed) {
+            seen.push(handed);
+        }
+        true
+    }
+}
+
+/// A host of one prefill and one decode under the stock encode document
+/// whose encode profile holds the filter `filter` of the host's own build:
+/// in its stock filters' stead where `alone`, and behind them else.
+fn filtering(filter: &'static str, alone: bool, catalog: &StageRegistry, encoders: usize) -> Host {
+    let mut document = stock();
+    let encode = document.profiles.get_mut("encode");
+    let filters = &mut encode.expect("the encode profile").filter;
+    if alone {
+        filters.clear();
+    }
+    filters.push(filter.into());
+    let digest = document.digest().expect("a digest");
+    let spec = AppliedSpec::validate_digested(&document, digest, catalog, &[]);
+    Host::under(spec.expect("a valid document"), 1, 1, encoders)
+}
+
+/// A stage of the encode profile reads the encoders' mask and their hold
+/// in its constraints. The first encoder is of another class than the
+/// prefill names. Where the engine asks which encoders are open, the two
+/// are numbered by the list. A key is offered the open encoders of the
+/// class, and its stages read the two numbered with those: under a profile
+/// whose filters keep a masked encoder open, the third encoder is the
+/// second of the two offered. Under the stock filters the masked encoder is
+/// not open, so a key is offered the second alone, under no mask. A hold
+/// on a part of the mask is handed on as that part. A place past the
+/// list's end is handed on as stated and names no encoder. The mask stays
+/// beside the rows: no row a stage is handed carries a veto's bit.
+#[test]
+fn a_stage_of_the_encode_profile_reads_the_encoders_mask_and_hold() {
+    let (handed, written) = (Handed::default(), Arc::new(Mutex::new(false)));
+    let kept = (Arc::clone(&handed), Arc::clone(&written));
+    let mut catalog = StageRegistry::builtin();
+    catalog
+        .filter("reads-vetoes", move || {
+            Box::new(ReadsVetoes(Arc::clone(&kept.0), Arc::clone(&kept.1)))
+        })
+        .expect("a free filter name");
+    let said = (&[of(2), of(1), of(1)][..], &[1][..]);
+    let keys = [Identity::plain("item")];
+    let mut placed = EncodePlaced::new();
+    let read = || std::mem::take(&mut *handed.lock());
+    let none = || (Vec::new(), Vec::new());
+    // The filter alone: no stage holds a masked encoder back.
+    let mut host = filtering("reads-vetoes", true, &catalog, 3);
+    host.encoder_vetoes = [vec![2], vec![2]];
+    let (_, _, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert_eq!(encoders.len(), 1);
+    assert_eq!(read(), [(vec![2], vec![2]), (vec![1], vec![1])]);
+    host.encoder_vetoes = [vec![1, 9], Vec::new()];
+    let (_, _, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert_eq!(encoders.len(), 1);
+    assert_eq!(read(), [(vec![1, 9], Vec::new()), (vec![0], Vec::new())]);
+    host.encoder_vetoes = [vec![1, 2], vec![2]];
+    let (_, _, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert_eq!(encoders.len(), 1);
+    assert_eq!(read(), [(vec![1, 2], vec![2]), (vec![0, 1], vec![1])]);
+    host.encoder_vetoes = Default::default();
+    let (_, _, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert_eq!(encoders.len(), 1);
+    assert_eq!(read(), [none()]);
+    // Behind the stock filters: the third encoder, masked under a hold,
+    // is not open, and the second takes the key.
+    let mut host = filtering("reads-vetoes", false, &catalog, 3);
+    host.encoder_vetoes = [vec![2], vec![2]];
+    let (_, _, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert_eq!(encoders, vec![1]);
+    assert_eq!(read(), [(vec![2], vec![2]), none()]);
+    assert!(!*written.lock());
+}
+
+/// A filter of a host's own build that opens a scope over the rows it is
+/// handed, as a plugin's stage does, counts the scopes opened and keeps
+/// every row.
+#[derive(Debug)]
+struct ShownRows(Arc<Mutex<u32>>);
+
+impl Filter for ShownRows {
+    fn name(&self) -> &'static str {
+        "shown-rows"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+        true
+    }
+
+    fn scope(&self) -> Option<&dyn DecisionScope> {
+        Some(self)
+    }
+}
+
+impl DecisionScope for ShownRows {
+    fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {
+        *self.0.lock() += 1;
+    }
+
+    fn close(&self) {}
+}
+
+/// An encode profile that shows its rows to a stage is declined for a
+/// request with items under the stage `encode-scope`, with an encoder's
+/// veto as with none: no scope is opened over the encoders and no key is
+/// placed either way. So no mask need be written into an encoder's record.
+#[test]
+fn an_encode_profile_that_shows_its_rows_is_declined_under_a_veto_as_under_none() {
+    let opened = Arc::new(Mutex::new(0));
+    let counted = Arc::clone(&opened);
+    let mut catalog = StageRegistry::builtin();
+    catalog
+        .filter("shown-rows", move || {
+            Box::new(ShownRows(Arc::clone(&counted)))
+        })
+        .expect("a free filter name");
+    let mut host = filtering("shown-rows", false, &catalog, 2);
+    let said = (&[of(1), of(1)][..], &[1][..]);
+    let keys = [Identity::plain("item")];
+    let mut placed = EncodePlaced::new();
+    for vetoes in [[vec![], vec![]], [vec![0], vec![]], [vec![0], vec![0]]] {
+        host.encoder_vetoes = vetoes;
+        let (decision, _, encoders) = host.decide(said, &keys, None, &mut placed);
+        assert_eq!(
+            declined_under(&decision),
+            Some("encode-scope"),
+            "{:?}",
+            host.encoder_vetoes
+        );
+        assert!(encoders.is_empty(), "{:?}", host.encoder_vetoes);
+        assert_eq!(*opened.lock(), 0, "{:?}", host.encoder_vetoes);
+    }
 }
 
 /// An encode request that states a mask of its own is declined under the

@@ -567,6 +567,8 @@ fn a_decode_decided_again_over_an_encode_requests_lists_reads_its_pairs_decodes(
     let three = EncodeLists {
         pair,
         encoders: encoders.lent(),
+        encoders_stalled: &[],
+        encoders_held: &[],
         facts: &[],
         prefill_classes: &[],
     };
