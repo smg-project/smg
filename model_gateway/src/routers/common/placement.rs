@@ -149,7 +149,8 @@ pub(crate) struct PlacementInputs<'a> {
     /// suffixes with it: the request's own id. No classic policy reads it.
     /// The policy engine is handed it and derives the routing value by its
     /// document's own rule, so it is stated whether or not the sticky
-    /// override derives a key.
+    /// override derives a key. The HTTP pair route alone states the derived
+    /// key here, and so states an id only where the override derives one.
     pub rid: Option<&'a str>,
     /// The request's cache partition, when set.
     pub cache_namespace: Option<CacheNamespace>,
