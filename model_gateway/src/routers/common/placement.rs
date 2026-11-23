@@ -753,12 +753,13 @@ fn from_by_engine(
 /// selectable. Records the selection metric under the chosen worker's own
 /// transport label.
 ///
-/// This function and its two siblings are thin fronts, inlined where a
-/// route calls them. Each reads the registry's engine once. Where the
-/// gateway started none it runs the classic selection, which stands as it
-/// did before the engine and answers the worker's handle alone. Where it
-/// started one the engine places the request, out of line.
-#[inline]
+/// This function and its two siblings are thin fronts, always inlined
+/// where a route calls them. Each reads the registry's engine once. Where
+/// the gateway started none it calls the classic selection, which stands
+/// as its own function as it did before the engine and answers the
+/// worker's handle alone. Where it started one the engine places the
+/// request, out of line.
+#[inline(always)]
 pub(crate) fn select_single(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -773,7 +774,10 @@ pub(crate) fn select_single(
     classic_single(registry, policies, model_id, pool, wire, inputs).map(Placed::from)
 }
 
-/// [`select_single`] by the classic policies.
+/// [`select_single`] by the classic policies. Never inlined into its front:
+/// the function a classic placement runs is this one, compiled as it was
+/// before the engine, whatever stands beside its call.
+#[inline(never)]
 fn classic_single(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -791,7 +795,7 @@ fn classic_single(
 /// membership generation. The pool is borrowed from the snapshot: the
 /// selection takes no count of the list. It keeps its name on the way to
 /// the policy.
-#[inline]
+#[inline(always)]
 pub(crate) fn select_single_of(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -841,7 +845,7 @@ fn classic_single_of(
 /// [`select_single`] over an explicit candidate slice: the entry for a caller
 /// with a candidate rule the pools cannot express, such as dropping DP-aware
 /// workers from a path that cannot pin a rank. Nobody names such a list.
-#[inline]
+#[inline(always)]
 pub(crate) fn select_from(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
