@@ -519,6 +519,8 @@ pub struct PoolRecords {
     /// Each worker's record with its fixed fields written and every live
     /// field at rest, by position.
     fixed: Box<[Candidate]>,
+    /// Whether every worker of the list is a regular one.
+    regular: bool,
     /// Each worker's id, by position.
     ids: Box<[WorkerId]>,
     /// What each worker states for a request's hard demands, by position
@@ -666,6 +668,7 @@ impl PoolRecords {
         // membership.
         let number = clock.pools.fetch_add(1, Ordering::Relaxed) + 1;
         Self {
+            regular: fixed.iter().all(|row| row.role == Role::Single),
             fixed,
             ids,
             demand_facts,
@@ -695,6 +698,12 @@ impl PoolRecords {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.fixed.is_empty()
+    }
+
+    /// Whether every worker of the list is a regular one, read once when
+    /// the records were made: a keyed decision is told it with no row read.
+    pub(crate) fn regular(&self) -> bool {
+        self.regular
     }
 
     /// Each worker's id, by its place in the list: the one its program

@@ -5914,7 +5914,9 @@ impl Engine {
             let opened = marks
                 .keyed_scope()
                 .then(|| profile.open(facts, candidates, pool));
-            if vetoed::keeps_its_key(binding, *placing, *vetoed, facts) {
+            if vetoed::keeps_its_key(binding, *placing, *vetoed, facts)
+                && vetoed::regular(candidates, cx)
+            {
                 let rule = binding.sessions.as_ref();
                 // The lifted run stands in for the rule's overload tier. A
                 // pool it leaves nobody is put to the liveness tier, by the
@@ -6118,7 +6120,10 @@ impl Engine {
         if marks.by_assignment() && rule.is_none() {
             return Some(self.assign(profile, index, placing, facts, pool, set, cx, scratch));
         }
-        if marks.keyed() && vetoed::keeps_its_key(binding, placing, entry.vetoed, facts) {
+        if marks.keyed()
+            && vetoed::keeps_its_key(binding, placing, entry.vetoed, facts)
+            && vetoed::regular(candidates, cx)
+        {
             // The binding's own set, as the live decision hands it: a pool
             // the lifted run leaves nobody is put to the liveness tier.
             return Some(match rule {
@@ -8233,6 +8238,9 @@ mod tests {
         let down = with(|row| row.health.healthy = false);
         let mut one_over = free;
         one_over[1].health.overloaded = true;
+        // Prefill workers: no key is kept over them.
+        let mut prefill = with(|row| row.role = Role::Prefill);
+        prefill[1].health.overloaded = true;
         let plain = RequestFacts {
             model: "m",
             ..RequestFacts::default()
@@ -8337,6 +8345,15 @@ mod tests {
                 &doubted,
                 false,
             ),
+            ("kept, prefill workers", None, true, &keyed, &prefill, false),
+            (
+                "kept under a rule, prefill workers",
+                Some(SESSIONS),
+                true,
+                &keyed,
+                &prefill,
+                false,
+            ),
         ];
         let cx = &Constraints::default();
         for (path, sessions, keeps, facts, rows, pinned) in paths {
@@ -8362,6 +8379,11 @@ mod tests {
                 .expect("a shadow decision");
             assert_eq!(said(&shadow), said(&live), "{path}");
             assert_eq!(shadow.trace().profile, 1, "{path}");
+            // The prefill worker over its thresholds passes the key on: a
+            // kept key would take it.
+            if rows[0].role == Role::Prefill {
+                assert_eq!(said(&live).0, [free[0].id], "{path}");
+            }
             if !facts.session_key.is_none() {
                 assert_eq!(
                     engine.sessions().held(facts.session()),
