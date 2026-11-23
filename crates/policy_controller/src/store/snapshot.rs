@@ -4739,8 +4739,8 @@ fn ruling_of(spec: &AppliedSpec, model: &str, rows: &[Candidate]) -> Option<Warm
 }
 
 /// The tree's placement bound for a pool that keeps a record of sent
-/// prefixes: its profile reads them, or its binding's shadow does where
-/// that profile is named no row
+/// prefixes: its profile reads them, its model's pair does at the decode
+/// side, or its binding's shadow does where that profile is named no row
 /// ([`Engine::pool_record_for`](crate::engine::framework::Engine::pool_record_for)).
 fn predict_of(
     spec: &AppliedSpec,

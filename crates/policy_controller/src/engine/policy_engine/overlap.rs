@@ -1355,15 +1355,16 @@ fn state(decision: &mut Decision, feed: Feed<'_>, facts: &RequestFacts<'_>, bloc
 /// ([`lease_events::stages_hear`]). The one test in front of every write
 /// that keeps where a prompt went.
 ///
-/// The rule's word is read through that one function at four places: the
+/// The rule's word is read through that one function at five places: the
 /// words of a single's lease, the record's two writes here, the store of a
-/// prompt in a lent token tree ([`sent_address`]), and the hand-over of a
-/// pin the keyed entry followed to this lookup. Under the rule's default
-/// word a request it places is the profile's own, and its prompt is kept
-/// as any pick's. Under the other the rule keeps the request from the
-/// profile, as a gateway's sticky map hands a request it places to no
-/// policy: the policy's record never sees that request's prompt.
-fn told_target(decision: &Decision) -> Option<&Target> {
+/// prompt in a lent token tree ([`sent_address`]), the hand-over of a pin
+/// the keyed entry followed to this lookup, and a pair's two writes behind
+/// its pick, a side at a time. Under the rule's default word a request it
+/// places is the profile's own, and its prompt is kept as any pick's. Under
+/// the other the rule keeps the request from the profile, as a gateway's
+/// sticky map hands a request it places to no policy: the policy's record
+/// never sees that request's prompt.
+pub(super) fn told_target(decision: &Decision) -> Option<&Target> {
     if !lease_events::stages_hear(decision) {
         return None;
     }
