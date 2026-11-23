@@ -4500,6 +4500,11 @@ fn a_table_past_the_near_caches_answers_held_pieces_in_the_order_cut() {
             format!("{head}item {item} costs {}, ", item * 37 % 1000)
         })
         .collect();
+    // Both texts reach the block pass, or no piece is held.
+    let pattern = &native.stages[0].pattern;
+    let left = pattern.for_each_match::<true, _>(&handed, false, |_, _| {});
+    assert!(pattern.by_blocks(&handed[left..]).is_some());
+    assert!(pattern.by_blocks(&mixed).is_some());
     for (cut, text) in [("handed over", handed), ("by blocks", mixed)] {
         let reference = tokenizer
             .encode(text.as_str(), false)

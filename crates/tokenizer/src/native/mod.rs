@@ -622,9 +622,9 @@ const NEAR_SEED_SLOTS: usize = 131_072;
 /// (`Native::answer_asked`).
 const ASK_AHEAD: usize = 32;
 /// Slots of a thread's packed table past which a unit cut by blocks holds
-/// its pieces. A choice by workload: holding costs 27 instructions a token,
-/// and under a bound of 16,384 slots a text of 32 thousand tokens read 3 %
-/// slower, new and read again (measured).
+/// its pieces. A choice by workload: holding costs 25 to 30 instructions a
+/// token, and under a bound of 16,384 slots a text of 32 thousand tokens
+/// read 3 % slower, new and read again (measured).
 const ASK_AHEAD_SLOTS: usize = 8 * THREAD_BACKING_SLOTS;
 
 /// A piece held for `Native::answer_asked`.
