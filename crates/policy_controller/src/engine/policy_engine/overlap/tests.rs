@@ -1403,3 +1403,268 @@ fn a_profile_named_no_row_is_handed_the_column() {
     let seen = seen.expect("a decision");
     assert_eq!(seen, [(0, 0), (0, 0), (4, 0), (0, 0)]);
 }
+
+/// Three workers publish no blocks on their cache event streams.
+/// The lightest worker takes the cold prompt. All 39 repeats stay there
+/// after it becomes the heaviest worker.
+#[test]
+fn a_worker_that_asks_for_events_and_publishes_none_keeps_its_prompt() {
+    use crate::engine::view::LoadRow;
+
+    let (affinity, _, index) = hosted(true);
+    let bed = Bed::new(affinity, preset("cache_aware"), 3);
+    let index = index.expect("the cache index");
+    for worker in &bed.workers {
+        let number = index.intern_worker(worker.url()).expect("a worker number");
+        assert_eq!(index.worker_block_count(number), 0);
+    }
+
+    let asked = prompt(1_000, 8);
+    let mut rows = records(&bed.ids);
+    let pool = PoolFacts {
+        pool_size: 3,
+        generation: 1,
+        ..PoolFacts::default()
+    };
+    let mut scratch = Scratch::new();
+    for turn in 0..40 {
+        let now = NOW + turn * 20_000;
+        let loads = if turn == 0 { [0, 1, 1] } else { [2, 0, 0] };
+        for (row, running) in rows.iter_mut().zip(loads) {
+            row.load = Some(LoadRow {
+                running,
+                ..LoadRow::default()
+            });
+            row.load_sampled_at_micros = now;
+        }
+
+        let decision = decide(
+            &bed.affinity,
+            &bed.pool,
+            &bed.spec,
+            &bed.workers,
+            &bed.ids,
+            &mut request(&asked, 7, now),
+            |_| None,
+            |_| true,
+            |facts| {
+                bed.spec
+                    .engine()
+                    .decide(facts, &pool, &rows, &Constraints::default(), &mut scratch)
+            },
+        );
+        let pick = decision.pick().expect("a pick");
+        let target = pick.targets.first().expect("a target");
+        assert_eq!(target.id, bed.ids[0], "turn {turn}");
+    }
+}
+
+/// A pick records the eight-block prompt. A same-tick repeat preserves
+/// its place in eviction order. A repeat one tick later renews its last use.
+#[test]
+fn a_request_sent_a_moment_ago_writes_nothing() {
+    let asked = prompt(1_000, 8);
+    let marker = prompt(2_000, 1);
+    let first = request(&asked, 7, NOW);
+
+    for (last, depth_after_eviction) in [(NOW, 7), (NOW + (1 << 20), 8)] {
+        let (affinity, _, _) = hosted(false);
+        let bed = Bed::new(affinity, preset("cache_aware"), 1);
+        bed.decide(&first, Some(0));
+        assert_eq!(bed.holders(&asked, NOW), [(0, 0, 8)]);
+
+        bed.decide(&request(&marker, 7, NOW), Some(0));
+        bed.decide(&first, Some(0));
+        if last != NOW {
+            bed.decide(&request(&asked, 7, last), Some(0));
+        }
+
+        // The older of the two ends loses one block.
+        let record = bed.affinity.record_of(MODEL, 8);
+        record.predictor.write().sweep(1);
+        assert_eq!(
+            bed.holders(&asked, last),
+            [(0, 0, depth_after_eviction)],
+            "prompt depth after one eviction at {last} microseconds"
+        );
+    }
+}
+
+/// Full write slices contain sixteen blocks. The last slice can be shorter.
+/// Same-tick hits at the slice ends preserve their eviction order.
+#[test]
+fn a_long_request_is_written_in_slices_of_sixteen() {
+    let cases: [(u32, u32, &[u32]); 3] = [
+        (1_000, 40, &[16, 32, 40]),
+        (2_000, 32, &[16, 32]),
+        (3_000, 33, &[16, 32, 33]),
+    ];
+    let (affinity, _, _) = hosted(false);
+    let previous = Bed::new(affinity, preset("cache_aware"), 2);
+
+    // Give every block an older tick on a worker outside the next list.
+    for &(first, blocks, _) in &cases {
+        let asked = prompt(first, blocks);
+        previous.decide(&request(&asked, 7, NOW - (1 << 20)), Some(1));
+    }
+    let bed = Bed::new(previous.affinity, previous.spec, 1);
+
+    for (first, blocks, expected_ends) in cases {
+        let asked = prompt(first, blocks);
+        let facts = request(&asked, 7, NOW);
+        let cold = bed.decide(&facts, Some(0)).expect("named rows");
+        assert!(cold.holders.is_empty(), "cold prompt of {blocks} blocks");
+
+        // Only the ends of writes receive the new tick on existing blocks.
+        let mut ends = Vec::new();
+        for end in 1..=blocks {
+            let prefix = RequestFacts {
+                block_hashes: &facts.block_hashes[..end as usize],
+                prompt_tokens: end * BLOCK,
+                ..facts
+            };
+            let (_, read) = bed.column(&prefix, Phase::Single);
+            let read = read.expect("the prefix record").read;
+            assert_eq!(read.blocks, end, "recorded depth for prefix {end}");
+            if read.fresh {
+                ends.push(end);
+            }
+        }
+        assert_eq!(ends.as_slice(), expected_ends, "{blocks} cold blocks");
+    }
+
+    let marker = prompt(9_000, 1);
+    bed.decide(&request(&marker, 7, NOW), Some(0));
+    for end in [40, 16, 32] {
+        let prefix = prompt(1_000, end);
+        let named = bed
+            .decide(&request(&prefix, 7, NOW), Some(0))
+            .expect("named rows");
+        assert_eq!(named.holders, [(0, 0, end)]);
+    }
+
+    // A write at any repeated end puts it after the marker.
+    let record = bed.affinity.record_of(MODEL, 1);
+    record.predictor.write().sweep(usize::MAX);
+    assert_eq!(
+        bed.holders(&marker, NOW),
+        [(0, 0, 1)],
+        "the marker stays newest"
+    );
+}
+
+/// A repeat names the picked worker at a predicted depth of twelve blocks.
+/// Changing only the namespace seed leaves the holder list empty.
+#[test]
+fn a_namespace_keeps_its_prefixes_apart() {
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 1);
+    let asked = prompt(1_000, 12);
+    let mut facts = request(&asked, 7, NOW);
+
+    bed.decide(&facts, Some(0));
+    assert_eq!(bed.holders(&asked, NOW), [(0, 0, 12)]);
+
+    facts.namespace_seed ^= 1;
+    let named = bed.decide(&facts, None).expect("rows named");
+    assert!(named.holders.is_empty());
+}
+
+/// A pick with no hashes leaves the prefix record empty.
+/// A pick for twelve text windows records all twelve for its worker.
+#[test]
+fn a_text_request_is_recorded_and_absent_hashes_are_not() {
+    use crate::engine::view::TEXT_BYTES_PER_TOKEN;
+
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 1);
+    let empty = PromptHashes::default();
+    bed.decide(&request(&empty, 7, NOW), Some(0));
+
+    let record = {
+        let records = bed.affinity.records.lock();
+        Arc::clone(records.get(MODEL).expect("the model's record"))
+    };
+    assert!(record.predictor.read().is_empty());
+
+    let window = (BLOCK * TEXT_BYTES_PER_TOKEN) as usize;
+    let text = "x".repeat(12 * window);
+    let asked =
+        PromptHashes::under_document(&bed.spec, Some(BLOCK), None, Some(&text), HashSeeds::PLAIN);
+    let facts = request(&asked, 7, NOW);
+    assert_eq!(
+        (facts.hash_kind, facts.block_hashes.len()),
+        (HashKind::Text, 12)
+    );
+
+    bed.decide(&facts, Some(0));
+    assert_eq!(
+        record.predictor.read().len(),
+        12,
+        "one placement per window"
+    );
+    assert_eq!(bed.holders(&asked, NOW), [(0, 0, 12)]);
+}
+
+/// A shed leaves the first prompt's twelve prefix keys in the buffer.
+/// An unhashed least-load pick for another model leaves the first record empty.
+/// A repeat of the first prompt still names no holder.
+#[test]
+fn a_decision_that_names_no_row_writes_nothing_of_the_one_before() {
+    let mut document = PolicySpec::preset("least_load").expect("least-load preset");
+    let reader = PolicySpec::preset("cache_aware").expect("cache-aware preset");
+    let mut binding = reader.bindings[0].clone();
+    binding.matcher.model = MODEL.into();
+    document.bindings.insert(0, binding);
+    document.profiles.extend(reader.profiles);
+    let spec = AppliedSpec::validate(&document).expect("both bindings validate");
+
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, spec, 1);
+    let asked = prompt(1_000, 12);
+    assert!(bed.holders(&asked, NOW).is_empty());
+    assert_eq!(
+        with_buffers(|buffers| buffers.keys.len()),
+        12,
+        "the first lookup leaves its prefix keys"
+    );
+
+    let empty = PromptHashes::default();
+    let mut other = request(&empty, 7, NOW);
+    other.model = "model-b";
+    let rows = records(&bed.ids);
+    let pool = PoolFacts {
+        pool_size: 1,
+        generation: 1,
+        ..PoolFacts::default()
+    };
+    let decision = decide(
+        &bed.affinity,
+        &bed.pool,
+        &bed.spec,
+        &bed.workers,
+        &bed.ids,
+        &mut other,
+        |_| None,
+        |_| true,
+        |facts| {
+            assert!(facts.named.is_none(), "least load receives no named rows");
+            bed.spec.engine().decide(
+                facts,
+                &pool,
+                &rows,
+                &Constraints::default(),
+                &mut Scratch::new(),
+            )
+        },
+    );
+    let pick = decision.pick().expect("least-load pick");
+    assert_eq!(pick.targets.first().expect("first target").id, bed.ids[0]);
+
+    {
+        let records = bed.affinity.records.lock();
+        let record = records.get(MODEL).expect("the first model's record");
+        assert!(record.predictor.read().is_empty());
+    }
+    assert!(bed.holders(&asked, NOW).is_empty());
+}

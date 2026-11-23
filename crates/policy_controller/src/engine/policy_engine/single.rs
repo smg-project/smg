@@ -3637,4 +3637,279 @@ pub(crate) mod tests {
             "{followed} pins followed, {left} left"
         );
     }
+
+    /// One worker states runtime 7 and the other states no runtime.
+    /// A request for runtime 9 is shed under `wires` with no endpoint.
+    /// The shed takes no lease ID and sends no issue event.
+    #[test]
+    fn a_runtime_demand_no_member_meets_is_shed_without_a_lease() {
+        let (engine, heard) = hearing_as(false, true, EventSet::LEASE);
+        let list = pool(2);
+        let members = PublishedList::with_facts(Arc::clone(&list), |worker| FixedFacts {
+            demands: DemandFacts {
+                runtime: if Arc::ptr_eq(worker, &list[0]) { 7 } else { 0 },
+                ..DemandFacts::default()
+            },
+            ..FixedFacts::default()
+        });
+        let mut asked = request();
+        asked.constraints.demands.runtime = 9;
+
+        let outcome = decided(&engine, &Asks::of(asked, Some(&members)));
+        let Decision::Shed(shed) = outcome.decision else {
+            panic!("expected a shed for runtime 9, got {:?}", outcome.decision);
+        };
+        assert_eq!(
+            (shed.reason, shed.emptied_by),
+            (ShedReason::NoEndpoints, "wires")
+        );
+        assert!(outcome.lease.is_none());
+        assert_eq!(
+            engine.leases.0.load(Ordering::Relaxed),
+            0,
+            "no lease ID taken"
+        );
+        assert!(heard.lock().is_empty(), "no lease issue reaches the picker");
+    }
+
+    /// The workers state decoding values 5 and 0.
+    /// A request for 7 is shed under `decoding`.
+    /// A request for 5 picks the worker that states 5.
+    #[test]
+    fn a_constraint_no_member_decides_alike_is_shed_under_its_own_stage() {
+        let engine = preset("random");
+        let list = pool(2);
+        let members = PublishedList::with_facts(Arc::clone(&list), |worker| FixedFacts {
+            demands: DemandFacts {
+                decoding: if Arc::ptr_eq(worker, &list[0]) { 5 } else { 0 },
+                ..DemandFacts::default()
+            },
+            ..FixedFacts::default()
+        });
+        let mut asks = Asks::of(request(), Some(&members));
+        asks.request.constraints.demands.decoding = 7;
+        let missed = decided(&engine, &asks).decision;
+        let Decision::Shed(shed) = missed else {
+            panic!("expected a shed for decoding 7, got {missed:?}");
+        };
+        assert_eq!(
+            (shed.reason, shed.emptied_by),
+            (ShedReason::NoEndpoints, "decoding")
+        );
+
+        asks.request.constraints.demands.decoding = 5;
+        let matched = decided(&engine, &asks).decision;
+        let pick = matched.pick().expect("a worker states decoding 5");
+        let first = pick.targets.first().expect("a first target");
+        assert_eq!(first.id, worker_id(list[0].as_ref()));
+    }
+
+    /// Vision and reference demands select the workers that meet them.
+    /// Each excluded worker fails at its first unmet demand.
+    /// The latest of those demands names the shed when the pool empties.
+    #[test]
+    fn a_media_demand_keeps_the_members_that_take_it_and_names_its_shed() {
+        use crate::engine::References;
+
+        let engine = preset("random");
+        let members_with = |states: &[(bool, bool, bool)]| {
+            let list = pool(states.len());
+            let mut states = states.iter().copied();
+            PublishedList::with_facts(Arc::clone(&list), |_| {
+                let (vision, references, host_pipeline) =
+                    states.next().expect("media facts for each worker");
+                FixedFacts {
+                    vision,
+                    demands: DemandFacts {
+                        runtime: 7,
+                        references,
+                        host_pipeline,
+                        ..DemandFacts::default()
+                    },
+                    ..FixedFacts::default()
+                }
+            })
+        };
+        let mixed = members_with(&[
+            (true, false, false),
+            (true, true, true),
+            (false, true, false),
+        ]);
+        let id = |at: usize| worker_id(mixed.workers()[at].as_ref());
+        let (plain, caller, own) = (id(0), id(1), id(2));
+        let media = |vision, references| Demands {
+            vision,
+            references,
+            ..Demands::default()
+        };
+
+        for (vision, references, expected) in [
+            (true, References::None, BTreeSet::from([plain, caller])),
+            (false, References::Any, BTreeSet::from([caller, own])),
+            (false, References::Caller, BTreeSet::from([caller])),
+            (false, References::Worker, BTreeSet::from([own])),
+        ] {
+            let mut asks = Asks::of(request(), Some(&mixed));
+            asks.request.constraints.demands = media(vision, references);
+            let mut firsts = BTreeSet::new();
+            for seed in 0..48_u64 {
+                asks.request.facts.seed = seed;
+                let outcome = decided(&engine, &asks);
+                let pick = outcome.decision.pick().expect("a matching worker");
+                firsts.insert(pick.targets.first().expect("a first target").id);
+            }
+            assert_eq!(
+                firsts, expected,
+                "vision {vision}, references {references:?}"
+            );
+        }
+
+        let other_runtime = Demands {
+            runtime: 9,
+            ..media(true, References::Caller)
+        };
+        let blind = members_with(&[(false, true, true), (false, false, false)]);
+        for (members, demands, stage) in [
+            (&mixed, media(true, References::Worker), "pipeline"),
+            (&mixed, other_runtime, "wires"),
+            (&blind, media(true, References::Any), "vision"),
+        ] {
+            assert_eq!(
+                places_named(&engine, members, demands),
+                Err((ShedReason::NoEndpoints, stage)),
+                "{demands:?}"
+            );
+        }
+    }
+
+    /// One model has a worker that takes images.
+    /// A vision request for a model with no list is shed under `none`.
+    #[test]
+    fn a_demand_for_a_model_no_member_serves_is_shed_under_no_stage() {
+        let engine = preset("random");
+        let members = PublishedList::with_facts(pool(1), |_| FixedFacts {
+            vision: true,
+            ..FixedFacts::default()
+        });
+        let mut asked = request();
+        asked.constraints.demands.vision = true;
+        let listed = decided(&engine, &Asks::of(asked, Some(&members)));
+        assert!(
+            listed.decision.pick().is_some(),
+            "the listed model takes images"
+        );
+
+        asked.facts.model = "a-model-nobody-serves";
+        let absent = decided(&engine, &Asks::of(asked, None)).decision;
+        let Decision::Shed(shed) = absent else {
+            panic!("expected a shed for the absent model, got {absent:?}");
+        };
+        assert_eq!(
+            (shed.reason, shed.emptied_by),
+            (ShedReason::NoEndpoints, "none")
+        );
+    }
+
+    /// The first pick records the block for the blind worker.
+    /// An unrestricted repeat picks that worker again.
+    /// A vision request for the same block picks the sighted worker.
+    #[test]
+    fn a_vision_demand_skips_the_blind_holder_of_the_first_block() {
+        let engine = preset("cache_aware");
+        let list = pool(2);
+        let (blind, sighted) = (&list[0], &list[1]);
+        let members = PublishedList::with_facts(Arc::clone(&list), |worker| FixedFacts {
+            vision: Arc::ptr_eq(worker, sighted),
+            ..FixedFacts::default()
+        });
+
+        let mut prompt = request();
+        prompt.facts.block_hashes = &[17];
+        let mut to_blind = prompt;
+        to_blind.constraints.places = Some(&[0]);
+        let mut vision = prompt;
+        vision.constraints.demands.vision = true;
+
+        for (asked, expected, step) in [
+            (to_blind, blind, "first placement"),
+            (prompt, blind, "unrestricted repeat"),
+            (vision, sighted, "vision request"),
+        ] {
+            let outcome = decided(&engine, &Asks::of(asked, Some(&members)));
+            let pick = outcome.decision.pick().expect("a pick");
+            let first = pick.targets.first().expect("a target");
+            assert_eq!(first.id, worker_id(expected.as_ref()), "{step}");
+        }
+    }
+
+    /// The picker declares its needs while the document is built.
+    /// Two single requests get picks without another call to `needs` or a fault.
+    #[test]
+    fn a_stage_is_asked_what_it_needs_at_the_build_alone() {
+        use std::sync::atomic::AtomicBool;
+
+        use crate::{
+            document::spec::Needs,
+            engine::{framework::DecisionScope, view::PoolFacts},
+        };
+
+        #[derive(Debug)]
+        struct BuildNeeds(Arc<AtomicBool>);
+
+        impl Lifecycle for BuildNeeds {}
+
+        impl DecisionScope for BuildNeeds {
+            fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+
+            fn close(&self) {}
+        }
+
+        impl Picker for BuildNeeds {
+            fn name(&self) -> &'static str {
+                "build-needs"
+            }
+
+            fn needs(&self) -> Needs {
+                assert!(!self.0.load(Ordering::Relaxed), "needs ran after the build");
+                Needs {
+                    active_sessions: true,
+                    ..Needs::default()
+                }
+            }
+
+            fn scope(&self) -> Option<&dyn DecisionScope> {
+                Some(self)
+            }
+
+            fn pick(
+                &self,
+                facts: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                kept: &[u32],
+                scores: &[f32],
+                band: TieBand,
+                out: &mut Targets,
+            ) {
+                Random.pick(facts, candidates, kept, scores, band, out);
+            }
+        }
+
+        let armed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&armed);
+        let engine = picked_by("build-needs", move || {
+            Box::new(BuildNeeds(Arc::clone(&flag)))
+        });
+        armed.store(true, Ordering::Relaxed);
+
+        let members = PublishedList::new(pool(3));
+        for id in [b"r-1", b"r-2"] {
+            let asks = Asks::of(Request { id, ..request() }, Some(&members));
+            assert!(decided(&engine, &asks).decision.pick().is_some());
+        }
+        assert_eq!(engine.faults(), 0);
+        assert!(
+            engine.spec().needs().active_sessions,
+            "the build recorded the picker's declared need"
+        );
+    }
 }

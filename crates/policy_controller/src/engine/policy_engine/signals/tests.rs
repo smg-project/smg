@@ -983,3 +983,31 @@ async fn a_worker_that_pushes_over_several_ranks_gives_no_value() {
     let read = read_at(&built, &asks(7, &members, Some(&loads)), later);
     assert_eq!(read, [(0, None), (1, Some(9.5))]);
 }
+
+/// A request for runtime 7 gets a pick.
+/// The scorer reads 11 tokens from the second worker and 13 from the fourth.
+/// It reads no other worker.
+#[test]
+fn rows_a_demand_leaves_read_their_own_signal_values() {
+    use crate::engine::{DemandFacts, FixedFacts};
+
+    let built = built(&reads("", "best"));
+    let list = pool(4);
+    let mut runtimes = [9, 7, 9, 7].into_iter();
+    let members = PublishedList::with_facts(Arc::clone(&list), |_| FixedFacts {
+        demands: DemandFacts {
+            runtime: runtimes.next().expect("one runtime per worker"),
+            ..DemandFacts::default()
+        },
+        ..FixedFacts::default()
+    });
+    let loads = stepped(4, 10.0);
+    let mut asked = asks(7, &members, Some(&loads));
+    asked.request.constraints.demands.runtime = 7;
+
+    let decision = decided_at(&built.engine, &asked, Instant::now());
+    assert!(decision.pick().is_some(), "{decision:?}");
+    let mut read = mem::take(&mut *built.read.lock());
+    read.sort_by_key(|&(place, _)| place);
+    assert_eq!(read, [(1, Some(11.0)), (3, Some(13.0))]);
+}

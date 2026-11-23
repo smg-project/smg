@@ -2,7 +2,7 @@
 //! The lock holds a push or a scan of the seat's recent decisions.
 
 #![cfg_attr(
-    not(feature = "controller"),
+    not(any(test, feature = "controller")),
     expect(
         dead_code,
         reason = "Only the served controller keeps sampled records."
@@ -347,5 +347,82 @@ mod tests {
         assert!(!count.keeps(0, &engine, &ticket));
         assert!(!count.keeps(0, &engine, &shed));
         assert!(count.keeps(0, &engine, &shed));
+    }
+
+    /// The next push to a full ring drops its oldest record.
+    /// The second and last request ids still find their records.
+    #[test]
+    fn the_ring_loses_its_oldest_record_when_it_wraps() {
+        let mut engine = naming_engine(7);
+        engine.set_explain_sample(1);
+        let shed = record(engine.generation(), None, 0);
+        let mut count = SampleCount::default();
+        let mut samples = Samples::default();
+
+        for n in 0..=SLOTS {
+            assert!(
+                count.keeps(0, &engine, &shed.decision),
+                "every shed is sampled"
+            );
+            let id = n.to_le_bytes();
+            let taken = (shed.at, shed.gateway, &id[..]);
+            samples.push(0, None, taken, &shed.decision, None, [None; 2]);
+        }
+        for (n, present) in [(0, false), (1, true), (SLOTS, true)] {
+            let found = samples.find(0, shed.gateway, fingerprint(&n.to_le_bytes()));
+            assert_eq!(found.is_some(), present, "request {n}");
+        }
+    }
+
+    /// The old generation stops one shed short of a sample.
+    /// The new generation skips its first shed and keeps its second.
+    #[test]
+    fn the_count_starts_over_under_a_new_generation() {
+        let mut document = PolicySpec::preset("random").expect("a preset");
+        document.explain.sample = 2;
+        let first = document.validate().expect("a valid document");
+        document.generation += 1;
+        let next = document.validate().expect("a valid document");
+        let mut count = SampleCount::default();
+        let mut samples = Samples::default();
+
+        for (engine, id, kept) in [
+            (&first, b"old", false),
+            (&next, b"one", false),
+            (&next, b"two", true),
+        ] {
+            let shed = record(engine.generation(), None, 0);
+            if count.keeps(0, engine, &shed.decision) {
+                let taken = (shed.at, shed.gateway, &id[..]);
+                samples.push(0, None, taken, &shed.decision, None, [None; 2]);
+            }
+            let found = samples.find(0, shed.gateway, fingerprint(id));
+            assert_eq!(found.is_some(), kept, "request {id:?}");
+        }
+    }
+
+    /// Each decider keeps every third shed.
+    /// A shed for one decider leaves the other decider's count alone.
+    #[test]
+    fn each_decider_keeps_every_nth_answer_by_its_own_count() {
+        let mut document = PolicySpec::preset("random").expect("a preset");
+        document.explain.sample = 3;
+        let engine = document.validate().expect("a valid document");
+        let shed = record(engine.generation(), None, 0);
+        let mut counts = [SampleCount::default(), SampleCount::default()];
+        let mut samples = Samples::default();
+
+        for base in [0, 3] {
+            for (seat, turn) in [(0_u8, 1), (0, 2), (1, 1), (0, 3), (1, 2), (1, 3)] {
+                let n = base + turn;
+                let id = [seat, n];
+                if counts[usize::from(seat)].keeps(0, &engine, &shed.decision) {
+                    let taken = (shed.at, shed.gateway, &id[..]);
+                    samples.push(0, None, taken, &shed.decision, None, [None; 2]);
+                }
+                let found = samples.find(0, shed.gateway, fingerprint(&id));
+                assert_eq!(found.is_some(), n % 3 == 0, "decider {seat}, answer {n}");
+            }
+        }
     }
 }

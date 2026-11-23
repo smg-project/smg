@@ -3607,4 +3607,221 @@ mod tests {
             assert_eq!(decision.trace().lifted, LiftedVeto::Overload, "seed {seed}");
         }
     }
+
+    /// The later call picks a decode behind one prefill.
+    /// Its filter scope opens once with a pool size of two and two decode rows.
+    #[test]
+    fn a_decode_call_shows_its_profile_the_decode_pools_facts() {
+        use crate::engine::framework::DecisionScope;
+
+        #[derive(Debug)]
+        struct ObservePool(Arc<Mutex<Vec<(u32, usize)>>>);
+
+        impl Filter for ObservePool {
+            fn name(&self) -> &'static str {
+                "observe-pool"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn scope(&self) -> Option<&dyn DecisionScope> {
+                Some(self)
+            }
+        }
+
+        impl DecisionScope for ObservePool {
+            fn open(&self, _: &RequestFacts<'_>, rows: &[Candidate], pool: &PoolFacts<'_>) {
+                self.0.lock().push((pool.pool_size, rows.len()));
+            }
+
+            fn close(&self) {}
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let opens = Arc::clone(&seen);
+        let mut catalog = StageRegistry::builtin();
+        catalog
+            .filter("observe-pool", move || {
+                Box::new(ObservePool(Arc::clone(&opens)))
+            })
+            .expect("a free filter name");
+        let mut document =
+            PolicySpec::pair_presets("least_load", "least_load").expect("the pair presets");
+        document
+            .profiles
+            .get_mut("decode")
+            .expect("the decode profile")
+            .filter
+            .push("observe-pool".into());
+        let spec = AppliedSpec::validate_in(&document, &catalog, &[]).expect("a valid document");
+        let host = Host::under((spec, Arc::default()), 1, 2);
+        let classes = every(1, 2);
+        let asks = host.asks(&classes, true);
+        let now = Instant::now();
+        let mut guard = DecisionGuard::decide_under(&host.engine, Default::default(), &asks, now)
+            .expect("a pair decision");
+        guard.dispatched(now);
+        seen.lock().clear();
+
+        let later = guard
+            .decide_decode_under(&asks, now)
+            .expect("a decode decision");
+        assert!(later.pick().is_some(), "{later:?}");
+        assert!(!guard.decode_chosen(), "the later call issued its pick");
+        assert_eq!(seen.lock().as_slice(), [(2, 2)]);
+    }
+
+    /// A shed at the later call leaves the original decode chosen.
+    /// Only the prefill has a booking until dispatch books the decode.
+    #[test]
+    fn a_shed_at_the_call_leaves_the_side_chosen() {
+        let host = Host::of(1, 1);
+        let classes = every(1, 1);
+        let mut asks = host.asks(&classes, true);
+        let now = Instant::now();
+        let local = Default::default();
+        let mut guard =
+            DecisionGuard::decide_under(&host.engine, local, &asks, now).expect("a pair decision");
+        let original = *guard.decision();
+        let target = first_target(&original);
+        let decode = target.pair.expect("the chosen decode").decode_id;
+        let before = *guard.lease().expect("the prefill lease");
+        guard.dispatched(now);
+
+        let call = now + Duration::from_millis(1);
+        for (hint, reason) in [
+            (0, ShedReason::NoEndpoints),
+            (1, ShedReason::PolicyDeclined),
+        ] {
+            asks.0.constraints.subset_hint = Some(hint);
+
+            // The raw answer exposes the shed and its lease field.
+            let held = HeldDecision {
+                decision: guard.decision(),
+                lease: &before.lease,
+                index: 0,
+                target: guard.target(),
+                decode: HeldDecode {
+                    session: decode_session(&asks.0.facts),
+                    tokens: before.lease.tokens,
+                    chosen: guard.decode_chosen(),
+                },
+            };
+            let answer = host
+                .engine
+                .decide_decode_under(local, &asks, &held, call)
+                .expect("a decode decision");
+            assert_eq!(
+                shed_for(&answer.decision),
+                (reason, "subset-hint"),
+                "hint {hint}"
+            );
+            assert!(answer.lease.is_none(), "hint {hint}");
+
+            // The guard returns the pick it still holds.
+            let standing = guard
+                .decide_decode_under(&asks, call)
+                .expect("the held pick");
+            assert_eq!(standing, &original);
+            assert_eq!(guard.target(), &target);
+            assert!(guard.decode_chosen());
+        }
+
+        let after = guard.lease().expect("the held prefill lease");
+        assert_eq!((after.lease, after.due), (before.lease, before.due));
+        let at = before.lease.issued_micros;
+        assert_eq!(
+            host.words(),
+            [
+                ("issued", Side::Prefill, target.id, at),
+                ("dispatched", Side::Prefill, target.id, at),
+            ]
+        );
+
+        guard.dispatched_decode(call);
+        assert!(!guard.decode_chosen());
+        assert_eq!(
+            host.words(),
+            [
+                ("issued", Side::Decode, decode, at + 1_000),
+                ("dispatched", Side::Decode, decode, at),
+            ]
+        );
+    }
+
+    /// The later decode call makes its request from the document it decides under.
+    /// It issues a decode lease and records that document's generation in the trace.
+    #[test]
+    fn a_decode_calls_request_is_made_from_the_document_the_call_decides_under() {
+        struct FromDocument<'a> {
+            asks: Asks<'a>,
+            document: &'a AppliedSpec,
+        }
+
+        impl RequestMaker for FromDocument<'_> {
+            fn model(&self) -> &str {
+                self.asks.model()
+            }
+
+            fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+                assert!(
+                    std::ptr::eq(spec, self.document),
+                    "the maker receives the deciding document"
+                );
+                let mut request = self.asks.make(spec);
+                request.facts.seed = spec.generation();
+                request
+            }
+
+            fn workers(&self) -> WorkerLists<'_> {
+                self.asks.workers()
+            }
+        }
+
+        let host = Host::of(1, 1);
+        let classes = every(1, 1);
+        let asks = host.asks(&classes, true);
+        let first = leased(&host, &asks, Instant::now());
+        let target = first_target(&first.decision);
+        let lease = first.lease.expect("the prefill lease").lease;
+        let held = HeldDecision {
+            decision: &first.decision,
+            lease: &lease,
+            index: 0,
+            target: &target,
+            decode: HeldDecode {
+                session: first.decode_session,
+                tokens: lease.tokens,
+                chosen: true,
+            },
+        };
+        let local = Default::default();
+        host.engine
+            .say(local, &held, dispatched(Side::Prefill, 0), Instant::now());
+
+        let maker = FromDocument {
+            asks,
+            document: host.engine.spec(),
+        };
+        let answer = host
+            .engine
+            .decide_decode_under(local, &maker, &held, Instant::now())
+            .expect("a decode decision");
+        assert_eq!(
+            answer.lease.expect("a decode lease").lease.side,
+            Side::Decode
+        );
+        let trace = answer.decision.trace();
+        assert_eq!(
+            trace.seed,
+            maker.document.generation(),
+            "the call uses the seed its maker set"
+        );
+        assert_eq!(
+            trace.generation, trace.seed,
+            "the trace names the generation handed to the maker"
+        );
+    }
 }

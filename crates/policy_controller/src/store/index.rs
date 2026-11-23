@@ -1432,17 +1432,6 @@ impl PoolIndex {
     }
 
     #[cfg(test)]
-    pub(super) fn sent_slices(&self) -> Option<usize> {
-        Some(
-            self.tables
-                .predicted
-                .as_ref()?
-                .slices
-                .load(Ordering::Relaxed),
-        )
-    }
-
-    #[cfg(test)]
     pub(super) fn predicted(&self) -> Option<Arc<Predicted>> {
         self.tables.predicted.clone()
     }

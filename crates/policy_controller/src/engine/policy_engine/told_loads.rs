@@ -1,8 +1,8 @@
 //! Load reports told to the stages that keep them.
 //!
 //! A stage that keeps a number of each worker's load report says so
-//! ([`Lifecycle::keeps_loads`](crate::stages::Lifecycle::keeps_loads)), and
-//! its host tells it the reports ([`Signal::Load`]). Here the host is the
+//! ([`Lifecycle::keeps_loads`]), and its host tells it the reports
+//! ([`Signal::Load`]). Here the host is the
 //! engine's own task ([`PolicyEngine::run`]). At each load snapshot the task
 //! takes from the channel its host handed ([`PolicyEngine::set_loads`]), it
 //! tells such stages the reports that are new in it, and only then keeps the
