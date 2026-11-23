@@ -322,11 +322,11 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 200, value_parser = parse_job_queue_concurrency, help_heading = "Worker Configuration")]
     job_queue_concurrency: usize,
 
-    /// DP engines per startup ZMQ worker: each ipc:// or tcp:// worker becomes a
-    /// grouped worker whose handshake awaits this many engines on one socket set
-    /// (default: as many as the first engine to dial declares, one for an
-    /// engine that declares none). Under --dp-aware a worker given this count
-    /// registers as one worker per engine, which share the socket set.
+    /// DP engines per startup ZMQ worker: each ipc:// or tcp:// worker given a
+    /// count above one registers as one worker per engine, which share one
+    /// socket set whose handshake awaits this many engines (default: one
+    /// worker, whose handshake awaits as many engines as the first to dial
+    /// declares, one for an engine that declares none).
     #[arg(long, value_parser = parse_positive_usize, help_heading = "Worker Configuration")]
     zmq_engine_count: Option<usize>,
 
@@ -616,7 +616,8 @@ struct RoutingArgs {
     #[arg(long, default_value = "expected_wait", value_parser = parse_power_of_two_load_metric, help_heading = "Routing Policy")]
     power_of_two_load_metric: PowerOfTwoLoadMetric,
 
-    /// Enable data parallelism aware scheduling
+    /// Deprecated, accepted and ignored: every registration reads an engine's
+    /// data-parallel size and registers one worker per rank (warned at start-up)
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
 
@@ -657,12 +658,13 @@ struct RoutingArgs {
     routing_key_headers: Vec<String>,
 
     /// Whether, and how, a request that carries a routing key is pinned to
-    /// one engine of a grouped data-parallel worker (a ZMQ worker whose
-    /// socket set several engines dial, as many as --zmq-engine-count says
-    /// or its engines declare), so a conversation keeps one engine's prefix
-    /// cache. The key is the sticky-session key: the first valid
-    /// --routing-key-headers header, or the body rid under
-    /// --routing-key-override
+    /// one engine of a grouped data-parallel worker (a ZMQ worker given no
+    /// engine count, whose socket set as many engines dial as they declare),
+    /// so a conversation keeps one engine's prefix cache. A worker given
+    /// --zmq-engine-count registers as one worker per engine, where the
+    /// routing policy picks the engine and this option does nothing. The key
+    /// is the sticky-session key: the first valid --routing-key-headers
+    /// header, or the body rid under --routing-key-override
     #[arg(
         long,
         value_enum,
@@ -677,9 +679,9 @@ struct RoutingArgs {
 
     /// Choose a data-parallel rank per request from the ranks' reported token
     /// loads: the HTTP prefill-decode router, for an engine registered as one
-    /// worker. Under --dp-aware the engine's ranks are workers and the policy's
-    /// pick among them is the rank choice, so this flag chooses nothing there
-    /// (warned at start-up)
+    /// worker. An engine that reports its data-parallel size registers as one
+    /// worker per rank and the policy's pick among them is the rank choice, so
+    /// this flag chooses nothing there (warned at start-up)
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_minimum_tokens_scheduler: bool,
 

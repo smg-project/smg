@@ -770,13 +770,16 @@ fn the_print_option_says_a_refusal_in_one_sentence() {
     );
 
     // A line the binary itself refuses: the configuration's own sentence.
-    let alone = printed(&["smg", "--policy", "power_of_two", "--print-policy-spec"]);
-    assert_eq!(alone.document(), None);
+    let mut line = vec!["smg"];
+    line.extend_from_slice(PAIR);
+    line.extend_from_slice(&["--decode-policy", "bucket", "--print-policy-spec"]);
+    let bucket = printed(&line);
+    assert_eq!(bucket.document(), None);
     assert!(
-        alone
+        bucket
             .refusal()
-            .is_some_and(|sentence| sentence.contains("at least 2 workers")),
-        "{alone:?}"
+            .is_some_and(|sentence| sentence.contains("Decode policy should not be allowed")),
+        "{bucket:?}"
     );
 
     // A document this build's controller does not run yet: it prints, with
@@ -794,6 +797,20 @@ fn the_print_option_says_a_refusal_in_one_sentence() {
                 "profiles.cache_aware.score[1].prefix-affinity: "
             )),
         "{decayed:?}"
+    );
+}
+
+/// A policy that compares two workers prints its document with one worker
+/// URL or none: no rule counts the worker URLs a line gives, since a URL
+/// registers one worker per data-parallel rank of its engine.
+#[test]
+fn the_print_counts_no_worker_urls_under_power_of_two() {
+    let alone = printed(&["smg", "--policy", "power_of_two", "--print-policy-spec"]);
+    assert!(
+        alone
+            .document()
+            .is_some_and(|yaml| yaml.contains("pick: power-of-two")),
+        "{alone:?}"
     );
 }
 

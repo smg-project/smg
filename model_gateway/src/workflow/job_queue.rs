@@ -1040,9 +1040,10 @@ fn apply_startup_worker_config(spec: &mut WorkerSpec, router_config: &RouterConf
     if let Some(runtime) = router_config.startup_worker_runtime_type {
         spec.runtime_type = runtime;
     }
-    // Grouped ZMQ worker: the handshake awaits this many DP engines on one
-    // socket set. Only ZMQ URLs — dp_size on an HTTP/gRPC startup worker would
-    // misread as dp-awareness.
+    // A ZMQ worker given an engine count: the handshake awaits this many DP
+    // engines on one socket set, and the worker registers as one worker per
+    // engine. Only ZMQ URLs — dp_size on an HTTP/gRPC startup worker would
+    // misread as a rank worker's.
     if let Some(count) = router_config.zmq_engine_count.filter(|&n| n > 1) {
         if ConnectionMode::from_url(&spec.url) == Some(ConnectionMode::Zmq) {
             spec.dp_size = Some(count);
@@ -1830,6 +1831,81 @@ mod tests {
                  of five; the lines with a credential: {credentialed:#?}"
             ))
         });
+    }
+
+    /// A gateway given no setting for it registers one worker per
+    /// data-parallel rank an engine names. An HTTP engine whose server info
+    /// names four ranks stands as four rank workers and none at its base
+    /// address. An engine that names one rank, one that names no size and
+    /// one whose server info fails to read each stand as one plain worker,
+    /// and none of the four registrations fails.
+    #[tokio::test]
+    async fn a_registration_registers_one_worker_per_rank_the_engine_names() {
+        use http::StatusCode;
+        use serde_json::json;
+        use smg_worker::workflow::find_workers_by_url;
+
+        use crate::{
+            app_context::testing::live_app_context,
+            workflow::steps::local::test_support::serve_json_routes,
+        };
+
+        let context = live_app_context();
+        let registry = &context.worker_registry;
+        let marks = DashSet::new();
+        for (status, server_info, ranks) in [
+            (StatusCode::OK, json!({"dp_size": 2, "attn_dp_size": 2}), 4),
+            (StatusCode::OK, json!({"dp_size": 1}), 1),
+            (StatusCode::OK, json!({"version": "test"}), 1),
+            (StatusCode::INTERNAL_SERVER_ERROR, json!({"dp_size": 4}), 1),
+        ] {
+            // The model list names the runtime whose server info reports the
+            // size, so each of the four is read the same way.
+            let base = serve_json_routes(vec![
+                ("/health", StatusCode::OK, json!({"status": "ok"})),
+                (
+                    "/v1/models",
+                    StatusCode::OK,
+                    json!({"data": [{"id": "m", "owned_by": "sglang"}]}),
+                ),
+                (
+                    "/model_info",
+                    StatusCode::OK,
+                    json!({"model_path": "m", "is_generation": true}),
+                ),
+                ("/server_info", status, server_info.clone()),
+            ])
+            .await;
+            let job = Job::AddWorker {
+                asker: WorkerJobAsker::Api,
+                config: Box::new(WorkerSpec::new(base.as_str())),
+                registration_mode: WorkerRegistrationMode::Upsert,
+            };
+
+            let result = execute_job(&job, &context, &marks, None).await;
+
+            let case = format!("{status} {server_info}");
+            assert!(result.is_ok(), "{case}: {result:?}");
+            let mut workers = find_workers_by_url(registry, &base);
+            workers.sort_by_key(|worker| worker.dp_rank());
+            let registered: Vec<(String, Option<usize>, Option<usize>)> = workers
+                .iter()
+                .map(|worker| (worker.url().to_string(), worker.dp_rank(), worker.dp_size()))
+                .collect();
+            let expected: Vec<(String, Option<usize>, Option<usize>)> = if ranks == 1 {
+                vec![(base.clone(), None, None)]
+            } else {
+                (0..ranks)
+                    .map(|rank| (format!("{base}@{rank}"), Some(rank), Some(ranks)))
+                    .collect()
+            };
+            assert_eq!(registered, expected, "{case}");
+            assert_eq!(
+                registry.get_by_url(&base).is_some(),
+                ranks == 1,
+                "{case}: a worker stands at the base address only where the engine is one worker"
+            );
+        }
     }
 
     /// The registration workflows the store holds that have not ended.

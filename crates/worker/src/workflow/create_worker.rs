@@ -134,12 +134,6 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
             &config.url,
         )?;
 
-        // A ZMQ worker that is not expanded into rank workers serves every
-        // rank over one set of sockets, as one grouped worker.
-        let zmq_engine_group = config
-            .dp_size
-            .filter(|&n| n > 1 && *connection_mode == ConnectionMode::Zmq);
-
         let url = normalize_url(&config.url, *connection_mode);
 
         let (resolved_resilience, circuit_breaker) = resolve_resilience(
@@ -160,11 +154,7 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
         );
         let health_endpoint = &settings.health_endpoint;
 
-        let dp_ranks: Vec<Option<(usize, usize)>> = if settings.dp_aware {
-            dp_rank_expansion(context.data.dp_info.as_ref())
-        } else {
-            vec![None] // single worker, no DP
-        };
+        let dp_ranks = dp_rank_expansion(context.data.dp_info.as_ref());
         // Rank workers register at `{base}@{rank}`, which the base address
         // checked above does not find.
         if create_only
@@ -235,9 +225,6 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
                 }
                 if let Some(ref address) = config.zmq_handshake_address {
                     builder = builder.zmq_handshake_address(address.clone());
-                }
-                if let (None, Some(group_size)) = (dp, zmq_engine_group) {
-                    builder = builder.zmq_engine_group(group_size);
                 }
                 if let Some(ref slot) = zmq_rank_connection {
                     builder = builder.shared_engine_connection(Arc::clone(slot));
@@ -703,12 +690,11 @@ fn already_exists(url: &str) -> WorkflowError {
     }
 }
 
-/// Ranks to register for a dp-aware worker. A width above one expands into
-/// one dp-annotated worker per rank. A width-1 advertisement (older
-/// servicers emit it as a capability signal) and a missing one both
-/// register a plain worker: there is no placement to choose, and pinning
-/// rank 0 anyway still alters engine-side scheduling. The DP read already
-/// logged the degradation for the missing-label case.
+/// Ranks to register for a worker, from the shape the DP read left. A width
+/// above one expands into one dp-annotated worker per rank. A width-1
+/// advertisement (older servicers emit it as a capability signal) and a
+/// missing one both register a plain worker: there is no placement to
+/// choose, and pinning rank 0 anyway still alters engine-side scheduling.
 fn dp_rank_expansion(dp_info: Option<&DpInfo>) -> Vec<Option<(usize, usize)>> {
     match dp_info {
         Some(dp_info) if dp_info.dp_size > 1 => (0..dp_info.dp_size)

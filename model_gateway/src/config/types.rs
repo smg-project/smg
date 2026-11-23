@@ -94,10 +94,11 @@ pub struct RouterConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_worker_runtime_type: Option<RuntimeType>,
     /// DP engines per startup ZMQ worker: each `--worker-urls` ZMQ worker
-    /// becomes a grouped worker whose handshake awaits this many engines on
-    /// one socket set (`dp_size` on the worker spec, no rank), or, under
-    /// `dp_aware`, one worker per engine sharing that socket set. `None`/1
-    /// keeps today's one-engine workers; HTTP/gRPC workers ignore this field.
+    /// given a count above one registers as one worker per engine, which
+    /// share one socket set whose handshake awaits that many engines
+    /// (`dp_size` on the worker spec). `None`/1 keeps one worker per URL: a
+    /// one-engine worker, or a grouped worker where its engines declare
+    /// several at the handshake. HTTP/gRPC workers ignore this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zmq_engine_count: Option<usize>,
     pub policy: PolicyConfig,
@@ -457,6 +458,10 @@ pub struct RouterConfig {
     /// `SMG_LOG_MM_TIMING`.
     #[serde(default)]
     pub log_mm_timing: bool,
+    /// Deprecated, accepted and ignored: every registration reads an
+    /// engine's data-parallel size and registers one worker per rank, with
+    /// this set or not. Start-up warns when it is set.
+    #[serde(default)]
     pub dp_aware: bool,
     #[serde(default)]
     pub dp_minimum_tokens_scheduler: bool,
@@ -1318,11 +1323,11 @@ impl Default for RoutingKeyOverrideConfig {
 
 /// How a request with a sticky key is placed on the engines (data-parallel
 /// ranks) of a grouped worker: one worker URL whose socket set several
-/// engines dial (as many as `--zmq-engine-count` above one or `dp_size` on
-/// its spec says, or, given no count, as its engines declare at the
-/// handshake). A group that `dp_aware` expanded into rank workers is not a
-/// grouped worker: there the routing policy's pick is the rank, and this
-/// setting does nothing. Routing policies see the group as one worker, and its
+/// engines dial, as many as they declare at the handshake. A group given a
+/// count (`--zmq-engine-count` above one, or `dp_size` on its spec) is
+/// registered as one worker per engine and is not a grouped worker: there
+/// the routing policy's pick is the rank, and this setting does nothing.
+/// Routing policies see the group as one worker, and its
 /// connection otherwise sends each request to its least-loaded engine,
 /// which scatters one conversation's turns over the engines' separate
 /// prefix caches. The key is the one sticky routing reads: the first valid

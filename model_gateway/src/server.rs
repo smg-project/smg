@@ -82,7 +82,8 @@ use crate::{
     },
     app_context::{effective_max_concurrent_requests, AppContext},
     config::{
-        available_cpus, bind_socket_addr, dp_minimum_tokens_scheduler_scope_warning, redacted,
+        available_cpus, bind_socket_addr, dp_aware_deprecation_warning,
+        dp_minimum_tokens_scheduler_scope_warning, redacted,
         runtime_worker_threads_oversubscription, unused_credentials_warnings,
         validate_mesh_listener_port, ParserChoice, RouterConfig,
     },
@@ -2447,12 +2448,16 @@ pub async fn startup_with(
     for warning in unused_credentials_warnings(&config.router_config.mode) {
         tracing::warn!("{warning}");
     }
-    // A rank scheduler under rank expansion chooses nothing: the operator's
-    // configuration runs, with the word that one of its flags does nothing.
-    if let Some(warning) = dp_minimum_tokens_scheduler_scope_warning(
-        config.router_config.dp_aware,
-        config.router_config.dp_minimum_tokens_scheduler,
-    ) {
+    // Two settings the operator's configuration still carries and that
+    // choose nothing where an engine's ranks are registered as workers: the
+    // configuration runs, with the word that the setting does nothing.
+    for warning in [
+        dp_aware_deprecation_warning(config.router_config.dp_aware),
+        dp_minimum_tokens_scheduler_scope_warning(config.router_config.dp_minimum_tokens_scheduler),
+    ]
+    .into_iter()
+    .flatten()
+    {
         tracing::warn!("{warning}");
     }
 

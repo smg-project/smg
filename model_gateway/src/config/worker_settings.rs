@@ -75,7 +75,6 @@ impl RouterConfig {
             startup_timeout_secs: self.worker_startup_timeout_secs,
             startup_delay_secs: self.worker_startup_delay_secs,
             startup_check_interval_secs: self.worker_startup_check_interval_secs,
-            dp_aware: self.dp_aware,
             model_path: self.model_path.clone(),
             model_aliases: self.model_aliases.clone(),
             retry: self.effective_retry_config(),
@@ -116,7 +115,6 @@ mod tests {
         };
 
         let config = RouterConfig {
-            dp_aware: true,
             model_path: Some("/models/a".to_string()),
             model_aliases: [("alias".to_string(), "a".to_string())].into(),
             retry: RetryConfig {
@@ -154,7 +152,6 @@ mod tests {
         let settings = config.registration_settings();
         let breaker = config.effective_circuit_breaker_config();
 
-        assert!(settings.dp_aware);
         assert_eq!(settings.model_path, config.model_path);
         assert_eq!(settings.model_aliases, config.model_aliases);
         assert_eq!(settings.retry, config.effective_retry_config());
