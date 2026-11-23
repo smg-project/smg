@@ -981,6 +981,10 @@ pub trait ResponseStorage: Send + Sync {
     /// The part of [`Self::get_response_chain`] a caller of `tenant` may see:
     /// the newest records down to the first it may not see (this walk reads
     /// that one and stops); none for a hidden, missing or unstored id.
+    ///
+    /// The Responses loaders read history through this method, not through
+    /// [`Self::get_response_chain`]: a backend that overrides that one with a
+    /// faster walk overrides this one too, as the in-memory store does.
     async fn get_response_chain_for(
         &self,
         response_id: &ResponseId,

@@ -1042,6 +1042,75 @@ mod tests {
         assert_eq!(hook.after_calls(), 1);
     }
 
+    #[tokio::test]
+    async fn hooked_response_chain_for_a_caller_is_one_chain_operation_on_the_cut_chain() {
+        // What each hook call was handed: the payload before, the result after.
+        struct RecordingHook(parking_lot::Mutex<Vec<(StorageOperation, serde_json::Value)>>);
+
+        #[async_trait]
+        impl StorageHook for RecordingHook {
+            async fn before(
+                &self,
+                operation: StorageOperation,
+                _context: Option<&RequestContext>,
+                payload: &serde_json::Value,
+            ) -> Result<BeforeHookResult, HookError> {
+                self.0.lock().push((operation, payload.clone()));
+                Ok(BeforeHookResult::Continue(ExtraColumns::new()))
+            }
+
+            async fn after(
+                &self,
+                operation: StorageOperation,
+                _context: Option<&RequestContext>,
+                _payload: &serde_json::Value,
+                result: &serde_json::Value,
+                extra: &ExtraColumns,
+            ) -> Result<ExtraColumns, HookError> {
+                self.0.lock().push((operation, result.clone()));
+                Ok(extra.clone())
+            }
+        }
+
+        let inner = Arc::new(MemoryResponseStorage::new());
+        let mut parent = StoredResponse::new(None);
+        parent.tenant = Some("tenant-b".to_string());
+        let parent_id = inner.store_response(parent).await.unwrap();
+        let mut head = StoredResponse::new(Some(parent_id));
+        head.tenant = Some("tenant-a".to_string());
+        let head_id = inner.store_response(head).await.unwrap();
+
+        let hook = Arc::new(RecordingHook(parking_lot::Mutex::new(Vec::new())));
+        let hooked = HookedResponseStorage::new(inner, hook.clone());
+
+        let own = hooked
+            .get_response_chain_for(&head_id, Some("tenant-a"))
+            .await
+            .unwrap();
+        let refused = hooked
+            .get_response_chain_for(&head_id, Some("tenant-b"))
+            .await
+            .unwrap();
+
+        // the head alone for a caller that may read it and not its parent,
+        // nothing for a caller that may not read the head
+        assert_eq!(
+            own.responses.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            [&head_id]
+        );
+        assert!(refused.responses.is_empty());
+        let payload = json!({ "response_id": head_id, "max_depth": null });
+        assert_eq!(
+            *hook.0.lock(),
+            [
+                (StorageOperation::GetResponseChain, payload.clone()),
+                (StorageOperation::GetResponseChain, json!(own)),
+                (StorageOperation::GetResponseChain, payload),
+                (StorageOperation::GetResponseChain, json!(refused)),
+            ]
+        );
+    }
+
     fn response_with_output_item(item_id: &str) -> StoredResponse {
         let mut stored = StoredResponse::new(None);
         stored.raw_response = json!({
