@@ -2081,12 +2081,16 @@ impl PDRouter {
             }
             .emit();
 
+            // Each side's request names the rank its connector holds the
+            // pair to and, where the connector names none, the rank of the
+            // side's own worker object: an engine registered rank by rank is
+            // sent the rank of the row that was picked.
             let prefill_request = self.build_post_with_headers(
                 prefill.as_ref(),
                 context.route,
                 prefill_body,
                 headers,
-                dp_rank,
+                dp_rank.or_else(|| prefill.dp_rank()),
             );
             let prefill_bytes = match Self::prefill_side_bytes(
                 ledger,
@@ -2202,12 +2206,14 @@ impl PDRouter {
             Some(ask) if relay => decode.again(ask),
             _ => decode,
         };
+        // The decode's rank is read here, behind the ask: a decode that
+        // moved is sent the rank of the row it moved to.
         let decode_request = self.build_post_with_headers(
             decode.worker(),
             context.route,
             decode_body,
             headers,
-            dp_rank,
+            dp_rank.or_else(|| decode.worker().dp_rank()),
         );
         // The decode side goes out here, behind its prefill's answer: its
         // send is said.
@@ -2921,9 +2927,10 @@ impl PDRouter {
     /// credential with the precedence every other upstream call has (the
     /// caller's `Authorization`, else the worker's configured key), so a worker
     /// behind a key-protected gateway, whose caller key ends at the
-    /// middleware, still carries the key the worker requires; and, for a
-    /// MoRI-IO side, the data-parallel rank both sides are pinned to, set
-    /// after the forwarded headers.
+    /// middleware, still carries the key the worker requires; and the
+    /// data-parallel rank the side goes to, where its caller names one (the
+    /// rank a MoRI-IO pair is pinned to, or the side's own worker object's),
+    /// set after the forwarded headers.
     #[expect(
         clippy::unused_self,
         reason = "method on PDRouter for consistent API; may use self.api_key in future"
