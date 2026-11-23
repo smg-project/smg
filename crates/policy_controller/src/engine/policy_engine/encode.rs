@@ -97,10 +97,12 @@ impl EncodeLists<'_> {
     /// A request that states no budget is decided with the widest one
     /// written into its facts too, as a pair's is ([`PairLists::decide`]).
     ///
-    /// A pair's lists are narrowed by no demand, no subset hint and no
+    /// These lists are narrowed by no demand, no subset hint and no
     /// places, and a request's own mask names places of no one list: a
     /// request that states one of these is shed or declined as its pair's
-    /// own decision answers it, and no key is placed. One side of the pair
+    /// records answer it, and no key is placed. A pair's own request is
+    /// held to a demand a side at a time ([`PairLists::decide`]), and an
+    /// encode request is not. One side of the pair
     /// alone is no pair, and the engine says so behind the encoders: a
     /// request that no encoder is ready for is shed under the encode side's
     /// stage. For a request with items, facts or classes of another length
@@ -189,9 +191,11 @@ impl EncodeLists<'_> {
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
         let pair = &self.pair;
+        // A hard demand is among what these lists do not decide: the pair
+        // sheds it by its records, and holds no side to it for this entry.
         if not_decided(&request.constraints).is_some() {
             placed.clear();
-            return pair.decide_over(engine, (prefill, decode), loads, now, request, None);
+            return pair.decide_unjudged(engine, (prefill, decode), loads, now, request);
         }
         // One value for the three lists' records, as a pair's decision
         // takes one for its two.

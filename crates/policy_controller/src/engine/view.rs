@@ -1446,9 +1446,12 @@ pub struct Constraints<'a> {
     /// ([`Demands`](crate::engine::Demands)). A door keeps the demands before any
     /// stage runs, where it keeps its gateway's wires, and no stage reads
     /// them: an engine handed rows by a host of its own is handed rows
-    /// that meet them. A pair's sides keep none yet: a door sheds a
-    /// pair's request that states a demand, under the stage `wires`,
-    /// whatever its sides state. In-process only: this protocol version
+    /// that meet them. Over a pair's two worker lists each side is held
+    /// to the workers that meet them as its role is held to them
+    /// ([`Demands::held_by`](crate::engine::Demands::held_by)). An encode
+    /// request's three lists keep none yet: such a request that states a
+    /// demand is shed under the stage `wires`, whatever its lists state.
+    /// In-process only: this protocol version
     /// states no demand, and a handle refuses a request that states one
     /// before it sends it over a link (`DecisionGuard::asked`).
     pub demands: crate::engine::Demands,
