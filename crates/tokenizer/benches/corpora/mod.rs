@@ -37,7 +37,8 @@ fn prose(seed: u64, bytes: usize) -> String {
 
 /// Pseudo-words, digits and short CJK runs: a vocabulary wider than a
 /// thread's piece-cache share, no special tokens (the cuts come from the
-/// pre-tokenizer's pieces alone).
+/// pre-tokenizer's pieces alone). The environment variable named by
+/// `corpus_var`, set to `prose`, selects [`prose`] instead.
 pub(super) fn body(corpus_var: &str, seed: u64, bytes: usize) -> String {
     if std::env::var(corpus_var).is_ok_and(|v| v == "prose") {
         return prose(seed, bytes);
