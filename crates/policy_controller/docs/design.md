@@ -73,10 +73,10 @@ Everything below follows from seven rules.
    request and tells it what became of the request. A host has no policy logic: it never asks
    which policy is running.
 5. **Switched off, it costs a test.** With the option off no engine is built and classic's own
-   selection decides; a request pays the test of the option where it is placed and what the five
-   placement functions and the load guard cost for carrying an answer of either side, counted for
-   each policy in the gateway's decision bench and shown on the page of each change to those
-   functions (section 13.2).
+   selection decides. A request then pays two things: the test of the option where it is placed,
+   and what the five placement functions and the load guard cost for carrying an answer of either
+   side. That cost is counted for each policy in the gateway's decision bench and shown on the
+   page of each change to those functions (section 13.2).
 6. **Classic is the reference.** Under the document that a set of routing flags means, the engine
    gives the answer the classic policy gives. A difference is a defect, or a decision written in
    section 15.
@@ -325,8 +325,10 @@ A program that embeds the crate can add stages of its own under new names
 
 ## 4. The data the engine reads
 
-Rule 2 says the engine keeps no copy of worker data. This section says where the data lives. None
-of these structures is the policy crate's.
+Rule 2 says the engine keeps no copy of worker data. This section says where the data lives: in
+structures of the worker crate and of the kv-index crate. The policy crate adds structures of its
+own in two places: the engine's hash table (section 4.5), and the controller's value for a worker
+list and its holder (section 4.1).
 
 ### 4.1 The worker registry **[built]** (`smg-worker`)
 
@@ -393,8 +395,8 @@ Who writes it: the health checker (status), the load monitor (overload, liveness
 load guard (the in-flight counters), request outcomes (the circuit breaker). A controller serves no
 request: the leases its store holds on file write the in-flight counter there (`HostCount`).
 
-What a decision reads of a worker: `Worker::routing_state()` gives ready, circuit breaker,
-stalled, overloaded and the in-flight count in one read.
+A decision reads a worker in one read: `Worker::routing_state()` gives ready, circuit breaker,
+stalled, overloaded and the in-flight count.
 
 ### 4.3 The load reports **[built]** (`smg-worker`)
 
@@ -427,9 +429,9 @@ process that opens the stream changes.
 ### 4.4 The in-flight counters **[built]** (`smg-worker`)
 
 A route creates one `WorkerLoadGuard` for the worker it chose. The guard adds one to the worker's
-in-flight counter (and to its routing key's counter), lives as long as the request, and at its
-drop takes one off and tells the worker's `RequestCompletionSink` that a request ended. Every
-path passes through it: success, error and a client that went away.
+in-flight counter, and to its routing key's counter. It lives as long as the request. At its drop
+it takes one off and tells the worker's `RequestCompletionSink` that a request ended. Every path
+passes through it: success, error and a client that went away.
 
 ### 4.5 The cache records
 
@@ -550,8 +552,10 @@ The engine is in `engine/`.
 
 ### 5.1 The engine object **[built]**
 
-A process has one engine object. It is built once from the policy document and holds the
-document's stages and what they remember. It holds no worker of its own: the registry its host hands it (section 8.1) holds them.
+A gateway has one engine object. It is built once from the policy document and holds the
+document's stages and what they remember. It holds no worker of its own: the registry that its
+host hands it (section 8.1) holds them. A controller builds a new engine object for each document
+it applies (section 10.2).
 
 ```rust
 // engine/policy_engine.rs
@@ -561,15 +565,21 @@ pub struct PolicyEngine {
                           // shadow counts
     clock: DecisionClock, // one clock for every decision and every load report's age
     leases: OwnWord,      // the id of the last lease issued: one atomic counter
+    sessions: Arc<SessionTable>, // the pins of every key a sessions rule placed: one table for the
+                          // engine's life
     affinity: Affinity,   // cache affinity: the host's index of cache events, and the engine's own
                           // record of the prefixes it sent, one for each model
     epochs: AtomicU64,    // how many list values were made
     faults: AtomicU64,    // decisions that panicked
-    unheard: AtomicU64,   // lease events that panicked inside a stage
+    unheard: AtomicU64,   // lease events and membership changes that panicked inside a stage
     upkeep_faults: AtomicU64, // steps of the engine's own task that panicked: the upkeep, the registry's follow,
                           // a telling of load reports
     loads: task::Loads,   // the host's load channel, once handed, and the newest load snapshot
                           // the engine's own task keeps at hand
+    members: membership::Handed, // the host's worker registry, once handed: the engine's own task
+                          // follows its events
+    lists: HandedLists,   // the host's worker lists, once handed: the engine's own task fills their
+                          // cells ahead of their requests
 }
 ```
 
@@ -577,17 +587,27 @@ It compiles under the crate feature `in-process`.
 
 ### 5.2 The engine's value for one worker list **[built]**
 
-For each list the registry publishes, the engine keeps one value. The host keeps an empty cell
-beside each list it publishes (`ListCell`) and lends the two together with each request (`LentList`). The engine makes its value into the cell at the list's first ask, and reads it there from then on: its own task asks first where the host handed its lists (section 8.2), and the first decision over the list otherwise. When the
-membership changes the registry publishes a new list with an empty cell, and the old value is
-dropped with the old list.
+For each list the registry publishes, the engine keeps one value. It keeps the value in a cell
+that the host lends:
 
-A host that knows a fact of its workers that their objects do not hold lends it with the list
-(`LentList::facts`). It lends one fact for each worker, in the list's order,
-and the engine writes it into the worker's record (5.3) where it fills the cell. Three such facts stand today:
-whether a worker takes images, the id the host knows the worker by where it keeps ids of its own,
-and what the worker states for a request's hard demands, which stands in a column beside the
-records. The fill makes the list's records.
+- The host keeps an empty cell beside each list it publishes (`ListCell`). It lends the list and
+  its cell together with each request (`LentList`).
+- The engine makes its value into the cell at the list's first ask, and reads it there from then
+  on. Where the host handed the engine its lists (section 8.2), the engine's own task asks first.
+  Otherwise the first decision over the list does.
+- When the membership changes, the registry publishes a new list with an empty cell. The old
+  value is dropped with the old list.
+
+A host may know a fact of its workers that their objects do not hold. It lends such a fact with
+the list (`LentList::facts`): one value for each worker, in the list's order. The engine writes it
+into the worker's record (section 5.3) where it fills the cell. Three such facts stand today:
+
+- whether a worker takes images;
+- the id the host knows the worker by, where the host keeps ids of its own;
+- what the worker states for a request's hard demands, which stands in a column beside the
+  records.
+
+The fill makes the list's records.
 
 ```rust
 // engine/policy_engine.rs
@@ -595,8 +615,11 @@ pub(crate) struct PoolMembers {
     workers: Arc<[Arc<dyn Worker>]>, // the host's own list of worker objects, shared, not copied
     rotation: OwnWord,               // round robin's counter for this list
     records: OnceLock<PoolRecords>,  // the unchanging half of each worker's record (5.3)
-    wires: OnceLock<WireModes>,      // which protocols (HTTP, gRPC) the list's workers speak
+    signal: OnceLock<(Box<str>, Phase, bool)>, // whether a decision over this list reads a named signal
+    wires: OnceLock<WireModes>,      // which protocols (HTTP, gRPC, ZMQ) the list's workers speak
     alone: OnceLock<(Box<str>, Option<AloneProfile>)>, // the profile one pick can decide (5.6)
+    shadow: OnceLock<(Box<str>, Option<ShadowWord>)>,  // the shadow of this list's model, where the
+                                     // document names one
     affinity: PoolAffinity,          // this list's lookup table for cache affinity
 }
 ```
@@ -647,12 +670,11 @@ The identity half is filled once for a list and cached (`PoolRecords`, `engine/r
 live half is read from the worker object once for each decision. The load report comes from the
 load snapshot; a snapshot's reports are converted once for a list and cached.
 
-`engine` is `PolicyEngine`'s number. It writes each record its engine's place where it finds the
-list's engines, once for a list, so records that state one place are ranks of one data-parallel
-engine. A default record leaves 0 on every record, which would read as
-one engine, so a stage reads the field where `PolicyEngine` decides: in process, and in a
-controller for a single request. The
-number holds within one generation of one list and is no id beyond it.
+The field `engine` numbers the list's data-parallel engines: records that state one number are
+ranks of one engine. `PolicyEngine` writes the numbers once for a list, where it finds the list's
+engines. A default record leaves 0 on every record, which would read as one engine. So a stage
+reads the field only where `PolicyEngine` decides: in process, and in a controller for a single
+request. The number holds within one generation of one list and is no id beyond it.
 
 ### 5.4 What a request states **[partly]**
 
@@ -742,7 +764,7 @@ list as well (`EncodeLists::encoders_stalled`, `encoders_held`), and the encode 
 pub enum Decision { Pick(Pick), Shed(Shed), Queue(Queue) }
 
 pub struct Pick {
-    pub targets: Targets,                // up to four workers, best first
+    pub targets: Targets,                // up to four targets, best first
     pub trace: Trace,                    // how the decision was made
     pub session_verdict: SessionVerdict, // what the decision did with the routing key
 }
