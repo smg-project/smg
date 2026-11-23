@@ -84,6 +84,12 @@ const _: () = assert!((STREAM_WINDOW as usize) * 255 * 4 <= (CONNECTION_WINDOW a
 /// the same; h2 left to itself advertises nothing and decodes up to 16 MiB.
 pub(super) const MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
 
+/// How much of the peer's response headers the connection keeps indexed,
+/// advertised in its SETTINGS. It is held for as long as the connection
+/// lives, and a peer that dates its responses fills h2's 4,096 with dates;
+/// 1,024 keeps a response's two constant headers and 14 dates.
+pub(super) const HEADER_TABLE_SIZE: u32 = 1024;
+
 /// How many streams the connection opens before the peer's SETTINGS have
 /// arrived. hyper's bound; h2 left to itself opens any number, and a burst
 /// of calls right after a dial could run past the peer's limit and have its
@@ -356,6 +362,7 @@ where
         .initial_window_size(stream_window)
         .initial_connection_window_size(connection_window)
         .max_header_list_size(MAX_HEADER_LIST_SIZE)
+        .header_table_size(HEADER_TABLE_SIZE)
         .initial_max_send_streams(INITIAL_MAX_SEND_STREAMS)
         .enable_push(false)
         .handshake(io)
