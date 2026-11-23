@@ -2072,6 +2072,7 @@ impl WorkerSelectionStage {
     /// that sends the pair no request: a bench's placement, a case. An
     /// engine's side of the request is let go here, which the engine hears
     /// as a release.
+    #[cfg(any(test, feature = "test-util"))]
     fn select_pd_pair(
         &self,
         model_id: &str,

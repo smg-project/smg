@@ -579,7 +579,9 @@ impl Placed {
     }
 
     /// [`Self::guard`] for a caller that keeps nothing else of the answer:
-    /// the worker's handle moves into the guard.
+    /// the worker's handle moves into the guard. The decision bench's routes
+    /// and tests call it. A route keeps its answer and calls [`Self::guard`].
+    #[cfg(any(test, feature = "test-util"))]
     #[inline]
     pub(crate) fn into_guard(self, key: Option<&str>) -> WorkerLoadGuard {
         match self.engine {
