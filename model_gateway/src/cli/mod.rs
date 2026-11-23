@@ -1044,6 +1044,18 @@ struct DiscoveryArgs {
     )]
     kv_engine_id_annotation: String,
 
+    /// Pod label containing the worker's prefill/decode pairing protocol.
+    /// A prefill and a decode pair only when their protocols are equal, so
+    /// an operator that rolls both roles can label the Pods of one rollout
+    /// alike and keep a prefill of one rollout from a decode of another.
+    /// A Pod without the label states none.
+    #[arg(
+        long,
+        default_value = "smg.ai/pairing-protocol",
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    pairing_protocol_label: String,
+
     /// Label selector for encode server pods in EPD mode
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
     encode_selector: Vec<String>,
@@ -3833,6 +3845,37 @@ mod tests {
         };
         assert_eq!(defaults.kv_connector_annotation, "smg.ai/kv-connector");
         assert_eq!(defaults.kv_engine_id_annotation, "smg.ai/kv-engine-id");
+    }
+
+    #[test]
+    fn the_pairing_protocol_label_flows_into_both_configs() {
+        let cli = cli_args_from(&[
+            "--service-discovery",
+            "--selector",
+            "app=worker",
+            "--pairing-protocol-label",
+            "example.com/rollout",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        let Some(DiscoveryConfig::Kubernetes(discovery)) = &router.discovery else {
+            panic!("expected Kubernetes discovery");
+        };
+        assert_eq!(discovery.pairing_protocol_label, "example.com/rollout");
+
+        let server = cli.to_server_config(router).unwrap();
+        let Some(RuntimeDiscoveryConfig::Kubernetes(discovery)) = &server.service_discovery_config
+        else {
+            panic!("expected Kubernetes runtime discovery");
+        };
+        assert_eq!(discovery.pairing_protocol_label, "example.com/rollout");
+
+        let defaults = cli_args_from(&["--service-discovery", "--selector", "app=worker"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        let Some(DiscoveryConfig::Kubernetes(defaults)) = &defaults.discovery else {
+            panic!("expected Kubernetes discovery");
+        };
+        assert_eq!(defaults.pairing_protocol_label, "smg.ai/pairing-protocol");
     }
 
     /// `--discovery-provider kubernetes` is `--service-discovery` under its
