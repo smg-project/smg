@@ -50,7 +50,7 @@ in two places:
 | Mode | Who decides | Who finds the workers and holds their data | Mark |
 |---|---|---|---|
 | Classic (the default) | the gateway's classic policies | the gateway | **[built]** |
-| Engine in the gateway | the engine, inside the gateway | the gateway, in the same structures as classic | **[planned]** |
+| Engine in the gateway | the engine, inside the gateway | the gateway, in the same structures as classic | **[partly]** |
 | Engine in a controller | the controller | the controller | **[partly]** |
 
 On main the gateway still calls the engine through an earlier integration. That integration is
@@ -1277,7 +1277,7 @@ The design adds no second mechanism where one exists.
 | a worker's health, breaker, overload, in-flight count | the worker object, read in place | nothing |
 | load reports | the load monitor's `LoadSnapshot` | nothing |
 | which worker holds a prompt, by cache events | the kv-index crate's index, through two traits | the gateway's two readers of its index for those traits, about 130 lines (section 9.2) |
-| which prefill pairs with which decode | the gateway's pair index (`PdPairIndex`) | the pair classes read from it, one file of 290 lines (section 9.2) |
+| which prefill pairs with which decode | the gateway's pair index (`PdPairIndex`) | the pair classes read from it, one file of 282 lines (section 9.2) |
 | which worker was sent a prompt | the host's own trees, of the kv-index crate's two tree types | one more question on the trait the host already answers for cache events |
 | a request's lifetime on a worker | the load guard every route keeps | one optional field (decision 4) |
 | the place where a worker is chosen | classic's five placement functions | one call in each |
@@ -1359,7 +1359,7 @@ request ──> route (HTTP or gRPC, any family)
 
 The change also writes again three small things that stage 0 takes out with the earlier
 integration: the gateway's two readers of its own index of cache events for the engine (about
-130 lines on main today), the pair classes read from the gateway's pair index (one file of 290
+130 lines on main today), the pair classes read from the gateway's pair index (one file of 282
 lines), and the cell beside each published list.
 
 The bar for that change:
@@ -1370,6 +1370,8 @@ The bar for that change:
    decode again.
 3. With the engine off, a classic decision pays what rule 5 names and no more, counted in the
    gateway's decision bench.
+
+   With the engine off, the one call of the second point is still made for a pair sent prefill first: it returns at its first test, of the engine side of the pair's first answer, and reads no pair index. The decision bench's pair route does not make that call, so what a route pays to make it is not counted yet.
 4. With the engine on, every classic test of the gateway passes under the settings' own document.
 
 ### 9.3 The options
