@@ -528,8 +528,7 @@ message WatchWorkersRequest {
   // lease is not shared and where a shared lease's record was lost, and the
   // draw keeps a position of another run outside the positions this run
   // holds, under its first or ahead of its head, but for a chance of 4,097
-  // in 2^48 a resume, or of 69,634 where the lease is shared and the log
-  // holds the load rows' positions too.
+  // in 2^48 a resume.
   // membership_epoch moves only on a membership change and is no resume point.
   uint64 resume_seq = 2;
   // INVALID_ARGUMENT, by this field's name, where the controller tells no
@@ -1410,7 +1409,9 @@ message ReplicationBatch {
 // between a snapshot and what follows it. Rows are paged as a watch's
 // snapshot is (WorkerSnapshot: 128 rows or 2 MiB of rows, a first row
 // whatever it weighs), the load rows within the same bytes, the rows' parts
-// first. A standby stages the parts and restores at the last one, whole or
+// first. A leader of this build sends no load row and a standby reads past
+// one: the field stays until the protocol's next break.
+// A standby stages the parts and restores at the last one, whole or
 // not at all: a stream that ends inside a snapshot leaves its store as it
 // was. An empty store is one empty part.
 message ReplicationSnapshot {
