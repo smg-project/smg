@@ -3793,14 +3793,15 @@ fn has_room_of(
     // one answer for every row: such a rule reads nothing of a worker, and
     // it keeps every row or steps aside. A signal in the sum reads a worker,
     // and so does a capacity read of each worker, so both are settled
-    // first. Every name of such a rule is the request's: the refusal names
-    // the first of them in name order.
+    // first. Every name of such a rule is the request's, since any other
+    // became a term or was refused: the refusal names the first of them in
+    // name order, which is the map's own.
     if terms.is_empty() && signal_terms.is_empty() && capacity_signal.is_none() {
-        let first = if p.used.contains_key(HasRoomRule::OUTPUT_TOKENS) {
-            HasRoomRule::OUTPUT_TOKENS
-        } else {
-            HasRoomRule::REQUEST_TOKENS
-        };
+        let first = p
+            .used
+            .keys()
+            .next()
+            .map_or(HasRoomRule::REQUEST_TOKENS, String::as_str);
         return Err(at.bad(
             "used",
             first,
