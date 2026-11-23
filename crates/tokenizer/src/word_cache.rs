@@ -145,6 +145,17 @@ impl Listing {
         Some(&self.text[start as usize..end as usize])
     }
 
+    /// How many tokens have at most `most` bytes or are taken by `longer`;
+    /// one of at most `most` bytes is counted from its span alone.
+    pub(crate) fn count(&self, most: usize, longer: impl Fn(&str) -> bool) -> usize {
+        self.spans
+            .iter()
+            .filter(|&&(start, end)| {
+                (end - start) as usize <= most || longer(&self.text[start as usize..end as usize])
+            })
+            .count()
+    }
+
     /// How many ids the listing covers (`0..len`).
     pub(crate) fn len(&self) -> u32 {
         self.spans.len() as u32
