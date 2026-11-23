@@ -34,7 +34,8 @@
 //! a worker that does not meet the demand is not followed. A list the
 //! demands leave nobody is shed with no endpoint, under the stage of the
 //! demand that took its last worker. A pair that states a demand is
-//! shed.
+//! held to it a side at a time
+//! ([`PairLists::decide`](super::pair::PairLists::decide)).
 //!
 //! **A retry** names the workers it tried ([`RequestFacts::tried`]). Over
 //! a list where an engine holds several workers, the ranks of a
@@ -454,6 +455,19 @@ fn retried(
     decision
 }
 
+/// The constraints a request that states a hard demand is decided under
+/// ([`held_in`]). The places stand in `meeting`, the calling thread's own
+/// list, taken here: its caller puts it back ([`MEETING`]). Out of line:
+/// its code stays off the path of a request that states no demand.
+#[inline(never)]
+fn held<'a>(
+    records: &PoolRecords,
+    cx: Constraints<'a>,
+    meeting: &'a mut Option<Vec<u32>>,
+) -> Result<Constraints<'a>, UnmetDemand> {
+    held_in(records, cx, meeting.insert(MEETING.take()))
+}
+
 /// The constraints a request that states a hard demand is decided under:
 /// its own, held to the places of the list whose worker meets its demands,
 /// among the places its host holds it to ([`PoolRecords::meeting`]). They
@@ -462,16 +476,14 @@ fn retried(
 /// the demands, it is held to no more than its host said. Where none does,
 /// the answer is the demand that took the last worker.
 ///
-/// The places stand in `meeting`, the calling thread's own list, taken
-/// here: its caller puts it back ([`MEETING`]). Out of line: its code
-/// stays off the path of a request that states no demand.
-#[inline(never)]
-fn held<'a>(
+/// The places are written into `kept`, a list its caller keeps: a single
+/// request's is its thread's ([`held`]), and each side of a pair has its
+/// own, judged by what that side's role is held to ([`super::pair`]).
+pub(super) fn held_in<'a>(
     records: &PoolRecords,
     cx: Constraints<'a>,
-    meeting: &'a mut Option<Vec<u32>>,
+    kept: &'a mut Vec<u32>,
 ) -> Result<Constraints<'a>, UnmetDemand> {
-    let kept = meeting.insert(MEETING.take());
     match records.meeting(cx.demands, cx.places, kept) {
         None => Ok(cx),
         Some(unmet) if kept.is_empty() => Err(unmet),

@@ -681,9 +681,12 @@ pub struct Constraints<'a> {
 }
 ```
 
-What is not built in the engine that stays: a request that states a subset hint, a pair's demand,
-or protocols that not every worker of its list serves is refused. The refusal names the input,
-except a pair's demand, which is shed under the stage `wires`.
+What is not built in the engine that stays: a request that states a subset hint, an encode
+request that states a demand, or protocols that not every worker of its list serves is refused.
+The refusal names the input, except an encode request's demand, which is shed under the stage
+`wires`. A pair's demand is kept a side at a time: each side of its two lists is held to the
+workers that meet it as that side's role is held to it, and a side it leaves nobody sheds the pair
+under that demand's stage, the prefills' first.
 A pair's encode items are decided over a host's three lists, with the pair's lease issued
 (`PolicyEngine::decide_encode_at`). The trait has no method for them: the one it had took no
 lists and could only refuse, and it was removed.
@@ -855,7 +858,7 @@ the kept one. `GatewayId` is still defined in the store.
 - It honours what it refuses today: an encode request's pair held to some workers of its two
   lists (`PairLists::decide` keeps a pair to the positions its host states, and a single
   request states the positions of its list in `Constraints::places` and is decided, which is
-  built); a pair's demands (a single request's are kept, which is built).
+  built); an encode request's demands (a single request's and a pair's are kept, which is built).
 - Five request fields that only the old engine's host fills leave with it (`pinned_at`,
   `lent_in_flight`, `lent_session_in_flight`, `session_counted`, `model_fingerprint`),
   and `Constraints::pins`. One of them needs a successor: a sessions rule with
@@ -1788,7 +1791,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; a pair's shadows run in no engine, and `explain.sample` is kept by the served controller alone (decision 7) |
 | The ten presets and the conversion from routing settings | **[built]** | |
 | The stage interfaces and a builder's own stages | **[built]** | |
-| The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, a pair's demand, mixed protocols; of the recorded lines only the four hard-demand sheets and `sticky_rank` (45) replay through it |
+| The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, an encode request's demand, mixed protocols; of the recorded lines only the four hard-demand sheets and `sticky_rank` (45) replay through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |
 | `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. Every other request the engine names the holders of reads the engine's own record, with its three faults: a request whose caller names no entry is one. The string tree is planned |
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | placed on the ring the host lends (decision 3): through `place` the plain ring alone, at the place the engine reads with the request's keys; `prefix_hash` at the places a host that writes the request's facts itself states; that both are classic's is proven at stage 3; a host that lends none is placed on the crate's ring, which may be another worker than classic's |

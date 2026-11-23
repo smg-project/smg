@@ -25,6 +25,17 @@
 //! host reads it at that instant ([`PairAdmission`]). The stock pair
 //! document filters by both bits (`has-capacity`, `has-room`).
 //!
+//! **A hard demand** ([`Demands`]). A pair's request that states one is
+//! held to it a side at a time: each side to the places of its list whose
+//! worker meets the demand as that side's role is held to it
+//! ([`Demands::held_by`]), among the places its host states for the side,
+//! by a single request's own rule ([`single::held_in`]). A side the demand
+//! leaves nobody sheds the pair with no endpoint, under the stage of the
+//! demand that took that side's last worker, the prefills' first. The
+//! decode asked again judges its decodes alone. An encode request's three
+//! lists are held to no demand: such a request is shed under the wires'
+//! name.
+//!
 //! **The words.** A side is told its issue once: with the prefill's
 //! ([`issue`]), or, where the request sends its decode later, at the decode
 //! call ([`issue_decode`]) or at the dispatch that sends the decode with no
@@ -72,12 +83,13 @@ use crate::{
     engine::{
         decision::{shed, Decision, ShedReason, Target, SUBSET_HINT, WIRES},
         decision_engine::{DecideOutcome, HeldDecision, Leased, Request},
+        demands::{Demands, UnmetDemand},
         framework::{release, Engine, PairPools, Scratch},
         lease_events,
         list_cell::LentList,
         pair_classes::PartnerClasses,
-        records::{vetoes, HeldCells, Live},
-        view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, Session, WorkerId},
+        records::{vetoes, HeldCells, Live, PoolRecords},
+        view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role, Session, WorkerId},
     },
     stages::Lifecycle,
     tracking::lease::{Lease, LeaseId, LeaseKind, Side, DISPATCH_TTL},
@@ -166,11 +178,15 @@ pub struct PairLists<'a> {
 
 /// What a host states of one side's list beside the list: the places the
 /// request may take, and the places its standing vetoes mask and hold.
+/// Where the request states a hard demand, the places are those of them
+/// whose worker meets it ([`Self::meeting`]), and a side the demand leaves
+/// nobody names the demand that took its last worker.
 #[derive(Clone, Copy, Debug)]
 struct Beside<'a> {
     places: Option<&'a [u32]>,
     stalled: &'a [u32],
     held: &'a [u32],
+    unmet: Option<UnmetDemand>,
 }
 
 impl<'a> Beside<'a> {
@@ -178,6 +194,32 @@ impl<'a> Beside<'a> {
     /// the side's as they stand.
     const fn states_nothing(&self) -> bool {
         self.places.is_none() && self.stalled.is_empty() && self.held.is_empty()
+    }
+
+    /// The side held to the places of its list whose worker meets
+    /// `demands`, among the places it states, by a single request's own
+    /// rule ([`single::held_in`]): they are written into `kept`, a list
+    /// the calling thread keeps for the side. Where every worker the side
+    /// may take meets the demands it stands as it was stated, and where
+    /// none does it names the demand that took the last one. Out of line:
+    /// its code stays off the path of a pair that states no demand.
+    #[inline(never)]
+    fn meeting(self, records: &PoolRecords, demands: Demands, kept: &'a mut Vec<u32>) -> Self {
+        let stated = Constraints {
+            demands,
+            places: self.places,
+            ..Constraints::default()
+        };
+        match single::held_in(records, stated, kept) {
+            Ok(held) => Self {
+                places: held.places,
+                ..self
+            },
+            Err(unmet) => Self {
+                unmet: Some(unmet),
+                ..self
+            },
+        }
     }
 
     /// The request's constraints with this side's places and mask.
@@ -228,6 +270,7 @@ impl<'a> PairLists<'a> {
                 places: None,
                 stalled,
                 held,
+                unmet: None,
             };
             side.of(cx)
         };
@@ -261,6 +304,16 @@ impl<'a> PairLists<'a> {
     /// the values of this call's snapshot. Cells on `request` are read by
     /// neither side, and under no snapshot every worker reads no value.
     ///
+    /// A request that states a hard demand ([`Constraints::demands`]) is
+    /// decided with each side held to the places of its list whose worker
+    /// meets the demand as that side's role is held to it
+    /// ([`Demands::held_by`]), among the places stated for the side here.
+    /// The decode decided again judges its decodes alone. A side the
+    /// demand leaves nobody sheds the pair with no endpoint under the
+    /// stage of the demand that took that side's last worker, the
+    /// prefills' first. A request that states places of its own beside a
+    /// demand is declined under the places' name.
+    ///
     /// Prefills that are all at their admission limit shed a first
     /// decision, which reads as a request that waits ([`prefills_full`]).
     ///
@@ -288,11 +341,47 @@ impl<'a> PairLists<'a> {
     pub(super) fn decide_over(
         &self,
         engine: Loaded<'_, '_>,
+        sides: (&PoolMembers, &PoolMembers),
+        loads: Option<&Arc<LoadSnapshot>>,
+        now: Instant,
+        request: &mut Request<'_>,
+        held: Option<&Target>,
+    ) -> Decision {
+        self.decide_sides(engine, sides, loads, now, request, held, true)
+    }
+
+    /// A pair's first decision with a hard demand its request states left
+    /// to the records' decision, which sheds it ([`not_decided`]): what an
+    /// encode request's entry asks for a request its three lists do not
+    /// decide. Those lists are held to no demand.
+    pub(super) fn decide_unjudged(
+        &self,
+        engine: Loaded<'_, '_>,
+        sides: (&PoolMembers, &PoolMembers),
+        loads: Option<&Arc<LoadSnapshot>>,
+        now: Instant,
+        request: &mut Request<'_>,
+    ) -> Decision {
+        self.decide_sides(engine, sides, loads, now, request, None, false)
+    }
+
+    /// [`Self::decide_over`], and whether a hard demand the request states
+    /// is `judged` over the two lists: each side is then held to the
+    /// places whose worker meets it, and the records' decision is handed
+    /// none.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a pair's decision over its two lists, and how it reads a demand"
+    )]
+    fn decide_sides(
+        &self,
+        engine: Loaded<'_, '_>,
         (prefill, decode): (&PoolMembers, &PoolMembers),
         loads: Option<&Arc<LoadSnapshot>>,
         now: Instant,
         request: &mut Request<'_>,
         held: Option<&Target>,
+        judged: bool,
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
         // One value for both lists' records: this call's instant on the
@@ -327,24 +416,51 @@ impl<'a> PairLists<'a> {
                 places: self.prefill_places,
                 stalled: self.prefill_stalled,
                 held: self.prefill_held,
+                unmet: None,
             },
             Beside {
                 places: self.decode_places,
                 stalled: self.decode_stalled,
                 held: self.decode_held,
+                unmet: None,
             },
         ];
         let decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;
-            let (workers, records) = (prefill.workers(), prefill.records(spec, clock));
-            let (prefills, prefill_facts) = records.write(workers, &live, prefills);
-            let (workers, records) = (decode.workers(), decode.records(spec, clock));
-            let (decodes, decode_facts) = records.write(workers, &live, decodes);
+            let (workers, prefill_records) = (prefill.workers(), prefill.records(spec, clock));
+            let (prefills, prefill_facts) = prefill_records.write(workers, &live, prefills);
+            let (workers, decode_records) = (decode.workers(), decode.records(spec, clock));
+            let (decodes, decode_facts) = decode_records.write(workers, &live, decodes);
             stamp(prefills, decodes, self.classes, self.admission);
             let (engine, scratch) = (spec.engine(), &mut buffers.scratch);
+            let [prefill_side, decode_side] = sides;
+            // A hard demand the request states is judged here, a side at a
+            // time, by what each side's role is held to. The records'
+            // decision is handed the places and no demand. The decode
+            // asked again judges no prefill: the held one ran already.
+            let spent;
+            let (cx, prefill_side, decode_side) = if judged && !cx.demands.is_none() {
+                let [prefill_kept, decode_kept] = &mut buffers.meeting;
+                let demands = cx.demands;
+                let prefill_side = match held {
+                    None => {
+                        let demands = demands.held_by(Role::Prefill);
+                        prefill_side.meeting(prefill_records, demands, prefill_kept)
+                    }
+                    Some(_) => prefill_side,
+                };
+                let demands = demands.held_by(Role::Decode);
+                let decode_side = decode_side.meeting(decode_records, demands, decode_kept);
+                spent = Constraints {
+                    demands: Demands::default(),
+                    ..*cx
+                };
+                (&spent, prefill_side, decode_side)
+            } else {
+                (cx, prefill_side, decode_side)
+            };
             // A side whose profile shows its rows is handed its mask in
             // them. The decode asked again reads no mask of the prefills.
-            let [prefill_side, decode_side] = sides;
             let decode_side = decode_side.written(engine, facts.model, Phase::Decode, decodes);
             let prefill_side = match held {
                 None => prefill_side.written(engine, facts.model, Phase::Prefill, prefills),
@@ -426,12 +542,15 @@ fn tried_engines(
 /// What one thread keeps for its pair decisions: each list's records, the
 /// prefills' first, and the engine's scratch. An encode request's decision
 /// keeps its encoders' records here too ([`super::encode`]): a pair's
-/// leaves them as they were.
+/// leaves them as they were. A pair that states a hard demand keeps each
+/// side's places that meet it here, the prefills' first: such a request
+/// allocates nothing once each list has grown to its side.
 #[derive(Debug, Default)]
 pub(super) struct Buffers {
     pub(super) rows: [Vec<Candidate>; 2],
     pub(super) encoders: Vec<Candidate>,
     pub(super) scratch: Scratch,
+    meeting: [Vec<u32>; 2],
 }
 
 thread_local! {
@@ -461,10 +580,13 @@ pub(super) fn stamp(
     }
 }
 
-/// How a pair's request is shed where it states what a pair's lists are not
-/// narrowed by, and the stage it is shed under: a subset hint, a hard
-/// demand, or places of its list. A pair's records keep no demand fact, so
-/// such a request is shed and never placed past its demand. A hint of some
+/// How a pair's request is shed where it states what a pair's records are
+/// not narrowed by, and the stage it is shed under: a subset hint, a hard
+/// demand, or places of its list. A pair's records keep no demand fact. A
+/// pair's own decision judges a demand ahead of them, a side at a time
+/// ([`PairLists::decide`]), and hands them none. A demand that reaches
+/// them is an encode request's, whose three lists are held to none: it is
+/// shed, and the request is never placed past its demand. A hint of some
 /// records is declined: no stage here takes a part of a list. So are
 /// places the request states itself ([`single::PLACES`]): one set cannot
 /// hold two lists, and each side's places are its lists' to state
@@ -513,9 +635,12 @@ fn decode_session(facts: &RequestFacts<'_>) -> Session {
 /// was written into its records states none here ([`Beside::written`]).
 ///
 /// One side alone is no pair: where either list holds no record the engine
-/// answers over no candidate. A request that states a hard demand or a
-/// subset hint of none is shed, and a hint of some records is declined,
-/// each under a stage's name ([`not_decided`]).
+/// answers over no candidate. A hard demand that reaches the records, or a
+/// subset hint of none, is shed, and a hint of some records is declined,
+/// each under a stage's name ([`not_decided`]). A side the request's
+/// demand left nobody ([`Beside::meeting`]) sheds the pair with no
+/// endpoint under that demand's stage, the prefills' first, behind what
+/// the records decline by name.
 fn decide_records(
     engine: &Engine,
     facts: &RequestFacts<'_>,
@@ -535,6 +660,11 @@ fn decide_records(
         return shed(reason, stage, facts.seed, pool.generation);
     }
     let [prefills, decodes] = sides;
+    // A side the request's demand left nobody: the prefills' first.
+    if let Some(unmet) = prefills.unmet.or(decodes.unmet) {
+        let stage = unmet.stage();
+        return shed(ShedReason::NoEndpoints, stage, facts.seed, pool.generation);
+    }
     if prefills.states_nothing() && decodes.states_nothing() {
         return engine.decide_pair(facts, pool, pools, cx, cx, scratch);
     }
@@ -597,7 +727,9 @@ pub(super) fn issue(
 ///
 /// The held prefill is looked for before what the request states is
 /// judged: a call whose prefill is in no list of records reads
-/// `prefill-gone` from the engine's entry too, whatever it states.
+/// `prefill-gone` from the engine's entry too, whatever it states. Behind
+/// a prefill that stands in its list, decodes the request's demand left
+/// nobody of shed the call under that demand's stage.
 fn decide_decode_records(
     engine: &Engine,
     facts: &RequestFacts<'_>,
@@ -620,9 +752,14 @@ fn decide_decode_records(
         let no_lists = PairPools::default();
         return engine.decide_decode(&facts, &none, no_lists, prefill, None, cx, scratch);
     }
-    let listed = |_: &_| pools.prefills.iter().any(|row| row.id == prefill);
-    if let Some((reason, stage)) = not_decided(cx).filter(listed) {
+    let listed = || pools.prefills.iter().any(|row| row.id == prefill);
+    if let Some((reason, stage)) = not_decided(cx).filter(|_| listed()) {
         return shed(reason, stage, facts.seed, pool.generation);
+    }
+    // The decodes the request's demand left nobody of.
+    if let Some(unmet) = side.unmet.filter(|_| listed()) {
+        let stage = unmet.stage();
+        return shed(ShedReason::NoEndpoints, stage, facts.seed, pool.generation);
     }
     let first = held.pair.map(|pair| (pair.decode_id, pair.decode_dp_rank));
     if side.states_nothing() {
@@ -789,7 +926,7 @@ pub(super) fn issued(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, sync::Arc, time::Duration};
+    use std::{cell::RefCell, collections::BTreeSet, sync::Arc, time::Duration};
 
     use parking_lot::Mutex;
     use smg_worker::{
@@ -805,12 +942,12 @@ mod tests {
         engine::{
             decision::{Pair, Pick, Target, Targets},
             decision_engine::{DecisionEngine, HeldDecode, RequestMaker, WorkerLists},
-            demands::Demands,
+            demands::DemandFacts,
             framework::{Filter, Picker, TieBand},
             list_cell::tests::PublishedList,
             records::worker_id,
             sticky_sessions::{DecodeVerdict, SessionVerdict},
-            view::{Identity, Role, WireModes, WorkerId},
+            view::{FixedFacts, Identity, WireModes},
         },
         policies::consistent_hashing::InOrder,
         stages::{Best, HasCapacity, StageRegistry},
@@ -1025,6 +1162,7 @@ mod tests {
             places,
             stalled: &[],
             held: &[],
+            unmet: None,
         }
     }
 
@@ -2077,6 +2215,246 @@ mod tests {
         };
         assert_eq!(shed_under(1, 0), (ShedReason::NoEndpoints, WIRES));
         assert_eq!(shed_under(0, 1), (ShedReason::NoEndpoints, "prefill-gone"));
+    }
+
+    /// [`Host::of`] whose host says what each worker states for a request's
+    /// demands: `stated` answers for a side, the prefills' `0`, and a place
+    /// of that side's list.
+    fn stating(
+        prefills: usize,
+        decodes: usize,
+        stated: impl Fn(usize, usize) -> FixedFacts,
+    ) -> Host {
+        let mut host = Host::of(prefills, decodes);
+        let said = |side: usize, list: &Arc<[Arc<dyn Worker>]>| {
+            let mut places = 0..;
+            PublishedList::with_facts(Arc::clone(list), |_| {
+                stated(side, places.next().expect("a place"))
+            })
+        };
+        host.lists = [said(0, &host.prefills), said(1, &host.decodes)];
+        host
+    }
+
+    /// A pair's constraints that state `demands` and nothing else.
+    fn demanding(demands: Demands) -> Constraints<'static> {
+        Constraints {
+            demands,
+            ..Constraints::default()
+        }
+    }
+
+    /// The places of each list that twelve first decisions of `host` name
+    /// for a request that states `cx`, each list held to `places`.
+    fn places_named(
+        host: &Host,
+        cx: Constraints<'_>,
+        places: [Option<&[u32]>; 2],
+    ) -> (BTreeSet<usize>, BTreeSet<usize>) {
+        let picks = (0..12).map(|seed| {
+            let decision = host.decide_among(&OPEN, seed, None, cx, places);
+            host.picked(&decision)
+        });
+        picks.unzip()
+    }
+
+    /// What a decision that sheds is shed for, and under which stage.
+    fn shed_of(decision: &Decision) -> (ShedReason, &'static str) {
+        match decision {
+            Decision::Shed(shed) => (shed.reason, shed.emptied_by),
+            other => panic!("not shed: {other:?}"),
+        }
+    }
+
+    /// A pair that states a hard demand is decided over its two lists,
+    /// each side held to the workers that meet the demand: every pick
+    /// names one of them on each side, and each of them takes its turn.
+    /// With no demand the other workers take theirs.
+    ///
+    /// The classic router holds both of a pair's pools to the request's
+    /// own rule (`model_gateway/src/routers/common/placement.rs:1227`, the
+    /// rule's read at `:1262-1266`; its cases at `:3272` and `:3324`, at
+    /// main `b8c15d40a`).
+    #[test]
+    fn a_pair_that_states_a_demand_is_decided_among_the_workers_of_each_side_that_meet_it() {
+        // The second prefill takes images, and so do the first and the
+        // third decode.
+        let host = stating(2, 3, |side, at| FixedFacts {
+            vision: if side == 0 { at == 1 } else { at != 1 },
+            ..FixedFacts::default()
+        });
+        let pixels = demanding(Demands {
+            vision: true,
+            ..Demands::default()
+        });
+        let seeing = (BTreeSet::from([1]), BTreeSet::from([0, 2]));
+        assert_eq!(places_named(&host, pixels, [None, None]), seeing);
+        let all = (BTreeSet::from([0, 1]), BTreeSet::from([0, 1, 2]));
+        assert_eq!(
+            places_named(&host, Constraints::default(), [None, None]),
+            all
+        );
+    }
+
+    /// A prefill is held to neither the completion's bound nor the way a
+    /// constraint was decided ([`Demands::held_by`]): it runs the input,
+    /// and the decode beside it holds the budget and generates the tokens.
+    /// So a prefill whose window is under the completion's bound stays a
+    /// candidate while a decode under it leaves, and the input's bound
+    /// holds both sides.
+    #[test]
+    fn a_pairs_prefill_is_held_to_neither_the_completions_bound_nor_a_constraints_way() {
+        // Every worker states a window of 4,096 but the second decode,
+        // which states 16,384. The first decode alone states a way to
+        // decide a constraint.
+        let host = stating(2, 2, |side, at| FixedFacts {
+            demands: DemandFacts {
+                window: if (side, at) == (1, 1) { 16_384 } else { 4_096 },
+                decoding: if (side, at) == (1, 0) { 3 } else { 0 },
+                ..DemandFacts::default()
+            },
+            ..FixedFacts::default()
+        });
+        let both = BTreeSet::from([0, 1]);
+        let long = demanding(Demands {
+            output_window: 8_000,
+            ..Demands::default()
+        });
+        let wide = (both.clone(), BTreeSet::from([1]));
+        assert_eq!(places_named(&host, long, [None, None]), wide);
+        let decided = demanding(Demands {
+            decoding: 3,
+            ..Demands::default()
+        });
+        let alike = (both, BTreeSet::from([0]));
+        assert_eq!(places_named(&host, decided, [None, None]), alike);
+        // The input's bound is every worker's: no prefill holds it.
+        let prompt = demanding(Demands {
+            input_window: 8_000,
+            ..Demands::default()
+        });
+        let decision = host.decide_among(&OPEN, 0, None, prompt, [None, None]);
+        let narrow = (ShedReason::NoEndpoints, "context-window");
+        assert_eq!(shed_of(&decision), narrow);
+    }
+
+    /// A side the demand leaves nobody sheds the pair with no endpoint
+    /// under the stage of the demand that took that side's last worker, as
+    /// a single request's list is shed. Where each side is left nobody, the
+    /// prefills' demand is the one named.
+    #[test]
+    fn a_side_a_demand_leaves_nobody_sheds_the_pair_under_that_demands_stage() {
+        // No prefill takes images. Every decode does, and each states a
+        // window of 4,096.
+        let host = stating(2, 2, |side, _| FixedFacts {
+            vision: side == 1,
+            demands: DemandFacts {
+                window: if side == 1 { 4_096 } else { 0 },
+                ..DemandFacts::default()
+            },
+            ..FixedFacts::default()
+        });
+        let shed_under = |demands: Demands| {
+            let decision = host.decide_among(&OPEN, 0, None, demanding(demands), [None, None]);
+            shed_of(&decision)
+        };
+        let pixels = Demands {
+            vision: true,
+            ..Demands::default()
+        };
+        assert_eq!(shed_under(pixels), (ShedReason::NoEndpoints, "vision"));
+        let long = Demands {
+            output_window: 8_000,
+            ..Demands::default()
+        };
+        let narrow = (ShedReason::NoEndpoints, "context-window");
+        assert_eq!(shed_under(long), narrow);
+        // Both sides are left nobody, each by another demand.
+        let each = Demands {
+            vision: true,
+            ..long
+        };
+        assert_eq!(shed_under(each), (ShedReason::NoEndpoints, "vision"));
+    }
+
+    /// A demand is judged among the places a pair's host states for a
+    /// side: the side is held to those of them whose worker meets it, and
+    /// a side none of whose places meets it sheds the pair, whatever a
+    /// worker outside them states.
+    #[test]
+    fn a_pairs_demand_is_judged_among_the_places_its_host_states() {
+        // The second and the third worker of each list take images.
+        let host = stating(3, 3, |_, at| FixedFacts {
+            vision: at != 0,
+            ..FixedFacts::default()
+        });
+        let pixels = demanding(Demands {
+            vision: true,
+            ..Demands::default()
+        });
+        let held = places_named(&host, pixels, [Some(&[0, 1]), Some(&[1, 2])]);
+        assert_eq!(held, (BTreeSet::from([1]), BTreeSet::from([1, 2])));
+        let blind = host.decide_among(&OPEN, 0, None, pixels, [None, Some(&[0])]);
+        assert_eq!(shed_of(&blind), (ShedReason::NoEndpoints, "vision"));
+    }
+
+    /// A pair's request that states both a hard demand and places of its
+    /// own is declined under the places' name, whether its sides meet the
+    /// demand or not: a pair's places are its lists' to state, and that
+    /// answer comes ahead of the demand's.
+    #[test]
+    fn a_pair_that_states_a_demand_and_places_of_its_own_is_declined_under_the_places() {
+        let pixels = demanding(Demands {
+            vision: true,
+            ..Demands::default()
+        });
+        let stated = Constraints {
+            places: Some(&[0]),
+            ..pixels
+        };
+        let declined = (ShedReason::PolicyDeclined, single::PLACES);
+        // Every worker takes images, then none does.
+        for sees in [true, false] {
+            let host = stating(1, 1, |_, _| FixedFacts {
+                vision: sees,
+                ..FixedFacts::default()
+            });
+            let decision = host.decide_among(&OPEN, 0, None, stated, [None, None]);
+            assert_eq!(shed_of(&decision), declined, "takes images: {sees}");
+        }
+    }
+
+    /// The decode asked again behind a held prefill is held to the decodes
+    /// that meet the demand, and judges no prefill: the held one ran
+    /// already, whatever it states. Where no decode meets the demand the
+    /// call is shed under that demand's stage.
+    ///
+    /// The classic router decides no decode again (`placement.rs:1227`, at
+    /// main `b8c15d40a`): this answer is the engine's own.
+    #[test]
+    fn a_decode_asked_again_is_held_to_the_decodes_that_meet_the_demand() {
+        let pixels = demanding(Demands {
+            vision: true,
+            ..Demands::default()
+        });
+        // No prefill takes images, and the second decode alone does.
+        let host = stating(1, 2, |side, at| FixedFacts {
+            vision: (side, at) == (1, 1),
+            ..FixedFacts::default()
+        });
+        let held = prefill_alone(worker_id(host.prefills[0].as_ref()));
+        for seed in 0..6 {
+            let again = host.decide_among(&OPEN, seed, Some(&held), pixels, [None, None]);
+            assert_eq!(host.picked(&again), (0, 1));
+        }
+        // The pair's first decision judges its prefills.
+        let first = host.decide_among(&OPEN, 0, None, pixels, [None, None]);
+        assert_eq!(shed_of(&first), (ShedReason::NoEndpoints, "vision"));
+        // No decode takes images.
+        let blind = stating(1, 2, |_, _| FixedFacts::default());
+        let held = prefill_alone(worker_id(blind.prefills[0].as_ref()));
+        let again = blind.decide_among(&OPEN, 0, Some(&held), pixels, [None, None]);
+        assert_eq!(shed_of(&again), (ShedReason::NoEndpoints, "vision"));
     }
 
     /// Under round robin on both sides a pair's first decision takes the
