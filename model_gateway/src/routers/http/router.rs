@@ -2209,7 +2209,7 @@ pub(crate) async fn send_with_stale_conn_retry(
     }
 }
 
-fn convert_reqwest_error(e: reqwest::Error) -> Response {
+pub(super) fn convert_reqwest_error(e: reqwest::Error) -> Response {
     // The error's words and its causes, without the URL reqwest puts in them:
     // the worker's address is logged by the caller and is not the client's.
     let message = cause(&e);
