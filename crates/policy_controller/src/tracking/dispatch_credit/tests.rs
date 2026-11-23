@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::{ops::Deref, sync::Arc, time::Instant};
 
 use parking_lot::Mutex;
 use serde_json::json;
@@ -6,7 +6,10 @@ use serde_json::json;
 use crate::{
     document::{AppliedSpec, PolicySpec, SpecError, API_VERSION},
     engine::{
-        decision, decision_engine::Request, framework, store_backed_engine::StoreBackedEngine,
+        decision,
+        decision_engine::{DecisionEngine, Request},
+        framework,
+        store_backed_engine::StoreBackedEngine,
         Candidate, Constraints, Engine, Filter, LoadRow, Pair, PoolFacts, RequestFacts, Scorer,
         Scratch, Target, TieBand, WorkerId,
     },
@@ -16,9 +19,8 @@ use crate::{
         WorkerStatus, WorkersStore,
     },
     tracking::{
-        decision_guard::DecisionGuard,
-        lease::{Dispatch, Said},
-        CreditedDispatches, DispatchCounts, DispatchCredit, Lease, Membership, Side,
+        decision_guard::DecisionGuard, CreditedDispatches, DispatchCounts, DispatchCredit, Lease,
+        Membership, Side,
     },
 };
 
@@ -471,30 +473,15 @@ fn decide<'a>(
     .expect("a decision")
 }
 
-fn chosen(decision: &DecisionGuard<&StoreBackedEngine>) -> Candidate {
+/// The first target of a held decision, as the candidate a reader is asked
+/// of, whichever engine decided it.
+fn chosen<D: Deref<Target: DecisionEngine>>(decision: &DecisionGuard<D>) -> Candidate {
     let target = decision
         .decision()
         .pick()
         .and_then(|pick| pick.targets.first())
         .expect("a pick");
     row(target.id.0, target.dp_rank)
-}
-
-#[test]
-fn a_handle_dispatch_changes_the_next_in_process_pick() {
-    let (door, _, readers) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"first", now);
-    let sent_to = chosen(&first);
-    let sent = Arc::clone(&readers.lock()[0]);
-    assert_eq!(
-        sent.read(&clock(0), &sent_to),
-        CreditedDispatches::default()
-    );
-    first.dispatched(now);
-    let second = decide(&door, b"second", now);
-    assert_ne!(chosen(&second).id, sent_to.id);
-    assert_eq!(sent.read(&clock(0), &sent_to), one(TOKENS));
 }
 
 #[test]
@@ -693,29 +680,6 @@ fn a_generation_with_no_readers_leaves_sends_behind() {
         readers[1].read(&clock(0), &sent_to),
         CreditedDispatches::default()
     );
-}
-
-#[test]
-fn a_second_dispatch_report_of_the_same_side_counts_nothing() {
-    let (door, _, readers) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"first", now);
-    let sent_to = chosen(&first);
-    let lease = first.lease().expect("the pick's lease").lease;
-    first.dispatched(now);
-    door.report(
-        GATEWAY,
-        lease.id,
-        Said::Dispatched(
-            Dispatch {
-                target_index: lease.target_index,
-                side: lease.side,
-                since_decision_micros: DELAY,
-            },
-            now,
-        ),
-    );
-    assert_eq!(readers.lock()[0].read(&clock(0), &sent_to), one(TOKENS));
 }
 
 #[test]
@@ -1189,4 +1153,109 @@ fn a_registered_picker_reads_the_sends_of_its_profile() {
             ..CreditedDispatches::default()
         }
     );
+}
+
+/// A send told through a decision's handle, over the engine that decides
+/// over worker lists.
+#[cfg(feature = "in-process")]
+mod over_lists {
+    use std::{sync::Arc, time::Instant};
+
+    use smg_worker::{identity::basic::Worker, test_support::ready_worker};
+
+    use super::{catalog, chosen, clock, document, one, validated, Readers, POOL, TOKENS};
+    use crate::{
+        document::AppliedSpec,
+        engine::{
+            decision_engine::{Request, RequestMaker, WorkerLists},
+            policy_engine::{PolicyEngine, PoolMembers},
+            Constraints, RequestFacts,
+        },
+        store::GatewayId,
+        tracking::{decision_guard::DecisionGuard, CreditedDispatches},
+    };
+
+    /// A request stated ahead, with the list its host hands for it.
+    struct Asks<'a>(Request<'a>, &'a PoolMembers);
+
+    impl RequestMaker for Asks<'_> {
+        fn model(&self) -> &str {
+            self.0.facts.model
+        }
+
+        fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
+            self.0
+        }
+
+        fn workers(&self) -> WorkerLists<'_> {
+            WorkerLists::Single(self.1)
+        }
+    }
+
+    /// The engine of the standing document, two ready workers as it reads
+    /// their list, and the document's readers.
+    fn bed() -> (PolicyEngine, PoolMembers, Readers) {
+        let (catalog, readers) = catalog();
+        let engine = PolicyEngine::new(validated(&document(None), &catalog));
+        let list: Arc<[Arc<dyn Worker>]> = ["http://first:8000", "http://second:8000"]
+            .iter()
+            .map(|url| ready_worker(url, POOL))
+            .collect();
+        let members = engine.pool_members(&list);
+        (engine, members, readers)
+    }
+
+    /// A decision for a request of [`TOKENS`] tokens over `members`, held
+    /// by its handle.
+    fn decide<'a>(
+        engine: &'a PolicyEngine,
+        members: &PoolMembers,
+        id: &[u8],
+        now: Instant,
+    ) -> DecisionGuard<&'a PolicyEngine> {
+        let request = Request {
+            id,
+            facts: RequestFacts {
+                model: POOL,
+                prompt_tokens: TOKENS,
+                ..RequestFacts::default()
+            },
+            constraints: Constraints::default(),
+        };
+        let asks = Asks(request, members);
+        DecisionGuard::decide_under(engine, GatewayId::LOCAL, &asks, now).expect("a decision")
+    }
+
+    /// A send told through a decision's handle is read by the profile's
+    /// reader, and the engine's next decision goes to the other worker.
+    #[test]
+    fn a_handle_dispatch_changes_the_next_in_process_pick() {
+        let (engine, members, readers) = bed();
+        let now = Instant::now();
+        let mut first = decide(&engine, &members, b"first", now);
+        let sent_to = chosen(&first);
+        let sent = Arc::clone(&readers.lock()[0]);
+        assert_eq!(
+            sent.read(&clock(0), &sent_to),
+            CreditedDispatches::default()
+        );
+        first.dispatched(now);
+        let second = decide(&engine, &members, b"second", now);
+        assert_ne!(chosen(&second).id, sent_to.id);
+        assert_eq!(sent.read(&clock(0), &sent_to), one(TOKENS));
+    }
+
+    /// A handle says its dispatch once, so a second word of the same send
+    /// counts nothing. The engine files no lease: the handle is the one
+    /// that tells it a word, and no entry takes a report by a lease's id.
+    #[test]
+    fn a_second_dispatch_word_of_one_handle_counts_nothing() {
+        let (engine, members, readers) = bed();
+        let now = Instant::now();
+        let mut first = decide(&engine, &members, b"first", now);
+        let sent_to = chosen(&first);
+        first.dispatched(now);
+        first.dispatched(now);
+        assert_eq!(readers.lock()[0].read(&clock(0), &sent_to), one(TOKENS));
+    }
 }
