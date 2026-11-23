@@ -141,23 +141,21 @@ pub(crate) struct EncodeDispatchPlan {
 pub(crate) struct PreparedEncodeJob {
     item: PreparedEncodeItem,
     target: EncodeTarget,
-    /// The encode worker the job is assigned to: its load counts the send.
+    /// The encode worker the job is assigned to: the send goes to it, and
+    /// its load counts the send.
     worker: Arc<dyn Worker>,
     bootstrap_room: i64,
 }
 
-/// The encode worker a job goes to, by the transport that reaches it.
+/// The transport that reaches the encode worker of a job.
 pub(crate) enum EncodeTarget {
     /// A gRPC encode worker, by its URL.
-    Grpc(String),
-    /// A TokenSpeed encode server on the direct ZMQ lane: its worker, whose
-    /// connection carries the request, and the rendezvous the request names
+    Grpc,
+    /// A TokenSpeed encode server on the direct ZMQ lane: the worker's
+    /// connection carries the request, with the rendezvous the request names
     /// (the server's own bootstrap address, which the prefill side pulls the
     /// embedding from).
-    Zmq {
-        worker: Arc<dyn Worker>,
-        rendezvous: EncodeRendezvous,
-    },
+    Zmq { rendezvous: EncodeRendezvous },
 }
 
 impl EncodePlan {
@@ -192,8 +190,10 @@ impl PreparedEncodeJob {
     pub(crate) async fn dispatch(self) -> std::result::Result<(), String> {
         // Booked on its encode worker until the send ends, as a generate
         // call is on its worker.
-        let _load = WorkerLoadGuard::with_key(self.worker, None);
-        self.item.dispatch(self.target, self.bootstrap_room).await
+        let _load = WorkerLoadGuard::with_key(Arc::clone(&self.worker), None);
+        self.item
+            .dispatch(self.worker.as_ref(), self.target, self.bootstrap_room)
+            .await
     }
 }
 
@@ -218,6 +218,7 @@ impl PreparedEncodeItem {
 
     pub(crate) async fn dispatch(
         mut self,
+        worker: &dyn Worker,
         target: EncodeTarget,
         bootstrap_room: i64,
     ) -> std::result::Result<(), String> {
@@ -235,7 +236,7 @@ impl PreparedEncodeItem {
                 // Stage with bootstrap_room as the slot key (load-bearing), so
                 // into_proto(false) below does not re-stage with a random key.
                 // The ZMQ lane carries the tensor inline, never a remote pull.
-                if let (EncodeTarget::Grpc(_), Some(exporter)) = (&target, mm_rdma_exporter()) {
+                if let (EncodeTarget::Grpc, Some(exporter)) = (&target, mm_rdma_exporter()) {
                     item.encoder_input =
                         stage_tokenspeed_tensor_rdma(exporter, bootstrap_room, item.encoder_input);
                 }
@@ -258,11 +259,11 @@ impl PreparedEncodeItem {
                     .unwrap_or_default();
                 let _shm_guard = TokenSpeedShmCleanupGuard(shm_handles);
                 match target {
-                    EncodeTarget::Grpc(endpoint) => {
-                        send_tokenspeed_encode_rpc(endpoint, request).await
+                    EncodeTarget::Grpc => {
+                        send_tokenspeed_encode_rpc(worker.url().to_string(), request).await
                     }
-                    EncodeTarget::Zmq { worker, rendezvous } => {
-                        send_tokenspeed_encode_frame(worker.as_ref(), &rendezvous, request).await
+                    EncodeTarget::Zmq { rendezvous } => {
+                        send_tokenspeed_encode_frame(worker, &rendezvous, request).await
                     }
                 }
             }
@@ -414,15 +415,12 @@ fn build_plan(
         });
         let target = match worker.connection_mode() {
             ConnectionMode::Zmq => EncodeTarget::Zmq {
-                worker: Arc::clone(worker),
                 rendezvous: EncodeRendezvous {
                     bootstrap_host: bootstrap_host.to_string(),
                     bootstrap_port: i32::from(bootstrap_port),
                 },
             },
-            ConnectionMode::Grpc | ConnectionMode::Http => {
-                EncodeTarget::Grpc(worker.url().to_string())
-            }
+            ConnectionMode::Grpc | ConnectionMode::Http => EncodeTarget::Grpc,
         };
         jobs.push(PreparedEncodeJob {
             item,
@@ -729,8 +727,8 @@ mod tests {
         let job = jobs.pop().unwrap();
         assert_eq!(job.bootstrap_room, bootstrap_info[0].bootstrap_room);
         match &job.target {
-            EncodeTarget::Zmq { worker, rendezvous } => {
-                assert_eq!(worker.url(), encoder.url());
+            EncodeTarget::Zmq { rendezvous } => {
+                assert_eq!(job.worker.url(), encoder.url());
                 assert_eq!(
                     (
                         rendezvous.bootstrap_host.as_str(),
@@ -739,7 +737,7 @@ mod tests {
                     ("10.0.0.9", 8998)
                 );
             }
-            EncodeTarget::Grpc(endpoint) => panic!("a gRPC target {endpoint}"),
+            EncodeTarget::Grpc => panic!("a gRPC target"),
         }
         let PreparedEncodeItem::TokenSpeed {
             item: Some(item),
@@ -823,7 +821,7 @@ mod tests {
             Arc::new(BasicWorkerBuilder::new(format!("http://{address}")).build());
         let watch = launch_encode_dispatch(EncodeDispatchPlan::new(vec![PreparedEncodeJob {
             item: PreparedEncodeItem::tokenspeed(item, false, 0),
-            target: EncodeTarget::Grpc(worker.url().to_string()),
+            target: EncodeTarget::Grpc,
             worker: Arc::clone(&worker),
             bootstrap_room: 42,
         }]));
@@ -1044,7 +1042,7 @@ mod tests {
             let (item, path) = tokenspeed_item_backed_by_shm();
             let dispatch = EncodeDispatchPlan::new(vec![PreparedEncodeJob {
                 item,
-                target: EncodeTarget::Grpc("http://encode-worker:9000".to_string()),
+                target: EncodeTarget::Grpc,
                 worker: Arc::new(BasicWorkerBuilder::new("http://encode-worker:9000").build()),
                 bootstrap_room: 42,
             }]);
@@ -1087,9 +1085,8 @@ mod tests {
 
             // Bogus endpoint: the encode RPC fails, but the send-path guard still
             // reclaims the segment when dispatch() returns.
-            let _ = item
-                .dispatch(EncodeTarget::Grpc("http://127.0.0.1:1".to_string()), 7)
-                .await;
+            let worker = BasicWorkerBuilder::new("http://127.0.0.1:1").build();
+            let _ = item.dispatch(&worker, EncodeTarget::Grpc, 7).await;
 
             assert!(
                 !path.exists(),
