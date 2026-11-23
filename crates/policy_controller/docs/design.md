@@ -1498,7 +1498,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The policy document: profiles, bindings by model and phase, plans, overload, routing key, sessions | **[built]** | |
 | Bindings by tenant, priority, header, prompt size, labels; a session id issued by the engine (`issue_session_id`) | **[planned]** | in the schema; a document that writes one is refused as not in this build |
 | `canary`, `override: allowed`, `admission` | **[planned]** | in the schema; a document that writes one is refused, and the error names the field |
-| `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; a pair's shadows and `explain.sample` run in the old engine only (decision 7) |
+| `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; a pair's shadows run in no engine, and `explain.sample` is kept by the served controller alone (decision 7) |
 | The ten presets and the conversion from routing settings | **[built]** | |
 | The stage interfaces and a builder's own stages | **[built]** | |
 | The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, a pair's demand, mixed protocols; no recorded line replays through it |
@@ -1625,7 +1625,8 @@ every fallback engine".
 ### Decision 7: shadow and explain
 
 The kept engine runs a single request's shadow, and counts as skipped one that reads affinity
-rows of its own. A pair's shadows and the explain sample run in the old engine only. A document
+rows of its own. A pair's shadows run in no engine, and the explain sample is kept by the
+served controller alone. A document
 that writes `canary`, `override: allowed` or `admission` is refused. No engine runs them.
 
 | Option | Cost |

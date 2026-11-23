@@ -5084,6 +5084,10 @@ impl Engine {
     /// the shadow profile's needs to the live one's: a host that skips a
     /// shadow, or names it rows of its own ([`ShadowRows`]), fills the
     /// live decision's column by this word.
+    #[expect(
+        dead_code,
+        reason = "no host names a shadow rows of its own until the engine over worker lists does"
+    )]
     pub(crate) fn live_column_at(&self, at: u32, phase: Phase) -> bool {
         self.bindings
             .get(at as usize)
@@ -5097,6 +5101,13 @@ impl Engine {
     /// own, as [`Self::affinity_rows_cap`] says a live profile's. `0` where the
     /// binding names no shadow. A host asks it where it names such rows,
     /// and for no other decision.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no host names a shadow rows of its own until the engine over worker lists does"
+        )
+    )]
     pub(crate) fn shadow_cap_at(&self, at: u32) -> u32 {
         self.bindings
             .get(at as usize)
@@ -5113,6 +5124,13 @@ impl Engine {
     /// reads that call's shadow word ([`Self::shadow_at`]) and names its
     /// sampled record by this position. `None` where the prefill lookup
     /// finds no pair.
+    #[cfg_attr(
+        not(feature = "controller"),
+        expect(
+            dead_code,
+            reason = "the served controller names a decode call's sampled record by it"
+        )
+    )]
     pub(crate) fn pair_position(&self, model: &str) -> Option<u32> {
         let at = self.binding_position(model, Phase::Prefill)?;
         let pairs = matches!(self.binding_at(at)?.plan, Plan::PdPair | Plan::Epd { .. });
@@ -5288,6 +5306,10 @@ impl Engine {
     /// that names the shadow rows of its own ([`ShadowRows::Own`]) holds
     /// a naming that fills its cap to it. `None` too where the binding
     /// names no shadow.
+    #[expect(
+        dead_code,
+        reason = "no host names a shadow rows of its own until the engine over worker lists does"
+    )]
     pub(crate) fn shadow_keeps_at<'a>(
         &'a self,
         at: u32,
@@ -6977,6 +6999,13 @@ impl Engine {
         clippy::too_many_arguments,
         reason = "the pair's entry and its inputs, beside the side and the live pick"
     )]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no host asks a pair's shadows until the engine over worker lists does"
+        )
+    )]
     pub(crate) fn shadow_side(
         &self,
         at: u32,
@@ -7049,6 +7078,13 @@ impl Engine {
     #[expect(
         clippy::too_many_arguments,
         reason = "the decode entry and its inputs, beside the binding"
+    )]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no host asks a later decode's shadow until the engine over worker lists does"
+        )
     )]
     pub(crate) fn shadow_decode_later(
         &self,

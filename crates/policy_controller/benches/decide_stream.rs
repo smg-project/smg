@@ -121,10 +121,9 @@
 //!
 //! `DECIDE_STREAM_EXPLAIN_SAMPLE` sets the document's sampling rate for
 //! each row, with zero as the default. `DECIDE_STREAM_SHADOW` gives a
-//! one-side row's binding a twin of its profile as its shadow, so a door's
-//! cell counts a decision with its shadow. Set to `other`, a binding of
-//! another model names that shadow: the cell then counts a decision with
-//! no shadow under a document that shadows.
+//! one-side row's binding a twin of its profile as its shadow. Set to
+//! `other`, a binding of another model names that shadow. No cell asks a
+//! shadow: each then counts a decision under a document that names one.
 //!
 //! A measured run pins a cell's busy threads to a core each, over the
 //! cores the process was given, in their order: the deciders, the

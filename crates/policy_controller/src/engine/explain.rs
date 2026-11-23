@@ -1,6 +1,14 @@
 //! A seat's holder counts picks and sheds before it takes the ring lock.
 //! The lock holds a push or a scan of the seat's recent decisions.
 
+#![cfg_attr(
+    not(feature = "controller"),
+    expect(
+        dead_code,
+        reason = "Only the served controller keeps sampled records."
+    )
+)]
+
 use std::{collections::VecDeque, time::Instant};
 
 use crate::{
@@ -59,15 +67,6 @@ pub struct DecisionNames {
     pub scorers: Vec<String>,
 }
 
-/// A sampled decision with the names that can still be read for it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DecisionExplanation {
-    /// The sampled decision.
-    pub record: DecisionRecord,
-    /// `None` when the decision's generation or binding is unavailable.
-    pub names: Option<DecisionNames>,
-}
-
 impl DecisionRecord {
     /// Reads names if `engine` has the recorded generation number and binding.
     #[must_use]
@@ -111,7 +110,7 @@ impl DecisionRecord {
 }
 
 /// A decider's count toward its next sample, kept under one term and
-/// generation. A door in process uses term zero throughout.
+/// generation.
 #[derive(Default)]
 pub(crate) struct SampleCount {
     term: u64,
@@ -140,11 +139,6 @@ impl SampleCount {
         }
         self.count = 0;
         true
-    }
-
-    #[cfg(test)]
-    pub(super) fn counted(&self) -> u32 {
-        self.count
     }
 }
 
@@ -217,11 +211,6 @@ impl Samples {
             .rev()
             .find(|record| record.gateway == gateway && record.request == request)
             .copied()
-    }
-
-    #[cfg(test)]
-    pub(super) fn slots(&self) -> usize {
-        self.records.capacity()
     }
 }
 
