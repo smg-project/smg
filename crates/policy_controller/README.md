@@ -722,7 +722,7 @@ bindings:
     profiles: { encode: encode, prefill: prefill, decode: decode }
 ```
 
-Use this document with `PolicyEngine::decide_encode_at`. Pass the request's `EncodeItems` and an `EncodePlaced`. A host that decides over its own rows calls `Engine::decide_encode_pair` and supplies the worker offers and the compatibility tables as well. The encode profile can key each item by content hash. A push handoff can place by one supplied key. Images require a vision-capable encoder, and a request can require a vision-capable decode worker. The decision writes encoder choices to `EncodePlaced`. All choices are made before dispatch. [Encode entry and refusal names](src/engine/framework/encode.rs)
+Use this document with `PolicyEngine::decide_encode_at`. Pass the request's `EncodeItems` and an `EncodePlaced`. A host that decides over its own rows calls `Engine::decide_encode_pair` and supplies the worker offers and the compatibility tables as well. The encode profile can key each item by content hash. A push handoff can place by one supplied key. Images and videos require a vision-capable encoder, and a request can require a vision-capable decode worker. The decision writes encoder choices to `EncodePlaced`. All choices are made before dispatch. [Encode entry and refusal names](src/engine/framework/encode.rs)
 
 ### Session keys
 

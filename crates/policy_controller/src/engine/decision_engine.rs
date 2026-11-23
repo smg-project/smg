@@ -291,8 +291,8 @@ pub enum WorkerLists<'a> {
     /// asked again. Such a decision does not read whether a decode takes
     /// images, so the encode entry declines a request that states the
     /// later decode where its decode is held to the ones that take images:
-    /// by its demand, or by the preference of image references beside an
-    /// image.
+    /// by its demand, or by the preference of references beside an image
+    /// or a video.
     Encode(super::policy_engine::encode::EncodeLists<'a>),
 }
 

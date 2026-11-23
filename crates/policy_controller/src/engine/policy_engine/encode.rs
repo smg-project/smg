@@ -33,9 +33,9 @@ use crate::engine::{
 mod tests;
 
 /// What a request that states the later decode is declined under where its
-/// decode is held to the ones that take images, by its demand or by image
-/// references beside an image: a decode asked again takes no items, so
-/// nothing there holds it to a decode that takes images.
+/// decode is held to the ones that take images, by its demand or by
+/// references beside an image or a video: a decode asked again takes no
+/// items, so nothing there holds it to a decode that takes images.
 const DECODE_LATER: &str = "decode-later";
 
 /// An encode request's three lists as their host lends them for one
@@ -310,8 +310,8 @@ impl PolicyEngine {
     ///
     /// A request that states the later decode is declined under
     /// `decode-later` where it asks images of its decode
-    /// ([`EncodeItems::decode_images`]), and where it carries image
-    /// references beside an image ([`EncodeItems::references`]), which
+    /// ([`EncodeItems::decode_images`]), and where it carries references
+    /// beside an image or a video ([`EncodeItems::references`]), which
     /// prefer a decode that takes images: a decode asked again takes no
     /// items, so nothing there holds it to such a decode. The decline reads
     /// the request's own facts and no list: it stands also where no decode
@@ -439,7 +439,7 @@ impl Loaded<'_, '_> {
 /// A request that states the later decode is declined under
 /// [`DECODE_LATER`], and no key is placed, where its decode is held to the
 /// ones that take images: by its demand ([`EncodeItems::decode_images`]),
-/// or by the preference of image references beside an image
+/// or by the preference of references beside an image or a video
 /// ([`EncodeItems::references`]). The entries that decide a decode again
 /// take no items ([`WorkerLists::Encode`]). The decline reads the request's
 /// own facts and no list, so it stands also where no decode takes images.
@@ -480,7 +480,7 @@ pub(super) fn decide(
             return single::declined(own, request, WIRES);
         }
     }
-    let images = items.holds_decode_to_images(request.facts.media.images != 0);
+    let images = items.holds_decode_to_images(request.facts.media.holds_pixels());
     if images && request.constraints.decode_later {
         placed.clear();
         return single::declined(own, request, DECODE_LATER);

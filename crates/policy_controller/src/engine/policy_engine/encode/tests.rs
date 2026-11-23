@@ -59,7 +59,8 @@ impl PairAdmission for Gates {
 /// prefill pairs with every decode and every gate is open, until a case
 /// says otherwise, under the stock encode document.
 /// `loads` is the snapshot of load reports the host hands with a decision.
-/// `images` says the request states an image. `excluded` are the workers
+/// `images` says the request states an image, and `video` a video.
+/// `excluded` are the workers
 /// the host says it just failed to reach. `places` are the places of the
 /// prefill list and of the decode list the host holds the request to.
 /// `vetoes` are the places of each of the two its standing vetoes mask, and
@@ -74,6 +75,7 @@ struct Host {
     gates: Gates,
     loads: Option<Arc<LoadSnapshot>>,
     images: bool,
+    video: bool,
     excluded: Vec<WorkerId>,
     places: [Option<Vec<u32>>; 2],
     vetoes: [[Vec<u32>; 2]; 2],
@@ -170,6 +172,7 @@ impl Host {
             gates: Gates(|_| true, |_| true),
             loads: None,
             images: false,
+            video: false,
             excluded: Vec::new(),
             places: [None, None],
             vetoes: Default::default(),
@@ -224,7 +227,7 @@ impl Host {
     /// The host's request as the engine's entries take it: made at the
     /// prefill phase over the three lists, held to no wire, its decode
     /// sent with its prefill, with the snapshot the host hands and the
-    /// image it states.
+    /// image and the video it states.
     fn asks<'a>(&'a self, said: (&'a [EncoderFacts], &'a [u32])) -> Asks<'a> {
         Asks {
             lists: WorkerLists::Encode(self.lists(said)),
@@ -232,6 +235,7 @@ impl Host {
             wires: WireModes::NONE,
             later: false,
             images: self.images,
+            video: self.video,
             loads: self.loads.as_ref(),
         }
     }
@@ -262,6 +266,7 @@ impl Host {
             phase: Phase::Prefill,
             media: MediaCounts {
                 images: u16::from(self.images),
+                video: u16::from(self.video),
                 ..MediaCounts::NONE
             },
             attempt: u8::from(!self.tried.is_empty()),
@@ -363,6 +368,37 @@ fn the_three_lists_records_read_the_load_reports_their_host_hands() {
     host.images = true;
     let (_, _, encoders) = host.decide(said, &keys, None, &mut placed);
     assert_eq!(encoders, vec![0]);
+}
+
+/// A request whose media is video alone asks vision of its encoder as one
+/// that states an image does: its item goes to the encoder its host says
+/// takes images, whichever reports the shorter queue, and where the host
+/// says it of no encoder the request is refused under the vision gap.
+///
+/// The classic router asks vision for any pixel item, an image or a video
+/// (`is_pixel_modality` and `request_needs_vision`,
+/// `model_gateway/src/routers/grpc/multimodal/capability.rs:325-344` on
+/// main d6517a4fe), and holds each encoder to it
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:1530`).
+#[test]
+fn a_request_of_video_alone_takes_the_encoder_that_takes_images() {
+    let mut host = Host::of(2, 2, 2);
+    let said = (&[of(1), of(1)][..], &[1, 1][..]);
+    let keys = [Identity::plain("item")];
+    let mut placed = EncodePlaced::new();
+    // The second encoder reports the shorter queue, and the host says of
+    // the first alone that it takes images.
+    host.loads = Some(reports(1));
+    let (_, _, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert_eq!(encoders, vec![1], "no pixel: the shorter queue");
+    host.video = true;
+    let (_, _, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert_eq!(encoders, vec![0], "a video: the encoder that takes images");
+    // The host says of no encoder that it takes images.
+    let encoders = Arc::clone(host.lists[2].workers());
+    host.lists[2] = PublishedList::with_facts(encoders, |_| FixedFacts::default());
+    let (decision, _, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert_eq!((gap(&decision), encoders.len()), (Some("encode-vision"), 0));
 }
 
 /// A pair's lists are narrowed by no subset hint: the pair's own decision
@@ -1161,14 +1197,15 @@ fn the_engines_call_is_shown_the_prefill_lists_pool_facts() {
 
 /// A host's request as the engine's entries take it: made at `phase` over
 /// `lists`, held to `wires`, with whether its decode is sent `later`,
-/// whether it states an image (`images`) and the snapshot of `loads` its
-/// host gives it, where it gives one.
+/// whether it states an image (`images`) or a video (`video`), and the
+/// snapshot of `loads` its host gives it, where it gives one.
 struct Asks<'a> {
     lists: WorkerLists<'a>,
     phase: Phase,
     wires: WireModes,
     later: bool,
     images: bool,
+    video: bool,
     loads: Option<&'a Arc<LoadSnapshot>>,
 }
 
@@ -1185,6 +1222,7 @@ impl RequestMaker for Asks<'_> {
                 phase: self.phase,
                 media: MediaCounts {
                     images: u16::from(self.images),
+                    video: u16::from(self.video),
                     ..MediaCounts::NONE
                 },
                 ..RequestFacts::default()
@@ -1858,6 +1896,45 @@ fn a_request_whose_decode_is_held_to_images_and_sent_later_is_declined() {
     let declined = entry.decide_encode_at(&later, refers, &mut placed, || now);
     let (declined, _) = declined.expect("a decision");
     assert_eq!(declined_under(&declined.decision), Some("decode-later"));
+}
+
+/// References beside a video hold the decode to the ones that take images
+/// as references beside an image do: sent with its prefill the request is
+/// decided on the decode its host says takes images, and one that states
+/// the later decode is declined under `decode-later`. The classic router
+/// asks vision for an image or a video alike
+/// (`model_gateway/src/routers/grpc/multimodal/capability.rs:325-344` on
+/// main d6517a4fe).
+#[test]
+fn references_beside_a_video_hold_the_decode_as_beside_an_image() {
+    let mut host = Host::of(1, 2, 1);
+    host.says_the_decode_takes_images(1);
+    let takes = [EncoderFacts {
+        references: true,
+        ..of(1)
+    }];
+    let said = (&takes[..], &[1][..]);
+    let keys = [Identity::plain("item")];
+    let refers = EncodeItems {
+        keys: &keys,
+        references: true,
+        ..EncodeItems::default()
+    };
+    let (mut placed, now) = (EncodePlaced::new(), Instant::now());
+    let entry = &host.engine;
+    let with_video = |later| Asks {
+        later,
+        video: true,
+        ..host.asks(said)
+    };
+    let decided = entry.decide_encode_at(&with_video(false), refers, &mut placed, || now);
+    let (decided, _) = decided.expect("a decision");
+    assert_eq!(decode_of(&decided.decision), Some(1));
+    assert!(decided.lease.is_some() && placed.encoders().len() == 1);
+    let later = entry.decide_encode_at(&with_video(true), refers, &mut placed, || now);
+    let (later, _) = later.expect("a decision");
+    assert_eq!(declined_under(&later.decision), Some("decode-later"));
+    assert!(later.lease.is_none() && placed.encoders().is_empty());
 }
 
 /// Three lists through the engine's other entries are the pair's two: a

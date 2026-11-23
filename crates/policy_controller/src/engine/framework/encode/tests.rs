@@ -92,6 +92,9 @@ struct Bed {
     references: bool,
     decode_images: bool,
     images: u16,
+    /// The videos the request states beside its images; none until a case
+    /// states one.
+    video: u16,
     /// The wires the request's host states to the encode side; none until a
     /// case states one.
     wires: WireModes,
@@ -117,6 +120,7 @@ impl Bed {
             references: false,
             decode_images: false,
             images: 1,
+            video: 0,
             wires: WireModes::NONE,
         }
     }
@@ -127,6 +131,7 @@ impl Bed {
             model: "m",
             media: MediaCounts {
                 images: self.images,
+                video: self.video,
                 ..MediaCounts::default()
             },
             seed: 7,
@@ -907,6 +912,54 @@ fn references_with_images_and_no_item_take_a_decode_with_vision() {
     assert_eq!(bed.placed(), ((0, 1), vec![], false));
     bed.images = 0;
     assert_eq!(bed.placed(), ((0, 0), vec![], false));
+}
+
+/// A video asks vision as an image does, of the encoder that takes the
+/// request and, beside references, of its decode. A request whose one item
+/// is a video is refused under the vision gap where the only encoder takes
+/// no images, and its item goes to the encoder that takes them where one
+/// does, busy as it is. References beside a video take a decode that takes
+/// images, with an item and with none.
+///
+/// The classic router asks vision for any pixel item, an image or a video
+/// (`is_pixel_modality` and `request_needs_vision`,
+/// `model_gateway/src/routers/grpc/multimodal/capability.rs:325-344` on
+/// main d6517a4fe), and holds each encoder to it
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:1530`).
+#[test]
+fn a_video_alone_asks_vision_as_an_image_does() {
+    let blind = |at: u32, role: Role, in_flight: u32| Candidate {
+        vision: false,
+        ..row(at, role, u32::from(role == Role::Decode), in_flight)
+    };
+    let video = || {
+        let mut bed = Bed::new();
+        bed.images = 0;
+        bed.video = 1;
+        bed
+    };
+    // The only encoder takes no image.
+    let mut bed = video();
+    bed.encoders = vec![blind(0, Role::Encode, 0)];
+    assert_eq!(bed.stage(), "encode-vision");
+    // Beside one that takes images the item goes there, busy as it is.
+    bed.encoders = vec![blind(0, Role::Encode, 0), row(1, Role::Encode, 0, 9)];
+    bed.facts = vec![pushing(1), pushing(1)];
+    assert_eq!(bed.placed(), ((0, 0), vec![1], false));
+
+    // References beside a video: the idle decode takes no image, the busy
+    // one does.
+    let mut bed = video();
+    bed.references = true;
+    bed.facts = vec![EncoderFacts {
+        references: true,
+        ..pushing(1)
+    }];
+    bed.decodes = vec![blind(0, Role::Decode, 0), row(1, Role::Decode, 1, 9)];
+    assert_eq!(bed.placed(), ((0, 1), vec![0], false));
+    // And with no item.
+    bed.keys.clear();
+    assert_eq!(bed.placed(), ((0, 1), vec![], false));
 }
 
 #[test]

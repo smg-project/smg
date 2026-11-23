@@ -664,7 +664,7 @@ pub struct Candidate {
     pub zone: u16,           // zone, as a position in the document's list
     pub labels: u64,         // one bit for each label the document declares (at most 64)
     pub ec_compatible: bool, // usable for the encode side of an encode-prefill-decode request
-    pub vision: bool,        // takes images
+    pub vision: bool,        // takes pixel media: an image or a video
     pub host_local: bool,    // reachable from one gateway only
     pub engine: u32,         // its engine's place among the list's engines; ranks share one
 
@@ -720,7 +720,7 @@ pub struct RequestFacts<'a> {
     pub attempt: u8,               // 0 for the first try
     pub tried: &'a [WorkerId],     // workers earlier attempts already used
     pub headers: &'a [Header<'a>], // the headers the document allows a policy to read
-    pub media: MediaCounts,        // how many images, audio and video inputs
+    pub media: MediaCounts,        // how many images, audio and video inputs; an image or a video asks vision
     pub seed: u64,                 // the only randomness a stage gets; kept in the trace
     pub budget_micros: u32,        // time left for the decision
     pub now_micros: u64,           // the host's clock at the decision
