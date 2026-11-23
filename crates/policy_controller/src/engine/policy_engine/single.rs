@@ -393,12 +393,13 @@ fn by_facts<const RETRY: bool>(
 /// whole decision's place. The lookup returns that answer as it was handed:
 /// no stage is asked again and no row is written for a decision's pass.
 /// Where the profile's stages read who holds the prompt, the lookup does
-/// behind this answer what it does behind any pick. It hands the prompt to
-/// the record of sent prefixes, or to the host's token tree by the entry
-/// and the target its maker names. It may read its list's table again, as
-/// any decision that finds the table expired, and a tree's match marks the
-/// path it walked as used. Where no binding of the phase reads affinity,
-/// the lookup is one test.
+/// behind this answer what it does behind any pick. It states in the pick
+/// what the pin's worker holds of the request, from the rows it names. It
+/// hands the prompt to the record of sent prefixes, or to the host's token
+/// tree by the entry and the target its maker names. It may read its list's
+/// table again, as any decision that finds the table expired, and a tree's
+/// match marks the path it walked as used. Where no binding of the phase
+/// reads affinity, the lookup is one test.
 ///
 /// Out of line: its code stays off the path of a request with no pin, and
 /// of a pin its rule keeps from the profile.
@@ -622,7 +623,7 @@ pub(crate) mod tests {
             WarmupSliceParams,
         },
         engine::{
-            decision::{LiftedVeto, PlacedBy, Target, Targets, MAX_TARGETS},
+            decision::{LiftedVeto, Overlap, PlacedBy, Target, Targets, MAX_TARGETS},
             decision_engine::{Decided, DecisionEngine, DecisionRefused, TokenKey, WorkerLists},
             demands::{DemandFacts, Demands},
             framework::{Picker, Place, PoolWord, TieBand, DRAW_FROM},
@@ -630,8 +631,8 @@ pub(crate) mod tests {
             prompt_hashes::HashSeeds,
             records::worker_id,
             view::{
-                Candidate, Constraints, FixedFacts, Identity, RequestFacts, SessionCountedUnder,
-                WireModes, WorkerId,
+                AffinityFacts, Candidate, Constraints, FixedFacts, Identity, RequestFacts,
+                SessionCountedUnder, WireModes, WorkerId,
             },
         },
         policies::random::Random,
@@ -2307,7 +2308,9 @@ pub(crate) mod tests {
     /// request's holders with the answer made. The record then holds the
     /// prompt for the pin's worker alone, and the prompt goes back there
     /// with no key. The pick is the one made under the other word but for
-    /// the word itself.
+    /// the word itself and for what it states of the pin's worker: a prompt
+    /// nobody was sent is a miss of its blocks, and a pick kept from the
+    /// profile states nothing.
     ///
     /// A pinned worker that is not ready gives the key back to the whole
     /// decision.
@@ -2406,10 +2409,14 @@ pub(crate) mod tests {
         let (kept, own) = (followed(RulePlaced::Untold), followed(RulePlaced::Told));
         // The hand-over returns the keyed entry's answer. The first key's
         // pinned request met both engines alike: the pick that went through
-        // the lookup and the one that did not differ by the rule's word
-        // alone.
+        // the lookup and the one that did not differ by the rule's word,
+        // and by what the lookup states behind the told one. Nobody was
+        // sent that prompt: a miss of its 64 blocks.
+        assert_eq!(kept[0].overlap(), Overlap::NONE, "kept from the profile");
         let mut twin = kept[0];
         twin.targets.by_rule(RulePlaced::Told);
+        twin.targets
+            .state(Overlap::held(AffinityFacts::default(), 64));
         assert_eq!(twin, own[0]);
         assert_ne!(kept[0], own[0], "the rule's word is on the pick");
     }
@@ -2736,8 +2743,8 @@ pub(crate) mod tests {
     /// Where the rule keeps what it places from the profile no form leaves
     /// a block of the prompt in the record: a gateway's sticky map hands
     /// none of them to its policy, so the policy's record never sees the
-    /// prompt (`model_gateway/src/policies/registry.rs:540-546` for a pin
-    /// under its cap, `:589-590` for the map's own assignment). Where the
+    /// prompt (`model_gateway/src/policies/registry.rs:736-739` for a pin
+    /// under its cap, `:782-783` for the map's own assignment). Where the
     /// request is the profile's own, the rule's default, every form leaves
     /// the whole prompt for the session's worker and for no other, the pin
     /// by one record as the pin the whole decision follows. That prompt

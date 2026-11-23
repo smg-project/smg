@@ -5494,6 +5494,17 @@ impl Engine {
             .map_or(0, |(_, index, _)| self.named_by[usize::from(index)].cap)
     }
 
+    /// Whether the profile a decision of `phase` for `model` resolves to
+    /// reads affinity by its own stages: the word of [`Self::needs_for`]
+    /// less the binding's shadow profile and its sessions rule. `false`
+    /// where no binding matches. A pick's overlap is stated by this word:
+    /// rows a host names for a shadow alone say nothing of the live pick.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn profile_reads_affinity(&self, model: &str, phase: Phase) -> bool {
+        self.resolve(model, phase)
+            .is_some_and(|(_, index, _)| self.profile_needs[usize::from(index)].affinity)
+    }
+
     /// The test the standing pass of the decision's profile asks of a row
     /// ([`RowTest::keeps`]),
     /// for a host to ask of a holder before it names it. It is the test a
