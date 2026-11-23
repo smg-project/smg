@@ -180,8 +180,10 @@ mod tests {
     /// is idle. No row a decision reads is written by hand: the engine
     /// writes each from a worker's object and its engine's report.
     struct Fleet {
-        /// The engine, built for the life of the process as a program
-        /// builds it: a placement holds it for as long as its request runs.
+        /// The engine, built for the life of the process: a placement holds
+        /// it for as long as its request runs. The fixture makes each
+        /// hand-over of a program itself: the load channel once at the
+        /// start, and a worker's address as it joins.
         engine: &'static PolicyEngine,
         workers: Arc<[Arc<dyn Worker>]>,
         cell: ListCell,
