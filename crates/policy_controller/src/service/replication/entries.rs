@@ -90,11 +90,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ("LoadSink", "wake_with", EntryReplication::Read),
     (
         "KvEventSink",
-        "admit",
-        EntryReplication::Rebuilt(SUBSCRIPTION),
-    ),
-    (
-        "KvEventSink",
         "admit_through",
         EntryReplication::Rebuilt(SUBSCRIPTION),
     ),
@@ -222,7 +217,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ("MemoryStore", "membership_builds", EntryReplication::Read),
     ("MemoryStore", "resyncs", EntryReplication::Read),
     ("MemoryStore", "indexed_blocks", EntryReplication::Read),
-    ("MemoryStore", "lane_counts", EntryReplication::Read),
     ("MemoryStore", "unindexed_rows", EntryReplication::Read),
 ];
 

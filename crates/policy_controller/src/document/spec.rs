@@ -5536,7 +5536,8 @@ pub struct AppliedSpec {
     max_block_hashes: u32,
     /// The view's block size: a request that names none is counted by it.
     block_size: u32,
-    /// The index settings a model takes at a membership write or apply.
+    /// The index settings a model takes where the in-process engine reads
+    /// a pool's table.
     #[cfg(feature = "in-process")]
     index: BTreeMap<String, IndexSpec>,
     pairing: Pairing,

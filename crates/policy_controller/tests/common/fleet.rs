@@ -15,9 +15,9 @@
 //! store's one writer of them, and a listener ([`subscribe`]) holds one
 //! event stream an engine and keeps what the stream said. A build without
 //! that feature has no feed, so there the listener stands in for one: it
-//! decodes each batch into the events an index applies and hands it to
-//! the sink. A dial is bounded, so an engine that stops answering costs a
-//! turn that bound and no more.
+//! runs each batch's header through its row's cursor, since no caller
+//! outside the crate writes a block of an index. A dial is bounded, so an
+//! engine that stops answering costs a turn that bound and no more.
 //!
 //! An engine speaks the wire of its kind ([`Shape::runtime`]): the fleet's
 //! first wire, or the one whose load report counts resident tokens. The
@@ -75,9 +75,9 @@ use smg_policy_controller::{
     },
     stages::StageRegistry,
     store::{
-        BatchFacts, BatchOutcome, GatewayId, HealthPolicy, KvCursor, KvEvent, KvEventSink,
-        LaneCounts, LeaseState, MembershipChange, MembershipTail, MemoryStore, ResyncReason,
-        SequenceHash, Signals, StoredBlock, WorkerFacts, WorkerStatus, WorkersStore,
+        BatchFacts, BatchOutcome, GatewayId, HealthPolicy, KvCursor, KvEventSink, LeaseState,
+        MembershipChange, MembershipTail, MemoryStore, ResyncReason, SequenceHash, Signals,
+        StoredBlock, WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::LeaseId,
 };
@@ -228,8 +228,6 @@ pub struct Heard {
     pub held: usize,
     /// The blocks the store's index holds for the row.
     pub indexed: usize,
-    /// What the row's lane counted beside its blocks.
-    pub counts: Option<LaneCounts>,
     /// The rank's cursor in the store, when the rank has been heard from.
     pub cursor: Option<KvCursor>,
 }
@@ -777,6 +775,19 @@ async fn probe(
     }
 }
 
+/// One event of an engine's batch as the listener keeps it.
+enum KvEvent {
+    /// Blocks stored in order after `parent`; `None` starts a chain.
+    Stored {
+        parent: Option<SequenceHash>,
+        blocks: Vec<StoredBlock>,
+    },
+    /// Blocks evicted, by the engine's hashes.
+    Removed(Vec<SequenceHash>),
+    /// The engine emptied its cache.
+    Cleared,
+}
+
 /// One engine batch as the events an index applies: every block under the
 /// engine's own hash, its content hash made of its token ids. The harness's
 /// engines publish one cache group in one tier, so this decode chooses
@@ -814,14 +825,14 @@ fn decode(batch: &KvEventBatch) -> Vec<KvEvent> {
 
 /// One batch as its rank's row keeps it: the last sequence, and the blocks
 /// its events leave the engine holding. Where the controller feeds itself
-/// the store is handed nothing here. Otherwise the batch goes, decoded,
-/// through its rank's cursor into its row's index, with the header the
-/// batch carries, and a batch the sink did not apply leaves the blocks as
-/// they were. A batch that carries a load record alone is passed by, and
-/// its record is not written here: loads are the monitor's. A snapshot chunk
-/// is a relay's: its start is a collector's word to every row of the
-/// engine, which this listener does not say, so a chunk is counted and
-/// passed by. Returns `false` at a gap the sink named.
+/// the store is handed nothing here. Otherwise the batch's header goes
+/// through its rank's cursor, which writes no block of the row's index,
+/// and a batch the sink did not admit leaves the blocks as they were. A
+/// batch that carries a load record alone is passed by, and its record is
+/// not written here: loads are the monitor's. A snapshot chunk is a
+/// relay's: its start is a collector's word to every row of the engine,
+/// which this listener does not say, so a chunk is counted and passed by.
+/// Returns `false` at a gap the sink named.
 fn admit(store: &MemoryStore, engine: &Probed, events: &Events, batch: &KvEventBatch) -> bool {
     if batch.load.as_ref().is_some_and(|load| load.load_only) {
         return true;
@@ -846,7 +857,7 @@ fn admit(store: &MemoryStore, engine: &Probed, events: &Events, batch: &KvEventB
     let row = rows.entry(id).or_default();
     row.last = batch.sequence_number;
     if !PRODUCT_FEEDS {
-        match store.admit(id, rank, facts, &decoded) {
+        match store.admit_through(id, rank, facts, &mut |_| {}) {
             BatchOutcome::Applied => {}
             BatchOutcome::Skipped => return true,
             BatchOutcome::Gap { .. } => {
@@ -1528,7 +1539,6 @@ impl Harness {
                     last: stream.map_or(0, |stream| stream.last),
                     held: stream.map_or(0, |stream| stream.held.len()),
                     indexed: self.store.indexed_blocks(*id, *rank),
-                    counts: self.store.lane_counts(*id, *rank),
                     cursor: self.store.cursor(*id, *rank),
                 }
             })
