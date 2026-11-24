@@ -1069,3 +1069,24 @@ fn a_swept_block_keeps_its_tick() {
     );
     predictor.check();
 }
+
+/// The first piece doubles from 64 blocks to a whole piece, one step each
+/// time its blocks are used up.
+#[test]
+fn the_first_piece_doubles_with_its_blocks_to_a_whole_piece() {
+    let mut predictor = PrefixPredictor::new(usize::MAX);
+    let hashes: Vec<u64> = (0..=CHUNK as u64).collect();
+    let mut room = 64;
+    while room < CHUNK {
+        // A full piece holds its blocks; the next block doubles it.
+        for (blocks, want) in [(room, room), (room + 1, room * 2)] {
+            predictor.sent_by(SEED, &hashes[..blocks], worker(1));
+            assert_eq!(predictor.chunks[0].len(), want, "{blocks} blocks");
+        }
+        room *= 2;
+    }
+    predictor.sent_by(SEED, &hashes, worker(1));
+    let rooms: Vec<usize> = predictor.chunks.iter().map(|piece| piece.len()).collect();
+    assert_eq!(rooms, [CHUNK, CHUNK]);
+    predictor.check();
+}
