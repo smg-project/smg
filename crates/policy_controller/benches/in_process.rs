@@ -55,7 +55,21 @@
 //! of the decisions. The setup and the untimed decisions are in both runs.
 //! Count with `--upkeep-thread 0`: the engine's task then takes its first
 //! step and no thread of its own turns it. With that thread, the counts of
-//! one binary differ from run to run by the allocator's locks.
+//! one binary differ from run to run by the allocator's locks. The list's
+//! first untimed requests take the seeds of the first caller's first
+//! turns, 4,096 of them, or eight a worker where that is more: a cell that
+//! must meet a new key at every counted decision takes two values of
+//! `--decisions` above that.
+//!
+//! `--cold-kb N` counts a decision that finds its data cold. Before each
+//! timed decision the caller reads one byte of every 64-byte line of a
+//! buffer of N KiB, which pushes what the decision reads out of a cache
+//! smaller than the buffer, and then writes 16 KiB of stack under its own
+//! frame again, as the stack of a thread that serves stays warm. Count
+//! such a run under callgrind's cache model: a function's data misses are
+//! then the lines of memory outside the stack that it is first to touch.
+//! The walk is inside the stretch, so its time says nothing; a cell whose
+//! callers time their own turns refuses the flag.
 
 #![expect(
     clippy::expect_used,
@@ -620,6 +634,8 @@ enum Shadowed {
 struct Run {
     callers: usize,
     cell: Cell,
+    /// The KiB a caller walks before each timed decision; `0` walks none.
+    cold_kb: usize,
     decisions: u64,
     /// How many engines a caller asks by turns: one, or two.
     engines: u64,
@@ -641,6 +657,7 @@ fn run() -> Run {
     let mut run = Run {
         callers: 1,
         cell: Cell::named("round_robin"),
+        cold_kb: 0,
         decisions: 1_000_000,
         engines: 1,
         entry: "decide_at".to_owned(),
@@ -662,6 +679,7 @@ fn run() -> Run {
         match switch.as_str() {
             "--callers" => run.callers = number() as usize,
             "--cell" => run.cell = Cell::named(&value),
+            "--cold-kb" => run.cold_kb = number() as usize,
             "--decisions" => run.decisions = number(),
             "--engines" => run.engines = number(),
             "--entry" => run.entry = place::named(&value),
@@ -856,9 +874,11 @@ fn ask(beside: Option<&PolicyEngine>) {
 /// One caller's turns by `turn`: its first untimed, then, behind the start
 /// every caller waits at, its timed ones as one stretch. Says how many of
 /// those were placed, the stretch in nanoseconds and its allocations.
+/// A caller with `cold` to walk walks it before each timed turn.
 fn stretch<T>(
     start: &Barrier,
     decisions: u64,
+    cold: &[u8],
     mut turn: impl FnMut(u64) -> Option<T>,
 ) -> (u64, u64, u64) {
     for at in 0..CALLER_WARM {
@@ -867,11 +887,35 @@ fn stretch<T>(
     start.wait();
     let (allocated, started) = (calls(), Instant::now());
     let mut took = 0;
-    for at in CALLER_WARM..CALLER_WARM + decisions {
-        took += u64::from(black_box(turn(at)).is_some());
+    // Two loops: a run that walks nothing runs the instructions it ran.
+    if cold.is_empty() {
+        for at in CALLER_WARM..CALLER_WARM + decisions {
+            took += u64::from(black_box(turn(at)).is_some());
+        }
+    } else {
+        for at in CALLER_WARM..CALLER_WARM + decisions {
+            // The buffer is hidden at every turn: a walk of a buffer the
+            // build knows unchanged is done once, ahead of the loop.
+            black_box(cold_walk(black_box(cold)));
+            warm_stack();
+            took += u64::from(black_box(turn(at)).is_some());
+        }
     }
     let nanos = started.elapsed().as_nanos() as u64;
     (took, nanos, (calls() - allocated) as u64)
+}
+
+/// One byte of every 64-byte line of `buffer` read.
+#[inline(never)]
+fn cold_walk(buffer: &[u8]) -> u64 {
+    buffer.iter().step_by(64).map(|byte| u64::from(*byte)).sum()
+}
+
+/// 16 KiB of stack under the caller's frame written again: the walk
+/// leaves them cold, and the stack of a thread that serves stays warm.
+#[inline(never)]
+fn warm_stack() {
+    black_box(&mut [0_u8; 16 * 1024]);
 }
 
 fn main() {
@@ -891,6 +935,12 @@ fn main() {
         ..
     } = run.cell;
     fits(&run);
+    // Ahead of the callers: one that stopped alone would leave the
+    // others at their start.
+    assert!(
+        run.cold_kb == 0 || run.cell.caller.is_none(),
+        "--cold-kb: this cell's callers time their own turns"
+    );
     let workers: Arc<[Arc<dyn Worker>]> = (0..run.workers)
         .map(|at| ready_worker(&format!("http://worker-{at:04}:8000"), MODEL))
         .collect();
@@ -1026,6 +1076,7 @@ fn measure(
         (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
     let (publications, left, end) = (AtomicU64::new(0), Mutex::new(run.callers), Condvar::new());
     let converted_before = converted();
+    let cold = vec![1_u8; run.cold_kb * 1024];
     let wall = thread::scope(|scope| {
         let one_caller = |caller: u64| {
             let seed = |turn: u64| mix(caller << 40 | turn);
@@ -1033,7 +1084,9 @@ fn measure(
             // itself; any other caller asks the run's `decide`.
             let (took, nanos, allocated) = match run.cell.caller {
                 Some(turns) => turns(host, &start, run.decisions, caller),
-                None => stretch(&start, run.decisions, |turn| decide(black_box(seed(turn)))),
+                None => stretch(&start, run.decisions, &cold, |turn| {
+                    decide(black_box(seed(turn)))
+                }),
             };
             busy_nanos.fetch_add(nanos, Ordering::Relaxed);
             allocations.fetch_add(allocated, Ordering::Relaxed);
