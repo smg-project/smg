@@ -123,7 +123,7 @@ fn asked<'a>(
     let (decided, later) = decided.map_err(Unplaced::Refused)?;
     let (key, kept) = (made.key(), [made.sent.get(), made.decodes.get()]);
     // What the decision was answered on the encoders it asked of.
-    let answered = made.encoders.get();
+    let answered = made.encoders.take();
     if prefills_full(&decided.decision) {
         return Err(Unplaced::PrefillsFull);
     }

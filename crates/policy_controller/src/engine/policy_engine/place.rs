@@ -63,7 +63,7 @@ mod target;
 
 use std::{
     any::Any,
-    cell::{Cell, OnceCell},
+    cell::{Cell, OnceCell, RefCell},
     fmt,
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     sync::Arc,
@@ -437,10 +437,10 @@ pub(super) struct Made<'r, 'a> {
     /// The same on the decodes of a pair's targets, by their places in the
     /// decode list: `sent` holds the prefills' then.
     decodes: Cell<Sent>,
-    /// The same on the encoders an encode request's decision placed, by
-    /// their places in the encoders' list
-    /// ([`RequestMaker::sends_to_encoder`]).
-    encoders: Cell<Sent>,
+    /// What a decision was answered on the encoders it placed
+    /// ([`RequestMaker::sends_to_encoder`]): the call takes these answers,
+    /// and reads none of those encoders again.
+    encoders: RefCell<Answered>,
     /// Whether the request is a pair's decode decided again: a target's
     /// prefill was sent already, and its decode alone is asked.
     decode_alone: bool,
@@ -492,6 +492,22 @@ impl Sent {
     }
 }
 
+/// What a call's maker answered on the encoders an encode request's
+/// decision placed, by their places in the encoders' list: each place
+/// asked, and whether the call sends to it. A request's items have no
+/// ceiling, so the list grows with the encoders asked of.
+#[derive(Default)]
+struct Answered(Vec<(u32, bool)>);
+
+impl Answered {
+    /// The answer on the encoder at `place`: whether the call sends to it.
+    /// `None` where the decision did not ask of it.
+    fn answer(&self, place: u32) -> Option<bool> {
+        let kept = self.0.iter().find(|(asked, _)| *asked == place);
+        kept.map(|&(_, sendable)| sendable)
+    }
+}
+
 impl<'r, 'a> Made<'r, 'a> {
     /// `request` for a decision of `engine` that leaves `missed` out.
     pub(super) const fn new(
@@ -514,7 +530,7 @@ impl<'r, 'a> Made<'r, 'a> {
             panicked: OnceCell::new(),
             sent: Cell::new(Sent::NONE),
             decodes: Cell::new(Sent::NONE),
-            encoders: Cell::new(Sent::NONE),
+            encoders: RefCell::new(Answered(Vec::new())),
             decode_alone: false,
         }
     }
@@ -896,18 +912,17 @@ impl RequestMaker for Made<'_, '_> {
     // The call's own read of an encoder a decision placed, made ahead of
     // that read for the write of where the prompt went: ready, on one read
     // of its state. The route's rule is asked of no encoder. The answer is
-    // kept ([`Sent`]) and the call takes it, so an encoder is read once a
-    // decision.
+    // kept ([`Answered`]) and the call takes it, so an encoder is read once
+    // a decision, however many the request's items are placed on.
     fn sends_to_encoder(&self, position: u32) -> bool {
         let WorkerLists::Encode(lists) = &self.request.lists else {
             return true;
         };
-        let mut kept = self.encoders.get();
-        kept.answer(position).unwrap_or_else(|| {
+        let kept = self.encoders.borrow().answer(position);
+        kept.unwrap_or_else(|| {
             let worker = lists.encoders.workers.get(position as usize);
             let sendable = worker.is_some_and(|worker| ready(worker.as_ref()));
-            kept.keep(position, sendable);
-            self.encoders.set(kept);
+            self.encoders.borrow_mut().0.push((position, sendable));
             sendable
         })
     }

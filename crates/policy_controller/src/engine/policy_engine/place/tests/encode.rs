@@ -27,7 +27,8 @@ impl PairAdmission for Capacity {
 }
 
 /// A picker of the encode side that places an item by its value: the item
-/// `last` on the last worker the filters left, every other on the first.
+/// `last` on the last worker the filters left, an item whose value is a
+/// number on the worker at that place of them, every other on the first.
 #[derive(Debug)]
 struct ByItem;
 
@@ -47,8 +48,12 @@ impl Picker for ByItem {
         _: TieBand,
         out: &mut Targets,
     ) {
-        let last = facts.session_key.plain == Some("last");
-        let at = if last { kept.last() } else { kept.first() };
+        let value = facts.session_key.plain;
+        let at = match value.and_then(|value| value.parse::<usize>().ok()) {
+            Some(place) => kept.get(place),
+            None if value == Some("last") => kept.last(),
+            None => kept.first(),
+        };
         push_drawn(candidates, at.map_or(&[], std::slice::from_ref), out);
     }
 }
@@ -675,6 +680,49 @@ fn a_prompt_behind_an_encoder_that_cannot_be_sent_to_is_written_for_no_pair() {
     // all twenty-four. Recorded for none, each side is drawn among four.
     assert!(prefills < 24, "{prefills} of 24 to the prefill given up");
     assert!(decodes < 24, "{decodes} of 24 to the decode given up");
+}
+
+/// The call keeps the answer its decision was given on every encoder,
+/// however many the request's items are placed on: five here. The route's
+/// rule is asked inside the decision, behind the question of the encoders,
+/// and the fifth encoder's breaker opens there. The decision wrote its pair
+/// by the answers it was given. So the call takes those answers and places
+/// the request on the five: it reads no encoder a second time, and gives up
+/// no decision whose pair is written.
+#[test]
+fn a_call_takes_its_decisions_answer_on_each_of_five_encoders() {
+    let preset = "cache_aware";
+    let mut document = PolicySpec::epd_presets("power_of_two", preset, preset).expect("presets");
+    let encode = document.profiles.get_mut("encode");
+    encode.expect("the encode profile").pick = "by-item".into();
+    let (engine, _) = hearing(document);
+    let three = Three::of([2, 2, 5], |_, _| false);
+    let lists = three.lists((&[PLAIN; 5], &[1, 1]));
+    // Each item is placed on the encoder at the place its value names.
+    let keys = ["0", "1", "2", "3", "4"].map(Identity::plain);
+    let items = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    let tokens: Vec<u32> = (1_000..5_096).collect();
+    let fifth = &three.workers[2][4];
+    let opens = |_: &dyn Worker| -> bool {
+        trip(fifth);
+        true
+    };
+    let request = PlaceRequest {
+        prompt: Prompt {
+            tokens: Some(&tokens),
+            ..Prompt::NONE
+        },
+        admits: Some(&opens),
+        ..asking(lists, items)
+    };
+    let mut call = Call::default();
+    let asked = ask(engine.loaded(), &request, &lists, items, &mut call);
+    let placement = asked.expect("a decision").expect("a placement");
+    assert_eq!(three.places(&placement).2, vec![0, 1, 2, 3, 4]);
+    assert!(call.missed.is_empty(), "{:?}", call.missed);
 }
 
 /// The pair's targets of an encode request are walked as a pair's are. A

@@ -75,6 +75,9 @@ impl PairAdmission for Gates {
 ///
 /// `prompt` is the request's prompt as its host hashed it, where a case
 /// states one.
+///
+/// `asked` takes the place of each encoder a decision asks its caller of,
+/// where a case counts those questions: that caller answers yes to each.
 struct Host {
     engine: PolicyEngine,
     lists: [PublishedList; 3],
@@ -92,6 +95,7 @@ struct Host {
     tried: Vec<WorkerId>,
     seed: u64,
     prompt: Option<PromptHashes>,
+    asked: Option<Mutex<Vec<u32>>>,
 }
 
 /// Where the worker at `place` of a host's list `list` answers.
@@ -191,6 +195,7 @@ impl Host {
             tried: Vec::new(),
             seed: 0,
             prompt: None,
+            asked: None,
         }
     }
 
@@ -307,7 +312,31 @@ impl Host {
         };
         let (engine, now) = (&self.engine, Instant::now());
         let loads = self.loads.as_ref();
-        let decision = lists.decide(engine, loads, now, &mut request, items, placed);
+        let decision = match &self.asked {
+            None => lists.decide(engine, loads, now, &mut request, items, placed),
+            // A case that counts the questions of the encoders answers them
+            // itself, through the entry that takes its caller's answers.
+            Some(asked) => {
+                let own = engine.loaded();
+                let noted = |place| {
+                    asked.lock().push(place);
+                    true
+                };
+                let sides = lists.asked(own);
+                lists.decide_over(
+                    own,
+                    sides,
+                    None,
+                    loads,
+                    now,
+                    &mut request,
+                    items,
+                    placed,
+                    |_| true,
+                    noted,
+                )
+            }
+        };
         assert_eq!(request.facts.now_micros, engine.clock().micros(now));
         let named = |list: usize, place: u32, id| {
             assert_eq!(worker_id(self.worker(list, place as usize).as_ref()), id);
@@ -435,6 +464,29 @@ fn a_prompt_sent_to_an_encode_requests_pair_goes_to_that_pair_again() {
         fresh.iter().all(|&(prefill, _)| prefill % 2 == 0),
         "{fresh:?}"
     );
+}
+
+/// A decision that writes where its prompt went asks its caller of an
+/// encoder once, however many of the request's items it placed there: two
+/// items on the one encoder that is ready are one question, of that
+/// encoder's place.
+#[test]
+fn an_encoder_two_items_are_placed_on_is_asked_of_once() {
+    let aware = "cache_aware";
+    let document = PolicySpec::epd_presets("power_of_two", aware, aware).expect("the presets");
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let mut host = Host::under(spec, 2, 2, 2);
+    // The first encoder is not ready: both items take the second.
+    host.worker(2, 0).set_status(WorkerStatus::NotReady);
+    host.prompt = Some(prompt(&host.engine, 1_000));
+    host.asked = Some(Mutex::default());
+    let said = (&[of(1), of(1)][..], &[1, 1][..]);
+    let keys = [Identity::plain("item-a"), Identity::plain("item-b")];
+    let mut placed = EncodePlaced::new();
+    let (_, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert_eq!((prefill.is_some(), encoders), (true, vec![1, 1]));
+    let asked = host.asked.as_ref().expect("the questions are counted");
+    assert_eq!(*asked.lock(), [1]);
 }
 
 /// A request whose media is video alone asks vision of its encoder as one
