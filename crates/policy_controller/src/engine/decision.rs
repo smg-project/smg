@@ -491,8 +491,9 @@ pub enum OverlapSource {
 ///
 /// A request decided inside a token tree its host lends is given the rows
 /// the tree's match names, and its pick states by them: the match's tokens
-/// counted in the request's blocks for a worker among the match's holders,
-/// and a miss for any other. A match under one block is a miss.
+/// counted in the request's blocks for a worker named among the match's
+/// holders, and a miss for any other. Past the profile's sample the holders
+/// named are a draw. A match under one block is a miss.
 ///
 /// Six bytes, in bytes a pick's targets had spare behind their count: a
 /// pick is no larger for it ([`Pick::overlap`]).
