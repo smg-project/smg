@@ -859,10 +859,12 @@ fn router_stream_families_name_the_attempt_anchor() {
 /// The dispatch wait says on `/metrics` what its clock is (the request's
 /// entry at the edge to the answering attempt's RPC dispatch, where the TTFT
 /// clock starts), which answers it observes (streamed and collected, under
-/// the TTFT's labels), that for a streamed answer the two add up to the time
-/// to first token from the request's receipt, and that its count also holds
-/// the collected answers. It says where a later turn of a tool loop counts
-/// from: that turn's start.
+/// the TTFT's labels) and which it does not (a Responses answer on the
+/// Harmony pipeline, a background Responses request that is not streamed),
+/// that for a streamed answer the two add up to the time to first token from
+/// the request's receipt, and that its count also holds the collected
+/// answers. It says where a later turn of a tool loop counts from: that
+/// turn's start.
 #[test]
 fn the_dispatch_wait_help_names_its_clock_its_answers_and_its_sum_with_the_ttft() {
     let (rendered, ()) = with_test_recorder(|| {
@@ -886,6 +888,7 @@ fn the_dispatch_wait_help_names_its_clock_its_answers_and_its_sum_with_the_ttft(
         .unwrap_or_else(|| panic!("no # HELP for {DISPATCH_WAIT_SECONDS}; rendered:\n{rendered}"));
     for phrase in [
         "of streamed and collected answers by router_type, backend_type, model, endpoint",
+        "a Responses answer on the Harmony pipeline records none, streamed or collected, nor does a background Responses request that is not streamed",
         "from the request's entry at the edge to the answering attempt's RPC dispatch",
         "the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes",
         "a refused attempt's wait and its backoff are here",
