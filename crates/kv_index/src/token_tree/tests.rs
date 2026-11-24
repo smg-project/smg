@@ -2834,3 +2834,435 @@ fn hashes_name_live_nodes_through_random_inserts_and_evictions() {
     assert_eq!(tree.hashed_paths(), 0);
     assert_hashes_name_live_nodes(&tree);
 }
+
+/// A bounded pass holds one leaf at a time and walks again: the same LRU
+/// tenants go and the tree ends at the budget.
+#[test]
+fn test_bounded_eviction_keeps_the_lru_order_and_the_budget() {
+    let tree = TokenTree::new();
+    for t in 0..8u32 {
+        tree.insert_tokens(&make_tokens(t * 100_000 + 1, 2), &format!("tenant{t}"));
+    }
+    let max_size = 4 * 2 * PAGE_SIZE;
+    tree.evict_tenant_by_size_bounded(max_size, 1, &|| true);
+
+    assert_eq!(tree.total_token_size(), max_size);
+    for t in 0..8u32 {
+        let matched = tree
+            .match_prefix_with_counts(&make_tokens(t * 100_000 + 1, 2))
+            .matched_token_count;
+        let expected = if t < 4 { 0 } else { 2 * PAGE_SIZE };
+        assert_eq!(matched, expected, "tenant{t}");
+    }
+}
+
+/// A shared prefix's node becomes a tenant's leaf once its branch goes; a
+/// bounded pass that runs out of entries walks again and evicts it.
+#[test]
+fn test_bounded_eviction_reaches_promoted_parents() {
+    let tree = TokenTree::new();
+    let (a, b, c) = branching_paths();
+    tree.insert_tokens(&a, "t");
+    tree.insert_tokens(&b, "t");
+    tree.insert_tokens(&c, "t");
+    tree.evict_tenant_by_size_bounded(0, 1, &|| true);
+    assert_eq!(tree.total_token_size(), 0);
+}
+
+/// A parent promoted to a leaf in a bounded pass is not evicted ahead of
+/// older leaves the pass left out: it waits for the next pass, and the LRU
+/// order holds across passes (see the string tree's test of the same name).
+#[test]
+fn test_bounded_eviction_defers_parents_newer_than_its_kept_leaves() {
+    let tree = TokenTree::new();
+    // Two pages for t: the oldest; split below when t touches the first.
+    tree.insert_tokens(&make_tokens(1, 2), "t");
+    // u's one page: the next oldest.
+    tree.insert_tokens(&make_tokens(9_000, 1), "u");
+    // t touches its first page alone: newest.
+    tree.insert_tokens(&make_tokens(1, 1), "t");
+    assert_eq!(tree.total_token_size(), 3 * PAGE_SIZE);
+
+    // One entry per pass: the first keeps t's second page; evicting it
+    // promotes t's first, newer than u's page, which the pass left out.
+    tree.evict_tenant_by_size_bounded(PAGE_SIZE, 1, &|| true);
+
+    let sizes = tree.get_tenant_token_counts();
+    assert_eq!(
+        sizes.get("u").copied().unwrap_or(0),
+        0,
+        "u's older leaf goes first"
+    );
+    assert_eq!(
+        sizes.get("t").copied(),
+        Some(PAGE_SIZE),
+        "t's newer first page stays"
+    );
+}
+
+/// A pass whose bound holds every leaf leaves none out, so it sets no
+/// cutoff: the parent it promotes, though newer than every leaf it kept,
+/// goes in the same pass, and one pass empties the tree.
+#[test]
+fn test_bounded_eviction_with_room_for_every_leaf_is_one_pass() {
+    let tree = TokenTree::new();
+    tree.insert_tokens(&make_tokens(1, 2), "t"); // t's two pages: oldest
+    tree.insert_tokens(&make_tokens(9_000, 1), "u"); // u's page: next oldest
+    tree.insert_tokens(&make_tokens(1, 1), "t"); // t's first page alone: newest
+    let done = tree.evict_tenant_by_size_bounded(0, 2, &|| true);
+    assert_eq!(tree.total_token_size(), 0);
+    assert_eq!(done.passes, 1);
+}
+
+/// `max_entries` 0 is taken as 1: the eviction ends where one entry a pass
+/// does, without a division by zero.
+#[test]
+fn test_bounded_eviction_takes_no_entries_as_one() {
+    let (bounded, whole) = (TokenTree::new(), TokenTree::new());
+    for t in 0..8u32 {
+        bounded.insert_tokens(&make_tokens(t * 100_000 + 1, 2), &format!("tenant{t}"));
+        whole.insert_tokens(&make_tokens(t * 100_000 + 1, 2), &format!("tenant{t}"));
+    }
+    let done = bounded.evict_tenant_by_size_bounded(4 * 2 * PAGE_SIZE, 0, &|| true);
+    whole.evict_tenant_by_size_bounded(4 * 2 * PAGE_SIZE, 1, &|| true);
+    assert_eq!(
+        bounded.get_tenant_token_counts(),
+        whole.get_tenant_token_counts()
+    );
+    assert!(done.passes > 1, "one entry a pass");
+}
+
+/// `keep_going` is asked before every pass, and the stats count passes and
+/// evicted entries.
+#[test]
+fn test_bounded_eviction_stops_when_told_and_counts_its_passes() {
+    let seeded = || {
+        let tree = TokenTree::new();
+        for t in 0..8u32 {
+            tree.insert_tokens(&make_tokens(t * 100_000 + 1, 2), &format!("tenant{t}"));
+        }
+        tree
+    };
+    let tree = seeded();
+    let stopped = tree.evict_tenant_by_size_bounded(0, 1, &|| false);
+    assert!(stopped.cancelled);
+    assert_eq!((stopped.passes, stopped.evicted), (0, 0));
+    assert_eq!(tree.total_token_size(), 8 * 2 * PAGE_SIZE);
+
+    // How many nodes a path takes is the tree's own business: one leaf a
+    // pass must still end where an unbounded eviction does, in more passes.
+    let done = tree.evict_tenant_by_size_bounded(4 * 2 * PAGE_SIZE, 1, &|| true);
+    let whole = seeded();
+    whole.evict_tenant_by_size(4 * 2 * PAGE_SIZE);
+    assert!(!done.cancelled);
+    assert_eq!(tree.total_token_size(), whole.total_token_size());
+    assert!(
+        done.passes > 1,
+        "one leaf a pass took {} passes",
+        done.passes
+    );
+    assert!(done.evicted >= done.passes);
+}
+
+/// A stop lands inside a pass, not only between passes: `keep_going` is asked
+/// every `CANCEL_CHECK_EVERY` nodes walked, so one pass over a large tree
+/// stops early, evicting nothing, in the bounded and the unbounded eviction.
+#[test]
+fn test_eviction_stops_inside_a_pass() {
+    let tree = TokenTree::new();
+    for t in 0..(3 * CANCEL_CHECK_EVERY) as u32 {
+        tree.insert_tokens(&make_tokens(t * 100_000 + 1, 1), "tenant");
+    }
+    let full = tree.total_token_size();
+    let asked = std::cell::Cell::new(0usize);
+    let stop_on_second = || {
+        asked.set(asked.get() + 1);
+        asked.get() < 2
+    };
+    let done = tree.evict_tenant_by_size_bounded(0, usize::MAX, &stop_on_second);
+    assert!(done.cancelled);
+    assert_eq!(
+        (done.passes, done.evicted),
+        (1, 0),
+        "stopped within its one pass"
+    );
+    assert_eq!(tree.total_token_size(), full);
+
+    // The unbounded eviction asks once at entry (true), then stops at the
+    // walk's first check.
+    asked.set(0);
+    assert!(tree.evict_tenant_by_size_until(0, &stop_on_second));
+    assert_eq!(
+        tree.total_token_size(),
+        full,
+        "the unbounded walk stopped too"
+    );
+    assert!(!tree.evict_tenant_by_size_until(0, &|| true));
+    assert_eq!(tree.total_token_size(), 0);
+}
+
+/// A stop lands while the pass evicts too, not only while it walks:
+/// `keep_going` is asked every `CANCEL_CHECK_EVERY` entries taken off the
+/// heap, so an eviction the walk let through stops within that many entries.
+#[test]
+fn test_eviction_stops_while_it_evicts() {
+    let tree = TokenTree::new();
+    for t in 0..(3 * CANCEL_CHECK_EVERY) as u32 {
+        tree.insert_tokens(&make_tokens(t * 100_000 + 1, 1), "tenant");
+    }
+    let full = tree.total_token_size();
+    // True at entry and through the walk's checks (3 × CANCEL_CHECK_EVERY
+    // nodes walked, asked 3 times), false from the first check of the
+    // evicting loop.
+    let asked = std::cell::Cell::new(0usize);
+    let walk_only = || {
+        asked.set(asked.get() + 1);
+        asked.get() <= 4
+    };
+    assert!(tree.evict_tenant_by_size_until(0, &walk_only));
+    let left = tree.total_token_size();
+    assert!(left < full, "the walk finished and eviction began");
+    assert!(left > 0, "the stop landed while evicting, not after");
+    let per_leaf = full / (3 * CANCEL_CHECK_EVERY);
+    assert!(
+        full - left <= CANCEL_CHECK_EVERY * per_leaf,
+        "stopped within {CANCEL_CHECK_EVERY} entries: {} of {full} evicted",
+        full - left
+    );
+}
+
+/// A stop is asked for before the eviction starts, so a tree smaller than
+/// one check's worth of nodes stops too, untouched.
+#[test]
+fn test_eviction_stops_before_it_starts() {
+    let tree = TokenTree::new();
+    tree.insert_tokens(&make_tokens(1, 1), "t");
+    let full = tree.total_token_size();
+    assert!(tree.evict_tenant_by_size_until(0, &|| false));
+    assert_eq!(tree.total_token_size(), full);
+}
+
+/// A removal that freed nothing is not counted as evicted, and the pass that
+/// made it, though it evicted nothing, walks again: the oldest entry is an
+/// empty node (no insert builds one; it stands in for a tenant a concurrent
+/// removal took first), and the real leaf behind it still goes.
+#[test]
+fn test_bounded_eviction_counts_only_what_it_freed_and_walks_past_it() {
+    let tree = TokenTree::new();
+    tree.insert_tokens(&make_tokens(1, 1), "t");
+    let empty = Arc::new(Node::new(Vec::new()));
+    empty.tenant_last_access_time.insert(Arc::from("t"), 0);
+    *empty.parent.write() = Arc::downgrade(&tree.root);
+    *empty.page_key.write() = Some(u64::MAX);
+    tree.root.children.insert(u64::MAX, Arc::clone(&empty));
+
+    let done = tree.evict_tenant_by_size_bounded(0, 1, &|| true);
+    assert_eq!(tree.total_token_size(), 0, "the real leaf went too");
+    assert_eq!((done.passes, done.evicted), (2, 1));
+}
+
+/// Twin token trees under `policy`, built by the same seeded inserts: paths
+/// of one to four pages over shared roots and branches, some a prefix of an
+/// earlier one (a parent touched alone), for three tenants. Each tenant has
+/// roots of its own: where two tenants hold one node, the unbounded eviction
+/// does not take up the parent that node's eviction leaves a leaf (see
+/// `evict_tenant_by_size_bounded`), and the two orders part.
+fn twin_token_trees(policy: EvictionPolicy, seed: u64) -> (TokenTree, TokenTree) {
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(seed);
+    let trees = (
+        TokenTree::with_policy(policy),
+        TokenTree::with_policy(policy),
+    );
+    for _ in 0..40 {
+        let owner = rng.random_range(0..3usize);
+        let root = owner as u32 * 2 + rng.random_range(0..2u32);
+        let depth = rng.random_range(1..=4usize);
+        let mut tokens = make_tokens(root * 100_000 + 1, 1);
+        for page in 1..depth {
+            let branch = rng.random_range(0..3u32);
+            tokens.extend(make_tokens(
+                1_000_000 + root * 10_000 + page as u32 * 100 + branch * 20,
+                1,
+            ));
+        }
+        let tenant = ["a", "b", "c"][owner];
+        trees.0.insert_tokens(&tokens, tenant);
+        trees.1.insert_tokens(&tokens, tenant);
+    }
+    trees
+}
+
+/// Bounded eviction ends where the unbounded one does, per tenant, under
+/// every policy (LFU and Priority tie on their first element and order by
+/// the second; FIFO and FILO order by creation), across entry bounds that
+/// leave leaves out and budgets down to empty.
+#[test]
+fn test_bounded_eviction_matches_unbounded_under_every_policy() {
+    for policy in [
+        EvictionPolicy::Lru,
+        EvictionPolicy::Lfu,
+        EvictionPolicy::Fifo,
+        EvictionPolicy::Mru,
+        EvictionPolicy::Filo,
+        EvictionPolicy::Priority,
+    ] {
+        for seed in 0..6 {
+            for max_entries in [2, 3, 5] {
+                for share in [3, 2, 1, 0] {
+                    let (bounded, whole) = twin_token_trees(policy, seed);
+                    let budget = whole.total_token_size() * share / 4;
+                    whole.evict_tenant_by_size(budget);
+                    let done = bounded.evict_tenant_by_size_bounded(budget, max_entries, &|| true);
+                    assert_eq!(
+                        bounded.get_tenant_token_counts(),
+                        whole.get_tenant_token_counts(),
+                        "{policy:?} seed {seed} max_entries {max_entries} budget {budget}"
+                    );
+                    if share == 0 {
+                        assert!(done.passes > 1, "{policy:?} seed {seed}: one pass held all");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Each tenant's tokens as a walk finds them (the root holds none).
+fn walked_token_counts(tree: &TokenTree) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    let mut stack = vec![Arc::clone(&tree.root)];
+    while let Some(node) = stack.pop() {
+        for child in &node.children {
+            stack.push(Arc::clone(child.value()));
+        }
+        let tokens = node.tokens.read().len();
+        for entry in &node.tenant_last_access_time {
+            *counts.entry(entry.key().to_string()).or_default() += tokens;
+        }
+    }
+    counts
+}
+
+/// Two bounded evictors alongside an inserter (8,000 inserts over shared
+/// prefixes) end, keep every tenant's count true (what a walk finds it
+/// holding) and summing to the total, and once the inserter stops one more
+/// eviction meets the budget.
+#[test]
+fn test_bounded_eviction_alongside_inserts_keeps_true_counts() {
+    use std::sync::atomic::AtomicBool;
+    let tree = TokenTree::new();
+    let stop = AtomicBool::new(false);
+    let budget = 8 * PAGE_SIZE;
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            for i in 0..8_000u32 {
+                let mut tokens = make_tokens(i % 3 * 100_000 + 1, 1);
+                tokens.extend(make_tokens(1_000_000 + i % 700 * 100, 1));
+                tree.insert_tokens(&tokens, ["a", "b", "c"][i as usize / 3 % 3]);
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        scope.spawn(|| {
+            while !stop.load(Ordering::Relaxed) {
+                tree.evict_tenant_by_size_bounded(budget, 2, &|| true);
+            }
+        });
+        while !stop.load(Ordering::Relaxed) {
+            tree.evict_tenant_by_size_bounded(budget, 3, &|| true);
+        }
+    });
+    let done = tree.evict_tenant_by_size_bounded(budget, 3, &|| true);
+    assert!(done.cancelled || tree.total_token_size() <= budget);
+    let held = |counts: HashMap<String, usize>| {
+        counts
+            .into_iter()
+            .filter(|(_, n)| *n > 0)
+            .collect::<HashMap<_, _>>()
+    };
+    let maintained = held(tree.get_tenant_token_counts());
+    assert_eq!(maintained, held(walked_token_counts(&tree)));
+    assert_eq!(maintained.values().sum::<usize>(), tree.total_token_size());
+}
+
+/// A stopped eviction puts the hash sweep off, one in a row at most: after
+/// a second stop in a row, an entry whose node is gone has left the map.
+#[test]
+fn test_a_second_stop_in_a_row_sweeps_the_hash_map() {
+    let tree = TokenTree::new();
+    for t in 0..(3 * CANCEL_CHECK_EVERY) as u32 {
+        tree.insert_tokens(&make_tokens(t * 100_000 + 1, 1), "tenant");
+    }
+    // An entry naming no live node, as one that crossed its node's detach.
+    tree.hashed.insert(u64::MAX, Weak::new());
+    let asked = std::cell::Cell::new(0usize);
+    let stop_on_second = || {
+        asked.set(asked.get() + 1);
+        asked.get() < 2
+    };
+    assert!(tree.evict_tenant_by_size_until(0, &stop_on_second));
+    assert!(
+        tree.hashed.contains_key(&u64::MAX),
+        "the first stop puts it off"
+    );
+    asked.set(0);
+    assert!(tree.evict_tenant_by_size_until(0, &stop_on_second));
+    assert!(!tree.hashed.contains_key(&u64::MAX), "the second sweeps");
+    assert!(tree.total_token_size() > 0, "both stopped inside the walk");
+}
+
+/// A bounded eviction stopped before its first pass walked nothing, so it
+/// leaves the hash map alone: two such stops in a row sweep nothing.
+#[test]
+fn test_a_bounded_eviction_stopped_before_a_pass_leaves_the_map_alone() {
+    let tree = TokenTree::new();
+    tree.insert_tokens(&make_tokens(1, 1), "t");
+    tree.hashed.insert(u64::MAX, Weak::new());
+    for _ in 0..2 {
+        let done = tree.evict_tenant_by_size_bounded(0, 1, &|| false);
+        assert!(done.cancelled);
+        assert_eq!(done.passes, 0);
+    }
+    assert!(tree.hashed.contains_key(&u64::MAX));
+}
+
+/// A bounded eviction stopped inside its first pass did walk, so it counts
+/// as a stop for the sweep: two such stops in a row sweep the hash map.
+#[test]
+fn test_two_bounded_stops_inside_the_first_pass_sweep_the_map() {
+    let tree = TokenTree::new();
+    for t in 0..(3 * CANCEL_CHECK_EVERY) as u32 {
+        tree.insert_tokens(&make_tokens(t * 100_000 + 1, 1), "tenant");
+    }
+    tree.hashed.insert(u64::MAX, Weak::new());
+    let full = tree.total_token_size();
+    let asked = std::cell::Cell::new(0usize);
+    // True before the pass, false at the walk's first check.
+    let stop_in_the_walk = || {
+        asked.set(asked.get() + 1);
+        asked.get() < 2
+    };
+    let first = tree.evict_tenant_by_size_bounded(0, 1, &stop_in_the_walk);
+    assert_eq!(
+        (first.cancelled, first.passes, first.evicted),
+        (true, 1, 0),
+        "stopped inside the first pass's walk"
+    );
+    assert!(
+        tree.hashed.contains_key(&u64::MAX),
+        "the first stop puts it off"
+    );
+    asked.set(0);
+    let second = tree.evict_tenant_by_size_bounded(0, 1, &stop_in_the_walk);
+    assert_eq!(
+        (second.cancelled, second.passes, second.evicted),
+        (true, 1, 0),
+        "stopped inside the first pass's walk"
+    );
+    assert!(!tree.hashed.contains_key(&u64::MAX), "the second sweeps");
+    assert_eq!(
+        tree.total_token_size(),
+        full,
+        "both stopped inside the walk"
+    );
+}
