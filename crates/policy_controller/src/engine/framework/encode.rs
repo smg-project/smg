@@ -857,7 +857,9 @@ impl Engine {
         side.far.sort_unstable();
         side.far_vision.sort_unstable();
         // The three answers only rise: the pass ends at the prefill
-        // that gives the last of them.
+        // that gives the last of them the request reads. The third is read
+        // for a request whose decode is held to the ones that take images.
+        let images = items.holds_decode_to_images(pixels);
         for (at, row) in pools.prefills.iter().enumerate() {
             let listed = pools.table.of(&row.pair_class);
             if listed
@@ -867,6 +869,9 @@ impl Engine {
                 any_pair = true;
                 if !needs || holds(&side.member, &side.far_member, class_of(at)) {
                     any_served = true;
+                    if !images {
+                        break;
+                    }
                     if listed
                         .iter()
                         .any(|&class| holds(&side.vision_of, &side.far_vision, class))
