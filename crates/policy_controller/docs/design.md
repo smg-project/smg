@@ -1682,31 +1682,39 @@ no worker of a list is shed with no endpoint, under `admits`. A single request's
 is given what the call has left of the request's budget, and a request with none left when a
 decision is due is shed under `budget`. A pair's decisions are each given the whole budget.
 
-**[built]** A single request can name its worker. A binding's `routing_key` block names a target
-source (`KeySourceSpec::target`): a header whose number names the one worker the request goes
-to. The preset of `consistent_hashing` names `x-smg-target-worker` so, as classic's policy of
-that name reads it, and the routing settings write the same source for that policy alone. The
-one call reads the header once, ahead of its decision. The number counts, from 0 and in the
-list's order, the workers that are available by the worker's own test and that the route's rule
-takes, as classic counts them (`model_gateway/src/routers/common/placement.rs:1187-1188`,
-`:1225-1234`; `model_gateway/src/policies/consistent_hashing.rs:154-160`, `:262-264`). A worker
-that fails a hard demand of the request takes no number: classic counts over the pool it
-narrowed to a pinned request's wire (`candidates` in `placement.rs`). The call's
-one decision is held to the place of the worker the number reaches (`Constraints::places`): a
-retry is handed that worker again, and the request goes to that worker or to none. Where the
-text is no number, fewer workers can be sent to, or the worker cannot take the request after
-all, the request is shed with no endpoint, under `target-worker`. Whether a binding names a
-target source is decided when the document is applied: a request under a document that names
-none pays one test of that word and no read of a header.
+**[built]** A single request can name its worker.
+
+- **Where it is named.** A binding's `routing_key` block names a target source
+  (`KeySourceSpec::target`): a header whose number names the one worker the request goes to. The
+  preset of `consistent_hashing` names `x-smg-target-worker` as that source, as classic's policy
+  of that name reads it, and the routing settings write the same source for that policy alone.
+- **How the number counts.** The one call reads the header once, ahead of its decision. The
+  number counts, from 0 and in the list's order, the workers that are available by the worker's
+  own test and that the route's rule takes, as classic counts them (`select_pass` in
+  `model_gateway/src/routers/common/placement.rs`; `target_among` in
+  `model_gateway/src/policies/consistent_hashing.rs`). A worker that fails a hard demand of the
+  request takes no number: classic counts over the pool it narrowed to a pinned request's wire
+  (`Candidates::of` in `placement.rs`).
+- **What the call does with it.** The call's one decision is held to the place of the worker
+  the number reaches (`Constraints::places`), and the request goes to that worker or to none.
+  A retry is a new call and counts again by the same tests: a worker an earlier attempt tried
+  takes a number where it passes them, and is handed again where the number reaches it.
+- **When the request is shed.** Where some worker of the list can be sent to, the request is
+  shed with no endpoint, under `target-worker`, in each of these cases: the text is no number,
+  the number reaches no worker, or the worker it reaches cannot take the request after all.
+- **What it costs under a document that names none.** Whether a binding names a target source
+  is decided when the document is applied: a request under a document that names none pays one
+  test of that word, and no header of it is read for a target.
 
 Where no worker of the list can be sent to, there is none to count. Classic steers such a
 request to its least-loaded worker, as it steers any request, and lifts no veto for its routing
-value (`placement.rs:1256-1258`; `consistent_hashing.rs:262-264`). The engine places it as a
+value (`overload_fallback` in `placement.rs`; `routes_by_session_key` in
+`consistent_hashing.rs`). The engine places it as a
 request that names no worker and carries no routing value, by the binding's rule for workers
 that are all vetoed.
 
-One thing differs from classic there, by rule. Classic reads the header once a side for a pair,
-each side's policy over its own workers (`placement.rs:2519`, `:2540`, `:2616`). **[planned]**
+One thing differs from classic there, by rule. Classic reads the header for a pair too, each
+side's policy over its own workers (`pair_pass` in `placement.rs`). **[planned]**
 The engine reads no pair's and no encode request's header for a target yet.
 
 An encode request is placed over its three lists as a pair is over its two, each decision given the whole budget. Where it carries items its call makes three decisions at most, and none is held to the workers the rule takes. One
