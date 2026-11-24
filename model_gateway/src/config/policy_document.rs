@@ -46,8 +46,9 @@ impl RouterConfig {
     /// settings that no document says.
     ///
     /// A pure function of the configuration. The document is not validated
-    /// here: the controller validates a document where it is applied, and
-    /// names there a stage its build does not run yet.
+    /// here, the encode mode of many routers apart: the controller
+    /// validates a document where it is applied, and names there a stage
+    /// its build does not run yet.
     pub fn policy_document(&self) -> Result<PolicySpec, RoutingSettingsError> {
         self.routing_settings().policy_document()
     }
@@ -1211,6 +1212,90 @@ mod tests {
             };
             let document = config.policy_document().expect("the mode's document");
             assert_eq!(document.bindings.len(), bindings, "{connection_mode:?}");
+        }
+    }
+
+    /// A gateway of many routers in the encode mode starts under a main
+    /// policy the controller's check refuses: a prefix ring the view carries
+    /// no block for, or a cache-aware setting the build does not run. The
+    /// validator takes the configuration, and the document the gateway hosts
+    /// is the mode's three sides alone, as it was before the mode bound a
+    /// single request. A main policy the check takes binds one.
+    #[test]
+    fn an_encode_gateway_of_many_routers_starts_under_a_main_policy_the_check_refuses() {
+        use crate::config::validation::ConfigValidator;
+        let ring = |prefix_token_count, cache_boundaries| PolicyConfig::PrefixHash {
+            prefix_token_count,
+            load_factor: 1.25,
+            balance_abs_threshold: 10,
+            cache_boundaries,
+        };
+        let cached = |setting: &str| {
+            let mut policy = PolicyConfig::cache_aware(0.3, 64, 1.5, 120, 67_108_864);
+            if let PolicyConfig::CacheAware {
+                overlap_decay,
+                selection_temperature,
+                selection_accounting_ttl_ms,
+                balance_uncached_credit,
+                ..
+            } = &mut policy
+            {
+                match setting {
+                    "overlap_decay" => *overlap_decay = 0.5,
+                    "selection_temperature" => *selection_temperature = 0.05,
+                    "selection_accounting_ttl_ms" => *selection_accounting_ttl_ms = 200,
+                    "balance_uncached_credit" => *balance_uncached_credit = true,
+                    _ => {}
+                }
+            }
+            policy
+        };
+        for (row, policy, bindings) in [
+            ("a main ring of 15 tokens", ring(15, vec![]), 1),
+            ("a main ring of 4112 tokens", ring(4112, vec![]), 1),
+            ("a main ring over a boundary of 8", ring(256, vec![8]), 1),
+            (
+                "a main ring over a boundary of 8192",
+                ring(256, vec![8192]),
+                1,
+            ),
+            ("a main ring of 256 tokens", ring(256, vec![]), 2),
+            ("an overlap decay", cached("overlap_decay"), 1),
+            (
+                "a selection temperature",
+                cached("selection_temperature"),
+                1,
+            ),
+            (
+                "an accounting time",
+                cached("selection_accounting_ttl_ms"),
+                1,
+            ),
+            ("the uncached credit", cached("balance_uncached_credit"), 1),
+            ("a cache-aware main policy that sets none", cached(""), 2),
+        ] {
+            let round_robin = Some(PolicyConfig::RoundRobin);
+            let config = RouterConfig {
+                enable_igw: true,
+                policy_controller: true,
+                policy,
+                ..config_of(RoutingMode::EncodePrefillDecode {
+                    encode_urls: Vec::new(),
+                    prefill_urls: Vec::new(),
+                    decode_urls: Vec::new(),
+                    encode_policy: round_robin.clone(),
+                    prefill_policy: round_robin.clone(),
+                    decode_policy: round_robin,
+                })
+            };
+            let checked = ConfigValidator::validate(&config);
+            assert!(checked.is_ok(), "{row}: {:?}", checked.err());
+            let document = config
+                .policy_document_in_force()
+                .expect("the settings' document");
+            let hosted = config.hosted_policy(&document, &StageRegistry::builtin());
+            assert!(hosted.is_ok(), "{row}: {:?}", hosted.err());
+            assert_eq!(document.bindings.len(), bindings, "{row}");
         }
     }
 
