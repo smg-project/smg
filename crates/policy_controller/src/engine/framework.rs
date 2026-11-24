@@ -15752,6 +15752,17 @@ mod tests {
             decodes,
             ..PairPools::default()
         };
+        pair_placed_in(engine, facts, pools, scratch)
+    }
+
+    /// [`pair_placed`] over the pools as a host hands them, with its pair
+    /// table and its first partners.
+    fn pair_placed_in(
+        engine: &Engine,
+        facts: &RequestFacts<'_>,
+        pools: PairPools<'_>,
+        scratch: &mut Scratch,
+    ) -> ((u32, u32), (SessionVerdict, DecodeVerdict)) {
         let (pool, cx) = (PoolFacts::default(), Constraints::default());
         let decision = engine.decide_pair(facts, &pool, pools, &cx, &cx, scratch);
         let pick = decision.pick().expect("a pair");
@@ -15953,6 +15964,78 @@ mod tests {
                 other => panic!("a prefill picker that declines answered {other:?}"),
             }
         }
+    }
+
+    /// A rule places a pair's prefill side over the classes the side is
+    /// shown, in each of the two runs a host's first partners make.
+    ///
+    /// Prefill class 1 pairs with both decode classes, and its first
+    /// partner is decode class 1. Prefill class 2 pairs with decode class
+    /// 2 and has no first partner. While no first partner is open, a new
+    /// key is placed over every open partner: on the idle prefill, of
+    /// class 2. Once the first partner opens, the side is shown the
+    /// prefills of class 1 alone. The key's pin stands outside them, so
+    /// the rule places the key again among them, and its decode is the
+    /// first partner. A pin's pick names the pin alone: shown every
+    /// class, the rule would follow the pin to a prefill with no first
+    /// partner, and the key would find no pair. Where the first run sheds,
+    /// the second places a new key over every open partner, by the rule
+    /// again: the pick states its claim. Each run leaves the classes it
+    /// was shown in the scratch, where a side's shadow reads them.
+    ///
+    /// The classic router hands its policy the prefills that pair on a
+    /// known runtime alone
+    /// (`model_gateway/src/routers/common/placement.rs:2651-2674`), and
+    /// the classic manual policy selects anew for a key whose workers are
+    /// not among those it is handed
+    /// (`model_gateway/src/policies/manual.rs:303-308`).
+    #[test]
+    fn a_rule_places_a_pairs_prefill_among_first_partners_then_over_every_partner() {
+        let engine = pair_session_engine(vec![least_requests_profile()], Assignment::Delegate);
+        let mut scratch = Scratch::new();
+        let table = PairTable::new(&[2, 3], &[1, 2, 2]);
+        let first = FirstPartners::new(&[1, 1], &[1]);
+        assert_eq!(first.within(&table), Ok(()));
+        // A side's two workers, of class 1 and of class 2, under ids from
+        // `first_id` on and the loads given.
+        let rows = |loads: [u32; 2], first_id: u64| -> Vec<Candidate> {
+            let mut rows = classed_rows(&[1, 2]);
+            for (row, load) in rows.iter_mut().zip(loads) {
+                (row.id, row.in_flight) = (WorkerId(first_id + u64::from(row.position)), load);
+            }
+            rows
+        };
+        // The idle worker of each side is the one of class 2.
+        let (mut prefills, mut decodes) = (rows([5, 0], 100), rows([5, 0], 200));
+        // The pair of `key`'s next request with its two verdicts, and the
+        // classes its prefill side was shown.
+        let placed = |key, prefills: &[Candidate], decodes: &[Candidate], scratch: &mut Scratch| {
+            let pools = PairPools {
+                prefills,
+                decodes,
+                table,
+                first,
+                ..PairPools::default()
+            };
+            let answer = pair_placed_in(&engine, &pair_request(Some(key)), pools, scratch);
+            (answer, scratch.classes.clone())
+        };
+        let claim = DecodeVerdict::CLAIMED;
+        let claimed = |id| (SessionVerdict::Claimed(WorkerId(id)), claim);
+        // No first partner is open: decode class 1 has no healthy worker.
+        decodes[0].health.healthy = false;
+        let (answer, shown) = placed(7, &prefills, &decodes, &mut scratch);
+        assert_eq!((answer, shown), (((1, 1), claimed(101)), vec![1, 2]));
+        // The first partner opens, and the key's pin is not among the
+        // prefills that have one.
+        decodes[0].health.healthy = true;
+        let (answer, shown) = placed(7, &prefills, &decodes, &mut scratch);
+        assert_eq!((answer, shown), (((0, 0), claimed(100)), vec![1]));
+        // The one prefill with a first partner open is not healthy: the
+        // first run sheds, and the second is the rule's too.
+        prefills[0].health.healthy = false;
+        let (answer, shown) = placed(8, &prefills, &decodes, &mut scratch);
+        assert_eq!((answer, shown), (((1, 1), claimed(101)), vec![1, 2]));
     }
 
     /// A side of a pair takes no turn of a list. Its request with no
