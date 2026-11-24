@@ -45,7 +45,7 @@ use crate::{
             pd_admission,
             pd_failure::{PdSide, SidePhase},
             placement::Placed,
-            prefill_admission::PrefillLoadGuard,
+            prefill_admission::{PrefillAhead, PrefillLoadGuard},
             retry::mark_non_retryable,
         },
         error,
@@ -61,7 +61,7 @@ use crate::{
                 DispatchBooking, FanoutStream, FirstItem, PrefillTicket, ProtoEmbedRequest,
                 ProtoGenerateRequest, ProtoGenerateResponse, ProtoRequest, ProtoStream,
             },
-            sequential_pd::{execute_sequential_pd, DecodeBehindPrefill},
+            sequential_pd::{execute_sequential_pd, DecodeBehindPrefill, SequentialPlan},
             utils::{
                 account_pd_side_failure,
                 stream_failure::UpstreamClass,
@@ -426,13 +426,13 @@ pub(crate) async fn execute_plan(
             // attempt's dispatch future (and the run's one box) for a path the
             // request does not take.
             ExecutionPlan::PrefillDecode(req) => {
-                let prefill_guard = require_prefill_guard(prefill_guard)?;
+                let prefill = require_prefill_guard(prefill_guard)?;
                 Box::pin(execute_pd_dispatch(
                     req,
                     clients,
                     workers,
                     model,
-                    prefill_guard,
+                    prefill,
                     ledger,
                     room_residue,
                     None,
@@ -445,7 +445,7 @@ pub(crate) async fn execute_plan(
                 // A rendezvous plan's bootstrap info went into the prefill
                 // request at request building and its encode jobs go with the
                 // prefill/decode pair; a push plan runs its encode call first.
-                let prefill_guard = require_prefill_guard(prefill_guard)?;
+                let prefill = require_prefill_guard(prefill_guard)?;
                 Box::pin(execute_epd_dispatch(
                     request,
                     clients,
@@ -453,7 +453,7 @@ pub(crate) async fn execute_plan(
                     model,
                     encode,
                     encode_watch,
-                    prefill_guard,
+                    prefill,
                     ledger,
                     behind.take(),
                 ))
@@ -585,8 +585,9 @@ fn dispatch_timed_out(
 }
 
 /// A disaggregated dispatch without the Prefill admission slot worker
-/// selection took for it is a pipeline bug, not a routable request.
-fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadGuard, Response> {
+/// selection took for it is a pipeline bug, not a routable request. The
+/// slot is the load not yet sent, or a batch sub-request's replica of it.
+fn require_prefill_guard<G>(guard: Option<G>) -> Result<G, Response> {
     guard.ok_or_else(|| {
         error!(
             function = "execute_plan",
@@ -597,6 +598,32 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
             "PD dispatch without a Prefill admission slot",
         )
     })
+}
+
+/// What a pair's dispatch is handed for its prefill's load. One request's
+/// dispatch is handed the load not yet sent ([`PrefillAhead`]): it says the
+/// send where the prefill goes out, by the one test of the prefill's
+/// answer. A sub-request of a batch is handed a replica of a load whose
+/// send the batch said ahead of its replicas ([`PrefillLoadGuard`]): it has
+/// nothing to say and makes no test.
+trait PrefillSend {
+    /// The load as the request holds it through its Prefill phase, with
+    /// the prefill's send said.
+    fn sent(self) -> PrefillLoadGuard;
+}
+
+impl PrefillSend for PrefillAhead {
+    #[inline]
+    fn sent(self) -> PrefillLoadGuard {
+        PrefillAhead::sent(self)
+    }
+}
+
+impl PrefillSend for PrefillLoadGuard {
+    #[inline]
+    fn sent(self) -> Self {
+        self
+    }
 }
 
 /// Whether the dispatch owes the plan's decode anything behind its prefill
@@ -628,13 +655,16 @@ fn decode_is_owed_behind_its_prefill(plan: &ExecutionPlan, workers: &WorkerSelec
 /// decode, which goes out behind its prefill (see [`DecodeBehindPrefill`]);
 /// `None` for every dispatch whose decode guard said its send where it was
 /// made.
+/// `prefill` is the prefill's load as the dispatch was handed it
+/// ([`PrefillSend`]): one request's send is said here, where the shape is
+/// dispatched.
 #[expect(clippy::too_many_arguments)]
 async fn execute_pd_dispatch(
     proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     model: &str,
-    prefill_guard: PrefillLoadGuard,
+    prefill: impl PrefillSend,
     ledger: &AttemptLedger,
     room_residue: Option<RoomResidue>,
     encode: Option<EncodeWatch>,
@@ -665,45 +695,59 @@ async fn execute_pd_dispatch(
     // `PdProtocol::for_runtime`): sequential sides relay the KV handoff
     // through the router, parallel sides rendezvous on bootstrap info
     // carried in the request.
+    //
+    // The prefill goes out with the shape's dispatch, so one request's
+    // send is said here ([`PrefillSend::sent`]), behind every refusal of
+    // the request: the runtime's above, and the sequential plan's. What
+    // still stands between that word and the client's call is the
+    // pipeline's own fault alone, a client selection that is no pair's. A
+    // batch said its send once, ahead of its sub-requests' dispatches
+    // ([`execute_batch_dispatch`]): for one of those the word is said
+    // already, and these refusals come behind it.
     let result = match protocol.dispatch {
         PdDispatch::Sequential => {
+            let plan = SequentialPlan::decide(&proto_request, workers)?;
             execute_sequential_pd(
+                plan,
                 proto_request,
                 clients,
                 workers,
                 model,
-                prefill_guard,
+                prefill.sent(),
                 ledger,
                 behind,
             )
             .await
         }
-        PdDispatch::Parallel => match pd_fanout_width(&proto_request, protocol) {
-            Some(n) => {
-                execute_fanout_pd(
-                    proto_request,
-                    n,
-                    clients,
-                    workers,
-                    prefill_guard,
-                    ledger,
-                    room_residue,
-                    encode,
-                )
-                .await
+        PdDispatch::Parallel => {
+            let prefill_guard = prefill.sent();
+            match pd_fanout_width(&proto_request, protocol) {
+                Some(n) => {
+                    execute_fanout_pd(
+                        proto_request,
+                        n,
+                        clients,
+                        workers,
+                        prefill_guard,
+                        ledger,
+                        room_residue,
+                        encode,
+                    )
+                    .await
+                }
+                None => {
+                    execute_parallel_pd(
+                        proto_request,
+                        clients,
+                        workers,
+                        prefill_guard,
+                        ledger,
+                        encode,
+                    )
+                    .await
+                }
             }
-            None => {
-                execute_parallel_pd(
-                    proto_request,
-                    clients,
-                    workers,
-                    prefill_guard,
-                    ledger,
-                    encode,
-                )
-                .await
-            }
-        },
+        }
     }?;
     Ok(attribute_pd_sides(result, workers))
 }
@@ -848,7 +892,7 @@ async fn execute_epd_dispatch(
     model: &str,
     encode: Option<EncodeOutputs>,
     encode_watch: &mut Option<EncodeWatch>,
-    prefill_guard: PrefillLoadGuard,
+    prefill: PrefillAhead,
     ledger: &AttemptLedger,
     behind: Option<DecodeBehindPrefill<'_>>,
 ) -> Result<ExecutionResult, Response> {
@@ -859,7 +903,7 @@ async fn execute_epd_dispatch(
         clients,
         workers,
         model,
-        prefill_guard,
+        prefill,
         ledger,
         None,
         encode_watch.clone(),
@@ -1032,15 +1076,19 @@ async fn execute_batch_dispatch(
     clients: &ClientSelection,
     workers: &WorkerSelection,
     model: &str,
-    prefill_guard: Option<PrefillLoadGuard>,
+    prefill_guard: Option<PrefillAhead>,
     ledger: &AttemptLedger,
     dispatched_at: Instant,
 ) -> Result<ExecutionResult, Response> {
     // One Prefill handle per PD sub-request, all on the one admission slot.
+    // The batch's prefills go out with the dispatches below: the send is
+    // said here, once, ahead of the handles made of the load, and so ahead
+    // of what a sub-request's dispatch may still refuse.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
         ExecutionPlanKind::Single => requests.iter().map(|_| None).collect(),
         ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
             require_prefill_guard(prefill_guard)?
+                .sent()
                 .replicate_to(requests.len())
                 .into_iter()
                 .map(Some)

@@ -1,6 +1,7 @@
 //! A gRPC pair the policy engine places, through the sequential dispatch:
 //! the decode is asked again behind its prefill, and the engine's stages
-//! hear each side of the pair where the route sends and ends it.
+//! hear each side of the pair where the route sends and ends it. A pair
+//! the route refuses ahead of its prefill's send is heard as a release.
 //!
 //! The gateway is built by the test harness with the policy controller on,
 //! a table that holds one scorer of the test's own, and a pair document
@@ -217,6 +218,32 @@ fn worker(port: u16, worker_type: WorkerType) -> Arc<dyn Worker> {
     Arc::new(grpc_worker(port, worker_type, RuntimeType::Vllm, card).build())
 }
 
+/// A worker of the sequential shape on `port` whose engine runs a KV
+/// connector this route does not speak: the dispatch refuses its pair
+/// before either side is sent.
+fn unspoken_worker(port: u16, worker_type: WorkerType) -> Arc<dyn Worker> {
+    let card = ModelCard::new(MODEL);
+    let worker = grpc_worker(port, worker_type, RuntimeType::Vllm, card);
+    Arc::new(worker.kv_connector("MoRIIOConnector").build())
+}
+
+/// One chat through `router`: the status it is answered with.
+#[expect(clippy::unwrap_used, reason = "test helper: failures should panic")]
+async fn answered(router: &dyn RouterTrait) -> StatusCode {
+    let request = serde_json::from_value(serde_json::json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "Hello world"}],
+        "max_tokens": 8,
+        "stream": false,
+    }))
+    .unwrap();
+    let tenant = TenantRequestMeta::new(TenantKey::new("pd-policy-engine-test-tenant"));
+    let response = router
+        .route_chat(None, &tenant, Arc::new(request), MODEL)
+        .await;
+    response.status()
+}
+
 /// One chat through `router`, answered in full: the answer's JSON.
 #[expect(
     clippy::expect_used,
@@ -279,7 +306,7 @@ async fn one_pair_through_the_sequential_route(decode_pick: DecodePick) -> Vec<S
 /// A pair the policy engine places goes through the sequential pair route
 /// under a document that decides the decode behind its prefill. The first
 /// decision books the prefill alone, and its dispatch is said where the
-/// prefill's guard is made. Once the prefill has answered the route asks the
+/// route sends the prefill. Once the prefill has answered the route asks the
 /// decode again: the engine issues the decode then, and the prefill side
 /// ends for the stages there, not at the response's end. The decode's
 /// dispatch is said where the route sends it, ahead of the decode engine
@@ -491,4 +518,54 @@ async fn a_pair_whose_decode_moved_states_the_weight_version_of_its_decode() {
         moved["system_fingerprint"], "version-b",
         "the answer of a decode that moved states its own version"
     );
+}
+
+/// A pair the route refuses between its selection and its prefill's send
+/// tells the engine a release, and no dispatch. The pair's engines run a
+/// KV connector this route does not speak, so the dispatch refuses the
+/// request before either side goes out, and neither engine is asked. The
+/// prefill's worker was counted from the selection on, and is counted no
+/// more. Under a document that decides the decode behind its prefill the
+/// first decision booked the prefill alone: the engine hears that one issue
+/// and its one release. Under the stock document it booked both sides, and
+/// hears each released.
+#[tokio::test]
+async fn a_pair_refused_ahead_of_its_prefills_send_is_heard_as_a_release() {
+    for (decode_pick, told) in [
+        (
+            DecodePick::AfterPrefill,
+            &["issued Prefill", "released Prefill"][..],
+        ),
+        (
+            DecodePick::WithPrefill,
+            &[
+                "issued Prefill",
+                "issued Decode",
+                "released Prefill",
+                "released Decode",
+            ][..],
+        ),
+    ] {
+        let (heard, preferred) = (Heard::default(), Preferred::default());
+        let prefill = Prefill {
+            heard: Arc::clone(&heard),
+            preferred: Arc::clone(&preferred),
+            then: None,
+        };
+        let prefill = serve_engine(prefill.into_server()).await;
+        let decode = serve_engine(Decode(Arc::clone(&heard), "the decode").into_server()).await;
+        let prefill = unspoken_worker(prefill, WorkerType::Prefill);
+        let decode = unspoken_worker(decode, WorkerType::Decode);
+        let workers = vec![Arc::clone(&prefill), Arc::clone(&decode)];
+
+        let status = common::with_policy_stages(stages_hearing(&heard, &preferred), async {
+            let router = build_grpc_router(pair_config(decode_pick), MODEL, workers).await;
+            answered(router.as_ref()).await
+        })
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{decode_pick:?}");
+        let said = heard.lock().expect("the record").clone();
+        assert_eq!(said, told, "{decode_pick:?}");
+        assert_eq!((prefill.load(), decode.load()), (0, 0), "{decode_pick:?}");
+    }
 }
