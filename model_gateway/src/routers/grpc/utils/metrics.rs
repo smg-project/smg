@@ -11,6 +11,7 @@ use crate::{
     rate_limit::RATE_LIMIT_ERROR_CODE,
     routers::{
         common::{
+            attempt_ledger::WORKER_BODY_TOO_LARGE,
             overload::WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
             placement::{
                 MODEL_NOT_FOUND_CODE, NO_AVAILABLE_WORKERS_CODE, NO_MEDIA_REF_CAPABLE_WORKER_CODE,
@@ -173,9 +174,9 @@ pub(crate) fn error_reason_for_response(response: &Response) -> &'static str {
         // The decisions route's code for an answer it could not read, the
         // HTTP router's for one it could not decode or one over the payload
         // limit.
-        "invalid_decisions_response"
-        | "call_upstream_decode_error"
-        | "upstream_response_too_large" => REASON_BAD_RESPONSE,
+        "invalid_decisions_response" | "call_upstream_decode_error" | WORKER_BODY_TOO_LARGE => {
+            REASON_BAD_RESPONSE
+        }
         "" => error_reason_from_status(status),
         // Another code of the gateway's own: a 429 under it is a shed of the
         // gateway's (a budget or a cap it holds), never a worker's pushback.
