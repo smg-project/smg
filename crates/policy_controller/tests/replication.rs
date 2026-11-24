@@ -49,7 +49,8 @@ use smg_policy_controller::{
             replication_event::Event as Sent, worker_event::Event,
         },
     },
-    store::{HealthPolicy, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{HealthPolicy, MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
+    worker_host::{Members, Objects},
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -1566,6 +1567,9 @@ struct Replica {
     replication: SocketAddr,
     admin: SocketAddr,
     store: Arc<MemoryStore>,
+    /// The holder of the replica's worker objects: what a worker the case
+    /// registers is written through.
+    workers: Arc<Objects<Members>>,
     readiness: Readiness,
     stop: oneshot::Sender<()>,
     served: JoinSet<()>,
@@ -1627,6 +1631,7 @@ impl Replica {
             .expect("the scope is mounted");
         let admin = controller.addresses().admin;
         let (store, readiness) = (controller.store(), controller.readiness());
+        let workers = controller.workers();
         let (stop, stopped) = oneshot::channel::<()>();
         let mut served = JoinSet::new();
         served.spawn(async move {
@@ -1639,6 +1644,7 @@ impl Replica {
             replication,
             admin,
             store,
+            workers,
             readiness,
             stop,
             served,
@@ -1754,11 +1760,12 @@ async fn a_promoted_standby_holds_every_row_of_its_leader() {
         wire_modes: WireModes::GRPC,
         ..facts("grpc://127.0.0.1:1", 1, 0)
     };
-    let polled = leader.store.upsert(polled).id();
+    let written = leader
+        .workers
+        .upsert(&leader.store, polled, Registrant::Control);
+    let polled = written.expect("the store took the registration").id();
     let revision = leader.store.get(polled).expect("the row").revision;
-    leader
-        .store
-        .set_status(polled, WorkerStatus::Ready, revision);
+    leader.workers.connect_row(&leader.store, polled, revision);
     // A row nobody polls.
     writes(&leader.store, 0);
     // The leader writes while the standby follows.

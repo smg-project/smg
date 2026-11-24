@@ -648,7 +648,7 @@ mod tests {
                 },
                 lifecycle::tests::{a_completed, a_dispatched, a_released, worker},
                 principal::{tests::told, Layer, ENTRY},
-                replication::journaled_for,
+                replication::journaled_at,
                 service::{Service, Shared},
                 PROTOCOL_VERSION,
             },
@@ -696,7 +696,7 @@ mod tests {
             ADDRESS.to_owned(),
             &elector,
             stood,
-            followed(journaled_for(&LeasePlace::Process, 0, 2)),
+            followed(journaled_at(&LeasePlace::Process, 0, 2)),
             Arc::new(crate::stages::StageRegistry::builtin()),
             2,
         )

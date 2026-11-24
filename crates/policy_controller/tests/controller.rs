@@ -47,9 +47,10 @@ use smg_policy_controller::{
     },
     store::{
         GatewayId, LeaseRecord, LeaseState, LeasesStore, MemoryStore, Overload, PickRecord,
-        WorkerFacts, WorkerStatus, WorkersStore,
+        Registrant, WorkerFacts, WorkersStore,
     },
     tracking::{Lease, LeaseId},
+    worker_host::{Members, Objects},
 };
 use smg_worker::health::overload::OverloadThresholds;
 use tokio::{
@@ -606,25 +607,22 @@ async fn a_present_gateway_is_answered_which_worker_on_its_decide_stream() {
         .expect("a listener of the configuration");
     let addresses = controller.addresses();
     let mut readiness = controller.readiness();
-    let store = controller.store();
+    let (store, holder) = (controller.store(), controller.workers());
     // Three ready members serving the model, under a preset of this build.
     let mut workers = Vec::new();
     for name in ["w0", "w1", "w2"] {
         let key = format!("http://{name}.fleet:8000");
-        let id = store
-            .upsert(WorkerFacts {
-                key: key.clone(),
-                engine: key,
-                incarnation: 1,
-                role: Role::Single,
-                models: vec![MODEL.to_owned()],
-                dp_size: 1,
-                max_running: Some(256),
-                ..WorkerFacts::default()
-            })
-            .id();
-        let revision = WorkersStore::get(&*store, id).expect("the row").revision;
-        store.set_status(id, WorkerStatus::Ready, revision);
+        let stated = WorkerFacts {
+            key: key.clone(),
+            engine: key,
+            incarnation: 1,
+            role: Role::Single,
+            models: vec![MODEL.to_owned()],
+            dp_size: 1,
+            max_running: Some(256),
+            ..WorkerFacts::default()
+        };
+        let id = ready(&holder, &store, stated).expect("a ready worker");
         workers.push(id.0);
     }
     let mut document = PolicySpec::preset("random").expect("a preset of this build");
@@ -1459,7 +1457,7 @@ async fn mutual_tls_admits_the_authoritys_clients_and_refuses_the_rest() {
 #[ignore = "a measurement for the Numbers table, run by name"]
 async fn rss_idle_and_with_a_thousand_workers_in_the_store() {
     let controller = Controller::bind(config()).await.expect("bind");
-    let store = controller.store();
+    let (store, holder) = (controller.store(), controller.workers());
     let mut readiness = controller.readiness();
     let (stop, stopped) = oneshot::channel::<()>();
     let serve = controller.serve(async {
@@ -1471,7 +1469,7 @@ async fn rss_idle_and_with_a_thousand_workers_in_the_store() {
         let idle = vm_rss_kib();
         for i in 0..1_000u32 {
             let key = format!("http://worker-{i}.fleet:8000");
-            store.upsert(WorkerFacts {
+            let stated = WorkerFacts {
                 key: key.clone(),
                 engine: key,
                 incarnation: 1,
@@ -1480,7 +1478,9 @@ async fn rss_idle_and_with_a_thousand_workers_in_the_store() {
                 dp_size: 1,
                 max_running: Some(256),
                 ..WorkerFacts::default()
-            });
+            };
+            let change = holder.upsert(&store, stated, Registrant::Control);
+            change.expect("the store took the registration");
         }
         // The fleet arrived inside one window: its one build, asked here so
         // the figure holds the world a decision reads.
@@ -1576,20 +1576,17 @@ async fn a_served_dispatch_feeds_a_registered_scorer_without_lifecycle_hooks() {
         .await
         .expect("the document validates");
 
-    let store = controller.store();
+    let (store, holder) = (controller.store(), controller.workers());
     for key in ["http://first:8000", "http://second:8000"] {
-        let id = store
-            .upsert(WorkerFacts {
-                key: key.to_owned(),
-                engine: key.to_owned(),
-                incarnation: 1,
-                models: vec![MODEL.to_owned()],
-                dp_size: 1,
-                ..WorkerFacts::default()
-            })
-            .id();
-        let revision = WorkersStore::get(&*store, id).expect("the row").revision;
-        store.set_status(id, WorkerStatus::Ready, revision);
+        let stated = WorkerFacts {
+            key: key.to_owned(),
+            engine: key.to_owned(),
+            incarnation: 1,
+            models: vec![MODEL.to_owned()],
+            dp_size: 1,
+            ..WorkerFacts::default()
+        };
+        ready(&holder, &store, stated).expect("a ready worker");
     }
     store.publish_now();
 
@@ -1742,34 +1739,42 @@ async fn metrics_server(
     Ok((format!("http://{addr}"), stop))
 }
 
-/// A ready row at `key` on `wires`, of the first gauge family's engine
+/// A ready worker of `stated`, written as a registration call writes one:
+/// through the served controller's holder ([`Controller::workers`]), with
+/// its connect signal behind the write. `None` where `store` took no
+/// write.
+fn ready(holder: &Objects<Members>, store: &MemoryStore, stated: WorkerFacts) -> Option<WorkerId> {
+    let id = holder.upsert(store, stated, Registrant::Control)?.id();
+    let revision = WorkersStore::get(store, id)?.revision;
+    holder.connect_row(store, id, revision);
+    Some(id)
+}
+
+/// A ready worker at `key` on `wires`, of the first gauge family's engine
 /// kind, with the queue bound `waiting` where the row states one.
 fn ready_row(
+    holder: &Objects<Members>,
     store: &MemoryStore,
     key: &str,
     wires: WireModes,
     waiting: Option<u32>,
 ) -> Option<WorkerId> {
-    let id = store
-        .upsert(WorkerFacts {
-            key: key.to_owned(),
-            engine: key.to_owned(),
-            incarnation: 1,
-            role: Role::Single,
-            wire_modes: wires,
-            engine_kind: RuntimeType::Vllm.as_str().to_owned(),
-            models: vec!["m".to_owned()],
-            dp_size: 1,
-            overload: Overload {
-                waiting_requests: waiting,
-                ..Overload::default()
-            },
-            ..WorkerFacts::default()
-        })
-        .id();
-    let revision = WorkersStore::get(store, id)?.revision;
-    store.set_status(id, WorkerStatus::Ready, revision);
-    Some(id)
+    let stated = WorkerFacts {
+        key: key.to_owned(),
+        engine: key.to_owned(),
+        incarnation: 1,
+        role: Role::Single,
+        wire_modes: wires,
+        engine_kind: RuntimeType::Vllm.as_str().to_owned(),
+        models: vec!["m".to_owned()],
+        dp_size: 1,
+        overload: Overload {
+            waiting_requests: waiting,
+            ..Overload::default()
+        },
+        ..WorkerFacts::default()
+    };
+    ready(holder, store, stated)
 }
 
 /// The value of the controller's series `name` on a metrics `page`.
@@ -1802,8 +1807,9 @@ async fn the_serve_runs_the_load_monitor_and_renders_its_counts() {
     .expect("the controller binds");
     let admin = controller.addresses().admin;
     let (store, loads) = (controller.store(), controller.loads());
-    ready_row(&store, &polled, WireModes::GRPC, None).expect("the polled row");
-    ready_row(&store, &read, WireModes::HTTP, Some(4)).expect("the read row");
+    let holder = controller.workers();
+    ready_row(&holder, &store, &polled, WireModes::GRPC, None).expect("the polled row");
+    ready_row(&holder, &store, &read, WireModes::HTTP, Some(4)).expect("the read row");
     let (stop, stopped) = oneshot::channel::<()>();
     let serve = controller.serve(async {
         let _ = stopped.await;
@@ -1909,7 +1915,8 @@ async fn a_start_states_the_overload_thresholds_a_worker_with_none_is_judged_by(
         .expect("the controller binds");
         let admin = controller.addresses().admin;
         let (store, loads) = (controller.store(), controller.loads());
-        ready_row(&store, worker, WireModes::HTTP, None).expect("the read row");
+        let holder = controller.workers();
+        ready_row(&holder, &store, worker, WireModes::HTTP, None).expect("the read row");
         let (stop, stopped) = oneshot::channel::<()>();
         let serve = controller.serve(async {
             let _ = stopped.await;

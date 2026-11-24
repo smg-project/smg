@@ -67,7 +67,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        service::controller::worker_objects::{ObjectsWake, WorkerObjects},
+        service::controller::worker_objects::WorkerObjects,
         store::{MemoryStore, WorkerFacts, WorkersStore},
     };
 
@@ -75,7 +75,7 @@ mod tests {
 
     fn follow_a_row() -> (WorkerObjects, Option<WorkerId>) {
         let store = Arc::new(MemoryStore::new());
-        let workers = WorkerObjects::new(Arc::clone(&store), ObjectsWake::default());
+        let workers = WorkerObjects::new(Arc::clone(&store));
         store.upsert(WorkerFacts {
             key: URL.to_owned(),
             engine: URL.to_owned(),
