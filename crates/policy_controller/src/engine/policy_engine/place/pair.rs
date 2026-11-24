@@ -55,7 +55,8 @@ pub(super) fn decode_label(engine: Loaded<'_, '_>, model: &str) -> &'static str 
 /// workers the call missed so far ([`Call::missed`]), and the first of its
 /// targets both of whose workers can be sent to. The decision is lent
 /// `lent`: the request's own lists, or those lists with each side's
-/// places beside it ([`again`]).
+/// places beside it, the workers a rule takes ([`again`]) or the worker a
+/// request names ([`target::pair`](super::target::pair)).
 ///
 /// The placement names the request's routing value, and the profile of its
 /// decode side by its label ([`decode_label`]).
@@ -168,7 +169,13 @@ pub(super) fn place<'a>(
 /// most ([`Call::again`]), and no worker for the request behind the last.
 /// An ask that sheds the request as saturated goes there too: it judged
 /// the overload over the lists it was lent, which a rule may narrow.
-fn asks<'a>(
+///
+/// A pair held to the prefill its request names is asked so over its lists
+/// with that prefill's place beside them
+/// ([`target::pair`](super::target::pair)): a rule the request states is
+/// then asked of that place alone. One held to the two workers it names
+/// is the call's one decision: no ask follows it ([`again`]).
+pub(super) fn asks<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
     lists: &PairLists<'_>,
@@ -215,6 +222,10 @@ fn asks<'a>(
 /// wholly over its thresholds that decision sheds again, and its shed
 /// stands. A shed stands where the rule is not asked here: behind a
 /// later ask, and under no rule.
+///
+/// A pair held to the two workers its request names
+/// ([`target::pair`](super::target::pair)) is asked no second time: behind
+/// a worker it cannot send to it has no worker, and its shed stands.
 #[cold]
 #[inline(never)]
 fn again<'a>(
@@ -233,23 +244,23 @@ fn again<'a>(
             ..pair
         }
     }
+    if call.named_pair {
+        return Err(shed.unwrap_or(Unplaced::NoWorkers));
+    }
     let (mut prefills, mut decodes) = (None, None);
     // The rule is asked of a list once a call: behind the first ask.
     if call.spent == 0 {
-        let spent = &mut call.spent;
         hold_to_rule(
             request,
             Some(lists.prefill),
             lists.prefill_places,
             &mut prefills,
-            spent,
         )?;
         hold_to_rule(
             request,
             Some(lists.decode),
             lists.decode_places,
             &mut decodes,
-            spent,
         )?;
     }
     // A shed stands where the rule was not asked here: behind a later ask,

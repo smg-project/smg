@@ -13,6 +13,11 @@
 //! follows the move ahead of that dispatch, as a gateway's sticky map moves
 //! a pin where it selects the worker.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{
     collections::hash_map,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -72,6 +77,7 @@ impl SessionRule {
 /// pick and the lease, so a commit moves the pins by its own decision's
 /// verdict and no other request's reading of the key can erase it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionVerdict {
     /// No sessions rule governed the decision, or its rule placed a request
     /// of a key at its cap on another worker at the cap: its commit pins
@@ -88,7 +94,8 @@ pub enum SessionVerdict {
     Respill,
     /// The key had no routable pin and the decision claimed the worker it
     /// placed the request on: that decision's commit confirms the claim on
-    /// the worker, or withdraws it when the dispatch landed elsewhere.
+    /// the worker, or withdraws it when the dispatch landed elsewhere or it
+    /// refused every target.
     Claimed(WorkerId),
 }
 
@@ -146,6 +153,7 @@ pub type SessionPins = [WorkerId; 2];
 
 /// When a table forgets a key it holds, on the decision clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionExpiry {
     /// At this instant: the key's rule has a TTL.
     At(u64),
@@ -221,7 +229,8 @@ struct Entry {
     /// it stands unconfirmed, and no other dispatch elsewhere touches it; a
     /// claim whose commit never comes stands until the TTL sweeps the key.
     /// A pair's decision moves its own claim to the prefill its pair formed
-    /// on, and withdraws it where none formed ([`SessionTable::move_claim`]).
+    /// on, and withdraws it where none formed; a commit that refused every
+    /// target withdraws its decision's ([`SessionTable::move_claim`]).
     /// A rename's step takes the mark where the key held the claim's
     /// worker under another id as well ([`Entry::follow`]).
     claim: WorkerId,
@@ -611,7 +620,8 @@ impl SessionTable {
     /// claim is a pin made before a commit, and it is marked as such:
     /// any dispatch to it confirms it, the claiming decision's own dispatch
     /// elsewhere withdraws it (`dispatched`), the TTL sweeps it otherwise.
-    /// A pair's decision moves its own claim before its dispatch
+    /// A pair's decision moves its own claim before its dispatch, and a
+    /// commit that refused every target withdraws its decision's
     /// ([`Self::move_claim`]).
     ///
     /// The pin and the claim of record take the id that stands for the
@@ -679,6 +689,10 @@ impl SessionTable {
     /// A move on an id its worker had before it was registered again
     /// fronts the id that stands ([`Self::stands`]), as a dispatch on
     /// that id does.
+    /// A pair's decision moves its prefill side's pin where the pair
+    /// forms, to the prefill the pair formed on. A prefill its side placed
+    /// first and passed over is fronted at no instant, and a decision
+    /// that forms no pair moves no pin.
     pub(crate) fn respilled(&self, key: Session, target: WorkerId) {
         let key = key.get();
         if target == WorkerId(0) {
@@ -696,7 +710,8 @@ impl SessionTable {
 
     /// The decision that claimed `claimed` for `key` does not go there: a
     /// pair's decision formed its pair on another prefill, `target`, or on
-    /// none (`WorkerId(0)`). The claim is withdrawn where it still stands
+    /// none (`WorkerId(0)`), or its commit refused every target
+    /// (`WorkerId(0)` too). The claim is withdrawn where it still stands
     /// unconfirmed, as the claiming decision's commit elsewhere withdraws
     /// it ([`Self::dispatched`]), and `target` is claimed in its place by
     /// the key's recovery: the key's next decision follows a worker the

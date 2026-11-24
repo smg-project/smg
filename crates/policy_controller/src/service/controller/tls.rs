@@ -95,6 +95,7 @@ async fn read(path: &Path) -> Result<Vec<u8>, TlsError> {
 
 /// A listener's TLS material refused, by file.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TlsError {
     /// The file could not be read.
     #[error("reading {path}: {source}")]

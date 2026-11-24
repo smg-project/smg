@@ -146,7 +146,10 @@ mod tests {
     };
     use crate::{
         engine::view::{WireModes, WorkerId},
-        service::elector::{ElectError, Elector},
+        service::{
+            controller::Config,
+            elector::{ElectError, Elector},
+        },
         store::{
             GatewayId, HealthPolicy, MemoryStore, Reachability, WorkerFacts, WorkerStatus,
             WorkersStore,
@@ -219,6 +222,7 @@ mod tests {
                 Arc::clone(&store),
                 ObjectsWake::default(),
                 dials,
+                Config::DEFAULT_WORKER_OVERLOAD,
             ));
             let elector = Elector::alone("replica", lasting())?;
             let prober = Arc::new(Prober::new(Arc::clone(&workers), elector.fence()));

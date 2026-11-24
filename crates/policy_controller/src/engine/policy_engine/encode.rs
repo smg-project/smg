@@ -3,9 +3,12 @@
 //! the engine decides them in
 //! ([`Engine::decide_encode_pair`](crate::engine::Engine::decide_encode_pair)).
 //!
-//! No affinity column stands beside the encoders, and no ring is lent for
-//! them: an encode profile's stage that places by a ring places by its
-//! own.
+//! No affinity column stands beside the encoders. A ring lent for the
+//! items ([`EncodeItems::ring`]) places an item that carries its text
+//! where that ring's walk reaches among the encoders offered, where the
+//! encode profile reads that ring and its lender places what it is
+//! asked. Every other item is placed as with no ring lent: an encode
+//! profile's stage that places by a ring places it by its own.
 //!
 //! **Named signals.** Under a document a stage of which reads a named
 //! signal, each of the three sides whose profile reads one is lent its own
@@ -20,6 +23,11 @@
 //! **The entries.** A host asks through
 //! [`PolicyEngine::decide_encode_at`]: the three lists' decision, with the
 //! pair's lease a pick is issued. No lease is issued for an encoder.
+
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
 
 use std::{cell::OnceCell, sync::Arc, time::Instant};
 

@@ -542,6 +542,7 @@ fn configure(config: &mut Config) {
 
 /// Why a component is refused at load.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum LoadError {
     #[error("the WebAssembly runtime failed: {0}")]
     Runtime(String),
@@ -583,6 +584,7 @@ pub enum LoadError {
 
 /// Which world a module exports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum World {
     /// `smg:policy/policy`: the view as records.
     Record,
@@ -666,6 +668,7 @@ enum Fault {
 
 /// The counters of one plugin, read through [`Plugin::stats`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Stats {
     /// Stage calls the guest answered.
     pub answered: u64,

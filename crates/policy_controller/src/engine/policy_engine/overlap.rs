@@ -428,9 +428,10 @@ impl Affinity {
     /// passed over. A record of text counts the turn, and every `sweep_s`
     /// turns what it holds over its `max_size` is owed: it takes its
     /// turn's share of that cut here, behind the map's mutex. One turn
-    /// takes [`PrefixRecord::RUN`] placements out at most, an equal part
-    /// of it for each record that owes a cut, never under one step of a
-    /// sweep.
+    /// takes 262,144 steps at most, an equal part of them for each record
+    /// that owes a cut, never under one step of a sweep: a placement out
+    /// is a step, and so is an entry the work of a leave visits. A cut
+    /// waits for that work, through 256 turns at most.
     ///
     /// A record leaves the map here once the map alone holds it and it
     /// holds no worker's place: no list's table reads it, and every worker
@@ -553,6 +554,9 @@ struct PrefixRecord {
     pace: AtomicUsize,
     /// Work waits for a sweep: a worker left, or the bound came down.
     sweeping: AtomicBool,
+    /// The turns in a row that found a cut owed behind that work. The
+    /// timer alone writes it.
+    waited: AtomicU32,
     /// How many leaves were told. Written under the record's guard, a
     /// reader's where the leave takes no place out: a write in parts stops
     /// where it moved since its naming.
@@ -620,12 +624,16 @@ impl PrefixRecord {
     /// whole between two cuts up to it, and a write past it makes its own
     /// room: what callers send grows the record no further.
     const CEILING: usize = 32;
-    /// The placements one turn of the timer takes out at most, of every
-    /// record together: the thread that runs the cut takes the load
-    /// reports and the registry's words too, and what a turn takes out
-    /// bounds how long the turn keeps it. A debt past it is spread over
-    /// more turns, and what is left at the next count is counted again.
+    /// The steps one turn of the timer takes at most, of every record
+    /// together, a placement out or an entry the work of a leave visits:
+    /// the thread that runs the cut takes the load reports and the
+    /// registry's words too, and a turn's steps bound how long the turn
+    /// keeps it. A debt past it is spread over more turns, and what is
+    /// left at the next count is counted again.
     const RUN: usize = 1 << 18;
+    /// The turns a cut waits for the work a leave left before it runs
+    /// ahead of it ([`Self::cut`]).
+    const WAIT: u32 = 256;
 
     fn new(bound: usize, max_size: u64) -> Self {
         Self {
@@ -639,6 +647,7 @@ impl PrefixRecord {
             owed: AtomicUsize::new(0),
             pace: AtomicUsize::new(0),
             sweeping: AtomicBool::new(false),
+            waited: AtomicU32::new(0),
             left: AtomicU64::new(0),
             left_out: AtomicU64::new(0),
         }
@@ -685,7 +694,8 @@ impl PrefixRecord {
     /// `sweep_s` turns what a record of text holds over [`Self::swept`] is
     /// owed, a turn's share of it at a time. A record of token blocks is
     /// held at every write, and one no request read holds nothing: neither
-    /// counts a turn. Whether a cut is owed.
+    /// counts a turn. A turn that finds a cut owed behind the work a leave
+    /// left is counted too, until that work is done. Whether a cut is owed.
     fn timed(&self) -> bool {
         let unit = self.window.load(Ordering::Relaxed);
         if unit == Self::UNREAD || unit == Self::TOKENS {
@@ -703,11 +713,18 @@ impl PrefixRecord {
             self.pace
                 .store(over.div_ceil(every as usize), Ordering::Relaxed);
         }
-        self.owed.load(Ordering::Relaxed) != 0
+        let owes = self.owed.load(Ordering::Relaxed) != 0;
+        if !self.sweeping.load(Ordering::Relaxed) {
+            self.waited.store(0, Ordering::Relaxed);
+        } else if owes {
+            let waited = self.waited.load(Ordering::Relaxed).saturating_add(1);
+            self.waited.store(waited, Ordering::Relaxed);
+        }
+        owes
     }
 
     /// A turn's share of the cut, on the timer's thread and outside the
-    /// map's mutex, `run` placements at most: the oldest ends leave, a
+    /// map's mutex, `run` steps at most: the oldest ends leave, a
     /// sweep's step at a time, and no step is taken where the record
     /// stands at [`Self::swept`] or under it. A block leaves with every
     /// worker sent it, as at a write that makes room, so the last step can
@@ -716,7 +733,15 @@ impl PrefixRecord {
     /// leave or a bound that moved, are not taken again from what stays.
     /// While such work waits ([`Self::sweeping`]) the record still counts
     /// what that work will take out, so the turn's steps go to it, at the
-    /// ceiling, and the cut lowers no bound until it is done. And the debt
+    /// ceiling and as many as `run` allows, whatever the debt's share, and
+    /// the cut lowers no bound until it is done: that work visits every
+    /// entry the record ever held, `run` of them a turn. Workers that
+    /// leave one behind another keep it waiting with no end, and the
+    /// record would stand at up to its ceiling as long. So a cut that has
+    /// waited [`Self::WAIT`] turns runs ahead: it takes its share first,
+    /// what is left of the turn goes to that work, and the record can end
+    /// under the figure by the placements of the workers that left which
+    /// that work had still to take out. And the debt
     /// ends where a step leaves nothing over the figure. A decider that
     /// waits to read the record is given the lock between two steps. A
     /// decider's write waits for no lock, so one that meets a step is left
@@ -726,21 +751,27 @@ impl PrefixRecord {
     fn cut(&self, run: usize) {
         let owed = self.owed.load(Ordering::Relaxed);
         let mut left = self.pace.load(Ordering::Relaxed).min(owed).min(run);
-        let mut paid = 0;
+        let ahead = self.waited.load(Ordering::Relaxed) > Self::WAIT;
+        let (mut turn, mut paid) = (run, 0);
         let mut predictor = self.predictor.write();
-        while left != 0 {
-            if self.sweeping.load(Ordering::Relaxed) {
+        while turn != 0 {
+            if self.sweeping.load(Ordering::Relaxed) && (left == 0 || !ahead) {
                 // A step of the work that waits counts as a step of the
-                // share: the turn holds the thread no longer for it.
+                // turn: the turn holds the thread no longer for it.
                 self.sweep(&mut predictor);
-                left = left.saturating_sub(Self::SWEEP);
+                turn = turn.saturating_sub(Self::SWEEP);
+            } else if left == 0 {
+                break;
             } else {
                 let (ceiling, held) = (predictor.bound(), predictor.len());
                 // The figure is read at every step: a table's read moves
                 // it between two.
                 let over = held.saturating_sub(self.swept.load(Ordering::Relaxed));
                 if over == 0 {
-                    break;
+                    // Nothing stands over the figure: what is left of the
+                    // turn goes to the work that waits.
+                    left = 0;
+                    continue;
                 }
                 let step = left.min(Self::SWEEP).min(over);
                 predictor.set_bound(held.saturating_sub(step).min(ceiling));
@@ -749,6 +780,7 @@ impl PrefixRecord {
                 let out = held - predictor.len();
                 paid += out;
                 left = left.saturating_sub(out);
+                turn = turn.saturating_sub(out);
                 if steps == 0 {
                     // Nothing is left to take: the debt ends here.
                     paid = owed;

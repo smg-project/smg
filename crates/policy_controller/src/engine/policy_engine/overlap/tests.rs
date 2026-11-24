@@ -23,6 +23,17 @@ use crate::{
     },
 };
 
+impl Affinity {
+    /// The bound, in placements, of the record of the prefixes sent to
+    /// `model`'s workers: none where no list's table asked for one yet.
+    pub(in crate::engine::policy_engine) fn bound_of(&self, model: &str) -> Option<usize> {
+        let records = self.records.lock();
+        let record = records.get(model)?;
+        let bound = record.predictor.read().bound();
+        Some(bound)
+    }
+}
+
 const MODEL: &str = "model-a";
 /// Tokens a block.
 const BLOCK: u32 = 16;
@@ -982,6 +993,44 @@ fn a_record_that_text_begins_is_cut_to_max_size_bytes_by_the_timer() {
     assert!(record.timed());
     record.cut(12);
     assert_eq!(placements(&handed), 68);
+    // The work a leave left takes the turn's bound, not the debt's share.
+    // Of 240 windows over a figure of eight the fourth turn takes
+    // fifty-eight. The eighty of a worker that then leaves go on the
+    // fifth, whose own fifty-eight are taken behind them, and the sixth
+    // ends at the figure.
+    let texts = [
+        "0f1e2d3c4b5a6978".repeat(320),
+        "8796a5b4c3d2e1f0".repeat(320),
+    ];
+    let [second, third] = texts
+        .map(|text| PromptHashes::under_document(&spec, Some(BLOCK), None, Some(&text), seeds));
+    let quick = cut_to(8, 4);
+    quick.decide(&request(&long, 7, NOW), Some(3));
+    quick.decide(&request(&second, 7, NOW), Some(2));
+    quick.decide(&request(&third, 7, NOW), Some(1));
+    assert_eq!(turns(&quick, 4), [240, 240, 240, 182]);
+    quick.affinity.forget(quick.ids[1]);
+    assert_eq!(turns(&quick, 2), [44, 8]);
+    // A worker that leaves and comes back at every turn keeps that work
+    // waiting, here under a turn of one step. The cut waits for it through
+    // 256 turns, the eighty windows of the oldest prompt whole; the turn
+    // behind them it runs ahead and takes the sixty-four it is handed.
+    let kept = cut_to(8, 1);
+    kept.decide(&request(&long, 7, NOW), Some(3));
+    kept.decide(&request(&second, 7, NOW), Some(2));
+    kept.decide(&request(&third, 7, NOW), Some(0));
+    kept.decide(&request(&short, 7, NOW), Some(1));
+    let record = Arc::clone(&kept.affinity.records.lock()[MODEL]);
+    let turn = |_| {
+        kept.affinity.forget(kept.ids[1]);
+        kept.decide(&request(&short, 7, NOW), Some(1));
+        assert!(record.timed());
+        record.cut(64);
+    };
+    (0..256).for_each(turn);
+    assert_eq!(kept.holders(&long, NOW), [(3, 0, 80)]);
+    turn(256);
+    assert_eq!(kept.holders(&long, NOW), [(3, 0, 16)]);
     // A record of token blocks takes no cut: under a bound that came down
     // the timer's turn takes its one step of sixty-four, as before.
     let blocks = cut_to(64, 1);

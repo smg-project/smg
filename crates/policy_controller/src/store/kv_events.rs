@@ -1,6 +1,12 @@
 //! The KV event sink: the admission cursor per rank in front of the index
 //! (design 5.1, the KV index row; 5.4, a standby subscribes itself).
 
+#![expect(
+    clippy::exhaustive_enums,
+    clippy::exhaustive_structs,
+    reason = "the store's index of cache events moves to the worker's side, which decides its types"
+)]
+
 use super::index::LaneWriter;
 use crate::engine::view::WorkerId;
 
@@ -53,23 +59,19 @@ pub enum BatchOutcome {
     Gap { expected: u64, received: u64 },
 }
 
-/// Why a rank's cursor was reset or its blocks replaced. The first six are
-/// the servicer's own stream status codes, forwarded by a relay as frames so
-/// the store tells a relay restart from an engine restart; the next two the
-/// cursor's own findings; the last the collector's word at a snapshot's
-/// start.
+/// Why a rank's cursor was reset or its blocks replaced. The first two are
+/// the server's own status codes; the third the collector's word for a
+/// snapshot its stream did not finish; the next two the cursor's own
+/// findings; the last the collector's word at a snapshot's start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResyncReason {
     /// The server's history no longer reaches the cursor.
     OutOfRange,
     /// The server lost batches it cannot name.
     DataLoss,
-    StreamEnded,
     /// The stream ended with a snapshot still arriving: a partial live set,
     /// kept until the next snapshot's start.
     SnapshotAbandoned,
-    RelayRestart,
-    EngineReplaced,
     /// A sequence far below the cursor, or a clear below it: the publisher
     /// started over and its cache is empty.
     PublisherRestart,
@@ -87,10 +89,7 @@ impl ResyncReason {
         match self {
             Self::OutOfRange => "out_of_range",
             Self::DataLoss => "data_loss",
-            Self::StreamEnded => "stream_ended",
             Self::SnapshotAbandoned => "snapshot_abandoned",
-            Self::RelayRestart => "relay_restart",
-            Self::EngineReplaced => "engine_replaced",
             Self::PublisherRestart => "publisher_restart",
             Self::GapCleared => "gap_cleared",
             Self::Snapshot => "snapshot",

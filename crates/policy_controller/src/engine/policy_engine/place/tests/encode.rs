@@ -1047,6 +1047,71 @@ fn an_id_keyed_requests_item_goes_where_its_key_goes_under_a_prefix_ring() {
     }
 }
 
+/// The one call lends an encode request's items the ring its request
+/// states. Each item that carries its text goes to the encoder that ring's
+/// walk reaches from where the text stands, as the classic gateway places
+/// an item by the hex of its content hash on the model's ring
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs`,
+/// lines 2637 to 2649 and 2722 to 2772 at 6aa129a5c). The encode profile's
+/// word alone says so. The pair's two sides here read no ring, and the
+/// items are lent it all the same: classic reads the ring for the items by
+/// its encode policy, whatever the main policy is. The caller states its
+/// ring once: a ring written into the items themselves is not read, beside
+/// the call's ring and with none on the call.
+#[test]
+fn the_one_call_lends_an_encode_requests_items_the_ring_its_request_states() {
+    let side = "round_robin";
+    let document = PolicySpec::epd_presets("consistent_hashing", side, side);
+    let spec = AppliedSpec::validate(&document.expect("the presets")).expect("a valid document");
+    let engine = hosted(PolicyEngine::new(spec));
+    let three = Three::of([1, 1, 8], |_, _| false);
+    let order = [6usize, 1, 4, 0, 7, 2, 5, 3];
+    let reversed = [3usize, 5, 2, 7, 0, 4, 1, 6];
+    let of = |order: &[usize]| {
+        let url = |&at: &usize| three.workers[2][at].url().to_owned();
+        Lent(order.iter().map(url).collect())
+    };
+    let (ring, turned) = (of(&order), of(&reversed));
+    // Six texts at six places of the ring's eight: the case's ring places
+    // a text by its fingerprint, whose last bits read each byte's alone.
+    let texts = ["a0", "a1", "a2", "a3", "a4", "a5"];
+    let keys = texts.map(Identity::plain);
+    // Each item's encoder for a request that states `call` as its ring,
+    // with `own` written into its items.
+    let encoders = |call: Option<&dyn LentRing>, own: Option<&dyn LentRing>| {
+        let items = EncodeItems {
+            keys: &keys,
+            ring: own,
+            ..EncodeItems::default()
+        };
+        let request = PlaceRequest {
+            ring: call,
+            ..asking(three.lists((&[PLAIN; 8], &[1])), items)
+        };
+        let placement = engine.place(&request).expect("a placement");
+        three.places(&placement).2
+    };
+    // The encoder a ring of `order` reaches first from each text's place.
+    let walked = |order: &[usize]| -> Vec<usize> {
+        let first = |text: &&str| order[(ring.position(text) % 8) as usize];
+        texts.iter().map(first).collect()
+    };
+    let stated = encoders(Some(&ring), None);
+    assert_eq!(stated, walked(&order));
+    // The call's ring is the one read, beside another in the items.
+    assert_ne!(
+        walked(&reversed),
+        stated,
+        "the two rings agree on every item"
+    );
+    assert_eq!(encoders(Some(&ring), Some(&turned)), stated);
+    // With none on the call the items are lent none, whatever they hold:
+    // the stage's own ring places them.
+    let own = encoders(None, None);
+    assert_ne!(own, stated, "the stage's own ring agrees with the lent one");
+    assert_eq!(encoders(None, Some(&turned)), own);
+}
+
 /// An encode request's record of sent prefixes names the pair its request
 /// went to, as a pair's does. Where the route's rule refuses the decode of
 /// the pick's first target, the request goes past it, and the prompt's next

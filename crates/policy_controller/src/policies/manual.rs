@@ -65,6 +65,7 @@ pub(crate) fn view_headers() -> Vec<String> {
 /// same way. The picker itself ranks nothing: asked to pick, as a side's
 /// shadow asks its profile, it declines.
 #[derive(Debug, Default)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct Manual;
 
 impl Lifecycle for Manual {}

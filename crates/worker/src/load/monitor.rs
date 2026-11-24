@@ -87,6 +87,8 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "workflow")]
+use crate::connection::engine::EngineConnector;
 use crate::{
     connection::engine::LoadSource,
     health::liveness,
@@ -117,6 +119,9 @@ mod scrape;
 use classic_sink::ClassicLoadSink;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The path of the engine-native load route.
+pub(crate) const ENGINE_LOADS_ROUTE: &str = "/v1/loads";
 
 /// The bytes of a load answer the monitor reads, over HTTP. A longer answer
 /// is a failed fetch.
@@ -248,7 +253,7 @@ struct GroupState {
 }
 
 /// Outcome of probing one native load endpoint.
-enum NativeLoads {
+pub(crate) enum NativeLoads {
     Available(WorkerLoadResponse),
     /// The backend answered, and the endpoint is not there. Memoizable.
     Absent,
@@ -289,9 +294,7 @@ impl NativeLoadsPath {
     fn probe_url(self, worker: &Arc<dyn Worker>) -> String {
         let base = worker.base_url();
         match self {
-            // Sections beyond `core` degrade gracefully: an engine that does
-            // not report them omits the fields, which deserialize to `None`.
-            Self::Engine => format!("{base}/v1/loads?include=core,disagg,queues,memory"),
+            Self::Engine => Self::engine_url(base),
             // A gateway serves a whole fleet, so an unscoped `/loads` blends
             // every model it fronts. A worker registered for exactly one
             // model must be asked about that model alone.
@@ -304,6 +307,13 @@ impl NativeLoadsPath {
                 _ => format!("{base}/loads"),
             },
         }
+    }
+
+    /// The engine-native route of the engine at `base`. Sections beyond
+    /// `core` degrade gracefully: an engine that does not report them omits
+    /// the fields, which deserialize to `None`.
+    fn engine_url(base: &str) -> String {
+        format!("{base}{ENGINE_LOADS_ROUTE}?include=core,disagg,queues,memory")
     }
 }
 
@@ -2194,7 +2204,46 @@ impl<G: Generation> WorkerMonitor<G> {
     /// path permanently.
     async fn probe_native_loads(worker: &Arc<dyn Worker>, path: NativeLoadsPath) -> NativeLoads {
         let url = path.probe_url(worker);
-        let resp = match Self::authed_request(worker, &url).send().await {
+        Self::read_native_loads(Self::authed_request(worker, &url)).await
+    }
+
+    /// One read of the engine-native load route of the HTTP engine of
+    /// `runtime` at `base`, as a poll reads it, for a registration. It has
+    /// no worker yet, so it lends the read its own client and key. The read
+    /// ends within the poll's request timeout.
+    ///
+    /// `None` where the host's connector keeps a load source for the engine:
+    /// a poll reads such an engine through its source alone, and the engine
+    /// is asked nothing. The connector is asked under the poll's deadline,
+    /// and one that does not say in time keeps none here.
+    ///
+    /// Its one caller is a registration's step, so it builds under that
+    /// step's feature.
+    #[cfg(feature = "workflow")]
+    pub(crate) async fn read_engine_loads(
+        connector: &dyn EngineConnector,
+        runtime: RuntimeType,
+        client: &reqwest::Client,
+        base: &str,
+        api_key: Option<&str>,
+    ) -> Option<NativeLoads> {
+        let source = connector.http_load_source(base, runtime);
+        if let Ok(Some(_)) = tokio::time::timeout(LOAD_POLL_DEADLINE, source).await {
+            return None;
+        }
+        let request = client
+            .get(NativeLoadsPath::engine_url(base))
+            .timeout(REQUEST_TIMEOUT);
+        let request = match api_key {
+            Some(key) => request.bearer_auth(key),
+            None => request,
+        };
+        Some(Self::read_native_loads(request).await)
+    }
+
+    /// What a native load route answers `request`.
+    async fn read_native_loads(request: reqwest::RequestBuilder) -> NativeLoads {
+        let resp = match request.send().await {
             Ok(resp) => resp,
             // Transport error or timeout: says nothing about the route.
             Err(error) => return NativeLoads::Inconclusive(Self::request_failure(&error)),

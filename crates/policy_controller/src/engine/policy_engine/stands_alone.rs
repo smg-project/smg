@@ -64,7 +64,7 @@ mod tests {
     use crate::{
         document::spec::{AppliedSpec, PolicySpec, ShadowSpec, PRESETS},
         engine::{
-            decision::{Decision, ShedReason, Target},
+            decision::{Decision, ShadowKind, ShedReason, Target},
             decision_engine::{
                 DecideOutcome, DecisionEngine, DecisionRefused, Request, RequestMaker, WorkerLists,
             },
@@ -462,7 +462,14 @@ mod tests {
         let engine = engine_of(&document);
         let list = pool(4);
         let members = PublishedList::new(Arc::clone(&list));
-        let counted = |binding: u32| -> u64 { engine.shadow_kinds(binding).iter().sum() };
+        // A shadow that decided is counted under one of three kinds, and
+        // one that was skipped under the fourth.
+        let kinds = |binding: u32| engine.shadow_kinds(binding);
+        let counted = |binding: u32| -> u64 {
+            let [agreed, target, outcome, _] = kinds(binding);
+            agreed + target + outcome
+        };
+        let skipped = || [0, 1].map(|binding| kinds(binding)[ShadowKind::Skipped.index()]);
         let now = Instant::now();
         let ask = |phase: Phase, seed: u64| {
             let asks = Asks::of(stating(phase, seed), Some(&members));
@@ -475,14 +482,32 @@ mod tests {
         assert_eq!((counted(0), counted(1)), (1, 0), "a single names no shadow");
         ask(Phase::Prefill, 3);
         assert_eq!((counted(0), counted(1)), (2, 0), "behind a single too");
+        // On a second list a single comes first, and takes its whole
+        // decision: a plain one is placed by one pick ahead of its making
+        // and asks the list no word. The list then keeps a single's word,
+        // and a prefill behind it still runs its own binding's shadow.
+        let whole = |phase: Phase, seed: u64, members: &PublishedList| {
+            let lists = WorkerLists::Single(members.lent());
+            let hands = Hands::of(stating(phase, seed), lists);
+            let decided = engine.decide_under(GatewayId::LOCAL, &hands, now);
+            assert!(decided.is_ok(), "{phase:?}: {decided:?}");
+        };
+        let second = PublishedList::new(pool(4));
+        whole(Phase::Single, 5, &second);
+        assert_eq!((counted(0), counted(1)), (2, 0), "a single first");
+        whole(Phase::Prefill, 6, &second);
+        assert_eq!((counted(0), counted(1)), (3, 0), "a prefill behind it");
         // The entry that issues no lease answers the same binding's word,
-        // and counts none.
+        // of a shadow that decided, and counts none.
         let word = |phase: Phase| {
             let asks = Asks::of(stating(phase, 4), Some(&members));
             let decided = engine.decide_without_lease(&asks, now);
-            decided.expect("a decision").1.map(|said| said.binding)
+            let said = decided.expect("a decision").1?;
+            Some((said.binding, said.kind != ShadowKind::Skipped))
         };
-        assert_eq!((word(Phase::Prefill), word(Phase::Single)), (Some(0), None));
-        assert_eq!((counted(0), counted(1)), (2, 0), "the caller counts it");
+        let words = (word(Phase::Prefill), word(Phase::Single));
+        assert_eq!(words, (Some((0, true)), None));
+        assert_eq!((counted(0), counted(1)), (3, 0), "the caller counts it");
+        assert_eq!(skipped(), [0, 0], "each shadow that was due decided");
     }
 }

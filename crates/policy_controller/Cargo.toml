@@ -31,7 +31,11 @@ rustc-hash = "2"
 # as the committed artifact.
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
+# A JSON policy spec reads one way in every build: `float_roundtrip` reads a
+# number as the nearest double. Without it here the crate built alone, and a
+# controller's image, read a long number one last bit apart from a gateway's
+# build, where another crate of the workspace asks for the feature.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 # The document's digest (SHA-256), at the version the gRPC client crate under
 # `controller` and the gateway already link.
 sha2 = "0.11"

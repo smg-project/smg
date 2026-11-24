@@ -376,7 +376,8 @@ impl Checked {
     /// `keys` ([`Self::item_keys`]). A request with no key is one all the
     /// same: it still says what it asks of its pair's decode. A frame that
     /// is no encode request ([`Self::carries_items`]) states no item and
-    /// asks nothing.
+    /// asks nothing. The items are lent no ring, as no frame carries one:
+    /// the encode stage's own ring places them.
     pub(crate) fn items<'a>(&'a self, keys: &'a [Identity<'a>]) -> EncodeItems<'a> {
         let Some(items) = self.items.as_deref() else {
             return EncodeItems::default();
@@ -388,6 +389,7 @@ impl Checked {
             one: (!one.is_none()).then_some(one),
             references: stated.references,
             decode_images: stated.decode_images,
+            ring: None,
         }
     }
 

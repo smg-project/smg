@@ -152,11 +152,17 @@ fn write(blocks: &mut impl Written, events: &[Event]) -> u64 {
     parentless
 }
 
+/// A batch's header as a collector says it: a clear that stands among
+/// `events` is said in the header.
+fn header(facts: BatchFacts, events: &[Event]) -> BatchFacts {
+    let clears = facts.clears || events.iter().any(|e| matches!(e, Event::Cleared));
+    BatchFacts { clears, ..facts }
+}
+
 /// The cases' way to a row's lane: one batch of the cases' events through
 /// the lent way in.
 trait Drive {
-    /// The cursor reads `facts`, with a clear that stands among `events`
-    /// said in the header as a collector says it. An admitted batch's body
+    /// The cursor reads the batch's [`header`]. An admitted batch's body
     /// writes the events over the lane's map, taken for the batch and put
     /// back.
     fn drive(&self, id: WorkerId, rank: u16, facts: BatchFacts, events: &[Event]) -> BatchOutcome;
@@ -164,9 +170,7 @@ trait Drive {
 
 impl Drive for MemoryStore {
     fn drive(&self, id: WorkerId, rank: u16, facts: BatchFacts, events: &[Event]) -> BatchOutcome {
-        let clears = facts.clears || events.iter().any(|e| matches!(e, Event::Cleared));
-        let facts = BatchFacts { clears, ..facts };
-        self.admit_through(id, rank, facts, &mut |writer| {
+        self.admit_through(id, rank, header(facts, events), &mut |writer| {
             let mut map = std::mem::take(writer.map());
             write(
                 &mut Writes {
@@ -863,9 +867,9 @@ enum Wire {
 }
 
 /// One batch on the reference index as a lane takes it: through the lane's
-/// own admission, with a clear among the events said in the header, and the
-/// events written where the cursor admits the batch. The stores that came
-/// under a parent the worker does not hold are added to `parentless`.
+/// own admission, which reads the batch's [`header`], and the events
+/// written where the cursor admits the batch. The stores that came under a
+/// parent the worker does not hold are added to `parentless`.
 fn refer(
     cursor: &mut RankCursor,
     blocks: &mut Reference<'_>,
@@ -873,8 +877,7 @@ fn refer(
     events: &[Event],
     parentless: &mut u64,
 ) -> BatchOutcome {
-    let clears = facts.clears || events.iter().any(|e| matches!(e, Event::Cleared));
-    match by_cursor(cursor, blocks, facts, clears) {
+    match by_cursor(cursor, blocks, header(facts, events)) {
         Ok(_) => {
             *parentless += write(blocks, events);
             BatchOutcome::Applied

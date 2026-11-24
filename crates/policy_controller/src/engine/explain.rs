@@ -52,6 +52,7 @@ pub struct DecisionRecord {
 
 /// The names of a sampled decision, from the generation that decided.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecisionNames {
     /// The binding's plan, spelled as in the policy document.
     pub plan: &'static str,

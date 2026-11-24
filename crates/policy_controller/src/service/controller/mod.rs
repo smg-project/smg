@@ -221,6 +221,7 @@ struct Bound {
 
 /// Where a bound controller listens.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Addresses {
     /// The gRPC listeners, in configuration order.
     pub listeners: Vec<ListenerAddress>,
@@ -230,6 +231,7 @@ pub struct Addresses {
 
 /// One bound gRPC listener.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct ListenerAddress {
     /// The listener's name.
     pub name: String,
@@ -253,6 +255,7 @@ impl Addresses {
 
 /// A controller that did not start or did not serve.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The configuration was refused.
     #[error("configuration: {0}")]
@@ -464,19 +467,24 @@ impl Controller {
         let woken = objects.clone();
         let journal =
             replication::journaled_waking(&config.election.lease, config.decide_shards, objects);
-        let workers = Arc::new(worker_objects::WorkerObjects::new(
+        let workers = Arc::new(worker_objects::WorkerObjects::stating(
             Arc::clone(&journal.0),
             woken,
+            config.worker_overload,
         ));
         let kv_feed = KvFeed::new(Arc::clone(&journal.0), workers.holder());
         let prober = worker_objects::Prober::new(Arc::clone(&workers), elector.fence());
         // The load monitor is built stopped, ahead of the deciding threads:
         // each takes its channel at its start, and the serve runs its task.
         let monitor = worker_objects::LoadMonitor::new(&workers, config.load_poll_interval);
-        // The load records that ride the workers' event streams go to the
-        // monitor while this replica leads: the feed takes their sink
-        // ahead of its first stream.
+        // The load records on the workers' streams go to the monitor while
+        // this replica leads: the feed takes their sink ahead of its first
+        // stream.
         kv_feed.set_load_sink(monitor.pushed());
+        // The monitor says whose loads are wanted, so a gRPC worker that is
+        // not indexed streams its load records alone. Every replica opens
+        // that stream: a take finds it open.
+        kv_feed.set_loads_wanted(monitor.wanted());
         let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
@@ -509,6 +517,7 @@ impl Controller {
                     &workers.holder(),
                     Arc::new(door),
                     Arc::clone(&shared.fence),
+                    config.worker_overload,
                 )
                 .map(Box::new)
             })
@@ -981,7 +990,7 @@ impl Controller {
                 Ok(())
             });
             // The load monitor runs under the same word: a replica that
-            // does not lead asks no engine for its load either. Its stop
+            // does not lead polls no engine for its load either. Its stop
             // publishes the snapshot empty for the deciding threads, but
             // for the one loop `LoadMonitor::run` names.
             let (loads_stop, led) = (stop.subscribe(), shared.role.subscribe());

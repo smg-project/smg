@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use smg_policy_controller::engine::{FixedFacts, LentList, ListCell, PartnerClasses};
+use smg_policy_controller::engine::{LentList, PartnerClasses, PublishedList};
 use smg_worker::{
     identity::basic::Worker,
     pd::pairing::{PairingMismatch, PdPairing, PdPairingMode},
@@ -104,22 +104,20 @@ pub(crate) struct PdPairIndex {
     pub partners: Vec<Arc<[Arc<dyn Worker>]>>,
     /// Set when both pools have workers and no pair is compatible.
     pub refusal: Option<PairingRefusal>,
-    /// What the policy engine is handed beside the two pools ([`Stated`]):
-    /// empty until the engine first places a pair over this index.
-    stated: OnceLock<Stated>,
-    /// The cells the two pools are lent to the policy engine with
-    /// ([`Self::lent`]): the prefill pool's, then the decode pool's.
-    cells: [ListCell; 2],
+    /// What the policy engine is lent of this index ([`Published`]): empty
+    /// until the engine first places a pair over it.
+    published: OnceLock<Published>,
 }
 
-/// What the policy engine is handed beside an index's two pools
-/// ([`PdPairIndex::lent`]): their pair classes, and what this gateway states
-/// of each pool's workers beside their objects ([`stated_facts`]), the
-/// prefill pool's and then the decode pool's.
+/// What the policy engine is lent of an index ([`PdPairIndex::lent`]): the
+/// two pools as the engine's published lists, the prefill pool's and then
+/// the decode pool's, and their pair classes. Each list holds its pool, the
+/// cell the engine keeps its value of the pool in, and what this gateway
+/// states of the pool's workers beside their objects ([`stated_facts`]).
 #[derive(Debug)]
-struct Stated {
+struct Published {
+    lists: [PublishedList; 2],
     classes: PartnerClasses,
-    facts: [Box<[FixedFacts]>; 2],
 }
 
 impl PdPairIndex {
@@ -175,22 +173,19 @@ impl PdPairIndex {
             prefill: prefill.into(),
             partners,
             refusal,
-            stated: OnceLock::new(),
-            cells: Default::default(),
+            published: OnceLock::new(),
         }
     }
 
-    /// What the engine is handed beside the two pools, made at the first
-    /// call and kept with the index: a membership pays for it once, and a
-    /// gateway whose pairs no engine places never does. A call that arrives
-    /// during the first waits for it.
-    fn stated(&self) -> &Stated {
-        self.stated.get_or_init(|| Stated {
+    /// What the engine is lent of the index, made at the first call and
+    /// kept with the index: a membership pays for it once, and a gateway
+    /// whose pairs no engine places never does. A call that arrives during
+    /// the first waits for it.
+    fn published(&self) -> &Published {
+        let list = |pool: &Workers| PublishedList::stating(Arc::clone(pool), stated_facts(pool));
+        self.published.get_or_init(|| Published {
+            lists: [list(&self.prefill_pool), list(&self.decode_pool)],
             classes: pair_classes::of(self),
-            facts: [
-                stated_facts(&self.prefill_pool),
-                stated_facts(&self.decode_pool),
-            ],
         })
     }
 
@@ -204,26 +199,13 @@ impl PdPairIndex {
     /// list in that cell from the index's first pair on, and the value
     /// falls with the index, as the lists do.
     ///
-    /// The classes and the stated facts are read from one place
-    /// ([`Self::stated`]): a pair's lending reads no more than it did while
-    /// the gateway stated no fact.
+    /// The lists and the classes are read from one place
+    /// ([`Self::published`]): a pair's lending reads no more than it did
+    /// while the gateway stated no fact.
     pub(crate) fn lent(&self) -> ([LentList<'_>; 2], &PartnerClasses) {
-        let stated = self.stated();
-        let [prefill, decode] = &self.cells;
-        let [prefill_facts, decode_facts] = &stated.facts;
-        let lists = [
-            LentList {
-                workers: &self.prefill_pool,
-                cell: prefill,
-                facts: Some(prefill_facts),
-            },
-            LentList {
-                workers: &self.decode_pool,
-                cell: decode,
-                facts: Some(decode_facts),
-            },
-        ];
-        (lists, &stated.classes)
+        let published = self.published();
+        let [prefill, decode] = &published.lists;
+        ([prefill.lent(), decode.lent()], &published.classes)
     }
 
     /// Whether some prefill can pair at all: both pools have workers and at
@@ -241,8 +223,7 @@ impl PdPairIndex {
             prefill: Arc::from([]),
             partners: Vec::new(),
             refusal: None,
-            stated: OnceLock::new(),
-            cells: Default::default(),
+            published: OnceLock::new(),
         }
     }
 }
@@ -279,6 +260,7 @@ fn pairing_mismatches(
 #[cfg(test)]
 mod tests {
     use openai_protocol::model_card::ModelCard;
+    use smg_policy_controller::engine::FixedFacts;
     use smg_worker::{
         identity::basic::{ConnectionMode, RuntimeType, WorkerType},
         test_support::no_health_check,

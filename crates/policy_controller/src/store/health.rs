@@ -2,6 +2,11 @@
 //! row). A worker's status is its worker object's word: the holder of the
 //! objects tells the store each one (`MemoryStore::status_told`).
 
+#![expect(
+    clippy::exhaustive_enums,
+    reason = "the store's copy of this worker data leaves the crate, and its types with it"
+)]
+
 use std::time::Instant;
 
 use crate::{

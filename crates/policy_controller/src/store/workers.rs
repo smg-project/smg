@@ -2,6 +2,12 @@
 //! that change it and the watch the gateways' pools derive from (design 5.1,
 //! the workers row; 5.2, `WatchWorkers`).
 
+#![expect(
+    clippy::exhaustive_enums,
+    clippy::exhaustive_structs,
+    reason = "the store's table of worker records leaves the crate, and its types with it"
+)]
+
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use crate::{
@@ -146,11 +152,9 @@ pub struct WorkerFacts {
     /// and every copy of a row shares the one its worker reported.
     pub pairing: Option<Arc<PairingDescriptor>>,
     /// The worker's end of the encode handoff, as the handshake learned it;
-    /// the default states none. The store derives the encode classes from
-    /// it, with the engine kind as the runtime, where a membership write
-    /// moves a member or an offer and where a generation moves the pairing
-    /// mode (`encoding`). The door drops a blank
-    /// connector and reads its name past its blanks.
+    /// the default states none. A worker host derives its encode classes
+    /// from it, with the engine kind as the runtime (`encoding`). The door
+    /// drops a blank connector and reads its name past its blanks.
     pub encode: EncodeOffer,
     /// The worker takes images, as its registration states: an encoder
     /// encodes them and a decode attends to them. A request that needs

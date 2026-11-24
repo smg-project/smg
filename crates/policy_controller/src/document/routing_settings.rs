@@ -2,6 +2,11 @@
 //! the types it is made of, and why some settings have no document
 //! ([`RoutingSettingsError`]).
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::collections::{btree_map::Entry, BTreeMap};
 
 use serde::Serialize;
@@ -239,6 +244,7 @@ impl RoutingSettings {
 /// mode places a single request, which its document then binds
 /// ([`RoutingSettings`], where a setting lands).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConnectionModeSetting {
     /// Over HTTP. A pair mode counts tokens on one prefill worker, a single
     /// request its own routing places by the main policy.
@@ -289,6 +295,7 @@ impl Default for RoutingKeyOverrideSettings {
 /// runs under the main one. The pools of a mode and their addresses are the
 /// gateway's own, and no part of this type.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum ModeSettings {
     /// Single workers.
     Regular,
@@ -352,6 +359,7 @@ impl ModeSettings {
 /// configuration says it: [`PowerOfTwoMetric`], with the price of a request
 /// in the configuration's width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LoadMetricSetting {
     /// The expected wait of two random workers.
     ExpectedWait,
@@ -371,6 +379,7 @@ pub enum LoadMetricSetting {
 /// A policy lands on the preset of its name ([`PolicySettings::name`]), and
 /// each setting in the stage of that preset that reads it.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum PolicySettings {
     /// `random`.
     Random,
@@ -573,6 +582,7 @@ const ENCODE_SIDE: &str = "encode";
 
 /// Why a set of routing settings has no policy document to run.
 #[derive(Debug, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum RoutingSettingsError {
     /// A setting decides a placement and the document has no place for it.
     #[error("{setting} = {value}: {reason}")]
