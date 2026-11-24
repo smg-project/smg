@@ -217,6 +217,14 @@ const CELLS: &[Cell] = &[
         ..Cell::PLAIN
     },
     Cell {
+        name: "cache_aware_recorded",
+        document: || preset("cache_aware"),
+        caller: Some(conversations::caller),
+        fits: conversations::fits,
+        words: conversations::words,
+        ..Cell::PLAIN
+    },
+    Cell {
         name: "cache_aware_sessions",
         document: || sessions_over("cache_aware", RulePlaced::Untold),
         behind: sessions,
