@@ -201,9 +201,9 @@ impl PolicyEngine {
     /// A word of a lease issued under the standing document reaches no
     /// stage from here on ([`DecisionEngine::say`]), and the shadow counts
     /// start at zero ([`Self::shadow_counts`]). The session table
-    /// hears no dispatch of such a lease either: a claim that decision
-    /// made is neither confirmed nor taken back, and a pin its dispatch
-    /// would move stays. A list keeps the
+    /// hears the dispatch of such a lease as it hears any: a claim that
+    /// decision made is confirmed or taken back, and the key's pin
+    /// follows the worker the request was sent to. A list keeps the
     /// value the engine made of it under each document until the list
     /// falls ([`LentList`]): a list that stands across many documents is
     /// read past the values of the earlier ones. The document replaced

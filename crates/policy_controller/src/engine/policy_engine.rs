@@ -1150,8 +1150,9 @@ impl Loaded<'_, '_> {
 ///
 /// A word of a lease is told to the stages of the document in force, where
 /// that document issued the lease. A lease issued under a document that a
-/// new one replaced since is told to nobody ([`PolicyEngine::apply`]). The
-/// shadow counts are those of the document in force.
+/// new one replaced since is told to no stage, and its dispatch to the
+/// session table alone ([`PolicyEngine::apply`]). The shadow counts are
+/// those of the document in force.
 impl DecisionEngine for PolicyEngine {
     fn decide_under(
         &self,
@@ -1199,10 +1200,16 @@ impl DecisionEngine for PolicyEngine {
             Said::Completed(_) => EventKind::Completed,
             Said::Released(..) => EventKind::Released,
         };
-        // A word of a decision made under another document is told to
-        // nobody: its stages are not the ones in force.
+        // A word of a decision made under another document is told to no
+        // stage: its stages are not the ones in force.
         let document = self.document.load();
         if held.lease.generation != document.spec.generation() {
+            // The session table is the engine's own and stands across
+            // documents: a dispatch settles there the claim its decision
+            // made, as under one document.
+            if let Said::Dispatched(dispatch, _) = said {
+                lease_events::table(&self.sessions, held, dispatch.side);
+            }
             return;
         }
         if held.lease.side == Side::Single && !document.hears.contains(kind) {

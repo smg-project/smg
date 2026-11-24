@@ -237,10 +237,11 @@ fn a_handle_shows_the_document_it_was_asked_under() {
 }
 
 /// A word of a lease issued under a document that was replaced since is
-/// told to nobody: the stages that issued it decide no more, and the
-/// stages in force never heard of the lease.
+/// told to no stage: the stages that issued it decide no more, and the
+/// stages in force never heard of the lease. Its dispatch still reaches
+/// the session table, which is no stage of a document.
 #[test]
-fn a_word_of_a_lease_of_a_replaced_document_is_told_to_nobody() {
+fn a_word_of_a_lease_of_a_replaced_document_is_told_to_no_stage() {
     let (first, heard) = hearing_spec_at(1);
     let engine = PolicyEngine::new(first);
     let members = PublishedList::new(pool(4));

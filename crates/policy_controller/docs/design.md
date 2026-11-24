@@ -1238,8 +1238,9 @@ with each event (`DecisionEngine::say`). The crate has a guard for that, `Decisi
 request's lease back from that file in the guard's form, so one rule tells a single request's
 events under either host (`lease_events::single`). The host says who hears: behind a new
 document the engine that issued the lease is gone, and the standing one counts the send. In a
-gateway's own process a word of a lease issued under another document is told to nobody. A
-pair's events on a controller are told by the controller's own code.
+gateway's own process a word of a lease issued under another document is told to no stage,
+and its dispatch still moves the session's pin. A pair's events on a controller are told by
+the controller's own code.
 
 What an event does:
 

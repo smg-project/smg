@@ -24,6 +24,7 @@ use super::{
     decision::{Decision, Target},
     decision_engine::HeldDecision,
     framework::Engine,
+    sticky_sessions::{SessionTable, SessionVerdict},
     view::{Session, WorkerId},
 };
 use crate::{
@@ -303,6 +304,35 @@ pub(crate) fn pair(
                 engine.on_released(&decode, reason);
             }
         }
+    }
+}
+
+/// Tells `sessions` alone of a dispatch on `side`: the table's part of the
+/// word, for a host whose document changed behind the lease's issue. Its
+/// table stands across its documents, and no count and no stage of the new
+/// one hears. The claim is settled under the lease and on the worker
+/// [`single`] and [`pair`] tell the table: a single's and a prefill's on
+/// the target taken, a decode's under its own verdict on the decode it
+/// went to.
+pub(crate) fn table(sessions: &SessionTable, held: &HeldDecision<'_>, side: Side) {
+    let (session, verdict, to) = match (held.lease.side, side) {
+        (Side::Single, _) | (Side::Prefill, Side::Prefill) => {
+            let lease = held.lease;
+            (lease.session, lease.session_verdict, held.target.id)
+        }
+        (Side::Prefill, Side::Decode) => {
+            let first = held.decision.pick().and_then(|pick| pick.targets.first());
+            let issued =
+                first.and_then(|first| decode_as_issued(held.lease, first, held.decode.session));
+            let (Some(decode), Some(pair)) = (issued, held.target.pair) else {
+                return;
+            };
+            (decode.session, decode.session_verdict, pair.decode_id)
+        }
+        _ => return,
+    };
+    if verdict != SessionVerdict::None {
+        sessions.dispatched(session, verdict, to);
     }
 }
 
