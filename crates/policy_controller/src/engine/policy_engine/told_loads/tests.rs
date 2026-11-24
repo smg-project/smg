@@ -48,16 +48,13 @@ use crate::{
     load::{ReportSignals, SignalCell, SignalCells, SignalColumn},
     policies::random::Random,
     stages::{registry::StageRegistry, Lifecycle},
-    tracking::{
-        in_flight::WorkerSlot,
-        lease::{Membership, Signal},
-    },
+    tracking::lease::{Membership, Signal},
 };
 
 const MODEL: &str = "model-a";
 
-/// One report a stage was told: the worker, its rank, the row, the slot of
-/// its count and the sample's instant. With them, the snapshot the engine
+/// One report a stage was told: the worker, its rank, the row and the
+/// sample's instant. With them, the snapshot the engine
 /// kept at hand while the stage heard it, by its place in memory, and zero
 /// for none, whether the stage had been told the worker as joined, and
 /// whether the report stated no named value.
@@ -66,7 +63,6 @@ struct Told {
     worker: WorkerId,
     dp_rank: u16,
     row: LoadRow,
-    slot: WorkerSlot,
     sampled_at_micros: u64,
     at_hand: usize,
     joined: bool,
@@ -116,7 +112,6 @@ impl Lifecycle for Keeps {
             worker,
             dp_rank,
             row,
-            slot,
             sampled_at_micros,
             signals,
         } = *signal
@@ -136,7 +131,6 @@ impl Lifecycle for Keeps {
             worker,
             dp_rank,
             row,
-            slot,
             sampled_at_micros,
             at_hand: kept.map_or(0, |kept| Arc::as_ptr(&kept) as usize),
             joined,
@@ -329,7 +323,7 @@ fn steps_of(engine: &PolicyEngine, told: &[Told]) -> Vec<(WorkerId, u64)> {
 /// told as joined, as a list's record states it, from the task's first
 /// step on: under the id the list names the worker by,
 /// with its rank, the same row and the same sample instant on the engine's
-/// clock, and with no slot. The row's age is at rest, where a record states
+/// clock. The row's age is at rest, where a record states
 /// it at its decision. The third worker is a prefill and the second rank of
 /// its engine: its report converts by its role, so it states no rate where
 /// the first's states one, and it is told under its rank. The second
@@ -381,8 +375,7 @@ async fn a_stage_that_keeps_reports_is_told_each_report_as_a_record_states_it() 
         assert_eq!((word.worker, word.dp_rank, word.row), stated, "{position}");
         assert_eq!(word.sampled_at_micros, record.load_sampled_at_micros);
         let waiting = if position == 1 { 8_192 } else { 4_096 };
-        let stated = (word.slot, word.row.waiting_uncached_tokens);
-        assert_eq!(stated, (WorkerSlot::NONE, waiting), "{position}");
+        assert_eq!(word.row.waiting_uncached_tokens, waiting, "{position}");
     }
     let rates = (told[0].row.live_rate, told[2].row.live_rate);
     assert_eq!(rates, (1_000, 0), "a prefill states no such rate");

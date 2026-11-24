@@ -853,7 +853,6 @@ impl MemoryStore {
                 workers.members(),
                 OnTable(ranks),
             )?;
-            world.tell_kept_loads();
             spec.engine().succeed(self.world.load().spec().engine());
             writer.replaced(self.world.swap(world));
             // A generation of another pairing mode builds the membership
@@ -931,7 +930,6 @@ impl MemoryStore {
             OnTable(ranks),
             Classes::Derive,
         );
-        world.tell_kept_loads();
         writer.replaced(self.world.swap(world));
         // The build listed every member: none is left for the table.
         self.listed();
@@ -1152,13 +1150,8 @@ impl MemoryStore {
     /// Show the deciders the world a write made, when it made one. Called
     /// with the load lock held: the worlds reach the cell in the order the
     /// writer made them, and the writer takes back the one each replaces.
-    /// A world's engine is told the reports the world holds first, where a
-    /// stage of it keeps a number of them, under that lock and so in the
-    /// worlds' order: a load write waits for that tell and for no other
-    /// word to a stage.
     fn show(&self, writer: &mut Writer, world: Option<Arc<StoreSnapshot>>) {
         if let Some(world) = world {
-            world.tell_kept_loads();
             writer.replaced(self.world.swap(world));
         }
     }

@@ -530,7 +530,6 @@ impl Checked {
             model_fingerprint: ModelFingerprint::NONE,
             // What the leases book stands beside rows a view lent: no
             // frame carries it.
-            lent_in_flight: None,
             session_counted: false,
             // The frame carries no signal cells: they stand beside the
             // candidates of the program that decides.

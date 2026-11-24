@@ -98,11 +98,9 @@ use crate::engine::policy_engine::PolicyEngine;
 use crate::{
     document::spec::{AppliedSpec, Pairing, ViewListPositions},
     engine::{
-        framework::{Engine, OverloadThresholds},
+        framework::OverloadThresholds,
         view::{fingerprint, Candidate, Health, Phase, Role, WorkerId},
     },
-    load::signals::ReportSignals,
-    stages::lifecycle::Lifecycle,
     store::{
         applied::Applied,
         encoding::{EncodeClasses, EncodeMember},
@@ -111,10 +109,7 @@ use crate::{
         workers::{Overload, Reachability, WorkerFacts, WorkerRow, WorkerStatus},
         GatewayId,
     },
-    tracking::{
-        in_flight::{InFlightCounts, WorkerSlot},
-        lease::Signal,
-    },
+    tracking::in_flight::{InFlightCounts, WorkerSlot},
 };
 
 #[cfg(test)]
@@ -701,43 +696,6 @@ impl StoreSnapshot {
     #[cfg(feature = "controller")]
     pub(crate) fn samples_decisions(&self) -> bool {
         self.samples_decisions
-    }
-
-    /// Tells this world's engine each rank's report, where a stage of it
-    /// keeps a number of them ([`Lifecycle::keeps_loads`]): what the store
-    /// does before it shows a world, so a decision over the world finds
-    /// the numbers of its own rows. An engine with no such stage says so
-    /// by one word made at its build, and the tell is not entered: by
-    /// count the call alone read 29 instructions a publication.
-    pub(crate) fn tell_kept_loads(&self) {
-        let engine = self.spec.engine();
-        if engine.keeps_loads() {
-            self.tell_loads(engine);
-        }
-    }
-
-    /// Tells each stage of `engine` that keeps a number of the reports
-    /// each rank's report as this world shows it to a decision, with the
-    /// rank's slot, the report's sample instant and no named value
-    /// ([`Signal::Load`]). A stage that keeps none is sent nothing. A
-    /// member of several pools is told once a pool, the same word.
-    pub fn tell_loads(&self, engine: &Engine) {
-        engine.tell_loads(|tell| {
-            for (rows, shape) in self.rows.iter().zip(self.derived.pools.iter()) {
-                for (row, &slot) in rows.iter().zip(shape.booked.iter()) {
-                    if let Some(load) = row.load {
-                        tell(&Signal::Load {
-                            worker: row.id,
-                            dp_rank: row.dp_rank,
-                            row: load,
-                            slot,
-                            sampled_at_micros: row.load_sampled_at_micros,
-                            signals: ReportSignals::NONE,
-                        });
-                    }
-                }
-            }
-        });
     }
 
     /// `at` in the rows' clock: microseconds since the store's origin.

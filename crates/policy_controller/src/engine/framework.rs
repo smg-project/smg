@@ -4766,9 +4766,6 @@ impl<'a> PairPools<'a> {
                 seed,
                 affinity,
                 named: None,
-                // Lent counts are positions in one pool: neither side takes
-                // them.
-                lent_in_flight: None,
                 // The side's own cells: the request's would be read by
                 // another pool's positions.
                 signal_cells,
@@ -8293,6 +8290,8 @@ impl Engine {
     /// is given. An engine with no such stage never runs it: a publication
     /// that tells nobody walks no row. A plugin that watches signals hears
     /// of a world's reports no more than it did before a stage kept any.
+    /// The engine over worker lists is the one host that tells reports.
+    #[cfg(feature = "in-process")]
     pub(crate) fn tell_loads(&self, reports: impl Fn(&mut dyn FnMut(&Signal<'_>))) {
         for keeper in &self.keepers {
             match *keeper {
@@ -8449,7 +8448,6 @@ mod tests {
             pickers::{self, Best, CountFirst},
             scorers::{self, LeastRequests},
         },
-        tracking::in_flight::tests::Lent,
     };
 
     fn candidate(position: u32, in_flight: u32) -> Candidate {
@@ -11147,13 +11145,6 @@ mod tests {
             }),
             ..RequestFacts::default()
         };
-        // Nor the counts a host lent: they are read by a position.
-        let mut counted = [0, 1].map(|position| Candidate {
-            position,
-            ..Candidate::default()
-        });
-        let lent = Lent::take(&mut counted);
-        let facts = lent.beside(&facts);
         let pools = PairPools {
             prefills: &prefills,
             decodes: &decodes,
@@ -11162,7 +11153,6 @@ mod tests {
         for (side, name) in [(PairSide::Prefill, "prefill"), (PairSide::Decode, "decode")] {
             let (_, read) = pools.side(side, &facts).expect("an empty column fits");
             assert!(read.named.is_none(), "the {name} side");
-            assert!(read.lent_in_flight.is_none(), "the {name} side");
         }
     }
 
@@ -19268,11 +19258,10 @@ mod tests {
         assert!(led < 20, "{led} of 200 decisions were led by a busy holder");
     }
 
-    /// The mean the join hands on is of the drawn rows' counts as the
-    /// request's facts read them: the lent count where a table is lent.
+    /// The mean the join hands on is of the drawn rows' own counts.
     #[test]
-    fn the_join_hands_on_the_mean_of_the_drawn_rows_lent_counts() {
-        let mut pool: Vec<Candidate> = (0..)
+    fn the_join_hands_on_the_mean_of_the_drawn_rows_counts() {
+        let pool: Vec<Candidate> = (0..)
             .zip([6, 2, 9, 9])
             .map(|(position, in_flight)| Candidate {
                 position,
@@ -19280,8 +19269,7 @@ mod tests {
                 ..Candidate::default()
             })
             .collect();
-        let lent = Lent::take(&mut pool);
-        let facts = lent.beside(&RequestFacts::default());
+        let facts = RequestFacts::default();
         let mut kept = vec![0, 1];
         let mean = join_named(
             &facts,

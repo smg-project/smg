@@ -687,10 +687,8 @@ impl Scorer for PrefixAffinity {
     /// whether the held prefix's price kept the row in front: it is a
     /// deepest holder of the pass that decided, and at the mean that pass
     /// judged by it stands over the swing's margin and under the priced
-    /// one. The row's count is the decision's own: a lent table answers a
-    /// second read with the first. Under the fleet's KV gate the stage
-    /// ordered nothing: the row's match is said all the same, and no
-    /// margin.
+    /// one. Under the fleet's KV gate the stage ordered nothing: the row's
+    /// match is said all the same, and no margin.
     ///
     /// A request of more than 65,535 blocks halves both counts until its
     /// own fits, so the share they say stays true.
@@ -1352,7 +1350,6 @@ mod tests {
             prefix_pass::forget_prefix_pass,
             view::{AffinityHolder, Constraints, Health, LoadRow, PoolFacts},
         },
-        tracking::in_flight::tests::Lent,
     };
 
     /// A row and its entry of the affinity column, as a case writes a pool.
@@ -1421,18 +1418,13 @@ mod tests {
         rows: &[Candidate],
         column: &[AffinityFacts],
     ) -> Vec<f32> {
-        // The counts a case wrote into its rows stand in a table lent
-        // beside them, each row reading zero: every case that scores
-        // through here holds its stage to the one reader of a row's count.
-        let mut rows = rows.to_vec();
-        let lent = Lent::take(&mut rows);
-        let facts = lent.beside(&RequestFacts {
+        let facts = RequestFacts {
             affinity: column,
             ..*facts
-        });
+        };
         let kept = kept(rows.len() as u32);
         let mut out = vec![0.0; rows.len()];
-        scorer.score(&facts, &rows, &kept, &mut out);
+        scorer.score(&facts, rows, &kept, &mut out);
         out
     }
 
@@ -1769,14 +1761,13 @@ mod tests {
         assert_eq!(slice.misses.load(Ordering::Relaxed), 8);
     }
 
-    /// Two thin workers part by the counts the request's facts read: beside
-    /// a lent table that the rows' own fields contradict, a sliced miss
-    /// goes to the thin worker the table says is the least loaded.
+    /// Two thin workers part by their requests in flight: a sliced miss
+    /// goes to the thin worker that holds the fewest.
     #[test]
-    fn a_thin_miss_goes_to_the_thin_worker_the_lent_counts_say_is_least_loaded() {
+    fn a_thin_miss_goes_to_the_thin_worker_with_the_fewest_requests() {
         let slice = warmup(0.25, 0);
         // Level 64 (the median of 64, 64, 64, 0, 0): rows 3 and 4 are thin,
-        // and row 4 has the fewer requests by the counts lent.
+        // and row 4 has the fewer requests.
         let pool = [
             sized(0, 3, 0, 64),
             sized(1, 2, 0, 64),
@@ -1785,15 +1776,11 @@ mod tests {
             sized(4, 1, 0, 0),
         ];
         let column = column(&pool);
-        let mut rows = rows(&pool);
-        let lent = Lent::take(&mut rows);
-        // The rows' own fields say the contrary.
-        rows[3].in_flight = 1;
-        rows[4].in_flight = 5;
-        let facts = lent.beside(&RequestFacts {
+        let rows = rows(&pool);
+        let facts = RequestFacts {
             affinity: &column,
             ..facts(16)
-        });
+        };
         let kept = kept(rows.len() as u32);
         let mut out = vec![0.0; rows.len()];
         slice.score(&facts, &rows, &kept, &mut out);
@@ -2298,17 +2285,13 @@ mod tests {
         rows: &[Candidate],
         named: AffinityRows<'_>,
     ) -> Vec<f32> {
-        // The rows' counts are lent beside them, as [`scores_beside`] lends
-        // them.
-        let mut rows = rows.to_vec();
-        let lent = Lent::take(&mut rows);
-        let facts = lent.beside(&RequestFacts {
+        let facts = RequestFacts {
             named: Some(named),
             ..*facts
-        });
+        };
         let kept = kept(rows.len() as u32);
         let mut out = vec![0.0; rows.len()];
-        scorer.score(&facts, &rows, &kept, &mut out);
+        scorer.score(&facts, rows, &kept, &mut out);
         out
     }
 
@@ -2949,19 +2932,17 @@ mod tests {
             ]
         };
         let (calm, hot) = (pool(500), pool(950));
-        // The front pass over a pool, lent its rows' counts as the whole
-        // pass's helper lends them: the scores and what the pass said.
+        // The front pass over a pool: the scores and what the pass said.
         let front = |pool: &[Held]| {
             let column = column(pool);
-            let mut lent_rows = rows(pool);
-            let lent = Lent::take(&mut lent_rows);
-            let facts = lent.beside(&RequestFacts {
+            let rows = rows(pool);
+            let facts = RequestFacts {
                 affinity: &column,
                 ..facts(16)
-            });
-            let kept = kept(lent_rows.len() as u32);
-            let mut out = vec![0.0; lent_rows.len()];
-            let (_, said) = stage.score_front(&facts, &lent_rows, &kept, &kept, &mut out);
+            };
+            let kept = kept(rows.len() as u32);
+            let mut out = vec![0.0; rows.len()];
+            let (_, said) = stage.score_front(&facts, &rows, &kept, &kept, &mut out);
             (out, matches!(said, ScoreFront::Alike))
         };
         let held = || {

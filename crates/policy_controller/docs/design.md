@@ -889,7 +889,7 @@ pub struct Request<'a> {
     pub constraints: Constraints<'a>, // what only the deciding host knows
 }
 
-// engine/view.rs (the fields a stage reads; 31 in all)
+// engine/view.rs (the fields a stage reads; 30 in all)
 pub struct RequestFacts<'a> {
     pub model: &'a str,            // the resolved model id
     pub phase: Phase,              // Single, Prefill, Decode or Encode
@@ -915,8 +915,8 @@ pub struct RequestFacts<'a> {
     pub now_micros: u64,           // the host's clock at the decision
     pub ring: Option<&'a dyn LentRing>, // the hash ring the host keeps, lent to this decision
     pub ring_positions: &'a [u64], // where the request stands on that ring, as the host states it
-    // seven more fields: `affinity`, `named`, `signal_cells`, `session_counted` and
-    // `session_key_from_rid`, and the two that 5.8 removes
+    // six more fields: `affinity`, `named`, `signal_cells`, `session_counted`,
+    // `session_key_from_rid` and `model_fingerprint`, which 5.8 removes
 }
 
 pub struct Constraints<'a> {
@@ -1176,8 +1176,8 @@ The types the two engines shared stay where they were moved ahead of the deletio
   built); an encode request's demands, kept a list at a time as a single request's and a pair's
   are kept, which is built but for two refusals that are named otherwise than classic names them
   (section 5.4).
-- The request fields that only the old engine's host fills leave with it. `lent_in_flight`
-  and `model_fingerprint` have yet to go.
+- The request fields that only the old engine's host fills leave with it. `model_fingerprint`
+  has yet to go.
   Another, `session_counted`, stays, which is built: by it a host says that somebody counts a
   key's requests on each worker, and a sessions rule with a cap asks nothing more of it. Where
   that count stands on a worker object is the request's maker's to say

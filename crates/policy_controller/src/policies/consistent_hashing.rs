@@ -2208,7 +2208,6 @@ mod tests {
     /// owner passed over leaves the decision scored as a keyless one, and
     /// an owner that keeps its key leaves it scored as with no rule.
     fn keeps(rule: &ConsistentHash, loads: &[u32]) -> bool {
-        use crate::tracking::in_flight::tests::Lent;
         let plain = ConsistentHash::new(None);
         let mut pool: Vec<Candidate> = (0..loads.len() as u32).map(|i| candidate(i, 0)).collect();
         let ranks = scored(&plain, &keyed(5), &pool);
@@ -2217,10 +2216,7 @@ mod tests {
         for (&place, &load) in order.iter().zip(loads) {
             pool[place].in_flight = load;
         }
-        // The loads stand in a table lent beside the rows, each row reading
-        // zero: the rule reads them through the request's facts.
-        let lent = Lent::take(&mut pool);
-        let scores = scored(rule, &lent.beside(&keyed(5)), &pool);
+        let scores = scored(rule, &keyed(5), &pool);
         let kept = scores[order[0]] == 1.0;
         assert!(
             if kept {
@@ -2859,16 +2855,6 @@ mod tests {
         // owners at 2 and 3 are rows 0 and 7, both under the bound.
         assert_eq!(tried(&rule, &[0, 2, 3], &all), [0, 7, 3, 1]);
         assert_eq!(tried(&rule, &[0, 3, 2], &all), [7, 3, 1, 6]);
-        // The owner's requests are the ones the request's facts state: in
-        // a table lent beside rows that each read zero, row 5 holds 40.
-        {
-            use crate::tracking::in_flight::tests::Lent;
-            let mut bare = rows.clone();
-            let counts = Lent::take(&mut bare);
-            let facts = lent(&ring, &[0, 2]);
-            let scores = scored_among(&rule, &counts.beside(&facts), &bare, &all);
-            assert_eq!((scores[5], scores[0]), (0.0, 1.0));
-        }
         // Row 5 is no survivor: the owner at 0 is the ring's next, row 2.
         assert_eq!(tried(&rule, &[0, 3], &[0, 1, 2, 3, 4, 6, 7]), [7, 3, 1, 6]);
         // With no rule the first place is read, whatever its owner holds.
