@@ -703,7 +703,7 @@ impl Loaded<'_, '_> {
         clock: impl FnOnce() -> Instant,
     ) -> Result<Decided, DecisionRefused> {
         let mut whole = None;
-        let alone = self.caught(|| self.placed_or(maker, clock, &mut whole))?;
+        let alone = self.decide_into(maker, clock, &mut whole)?;
         match (alone, whole) {
             (Some(pick), _) => Ok(Decided::Alone(pick)),
             (None, Some((decided, later))) => Ok(Decided::Whole(decided, later)),
@@ -711,6 +711,20 @@ impl Loaded<'_, '_> {
             // place.
             (None, None) => Err(DecisionRefused::Faulted),
         }
+    }
+
+    /// The decision of [`Self::decide_at`] for a caller that keeps the
+    /// room of a whole decision itself, as the call that places a request
+    /// does: the place it answers, or `None` with the decision written
+    /// into `whole` beside whether the request stated the later decode.
+    /// Its caller hands `whole` empty, and only a whole decision fills it.
+    pub(super) fn decide_into(
+        self,
+        maker: &impl RequestMaker,
+        clock: impl FnOnce() -> Instant,
+        whole: &mut Option<(DecideOutcome, bool)>,
+    ) -> Result<Option<AlonePick>, DecisionRefused> {
+        self.caught(|| self.placed_or(maker, clock, whole))
     }
 }
 
