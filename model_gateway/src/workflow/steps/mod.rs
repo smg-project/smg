@@ -567,16 +567,25 @@ mod tests {
             WorkerJobAsker::Api,
         );
         let mut definition = create_worker_registration_workflow(&config);
-        // Keep the real DAG, executors, attempt budget and failure action. Only
-        // remove retry sleeping so the deterministic rejection test is fast.
-        let discovery = definition
-            .steps
-            .iter_mut()
-            .find(|step| step.id.to_string() == "discover_metadata")
-            .unwrap();
-        let retry = discovery.retry_policy.as_mut().unwrap();
-        assert_eq!(retry.max_attempts, 3);
-        retry.backoff = BackoffStrategy::Fixed(Duration::ZERO);
+        // Keep the real DAG, executors, timeouts, attempt budgets and failure
+        // actions. A transient health probe must not spend the production
+        // startup cadence before this fixture reaches optional metadata.
+        for (step_id, expected_attempts) in [
+            (
+                "detect_connection_mode",
+                startup_attempts(&config.registration_settings()),
+            ),
+            ("discover_metadata", 3),
+        ] {
+            let step = definition
+                .steps
+                .iter_mut()
+                .find(|step| step.id.to_string() == step_id)
+                .unwrap();
+            let retry = step.retry_policy.as_mut().unwrap();
+            assert_eq!(retry.max_attempts, expected_attempts);
+            retry.backoff = BackoffStrategy::Fixed(Duration::ZERO);
+        }
         let id = definition.id.clone();
         let engine = WorkflowEngine::new();
         engine.register_workflow(definition).unwrap();
@@ -683,11 +692,25 @@ mod tests {
 
     async fn engine_with_slow_optional_version(
         models: Value,
+        fail_first_health_check: bool,
     ) -> (String, tokio::task::JoinSet<()>, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let version_calls = Arc::clone(&calls);
+        let health_calls = Arc::new(AtomicUsize::new(0));
         let app = axum::Router::new()
-            .route("/health", axum::routing::get(|| async { "ok" }))
+            .route(
+                "/health",
+                axum::routing::get(move || {
+                    let calls = Arc::clone(&health_calls);
+                    async move {
+                        if fail_first_health_check && calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
             .route(
                 "/v1/models",
                 axum::routing::get(move || {
@@ -722,10 +745,13 @@ mod tests {
 
     #[tokio::test]
     async fn registration_workflow_optional_deadline_keeps_valid_models_and_ready() {
-        let (url, mut server, _) = engine_with_slow_optional_version(serde_json::json!({
-            "data": [{"id": "configured-model", "root": "local/configured-model"}],
-            "pairing_protocol": "kv-v1"
-        }))
+        let (url, mut server, _) = engine_with_slow_optional_version(
+            serde_json::json!({
+                "data": [{"id": "configured-model", "root": "local/configured-model"}],
+                "pairing_protocol": "kv-v1"
+            }),
+            true,
+        )
         .await;
         let registration = execute_registration_workflow(url.clone()).await;
         server.shutdown().await;
@@ -734,6 +760,10 @@ mod tests {
             state.status,
             WorkflowStatus::Completed,
             "optional slow version must not reject a healthy worker"
+        );
+        assert!(
+            state.step_states[&StepId::new("detect_connection_mode")].attempt >= 2,
+            "registration must recover from the fixture's initial health rejection"
         );
         assert_eq!(
             registry.get_by_url(&url).unwrap().status(),
@@ -770,9 +800,12 @@ mod tests {
 
     #[tokio::test]
     async fn registration_workflow_invalid_extension_fails_before_slow_optional_version() {
-        let (url, mut server, calls) = engine_with_slow_optional_version(serde_json::json!({
-            "data": [{"id": "configured-model"}], "pairing_protocol": 4
-        }))
+        let (url, mut server, calls) = engine_with_slow_optional_version(
+            serde_json::json!({
+                "data": [{"id": "configured-model"}], "pairing_protocol": 4
+            }),
+            false,
+        )
         .await;
         let (state, registry, _) = execute_registration_workflow(url.clone()).await;
         server.shutdown().await;
