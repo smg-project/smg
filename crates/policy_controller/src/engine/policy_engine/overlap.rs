@@ -54,8 +54,9 @@
 //! [`WarmUpRule`]: crate::engine::WarmUpRule
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fmt, mem,
+    rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
@@ -64,7 +65,9 @@ use std::{
 };
 
 use arc_swap::ArcSwapOption;
-use kv_index::{request_prefix_hashes, ChainIndex, ContentHash, GroupViews, TenantId, TokenTree};
+use kv_index::{
+    chain_prefix_hash, ChainIndex, ContentHash, GroupViews, SequenceHash, TenantId, TokenTree,
+};
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smg_worker::identity::basic::Worker;
@@ -229,8 +232,21 @@ pub fn deepest_of_within_groups(
     keep_within_groups(groups, block_hashes, block_size, cap, below, kept);
 }
 
+thread_local! {
+    /// The calling thread's own list for a request's chain of prefix
+    /// hashes, taken for one lookup and put back behind it: the chain
+    /// allocates nothing once the list has grown to the depth of the
+    /// thread's deepest holder.
+    static PREFIXES: Cell<Vec<SequenceHash>> = const { Cell::new(Vec::new()) };
+}
+
 /// Lowers each holder of `kept` to what its cache groups can serve, where
 /// the host's workers keep `groups`, and keeps the deepest, at most `cap`.
+///
+/// The request's chain of prefix hashes is made from its block hashes in
+/// the calling thread's own list ([`PREFIXES`]), no further than the depth
+/// of the deepest holder with a group view: no view reads the chain past
+/// its holder's depth.
 fn keep_within_groups(
     groups: Option<&GroupViews>,
     block_hashes: &[u64],
@@ -241,19 +257,27 @@ fn keep_within_groups(
 ) {
     if let Some(groups) = groups {
         let table = groups.read();
-        let mut prefixes = Vec::new();
+        // A lookup made while its thread ends finds the thread's list
+        // gone and takes a list of its own.
+        let mut prefixes = PREFIXES.try_with(Cell::take).unwrap_or_default();
+        prefixes.clear();
         kept.retain_mut(|(worker, depth)| {
             let Some(view) = table.view(*worker) else {
                 return true;
             };
-            if prefixes.is_empty() {
-                let contents: Vec<ContentHash> =
-                    block_hashes.iter().map(|&hash| ContentHash(hash)).collect();
-                prefixes = request_prefix_hashes(&contents);
+            // A holder's groups read the chain no further than its depth.
+            let until = (*depth as usize).min(block_hashes.len());
+            for &hash in block_hashes.get(prefixes.len()..until).unwrap_or_default() {
+                // The chain's first hash is the first block's own.
+                let prefix = prefixes.last().map_or(SequenceHash(hash), |&last| {
+                    chain_prefix_hash(last, ContentHash(hash))
+                });
+                prefixes.push(prefix);
             }
             *depth = (*depth).min(view.cap(&prefixes, *depth, block_size as usize).depth);
             *depth > 0
         });
+        let _ = PREFIXES.try_with(|list| list.set(prefixes));
     }
     keep_deepest(kept, cap, below);
 }
@@ -1300,18 +1324,21 @@ impl Buffers {
 
 /// Runs `with` over the calling thread's buffers.
 fn with_buffers<T>(with: impl FnOnce(&mut Buffers) -> T) -> T {
-    BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
-        Ok(mut buffers) => with(&mut buffers),
+    // The key's own call hands out the pointer alone: what a decision
+    // answers through that call is copied on its way out of it.
+    let buffers = BUFFERS.with(Rc::clone);
+    let Ok(mut buffers) = buffers.try_borrow_mut() else {
         // A stage asked for a decision from inside this one, on this
         // thread: that decision takes buffers of its own.
-        Err(_) => with(&mut Buffers::new()),
-    })
+        return with(&mut Buffers::new());
+    };
+    with(&mut buffers)
 }
 
 thread_local! {
     /// The calling thread's buffers: a naming allocates nothing once they
     /// have grown to a request's blocks and the profile's cap.
-    static BUFFERS: RefCell<Buffers> = const { RefCell::new(Buffers::new()) };
+    static BUFFERS: Rc<RefCell<Buffers>> = Rc::new(RefCell::new(Buffers::new()));
 }
 
 /// The list one decision is made over and the place it is decided for.
