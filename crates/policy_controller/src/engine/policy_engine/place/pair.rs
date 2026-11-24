@@ -236,20 +236,17 @@ fn again<'a>(
     let (mut prefills, mut decodes) = (None, None);
     // The rule is asked of a list once a call: behind the first ask.
     if call.spent == 0 {
-        let spent = &mut call.spent;
         hold_to_rule(
             request,
             Some(lists.prefill),
             lists.prefill_places,
             &mut prefills,
-            spent,
         )?;
         hold_to_rule(
             request,
             Some(lists.decode),
             lists.decode_places,
             &mut decodes,
-            spent,
         )?;
     }
     // A shed stands where the rule was not asked here: behind a later ask,

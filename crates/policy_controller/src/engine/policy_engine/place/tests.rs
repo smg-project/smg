@@ -1430,8 +1430,8 @@ fn a_call_decides_again_past_the_targets_it_could_not_send_to() {
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 
-/// A call makes three decisions, and a fourth only where its third found
-/// the workers a route's rule takes. Over a list none of whose first
+/// A call makes three decisions at most, and those of a request that
+/// states no rule are held to no worker. Over a list none of whose first
 /// twelve workers can be sent to, the three decisions name them four by
 /// four, each is given up by name, and the request has no worker. No fourth
 /// decision names the workers behind them.
@@ -1673,6 +1673,39 @@ fn a_rule_that_takes_no_worker_is_shed_under_its_name() {
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 
+/// A rule that takes no worker sheds the request so where no pick of the
+/// first decision is ready too. No pick is asked of the rule: it is asked
+/// once of every worker of the list, and no second decision is made.
+#[test]
+fn a_rule_that_takes_no_worker_is_shed_where_no_pick_is_ready() {
+    let (engine, heard) = in_order(false);
+    let list = pool(6);
+    for worker in list.iter() {
+        worker.set_status(WorkerStatus::NotReady);
+    }
+    let members = PublishedList::new(Arc::clone(&list));
+    let id = |at: usize| worker_id(list[at].as_ref());
+    let asked = RefCell::new(Vec::new());
+    let admits = |worker: &dyn Worker| {
+        asked.borrow_mut().push(worker_id(worker));
+        false
+    };
+    let request = PlaceRequest {
+        admits: Some(&admits),
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+    };
+    let shed = Unplaced::Shed {
+        reason: ShedReason::NoEndpoints,
+        emptied_by: "admits",
+        retry_after_secs: 1,
+    };
+    assert_eq!(engine.place(&request).err(), Some(shed));
+    let calls: Vec<_> = (0..6).map(id).collect();
+    assert_eq!(*asked.borrow(), calls, "no pick, and the list once");
+    assert_eq!(heard.lock().as_slice(), given_up(id(0)), "one decision");
+    assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+}
+
 /// A rule that takes workers none of which is ready is the decision's to
 /// answer: held to them, it sheds by its own filter and names it. The rule
 /// is asked of a worker that is not ready too, which tells this request
@@ -1717,14 +1750,12 @@ fn the_places_a_rule_takes_are_ascending_and_hold_every_later_pick() {
     };
     let mut call = Call::default();
     call.missed.push(worker_id(list[1].as_ref()));
-    hold_to_rule(
-        &request,
-        Some(members.lent()),
-        None,
-        &mut call.admitted,
-        &mut call.spent,
-    )
-    .expect("the rule takes workers");
+    // A request that states no rule keeps no places.
+    let unruled = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
+    hold_to_rule(&unruled, Some(members.lent()), None, &mut call.admitted).expect("no rule");
+    assert_eq!(call.admitted, None);
+    hold_to_rule(&request, Some(members.lent()), None, &mut call.admitted)
+        .expect("the rule takes workers");
     let places: Vec<u32> = thirds().map(|at| at as u32).collect();
     assert_eq!(call.admitted.as_deref(), Some(&places[..]));
 
@@ -1907,21 +1938,24 @@ fn a_rule_that_changes_its_answer_places_no_request_on_a_refused_pick() {
     );
 }
 
-/// A call whose third decision finds the workers its route's rule takes
-/// makes a fourth among them, and no fifth. Two decisions name the eight
-/// workers of the list that are not ready, the third names four ready ones
-/// the rule refuses, the rule is asked of the list, and the fourth decision
-/// is held to the one worker it takes. With three decisions a call, such a
-/// request had no worker though its list held a ready one its rule takes.
+/// A call whose first decision names workers that are not ready has its
+/// route's rule asked of the list behind that decision, though the rule
+/// refused nobody: a pick that is not ready is not asked of it, so such a
+/// decision learns nothing of the rule. Over a list whose first twelve
+/// workers are not ready, three decisions over the whole list name them
+/// four by four, and the request had no worker though the thirteenth is
+/// ready and the rule takes it. Held to that worker, the second decision
+/// names it.
 ///
-/// The classic router places it: it narrows the list by the rule and to
-/// the available workers ahead of its policy
-/// (`model_gateway/src/routers/common/placement.rs:504-509`, `:536-553`).
+/// The classic router places it: it narrows the list by the rule
+/// (`accepted_by`, `model_gateway/src/routers/common/placement.rs:474-483`
+/// on main `77d6a42d3`) and picks among the workers that are available
+/// (`:1338-1341` there).
 #[test]
-fn a_call_whose_third_decision_finds_the_rules_workers_makes_a_fourth() {
+fn a_call_whose_first_picks_are_not_ready_is_held_to_the_rules_workers() {
     let (engine, heard) = in_order(false);
     let list = pool(13);
-    for worker in &list[..8] {
+    for worker in &list[..12] {
         worker.set_status(WorkerStatus::NotReady);
     }
     let members = PublishedList::new(Arc::clone(&list));
@@ -1938,28 +1972,28 @@ fn a_call_whose_third_decision_finds_the_rules_workers_makes_a_fourth() {
     };
     let placement = engine.place(&request).expect("a placement");
     assert!(Arc::ptr_eq(&placement.worker, &list[12]));
-    assert_eq!(calls.get(), 4 + 13 + 1, "four picks, the list, the pick");
-    let mut said = [given_up(id(0)), given_up(id(4)), given_up(id(8))].concat();
+    assert_eq!(calls.get(), 13 + 1, "the list, then the pick");
+    let mut said = given_up(id(0)).to_vec();
     said.push(("issued at 0".to_owned(), far));
     assert_eq!(heard.lock().as_slice(), said);
     drop(placement);
     heard.lock().clear();
 
     // A rule that takes that worker of the list and refuses it as a pick:
-    // the fourth decision is the call's last.
+    // the list is asked once, and the third decision is the call's last.
     calls.set(0);
     let fickle = |worker: &dyn Worker| {
         calls.set(calls.get() + 1);
-        (5..=17).contains(&calls.get()) && worker_id(worker) == far
+        calls.get() <= 13 && worker_id(worker) == far
     };
     let request = PlaceRequest {
         admits: Some(&fickle),
         ..request
     };
     assert_eq!(engine.place(&request).err(), Some(Unplaced::NoWorkers));
-    assert_eq!(calls.get(), 4 + 13 + 1, "the list is asked once");
-    let four = [0, 4, 8, 12].map(|first| given_up(id(first)));
-    assert_eq!(heard.lock().as_slice(), four.concat());
+    assert_eq!(calls.get(), 13 + 2, "the list is asked once");
+    let three = [0, 12, 12].map(|first| given_up(id(first)));
+    assert_eq!(heard.lock().as_slice(), three.concat());
 }
 
 /// The rule is asked of the list while the call holds no decision: where it
