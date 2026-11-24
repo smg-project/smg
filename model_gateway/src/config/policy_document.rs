@@ -19,7 +19,7 @@ use smg_policy_controller::{
     document::{
         AppliedSpec, Assignment, ConnectionModeSetting, IndexKind, LoadMetricSetting, ModeSettings,
         OverloadSpec, Pairing, PolicySettings, PolicySpec, RoutingKeyOverrideSettings,
-        RoutingSettings, RoutingSettingsError, SpecError,
+        RoutingSettings, RoutingSettingsError, ShadowSpec, SpecError,
     },
     stages::StageRegistry,
 };
@@ -185,12 +185,27 @@ impl RouterConfig {
     /// ([`StageRegistry::builtin`]), or the table a build of the host's own
     /// hands in, which holds the stages that build added. A document that
     /// names a stage the table does not hold is refused by the stage's name.
+    ///
+    /// A binding's shadows by side are refused as not in this build: the
+    /// engine this gateway hosts decides a shadow beside a single request
+    /// alone, so a pair's would load and never run.
     pub fn hosted_policy(
         &self,
         document: &PolicySpec,
         stages: &StageRegistry,
     ) -> Result<AppliedSpec, SpecError> {
-        AppliedSpec::validate_in(document, stages, &self.denied_view_headers())
+        let applied = AppliedSpec::validate_in(document, stages, &self.denied_view_headers())?;
+        let by_side = document
+            .bindings
+            .iter()
+            .position(|binding| matches!(binding.shadow, Some(ShadowSpec::Sides(_))));
+        match by_side {
+            Some(index) => Err(SpecError::NotInBuild {
+                path: format!("bindings[{index}].shadow"),
+                what: "a pair's shadow",
+            }),
+            None => Ok(applied),
+        }
     }
 
     /// The header names this gateway denies the view of a document it
@@ -1222,6 +1237,41 @@ mod tests {
             config.hosted_policy(&document, &StageRegistry::builtin()).err(),
             Some(SpecError::UnknownFilter { name, .. }) if name == "keeps-all"
         ));
+    }
+
+    /// One model's single binding with a shadow stands ahead of a pair's
+    /// binding. The single binding's shadow loads, and a shadow by side on
+    /// the pair's binding is refused by that binding's path.
+    #[test]
+    fn a_pair_bindings_shadow_is_refused_as_not_in_this_build() {
+        let pairs = PolicySpec::pair_presets("round_robin", "round_robin");
+        let mut document = pairs.expect("the presets of a pair");
+        document.profiles.extend(preset("random").profiles);
+        let mut single = preset("round_robin");
+        document.profiles.append(&mut single.profiles);
+        let mut ahead = single.bindings.pop().expect("the single binding");
+        ahead.matcher.model = "one-model".to_owned();
+        ahead.shadow = Some(ShadowSpec::Profile("random".to_owned()));
+        document.bindings.insert(0, ahead);
+
+        let config = RouterConfig::default();
+        let refused = |document: &PolicySpec| {
+            config
+                .hosted_policy(document, &StageRegistry::builtin())
+                .err()
+        };
+        assert_eq!(refused(&document), None);
+
+        let pair = document.bindings.last_mut().expect("the pair's binding");
+        let by_side = [("prefill".to_owned(), "random".to_owned())];
+        pair.shadow = Some(ShadowSpec::Sides(by_side.into()));
+        assert_eq!(
+            refused(&document),
+            Some(SpecError::NotInBuild {
+                path: "bindings[1].shadow".to_owned(),
+                what: "a pair's shadow",
+            })
+        );
     }
 
     #[test]
