@@ -354,6 +354,23 @@ fn a_replaced_object_and_a_status_change_tell_the_stages_nothing() {
     assert_eq!(told(&heard), [("left", id(0))]);
 }
 
+/// A worker replaced under its id by a registration of another model
+/// serves the first model no more: the stages are told the model it left,
+/// and a stage that lists workers by model unlists it there. The worker
+/// stands, so no leave of its id is told.
+#[test]
+fn a_replacement_that_takes_a_model_tells_the_stages_the_model_left() {
+    let registry = registry(2);
+    let (engine, heard, mut follow) = following(&registry);
+    let _ = told(&heard);
+
+    let standing = object(&registry, 0);
+    assert!(registry.replace(&standing, ready_worker(&url(0), "model-b")));
+    drain(&engine, &mut follow);
+    assert_eq!(told(&heard), [("left a model", id(0))]);
+    assert_eq!(held(&follow), sorted(vec![id(0), id(1)]));
+}
+
 /// A host that states ids of its own: a worker is told under the id its
 /// host states, not the fingerprint of its address. A replacement under
 /// which the host states another id is a leave of the id told and a join

@@ -380,7 +380,7 @@ impl PolicyEngine {
     /// |---|---|
     /// | `Registered` | a join |
     /// | `Removed` | a leave, under the id told at the worker's join |
-    /// | `Replaced` | nothing where the host states the id told of the new object: the worker stands, with what the stages keep for it. Where it states another, a leave of the id told and a join of the new one. Nothing of an object the follow does not hold |
+    /// | `Replaced` | nothing where the host states the id told of the new object and that object serves every model of the old one: the worker stands, with what the stages keep for it. Where the new object serves one of those models no more, the models it left ([`Membership::Left`]). Where the host states another id, a leave of the id told and a join of the new one. Nothing of an object the follow does not hold |
     /// | `StatusChanged` | nothing: a decision reads a worker's status on its object |
     ///
     /// A worker removed and another registered at its address come as a
@@ -612,14 +612,27 @@ impl PolicyEngine {
                     self.stands(follow, worker_id, &new, id, true);
                     // A worker that stands under its id and serves one of
                     // its models no more keeps no place in that model's
-                    // record: the records forget it. A changed id was told
-                    // as a leave and a join, which forget it already. The
+                    // record: the records forget it, and the stages are
+                    // told the models it left. A changed id was told as a
+                    // leave and a join, which forget it already. The
                     // objects are asked under a catch, and a panic of their
-                    // code is read as a model lost.
+                    // code is read as a model lost that no word can name:
+                    // the records forget the worker and the stages hear
+                    // nothing.
                     let left = |model: &String| !new.supports_model(model);
-                    let lost = || worker_model_ids(&old).iter().any(left);
-                    if was == Some(id) && self.held(lost).unwrap_or(true) {
-                        self.affinity.forget(id);
+                    let lost = || {
+                        let mut models = worker_model_ids(&old);
+                        models.retain(left);
+                        models
+                    };
+                    if was == Some(id) {
+                        let lost = self.held(lost);
+                        if lost.as_ref().is_none_or(|lost| !lost.is_empty()) {
+                            self.affinity.forget(id);
+                        }
+                        if let Some(models) = lost.as_deref().filter(|lost| !lost.is_empty()) {
+                            self.tell(&Membership::Left { id, models });
+                        }
                     }
                 }
                 // The lists of both objects' models were published again,

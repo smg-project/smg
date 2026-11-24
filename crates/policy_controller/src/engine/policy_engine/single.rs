@@ -3310,6 +3310,9 @@ pub(crate) mod tests {
             let heard = match *change {
                 Membership::Added(id) => ("joined", id, 0),
                 Membership::Removed(id) => ("left", id, 0),
+                // A leave of the cases' model, and one of any other.
+                Membership::Left { id, models } if models == [MODEL] => ("left a model", id, 0),
+                Membership::Left { id, .. } => ("left another model", id, 0),
                 // The ids that stand, one word each.
                 Membership::Snapshot(ids) => {
                     let standing = ids.iter().map(|&id| ("standing", id, 0));
