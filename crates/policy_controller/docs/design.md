@@ -1011,27 +1011,28 @@ that not every worker of its list serves is refused. The refusal names the input
 A pair's demand is kept a side at a time: each side of its two lists is held to the
 workers that meet it as that side's role is held to it, and a side it leaves nobody sheds the pair
 under that demand's stage, the prefills' first.
-An encode request's demand is kept a list at a time the same way (`EncodeLists::decide`). An
+An encode request's demand is kept the same way for its pair, a side at a time
+(`EncodeLists::decide`), and by the encode pass for its encoders. An
 encoder takes the media of a request that carries items. So the encoders are held to the runtime,
 to vision and to the references, and each side of the pair as a pair's side is, less vision and
 the references (`Demands::beside_encoders`). Beside the pair an encoder is held to no window and to
 no way of deciding a constraint (`Demands::beside_pair`): it runs neither the prompt nor the
 completion. An encode request that stands alone has no pair beside it, and its one list is held to
 the whole demand. A request with no item takes no encoder,
-and its pair's two lists are held as a pair's own. A list the demand leaves nobody sheds the request
-under that demand's stage: the encoders' first, then the prefills', then the decodes'. For the
-encoders the stage is the encode pass's own word where the pass tests the same fact from the
-request's media: `encode-vision` for vision, `encode-media` for the references and their pipeline
-(`UnmetDemand::encoders_stage`). So a host hears the encode pass's own two words for the encoders'
-media, whether it states the demand or not. Which of the two a fleet hears follows the order of
-the one that judged it: where its encoders lack different things, the demand names the last it
-judged. The demand is judged ahead of the encode pass, which reads the places that meet it
-as the list's own places. Two refusals are named otherwise than classic names them. Where a
-demand's runtime leaves encoders that lack another fact, and an encoder off that runtime has it,
-the engine sheds under `places` and classic names that fact. Where the encoders lack different
-things, a stated demand names the references and classic the images. Both stand open under rule
-6 until the pass names, under the places a demand leaves, the fact those encoders lack, in its
-own order. A request with items that demands vision or a way of processing its
+and its pair's two lists are held as a pair's own. A side the demand leaves nobody sheds the
+request under that demand's stage, the prefills' first. No encoder is cut ahead of the encode
+pass. The pass keeps the encoders' part of the demand in its one test of an encoder, a part at a
+time, against what each encoder states beside its record (`EncodePool::demands`): the runtime is
+the rest of the request's wire, the references and their pipeline stand with the items'
+references, and vision with the request's pixels. An encoder that fails a part is no member of
+its class. So what the encoders lack is named in the pass's own order, as classic names it,
+whether a request states a fact as a demand or as its own: an encoder that would take the
+request but for its images (`encode-vision`), a pushing encoder that takes the media
+(`ec-compatible`), the media (`encode-media`), the encoders (`encoders`). No encoder is shed
+under a demand's own stage, and every answer for the encoders stands ahead of a side's. A
+host's places for the encoders stand beside a demand as beside none: the pass reads every
+encoder for what the model takes, and the places for what the request may reach.
+A request with items that demands vision or a way of processing its
 references leaves that part of the demand to its encoders. A decode asked again takes no items
 and would hold the decode to the whole demand, so the decode of such a request is not asked
 again: the entry declines one that states the later decode under `decode-later`, and a placement
@@ -1254,9 +1255,9 @@ The types the two engines shared stay where they were moved ahead of the deletio
 - It honours what it once refused: an encode request's pair held to some workers of its two
   lists, and its encoders held to some of theirs (`EncodeLists::decide` decides the request
   among the places its host states for each of the three lists, section 5.4, which is
-  built); an encode request's demands, kept a list at a time as a single request's and a pair's
-  are kept, which is built but for two refusals that are named otherwise than classic names them
-  (section 5.4).
+  built); an encode request's demands, its pair's kept a side at a time as a pair's are kept
+  and its encoders' by the encode pass, in classic's order of refusals (section 5.4), which is
+  built.
 - The request fields that only the old engine's host fills leave with it. `model_fingerprint`
   has yet to go.
   Another, `session_counted`, stays, which is built: by it a host says that somebody counts a
@@ -2793,7 +2794,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `manual` and sticky sessions on that engine | **[partly]** | their sheets replay through the decision function, not through the engine |
 | `bucket` on that engine | **[partly]** | the same |
 | Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; one of its 40 lines is held to an answer of the crate's own; the 8 lines behind the prefill admission's bound (`pair_bound`) and the 10 lines of a pair on one known runtime (`pair_runtime`) replay through that function as recorded, the 10 also over the classes a controller's pairing rule derives |
-| Encode-prefill-decode on that engine | **[partly]** | `PolicyEngine::decide_encode_at` decides it over a host's three lists and issues the pair's lease, and `place` places it; the entry declines a request held to a wire that a worker of its pair's two lists is not dialed on, places its items on the encoders dialed on a wire it states, declines a request with items where the list holds encoders and none is, and declines one that states the later decode where its decode is held to the workers that take images, or where it carries items and demands vision or a way of processing its references: a decode asked again takes no items; under a stated demand two refusals are named otherwise than classic names them (section 5.4) |
+| Encode-prefill-decode on that engine | **[partly]** | `PolicyEngine::decide_encode_at` decides it over a host's three lists and issues the pair's lease, and `place` places it; the entry declines a request held to a wire that a worker of its pair's two lists is not dialed on, places its items on the encoders dialed on a wire it states, declines a request with items where the list holds encoders and none is, and declines one that states the later decode where its decode is held to the workers that take images, or where it carries items and demands vision or a way of processing its references: a decode asked again takes no items |
 | The lease and its events; the guard | **[built]** | |
 | The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request, for a pair and for an encode request, with the route's rule and the decision made again, three decisions a call at most, and the later decisions of a single request and of a pair held to the workers the route's rule takes; the later decisions of an encode request that carries items held to them are not |
 | The crate's bench of the kept engine | **[planned]** | |

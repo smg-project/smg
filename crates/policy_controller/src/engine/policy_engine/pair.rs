@@ -35,9 +35,9 @@
 //! by a single request's own rule ([`single::held_in`]). A side the demand
 //! leaves nobody sheds the pair with no endpoint, under the stage of the
 //! demand that took that side's last worker, the prefills' first. The
-//! decode asked again judges its decodes alone. An encode request's three
-//! lists are held a list at a time too, its pair's two by this rule
-//! ([`PairLists::sides_meeting`], [`super::encode`]).
+//! decode asked again judges its decodes alone. An encode request's pair
+//! is held by this rule too ([`PairLists::sides_meeting`]), and its
+//! encoders by the engine's encode pass ([`super::encode`]).
 //!
 //! **The words.** A side is told its issue once: with the prefill's
 //! ([`issue_caught`]), or, where its decode is sent later, at the decode
@@ -571,7 +571,7 @@ impl<'a> PairLists<'a> {
             let spent;
             let demanded = !cx.demands.is_none();
             let (cx, prefill_side, decode_side) = if demanded {
-                let [prefill_kept, decode_kept, _] = &mut buffers.meeting;
+                let [prefill_kept, decode_kept] = &mut buffers.meeting;
                 let demands = cx.demands;
                 let prefill_side = match held {
                     None => {
@@ -810,10 +810,10 @@ fn held_prefill<'a, 'f>(
 /// What one thread keeps for its pair decisions: each list's records, the
 /// prefills' first, and the engine's scratch. An encode request's decision
 /// keeps its encoders' records here too ([`super::encode`]): a pair's
-/// leaves them as they were. A pair that states a hard demand keeps each
-/// side's places that meet it here, the prefills' first, and an encode
-/// request its encoders' in the third list: such a request allocates
-/// nothing once each list has grown to its side.
+/// leaves them as they were. A request that states a hard demand keeps
+/// each side's places that meet it here, the prefills' first, a pair's and
+/// an encode request's alike: such a request allocates nothing once each
+/// list has grown to its side.
 /// A side whose phase reads who holds the prompt keeps its list's column
 /// here, the prefills' first.
 #[derive(Debug, Default)]
@@ -821,7 +821,7 @@ pub(super) struct Buffers {
     pub(super) rows: [Vec<Candidate>; 2],
     pub(super) encoders: Vec<Candidate>,
     pub(super) scratch: Scratch,
-    pub(super) meeting: [Vec<u32>; 3],
+    pub(super) meeting: [Vec<u32>; 2],
     pub(super) columns: [Vec<AffinityFacts>; 2],
 }
 

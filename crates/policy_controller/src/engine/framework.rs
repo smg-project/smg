@@ -53,7 +53,6 @@ mod vetoed;
 
 pub use alone::{AloneProfile, InTheWay, NotAlone, Place};
 pub use encode::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
-pub(crate) use encode::{ENCODE_MEDIA, ENCODE_VISION};
 use engines::{run_engines, run_owned};
 pub use keyed::PoolRows;
 use vetoed::{AllVetoed, Half};

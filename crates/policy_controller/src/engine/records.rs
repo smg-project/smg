@@ -826,6 +826,17 @@ impl PoolRecords {
         &self.fixed
     }
 
+    /// What each worker states for a request's hard demands, by its place
+    /// in the list ([`FixedFacts::demands`]): empty where no worker of the
+    /// list states anything, and each of them then states nothing. An
+    /// encode request's decision lends it to the encode pass, which holds
+    /// an encoder to its part of a demand itself
+    /// ([`EncodePool::demands`](crate::engine::EncodePool::demands)).
+    #[must_use]
+    pub(crate) fn demand_facts(&self) -> &[DemandFacts] {
+        self.demand_facts.as_deref().unwrap_or_default()
+    }
+
     /// The places of the list whose worker meets `demands`, written into
     /// `kept`: of every place, in the list's order, or of `among` alone, in
     /// its order, the places the request is already held to. A worker is

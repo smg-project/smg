@@ -105,6 +105,10 @@ struct Bed {
     /// The ring the request's caller lends for the items; none until a case
     /// lends one.
     ring: Option<Box<dyn LentRing>>,
+    /// The hard demand the encode side's constraints state, and what each
+    /// encoder states for one; none until a case states them.
+    demands: Demands,
+    stated: Vec<DemandFacts>,
 }
 
 impl Bed {
@@ -130,6 +134,8 @@ impl Bed {
             video: 0,
             wires: WireModes::NONE,
             ring: None,
+            demands: Demands::default(),
+            stated: Vec::new(),
         }
     }
 
@@ -196,6 +202,7 @@ impl Bed {
             prefill_classes: &self.prefill_classes,
             affinity: &self.encode_affinity,
             signal_cells: encoders.as_ref(),
+            demands: &self.stated,
         };
         let items = EncodeItems {
             keys: &self.keys,
@@ -207,6 +214,7 @@ impl Bed {
         let cx = Constraints::default();
         let encode_cx = Constraints {
             wire_modes: self.wires,
+            demands: self.demands,
             ..Constraints::default()
         };
         let mut placed = EncodePlaced::new();
@@ -571,6 +579,64 @@ fn a_gap_is_named_by_the_encoders_on_the_requests_wires() {
     assert_eq!(bed.stage(), "ec-compatible");
 }
 
+/// The pass keeps the hard demand its encode side states in its one test
+/// of an encoder, against what each encoder states beside its row
+/// ([`EncodePool::demands`]): the runtime as a wire, and vision with the
+/// request's pixels. An encoder with no entry states nothing and meets no
+/// demand for a runtime, as every encoder does under an empty column. A
+/// window and a way of deciding a constraint are no encoder's to meet.
+///
+/// The classic router holds an encoder to the request's wire in its one
+/// test of an encoder
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2576`
+/// on main ccc411cf0), and answers a pushing encoder that takes the media
+/// off that wire as one that lacks its role (`:2603-2608`).
+#[test]
+fn an_encoder_is_held_to_the_encode_sides_demand_by_what_it_states() {
+    let on = |runtime: u32| DemandFacts {
+        runtime,
+        ..DemandFacts::default()
+    };
+    let mut bed = Bed::new();
+    bed.encoders = vec![row(0, Role::Encode, 0, 0), row(1, Role::Encode, 0, 4)];
+    bed.facts = vec![pushing(1), pushing(1)];
+    bed.demands = Demands {
+        runtime: 7,
+        ..Demands::default()
+    };
+    // No column: no encoder states a runtime, and a pushing encoder that
+    // takes the media stands off the request's.
+    assert_eq!(bed.stage(), "ec-compatible");
+    // The first states another runtime, and the second has no entry.
+    bed.stated = vec![on(8)];
+    assert_eq!(bed.stage(), "ec-compatible");
+    // The second states the request's: the item goes there, past the idle
+    // first.
+    bed.stated = vec![on(8), on(7)];
+    assert_eq!(bed.placed(), ((0, 0), vec![1], false));
+    // A window and a way of deciding a constraint ask nothing of it.
+    bed.demands = Demands {
+        input_window: 9,
+        output_window: 9,
+        decoding: 3,
+        ..bed.demands
+    };
+    assert_eq!(bed.placed(), ((0, 0), vec![1], false));
+    // A demand for vision is the test of the request's pixels, and reads
+    // no entry. The request holds no image and demands vision, and the
+    // idle encoder takes none.
+    bed.stated = Vec::new();
+    bed.images = 0;
+    bed.demands = Demands {
+        vision: true,
+        ..Demands::default()
+    };
+    bed.encoders[0].vision = false;
+    assert_eq!(bed.placed(), ((0, 0), vec![1], false));
+    bed.encoders[1].vision = false;
+    assert_eq!(bed.stage(), "encode-vision");
+}
+
 /// A hard filter that refuses one row, by its id.
 #[derive(Debug)]
 struct RefusesOne(WorkerId);
@@ -688,6 +754,21 @@ fn encoders_the_veto_left_none_of_shed_as_saturation() {
     assert_eq!(shed_of(&bed.decide().0), missing);
     // With no wire stated the veto left none.
     bed.wires = WireModes::NONE;
+    assert_eq!(shed_of(&bed.decide().0), saturated);
+    // Nor is one over its thresholds that states another runtime than the
+    // request stays on.
+    let on = |runtime: u32| DemandFacts {
+        runtime,
+        ..DemandFacts::default()
+    };
+    bed.demands = Demands {
+        runtime: 7,
+        ..Demands::default()
+    };
+    bed.stated = vec![on(7), on(8)];
+    assert_eq!(shed_of(&bed.decide().0), missing);
+    // Both on the request's runtime: the veto left none.
+    bed.stated = vec![on(7), on(7)];
     assert_eq!(shed_of(&bed.decide().0), saturated);
 }
 
