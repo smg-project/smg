@@ -851,9 +851,7 @@ pub struct Candidate {
     /// ([`RequestFacts::pinned_at`]).
     pub session_hit: bool,
     /// Requests of the request's session key in flight on this worker. A
-    /// host writes it into a row it copies for the decision. A host that
-    /// keeps the count beside its rows hands it there instead
-    /// ([`RequestFacts::lent_session_in_flight`]).
+    /// host writes it into a row it copies for the decision.
     pub session_in_flight: u16,
     /// The pairing class: `0` for a worker outside any pairing. Which decode
     /// classes a prefill class pairs with is the pair table's to say
@@ -1087,43 +1085,6 @@ pub(crate) fn mean_in_flight(
     sum as f32 / rows.len() as f32
 }
 
-/// Lays the key's counts a host lent beside its rows
-/// ([`RequestFacts::lent_session_in_flight`]) over `rows`, a copy of the
-/// decision's rows as a plugin is shown them, through `set`: every row
-/// reads zero and each lent row its count, as
-/// [`RequestFacts::session_in_flight`] reads them. Where the host lent
-/// none the copy keeps the rows' own counts and nothing is written: a
-/// walk of the rows pays no test for the list.
-#[cfg(any(feature = "controller", feature = "wasm"))]
-pub(crate) fn lay_session_in_flight<R>(
-    facts: &RequestFacts<'_>,
-    rows: &mut [R],
-    set: impl Fn(&mut R, u16),
-) {
-    let Some(lent) = facts.lent_session_in_flight else {
-        return;
-    };
-    for row in rows.iter_mut() {
-        set(row, 0);
-    }
-    for keyed in lent {
-        if let Some(row) = rows.get_mut(keyed.row as usize) {
-            set(row, keyed.in_flight);
-        }
-    }
-}
-
-/// One row that carries requests of a decision's session key, as a host
-/// hands it beside rows that carry no such count
-/// ([`RequestFacts::lent_session_in_flight`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct KeyedRow {
-    /// The row's position in the candidate slice.
-    pub row: u32,
-    /// The key's requests in flight on the row's worker.
-    pub in_flight: u16,
-}
-
 /// Where a worker's object counts the requests of a request's session
 /// key: the name the count stands under there. A request's maker states it
 /// ([`RequestMaker::session_counted_under`](super::decision_engine::RequestMaker::session_counted_under)),
@@ -1278,24 +1239,11 @@ pub struct RequestFacts<'a> {
     /// pool, and a pair's rows carry what counts their host wrote.
     /// In-process only.
     pub lent_in_flight: Option<&'a in_flight::PoolInFlightCounts<'a>>,
-    /// The rows that carry requests of this request's session key, each
-    /// with its count, where the host did not write the count into the
-    /// rows ([`Candidate::session_in_flight`]): a host that keeps the
-    /// key's count beside its rows hands them here, ascending by row, a
-    /// row once. A row no entry names carries none. A reader of a row's
-    /// count asks both ([`RequestFacts::session_in_flight`]), and reads
-    /// the list wherever one stands: the rows' own counts are not read
-    /// beside it. `None` where the rows carry the count, and where the
-    /// host keeps none. A debug build asserts the list's order where a
-    /// decision takes its inputs. A pair takes none, as it takes no pin.
-    /// In-process only.
-    pub lent_session_in_flight: Option<&'a [KeyedRow]>,
     /// The host holds each row's count of this request's session key, the
     /// count a capped sessions rule asks for
-    /// ([`Needs::session_in_flight`](crate::document::Needs::session_in_flight)):
-    /// written into the rows ([`Candidate::session_in_flight`]) or lent
-    /// beside them ([`RequestFacts::lent_session_in_flight`]). A sessions
-    /// rule's in-flight cap reads the count either way. A key kept on its
+    /// ([`Needs::session_in_flight`](crate::document::Needs::session_in_flight)),
+    /// written into the rows ([`Candidate::session_in_flight`]): a sessions
+    /// rule's in-flight cap reads it there. A key kept on its
     /// worker over the overload veto is kept under a capped rule only
     /// where this is set: with no count the cap could not hand the key on,
     /// so the veto stands for it as for any request. Where the count
@@ -1511,23 +1459,6 @@ impl<'a> RequestFacts<'a> {
         match self.lent_in_flight {
             Some(lent) => lent.at(row.position),
             None => row.in_flight,
-        }
-    }
-
-    /// The requests of the request's session key in flight on `row`: what
-    /// the host lent for the row's position where it lent the key's rows
-    /// ([`RequestFacts::lent_session_in_flight`]), the row's own count
-    /// otherwise. A sessions rule's cap asks here. The list's presence
-    /// names the source, whatever [`RequestFacts::session_counted`] says:
-    /// a decision reads the key's count from one place.
-    #[inline]
-    pub fn session_in_flight(&self, row: &Candidate) -> u16 {
-        match self.lent_session_in_flight {
-            Some(lent) => {
-                let found = lent.binary_search_by_key(&row.position, |keyed| keyed.row);
-                found.map_or(0, |at| lent[at].in_flight)
-            }
-            None => row.session_in_flight,
         }
     }
 
@@ -1946,7 +1877,7 @@ mod tests {
     /// decision bench's cells that copy the facts (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
-        assert_eq!(size_of::<RequestFacts<'_>>(), 336);
+        assert_eq!(size_of::<RequestFacts<'_>>(), 320);
     }
 
     #[test]
