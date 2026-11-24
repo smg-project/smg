@@ -1154,12 +1154,14 @@ impl<G: Generation> WorkerMonitor<G> {
     /// are written behind the publish's own fence, read under the hold:
     /// an answer for a worker that left during the fetch writes none. A
     /// row the publish takes from a worker that left ends under the same
-    /// hold ([`Self::publish_rows`]).
+    /// hold ([`Self::publish_rows`]). `failed` are the polled workers whose
+    /// fetch failed.
     fn publish_polled(
         &self,
         model_id: &str,
         polled_urls: &[String],
         group_loads: Vec<(Arc<dyn Worker>, WorkerLoadResponse, bool)>,
+        failed: &[Arc<dyn Worker>],
     ) {
         let reports = self.pushed_reports.lock();
         // Every successful load poll is also the canonical observability
@@ -1182,13 +1184,14 @@ impl<G: Generation> WorkerMonitor<G> {
         // paired with the worker that produced it so the incarnation fence
         // can drop reports that raced a removal or replacement. Workers that
         // failed this tick get their stale entries pruned along with the
-        // rest. The responses move (no deep clones): the metrics pass above
+        // rest: what the snapshot keeps of one is `LoadState::publish`'s to
+        // say. The responses move (no deep clones): the metrics pass above
         // took its references.
         let fresh: Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)> = group_loads
             .into_iter()
             .map(|(worker, load, _)| (worker, Arc::new(load)))
             .collect();
-        self.publish_rows(&reports, polled_urls, fresh);
+        self.publish_rows(&reports, polled_urls, fresh, failed);
     }
 
     /// Publish rows, and end each row the publish took away from a worker
@@ -1198,15 +1201,19 @@ impl<G: Generation> WorkerMonitor<G> {
     /// rank the row held past the worker's width, or finds no row at the
     /// URL and writes nothing. The row's series end here instead, but for
     /// the ones a live writer writes ([`Self::clear_series`]). A row taken
-    /// from the URL's `Ready` worker, whose fetch failed this tick, ends
-    /// nothing. `reports` is the locked map of the pushed reports.
+    /// from the URL's `Ready` worker, whose fetch failed this tick or
+    /// answered with no row for it, ends nothing: the row leaves the
+    /// snapshot's entries, and where the fetch failed (`failed`) the
+    /// snapshot keeps it beside them ([`LoadState::publish`]). `reports`
+    /// is the locked map of the pushed reports.
     fn publish_rows(
         &self,
         reports: &FxHashMap<String, PushedFile>,
         group_urls: &[String],
         fresh: Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)>,
+        failed: &[Arc<dyn Worker>],
     ) {
-        for (worker, row) in self.load_state.publish_group(group_urls, fresh) {
+        for (worker, row) in self.load_state.publish(group_urls, fresh, failed) {
             self.clear_series(reports, &worker, Some(&row));
         }
     }
@@ -1425,7 +1432,7 @@ impl<G: Generation> WorkerMonitor<G> {
             // worker's row, and a row of another worker it overwrites ends
             // there. A refused one leaves the row to the eviction, which
             // writes the sentinel of the series with it.
-            self.publish_rows(&reports, &[], fresh);
+            self.publish_rows(&reports, &[], fresh, &[]);
         }
     }
 
@@ -2853,6 +2860,13 @@ async fn run_event_loop<G: Generation>(
 /// How long a backend load poll may take before the tick moves on without it.
 const LOAD_POLL_DEADLINE: Duration = Duration::from_secs(3);
 
+/// How long the last report of a worker whose load fetch fails is kept
+/// beside the snapshot's entries ([`LoadSnapshot::report_or_kept`]), from
+/// the report's own sample, as the ticks of its group judge it: ten
+/// deadlines of a load poll.
+pub(super) const KEPT_REPORT_LIFE: Duration =
+    Duration::from_secs(10 * LOAD_POLL_DEADLINE.as_secs());
+
 /// Run [`liveness::sweep`] over every registered worker every quarter second.
 ///
 /// A tick reads the registry's immutable membership snapshot: one pointer
@@ -2985,14 +2999,22 @@ async fn poll_group_once<G: Generation>(
     };
 
     let mut group_loads: Vec<(Arc<dyn Worker>, WorkerLoadResponse, bool)> = Vec::new();
+    // The polled workers whose fetch failed, apart from those whose engine
+    // answered with no row: the publish keeps a failed one's last report
+    // beside the entries.
+    let mut failed: Vec<Arc<dyn Worker>> = Vec::new();
     for mut engine in engines {
         let carries_rank_capacity = monitor.reconcile_engine(&mut engine, now);
         for ((worker, response), carries_rank_capacity) in
             engine.into_iter().zip(carries_rank_capacity)
         {
-            let Some(load) = response.filter(|load| !load.loads.is_empty()) else {
+            let Some(load) = response else {
+                failed.push(worker);
                 continue;
             };
+            if load.loads.is_empty() {
+                continue;
+            }
             // The wedged rule reads the queue depth off every report.
             let waiting: i64 = load
                 .loads
@@ -3020,7 +3042,7 @@ async fn poll_group_once<G: Generation>(
 
     if group_loads.is_empty() {
         debug!("No loads fetched for group {group_key}, pruning stale entries");
-        monitor.publish_polled(&group_key.model_id, &polled_urls, Vec::new());
+        monitor.publish_polled(&group_key.model_id, &polled_urls, Vec::new(), &failed);
         return;
     }
 
@@ -3032,7 +3054,7 @@ async fn poll_group_once<G: Generation>(
 
     let rows = group_loads.iter().map(|(_, load, _)| load.loads.len());
     monitor.poll_counts.published(rows.sum());
-    monitor.publish_polled(&group_key.model_id, &polled_urls, group_loads);
+    monitor.publish_polled(&group_key.model_id, &polled_urls, group_loads, &failed);
 }
 
 /// `poll_group_once` for a host's tests: one tick over engines the host's own
@@ -6092,6 +6114,156 @@ mod native_loads_tests {
             (2048, 4096),
             "the report takes the record's token count"
         );
+    }
+
+    /// A worker whose load fetch fails loses its entry, as it always has:
+    /// the snapshot's own reads give none. The report it stated work in
+    /// stands beside the entries, as old as its sample, for
+    /// [`LoadSnapshot::report_or_kept`]: through a second failed tick, and
+    /// until its engine answers, with no row or with a fresh one. A report
+    /// that states no request is not kept, nor one sampled
+    /// [`KEPT_REPORT_LIFE`] ago, nor
+    /// the report of the worker a replacement took the URL from; and a
+    /// kept one ends with its worker's eviction.
+    #[tokio::test]
+    async fn a_failed_fetch_keeps_a_working_report_beside_the_entries() {
+        const WORKING: (StatusCode, &str) = (
+            StatusCode::OK,
+            r#"{"loads":[{"dp_rank":0,"num_running_reqs":8,"num_waiting_reqs":8}]}"#,
+        );
+        const IDLE: (StatusCode, &str) = (
+            StatusCode::OK,
+            r#"{"loads":[{"dp_rank":0,"num_running_reqs":0,"num_waiting_reqs":0}]}"#,
+        );
+        const NO_ROW: (StatusCode, &str) = (StatusCode::OK, r#"{"loads":[]}"#);
+        const DOWN: (StatusCode, &str) = (StatusCode::INTERNAL_SERVER_ERROR, "");
+        let answers = [
+            WORKING, DOWN, DOWN, NO_ROW, WORKING, DOWN, IDLE, DOWN, WORKING, DOWN, WORKING, DOWN,
+            WORKING, DOWN,
+        ];
+        let stub = spawn_backend(&[(StatusCode::NOT_FOUND, "")], &answers).await;
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+        // A runtime with no gauge table: the native route is its one load
+        // read, so an answer of 500 fails the fetch.
+        let engine = || -> Arc<dyn Worker> {
+            let worker = BasicWorkerBuilder::new(&stub.url)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .runtime_type(RuntimeType::Generic)
+                .model(ModelCard::new("a"))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build();
+            worker.set_status(WorkerStatus::Ready);
+            Arc::new(worker)
+        };
+        let worker = engine();
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        let key = WorkerGroupKey {
+            model_id: "a".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+        };
+        let tick = || poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now());
+        // The running requests and the sample instant of the worker's
+        // report: by the snapshot's own read, and by the read that reaches
+        // a kept report.
+        let reads = || {
+            let snapshot = monitor.load_state.snapshot();
+            let stated = |(report, at): (&WorkerLoadResponse, Instant)| {
+                (report.loads[0].num_running_reqs, at)
+            };
+            assert_eq!(
+                snapshot.get(&stub.url).is_some(),
+                snapshot.report(&stub.url).is_some()
+            );
+            (
+                snapshot.report(&stub.url).map(stated),
+                snapshot.report_or_kept(&stub.url).map(stated),
+            )
+        };
+
+        tick().await;
+        let (own, either) = reads();
+        let (_, sampled) = own.expect("the engine answered");
+        assert_eq!(either, Some((8, sampled)));
+
+        tick().await;
+        assert_eq!(
+            reads(),
+            (None, Some((8, sampled))),
+            "a failed fetch prunes the entry and keeps the report beside it, as old as its sample"
+        );
+        let publishes = monitor.load_state.publish_count();
+        tick().await;
+        assert_eq!(reads(), (None, Some((8, sampled))));
+        assert_eq!(
+            monitor.load_state.publish_count(),
+            publishes,
+            "a second failed tick publishes nothing"
+        );
+        tick().await;
+        assert_eq!(
+            reads(),
+            (None, None),
+            "an answer with no row ends the kept report"
+        );
+
+        tick().await;
+        tick().await;
+        assert_eq!(reads().1.map(|(running, _)| running), Some(8));
+        tick().await;
+        let (own, either) = reads();
+        assert_eq!(own.map(|(running, _)| running), Some(0));
+        assert_eq!(either, own, "a fresh row takes the kept report's place");
+        tick().await;
+        assert_eq!(
+            reads(),
+            (None, None),
+            "a fresh row ends the kept report, and one that states no request is not kept"
+        );
+
+        tick().await;
+        let mut aged = monitor
+            .load_state
+            .snapshot()
+            .get(&stub.url)
+            .expect("the engine answered")
+            .clone();
+        aged.sampled_at = Instant::now().checked_sub(KEPT_REPORT_LIFE);
+        assert!(
+            aged.sampled_at.is_some(),
+            "the clock is older than the bound"
+        );
+        let _ = monitor
+            .load_state
+            .publish_group(&[], vec![(Arc::clone(&worker), Arc::new(aged))]);
+        tick().await;
+        assert_eq!(
+            reads(),
+            (None, None),
+            "a report sampled the bound ago is not kept"
+        );
+
+        tick().await;
+        let next = engine();
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        tick().await;
+        assert_eq!(
+            reads(),
+            (None, None),
+            "a replacement keeps nothing of the worker it took the URL from"
+        );
+
+        tick().await;
+        tick().await;
+        assert!(reads().1.is_some(), "the replacement's own report is kept");
+        registry.remove(&id);
+        monitor.evict_worker_loads(&next);
+        monitor.flush_pending_evictions();
+        assert_eq!(reads(), (None, None), "a kept report ends with its worker");
     }
 }
 
