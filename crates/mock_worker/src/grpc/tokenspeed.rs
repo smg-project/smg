@@ -166,7 +166,7 @@ impl TokenSpeedScheduler for MockScheduler {
         request: Request<ts::GetLoadsRequest>,
     ) -> Result<Response<ts::GetLoadsResponse>, Status> {
         let loads: Vec<ts::SchedulerLoad> = self
-            .load_rows(request.into_inner().dp_rank)
+            .load_rows(request.into_inner().dp_rank)?
             .into_iter()
             .map(|(dp_rank, s)| ts::SchedulerLoad {
                 active_token_usage: None,
