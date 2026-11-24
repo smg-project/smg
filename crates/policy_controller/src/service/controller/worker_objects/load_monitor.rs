@@ -654,8 +654,9 @@ mod tests {
     /// A load record that comes while the stop waits for the monitor's
     /// tasks is dropped: the streams are shut out ahead of the stop. The
     /// record comes where the stop drops a poll in flight. Handed on there,
-    /// it would start a publishing task that the stop no longer ends, and
-    /// a standby would publish its report.
+    /// it would start a publishing task that the stop no longer ends and
+    /// mark its worker as one whose stream pushes. The stop's eviction
+    /// takes such a record's report, and neither the task nor the mark.
     #[tokio::test(start_paused = true)]
     async fn a_load_record_inside_the_stop_is_dropped() {
         let mut replica = Replica::new();
@@ -690,6 +691,10 @@ mod tests {
         time::sleep(EVERY).await;
         assert_eq!(replica.waiting(A), None, "a record landed inside the stop");
         assert!(!replica.overloaded(A), "a verdict stands behind the stop");
+        assert!(
+            !replica.pushes(A),
+            "the monitor took a record inside the stop"
+        );
         // The step holds the sink, and the engine holds the step.
         replica.engine.at_cut.lock().take();
         assert!(replica.stopped().await, "the task ends at the stop");
