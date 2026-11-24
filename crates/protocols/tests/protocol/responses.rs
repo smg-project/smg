@@ -74,7 +74,7 @@ fn tool_continuation_keeps_other_input_and_cross_field_validation() {
     assert!(request.validate().is_err());
     assert!(serde_json::from_value::<ResponsesRequest>(json!({
         "model": "test-model", "previous_response_id": "resp_previous",
-        "input": [{"type": "function_call_output", "output": "sunny"}]
+        "input": [{"type": "function_call_output", "call_id": "call_weather"}]
     }))
     .is_err());
 }
@@ -1810,7 +1810,7 @@ fn image_generation_call_input_item_round_trips_spec_shape() {
             status,
             ..
         } => {
-            assert_eq!(id, "ig_2");
+            assert_eq!(id.as_deref(), Some("ig_2"));
             assert_eq!(result.as_deref(), Some("d29ybGQ="));
             assert!(revised_prompt.is_none());
             assert_eq!(*status, Some(ImageGenerationCallStatus::Completed));
@@ -1842,7 +1842,7 @@ fn image_generation_call_input_item_accepts_id_only_reference() {
             status,
             ..
         } => {
-            assert_eq!(id, "ig_3");
+            assert_eq!(id.as_deref(), Some("ig_3"));
             assert!(result.is_none());
             assert!(revised_prompt.is_none());
             assert!(status.is_none());
@@ -1877,7 +1877,7 @@ fn image_generation_call_input_item_round_trips_with_revised_prompt() {
             status,
             ..
         } => {
-            assert_eq!(id, "ig_2");
+            assert_eq!(id.as_deref(), Some("ig_2"));
             assert_eq!(result.as_deref(), Some("d29ybGQ="));
             assert_eq!(
                 revised_prompt.as_deref(),
@@ -2018,8 +2018,9 @@ fn image_generation_call_input_item_round_trips_with_full_metadata() {
             revised_prompt,
             size,
             status,
+            ..
         } => {
-            assert_eq!(id, "ig_prod_2");
+            assert_eq!(id.as_deref(), Some("ig_prod_2"));
             assert_eq!(action.as_deref(), Some("edit"));
             assert_eq!(background.as_deref(), Some("transparent"));
             assert_eq!(output_format.as_deref(), Some("webp"));
@@ -2059,8 +2060,9 @@ fn image_generation_call_input_item_round_trips_minimal_without_metadata() {
             revised_prompt,
             size,
             status,
+            ..
         } => {
-            assert_eq!(id, "ig_min_2");
+            assert_eq!(id.as_deref(), Some("ig_min_2"));
             assert!(action.is_none());
             assert!(background.is_none());
             assert!(output_format.is_none());
@@ -2690,6 +2692,7 @@ fn test_custom_tool_call_input_item_round_trip() {
             name,
             id,
             namespace,
+            ..
         } => {
             assert_eq!(call_id, "call_abc123");
             assert_eq!(input, "SELECT count(*) FROM events");
@@ -2724,6 +2727,7 @@ fn test_custom_tool_call_output_string_round_trip() {
             call_id,
             output,
             id,
+            ..
         } => {
             assert_eq!(call_id, "call_abc123");
             assert_eq!(id.as_deref(), Some("ctco_01"));
@@ -3088,6 +3092,7 @@ fn shell_call_input_item_round_trips_spec_shape() {
             environment,
             status,
             created_by,
+            ..
         } => {
             assert_eq!(call_id, "call_shell_1");
             assert_eq!(id.as_deref(), Some("sc_01"));
@@ -3148,6 +3153,7 @@ fn shell_call_minimal_shape_round_trips() {
             environment,
             status,
             created_by,
+            ..
         } => {
             assert_eq!(call_id, "call_shell_2");
             assert!(id.is_none());
@@ -3222,6 +3228,7 @@ fn shell_call_output_input_item_round_trips_spec_shape() {
             max_output_length,
             status,
             created_by,
+            ..
         } => {
             assert_eq!(call_id, "call_shell_1");
             assert_eq!(id.as_deref(), Some("sco_01"));
@@ -3326,8 +3333,8 @@ fn local_shell_call_input_item_round_trips_spec_shape() {
             action,
             status,
         } => {
-            assert_eq!(id, "ls_1");
-            assert_eq!(call_id, "call_ls_1");
+            assert_eq!(id.as_deref(), Some("ls_1"));
+            assert_eq!(call_id.as_deref(), Some("call_ls_1"));
             assert_eq!(*status, LocalShellCallStatus::InProgress);
             match action {
                 LocalShellExec::Exec {
@@ -3718,7 +3725,7 @@ fn test_apply_patch_tool_round_trip() {
 
     let tool: ResponseTool =
         serde_json::from_value(payload.clone()).expect("apply_patch tool should deserialize");
-    assert!(matches!(tool, ResponseTool::ApplyPatch));
+    assert!(matches!(tool, ResponseTool::ApplyPatch(_)));
 
     let serialized = serde_json::to_value(&tool).expect("apply_patch tool should serialize");
     assert_eq!(serialized, payload);
@@ -3850,6 +3857,7 @@ fn test_apply_patch_call_input_item_round_trip() {
             operation,
             status,
             id,
+            ..
         } => {
             assert_eq!(call_id, "call_patch_001");
             assert_eq!(*status, ApplyPatchCallStatus::Completed);
@@ -3889,6 +3897,7 @@ fn test_apply_patch_call_input_item_in_progress_status_and_omitted_id() {
             operation,
             status,
             id,
+            ..
         } => {
             assert_eq!(call_id, "call_patch_002");
             assert_eq!(*status, ApplyPatchCallStatus::InProgress);
@@ -3927,6 +3936,7 @@ fn test_apply_patch_call_output_input_item_completed_round_trip() {
             status,
             id,
             output,
+            ..
         } => {
             assert_eq!(call_id, "call_patch_001");
             assert_eq!(*status, ApplyPatchCallOutputStatus::Completed);
@@ -3958,6 +3968,7 @@ fn test_apply_patch_call_output_input_item_failed_without_output() {
             status,
             id,
             output,
+            ..
         } => {
             assert_eq!(call_id, "call_patch_003");
             assert_eq!(*status, ApplyPatchCallOutputStatus::Failed);
@@ -5841,4 +5852,78 @@ fn reasoning_input_accepts_null_content_and_optional_id() {
     assert!(items[4].get("id").is_none());
     assert!(items[5].get("id").is_none());
     assert!(items[5].get("content").is_none());
+}
+
+#[test]
+fn function_call_output_accepts_optional_call_id_name_namespace_and_caller() {
+    // Real Codex payload: function_call_output without call_id, identified by
+    // namespace + name, alongside programmatic-tool-calling caller metadata.
+    let payload = json!({
+        "model": "test-model",
+        "input": [
+            {
+                "type": "function_call_output",
+                "name": "codex_apps_open_page",
+                "namespace": "agent",
+                "output": "{\"page_id\":null}"
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_ptc",
+                "caller": {"type": "program", "caller_id": "prog_1"},
+                "name": "query_db",
+                "arguments": "{}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_ptc",
+                "caller": {"type": "direct"},
+                "output": "[]"
+            }
+        ]
+    });
+
+    let req: ResponsesRequest = serde_json::from_value(payload.clone())
+        .expect("call_id-less and caller-tagged items should deserialize");
+    req.validate().expect("items should validate");
+
+    let wire = serde_json::to_value(&req).unwrap();
+    assert_eq!(wire["input"], payload["input"]);
+}
+
+#[test]
+fn responses_schema_passthrough_for_ptc_tool_search_web_search_and_optional_ids() {
+    let payload = json!({
+        "model": "test-model",
+        "prompt_cache_options": {"retention": "24h"},
+        "tools": [
+            {"type": "programmatic_tool_calling"},
+            {"type": "apply_patch", "allowed_callers": ["direct", "programmatic"]},
+            {"type": "shell", "allowed_callers": ["programmatic"]},
+            {"type": "mcp", "server_label": "docs", "server_url": "https://example.com/mcp", "allowed_callers": ["direct"], "tunnel_id": "tun_1"}
+        ],
+        "tool_choice": {"type": "programmatic_tool_calling"},
+        "input": [
+            {"type": "tool_search_call", "call_id": "ts_1", "arguments": {"query": "weather"}, "execution": "client"},
+            {"type": "tool_search_output", "call_id": "ts_1", "execution": "client", "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}]},
+            {"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "rust"}},
+            {"type": "program", "id": "prg_1", "call_id": "call_p1", "code": "return 1;", "fingerprint": "fp_1"},
+            {"type": "program_output", "id": "prgo_1", "call_id": "call_p1", "result": "1", "status": "completed"},
+            {"type": "local_shell_call", "action": {"type": "exec", "command": ["ls"], "env": {}}, "status": "completed"},
+            {"type": "image_generation_call", "status": "failed", "error": {"code": "moderation_blocked"}}
+        ]
+    });
+
+    let req: ResponsesRequest = serde_json::from_value(payload.clone())
+        .expect("PTC, tool_search, web_search_call, and optional-id items should deserialize");
+    req.validate().expect("request should validate");
+
+    let wire = serde_json::to_value(&req).unwrap();
+    assert_eq!(
+        wire["prompt_cache_options"],
+        payload["prompt_cache_options"]
+    );
+    assert_eq!(wire["tools"], payload["tools"]);
+    assert_eq!(wire["tool_choice"], payload["tool_choice"]);
+    assert_eq!(wire["input"], payload["input"]);
 }

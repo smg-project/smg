@@ -315,7 +315,8 @@ fn stored_item_as_input(item: ConversationItem) -> Option<ResponseInputOutputIte
                 }
             }
         }
-        "additional_tools" | "agent_message" => {
+        "additional_tools" | "agent_message" | "tool_search_call" | "tool_search_output"
+        | "web_search_call" | "program" | "program_output" => {
             match serde_json::from_value::<ResponseInputOutputItem>(item.content) {
                 Ok(replayed) => Some(replayed),
                 Err(e) => {
@@ -535,7 +536,7 @@ mod tests {
                     format!("function_call:{call_id}")
                 }
                 ResponseInputOutputItem::FunctionCallOutput { call_id, .. } => {
-                    format!("function_call_output:{call_id}")
+                    format!("function_call_output:{}", call_id.as_deref().unwrap_or(""))
                 }
                 other => format!("{other:?}"),
             })

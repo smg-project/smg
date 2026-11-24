@@ -772,6 +772,9 @@ impl HarmonyBuilder {
                         ResponseInputOutputItem::McpListTools { .. }
                             | ResponseInputOutputItem::McpApprovalRequest { .. }
                             | ResponseInputOutputItem::AdditionalTools { .. }
+                            | ResponseInputOutputItem::ToolSearchCall { .. }
+                            | ResponseInputOutputItem::ToolSearchOutput { .. }
+                            | ResponseInputOutputItem::WebSearchCall { .. }
                     ) {
                         continue;
                     }
@@ -912,9 +915,43 @@ impl HarmonyBuilder {
             )),
 
             // Function call output (separate from call) - requires looking up the original call
+            // when paired by call_id, or falls back to explicit name/namespace or a user message
+            // for call_id-less outputs.
             ResponseInputOutputItem::FunctionCallOutput {
-                call_id, output, ..
-            } => replay_tool_result(prev_outputs, call_id, output.to_text_only()?),
+                call_id,
+                name,
+                namespace,
+                output,
+                ..
+            } => {
+                let text = output.to_text_only()?;
+                if let Some(call_id) = call_id.as_deref().filter(|id| !id.is_empty()) {
+                    replay_tool_result(prev_outputs, call_id, text)
+                } else if let Some(name) = name.as_deref().filter(|n| !n.is_empty()) {
+                    let qualified = namespace
+                        .as_deref()
+                        .filter(|ns| !ns.is_empty())
+                        .map_or_else(|| name.to_string(), |ns| format!("{ns}.{name}"));
+                    Ok(tool_result_message(format!("functions.{qualified}"), text))
+                } else {
+                    Ok(HarmonyMessage {
+                        author: Author {
+                            role: Role::User,
+                            name: None,
+                        },
+                        recipient: None,
+                        content: vec![Content::Text(TextContent {
+                            text: if text.is_empty() {
+                                "[tool_output]".to_string()
+                            } else {
+                                format!("[tool_output]\n{text}")
+                            },
+                        })],
+                        channel: None,
+                        content_type: None,
+                    })
+                }
+            }
             ResponseInputOutputItem::CustomToolCallOutput {
                 call_id, output, ..
             } => {
@@ -976,7 +1013,10 @@ impl HarmonyBuilder {
             // `construct_input_messages_with_harmony`).
             ResponseInputOutputItem::McpListTools { .. }
             | ResponseInputOutputItem::McpApprovalRequest { .. }
-            | ResponseInputOutputItem::AdditionalTools { .. } => {
+            | ResponseInputOutputItem::AdditionalTools { .. }
+            | ResponseInputOutputItem::ToolSearchCall { .. }
+            | ResponseInputOutputItem::ToolSearchOutput { .. }
+            | ResponseInputOutputItem::WebSearchCall { .. } => {
                 Err("Unsupported input item type".to_string())
             }
 
@@ -1036,7 +1076,9 @@ impl HarmonyBuilder {
             }
             // T5 schema-only: forced-cascade arm, no behavior.
             ResponseInputOutputItem::LocalShellCall { .. }
-            | ResponseInputOutputItem::LocalShellCallOutput { .. } => {
+            | ResponseInputOutputItem::LocalShellCallOutput { .. }
+            | ResponseInputOutputItem::Program { .. }
+            | ResponseInputOutputItem::ProgramOutput { .. } => {
                 Err("Unsupported input item type".to_string())
             }
         }

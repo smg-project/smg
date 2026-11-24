@@ -1847,6 +1847,8 @@ mod tests {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })];
 
         let routing = collect_builtin_routing(&orchestrator, &format_registry, Some(&tools));
