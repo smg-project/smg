@@ -7061,6 +7061,49 @@ impl Engine {
         decision
     }
 
+    /// The prefill side of a pair by its rule or its picker's assignment
+    /// ([`Self::placed_side`]), over the prefills of the classes it is
+    /// shown: the first partners' where `firsts`, else every open
+    /// partner's. The rule's run takes the whole scratch, so the classes
+    /// its set reads are lent for the run and stand in the scratch again
+    /// behind it.
+    ///
+    /// Out of line: a pair whose prefill side its profile runs holds one
+    /// test of it and the two runs of its profile, as it did.
+    #[inline(never)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the profile run's inputs, as run_profile takes them"
+    )]
+    fn placed_prefill(
+        &self,
+        firsts: bool,
+        binding: &Binding,
+        profile: &Profile,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        prefills: &[Candidate],
+        cx: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Decision {
+        let shown = if firsts {
+            &mut scratch.firsts
+        } else {
+            &mut scratch.classes
+        };
+        let classes = std::mem::take(shown);
+        let set = Set::side(prefills, None, Some(&classes));
+        let index = binding.profile;
+        let decision =
+            self.placed_side::<false>(binding, index, profile, facts, pool, set, cx, scratch);
+        if firsts {
+            scratch.firsts = classes;
+        } else {
+            scratch.classes = classes;
+        }
+        decision
+    }
+
     /// The `pd-pair` plan, and the pair half of `epd`: the prefill profile
     /// over `prefills`, then the decode profile over the decodes of the
     /// classes the chosen prefill's class pairs with ([`PairTable`]). A
@@ -7288,52 +7331,36 @@ impl Engine {
             .open(&pools.table, &scratch.marks, &mut scratch.firsts);
         // The prefill side's run over the classes it is shown, the first
         // partners' or every open partner's: by its rule or its picker's
-        // assignment where one places the side ([`Self::placed_side`]),
+        // assignment where one places the side ([`Self::placed_prefill`]),
         // else by its profile.
         let placed = self.places_side(entry, binding.profile, &prefill_facts);
-        let run_prefill = |firsts: bool, scratch: &mut Scratch| {
-            if !placed {
-                let shown: &[u32] = if firsts {
-                    &scratch.firsts
-                } else {
-                    &scratch.classes
-                };
-                return run_profile(
-                    prefill_profile,
-                    binding.profile,
-                    &prefill_facts,
-                    pool,
-                    Set::side(prefills, None, Some(shown)),
-                    run_cx,
-                    &mut scratch.single,
-                );
-            }
-            // The rule's run takes the whole scratch, so the classes its
-            // set reads are lent for the run and stand in the scratch again
-            // behind it.
-            let classes = std::mem::take(if firsts {
-                &mut scratch.firsts
-            } else {
-                &mut scratch.classes
-            });
-            let decision = self.placed_side::<false>(
+        let mut prefill = if placed {
+            self.placed_prefill(
+                firsts,
                 binding,
-                binding.profile,
                 prefill_profile,
                 &prefill_facts,
                 pool,
-                Set::side(prefills, None, Some(&classes)),
+                prefills,
                 run_cx,
                 scratch,
-            );
-            if firsts {
-                scratch.firsts = classes;
+            )
+        } else {
+            let shown: &[u32] = if firsts {
+                &scratch.firsts
             } else {
-                scratch.classes = classes;
-            }
-            decision
+                &scratch.classes
+            };
+            run_profile(
+                prefill_profile,
+                binding.profile,
+                &prefill_facts,
+                pool,
+                Set::side(prefills, None, Some(shown)),
+                run_cx,
+                &mut scratch.single,
+            )
         };
-        let mut prefill = run_prefill(firsts, scratch);
         if firsts {
             let stands = match &prefill {
                 Decision::Pick(_) => true,
@@ -7366,7 +7393,28 @@ impl Engine {
                 std::mem::swap(&mut scratch.classes, &mut scratch.firsts);
             } else {
                 firsts = false;
-                prefill = run_prefill(false, scratch);
+                prefill = if placed {
+                    self.placed_prefill(
+                        false,
+                        binding,
+                        prefill_profile,
+                        &prefill_facts,
+                        pool,
+                        prefills,
+                        run_cx,
+                        scratch,
+                    )
+                } else {
+                    run_profile(
+                        prefill_profile,
+                        binding.profile,
+                        &prefill_facts,
+                        pool,
+                        Set::side(prefills, None, Some(&scratch.classes)),
+                        run_cx,
+                        &mut scratch.single,
+                    )
+                };
             }
         }
         // The prefill's pick is read where its decision stands: a pick is
