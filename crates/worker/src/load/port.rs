@@ -78,7 +78,7 @@ pub struct PolledRanks {
     pub leaving: Vec<i32>,
 }
 
-/// One polled member's report at the end of a group's tick.
+/// One polled member's report in a batch of its group's answers.
 #[derive(Clone, Copy)]
 pub struct PolledReport<'a> {
     /// The polled worker the report is of.
@@ -93,14 +93,16 @@ pub struct PolledReport<'a> {
     pub carries_rank_capacity: bool,
 }
 
-/// What a group's tick leaves, once every polled engine has answered and the
-/// collector has laid the stream's rows over each answer.
+/// What a batch of a group's answers leaves, once the collector has laid the
+/// stream's rows over each answer. The engines of a tick that answer
+/// together are one batch, an engine that answers later is a batch of its
+/// own, and a tick that no answer came in ends with a batch of no report.
 #[derive(Clone, Copy)]
 pub struct GroupTick<'a> {
     /// Every `Ready` worker of the group the sink says yes of
     /// ([`LoadSink::polls`]), polled or served by its stream.
     pub workers: &'a [Arc<dyn Worker>],
-    /// The polled members that answered with rows.
+    /// The batch's polled members that answered with rows.
     pub reports: &'a [PolledReport<'a>],
 }
 
@@ -213,7 +215,7 @@ pub trait LoadSink: Send + Sync {
         true
     }
 
-    /// The end of a group's tick. A sink that keeps rows of its own took
-    /// them at [`Self::report`] and needs nothing here.
+    /// A batch of a group's answers ([`GroupTick`]). A sink that keeps rows
+    /// of its own took them at [`Self::report`] and needs nothing here.
     fn tick(&self, _tick: &GroupTick<'_>) {}
 }
