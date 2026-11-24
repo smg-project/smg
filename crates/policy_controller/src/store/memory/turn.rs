@@ -805,7 +805,8 @@ impl MemoryStore {
     }
 
     /// Gives the store the controller's word to the engine: what tells it
-    /// of a frame applied to a lease on file. Given once: the first stays.
+    /// of a frame applied to a lease on file. Given once: the first stays,
+    /// and the answer says whether this one was kept.
     #[cfg_attr(
         not(any(test, feature = "controller")),
         expect(dead_code, reason = "called by the served controller alone")
@@ -816,8 +817,8 @@ impl MemoryStore {
             + Send
             + Sync
             + 'static,
-    ) {
-        self.files.teller.get_or_init(|| Arc::new(teller));
+    ) -> bool {
+        self.files.teller.set(Arc::new(teller)).is_ok()
     }
 
     /// A lifecycle call the controller made for a lease panicked and was

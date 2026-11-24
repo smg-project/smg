@@ -3112,10 +3112,9 @@ const DUE_STEPS: usize = 4;
 /// single's lease whole, or the prefill part of a pair's.
 struct Held {
     record: LeaseRecord,
-    /// `None` for a lease on a worker that is no member, or on a member in
-    /// no pool, when the lease was written or moved ([`Slots::of`]): it
-    /// books no row a decision reads. A pair's prefill side that ended
-    /// books none.
+    /// `None` for a lease on a worker that is no member when the lease was
+    /// written or moved ([`Slots::of`]): it books no row a decision reads.
+    /// A pair's prefill side that ended books none.
     booked: Option<WorkerSlot>,
     /// The place of a pair's decode side in the file's list
     /// ([`Decodes`]), read where the record carries the mark of a pair's
@@ -4460,10 +4459,10 @@ struct Slots<'a>(&'a MemoryStore);
 
 impl Slots<'_> {
     /// The slot of `target`'s count: `None` for a worker that is no
-    /// member. The standing world lists a member in a pool from its first
-    /// build on, and a listed target takes no lock. Inlined into each
-    /// door: a listed target's read costs the door no call, one read for
-    /// each lease it files.
+    /// member. The standing world names a member's slot from its first
+    /// build on, in a pool or in none, and such a target takes no lock.
+    /// Inlined into each door: a named target's read costs the door no
+    /// call, one read for each lease it files.
     #[inline(always)]
     fn of(self, target: WorkerId) -> Option<WorkerSlot> {
         if let Some(slot) = self.0.world.load().booked_of(target) {
@@ -4472,12 +4471,12 @@ impl Slots<'_> {
         self.filed(target)
     }
 
-    /// The slot of a target the standing world does not list. A member
+    /// The slot of a target the standing world does not name. A member
     /// inside its registration window is read from the table its write
     /// filed it in. A build publishes before it empties the table, so a
-    /// target the table no longer holds is read off the world again: its
-    /// pools, then its members in no pool. The table's lock is a leaf,
-    /// taken under the turn or with no lock held.
+    /// target the table no longer holds is read off the world again.
+    /// The table's lock is a leaf, taken under the turn or with no lock
+    /// held.
     #[cold]
     fn filed(self, target: WorkerId) -> Option<WorkerSlot> {
         let filed = {
@@ -4487,12 +4486,7 @@ impl Slots<'_> {
                 .find(|&&(id, _)| id == target)
                 .map(|&(_, slot)| slot)
         };
-        filed.or_else(|| {
-            let world = self.0.world.load();
-            world
-                .booked_of(target)
-                .or_else(|| world.unpooled_of(target))
-        })
+        filed.or_else(|| self.0.world.load().booked_of(target))
     }
 }
 

@@ -110,16 +110,17 @@ pub(crate) fn released(
 /// replica's worker objects, and asks them whether the worker a dispatch
 /// names stands at its rank ([`Objects::lists_rank`]).
 ///
-/// A replica gives it once, at the start of its deciders, and so before a
-/// session or a `Decide` stream opens a hand: the first word a store is
-/// given stays.
-pub(crate) fn tells(store: &MemoryStore, objects: &Arc<Objects<Members>>) {
+/// A replica gives it where its shared state is built, ahead of its
+/// deciders' start and so before a session or a `Decide` stream opens a
+/// hand. The first word a store is given stays, and the answer says
+/// whether this one was kept: a replica's own must be.
+pub(crate) fn tells(store: &MemoryStore, objects: &Arc<Objects<Members>>) -> bool {
     let objects = Arc::clone(objects);
     store.tell_through(move |store, world, found, said, by| {
         told(store, world, found, said, by, |id, rank| {
             objects.lists_rank(id, rank)
         });
-    });
+    })
 }
 
 /// Tells the engine what a frame said of a lease, whoever applies the

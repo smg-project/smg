@@ -3911,8 +3911,8 @@ fn a_lease_on_a_member_in_no_pool_books_its_count() {
 }
 
 /// A world names the slot of a member in no pool from the build behind
-/// its write to the build behind its leave, and of no worker beside the
-/// members its build read.
+/// its write to the build behind its leave, a slot of its own, and of
+/// no worker beside the members its build read.
 #[test]
 fn a_world_names_a_member_in_no_pool_until_it_leaves() {
     let store = MemoryStore::new();
@@ -3922,28 +3922,21 @@ fn a_world_names_a_member_in_no_pool_until_it_leaves() {
         ..facts("http://b:1", 1)
     };
     let owed = store.upsert(bare).id();
-    assert!(store.snapshot().booked_of(pooled).is_some());
+    let listed = store.snapshot().booked_of(pooled);
+    assert!(listed.is_some());
     assert!(
-        store.snapshot().unpooled_of(owed).is_none(),
+        store.snapshot().booked_of(owed).is_none(),
         "inside its window"
     );
     store.publish_now();
-    assert!(
-        store.snapshot().unpooled_of(owed).is_some(),
-        "named, in no pool"
-    );
-    assert!(
-        store.snapshot().booked_of(owed).is_none(),
-        "no pool lists it"
-    );
-    assert!(
-        store.snapshot().unpooled_of(pooled).is_none(),
-        "a pool lists it"
-    );
+    let named = store.snapshot().booked_of(owed);
+    assert!(named.is_some(), "named, in no pool");
+    assert_ne!(named, listed, "a slot of its own");
+    assert_eq!(store.snapshot().booked_of(pooled), listed);
     let revision = WorkersStore::get(&store, owed).expect("the row").revision;
     assert!(store.remove(owed, revision).is_some());
-    assert!(store.snapshot().unpooled_of(owed).is_none(), "it left");
-    assert!(store.snapshot().booked_of(pooled).is_some());
+    assert!(store.snapshot().booked_of(owed).is_none(), "it left");
+    assert_eq!(store.snapshot().booked_of(pooled), listed);
 }
 
 /// A generation of the standing pairing mode builds no membership: the
@@ -3960,10 +3953,12 @@ fn a_generation_that_builds_no_membership_still_names_a_member_in_no_pool() {
     };
     let owed = store.upsert(bare).id();
     store.publish_now();
-    assert!(store.snapshot().unpooled_of(owed).is_some());
+    let named = store.snapshot().booked_of(owed);
+    assert!(named.is_some());
     store.apply(manual_ruled(2, 60, 30)).expect("generation 2");
-    assert!(
-        store.snapshot().unpooled_of(owed).is_some(),
+    assert_eq!(
+        store.snapshot().booked_of(owed),
+        named,
         "the generation built no membership"
     );
 }

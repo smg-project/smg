@@ -58,6 +58,7 @@ use super::{
     generations::{
         Format, Generations, SpecRejected, Unanswered, DRY_RUNS_WAITING, WRITES_WAITING,
     },
+    lifecycle,
     membership::MembershipCalls,
     principal::{self, Layer, Principal},
     replication::{Batches, Replication},
@@ -253,6 +254,14 @@ impl Shared {
             elector.fence(),
             Arc::clone(&store),
         ));
+        // The store's word to the engine asks this replica's worker objects.
+        // It is given here, ahead of the deciders' start and of any hand: a
+        // word the store was given before fails a debug build.
+        let kept = lifecycle::tells(&store, &objects);
+        debug_assert!(
+            kept,
+            "the store held a word to the engine before its replica's"
+        );
         let deciders = DecisionSlots::start(
             deciders,
             decision_slots::QUEUE_DEPTH,
@@ -1272,6 +1281,32 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    /// A store that was given a word to the engine before its replica's
+    /// shared state is built keeps that one, and the replica's count of
+    /// sends would then ask another's worker objects or none: a debug
+    /// build stops where the shared state is built.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "before its replica's")]
+    async fn a_word_given_before_the_replicas_stops_a_debug_build() {
+        let elector = Elector::alone(IDENTITY, PATIENT).expect("the settings are in order");
+        let (_standing, stood) = watch::channel(ElectionObservation::default());
+        let journaled = journaled_from(&LeasePlace::Process, 0);
+        let (store, feed, objects, loads) = bed::followed(journaled);
+        store.tell_through(|_, _, _, _, _| {});
+        let catalog = Arc::new(StageRegistry::builtin());
+        let state = (store, feed, objects, loads);
+        let _ = Shared::new(
+            ID.to_owned(),
+            ADDRESS.to_owned(),
+            &elector,
+            stood,
+            state,
+            catalog,
+            1,
+        );
     }
 
     /// The service's own calls object writes the worker objects its
