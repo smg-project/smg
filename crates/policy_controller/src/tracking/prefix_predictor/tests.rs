@@ -1069,3 +1069,21 @@ fn a_swept_block_keeps_its_tick() {
     );
     predictor.check();
 }
+
+/// The first piece holds room for 64 blocks and doubles as they come, to a
+/// whole piece: a model that sent a few blocks holds no room for 4,096.
+#[test]
+fn the_first_piece_doubles_with_its_blocks_to_a_whole_piece() {
+    let mut predictor = PrefixPredictor::new(usize::MAX);
+    let hashes: Vec<u64> = (0..=CHUNK as u64).collect();
+    for (blocks, want) in [
+        (1, vec![64]),
+        (65, vec![128]),
+        (CHUNK + 1, vec![CHUNK, CHUNK]),
+    ] {
+        predictor.sent_by(SEED, &hashes[..blocks], worker(1));
+        let room: Vec<usize> = predictor.chunks.iter().map(|piece| piece.len()).collect();
+        assert_eq!(room, want, "{blocks} blocks");
+    }
+    predictor.check();
+}

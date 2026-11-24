@@ -65,8 +65,10 @@
 //! places or for twice its workers at most, whichever is more, and the
 //! list's own 24 bytes. A block left with one worker holds it in itself
 //! again, and a list no block uses keeps room for eight places at most.
-//! The blocks stand in pieces of 4,096 that never move, and the keys in
-//! 256 maps by their top byte, so a growth moves one map's entries.
+//! The blocks stand in pieces of 4,096 that never move, but for the
+//! first: it starts at 64 and moves as it doubles to a whole piece, so a
+//! model that sent a few blocks holds no room for 4,096. The keys stand
+//! in 256 maps by their top byte, so a growth moves one map's entries.
 
 use std::{mem, slice};
 
@@ -84,8 +86,10 @@ const FREE: u32 = u32::MAX;
 /// No worker: the lone holder of a block whose holders are a group, or of
 /// one that no worker is left of.
 const NOBODY: u16 = u16::MAX;
-/// The blocks of one piece of the slab.
+/// The blocks of a whole piece of the slab.
 const CHUNK: usize = 1 << 12;
+/// The blocks the first piece starts with.
+const FIRST: usize = 1 << 6;
 /// The maps a key is found through, one for each value of its top byte.
 const MAPS: usize = 1 << 8;
 /// The places of room a list of workers keeps while no block uses it.
@@ -166,7 +170,8 @@ enum Ask<'a> {
 /// workers the store hears no cache events from, and what its issue writes.
 #[derive(Debug)]
 pub struct PrefixPredictor {
-    /// The blocks, in pieces that never move.
+    /// The blocks, in pieces. A whole piece never moves; the first
+    /// doubles to one.
     chunks: Vec<Box<[Block]>>,
     /// How many entries the pieces have handed out.
     span: u32,
@@ -644,9 +649,19 @@ impl PrefixPredictor {
             if self.span == UNLISTED {
                 return None;
             }
-            if (self.span as usize).is_multiple_of(CHUNK) {
+            let span = self.span as usize;
+            if span.is_multiple_of(CHUNK) {
+                let room = if span == 0 { FIRST } else { CHUNK };
                 self.chunks
-                    .push(vec![Block::BLANK; CHUNK].into_boxed_slice());
+                    .push(vec![Block::BLANK; room].into_boxed_slice());
+            } else if span < CHUNK {
+                let first = self.chunks.first_mut();
+                if let Some(first) = first.filter(|first| first.len() == span) {
+                    let mut grown = Vec::with_capacity(span * 2);
+                    grown.extend_from_slice(first);
+                    grown.resize(span * 2, Block::BLANK);
+                    *first = grown.into_boxed_slice();
+                }
             }
             self.span += 1;
             self.span - 1
