@@ -420,6 +420,12 @@ the gateway that asks gates capacity when it commits. All of it stands in a buil
 `in-process` feature, and a controller's decision of a pair at its prefill reads it (section
 10.1).
 
+Beside its encoder list and its prefill list the holder hands the two columns an encode request's
+decision reads (`Objects::encode_columns`). They are what the encode side reads of each encoder
+and the encode class each prefill names, by a worker's place in the list as lent. The classes are
+the store's own encode rule over what the rows state. The columns stand in the same build. No
+decision of a controller reads them yet: an encode request is answered `Busy` (section 10.1).
+
 ### 4.2 The worker object **[built]** (`smg-worker`)
 
 ```rust
